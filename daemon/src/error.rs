@@ -7,7 +7,7 @@ pub enum Error {
     #[cfg(feature = "ws")]
     Websocket(async_tungstenite::tungstenite::Error),
     RescanRequired,
-    Lmdb(lmdb::Error),
+    Sqlite(rusqlite::Error),
     Capnp(capnp::Error),
     NotInSchema(capnp::NotInSchema),
     BincodeError(bincode::ErrorKind),
@@ -34,7 +34,7 @@ impl std::error::Error for Error {
             #[cfg(feature = "ws")]
             Error::Websocket(ref e) => Some(e),
             Error::RescanRequired => None,
-            Error::Lmdb(ref e) => Some(e),
+            Error::Sqlite(ref e) => Some(e),
             Error::Capnp(ref e) => Some(e),
             Error::NotInSchema(ref e) => Some(e),
             Error::BincodeError(ref e) => Some(e),
@@ -60,7 +60,7 @@ impl fmt::Display for Error {
             #[cfg(feature = "ws")]
             Error::Websocket(ref e) => e.fmt(f),
             Error::RescanRequired => write!(f, "{}", self),
-            Error::Lmdb(ref e) => e.fmt(f),
+            Error::Sqlite(ref e) => e.fmt(f),
             Error::Capnp(ref e) => e.fmt(f),
             Error::NotInSchema(ref e) => e.fmt(f),
             Error::BincodeError(ref e) => e.fmt(f),
@@ -97,9 +97,9 @@ impl From<async_tungstenite::tungstenite::Error> for Error {
         Error::Websocket(err)
     }
 }
-impl From<lmdb::Error> for Error {
-    fn from(err: lmdb::Error) -> Error {
-        Error::Lmdb(err)
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Error {
+        Error::Sqlite(err)
     }
 }
 impl From<capnp::Error> for Error {

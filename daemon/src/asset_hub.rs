@@ -19,17 +19,18 @@ use distill_schema::{
     },
     parse_db_asset_ref,
 };
+use rusqlite::Connection;
 
 use crate::{
-    capnp_db::{CapnpCursor, DBTransaction, Environment, MessageReader, RwTransaction},
-    error::{Error, Result},
+    db::{queries, OwnedMessageReader, RwTransaction},
+    error::Result,
 };
+
+const TABLE_ASSET_METADATA: &str = "asset_metadata";
 
 pub type ListenerID = u64;
 
 pub struct AssetHub {
-    // db: Arc<Environment>,
-    tables: AssetHubTables,
     id_gen: AtomicU64,
     listeners: Mutex<HashMap<ListenerID, Sender<AssetBatchEvent>>>,
 }
@@ -66,39 +67,23 @@ impl ChangeBatch {
     }
 }
 
-struct AssetHubTables {
-    /// Maps an AssetUuid to a list of other assets that have a build dependency on it
-    /// AssetUuid -> [AssetUuid]
-    build_dep_reverse: lmdb::Database,
-    /// Maps an AssetID to its most recent metadata
-    /// AssetUuid -> AssetMetadata
-    asset_metadata: lmdb::Database,
-    /// Maps a SequenceNum to a AssetChangeLogEntry
-    /// SequenceNum -> AssetChangeLogEntry
-    asset_changes: lmdb::Database,
-}
-
-// Utility function called from add_changes
+// Utility function called from add_changes — uses autoincrement
 fn add_asset_changelog_entry(
-    tables: &AssetHubTables,
-    txn: &mut RwTransaction<'_>,
+    conn: &Connection,
     change: &ChangeEvent,
 ) -> Result<()> {
-    // Determine the next sequence ID in asset_changes table
-    let mut last_seq: u64 = 0;
-    let last_element = txn
-        .open_ro_cursor(tables.asset_changes)?
-        .capnp_iter_start()
-        .last();
-    if let Some((key, _)) = last_element {
-        last_seq = u64::from_le_bytes(utils::make_array(key));
-    }
-    last_seq += 1;
+    // Create the AssetChangeLogEntry capnp message
+    // We need to know the seq for the message content, but autoincrement assigns it.
+    // We'll insert with a placeholder seq=0, then update. Or better: insert, get last_insert_rowid, update value.
+    // Actually, we can just build the message with seq=0 for now since the seq is stored
+    // as the row key and consumers can use that.
+    // But the original code sets `value.set_num(last_seq)` inside the capnp message.
+    // Let's do a two-step: insert a placeholder, get the rowid, then update with the correct seq.
 
-    // Create the AssetChangeLogEntry to insert into asset_changes
     let mut value_builder = capnp::message::Builder::new_default();
     let mut value = value_builder.init_root::<asset_change_log_entry::Builder<'_>>();
-    value.reborrow().set_num(last_seq);
+    // We'll set num after we know the seq
+    value.reborrow().set_num(0);
     {
         let value = value.reborrow().init_event();
         match change {
@@ -128,156 +113,155 @@ fn add_asset_changelog_entry(
         }
     }
 
-    // Insert the record
-    txn.put(
-        tables.asset_changes,
-        &last_seq.to_le_bytes(),
-        &value_builder,
+    // Serialize the capnp message
+    let mut value_bytes = Vec::new();
+    capnp::serialize::write_message(&mut value_bytes, &value_builder)
+        .expect("capnp: failed to serialize message");
+
+    // Insert with autoincrement
+    conn.execute(
+        "INSERT INTO asset_changes (value) VALUES (?1)",
+        rusqlite::params![value_bytes],
     )?;
+    let seq = conn.last_insert_rowid() as u64;
+
+    // Now rebuild the message with the correct seq number
+    let mut value_builder = capnp::message::Builder::new_default();
+    let mut value = value_builder.init_root::<asset_change_log_entry::Builder<'_>>();
+    value.reborrow().set_num(seq);
+    {
+        let value = value.reborrow().init_event();
+        match change {
+            ChangeEvent::ContentUpdate(evt) => {
+                let mut db_evt = value.init_content_update_event();
+                db_evt.reborrow().init_id().set_id(&evt.id.0);
+                if let Some(ref import_hash) = evt.import_hash {
+                    db_evt.reborrow().set_import_hash(import_hash);
+                }
+                if let Some(ref build_dep_hash) = evt.build_dep_hash {
+                    db_evt.reborrow().set_build_dep_hash(build_dep_hash);
+                }
+            }
+            ChangeEvent::Remove(id) => {
+                value.init_remove_event().init_id().set_id(&id.0);
+            }
+            ChangeEvent::PathRemove(path) => {
+                value
+                    .init_path_remove_event()
+                    .set_path(path.to_string_lossy().as_bytes());
+            }
+            ChangeEvent::PathUpdate(path) => {
+                value
+                    .init_path_update_event()
+                    .set_path(path.to_string_lossy().as_bytes());
+            }
+        }
+    }
+    let mut value_bytes = Vec::new();
+    capnp::serialize::write_message(&mut value_bytes, &value_builder)
+        .expect("capnp: failed to serialize message");
+    conn.execute(
+        "UPDATE asset_changes SET value = ?1 WHERE seq = ?2",
+        rusqlite::params![value_bytes, seq as i64],
+    )?;
+
     Ok(())
 }
 
+/// Set all build deps for an asset. Replaces existing deps.
+fn set_build_deps(conn: &Connection, asset_id: &AssetUuid, deps: &[AssetRef]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM build_deps WHERE asset_id = ?1",
+        rusqlite::params![asset_id.0.as_ref()],
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO build_deps (asset_id, dep_id) VALUES (?1, ?2)",
+    )?;
+    for dep in deps {
+        if let AssetRef::Uuid(dep_uuid) = dep {
+            stmt.execute(rusqlite::params![
+                asset_id.0.as_ref(),
+                dep_uuid.0.as_ref()
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// Reverse lookup: get all asset_ids that depend on `dep_id`.
+fn get_build_dep_dependees(conn: &Connection, dep_id: &AssetUuid) -> Result<Vec<AssetUuid>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT asset_id FROM build_deps WHERE dep_id = ?1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![dep_id.0.as_ref()])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        if let Some(uuid) = utils::uuid_from_slice(&id_bytes) {
+            result.push(uuid);
+        }
+    }
+    Ok(result)
+}
+
 impl AssetHub {
-    pub fn new(db: Arc<Environment>) -> Result<AssetHub> {
+    pub fn new(_db: Arc<crate::db::Database>) -> Result<AssetHub> {
         Ok(AssetHub {
-            tables: AssetHubTables {
-                asset_metadata: db
-                    .create_db(Some("asset_metadata"), lmdb::DatabaseFlags::default())?,
-                build_dep_reverse: db
-                    .create_db(Some("build_dep_reverse"), lmdb::DatabaseFlags::default())?,
-                asset_changes: db
-                    .create_db(Some("asset_changes"), lmdb::DatabaseFlags::INTEGER_KEY)?,
-            },
             id_gen: AtomicU64::new(1),
             listeners: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn get_asset_metadata_iter<'a, V: DBTransaction<'a, T>, T: lmdb::Transaction + 'a>(
+    pub fn get_all_asset_metadata(
         &self,
-        txn: &'a V,
-    ) -> Result<lmdb::RoCursor<'a>> {
-        let cursor = txn.open_ro_cursor(self.tables.asset_metadata)?;
-        Ok(cursor)
+        conn: &Connection,
+    ) -> Result<Vec<OwnedMessageReader<asset_metadata::Owned>>> {
+        let rows = queries::iter_all::<asset_metadata::Owned>(conn, TABLE_ASSET_METADATA)?;
+        Ok(rows.into_iter().map(|(_, v)| v).collect())
     }
 
-    pub fn get_asset_metadata<'a, V: DBTransaction<'a, T>, T: lmdb::Transaction + 'a>(
+    pub fn get_asset_metadata(
         &self,
-        txn: &'a V,
+        conn: &Connection,
         id: &AssetUuid,
-    ) -> Option<MessageReader<'a, asset_metadata::Owned>> {
-        txn.get::<asset_metadata::Owned, _>(self.tables.asset_metadata, &id)
+    ) -> Option<OwnedMessageReader<asset_metadata::Owned>> {
+        queries::get_capnp::<asset_metadata::Owned>(conn, TABLE_ASSET_METADATA, &id.0)
             .expect("db: failed to get asset_metadata")
     }
 
-    pub fn get_build_deps_reverse<'a, V: DBTransaction<'a, T>, T: lmdb::Transaction + 'a>(
-        &self,
-        txn: &'a V,
-        id: &AssetUuid,
-    ) -> Result<Option<MessageReader<'a, data::asset_uuid_list::Owned>>> {
-        txn.get::<data::asset_uuid_list::Owned, _>(self.tables.build_dep_reverse, &id)
-    }
-
-    fn put_build_deps_reverse(
-        &self,
-        txn: &mut RwTransaction<'_>,
-        id: &AssetUuid,
-        dependees: Vec<AssetUuid>,
-    ) -> Result<()> {
-        let mut value_builder = capnp::message::Builder::new_default();
-        let mut value = value_builder.init_root::<data::asset_uuid_list::Builder<'_>>();
-        let mut list = value.reborrow().init_list(dependees.len() as u32);
-        for (idx, uuid) in dependees.iter().enumerate() {
-            list.reborrow().get(idx as u32).set_id(&uuid.0);
-        }
-        txn.put(self.tables.build_dep_reverse, &id, &value_builder)?;
-        Ok(())
-    }
-
-    // Writes the asset metadata to the DB. For any build dependency, we need to update the
-    // build_dep_reverse table. If there was already an asset metadata stored, we walk through the
-    // old asset metadata's build dependencies to remove the asset ID from the reverse dependency list.
-    // Then we walk through the new asset metadata's build dependencies and the asset ID to the
-    // reverse depenency list.
+    // Writes the asset metadata to the DB. For any build dependency, we update the
+    // build_deps table. The indexed reverse lookup replaces the old blob-based reverse index.
     pub fn update_asset(
         &self,
-        txn: &mut RwTransaction<'_>,
+        txn: &mut RwTransaction,
         metadata: &AssetMetadata,
         source: data::AssetSource,
         change_batch: &mut ChangeBatch,
     ) -> Result<()> {
-        let existing_metadata: Option<MessageReader<'_, asset_metadata::Owned>> =
-            txn.get(self.tables.asset_metadata, &metadata.id)?;
+        let conn = txn.conn();
+        let existing_metadata: Option<OwnedMessageReader<asset_metadata::Owned>> =
+            queries::get_capnp(conn, TABLE_ASSET_METADATA, &metadata.id.0)?;
         let new_metadata = build_asset_metadata_message::<&[u8; 8]>(metadata, source);
-        let mut deps_to_delete = Vec::new();
-        let mut deps_to_add = Vec::new();
         let mut artifact_changed = true;
         if let Some(artifact_metadata) = &metadata.artifact {
             if let Some(existing_metadata) = existing_metadata {
                 let existing_metadata = existing_metadata.get()?;
                 let latest_artifact = existing_metadata.get_latest_artifact();
-                let mut existing_deps = HashSet::new();
                 if let latest_artifact::Artifact(Ok(artifact)) = latest_artifact.which()? {
-                    // We have an old artifact and new artifact, determine the dependencies that no
-                    // longer exist - we need to remove this asset from their reverse deps list.
                     artifact_changed =
                         artifact_metadata.id.0.to_le_bytes() != artifact.get_hash()?;
-                    for dep in artifact.get_build_deps()? {
-                        let dep = *parse_db_asset_ref(&dep).expect_uuid();
-                        existing_deps.insert(dep);
-                        if !artifact_metadata.build_deps.contains(&AssetRef::Uuid(dep)) {
-                            deps_to_delete.push(dep);
-                        }
-                    }
                 }
-                // Determine the dependencies that are new - we need to add this asset id to their
-                // reverse dependency list
-                for dep in artifact_metadata.build_deps.iter() {
-                    if !existing_deps.contains(dep.expect_uuid()) {
-                        deps_to_add.push(dep);
-                    }
-                }
-            } else {
-                // There was no existing artifact, so we just add this asset id to all build deps
-                // reverse dependency lists
-                deps_to_add.extend(&artifact_metadata.build_deps);
             }
+            // Simply replace all deps for this asset — the indexed table handles reverse lookups
+            set_build_deps(
+                conn,
+                &metadata.id,
+                &artifact_metadata.build_deps,
+            )?;
         }
-        for dep in deps_to_add {
-            let mut dependees = Vec::new();
-            // Get the dependees that already are stored
-            if let Some(existing_list) = self.get_build_deps_reverse(txn, dep.expect_uuid())? {
-                for uuid in existing_list.get()?.get_list()? {
-                    let uuid = utils::uuid_from_slice(uuid.get_id()?).ok_or(Error::UuidLength)?;
-                    dependees.push(uuid);
-                }
-            }
-            // Add this asset to the list and store
-            dependees.push(metadata.id);
-            self.put_build_deps_reverse(txn, dep.expect_uuid(), dependees)?;
-        }
-        for dep in deps_to_delete {
-            // Get the dependees that already are stored
-            let mut dependees = Vec::new();
-            if let Some(existing_list) = self.get_build_deps_reverse(txn, &dep)? {
-                for uuid in existing_list.get()?.get_list()? {
-                    let uuid = utils::uuid_from_slice(uuid.get_id()?).ok_or(Error::UuidLength)?;
-                    dependees.push(uuid);
-                }
-            }
-            // Remove this asset from the list and store (or delete the key if the list is empty)
-            dependees
-                .iter()
-                .position(|x| x == &metadata.id)
-                .map(|i| dependees.swap_remove(i));
-            if dependees.is_empty() {
-                txn.delete(self.tables.build_dep_reverse, &dep)?;
-            } else {
-                self.put_build_deps_reverse(txn, &dep, dependees)?;
-            }
-        }
-        // Insert the asset and add a the asset UUID to the changes list if the new hash doesn't match the old
-        txn.put(self.tables.asset_metadata, &metadata.id, &new_metadata)?;
+        // Insert the asset metadata
+        queries::put_capnp(conn, TABLE_ASSET_METADATA, &metadata.id.0, &new_metadata)?;
+        txn.dirty = true;
         if artifact_changed {
             change_batch.content_changes.push(metadata.id);
         }
@@ -286,55 +270,28 @@ impl AssetHub {
 
     pub fn remove_asset(
         &self,
-        txn: &mut RwTransaction<'_>,
+        txn: &mut RwTransaction,
         id: &AssetUuid,
         change_batch: &mut ChangeBatch,
     ) -> Result<()> {
-        let metadata = self.get_asset_metadata(txn, id);
-        let mut deps_to_delete = Vec::new();
-        if let Some(metadata) = metadata {
-            let metadata = metadata.get()?;
-            if let latest_artifact::Artifact(Ok(artifact)) =
-                metadata.get_latest_artifact().which()?
-            {
-                for dep in artifact.get_build_deps()? {
-                    deps_to_delete.push(*parse_db_asset_ref(&dep).expect_uuid());
-                }
-            }
-        }
+        let conn = txn.conn();
+        // Clean up all build deps for this asset
+        conn.execute(
+            "DELETE FROM build_deps WHERE asset_id = ?1",
+            rusqlite::params![id.0.as_ref()],
+        )?;
         // Delete this asset's metadata
-        if txn.delete(self.tables.asset_metadata, &id)? {
+        if queries::delete(conn, TABLE_ASSET_METADATA, &id.0)? {
             change_batch.content_changes.push(*id);
         }
-        // For each of the stored asset metadata's dependencies, we need to remove the asset ID we
-        // are removing from their reverse dependency lists
-        for dep in deps_to_delete {
-            // Get the existing dependencies
-            let mut dependees = Vec::new();
-            if let Some(existing_list) = self.get_build_deps_reverse(txn, &dep)? {
-                for uuid in existing_list.get()?.get_list()? {
-                    let uuid = utils::uuid_from_slice(uuid.get_id()?).ok_or(Error::UuidLength)?;
-                    dependees.push(uuid);
-                }
-            }
-            // Remove this asset from the list and store (or delete the key if the list is empty)
-            dependees
-                .iter()
-                .position(|x| x == id)
-                .map(|i| dependees.swap_remove(i));
-            if dependees.is_empty() {
-                txn.delete(self.tables.build_dep_reverse, &dep)?;
-            } else {
-                self.put_build_deps_reverse(txn, &dep, dependees)?;
-            }
-        }
+        txn.dirty = true;
         Ok(())
     }
 
     // Adds a PathRemove ChangeEvent to the batch
     pub fn remove_path(
         &self,
-        _txn: &mut RwTransaction<'_>,
+        _txn: &mut RwTransaction,
         relative_path: &Path,
         change_batch: &mut ChangeBatch,
     ) -> Result<()> {
@@ -347,7 +304,7 @@ impl AssetHub {
     // Adds a PathUpdate ChangeEvent to the batch
     pub fn update_path(
         &self,
-        _txn: &mut RwTransaction<'_>,
+        _txn: &mut RwTransaction,
         relative_path: &Path,
         change_batch: &mut ChangeBatch,
     ) -> Result<()> {
@@ -357,20 +314,13 @@ impl AssetHub {
         Ok(())
     }
 
-    // This is usually called from FileAssetSource::process_asset_metadata, after calling
-    // process_metadata_changes, which will call update_path/remove_path and
-    // update_asset/remove_asset. First, we iterate all the asset IDs that changed and use the
-    // build_deps_reverse table to find all the "downstream" assets that may be affected by the
-    // imported changes. We do the same with those downstream assets, making this a "deep" search
-    // of the dependency tree.
+    // Deep search of dependency tree to find all affected assets
     pub fn add_changes(
         &self,
-        txn: &mut RwTransaction<'_>,
+        txn: &mut RwTransaction,
         change_batch: ChangeBatch,
     ) -> Result<bool> {
-        // TODO find the set of all changed assets, check the build dependency index and emit changes for all
-        // assets that have changed and all the assets where the build_dep_hash has changed.
-        // dedupe change events
+        let conn = txn.conn();
         let mut to_check = VecDeque::new();
         let mut affected_assets = HashSet::new();
         let mut events = Vec::new();
@@ -380,42 +330,35 @@ impl AssetHub {
         if !to_check.is_empty() {
             log::info!("{} assets changed content", to_check.len());
         }
-        // This find all the "downstream" assets from the changed assets that may be affected by
-        // newly imported changes
+        // Find all "downstream" assets from the changed assets
         while !to_check.is_empty() {
             let id = to_check.pop_front().unwrap();
             if affected_assets.insert(id) {
-                if let Some(dependees) = self.get_build_deps_reverse(txn, &id)? {
-                    for dependee in dependees.get()?.get_list()? {
-                        let uuid =
-                            utils::uuid_from_slice(dependee.get_id()?).ok_or(Error::UuidLength)?;
-                        to_check.push_back(uuid);
-                    }
+                let dependees = get_build_dep_dependees(conn, &id)?;
+                for dependee in dependees {
+                    to_check.push_back(dependee);
                 }
             }
         }
         for asset in affected_assets {
-            let metadata = self.get_asset_metadata(txn, &asset);
+            let metadata = self.get_asset_metadata(conn, &asset);
             if let Some(metadata) = metadata {
                 let metadata = metadata.get()?;
                 let mut dependency_graph = HashMap::new();
                 let mut to_check = VecDeque::new();
-                // This is a deep search "upstream" to find all the assets that may have affected this asset,
-                // and a hash of the associated import artifact
+                // Deep search "upstream" to find all assets that may have affected this asset
                 to_check.push_back(asset);
                 while !to_check.is_empty() {
                     let id = to_check.pop_front().unwrap();
                     if dependency_graph.contains_key(&id) {
                         continue;
                     }
-                    let metadata = self.get_asset_metadata(txn, &id);
+                    let metadata = self.get_asset_metadata(conn, &id);
                     if let Some(metadata) = metadata {
                         let metadata = metadata.get()?;
                         if let latest_artifact::Artifact(Ok(artifact)) =
                             metadata.get_latest_artifact().which()?
                         {
-                            // The asset has an artifact, put all the upstream dependencies into the
-                            // list.
                             dependency_graph.insert(asset, Vec::from(artifact.get_hash()?));
                             for dep in artifact.get_build_deps()? {
                                 to_check.push_back(*parse_db_asset_ref(&dep).expect_uuid());
@@ -423,8 +366,7 @@ impl AssetHub {
                         }
                     }
                 }
-                // Sort the list of upstream dependencies and combine the hashes of all their import
-                // artifacts to a new hash
+                // Sort and combine hashes
                 let mut sorted_assets: Vec<(&AssetUuid, &Vec<u8>)> =
                     dependency_graph.iter().collect();
                 sorted_assets.sort_by(|(x, _), (y, _)| {
@@ -457,36 +399,53 @@ impl AssetHub {
             log::info!("{} asset events generated", events.len());
         }
         for event in events.iter() {
-            add_asset_changelog_entry(&self.tables, txn, event)?;
+            add_asset_changelog_entry(conn, event)?;
         }
         for event in change_batch.path_events.iter() {
-            add_asset_changelog_entry(&self.tables, txn, event)?;
+            add_asset_changelog_entry(conn, event)?;
         }
+        txn.dirty = true;
         Ok(!events.is_empty())
     }
 
     // Get the key of the last asset change entry
-    pub fn get_latest_asset_change<'a, V: DBTransaction<'a, T>, T: lmdb::Transaction + 'a>(
+    pub fn get_latest_asset_change(
         &self,
-        txn: &'a V,
+        conn: &Connection,
     ) -> Result<u64> {
-        let mut last_seq: u64 = 0;
-        let last_element = txn
-            .open_ro_cursor(self.tables.asset_changes)?
-            .capnp_iter_start()
-            .last();
-        if let Some((key, _)) = last_element {
-            last_seq = u64::from_le_bytes(utils::make_array(key));
-        }
-        Ok(last_seq)
+        let mut stmt = conn.prepare_cached(
+            "SELECT COALESCE(MAX(seq), 0) FROM asset_changes",
+        )?;
+        let seq: u64 = stmt.query_row([], |row| row.get(0))?;
+        Ok(seq)
     }
 
-    pub fn get_asset_changes_iter<'a, V: DBTransaction<'a, T>, T: lmdb::Transaction + 'a>(
+    pub fn get_asset_changes(
         &self,
-        txn: &'a V,
-    ) -> Result<lmdb::RoCursor<'a>> {
-        let cursor = txn.open_ro_cursor(self.tables.asset_changes)?;
-        Ok(cursor)
+        conn: &Connection,
+        start: u64,
+        count: usize,
+    ) -> Result<Vec<(u64, OwnedMessageReader<asset_change_log_entry::Owned>)>> {
+        let limit = if count == 0 {
+            i64::MAX
+        } else {
+            count as i64
+        };
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, value FROM asset_changes WHERE seq >= ?1 ORDER BY seq LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![start as i64, limit])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let seq: u64 = row.get(0)?;
+            let value: Vec<u8> = row.get(1)?;
+            let reader = capnp::serialize::read_message(
+                &mut value.as_slice(),
+                distill_schema::default_capnp_reader_options(),
+            )?;
+            result.push((seq, reader.into_typed::<asset_change_log_entry::Owned>()));
+        }
+        Ok(result)
     }
 
     pub fn notify_listeners(&self) {

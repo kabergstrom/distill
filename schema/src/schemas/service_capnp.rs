@@ -736,7 +736,7 @@ pub mod asset_hub {
         pub client: ::capnp::capability::Client,
     }
     impl ::capnp::capability::FromClientHook for Client {
-        fn new(hook: Box<dyn (::capnp::private::capability::ClientHook)>) -> Client {
+        fn new(hook: Box<dyn ::capnp::private::capability::ClientHook>) -> Client {
             Client {
                 client: ::capnp::capability::Client::new(hook),
             }
@@ -985,7 +985,7 @@ pub mod asset_hub {
             pub client: ::capnp::capability::Client,
         }
         impl ::capnp::capability::FromClientHook for Client {
-            fn new(hook: Box<dyn (::capnp::private::capability::ClientHook)>) -> Client {
+            fn new(hook: Box<dyn ::capnp::private::capability::ClientHook>) -> Client {
                 Client {
                     client: ::capnp::capability::Client::new(hook),
                 }
@@ -6455,7 +6455,7 @@ pub mod asset_hub {
             pub client: ::capnp::capability::Client,
         }
         impl ::capnp::capability::FromClientHook for Client {
-            fn new(hook: Box<dyn (::capnp::private::capability::ClientHook)>) -> Client {
+            fn new(hook: Box<dyn ::capnp::private::capability::ClientHook>) -> Client {
                 Client {
                     client: ::capnp::capability::Client::new(hook),
                 }

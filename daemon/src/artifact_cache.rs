@@ -2,88 +2,63 @@ use std::sync::Arc;
 
 use distill_importer::SerializedAsset;
 use distill_schema::{build_artifact_metadata, data::artifact};
+use rusqlite::Connection;
 
 use crate::{
-    capnp_db::{DBTransaction, Environment, MessageReader, RoTransaction, RwTransaction},
+    db::{queries, Database, OwnedMessageReader, RoTransaction, RwTransaction},
     error::Result,
 };
 
-pub struct ArtifactCache {
-    db: Arc<Environment>,
-    tables: ArtifactCacheTables,
-}
+const TABLE_HASH_TO_ARTIFACT: &str = "hash_to_artifact";
 
-struct ArtifactCacheTables {
-    /// Maps a hash to the serialized artifact data
-    /// u64 -> Artifact
-    hash_to_artifact: lmdb::Database,
+pub struct ArtifactCache {
+    db: Arc<Database>,
 }
 
 impl ArtifactCache {
-    pub fn new(db: &Arc<Environment>) -> Result<ArtifactCache> {
-        Ok(ArtifactCache {
-            db: db.clone(),
-            tables: ArtifactCacheTables {
-                hash_to_artifact: db.create_db(
-                    Some("ArtifactCache::hash_to_artifact"),
-                    lmdb::DatabaseFlags::INTEGER_KEY,
-                )?,
-            },
-        })
+    pub fn new(db: &Arc<Database>) -> Result<ArtifactCache> {
+        Ok(ArtifactCache { db: db.clone() })
     }
 
     // TODO: invalidate cache
     #[allow(dead_code)]
     pub async fn delete(&self, hash: u64) -> Result<bool> {
-        let mut txn = self.db.rw_txn().await?;
-        Ok(txn
-            .delete(self.tables.hash_to_artifact, &hash.to_le_bytes())
-            .expect("db: Failed to delete entry from hash_to_artifact table"))
+        let txn = self.db.rw_txn().await?;
+        let result = queries::delete(txn.conn(), TABLE_HASH_TO_ARTIFACT, &hash.to_le_bytes())?;
+        Ok(result)
     }
 
     pub fn insert<T: AsRef<[u8]>>(
         &self,
-        txn: &mut RwTransaction<'_>,
+        txn: &mut RwTransaction,
         artifact: &SerializedAsset<T>,
     ) {
-        txn.put(
-            self.tables.hash_to_artifact,
+        queries::put_capnp(
+            txn.conn(),
+            TABLE_HASH_TO_ARTIFACT,
             &artifact.metadata.id.0.to_le_bytes(),
             &build_artifact_message(artifact),
         )
-        .expect("lmdb: failed to put path ref");
+        .expect("sqlite: failed to put artifact");
+        txn.dirty = true;
     }
 
-    pub async fn ro_txn(&self) -> Result<RoTransaction<'_>> {
+    pub async fn ro_txn(&self) -> Result<RoTransaction> {
         self.db.ro_txn().await
     }
 
-    pub async fn rw_txn(&self) -> Result<RwTransaction<'_>> {
+    pub async fn rw_txn(&self) -> Result<RwTransaction> {
         self.db.rw_txn().await
     }
 
-    pub async fn get<'a, V: DBTransaction<'a, T>, T: lmdb::Transaction + 'a>(
+    pub fn get(
         &self,
-        txn: &'a V,
+        conn: &Connection,
         hash: u64,
-    ) -> Option<MessageReader<'a, artifact::Owned>> {
-        txn.get::<artifact::Owned, _>(self.tables.hash_to_artifact, &hash.to_le_bytes())
+    ) -> Option<OwnedMessageReader<artifact::Owned>> {
+        queries::get_capnp::<artifact::Owned>(conn, TABLE_HASH_TO_ARTIFACT, &hash.to_le_bytes())
             .expect("db: Failed to get entry from hash_to_artifact table")
     }
-
-    // pub fn get_or_insert_with<'a, T: AsRef<[u8]>>(
-    //     &self,
-    //     txn: &'a mut RwTransaction,
-    //     inserter: impl FnOnce() -> SerializedAsset<T>,
-    // ) -> artifact::Reader<'a> {
-    //     match self.get(txn) {
-    //         Some(r) => r,
-    //         None => {
-    //             self.insert(txn, &inserter());
-    //             self.get(txn).expect("Inserted in same transaction")
-    //         }
-    //     }
-    // }
 }
 
 pub(crate) fn build_artifact_message<T: AsRef<[u8]>>(

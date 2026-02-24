@@ -18,7 +18,7 @@ use futures::{channel::mpsc::unbounded, future::FutureExt};
 use std::rc::Rc;
 
 use crate::{
-    artifact_cache::ArtifactCache, asset_hub, asset_hub_service, capnp_db::Environment,
+    artifact_cache::ArtifactCache, asset_hub, asset_hub_service, db::Database,
     error::Result, extension_map::ExtensionMap, file_asset_source, file_tracker::FileTracker,
 };
 
@@ -37,20 +37,7 @@ impl ImporterMap {
     }
 }
 
-struct AssetDaemonTables {
-    /// Contains metadata about the daemon version and settings
-    /// String -> Blob
-    daemon_info: lmdb::Database,
-}
-impl AssetDaemonTables {
-    fn new(db: &Environment) -> Result<Self> {
-        Ok(Self {
-            daemon_info: db.create_db(Some("daemon_info"), lmdb::DatabaseFlags::default())?,
-        })
-    }
-}
-
-const DAEMON_VERSION: u32 = 2;
+const DAEMON_VERSION: u32 = 3;
 pub struct AssetDaemon {
     pub db_dir: PathBuf,
     pub address: SocketAddr,
@@ -203,14 +190,7 @@ impl AssetDaemon {
             let _ = fs::create_dir_all(dir);
         }
 
-        let asset_db = match Environment::new(&self.db_dir) {
-            Ok(db) => db,
-            Err(crate::Error::Lmdb(lmdb::Error::Other(1455))) => {
-                Environment::with_map_size(&self.db_dir, 1 << 31)
-                    .expect("failed to create asset db")
-            }
-            Err(err) => panic!("failed to create asset db: {:?}", err),
-        };
+        let asset_db = Database::new(&self.db_dir).expect("failed to create asset db");
         let asset_db = Arc::new(asset_db);
 
         try_clear_db(&asset_db, self.clear_db_on_start)
@@ -229,18 +209,12 @@ impl AssetDaemon {
 
         let importers = Arc::new(self.importers);
         let ctxs = Arc::new(self.importer_contexts);
-        let cache_db = match Environment::new(&cache_dir) {
-            Ok(db) => db,
-            Err(crate::Error::Lmdb(lmdb::Error::Other(1455))) => {
-                Environment::with_map_size(&cache_dir, 1 << 31).expect("failed to create cache db")
-            }
-            Err(err) => panic!("failed to create cache db: {:?}", err),
-        };
+        let cache_db = Database::new(&cache_dir).expect("failed to create cache db");
         let cache_db = Arc::new(cache_db);
         try_clear_db(&cache_db, self.clear_db_on_start)
             .await
             .expect("failed to clear cache db");
-        set_db_version(&asset_db)
+        set_db_version(&cache_db)
             .await
             .expect("failed to check daemon version in cache db");
         let artifact_cache =
@@ -304,10 +278,6 @@ impl AssetDaemon {
                     Ok(_) => {
                         log::warn!("Shutting Down!");
                         shutdown_tracker.stop().await;
-                        // shutdown_service.stop().await;
-                        // shutdown_asset_source.stop().await;
-                        // any value on this channel means shutdown
-                        // TODO: better shutdown
                         return;
                     }
                     Err(_) => continue,
@@ -317,63 +287,66 @@ impl AssetDaemon {
     }
 }
 
+/// All tables to clear when the DB version doesn't match
+const ALL_TABLES: &[&str] = &[
+    "source_files",
+    "dirty_files",
+    "asset_metadata",
+    "path_to_metadata",
+    "asset_id_to_path",
+    "daemon_info",
+    "hash_to_artifact",
+    "build_deps",
+    "path_refs",
+    "rename_file_events",
+    "asset_changes",
+];
+
 #[allow(clippy::string_lit_as_bytes)]
-async fn try_clear_db(env: &Environment, force_clear_db: bool) -> Result<()> {
-    use crate::capnp_db::DBTransaction;
-    let tables = AssetDaemonTables::new(env).expect("failed to create AssetDaemon tables");
-    let txn = env.ro_txn().await?;
+async fn try_clear_db(db: &Database, force_clear_db: bool) -> Result<()> {
+    use crate::db::queries;
+    let txn = db.ro_txn().await?;
     let info_key = "daemon_info".as_bytes();
 
     let mut clear_db = true;
-    let daemon_info = txn.get::<data::daemon_info::Owned, &[u8]>(tables.daemon_info, &info_key)?;
+    let daemon_info =
+        queries::get_capnp::<data::daemon_info::Owned>(txn.conn(), "daemon_info", info_key)?;
     if let Some(info) = daemon_info {
         let info = info.get()?;
         if info.get_version() == DAEMON_VERSION {
             clear_db = false;
         }
     }
+    drop(txn);
 
     if clear_db || force_clear_db {
-        let unnamed_db = env
-            .create_db(None, lmdb::DatabaseFlags::default())
-            .expect("failed to open unnamed DB when checking daemon info");
-        use lmdb::Cursor;
-        let mut databases = Vec::new();
-        for iter_result in txn
-            .open_ro_cursor(unnamed_db)
-            .expect("failed to create cursor when checking daemon info")
-            .iter_start()
-        {
-            let (key, _) = iter_result
-                .expect("failed to start iteration for cursor when checking daemon info");
-            let db_name = std::str::from_utf8(key).expect("failed to parse db name");
-            databases.push(
-                env.create_db(Some(db_name), lmdb::DatabaseFlags::default())
-                    .unwrap_or_else(|err| {
-                        panic!("failed to open db with name {}: {}", db_name, err)
-                    }),
-            );
+        let mut txn = db.rw_txn().await?;
+        for table in ALL_TABLES {
+            queries::clear_table(txn.conn(), table)?;
         }
-        let mut txn = env.rw_txn().await?;
-        for db in databases {
-            txn.clear_db(db).expect("failed to clear db");
-        }
+        // Also reset the autoincrement counters
+        txn.conn().execute(
+            "DELETE FROM sqlite_sequence WHERE name IN ('rename_file_events', 'asset_changes')",
+            [],
+        ).ok(); // sqlite_sequence may not exist if no inserts happened yet
+        txn.dirty = true;
         txn.commit()?;
     }
     Ok(())
 }
 
 #[allow(clippy::string_lit_as_bytes)]
-async fn set_db_version(env: &Environment) -> Result<()> {
+async fn set_db_version(db: &Database) -> Result<()> {
+    use crate::db::queries;
     let info_key = "daemon_info".as_bytes();
-    let tables = AssetDaemonTables::new(env).expect("failed to create AssetDaemon tables");
-    let mut txn = env.rw_txn().await?;
+    let mut txn = db.rw_txn().await?;
     let mut value_builder = capnp::message::Builder::new_default();
     {
         let mut m = value_builder.init_root::<data::daemon_info::Builder<'_>>();
         m.set_version(DAEMON_VERSION);
     }
-    txn.put(tables.daemon_info, &info_key, &value_builder)?;
+    queries::put_capnp(txn.conn(), "daemon_info", info_key, &value_builder)?;
+    txn.dirty = true;
     txn.commit()?;
 
     Ok(())
