@@ -46,7 +46,9 @@ struct FileTrackerTables {
 }
 #[derive(Clone, Debug)]
 pub enum FileTrackerEvent {
-    // Sent when we finish scanning all directories on startup, meaning we can drop any data in the
+    // Sent when we start scanning a directory
+    ScanStarted(PathBuf),
+    // Sent when we finish scanning a directroy on startup, meaning we can drop any data in the
     // db that wasn't found during the scan
     ScanFinished(PathBuf),
     // Debounced event that indicates there are dirty files ready for processing
@@ -358,9 +360,10 @@ mod events {
             FileEvent::ScanStart(path) => {
                 debug!("scan start: {}", path.to_string_lossy());
                 scan_stack.push(ScanContext {
-                    path,
+                    path: path.clone(),
                     files: HashMap::new(),
                 });
+                return Ok(Some(FileTrackerEvent::ScanStarted(path)));
             }
             FileEvent::ScanEnd(path, watched_dirs) => {
                 // When we finish a scan, we know which files exist in the subdirectories of the

@@ -1520,6 +1520,7 @@ impl FileAssetSource {
         while let Some(evt) = rx.next().await {
             log::debug!("Received file tracker event {:?}", evt);
             match evt {
+                FileTrackerEvent::ScanStarted(_path) => {}
                 // It's possible when we start that code changes to the importer require re-importing
                 // assets. (For example, if we bump the importer version number). The start message
                 // indicates that all directories have been scanned.
@@ -1535,6 +1536,7 @@ impl FileAssetSource {
                 // we should process a batch of them all at once
                 FileTrackerEvent::Update => {
                     update = true;
+                    println!("UPDATE DISTILL");
                     if unscanned_dirs.is_empty() {
                         self.handle_update().await;
                     }
