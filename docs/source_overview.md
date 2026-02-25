@@ -3,8 +3,8 @@
 ### DirWatcher
 Provides filesystem events with cross-platform support using the glorious crate [notify](https://docs.rs/notify/4.0.6/notify/). DirWatcher follows symlinks and supports watching multiple directories, providing events through a crossbeam_channel.
 
-### capnp_db
-Layers capnproto serialization on top of LMDB for zero-copy reads and a nicer API for using capnproto messages as keys and/or values.
+### db
+Provides SQLite-backed persistence for the daemon. Capnp serialization is used for blob values in key-value tables. Forward-relationship tables with SQL indexes replace hand-rolled reverse indexes.
 
 ### FileTracker
 Receives filesystem events from DirWatcher and indexes the last seen filesystem state in a DB to provide a consistent view. Can provide real change events based on filesystem modification time and length even if a change was performed when the daemon was not active. It also maintains a set of "dirty files" to be consumed by FileAssetSource to ensure that changes always can be processed, even in the case of a crash.

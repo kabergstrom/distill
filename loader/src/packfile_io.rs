@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use capnp::serialize::SliceSegments;
+use capnp::serialize::BufferSegments;
 use distill_core::{utils::make_array, AssetMetadata, AssetRef, AssetUuid};
 use distill_schema::pack::pack_file;
 use thread_local::ThreadLocal;
@@ -27,7 +27,7 @@ trait PackfileMessageReader: Send + Sync {
 struct PackfileMessageReaderFile {
     file: ManuallyDrop<File>,
     mmap: ManuallyDrop<Mmap>,
-    message_reader: ManuallyDrop<ThreadLocal<capnp::message::Reader<SliceSegments<'static>>>>,
+    message_reader: ManuallyDrop<ThreadLocal<capnp::message::Reader<BufferSegments<&'static [u8]>>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -74,7 +74,7 @@ impl Drop for PackfileMessageReaderFile {
 /// The buffer must be 8-byte aligned, or the unaligned feature in the capnp crate must be enabled
 struct PackfileMessageReaderBuffer {
     data: &'static [u8],
-    message_reader: ManuallyDrop<ThreadLocal<capnp::message::Reader<SliceSegments<'static>>>>,
+    message_reader: ManuallyDrop<ThreadLocal<capnp::message::Reader<BufferSegments<&'static [u8]>>>>,
 }
 
 impl PackfileMessageReaderBuffer {
@@ -108,7 +108,7 @@ impl Drop for PackfileMessageReaderBuffer {
 /// `PackfileMessageReaderBuffer`
 fn capnp_reader_from_slice<'a>(
     mut slice: &mut &'a [u8],
-) -> Result<capnp::message::Reader<SliceSegments<'a>>, capnp::Error> {
+) -> Result<capnp::message::Reader<BufferSegments<&'a [u8]>>, capnp::Error> {
     capnp::serialize::read_message_from_flat_slice(
         &mut slice,
         distill_schema::default_capnp_reader_options_unbounded(),

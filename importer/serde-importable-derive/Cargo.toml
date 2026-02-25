@@ -10,5 +10,5 @@ description = "Proc macro for SerdeImportables in `distill`."
 proc-macro = true
 
 [dependencies]
-syn = { version = "1.0.58", features = ["derive"] }
+syn = { version = "2", features = ["derive"] }
 quote = "1.0.8"

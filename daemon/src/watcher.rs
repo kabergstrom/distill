@@ -3,14 +3,58 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::mpsc::{channel, Receiver, Sender},
-    time::{Duration, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use distill_core::utils::canonicalize_path;
-use notify::{watcher, DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    event::{ModifyKind, RenameMode},
+    Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 
 use crate::error::{Error, Result};
 use futures::channel::mpsc::UnboundedSender;
+
+// Internal filesystem operation, replacing notify v4's DebouncedEvent
+enum FsOp {
+    Create(PathBuf),
+    Write(PathBuf),
+    Rename(PathBuf, PathBuf),
+    Remove(PathBuf),
+    Rescan,
+}
+
+// Message type for the internal channel
+enum WatcherMsg {
+    FsOp(FsOp),
+    Stop,
+}
+
+fn convert_notify_event(event: notify::Event) -> Vec<FsOp> {
+    match event.kind {
+        EventKind::Create(_) => event.paths.into_iter().map(FsOp::Create).collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            if event.paths.len() >= 2 {
+                vec![FsOp::Rename(
+                    event.paths[0].clone(),
+                    event.paths[1].clone(),
+                )]
+            } else {
+                vec![]
+            }
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            event.paths.into_iter().map(FsOp::Remove).collect()
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            event.paths.into_iter().map(FsOp::Create).collect()
+        }
+        EventKind::Modify(_) => event.paths.into_iter().map(FsOp::Write).collect(),
+        EventKind::Remove(_) => event.paths.into_iter().map(FsOp::Remove).collect(),
+        EventKind::Any => event.paths.into_iter().map(FsOp::Create).collect(),
+        EventKind::Access(_) | EventKind::Other => vec![],
+    }
+}
 
 // Wraps the notify crate:
 // - supports symlinks
@@ -33,16 +77,16 @@ pub struct DirWatcher {
     dirs: Vec<PathBuf>,
 
     // Channel for events from the watcher (and we insert events ourselves to indicate shutdown)
-    rx: Receiver<DebouncedEvent>,
-    tx: Sender<DebouncedEvent>,
+    rx: Receiver<WatcherMsg>,
+    tx: Sender<WatcherMsg>,
 
     // The final output of this struct goes here
     asset_tx: UnboundedSender<FileEvent>,
 }
 
-// When dropped, sends an exit "error" message via the same channel we receive messages from notify
+// When dropped, sends a stop message via the same channel we receive messages from notify
 pub struct StopHandle {
-    tx: Sender<DebouncedEvent>,
+    tx: Sender<WatcherMsg>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +126,21 @@ pub(crate) fn file_metadata(metadata: &fs::Metadata) -> FileMetadata {
     }
 }
 
+/// Returns true if the error indicates the path cannot be watched
+/// (doesn't exist, not a file/dir, etc.)
+fn is_not_watchable(err: &Error) -> bool {
+    match err {
+        Error::Notify(e) => matches!(
+            &e.kind,
+            notify::ErrorKind::PathNotFound
+                | notify::ErrorKind::Generic(_)
+                | notify::ErrorKind::Io(_)
+        ),
+        Error::IO(e) => e.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 impl DirWatcher {
     // Starts a watcher running on the given paths
     pub fn from_path_iter<'a, T>(paths: T, chan: UnboundedSender<FileEvent>) -> Result<DirWatcher>
@@ -89,8 +148,23 @@ impl DirWatcher {
         T: IntoIterator<Item = &'a Path>,
     {
         let (tx, rx) = channel();
+        let tx_clone = tx.clone();
+        let watcher = RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| match res {
+                Ok(event) => {
+                    for op in convert_notify_event(event) {
+                        let _ = tx_clone.send(WatcherMsg::FsOp(op));
+                    }
+                }
+                Err(_) => {
+                    let _ = tx_clone.send(WatcherMsg::FsOp(FsOp::Rescan));
+                }
+            },
+            Config::default(),
+        )?;
+
         let mut asset_watcher = DirWatcher {
-            watcher: watcher(tx.clone(), Duration::from_millis(300))?,
+            watcher,
             symlink_map: HashMap::new(),
             watch_refs: HashMap::new(),
             dirs: Vec::new(),
@@ -120,10 +194,10 @@ impl DirWatcher {
         }
     }
 
-    // Visit all files, call handle_notify_event() passing the event created by the provided callback
+    // Visit all files, call handle_fs_op() passing the event created by the provided callback
     fn scan_directory<F>(&mut self, dir: &Path, evt_create: &F) -> Result<()>
     where
-        F: Fn(PathBuf) -> DebouncedEvent,
+        F: Fn(PathBuf) -> FsOp,
     {
         let canonical_dir = canonicalize_path(dir);
         self.asset_tx
@@ -138,7 +212,7 @@ impl DirWatcher {
 
     fn scan_directory_recurse<F>(&mut self, dir: &Path, evt_create: &F) -> Result<()>
     where
-        F: Fn(PathBuf) -> DebouncedEvent,
+        F: Fn(PathBuf) -> FsOp,
     {
         match fs::read_dir(dir) {
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -149,7 +223,7 @@ impl DirWatcher {
                         Err(ref e) if e.kind() == io::ErrorKind::NotFound => continue,
                         Err(e) => return Err(Error::IO(e)),
                         Ok(entry) => {
-                            let evt = self.handle_notify_event(evt_create(entry.path()), true)?;
+                            let evt = self.handle_fs_op(evt_create(entry.path()), true)?;
                             if let Some(evt) = evt {
                                 self.asset_tx
                                     .unbounded_send(evt)
@@ -176,7 +250,7 @@ impl DirWatcher {
     pub fn run(&mut self) {
         // Emit a Create for every path recursively
         for dir in &self.dirs.clone() {
-            if let Err(err) = self.scan_directory(dir, &|path| DebouncedEvent::Create(path)) {
+            if let Err(err) = self.scan_directory(dir, &FsOp::Create) {
                 self.asset_tx
                     .unbounded_send(FileEvent::FileError(err))
                     .expect("Failed to send file error event. Ironic...");
@@ -185,7 +259,7 @@ impl DirWatcher {
 
         loop {
             match self.rx.recv() {
-                Ok(event) => match self.handle_notify_event(event, false) {
+                Ok(WatcherMsg::FsOp(op)) => match self.handle_fs_op(op, false) {
                     // By default, just proxy the event into the channel
                     Ok(maybe_event) => {
                         if let Some(evt) = maybe_event {
@@ -195,11 +269,11 @@ impl DirWatcher {
                     }
                     Err(err) => match err {
                         // If notify cannot assure correct modification events (sometimes due to overflowing a queue,
-                        // may be a limit on the OS) we have to reset to good state bu scanning everything
+                        // may be a limit on the OS) we have to reset to good state by scanning everything
                         Error::RescanRequired => {
                             for dir in &self.dirs.clone() {
                                 if let Err(err) =
-                                    self.scan_directory(dir, &|path| DebouncedEvent::Create(path))
+                                    self.scan_directory(dir, &FsOp::Create)
                                 {
                                     self.asset_tx
                                         .unbounded_send(FileEvent::FileError(err))
@@ -214,6 +288,7 @@ impl DirWatcher {
                             .expect("Failed to send file error event"),
                     },
                 },
+                Ok(WatcherMsg::Stop) => break,
                 Err(_) => {
                     self.asset_tx
                         .unbounded_send(FileEvent::FileError(Error::RecvError))
@@ -279,7 +354,7 @@ impl DirWatcher {
                 match self.unwatch(&to_unwatch) {
                     Ok(unwatched) => {
                         if unwatched {
-                            self.scan_directory(&to_unwatch, &|p| DebouncedEvent::Remove(p))?;
+                            self.scan_directory(&to_unwatch, &FsOp::Remove)?;
                         }
                         self.symlink_map.remove(src);
                         self.asset_tx
@@ -294,29 +369,21 @@ impl DirWatcher {
             }
         }
         if let Some(dst) = dst {
-            let link = fs::read_link(&dst);
+            let link = fs::read_link(dst);
             if let Ok(link_path) = link {
                 let link_path = canonicalize_path(&dst.join(link_path));
                 match self.watch(&link_path) {
                     Ok(watched) => {
                         if watched {
-                            self.scan_directory(&link_path, &|p| DebouncedEvent::Create(p))?;
+                            self.scan_directory(&link_path, &FsOp::Create)?;
                         }
                         self.symlink_map.insert(dst.clone(), link_path.clone());
                         self.asset_tx
                             .unbounded_send(FileEvent::Watch(link_path))
                             .map_err(|_| Error::SendError)?;
                     }
-                    Err(Error::Notify(notify::Error::Generic(text)))
-                        if text == "Input watch path is neither a file nor a directory." =>
-                    {
-                        // skip the symlink if it's not a valid path
-                    }
-                    Err(Error::Notify(notify::Error::PathNotFound)) => {}
-                    Err(Error::IO(err)) | Err(Error::Notify(notify::Error::Io(err)))
-                        if err.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        // skip the symlink if it no longer exists or can't be watched
+                    Err(err) if is_not_watchable(&err) => {
+                        // skip the symlink if it's not a valid path or no longer exists
                     }
                     Err(err) => {
                         return Err(err);
@@ -328,14 +395,14 @@ impl DirWatcher {
         Ok(recognized_symlink)
     }
 
-    // Handles events from notify, and manually triggered from calling scan_directory()
-    fn handle_notify_event(
+    // Handles filesystem operations from notify or from calling scan_directory()
+    fn handle_fs_op(
         &mut self,
-        event: DebouncedEvent,
+        op: FsOp,
         is_scanning: bool,
     ) -> Result<Option<FileEvent>> {
-        match event {
-            DebouncedEvent::Create(path) | DebouncedEvent::Write(path) => {
+        match op {
+            FsOp::Create(path) | FsOp::Write(path) => {
                 let path = canonicalize_path(&path);
                 self.handle_updated_symlink(Option::None, Some(&path))?;
 
@@ -368,7 +435,7 @@ impl DirWatcher {
                     result => result,
                 }
             }
-            DebouncedEvent::Rename(src, dest) => {
+            FsOp::Rename(src, dest) => {
                 let src = canonicalize_path(&src);
                 let dest = canonicalize_path(&dest);
                 self.handle_updated_symlink(Some(&src), Some(&dest))?;
@@ -389,7 +456,7 @@ impl DirWatcher {
                                 let replaced = canonicalize_path(&src.join(
                                     p.strip_prefix(&dest).expect("Failed to strip prefix dir"),
                                 ));
-                                DebouncedEvent::Rename(replaced, p)
+                                FsOp::Rename(replaced, p)
                             })?;
                         }
                         Ok(Some(FileEvent::Renamed(
@@ -400,23 +467,18 @@ impl DirWatcher {
                     }
                 }
             }
-            DebouncedEvent::Remove(path) => {
+            FsOp::Remove(path) => {
                 let path = canonicalize_path(&path);
                 self.handle_updated_symlink(Some(&path), Option::None)?;
                 Ok(Some(FileEvent::Removed(path)))
             }
-            DebouncedEvent::Rescan => Err(Error::RescanRequired),
-            DebouncedEvent::Error(_, _) => Err(Error::Exit),
-            _ => Ok(None),
+            FsOp::Rescan => Err(Error::RescanRequired),
         }
     }
 }
 
 impl Drop for StopHandle {
     fn drop(&mut self) {
-        let _ = self.tx.send(DebouncedEvent::Error(
-            notify::Error::Generic("EXIT".to_string()),
-            Option::None,
-        ));
+        let _ = self.tx.send(WatcherMsg::Stop);
     }
 }

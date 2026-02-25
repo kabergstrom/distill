@@ -10,13 +10,13 @@ publish = false
 [dependencies]
 distill-schema = { version = "=0.0.3", path = "../schema" }
 
-capnp = "0.14.0"
-capnp-rpc = "0.14.0"
+capnp = "0.20"
+capnp-rpc = "0.20"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 uuid = "0.8.2"
 async-trait = "0.1.22"
 crossterm = { version = "0.17", features = ["event-stream"] }
 defer = "0.1.0"
-async-io = "1.4.1"
-async-net = "1.6.0"
+async-io = "2"
+async-net = "2"
 async-executor = "1.4.1"

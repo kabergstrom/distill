@@ -79,13 +79,12 @@ pub struct FileState {
 
 impl std::fmt::Debug for FileState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use capnp::traits::ToU16;
         f.debug_struct("FileState")
             .field("path", &self.path)
             .field("state", &self.state)
             .field("last_modified", &self.last_modified)
             .field("length", &self.length)
-            .field("ty", &self.ty.to_u16())
+            .field("ty", &(self.ty as u16))
             .finish()
     }
 }

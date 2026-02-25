@@ -39,6 +39,7 @@ const DEFAULT_LOGGING_LEVEL: log::LevelFilter = log::LevelFilter::Debug;
 #[cfg(not(debug_assertions))]
 const DEFAULT_LOGGING_LEVEL: log::LevelFilter = log::LevelFilter::Info;
 
+#[cfg(not(feature = "pretty_log"))]
 mod simple_logger {
     use log::{Level, Metadata, Record};
 

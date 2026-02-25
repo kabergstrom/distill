@@ -112,7 +112,7 @@ impl AssetHubSnapshotImpl {
             }
         }
         let mut results_builder = results.get();
-        let assets = results_builder
+        let mut assets = results_builder
             .reborrow()
             .init_assets(metadatas.len() as u32);
         for (idx, metadata) in metadatas.iter().enumerate() {
@@ -158,7 +158,7 @@ impl AssetHubSnapshotImpl {
             }
         }
         let mut results_builder = results.get();
-        let assets = results_builder
+        let mut assets = results_builder
             .reborrow()
             .init_assets(metadatas.len() as u32);
         for (idx, metadata) in metadatas.values().enumerate() {
@@ -177,7 +177,7 @@ impl AssetHubSnapshotImpl {
         let conn = self.txn.conn();
         let metadatas = ctx.hub.get_all_asset_metadata(conn)?;
         let mut results_builder = results.get();
-        let assets = results_builder
+        let mut assets = results_builder
             .reborrow()
             .init_assets(metadatas.len() as u32);
         for (idx, metadata) in metadatas.iter().enumerate() {
@@ -294,7 +294,7 @@ impl AssetHubSnapshotImpl {
         let count = params.get_count() as usize;
         let changes = ctx.hub.get_asset_changes(conn, start, count)?;
         let mut results_builder = results.get();
-        let changes_results = results_builder
+        let mut changes_results = results_builder
             .reborrow()
             .init_changes(changes.len() as u32);
         for (idx, (_, change)) in changes.iter().enumerate() {

@@ -30,19 +30,6 @@ pub fn default_capnp_reader_options_unbounded() -> ReaderOptions {
 
 use distill_core::{utils::make_array, ArtifactId, ArtifactMetadata, AssetMetadata, AssetRef};
 pub use schemas::{data_capnp, pack_capnp, service_capnp};
-impl ::std::fmt::Debug for data_capnp::FileState {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        match self {
-            data::FileState::Exists => {
-                write!(f, "FileState::Exists")?;
-            }
-            data::FileState::Deleted => {
-                write!(f, "FileState::Deleted")?;
-            }
-        }
-        Ok(())
-    }
-}
 
 impl From<distill_core::CompressionType> for data_capnp::CompressionType {
     fn from(c: distill_core::CompressionType) -> Self {

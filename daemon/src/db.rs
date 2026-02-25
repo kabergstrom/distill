@@ -180,7 +180,7 @@ pub mod queries {
     use super::OwnedMessageReader;
 
     /// Read a capnp message from a KV table.
-    pub fn get_capnp<V: for<'b> capnp::traits::Owned<'b>>(
+    pub fn get_capnp<V: capnp::traits::Owned>(
         conn: &Connection,
         table: &str,
         key: &[u8],
@@ -266,7 +266,7 @@ pub mod queries {
     }
 
     /// Iterate all rows in a KV table, returning (key, capnp reader) pairs.
-    pub fn iter_all<V: for<'b> capnp::traits::Owned<'b>>(
+    pub fn iter_all<V: capnp::traits::Owned>(
         conn: &Connection,
         table: &str,
     ) -> Result<Vec<(Vec<u8>, OwnedMessageReader<V>)>> {
@@ -288,7 +288,7 @@ pub mod queries {
 
     /// Iterate rows in a KV table whose key starts with the given prefix (byte-wise >=).
     /// Returns (key, capnp reader) pairs.
-    pub fn iter_prefix<V: for<'b> capnp::traits::Owned<'b>>(
+    pub fn iter_prefix<V: capnp::traits::Owned>(
         conn: &Connection,
         table: &str,
         prefix: &[u8],
