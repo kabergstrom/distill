@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 use std::path::Path;
 
-use async_lock::{Semaphore, SemaphoreGuard};
+use std::sync::Arc;
+
+use async_lock::{Mutex, MutexGuardArc};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::error::Result;
@@ -17,7 +19,7 @@ pub type OwnedMessageReader<T> =
 
 pub struct Database {
     path: std::path::PathBuf,
-    write_semaphore: Semaphore,
+    write_conn: Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -29,14 +31,24 @@ impl Database {
         let conn = Connection::open(&db_file)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;",
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;",
         )?;
         Self::create_tables(&conn)?;
         drop(conn);
 
+        // Persistent write connection — reused across transactions to preserve
+        // the prepared-statement cache that `prepare_cached()` builds.
+        let write_conn = Connection::open(&db_file)?;
+        write_conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;",
+        )?;
+
         Ok(Database {
             path: db_file,
-            write_semaphore: Semaphore::new(1),
+            write_conn: Arc::new(Mutex::new(write_conn)),
         })
     }
 
@@ -83,16 +95,10 @@ impl Database {
     }
 
     pub async fn rw_txn(&self) -> Result<RwTransaction> {
-        let guard = self.write_semaphore.acquire().await;
-        // Safety: The Database (and its Semaphore) is always held in an Arc that
-        // outlives all RwTransactions. The guard is dropped when RwTransaction drops.
-        let guard: SemaphoreGuard<'static> = unsafe { std::mem::transmute(guard) };
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let guard = self.write_conn.lock_arc().await;
+        guard.execute_batch("BEGIN IMMEDIATE")?;
         Ok(RwTransaction {
-            conn,
-            _guard: guard,
+            guard,
             dirty: false,
         })
     }
@@ -102,7 +108,6 @@ impl Database {
             &self.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("BEGIN DEFERRED")?;
         Ok(RoTransaction { conn })
     }
@@ -114,25 +119,18 @@ impl Database {
 
 #[must_use]
 pub struct RwTransaction {
-    conn: Connection,
-    _guard: SemaphoreGuard<'static>,
+    guard: MutexGuardArc<Connection>,
     pub dirty: bool,
 }
 
-// Safety: rusqlite::Connection is Send but not Sync. We only ever use the
-// connection from one task at a time (guarded by the write semaphore), so
-// sending the transaction across await points is safe.
-unsafe impl Send for RwTransaction {}
-unsafe impl Sync for RwTransaction {}
-
 impl RwTransaction {
     pub fn conn(&self) -> &Connection {
-        &self.conn
+        &self.guard
     }
 
     pub fn commit(self) -> Result<()> {
         if self.dirty {
-            self.conn.execute_batch("COMMIT")?;
+            self.guard.execute_batch("COMMIT")?;
         }
         Ok(())
     }
@@ -140,8 +138,8 @@ impl RwTransaction {
 
 impl Drop for RwTransaction {
     fn drop(&mut self) {
-        // Rollback if not committed. Ignore errors since the connection is about to be dropped.
-        let _ = self.conn.execute_batch("ROLLBACK");
+        // Rollback if not committed. Ignore errors since the connection will be reused.
+        let _ = self.guard.execute_batch("ROLLBACK");
     }
 }
 
