@@ -41,8 +41,7 @@ impl Database {
         // the prepared-statement cache that `prepare_cached()` builds.
         let write_conn = Connection::open(&db_file)?;
         write_conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
+            "PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;",
         )?;
 
@@ -56,27 +55,27 @@ impl Database {
         conn.execute_batch(
             "
             -- Simple KV tables (capnp blob values)
-            CREATE TABLE IF NOT EXISTS source_files     (key BLOB PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS dirty_files      (key BLOB PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS asset_metadata   (key BLOB PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS path_to_metadata (key BLOB PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS asset_id_to_path (key BLOB PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS daemon_info      (key BLOB PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS hash_to_artifact (key BLOB PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS source_files     (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS dirty_files      (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS asset_metadata   (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS path_to_metadata (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS asset_id_to_path (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS daemon_info      (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS hash_to_artifact (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
 
             -- Forward-relationship tables (replace hand-rolled reverse indexes)
             CREATE TABLE IF NOT EXISTS build_deps (
                 asset_id BLOB NOT NULL,
                 dep_id   BLOB NOT NULL,
                 PRIMARY KEY (asset_id, dep_id)
-            );
+            ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS idx_build_deps_dep ON build_deps(dep_id);
 
             CREATE TABLE IF NOT EXISTS path_refs (
                 source_path TEXT NOT NULL,
                 ref_path    TEXT NOT NULL,
                 PRIMARY KEY (source_path, ref_path)
-            );
+            ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS idx_path_refs_ref ON path_refs(ref_path);
 
             -- Sequence tables (autoincrement replaces manual seq scan)
@@ -230,7 +229,8 @@ pub mod queries {
             "INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)",
             table
         );
-        conn.execute(&sql, params![key, value_bytes])?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.execute(params![key, value_bytes])?;
         Ok(())
     }
 
@@ -245,21 +245,24 @@ pub mod queries {
             "INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)",
             table
         );
-        conn.execute(&sql, params![key, value])?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.execute(params![key, value])?;
         Ok(())
     }
 
     /// Delete a key from a KV table. Returns true if a row was deleted.
     pub fn delete(conn: &Connection, table: &str, key: &[u8]) -> Result<bool> {
         let sql = format!("DELETE FROM {} WHERE key = ?1", table);
-        let count = conn.execute(&sql, params![key])?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let count = stmt.execute(params![key])?;
         Ok(count > 0)
     }
 
     /// Delete all rows from a table.
     pub fn clear_table(conn: &Connection, table: &str) -> Result<()> {
         let sql = format!("DELETE FROM {}", table);
-        conn.execute(&sql, [])?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.execute([])?;
         Ok(())
     }
 
@@ -284,16 +287,45 @@ pub mod queries {
         Ok(result)
     }
 
-    /// Iterate rows in a KV table whose key starts with the given prefix (byte-wise >=).
+    /// Compute the exclusive upper bound for a prefix scan.
+    /// Increments the last non-0xFF byte and truncates; returns `None` if all bytes are 0xFF
+    /// (meaning the prefix matches everything to the end of the keyspace).
+    fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut upper = prefix.to_vec();
+        while let Some(&last) = upper.last() {
+            if last < 0xFF {
+                *upper.last_mut().unwrap() = last + 1;
+                return Some(upper);
+            }
+            upper.pop();
+        }
+        None
+    }
+
+    /// Iterate rows in a KV table whose key starts with the given prefix.
     /// Returns (key, capnp reader) pairs.
     pub fn iter_prefix<V: capnp::traits::Owned>(
         conn: &Connection,
         table: &str,
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, OwnedMessageReader<V>)>> {
-        let sql = format!("SELECT key, value FROM {} WHERE key >= ?1 ORDER BY key", table);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params![prefix])?;
+        let upper = prefix_upper_bound(prefix);
+        let (sql, mut stmt);
+        let mut rows = if let Some(ref bound) = upper {
+            sql = format!(
+                "SELECT key, value FROM {} WHERE key >= ?1 AND key < ?2 ORDER BY key",
+                table
+            );
+            stmt = conn.prepare_cached(&sql)?;
+            stmt.query(params![prefix, bound])?
+        } else {
+            sql = format!(
+                "SELECT key, value FROM {} WHERE key >= ?1 ORDER BY key",
+                table
+            );
+            stmt = conn.prepare_cached(&sql)?;
+            stmt.query(params![prefix])?
+        };
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
             let key: Vec<u8> = row.get(0)?;
