@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashMap,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
@@ -17,7 +17,6 @@ use distill_schema::{
         self, asset_change_log_entry,
         asset_metadata::{self, latest_artifact},
     },
-    parse_db_asset_ref,
 };
 use rusqlite::Connection;
 
@@ -143,22 +142,6 @@ fn set_build_deps(conn: &Connection, asset_id: &AssetUuid, deps: &[AssetRef]) ->
         }
     }
     Ok(())
-}
-
-/// Reverse lookup: get all asset_ids that depend on `dep_id`.
-fn get_build_dep_dependees(conn: &Connection, dep_id: &AssetUuid) -> Result<Vec<AssetUuid>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT asset_id FROM build_deps WHERE dep_id = ?1",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![dep_id.0.as_ref()])?;
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id_bytes: Vec<u8> = row.get(0)?;
-        if let Some(uuid) = utils::uuid_from_slice(&id_bytes) {
-            result.push(uuid);
-        }
-    }
-    Ok(result)
 }
 
 impl AssetHub {
@@ -288,62 +271,78 @@ impl AssetHub {
         change_batch: ChangeBatch,
     ) -> Result<bool> {
         let conn = txn.conn();
-        let mut to_check = VecDeque::new();
-        let mut affected_assets = HashSet::new();
-        let mut events = Vec::new();
-        for id in change_batch.content_changes {
-            to_check.push_back(id);
+        let seeds = &change_batch.content_changes;
+        if !seeds.is_empty() {
+            log::info!("{} assets changed content", seeds.len());
         }
-        if !to_check.is_empty() {
-            log::info!("{} assets changed content", to_check.len());
-        }
-        // Find all "downstream" assets from the changed assets
-        while !to_check.is_empty() {
-            let id = to_check.pop_front().unwrap();
-            if affected_assets.insert(id) {
-                let dependees = get_build_dep_dependees(conn, &id)?;
-                for dependee in dependees {
-                    to_check.push_back(dependee);
+
+        // Find all transitively affected assets via a recursive CTE on build_deps.
+        // Seeds are the directly changed assets; the CTE walks downstream dependees.
+        let affected_assets: Vec<AssetUuid> = if seeds.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders: String = (1..=seeds.len())
+                .map(|i| format!("(?{})", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "WITH RECURSIVE affected(id) AS ( \
+                     VALUES {} \
+                     UNION \
+                     SELECT bd.asset_id FROM build_deps bd \
+                     JOIN affected a ON bd.dep_id = a.id \
+                 ) SELECT DISTINCT id FROM affected",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&[u8]> = seeds.iter().map(|id| id.0.as_ref()).collect();
+            let mut rows = stmt.query(rusqlite::params_from_iter(&params))?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                if let Some(uuid) = utils::uuid_from_slice(&id_bytes) {
+                    result.push(uuid);
                 }
             }
-        }
-        for asset in affected_assets {
-            let metadata = self.get_asset_metadata(conn, &asset);
+            result
+        };
+
+        // For each affected asset, find its transitive upstream build dependencies
+        // via a recursive CTE, fetch their metadata, and compute a combined hash.
+        let mut events = Vec::new();
+        for asset in &affected_assets {
+            let metadata = self.get_asset_metadata(conn, asset);
             if let Some(metadata) = metadata {
                 let metadata = metadata.get()?;
-                let mut dependency_graph = HashMap::new();
-                let mut to_check = VecDeque::new();
-                // Deep search "upstream" to find all assets that may have affected this asset
-                to_check.push_back(asset);
-                while !to_check.is_empty() {
-                    let id = to_check.pop_front().unwrap();
-                    if dependency_graph.contains_key(&id) {
-                        continue;
-                    }
-                    let metadata = self.get_asset_metadata(conn, &id);
-                    if let Some(metadata) = metadata {
-                        let metadata = metadata.get()?;
-                        if let latest_artifact::Artifact(Ok(artifact)) =
-                            metadata.get_latest_artifact().which()?
-                        {
-                            dependency_graph.insert(asset, Vec::from(artifact.get_hash()?));
-                            for dep in artifact.get_build_deps()? {
-                                to_check.push_back(*parse_db_asset_ref(&dep).expect_uuid());
-                            }
-                        }
-                    }
-                }
-                // Sort and combine hashes
-                let mut sorted_assets: Vec<(&AssetUuid, &Vec<u8>)> =
-                    dependency_graph.iter().collect();
-                sorted_assets.sort_by(|(x, _), (y, _)| {
-                    x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-                });
+
+                // Recursive CTE: walk upstream build deps, return metadata blobs sorted by key
+                let mut upstream_stmt = conn.prepare_cached(
+                    "WITH RECURSIVE upstream(id) AS ( \
+                         VALUES (?1) \
+                         UNION \
+                         SELECT bd.dep_id FROM build_deps bd \
+                         JOIN upstream u ON bd.asset_id = u.id \
+                     ) SELECT am.key, am.value FROM asset_metadata am \
+                       JOIN upstream u ON am.key = u.id \
+                       ORDER BY am.key",
+                )?;
+                let mut dep_rows = upstream_stmt.query(rusqlite::params![asset.0.as_ref()])?;
                 let mut hasher = ::std::collections::hash_map::DefaultHasher::new();
-                for (_, import_hash) in sorted_assets {
-                    import_hash.hash(&mut hasher);
+                while let Some(row) = dep_rows.next()? {
+                    let value: Vec<u8> = row.get(1)?;
+                    let reader = capnp::serialize::read_message(
+                        &mut value.as_slice(),
+                        distill_schema::default_capnp_reader_options(),
+                    )?;
+                    let dep_metadata = reader.into_typed::<asset_metadata::Owned>();
+                    if let latest_artifact::Artifact(Ok(artifact)) =
+                        dep_metadata.get()?.get_latest_artifact().which()?
+                    {
+                        artifact.get_hash()?.hash(&mut hasher);
+                    }
                 }
                 let build_dep_hash = hasher.finish();
+
                 let import_hash = {
                     if let latest_artifact::Artifact(Ok(artifact)) =
                         metadata.get_latest_artifact().which()?
@@ -354,12 +353,12 @@ impl AssetHub {
                     }
                 };
                 events.push(ChangeEvent::ContentUpdate(AssetContentUpdateEvent {
-                    id: asset,
+                    id: *asset,
                     import_hash: Some(import_hash),
                     build_dep_hash: Some(Vec::from(&build_dep_hash.to_le_bytes() as &[u8])),
                 }));
             } else {
-                events.push(ChangeEvent::Remove(asset));
+                events.push(ChangeEvent::Remove(*asset));
             }
         }
         if !events.is_empty() {

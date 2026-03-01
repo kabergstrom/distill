@@ -1,28 +1,29 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path,
     rc::Rc,
     sync::Arc,
 };
 
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
-use distill_core::utils::{self, canonicalize_path};
+use distill_core::{utils::{self, canonicalize_path}, AssetUuid};
 use distill_importer::SerializedAsset;
 use distill_schema::{
     data::{
         artifact,
-        asset_metadata::latest_artifact,
+        asset_metadata::{self, latest_artifact},
         AssetSource,
     },
     parse_artifact_metadata, parse_db_asset_ref,
     service::asset_hub,
 };
 use futures::AsyncReadExt;
+use rusqlite::Connection;
 
 use crate::{
     artifact_cache::ArtifactCache,
     asset_hub::{AssetBatchEvent, AssetHub},
-    db::{Database, RoTransaction},
+    db::{Database, OwnedMessageReader, RoTransaction},
     error::Error,
     file_asset_source::FileAssetSource,
     file_tracker::FileTracker,
@@ -31,6 +32,40 @@ use crate::{
 // crate::Error has `impl From<crate::Error> for capnp::Error`
 type Promise<T> = capnp::capability::Promise<T, capnp::Error>;
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Batch-fetch asset metadata for a set of IDs in a single query.
+fn batch_get_asset_metadata(
+    conn: &Connection,
+    ids: &[AssetUuid],
+) -> std::result::Result<HashMap<AssetUuid, OwnedMessageReader<asset_metadata::Owned>>, Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders: String = (1..=ids.len())
+        .map(|i| format!("?{}", i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT key, value FROM asset_metadata WHERE key IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&[u8]> = ids.iter().map(|id| id.0.as_ref()).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(&params))?;
+    let mut result = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let key: Vec<u8> = row.get(0)?;
+        let value: Vec<u8> = row.get(1)?;
+        if let Some(uuid) = utils::uuid_from_slice(&key) {
+            let reader = capnp::serialize::read_message(
+                &mut value.as_slice(),
+                distill_schema::default_capnp_reader_options(),
+            )?;
+            result.insert(uuid, reader.into_typed::<asset_metadata::Owned>());
+        }
+    }
+    Ok(result)
+}
 
 struct ServiceContext {
     hub: Arc<AssetHub>,
@@ -128,17 +163,18 @@ impl AssetHubSnapshotImpl {
         mut results: asset_hub::snapshot::GetAssetMetadataWithDependenciesResults,
     ) -> Result<()> {
         let params = params.get()?;
-        let ctx = self.txn.ctx();
         let conn = self.txn.conn();
-        let mut metadatas = HashMap::new();
-        for id in params.get_assets()? {
-            let id = utils::uuid_from_slice(id.get_id()?).ok_or(Error::UuidLength)?;
-            let value = ctx.hub.get_asset_metadata(conn, &id);
-            if let Some(metadata) = value {
-                metadatas.insert(id, metadata);
-            }
-        }
-        let mut missing_metadata = HashSet::new();
+
+        // Batch-fetch all requested assets in one query
+        let requested: Vec<AssetUuid> = params
+            .get_assets()?
+            .iter()
+            .filter_map(|id| utils::uuid_from_slice(id.get_id().ok()?))
+            .collect();
+        let mut metadatas = batch_get_asset_metadata(conn, &requested)?;
+
+        // Find missing load_deps from fetched metadata
+        let mut missing = Vec::new();
         for metadata in metadatas.values() {
             if let latest_artifact::Artifact(Ok(artifact)) =
                 metadata.get()?.get_latest_artifact().which()?
@@ -146,17 +182,17 @@ impl AssetHubSnapshotImpl {
                 for dep in artifact.get_load_deps()? {
                     let dep = *parse_db_asset_ref(&dep).expect_uuid();
                     if !metadatas.contains_key(&dep) {
-                        missing_metadata.insert(dep);
+                        missing.push(dep);
                     }
                 }
             }
         }
-        for id in missing_metadata {
-            let value = ctx.hub.get_asset_metadata(conn, &id);
-            if let Some(metadata) = value {
-                metadatas.insert(id, metadata);
-            }
+
+        // Batch-fetch missing deps in one query
+        if !missing.is_empty() {
+            metadatas.extend(batch_get_asset_metadata(conn, &missing)?);
         }
+
         let mut results_builder = results.get();
         let mut assets = results_builder
             .reborrow()

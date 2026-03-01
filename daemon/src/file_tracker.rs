@@ -614,28 +614,6 @@ impl FileTracker {
             .collect()
     }
 
-    // Returns file state from source_files table
-    pub fn read_all_files(&self, conn: &Connection) -> Vec<FileState> {
-        let rows = queries::iter_all::<source_file_info::Owned>(conn, TABLE_SOURCE_FILES)
-            .expect("db: Failed to read source_files");
-        rows.into_iter()
-            .filter_map(|(key, val)| {
-                let key = str::from_utf8(&key).expect("utf8: Failed to parse file path");
-                let info = val.get().ok()?;
-
-                Some(FileState {
-                    path: PathBuf::from(key),
-                    state: data::FileState::Exists,
-                    last_modified: info.get_last_modified(),
-                    length: info.get_length(),
-                    ty: info
-                        .get_type()
-                        .expect("Failed to read type in source file info"),
-                })
-            })
-            .collect()
-    }
-
     // Deletes an item from dirty_files table. This function must be used carefully to avoid a race
     // condition; check that the SourceFileInfo stored in the table matches the file that was read
     // and processed

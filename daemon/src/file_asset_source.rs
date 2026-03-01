@@ -225,10 +225,27 @@ impl FileAssetSource {
             .unwrap_or_default();
 
         // Delete all the asset paths that were inserted by the previous metadata
-        for asset in assets_to_remove {
-            debug!("removing deleted asset {:?}", asset);
-            self.delete_asset_path(txn, &asset);
-            affected_assets.push(asset);
+        if !assets_to_remove.is_empty() {
+            {
+                let placeholders: String = (1..=assets_to_remove.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "DELETE FROM asset_id_to_path WHERE key IN ({})",
+                    placeholders
+                );
+                let params: Vec<&[u8]> = assets_to_remove.iter().map(|id| id.0.as_ref()).collect();
+                txn.conn().prepare(&sql)
+                    .expect("db: Failed to prepare batch delete")
+                    .execute(rusqlite::params_from_iter(&params))
+                    .expect("db: Failed to batch delete from asset_id_to_path");
+            }
+            txn.dirty = true;
+            for asset in assets_to_remove {
+                debug!("removing deleted asset {:?}", asset);
+                affected_assets.push(asset);
+            }
         }
 
         let mut deduped_path_refs = HashSet::new();
@@ -406,10 +423,27 @@ impl FileAssetSource {
             })
             .unwrap_or_default();
 
-        // Delete the path/asset association for the assets
-        for asset in to_remove.iter() {
-            debug!("remove asset {:?}", asset);
-            self.delete_asset_path(txn, asset);
+        // Batch-delete the path/asset associations
+        if !to_remove.is_empty() {
+            for asset in to_remove.iter() {
+                debug!("remove asset {:?}", asset);
+            }
+            {
+                let placeholders: String = (1..=to_remove.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "DELETE FROM asset_id_to_path WHERE key IN ({})",
+                    placeholders
+                );
+                let params: Vec<&[u8]> = to_remove.iter().map(|id| id.0.as_ref()).collect();
+                txn.conn().prepare(&sql)
+                    .expect("db: Failed to prepare batch delete")
+                    .execute(rusqlite::params_from_iter(&params))
+                    .expect("db: Failed to batch delete from asset_id_to_path");
+            }
+            txn.dirty = true;
         }
 
         // Delete the path/source metadata association
@@ -491,16 +525,6 @@ impl FileAssetSource {
             Ok(PathBuf::from(path))
         })
         .ok()
-    }
-
-    fn delete_asset_path(&self, txn: &mut RwTransaction, asset_id: &AssetUuid) -> bool {
-        let count = txn.conn()
-            .prepare_cached("DELETE FROM asset_id_to_path WHERE key = ?1")
-            .expect("db: Failed to prepare asset_id_to_path delete")
-            .execute(rusqlite::params![&asset_id.0[..]])
-            .expect("db: Failed to delete asset_id from asset_id_to_path table");
-        txn.dirty = true;
-        count > 0
     }
 
     fn add_path_ref(
@@ -1058,47 +1082,52 @@ impl FileAssetSource {
         let changed_paths: Vec<PathBuf> = {
             let txn = self.db.ro_txn().await.expect("db: Failed to open ro txn");
 
-            self.tracker
-                .read_all_files(txn.conn())
-                .iter()
-                .filter_map(|file_state| {
-                    let metadata = self.get_source_metadata(txn.conn(), &file_state.path);
-                    let importer = self.importers.get_by_path(&file_state.path);
+            // Single LEFT JOIN: get all source file paths with their metadata (if any)
+            let mut stmt = txn.conn().prepare_cached(
+                "SELECT sf.key, pm.value FROM source_files sf \
+                 LEFT JOIN path_to_metadata pm ON sf.key = pm.key",
+            ).expect("db: Failed to prepare importer change query");
+            let mut rows = stmt.query([]).expect("db: Failed to query for importer changes");
 
-                    let changed = match (importer, metadata) {
-                        (None, None) => false,
-                        (None, Some(_)) => true,
-                        (Some(_), None) => true,
-                        (Some(importer), Some(metadata)) => {
-                            let metadata = metadata.get().expect("capnp: Failed to get metadata");
-                            let importer_version = metadata.get_importer_version();
+            let mut result = Vec::new();
+            while let Some(row) = rows.next().expect("db: Failed to iterate rows") {
+                let key: Vec<u8> = row.get(0).expect("db: Failed to get key");
+                let path = PathBuf::from(
+                    str::from_utf8(&key).expect("utf8: Failed to parse file path"),
+                );
+                let metadata_bytes: Option<Vec<u8>> = row.get(1).ok();
+                let importer = self.importers.get_by_path(&path);
 
-                            let options_type = metadata
-                                .get_importer_options_type()
-                                .expect("capnp: Failed to get importer options type");
+                let changed = match (importer, metadata_bytes) {
+                    (None, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(_), None) => true,
+                    (Some(importer), Some(bytes)) => {
+                        let reader = capnp::serialize::read_message(
+                            &mut bytes.as_slice(),
+                            distill_schema::default_capnp_reader_options(),
+                        ).expect("capnp: Failed to read metadata");
+                        let typed = reader.into_typed::<data::source_metadata::Owned>();
+                        let metadata = typed.get().expect("capnp: Failed to get metadata");
 
-                            let state_type = metadata
-                                .get_importer_state_type()
-                                .expect("capnp: Failed to get importer state type");
-
-                            let importer_type = metadata
-                                .get_importer_type()
-                                .expect("capnp: Failed to get importer type");
-
-                            importer_version != importer.version()
-                                || options_type != importer.options_type_uuid()
-                                || state_type != importer.default_state().uuid()
-                                || importer_type != importer.uuid()
-                        }
-                    };
-
-                    if changed {
-                        Some(file_state.path.clone())
-                    } else {
-                        None
+                        metadata.get_importer_version() != importer.version()
+                            || metadata.get_importer_options_type()
+                                .expect("capnp: Failed to get importer options type")
+                                != importer.options_type_uuid()
+                            || metadata.get_importer_state_type()
+                                .expect("capnp: Failed to get importer state type")
+                                != importer.default_state().uuid()
+                            || metadata.get_importer_type()
+                                .expect("capnp: Failed to get importer type")
+                                != importer.uuid()
                     }
-                })
-                .collect()
+                };
+
+                if changed {
+                    result.push(path);
+                }
+            }
+            result
         };
         let has_changed_paths = !changed_paths.is_empty();
         if has_changed_paths {
