@@ -67,65 +67,20 @@ impl ChangeBatch {
     }
 }
 
-// Utility function called from add_changes — uses autoincrement
+// Utility function called from add_changes — uses autoincrement.
+// Reserves a seq via a placeholder row, then builds the capnp message once with the real seq.
 fn add_asset_changelog_entry(
     conn: &Connection,
     change: &ChangeEvent,
 ) -> Result<()> {
-    // Create the AssetChangeLogEntry capnp message
-    // We need to know the seq for the message content, but autoincrement assigns it.
-    // We'll insert with a placeholder seq=0, then update. Or better: insert, get last_insert_rowid, update value.
-    // Actually, we can just build the message with seq=0 for now since the seq is stored
-    // as the row key and consumers can use that.
-    // But the original code sets `value.set_num(last_seq)` inside the capnp message.
-    // Let's do a two-step: insert a placeholder, get the rowid, then update with the correct seq.
-
-    let mut value_builder = capnp::message::Builder::new_default();
-    let mut value = value_builder.init_root::<asset_change_log_entry::Builder<'_>>();
-    // We'll set num after we know the seq
-    value.reborrow().set_num(0);
-    {
-        let value = value.reborrow().init_event();
-        match change {
-            ChangeEvent::ContentUpdate(evt) => {
-                let mut db_evt = value.init_content_update_event();
-                db_evt.reborrow().init_id().set_id(&evt.id.0);
-                if let Some(ref import_hash) = evt.import_hash {
-                    db_evt.reborrow().set_import_hash(import_hash);
-                }
-                if let Some(ref build_dep_hash) = evt.build_dep_hash {
-                    db_evt.reborrow().set_build_dep_hash(build_dep_hash);
-                }
-            }
-            ChangeEvent::Remove(id) => {
-                value.init_remove_event().init_id().set_id(&id.0);
-            }
-            ChangeEvent::PathRemove(path) => {
-                value
-                    .init_path_remove_event()
-                    .set_path(path.to_string_lossy().as_bytes());
-            }
-            ChangeEvent::PathUpdate(path) => {
-                value
-                    .init_path_update_event()
-                    .set_path(path.to_string_lossy().as_bytes());
-            }
-        }
-    }
-
-    // Serialize the capnp message
-    let mut value_bytes = Vec::new();
-    capnp::serialize::write_message(&mut value_bytes, &value_builder)
-        .expect("capnp: failed to serialize message");
-
-    // Insert with autoincrement
+    // Reserve the autoincrement seq with a placeholder
     conn.execute(
-        "INSERT INTO asset_changes (value) VALUES (?1)",
-        rusqlite::params![value_bytes],
+        "INSERT INTO asset_changes (value) VALUES (X'')",
+        [],
     )?;
     let seq = conn.last_insert_rowid() as u64;
 
-    // Now rebuild the message with the correct seq number
+    // Build the capnp message once with the correct seq
     let mut value_builder = capnp::message::Builder::new_default();
     let mut value = value_builder.init_root::<asset_change_log_entry::Builder<'_>>();
     value.reborrow().set_num(seq);
@@ -160,6 +115,8 @@ fn add_asset_changelog_entry(
     let mut value_bytes = Vec::new();
     capnp::serialize::write_message(&mut value_bytes, &value_builder)
         .expect("capnp: failed to serialize message");
+
+    // Update the placeholder with the real value
     conn.execute(
         "UPDATE asset_changes SET value = ?1 WHERE seq = ?2",
         rusqlite::params![value_bytes, seq as i64],
@@ -216,8 +173,18 @@ impl AssetHub {
         &self,
         conn: &Connection,
     ) -> Result<Vec<OwnedMessageReader<asset_metadata::Owned>>> {
-        let rows = queries::iter_all::<asset_metadata::Owned>(conn, TABLE_ASSET_METADATA)?;
-        Ok(rows.into_iter().map(|(_, v)| v).collect())
+        let mut stmt = conn.prepare_cached("SELECT value FROM asset_metadata")?;
+        let mut rows = stmt.query([])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let value: Vec<u8> = row.get(0)?;
+            let reader = capnp::serialize::read_message(
+                &mut value.as_slice(),
+                distill_schema::default_capnp_reader_options(),
+            )?;
+            result.push(reader.into_typed::<asset_metadata::Owned>());
+        }
+        Ok(result)
     }
 
     pub fn get_asset_metadata(

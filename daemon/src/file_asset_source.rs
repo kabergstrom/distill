@@ -43,7 +43,6 @@ use crate::{
 };
 
 const TABLE_PATH_TO_METADATA: &str = "path_to_metadata";
-const TABLE_ASSET_ID_TO_PATH: &str = "asset_id_to_path";
 
 pub(crate) struct FileAssetSource {
     hub: Arc<AssetHub>,
@@ -470,9 +469,10 @@ impl FileAssetSource {
         asset_id: &AssetUuid,
         path: &Path,
     ) {
-        let path_str = path.to_string_lossy();
-        let path = path_str.as_bytes();
-        queries::put_bytes(txn.conn(), TABLE_ASSET_ID_TO_PATH, &asset_id.0, path)
+        txn.conn()
+            .prepare_cached("INSERT OR REPLACE INTO asset_id_to_path (key, path) VALUES (?1, ?2)")
+            .expect("db: Failed to prepare asset_id_to_path insert")
+            .execute(rusqlite::params![&asset_id.0[..], path.to_string_lossy().as_ref()])
             .expect("db: Failed to put asset path to asset_id_to_path table");
         txn.dirty = true;
     }
@@ -483,16 +483,24 @@ impl FileAssetSource {
         conn: &Connection,
         asset_id: &AssetUuid,
     ) -> Option<PathBuf> {
-        queries::get_bytes(conn, TABLE_ASSET_ID_TO_PATH, &asset_id.0)
-            .expect("db: Failed to get asset_id from asset_id_to_path table")
-            .map(|p| PathBuf::from(str::from_utf8(&p).expect("utf8: Failed to parse path")))
+        let mut stmt = conn
+            .prepare_cached("SELECT path FROM asset_id_to_path WHERE key = ?1")
+            .expect("db: Failed to prepare asset_id_to_path select");
+        stmt.query_row(rusqlite::params![&asset_id.0[..]], |row| {
+            let path: String = row.get(0)?;
+            Ok(PathBuf::from(path))
+        })
+        .ok()
     }
 
     fn delete_asset_path(&self, txn: &mut RwTransaction, asset_id: &AssetUuid) -> bool {
-        let result = queries::delete(txn.conn(), TABLE_ASSET_ID_TO_PATH, &asset_id.0)
+        let count = txn.conn()
+            .prepare_cached("DELETE FROM asset_id_to_path WHERE key = ?1")
+            .expect("db: Failed to prepare asset_id_to_path delete")
+            .execute(rusqlite::params![&asset_id.0[..]])
             .expect("db: Failed to delete asset_id from asset_id_to_path table");
         txn.dirty = true;
-        result
+        count > 0
     }
 
     fn add_path_ref(
@@ -1020,12 +1028,15 @@ impl FileAssetSource {
             }
 
             // Update the asset_id_to_path table
-            for asset in asset_ids {
-                queries::delete(txn.conn(), TABLE_ASSET_ID_TO_PATH, &asset)
-                    .expect("db: Failed to delete from asset_id_to_path table");
-
-                queries::put_bytes(txn.conn(), TABLE_ASSET_ID_TO_PATH, &asset, dst)
-                    .expect("db: Failed to put to asset_id_to_path table");
+            {
+                let mut stmt = txn.conn()
+                    .prepare_cached("INSERT OR REPLACE INTO asset_id_to_path (key, path) VALUES (?1, ?2)")
+                    .expect("db: Failed to prepare asset_id_to_path upsert");
+                let dst_str = str::from_utf8(dst).expect("utf8: Failed to parse dst path");
+                for asset in asset_ids {
+                    stmt.execute(rusqlite::params![asset, dst_str])
+                        .expect("db: Failed to update asset_id_to_path table");
+                }
             }
 
             // Update the path_to_metadata table, if a metadata exists for this path

@@ -379,22 +379,17 @@ mod events {
                 // files from DB
                 let scan_ctx = scan_stack.pop().unwrap();
 
-                // Find all the files that start with the base directory of this scan
+                // Find all tracked files under the base directory of this scan
                 let mut db_file_set = HashSet::new();
                 {
-                    let path_str = path.to_string_lossy();
-                    let key = path_str.as_bytes();
-                    let path_string = scan_ctx.path.to_string_lossy().into_owned();
-                    let rows = queries::iter_prefix::<source_file_info::Owned>(
-                        txn.conn(),
-                        TABLE_SOURCE_FILES,
-                        key,
+                    let prefix = format!("{}%", scan_ctx.path.to_string_lossy());
+                    let mut stmt = txn.conn().prepare_cached(
+                        "SELECT key FROM source_files WHERE key LIKE ?1",
                     )?;
-                    for (key_bytes, _) in rows {
-                        let key = str::from_utf8(&key_bytes).expect("Encoded key was invalid utf8");
-                        if !key.starts_with(&path_string) {
-                            break;
-                        }
+                    let mut rows = stmt.query(rusqlite::params![prefix])?;
+                    while let Some(row) = rows.next()? {
+                        let key: Vec<u8> = row.get(0)?;
+                        let key = str::from_utf8(&key).expect("Encoded key was invalid utf8");
                         db_file_set.insert(PathBuf::from(key));
                     }
                 }
@@ -421,21 +416,31 @@ mod events {
                 // If this is the top-level scan, we have a final set of watched directories,
                 // so we can delete any files that are not in any watched directories from the DB.
                 if scan_stack.is_empty() {
+                    // Find source_files entries that don't belong to any watched directory.
+                    // Build: SELECT key FROM source_files WHERE key NOT LIKE ?1 AND key NOT LIKE ?2 ...
+                    let dirs_as_strings: Vec<String> = watched_dirs
+                        .into_iter()
+                        .map(|f| format!("{}%", f.to_string_lossy()))
+                        .collect();
+                    let conditions: Vec<String> = (0..dirs_as_strings.len())
+                        .map(|i| format!("key NOT LIKE ?{}", i + 1))
+                        .collect();
+                    let sql = if conditions.is_empty() {
+                        "SELECT key FROM source_files".to_string()
+                    } else {
+                        format!("SELECT key FROM source_files WHERE {}", conditions.join(" AND "))
+                    };
+                    let mut stmt = txn.conn().prepare_cached(&sql)?;
+                    let params: Vec<&dyn rusqlite::types::ToSql> =
+                        dirs_as_strings.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                    let mut rows = stmt.query(params.as_slice())?;
                     let mut to_delete = Vec::new();
-                    {
-                        let rows = queries::iter_all_raw(txn.conn(), TABLE_SOURCE_FILES)?;
-                        let dirs_as_strings: Vec<String> = watched_dirs
-                            .into_iter()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .collect();
-                        for (key_bytes, _) in rows {
-                            let key = str::from_utf8(&key_bytes)
-                                .expect("Encoded key was invalid utf8");
-                            if !dirs_as_strings.iter().any(|dir| key.starts_with(dir)) {
-                                to_delete.push(key_bytes);
-                            }
-                        }
+                    while let Some(row) = rows.next()? {
+                        let key: Vec<u8> = row.get(0)?;
+                        to_delete.push(key);
                     }
+                    drop(rows);
+                    drop(stmt);
                     for key_bytes in to_delete {
                         queries::delete(txn.conn(), TABLE_SOURCE_FILES, &key_bytes)?;
                         update_deleted_dirty_entry(txn.conn(), &key_bytes)?;
