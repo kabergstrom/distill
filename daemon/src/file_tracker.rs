@@ -15,7 +15,7 @@ use std::{
 };
 
 use distill_core::utils::canonicalize_path;
-use distill_schema::data::{self, dirty_file_info, source_file_info, FileType};
+use distill_schema::data::{self, source_file_info, FileType};
 use event_listener::Event;
 use futures::{
     channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
@@ -33,7 +33,6 @@ use crate::{
 };
 
 const TABLE_SOURCE_FILES: &str = "source_files";
-const TABLE_DIRTY_FILES: &str = "dirty_files";
 
 #[derive(Clone, Debug)]
 pub enum FileTrackerEvent {
@@ -169,20 +168,45 @@ fn add_rename_event(
     Ok(())
 }
 
-// Creates a DirtyFileInfo capn proto message
-fn build_dirty_file_info(
+// Write a dirty file entry with plain columns
+fn put_dirty_file(
+    conn: &Connection,
+    path: &str,
     state: data::FileState,
-    source_info: source_file_info::Reader<'_>,
-) -> capnp::message::Builder<capnp::message::HeapAllocator> {
-    let mut value_builder = capnp::message::Builder::new_default();
-    {
-        let mut value = value_builder.init_root::<dirty_file_info::Builder<'_>>();
-        value.set_state(state);
-        value
-            .set_source_info(source_info)
-            .expect("failed to set source info");
+    last_modified: u64,
+    length: u64,
+    file_type: FileType,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO dirty_files (path, state, last_modified, length, type) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?
+    .execute(rusqlite::params![
+        path,
+        state as i64,
+        last_modified as i64,
+        length as i64,
+        file_type as i64,
+    ])?;
+    Ok(())
+}
+
+fn file_state_from_i64(val: i64) -> data::FileState {
+    if val == data::FileState::Deleted as i64 {
+        data::FileState::Deleted
+    } else {
+        data::FileState::Exists
     }
-    value_builder
+}
+
+fn file_type_from_i64(val: i64) -> FileType {
+    if val == FileType::Directory as i64 {
+        FileType::Directory
+    } else if val == FileType::Symlink as i64 {
+        FileType::Symlink
+    } else {
+        FileType::File
+    }
 }
 
 // Creates a SourceFileInfo capn proto message
@@ -202,17 +226,20 @@ fn build_source_info(
 // Checks if the file is in source_files. If it is, write a delete entry to the dirty_files table
 fn update_deleted_dirty_entry(
     conn: &Connection,
-    key: &[u8],
+    path: &str,
 ) -> Result<()> {
-    let dirty_value = {
-        queries::get_capnp::<source_file_info::Owned>(conn, TABLE_SOURCE_FILES, key)?
-            .map(|v| {
-                let info = v.get().expect("failed to get source_file_info");
-                build_dirty_file_info(data::FileState::Deleted, info)
-            })
-    };
-    if let Some(dirty_value) = dirty_value {
-        queries::put_capnp(conn, TABLE_DIRTY_FILES, key, &dirty_value)?;
+    let existing: Option<OwnedMessageReader<source_file_info::Owned>> =
+        queries::get_capnp(conn, TABLE_SOURCE_FILES, path.as_bytes())?;
+    if let Some(existing) = existing {
+        let info = existing.get().expect("failed to get source_file_info");
+        put_dirty_file(
+            conn,
+            path,
+            data::FileState::Deleted,
+            info.get_last_modified(),
+            info.get_length(),
+            info.get_type().expect("Failed to get file type"),
+        )?;
     }
     Ok(())
 }
@@ -240,21 +267,24 @@ fn get_file_state_from_conn(
                 }
             })
     } else {
-        queries::get_capnp::<dirty_file_info::Owned>(conn, table, key)
-            .expect("db: Failed to get entry from dirty_files table")
-            .map(|value| {
-                let value = value.get().expect("capnp: Failed to get dirty file info");
-                let info = value
-                    .get_source_info()
-                    .expect("capnp: Failed to get source info");
-                FileState {
-                    path: path.to_path_buf(),
-                    state: data::FileState::Exists,
-                    last_modified: info.get_last_modified(),
-                    length: info.get_length(),
-                    ty: info.get_type().expect("Failed to read type in source info"),
-                }
+        conn.prepare_cached(
+            "SELECT state, last_modified, length, type FROM dirty_files WHERE path = ?1",
+        )
+        .expect("db: Failed to prepare dirty_files query")
+        .query_row(rusqlite::params![key_str.as_ref()], |row| {
+            let state: i64 = row.get(0)?;
+            let last_modified: i64 = row.get(1)?;
+            let length: i64 = row.get(2)?;
+            let file_type: i64 = row.get(3)?;
+            Ok(FileState {
+                path: path.to_path_buf(),
+                state: file_state_from_i64(state),
+                last_modified: last_modified as u64,
+                length: length as u64,
+                ty: file_type_from_i64(file_type),
             })
+        })
+        .ok()
     }
 }
 
@@ -298,12 +328,15 @@ mod events {
         }
         if changed {
             let value = build_source_info(metadata);
-            let dirty_value = build_dirty_file_info(
-                data::FileState::Exists,
-                value.get_root_as_reader::<source_file_info::Reader<'_>>()?,
-            );
             queries::put_capnp(txn.conn(), TABLE_SOURCE_FILES, key, &value)?;
-            queries::put_capnp(txn.conn(), TABLE_DIRTY_FILES, key, &dirty_value)?;
+            put_dirty_file(
+                txn.conn(),
+                &path_str,
+                data::FileState::Exists,
+                metadata.last_modified,
+                metadata.length,
+                db_file_type(metadata.file_type),
+            )?;
             txn.dirty = true;
         }
         Ok(())
@@ -335,16 +368,23 @@ mod events {
                 let value = build_source_info(&metadata);
                 queries::delete(txn.conn(), TABLE_SOURCE_FILES, src_key)?;
                 queries::put_capnp(txn.conn(), TABLE_SOURCE_FILES, dst_key, &value)?;
-                let dirty_value_new = build_dirty_file_info(
-                    data::FileState::Exists,
-                    value.get_root_as_reader::<source_file_info::Reader<'_>>()?,
-                );
-                let dirty_value_old = build_dirty_file_info(
+                let file_type = db_file_type(metadata.file_type);
+                put_dirty_file(
+                    txn.conn(),
+                    &src_str,
                     data::FileState::Deleted,
-                    value.get_root_as_reader::<source_file_info::Reader<'_>>()?,
-                );
-                queries::put_capnp(txn.conn(), TABLE_DIRTY_FILES, src_key, &dirty_value_old)?;
-                queries::put_capnp(txn.conn(), TABLE_DIRTY_FILES, dst_key, &dirty_value_new)?;
+                    metadata.last_modified,
+                    metadata.length,
+                    file_type,
+                )?;
+                put_dirty_file(
+                    txn.conn(),
+                    &dst_str,
+                    data::FileState::Exists,
+                    metadata.last_modified,
+                    metadata.length,
+                    file_type,
+                )?;
                 add_rename_event(txn.conn(), src_key, dst_key)?;
                 txn.dirty = true;
             }
@@ -357,7 +397,7 @@ mod events {
                 let path_str = path.to_string_lossy();
                 let key = path_str.as_bytes();
                 debug!("removed {}", path_str);
-                update_deleted_dirty_entry(txn.conn(), key)?;
+                update_deleted_dirty_entry(txn.conn(), &path_str)?;
                 queries::delete(txn.conn(), TABLE_SOURCE_FILES, key)?;
                 txn.dirty = true;
             }
@@ -401,9 +441,8 @@ mod events {
                 let to_remove = db_file_set.difference(&scan_ctx_set);
                 for p in to_remove {
                     let p_str = p.to_string_lossy();
-                    let p_key = p_str.as_bytes();
-                    update_deleted_dirty_entry(txn.conn(), p_key)?;
-                    queries::delete(txn.conn(), TABLE_SOURCE_FILES, p_key)?;
+                    update_deleted_dirty_entry(txn.conn(), &p_str)?;
+                    queries::delete(txn.conn(), TABLE_SOURCE_FILES, p_str.as_bytes())?;
                     txn.dirty = true;
                 }
                 info!(
@@ -442,8 +481,10 @@ mod events {
                     drop(rows);
                     drop(stmt);
                     for key_bytes in to_delete {
+                        let key_str = str::from_utf8(&key_bytes)
+                            .expect("utf8: Failed to parse file path");
                         queries::delete(txn.conn(), TABLE_SOURCE_FILES, &key_bytes)?;
-                        update_deleted_dirty_entry(txn.conn(), &key_bytes)?;
+                        update_deleted_dirty_entry(txn.conn(), key_str)?;
                         txn.dirty = true;
                     }
                 }
@@ -573,15 +614,18 @@ impl FileTracker {
         let key = path_str.as_bytes();
         if let Some(metadata) = metadata {
             let source_info = build_source_info(&metadata);
-            let dirty_file_info = build_dirty_file_info(
-                data::FileState::Exists,
-                source_info.get_root_as_reader::<source_file_info::Reader<'_>>()?,
-            );
             queries::put_capnp(txn.conn(), TABLE_SOURCE_FILES, key, &source_info)?;
-            queries::put_capnp(txn.conn(), TABLE_DIRTY_FILES, key, &dirty_file_info)?;
+            put_dirty_file(
+                txn.conn(),
+                &path_str,
+                data::FileState::Exists,
+                metadata.last_modified,
+                metadata.length,
+                db_file_type(metadata.file_type),
+            )?;
             txn.dirty = true;
         } else {
-            update_deleted_dirty_entry(txn.conn(), key)?;
+            update_deleted_dirty_entry(txn.conn(), &path_str)?;
         }
         Ok(())
     }
@@ -591,38 +635,40 @@ impl FileTracker {
         &self,
         conn: &Connection,
     ) -> Vec<FileState> {
-        let rows = queries::iter_all::<dirty_file_info::Owned>(conn, TABLE_DIRTY_FILES)
-            .expect("db: Failed to read dirty_files");
-        rows.into_iter()
-            .filter_map(|(key, val)| {
-                let key = str::from_utf8(&key).expect("utf8: Failed to parse file path");
-                let info = val.get().ok()?;
-                let source_info = info
-                    .get_source_info()
-                    .expect("capnp: Failed to get source info");
-
-                Some(FileState {
-                    path: PathBuf::from(key),
-                    state: info.get_state().ok()?,
-                    last_modified: source_info.get_last_modified(),
-                    length: source_info.get_length(),
-                    ty: source_info
-                        .get_type()
-                        .expect("Failed to read type in source file info"),
-                })
-            })
-            .collect()
+        let mut stmt = conn
+            .prepare_cached("SELECT path, state, last_modified, length, type FROM dirty_files")
+            .expect("db: Failed to prepare dirty_files query");
+        let mut rows = stmt.query([]).expect("db: Failed to query dirty_files");
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().expect("db: Failed to iterate dirty_files") {
+            let path: String = row.get(0).expect("db: Failed to get path");
+            let state: i64 = row.get(1).expect("db: Failed to get state");
+            let last_modified: i64 = row.get(2).expect("db: Failed to get last_modified");
+            let length: i64 = row.get(3).expect("db: Failed to get length");
+            let file_type: i64 = row.get(4).expect("db: Failed to get type");
+            result.push(FileState {
+                path: PathBuf::from(path),
+                state: file_state_from_i64(state),
+                last_modified: last_modified as u64,
+                length: length as u64,
+                ty: file_type_from_i64(file_type),
+            });
+        }
+        result
     }
 
     // Deletes an item from dirty_files table. This function must be used carefully to avoid a race
     // condition; check that the SourceFileInfo stored in the table matches the file that was read
     // and processed
     pub fn delete_dirty_file_state(&self, txn: &mut RwTransaction, path: &Path) -> bool {
-        let key_str = path.to_string_lossy();
-        let key = key_str.as_bytes();
-
-        queries::delete(txn.conn(), TABLE_DIRTY_FILES, key)
-            .expect("db: Failed to delete entry from dirty_files table")
+        let path_str = path.to_string_lossy();
+        let count = txn
+            .conn()
+            .prepare_cached("DELETE FROM dirty_files WHERE path = ?1")
+            .expect("db: Failed to prepare dirty_files delete")
+            .execute(rusqlite::params![path_str.as_ref()])
+            .expect("db: Failed to delete from dirty_files");
+        count > 0
     }
 
     #[cfg(not(target_os = "macos"))] // FIXME: these tests fail in macos CI
@@ -759,6 +805,7 @@ impl FileTracker {
 #[cfg(not(target_os = "macos"))] // FIXME: these tests fail in macos CI
 #[cfg(test)]
 pub mod tests {
+    const TABLE_DIRTY_FILES: &str = "dirty_files";
 
     use std::{
         fs,

@@ -56,7 +56,13 @@ impl Database {
             "
             -- Simple KV tables (capnp blob values)
             CREATE TABLE IF NOT EXISTS source_files     (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS dirty_files      (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS dirty_files (
+                path TEXT PRIMARY KEY,
+                state INTEGER NOT NULL,
+                last_modified INTEGER NOT NULL,
+                length INTEGER NOT NULL,
+                type INTEGER NOT NULL
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS asset_metadata   (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS path_to_metadata (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS asset_id_to_path (key BLOB PRIMARY KEY, path TEXT NOT NULL) WITHOUT ROWID;
@@ -231,27 +237,6 @@ pub mod queries {
         let mut stmt = conn.prepare_cached(&sql)?;
         stmt.execute([])?;
         Ok(())
-    }
-
-    /// Iterate all rows in a KV table, returning (key, capnp reader) pairs.
-    pub fn iter_all<V: capnp::traits::Owned>(
-        conn: &Connection,
-        table: &str,
-    ) -> Result<Vec<(Vec<u8>, OwnedMessageReader<V>)>> {
-        let sql = format!("SELECT key, value FROM {} ORDER BY key", table);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query([])?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next()? {
-            let key: Vec<u8> = row.get(0)?;
-            let value: Vec<u8> = row.get(1)?;
-            let reader = capnp::serialize::read_message(
-                &mut value.as_slice(),
-                distill_schema::default_capnp_reader_options(),
-            )?;
-            result.push((key, reader.into_typed::<V>()));
-        }
-        Ok(result)
     }
 
 }

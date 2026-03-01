@@ -384,21 +384,6 @@ impl FileAssetSource {
             .expect("db: Failed to get source metadata from path_to_metadata table")
     }
 
-    #[allow(dead_code)]
-    pub fn iter_source_metadata(
-        &self,
-        conn: &Connection,
-    ) -> Vec<(PathBuf, OwnedMessageReader<source_metadata::Owned>)> {
-        queries::iter_all::<source_metadata::Owned>(conn, TABLE_PATH_TO_METADATA)
-            .expect("db: Failed to iterate path_to_metadata table")
-            .into_iter()
-            .filter_map(|(key, value)| {
-                let path = PathBuf::from(str::from_utf8(&key).ok()?);
-                Some((path, value))
-            })
-            .collect()
-    }
-
     fn delete_source_metadata(&self, txn: &mut RwTransaction, path: &Path) -> Vec<AssetUuid> {
         // Get all assets that we know to be located at the given path
         let to_remove: Vec<AssetUuid> = self
