@@ -8,6 +8,7 @@ license.workspace = true
 blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-core = { path = "../distill-core" }
+distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 
 [dev-dependencies]

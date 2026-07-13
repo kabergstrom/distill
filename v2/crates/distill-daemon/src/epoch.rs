@@ -12,12 +12,22 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use distill_asset::ModuleEpochToken;
+use distill_asset::{ModuleEpochPoisonCause, ModuleEpochToken};
+use distill_core::attestation::{
+    validate_bootstrap_authority, validate_bootstrap_logical_authority, BundleFormatVersion,
+};
 pub use distill_core::attestation::{
-    CompiledAttestationDigest, CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
+    BootstrapAuthorityMismatch, CompiledAttestationDigest,
+    CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
 };
 pub use distill_core::target_set::TargetSetHash;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+pub use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1 as HostBootstrapAuthorityV1;
+use distill_schema::ngp_schema::CompilationIdentity;
+pub use distill_store::state::{
+    CleanupDisposition as CandidateCleanupDisposition, PipelinePoison, PipelinePoisonCode,
+    PipelinePoisonOrigin,
+};
 
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
@@ -34,9 +44,7 @@ pub struct ModuleAbiIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleIdentity {
-    /// Canonical §5 compilation-identity record. Kept encoded so the daemon
-    /// compares the exact attestation produced by source-walk.
-    pub compilation: Vec<u8>,
+    pub compilation: CompilationIdentity,
     pub module_abi: ModuleAbiIdentity,
 }
 
@@ -572,54 +580,10 @@ pub trait PipelineModuleLoader {
     ) -> Result<Box<dyn LoadedPipelineModule>, ModuleCallError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PoisonEntryPoint {
-    CandidateOpen,
-    PublishedRuntime,
-}
-
 /// Stable outcome of the explicit teardown attempted for an opened but
 /// unpublished candidate. `CleanedAndClosed` means the candidate failed its
 /// validation but left no resident module state; every other variant means the
 /// complete arena + library bundle was deliberately retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandidateCleanupDisposition {
-    CleanedAndClosed,
-    RegistrationCleanupFailed,
-    ModuleUnloadFailed,
-    TokenPoisoned,
-    TokenPinned,
-    DlcloseFailed,
-}
-
-impl CandidateCleanupDisposition {
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::CleanedAndClosed => "CleanedAndClosed",
-            Self::RegistrationCleanupFailed => "RegistrationCleanupFailed",
-            Self::ModuleUnloadFailed => "ModuleUnloadFailed",
-            Self::TokenPoisoned => "TokenPoisoned",
-            Self::TokenPinned => "TokenPinned",
-            Self::DlcloseFailed => "DlcloseFailed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelinePoison {
-    pub entry_point: PoisonEntryPoint,
-    pub detail: String,
-    pub cleanup_disposition: Option<CandidateCleanupDisposition>,
-}
-
-impl std::fmt::Display for PipelinePoison {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pipeline {:?} poison: {}", self.entry_point, self.detail)
-    }
-}
-
-impl std::error::Error for PipelinePoison {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochStatus {
     pub accepting_new_work: bool,
@@ -659,7 +623,7 @@ struct EpochInner {
 #[derive(Default)]
 struct EpochLifecycle {
     draining: bool,
-    runtime_error: Option<String>,
+    runtime_error: Option<(PipelinePoisonCode, String)>,
     unloaded: bool,
 }
 
@@ -733,7 +697,7 @@ impl PipelineEpoch {
         &self.0.registration
     }
 
-    pub fn try_start_job(&self) -> Result<EpochJobGuard, PipelinePoison> {
+    pub fn try_start_job(&self) -> Result<EpochJobGuard, EpochWorkError> {
         self.0.observe_token_poison();
         if !self.0.accepting.load(Ordering::Acquire) {
             return Err(self.0.rejection());
@@ -758,7 +722,13 @@ impl PipelineEpoch {
     /// thunks. The shared token makes the fence immediately visible to values
     /// and every snapshot that pins this epoch.
     pub fn report_runtime_failure(&self, error: impl Into<String>) {
-        self.0.poison(error.into());
+        self.0
+            .poison(PipelinePoisonCode::PublishedCallbackRejected, error.into());
+    }
+
+    pub fn report_runtime_panic(&self, error: impl Into<String>) {
+        self.0
+            .poison(PipelinePoisonCode::PublishedCallbackPanic, error.into());
     }
 
     pub fn drain_complete(&self) -> bool {
@@ -784,33 +754,43 @@ impl PipelineEpoch {
 
 impl EpochInner {
     fn observe_token_poison(&self) {
-        if self.token.is_poisoned() {
-            self.poison("a module-owned status thunk reported failure".to_owned());
+        if let Some(cause) = self.token.poison_cause() {
+            let (code, detail) = match cause {
+                ModuleEpochPoisonCause::CallbackPanic => (
+                    PipelinePoisonCode::PublishedCallbackPanic,
+                    "a module-owned no-unwind thunk contained a callback panic",
+                ),
+                ModuleEpochPoisonCause::CallbackRejected => (
+                    PipelinePoisonCode::PublishedCallbackRejected,
+                    "a module-owned status thunk returned a rejected status",
+                ),
+            };
+            self.poison(code, detail.to_owned());
         }
     }
 
-    fn poison(&self, detail: String) {
-        self.token.poison();
+    fn poison(&self, code: PipelinePoisonCode, detail: String) {
+        self.token.poison_with(match code {
+            PipelinePoisonCode::PublishedCallbackPanic => ModuleEpochPoisonCause::CallbackPanic,
+            _ => ModuleEpochPoisonCause::CallbackRejected,
+        });
         self.accepting.store(false, Ordering::Release);
         let mut lifecycle = lock_unpoisoned(&self.lifecycle);
         if lifecycle.runtime_error.is_none() {
-            lifecycle.runtime_error = Some(detail);
+            lifecycle.runtime_error = Some((code, detail));
         }
     }
 
-    fn rejection(&self) -> PipelinePoison {
+    fn rejection(&self) -> EpochWorkError {
         let lifecycle = lock_unpoisoned(&self.lifecycle);
         match &lifecycle.runtime_error {
-            Some(detail) => PipelinePoison {
-                entry_point: PoisonEntryPoint::PublishedRuntime,
-                detail: detail.clone(),
-                cleanup_disposition: None,
-            },
-            None => PipelinePoison {
-                entry_point: PoisonEntryPoint::CandidateOpen,
-                detail: "epoch is retired and no longer accepts new work".to_owned(),
-                cleanup_disposition: None,
-            },
+            Some((code, detail)) => EpochWorkError::Poisoned(pipeline_poison(
+                *code,
+                PipelinePoisonOrigin::PublishedRuntime,
+                CandidateCleanupDisposition::PublishedEpochLeaked,
+                detail.clone(),
+            )),
+            None => EpochWorkError::Retired { epoch_id: self.id },
         }
     }
 }
@@ -845,6 +825,12 @@ pub struct EpochJobGuard {
     epoch: Arc<EpochInner>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochWorkError {
+    Poisoned(PipelinePoison),
+    Retired { epoch_id: u64 },
+}
+
 impl Drop for EpochJobGuard {
     fn drop(&mut self) {
         self.epoch.active_jobs.fetch_sub(1, Ordering::AcqRel);
@@ -869,12 +855,13 @@ impl PipelineSnapshot {
             PublishedState::Ready(epoch) => {
                 epoch.0.observe_token_poison();
                 let lifecycle = lock_unpoisoned(&epoch.0.lifecycle);
-                if let Some(detail) = &lifecycle.runtime_error {
-                    Err(PipelinePoison {
-                        entry_point: PoisonEntryPoint::PublishedRuntime,
-                        detail: detail.clone(),
-                        cleanup_disposition: None,
-                    })
+                if let Some((code, detail)) = &lifecycle.runtime_error {
+                    Err(pipeline_poison(
+                        *code,
+                        PipelinePoisonOrigin::PublishedRuntime,
+                        CandidateCleanupDisposition::PublishedEpochLeaked,
+                        detail.clone(),
+                    ))
                 } else {
                     Ok(epoch)
                 }
@@ -893,6 +880,7 @@ pub enum UnloadOutcome {
 
 pub struct ModuleHost {
     state_dir: PathBuf,
+    bootstrap_authority: Option<&'static HostBootstrapAuthorityV1>,
     next_epoch_id: u64,
     published: Option<PublishedState>,
     retired: Vec<PipelineEpoch>,
@@ -904,19 +892,30 @@ impl ModuleHost {
         std::fs::create_dir_all(state_dir.join("modules"))?;
         Ok(Self {
             state_dir,
+            bootstrap_authority: None,
             next_epoch_id: 1,
             published: None,
             retired: Vec::new(),
         })
     }
 
+    pub fn new_with_bootstrap_authority(
+        state_dir: impl AsRef<Path>,
+        bootstrap_authority: &'static HostBootstrapAuthorityV1,
+    ) -> std::io::Result<Self> {
+        let mut host = Self::new(state_dir)?;
+        host.bootstrap_authority = Some(bootstrap_authority);
+        Ok(host)
+    }
+
     pub fn snapshot(&self) -> PipelineSnapshot {
         let state = self.published.clone().unwrap_or_else(|| {
-            PublishedState::Poisoned(PipelinePoison {
-                entry_point: PoisonEntryPoint::CandidateOpen,
-                detail: "no pipeline epoch has been published".to_owned(),
-                cleanup_disposition: None,
-            })
+            PublishedState::Poisoned(pipeline_poison(
+                PipelinePoisonCode::CandidateOpen,
+                PipelinePoisonOrigin::CandidateOpen,
+                CandidateCleanupDisposition::None,
+                "no pipeline epoch has been published",
+            ))
         });
         PipelineSnapshot { state }
     }
@@ -931,23 +930,42 @@ impl ModuleHost {
         loader: &mut dyn PipelineModuleLoader,
     ) -> Result<PipelineEpoch, PipelinePoison> {
         let id = self.mint_epoch_id();
-        let target_set = match validate_requirements(&mut requirements) {
+        let Some(bootstrap_authority) = self.bootstrap_authority else {
+            return Err(self.publish_candidate_poison(
+                PipelinePoisonCode::CandidateValidation,
+                "host has no decoded, DSCI-keyed bootstrap-control authority".to_owned(),
+            ));
+        };
+        let target_set = match validate_requirements(&mut requirements, bootstrap_authority) {
             Ok(target_set) => target_set,
-            Err(error) => return Err(self.publish_candidate_poison(error)),
+            Err(error) => {
+                return Err(
+                    self.publish_candidate_poison(PipelinePoisonCode::CandidateValidation, error)
+                )
+            }
         };
         let staged = match self.stage_copy(id, source) {
             Ok(staged) => staged,
-            Err(error) => return Err(self.publish_candidate_poison(error)),
+            Err(error) => {
+                return Err(self.publish_candidate_poison(PipelinePoisonCode::CandidateOpen, error))
+            }
         };
         if let Err(error) = CodeLoadingPolicy::authorize(CodeLoadRequest::HostPipelineModule {
             staged_copy: true,
             content_hash: Some(staged.content_hash),
         }) {
-            return Err(self.publish_candidate_poison(error.to_string()));
+            return Err(
+                self.publish_candidate_poison(PipelinePoisonCode::CandidateOpen, error.to_string())
+            );
         }
         let mut module = match boundary_call("open", || loader.open_staged(&staged)) {
             Ok(module) => module,
-            Err(error) => return Err(self.publish_candidate_poison(error.to_string())),
+            Err(error) => {
+                return Err(self.publish_candidate_poison(
+                    PipelinePoisonCode::CandidateOpen,
+                    error.to_string(),
+                ))
+            }
         };
 
         // Mint ownership immediately after open, before any probe can reach a
@@ -956,18 +974,27 @@ impl ModuleHost {
         let token = ModuleEpochToken::new(id);
         let mut registration_arena = CandidateRegistrationArena::new(token.clone());
 
-        let validation =
-            validate_open_module(module.as_mut(), &requirements, &mut registration_arena);
+        let validation = validate_open_module(
+            module.as_mut(),
+            &requirements,
+            bootstrap_authority,
+            &mut registration_arena,
+        );
         let registration = match validation {
             Ok(registration) => registration,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
-                return Err(self.publish_candidate_poison_with_cleanup(error, cleanup));
+                return Err(self.publish_candidate_poison_with_cleanup(
+                    error.code,
+                    error.detail,
+                    cleanup,
+                ));
             }
         };
         if token.is_poisoned() {
             let cleanup = discard_candidate(module, registration_arena);
             return Err(self.publish_candidate_poison_with_cleanup(
+                PipelinePoisonCode::CandidateRegistration,
                 "candidate token was poisoned during registration".to_owned(),
                 cleanup,
             ));
@@ -1018,11 +1045,14 @@ impl ModuleHost {
                     self.retired.remove(index);
                 }
                 Err(error) => {
-                    epoch.0.poison(format!(
-                        "epoch cleanup disposition={}: {}",
-                        error.disposition.code(),
-                        error.detail
-                    ));
+                    epoch.0.poison(
+                        PipelinePoisonCode::PublishedCleanup,
+                        format!(
+                            "epoch cleanup disposition={}: {}",
+                            cleanup_disposition_name(error.disposition),
+                            error.detail
+                        ),
+                    );
                     outcomes.push(UnloadOutcome::LeakedPoisoned(id));
                     index += 1;
                 }
@@ -1033,6 +1063,18 @@ impl ModuleHost {
 
     pub fn retired_count(&self) -> usize {
         self.retired.len()
+    }
+
+    pub fn retired_poison(&self, id: u64) -> Option<PipelinePoison> {
+        let epoch = self.retired.iter().find(|epoch| epoch.id() == id)?;
+        let lifecycle = lock_unpoisoned(&epoch.0.lifecycle);
+        let (code, message) = lifecycle.runtime_error.as_ref()?;
+        Some(pipeline_poison(
+            *code,
+            PipelinePoisonOrigin::PublishedRuntime,
+            CandidateCleanupDisposition::PublishedEpochLeaked,
+            message.clone(),
+        ))
     }
 
     fn mint_epoch_id(&mut self) -> u64 {
@@ -1064,33 +1106,40 @@ impl ModuleHost {
         })
     }
 
-    fn publish_candidate_poison(&mut self, detail: String) -> PipelinePoison {
-        self.publish_candidate_poison_with_optional_cleanup(detail, None)
+    fn publish_candidate_poison(
+        &mut self,
+        code: PipelinePoisonCode,
+        detail: String,
+    ) -> PipelinePoison {
+        self.publish_candidate_poison_record(code, detail, CandidateCleanupDisposition::None)
     }
 
     fn publish_candidate_poison_with_cleanup(
         &mut self,
+        initiating_code: PipelinePoisonCode,
         detail: String,
         cleanup: CandidateCleanup,
     ) -> PipelinePoison {
         let detail = format!(
             "{detail}; candidate cleanup disposition={}: {}",
-            cleanup.disposition.code(),
+            cleanup_disposition_name(cleanup.disposition),
             cleanup.detail
         );
-        self.publish_candidate_poison_with_optional_cleanup(detail, Some(cleanup.disposition))
+        let code = if cleanup.disposition == CandidateCleanupDisposition::CleanedAndClosed {
+            initiating_code
+        } else {
+            PipelinePoisonCode::CandidateCleanup
+        };
+        self.publish_candidate_poison_record(code, detail, cleanup.disposition)
     }
 
-    fn publish_candidate_poison_with_optional_cleanup(
+    fn publish_candidate_poison_record(
         &mut self,
+        code: PipelinePoisonCode,
         detail: String,
-        cleanup_disposition: Option<CandidateCleanupDisposition>,
+        cleanup: CandidateCleanupDisposition,
     ) -> PipelinePoison {
-        let poison = PipelinePoison {
-            entry_point: PoisonEntryPoint::CandidateOpen,
-            detail,
-            cleanup_disposition,
-        };
+        let poison = pipeline_poison(code, PipelinePoisonOrigin::CandidateOpen, cleanup, detail);
         self.retire_published_ready();
         self.published = Some(PublishedState::Poisoned(poison.clone()));
         poison
@@ -1106,7 +1155,14 @@ impl ModuleHost {
 
 fn validate_requirements(
     requirements: &mut CandidateRequirements,
+    bootstrap_authority: &HostBootstrapAuthorityV1,
 ) -> Result<CanonicalTargetSet, String> {
+    if &requirements.identity.compilation != bootstrap_authority.compilation_identity() {
+        return Err(
+            "candidate CompilationIdentity does not match the host bootstrap resource DSCI"
+                .to_owned(),
+        );
+    }
     validate_candidate_linkage(&requirements.native_dependencies)
         .map_err(|error| error.to_string())?;
     if requirements.identity.module_abi.panic_strategy != "unwind" {
@@ -1124,6 +1180,17 @@ fn validate_requirements(
         return Err("expected measured-layout table contains a duplicate type".to_owned());
     }
     validate_compiled_table(&requirements.compiled_types, "expected")?;
+    validate_bootstrap_logical_authority(
+        &requirements.compiled_types.rows,
+        BundleFormatVersion::V1,
+    )
+    .map_err(|error| format!("expected bootstrap-control authority invalid: {error}"))?;
+    validate_bootstrap_authority(
+        &requirements.compiled_types.rows,
+        bootstrap_authority.table(),
+        BundleFormatVersion::V1,
+    )
+    .map_err(|error| format!("expected bootstrap-control authority mismatch: {error}"))?;
     let canonical_targets = CanonicalTargetSet::canonical(
         requirements
             .targets
@@ -1149,43 +1216,86 @@ fn validate_requirements(
 fn validate_open_module(
     module: &mut dyn LoadedPipelineModule,
     requirements: &CandidateRequirements,
+    bootstrap_authority: &HostBootstrapAuthorityV1,
     registration_arena: &mut CandidateRegistrationArena,
-) -> Result<RegistrationSet, String> {
-    let identity =
-        boundary_call("identity", || module.identity()).map_err(|error| error.to_string())?;
+) -> Result<RegistrationSet, CandidatePhaseError> {
+    let identity = boundary_call("identity", || module.identity())
+        .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
     if identity != requirements.identity {
-        return Err("module compilation/interface identity mismatch".to_owned());
+        return Err(CandidatePhaseError::attestation(
+            "module compilation/interface identity mismatch",
+        ));
     }
     let mut layouts = boundary_call("measured_layouts", || module.measured_layouts())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
     layouts.sort();
     if layouts != requirements.measured_layouts {
-        return Err(measured_layout_error(
+        return Err(CandidatePhaseError::attestation(measured_layout_error(
             &requirements.measured_layouts,
             &layouts,
-        ));
+        )));
     }
     let compiled_types = boundary_call("compiled_types", || module.compiled_types())
-        .map_err(|error| error.to_string())?;
-    validate_compiled_table(&compiled_types, "module")?;
+        .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
+    validate_compiled_table(&compiled_types, "module").map_err(CandidatePhaseError::attestation)?;
+    validate_bootstrap_logical_authority(&compiled_types.rows, BundleFormatVersion::V1).map_err(
+        |error| {
+            CandidatePhaseError::attestation(format!(
+                "module bootstrap-control authority invalid: {error}"
+            ))
+        },
+    )?;
+    validate_bootstrap_authority(
+        &compiled_types.rows,
+        bootstrap_authority.table(),
+        BundleFormatVersion::V1,
+    )
+    .map_err(|error| {
+        CandidatePhaseError::attestation(format!(
+            "module bootstrap-control authority mismatch: {error}"
+        ))
+    })?;
     if compiled_types != requirements.compiled_types {
-        return Err(compiled_type_error(
+        return Err(CandidatePhaseError::attestation(compiled_type_error(
             &requirements.compiled_types.rows,
             &compiled_types.rows,
-        ));
+        )));
     }
     let registration_result = boundary_call("register", || {
         module.register(&requirements.targets, registration_arena)
     });
     if let Some(rejected) = registration_arena.rejected() {
-        return Err(format!(
+        return Err(CandidatePhaseError::registration(format!(
             "host latched rejected registration even though module registration returned: {rejected}"
-        ));
+        )));
     }
-    let pipeline_targets = registration_result.map_err(|error| error.to_string())?;
+    let pipeline_targets = registration_result
+        .map_err(|error| CandidatePhaseError::registration(error.to_string()))?;
     let registration = registration_arena.registration_set(pipeline_targets);
-    validate_registration(&registration, &requirements.targets)?;
+    validate_registration(&registration, &requirements.targets)
+        .map_err(CandidatePhaseError::registration)?;
     Ok(registration)
+}
+
+struct CandidatePhaseError {
+    code: PipelinePoisonCode,
+    detail: String,
+}
+
+impl CandidatePhaseError {
+    fn attestation(detail: impl Into<String>) -> Self {
+        Self {
+            code: PipelinePoisonCode::CandidateAttestation,
+            detail: detail.into(),
+        }
+    }
+
+    fn registration(detail: impl Into<String>) -> Self {
+        Self {
+            code: PipelinePoisonCode::CandidateRegistration,
+            detail: detail.into(),
+        }
+    }
 }
 
 fn measured_layout_error(expected: &[MeasuredLayout], actual: &[MeasuredLayout]) -> String {
@@ -1291,6 +1401,29 @@ fn boundary_call<T>(
 ) -> Result<T, ModuleCallError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
         .map_err(|_| ModuleCallError::boundary_panic(operation))?
+}
+
+fn pipeline_poison(
+    code: PipelinePoisonCode,
+    origin: PipelinePoisonOrigin,
+    cleanup: CandidateCleanupDisposition,
+    message: impl Into<String>,
+) -> PipelinePoison {
+    PipelinePoison::new(code, origin, cleanup, message)
+        .expect("daemon emits only the closed DSPP code/origin/cleanup matrix")
+}
+
+const fn cleanup_disposition_name(disposition: CandidateCleanupDisposition) -> &'static str {
+    match disposition {
+        CandidateCleanupDisposition::None => "None",
+        CandidateCleanupDisposition::CleanedAndClosed => "CleanedAndClosed",
+        CandidateCleanupDisposition::RegistrationCleanupFailed => "RegistrationCleanupFailed",
+        CandidateCleanupDisposition::ModuleUnloadFailed => "ModuleUnloadFailed",
+        CandidateCleanupDisposition::TokenPoisoned => "TokenPoisoned",
+        CandidateCleanupDisposition::TokenPinned => "TokenPinned",
+        CandidateCleanupDisposition::DlcloseFailed => "DlcloseFailed",
+        CandidateCleanupDisposition::PublishedEpochLeaked => "PublishedEpochLeaked",
+    }
 }
 
 struct CandidateCleanup {
