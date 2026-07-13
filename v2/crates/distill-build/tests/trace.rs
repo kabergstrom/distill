@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
+use distill_build::dslf::{DslfError, DslfV1};
 use distill_build::query::AssetQuery;
 use distill_build::trace::*;
 use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_migrate::FieldPath;
 
 #[derive(Default)]
 struct Snapshot {
@@ -130,24 +132,102 @@ fn failure_cause_grammar_is_checked() {
 
 #[test]
 fn local_failure_details_are_dslf_domain_separated_typed_facts() {
-    let a = local_failure_fingerprint(LocalFailureClass::Validator, |e| {
-        e.u16(4);
-        e.str("field");
-    });
-    let b = local_failure_fingerprint(LocalFailureClass::Validator, |e| {
-        e.u16(4);
-        e.str("field");
-    });
-    let changed = local_failure_fingerprint(LocalFailureClass::Validator, |e| {
-        e.u16(5);
-        e.str("field");
-    });
+    let facts = DslfV1::Validator {
+        asset: AssetUuid([1; 16]),
+        type_uuid: TypeUuid([2; 16]),
+        error_paths: vec![FieldPath::of(&["field"])],
+    };
+    let a = local_failure_fingerprint(&facts).unwrap();
+    let b = local_failure_fingerprint(&facts).unwrap();
+    let changed = local_failure_fingerprint(&DslfV1::Validator {
+        asset: AssetUuid([1; 16]),
+        type_uuid: TypeUuid([2; 16]),
+        error_paths: vec![FieldPath::of(&["other"])],
+    })
+    .unwrap();
     assert_eq!(a, b);
     assert_ne!(a, changed);
     let StableFailureFingerprint::Local { detail, .. } = a else {
         unreachable!()
     };
     assert_ne!(detail, *blake3::hash(b"field").as_bytes());
+}
+
+#[test]
+fn dslf_processor_bytes_pin_class_width_field_order_and_framing() {
+    let facts = DslfV1::Processor {
+        asset: AssetUuid([0x11; 16]),
+        processor_id: "p".into(),
+        processor_version: 0x0403_0201,
+        stage: 0x0605,
+        build_error_code: 0x0a09_0807,
+    };
+    let StableFailureFingerprint::Local { class, detail } =
+        local_failure_fingerprint(&facts).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(class, LocalFailureClass::Processor);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"DSLF");
+    bytes.push(1);
+    bytes.extend_from_slice(&3u16.to_le_bytes());
+    bytes.extend_from_slice(&[0x11; 16]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'p');
+    bytes.extend_from_slice(&0x0403_0201u32.to_le_bytes());
+    bytes.extend_from_slice(&0x0605u16.to_le_bytes());
+    bytes.extend_from_slice(&0x0a09_0807u32.to_le_bytes());
+    assert_eq!(detail, *blake3::hash(&bytes).as_bytes());
+}
+
+#[test]
+fn dslf_canonicalizes_declared_sets_but_retains_validator_multiplicity() {
+    let a = AssetUuid([1; 16]);
+    let b = AssetUuid([2; 16]);
+    let migration = |edges| DslfV1::MigrationPlan {
+        type_uuid: TypeUuid([3; 16]),
+        from: LogicalHash([4; 32]),
+        to: LogicalHash([5; 32]),
+        failure: distill_build::dslf::MigrationPlanFailureV1::AmbiguousEdge {
+            conflicting_edges: edges,
+        },
+    };
+    assert_eq!(
+        migration(vec![b, a, b]).digest().unwrap(),
+        migration(vec![a, b]).digest().unwrap()
+    );
+
+    let validator = |paths| DslfV1::Validator {
+        asset: a,
+        type_uuid: TypeUuid([6; 16]),
+        error_paths: paths,
+    };
+    let one = FieldPath::of(&["a"]);
+    let two = FieldPath::of(&["b"]);
+    assert_eq!(
+        validator(vec![two.clone(), one.clone()]).digest().unwrap(),
+        validator(vec![one.clone(), two]).digest().unwrap()
+    );
+    assert_ne!(
+        validator(vec![one.clone(), one.clone()]).digest().unwrap(),
+        validator(vec![one]).digest().unwrap()
+    );
+}
+
+#[test]
+fn dslf_rejects_duplicate_importer_sources() {
+    let source = distill_build::query::RootedPath::new("assets", "same.src").unwrap();
+    let facts = DslfV1::Importer {
+        importer_id: "gltf".into(),
+        importer_error_code: 7,
+        sources: vec![source.clone(), source.clone()],
+    };
+    assert_eq!(
+        facts.digest(),
+        Err(DslfError::DuplicateImporterSource(source))
+    );
 }
 
 #[test]

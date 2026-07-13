@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod codegen;
+pub mod dslf;
 pub mod import;
 pub mod keys;
 pub mod outputs;

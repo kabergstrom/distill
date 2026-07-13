@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_json::AuthoredValue;
 
+use crate::dslf::DslfV1;
 use crate::query::{
     file_query_result_hash, normalize_identifier, normalize_path, FileQuery, IntakeError, RootName,
     RootedPath,
@@ -64,18 +65,27 @@ pub struct ImportError {
 }
 
 pub struct ImportContext<'a, B: ImportBackend + ?Sized> {
+    importer_id: String,
     sources: Vec<RootedPath>,
     backend: &'a mut B,
     read_set: Vec<FileDep>,
 }
 
 impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
-    pub fn new(sources: Vec<RootedPath>, backend: &'a mut B) -> Self {
-        Self {
+    pub fn new(
+        importer_id: &str,
+        mut sources: Vec<RootedPath>,
+        backend: &'a mut B,
+    ) -> Result<Self, IntakeError> {
+        let importer_id = normalize_identifier(importer_id)?;
+        sources.sort_unstable();
+        sources.dedup();
+        Ok(Self {
+            importer_id,
             sources,
             backend,
             read_set: Vec::new(),
-        }
+        })
     }
 
     pub fn sources(&self) -> &[RootedPath] {
@@ -89,7 +99,7 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
     }
 
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, ImportError> {
-        let path = normalize_path(path).map_err(intake_failure)?;
+        let path = normalize_path(path).map_err(|error| self.intake_failure(error))?;
         match self.backend.read(&path) {
             Ok((rooted, bytes)) => {
                 let observed = FileContentObservation {
@@ -117,7 +127,7 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
     }
 
     pub fn probe(&mut self, path: &str) -> Result<bool, ImportError> {
-        let path = normalize_path(path).map_err(intake_failure)?;
+        let path = normalize_path(path).map_err(|error| self.intake_failure(error))?;
         match self.backend.probe(&path) {
             Ok(root) => {
                 let exists = root.is_some();
@@ -171,7 +181,7 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
     }
 
     pub fn importer_capability(&mut self, id: &str) -> Result<[u8; 32], ImportError> {
-        let id = normalize_identifier(id).map_err(intake_failure)?;
+        let id = normalize_identifier(id).map_err(|error| self.intake_failure(error))?;
         let key = CapabilityKey::Importer(id);
         match self.backend.capability(&key) {
             Some(hash) => {
@@ -193,6 +203,27 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
             }
         }
     }
+
+    fn intake_failure(&self, error: IntakeError) -> ImportError {
+        let error_code = match error {
+            IntakeError::EmptyIdentifier => 1,
+            IntakeError::IdentifierTooLong => 2,
+            IntakeError::Nul => 3,
+            IntakeError::InvalidPath => 4,
+            IntakeError::EmptyQuery => 5,
+            IntakeError::BundleRelativeWithoutOrigin => 6,
+            IntakeError::InvalidGlob(_) => 7,
+        };
+        let facts = DslfV1::Importer {
+            importer_id: self.importer_id.clone(),
+            importer_error_code: error_code,
+            sources: self.sources.clone(),
+        };
+        ImportError {
+            fingerprint: local_failure_fingerprint(&facts)
+                .expect("ImportContext canonicalizes its source set"),
+        }
+    }
 }
 
 fn raw_failure(
@@ -201,15 +232,6 @@ fn raw_failure(
     class: RawFileFailureClass,
 ) -> StableFailureFingerprint {
     StableFailureFingerprint::RawFile { op, subject, class }
-}
-
-fn intake_failure(_: IntakeError) -> ImportError {
-    ImportError {
-        fingerprint: local_failure_fingerprint(
-            crate::trace::LocalFailureClass::Processor,
-            |encoder| encoder.u16(1), // invalid normalized import input
-        ),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

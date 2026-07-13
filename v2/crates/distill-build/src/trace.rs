@@ -1,8 +1,10 @@
 //! Outcome-bearing build/import traces and verifying-trace lookup (§§8–10).
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSLF, DSTR};
+use distill_core::canonical::{CanonicalEncoder, DSTR};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 
+pub use crate::dslf::LocalFailureClass;
+use crate::dslf::{DslfError, DslfV1};
 use crate::query::{AssetQuery, FileQuery};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -16,19 +18,6 @@ pub enum ToolErrorClass {
     NotExecutable,
     MissingInterpreter,
     SpawnDenied,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u16)]
-pub enum LocalFailureClass {
-    Validator = 1,
-    MigrationPlan = 2,
-    Processor = 3,
-    MigrationFunction = 4,
-    OutputBinding = 5,
-    Importer = 6,
-    ImportIntake = 7,
-    ArtifactEncoding = 8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -275,19 +264,13 @@ pub enum FailureCause {
     Local(StableFailureFingerprint),
 }
 
-/// Construct a local stable fingerprint from typed canonical facts. Human
-/// presentation text is deliberately not accepted by this API.
-pub fn local_failure_fingerprint(
-    class: LocalFailureClass,
-    facts: impl FnOnce(&mut CanonicalEncoder),
-) -> StableFailureFingerprint {
-    StableFailureFingerprint::Local {
-        class,
-        detail: domain_digest(DSLF, 1, |encoder| {
-            encoder.u16(class as u16);
-            facts(encoder);
-        }),
-    }
+/// Construct a local stable fingerprint from the closed DSLF v1 grammar.
+/// Human presentation text and optional catch-all fact bags are impossible.
+pub fn local_failure_fingerprint(facts: &DslfV1) -> Result<StableFailureFingerprint, DslfError> {
+    Ok(StableFailureFingerprint::Local {
+        class: facts.class(),
+        detail: facts.digest()?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -34,7 +34,7 @@ fn failed_raw_operations_and_capability_misses_are_recorded() {
     fs.reads.push_back(Err(RawFileFailureClass::NotFound));
     fs.listings
         .push_back(Err(RawFileFailureClass::ListingFailed));
-    let mut ctx = ImportContext::new(vec![], &mut fs);
+    let mut ctx = ImportContext::new("test-importer", vec![], &mut fs).unwrap();
     assert!(ctx.read("missing.png").is_err());
     let query = FileQuery::new(Some("textures".into()), None).unwrap();
     assert!(ctx.enumerate(&query).is_err());
@@ -69,7 +69,7 @@ fn successful_read_records_root_and_raw_byte_hash() {
     let rooted = RootedPath::new("assets", "a.bin").unwrap();
     let mut fs = Fs::default();
     fs.reads.push_back(Ok((rooted.clone(), b"abc".to_vec())));
-    let mut ctx = ImportContext::new(vec![rooted.clone()], &mut fs);
+    let mut ctx = ImportContext::new("test-importer", vec![rooted.clone()], &mut fs).unwrap();
     assert_eq!(ctx.sources(), &[rooted]);
     assert_eq!(ctx.read("a.bin").unwrap(), b"abc");
     match &ctx.read_set()[0] {
