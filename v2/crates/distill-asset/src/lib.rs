@@ -19,6 +19,7 @@ pub mod reflect;
 pub mod thunks;
 pub mod types;
 
+pub use build::RegistryExtrasBuilder;
 pub use defaults::{
     default_table, AssetDefaults, DefaultCollector, DefaultNode, DefaultTable, DefaultWriter,
     PathStep, SchemaNodeId,
@@ -40,6 +41,11 @@ pub use distill_wire::native::{
     SkipDefaultId, SkipEntry, SkipWriterTable,
 };
 
+pub use distill_core::attestation::{
+    CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable, ControlRole, ReferenceStrength,
+    RegistryExtraFact, RegistryExtraRow, RegistryExtrasDigest, RegistryExtrasV1, RegistryPathStep,
+    SchemaNodeId as RegistrySchemaNodeId,
+};
 pub use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 pub use distill_json::AuthoredValue;
 

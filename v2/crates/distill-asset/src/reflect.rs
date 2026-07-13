@@ -11,7 +11,9 @@ use distill_json::AuthoredValue;
 use distill_wire::exec::Blob;
 use distill_wire::native::{NativeLayoutNode, ScalarKind};
 
-use crate::build::{checked_align, checked_len, checked_size, LayoutBuilder, LogicalBuilder};
+use crate::build::{
+    checked_align, checked_len, checked_size, LayoutBuilder, LogicalBuilder, RegistryExtrasBuilder,
+};
 use crate::defaults::{DefaultCollector, DefaultWriter, PathStep};
 use crate::hasher::DeterministicState;
 use crate::types::{AssetRef, EncodeContainer, EncodeSink, WeakAssetRef};
@@ -28,6 +30,14 @@ pub trait AssetReflect: 'static {
     fn logical(builder: &mut LogicalBuilder);
     fn encode(&self, sink: &mut dyn EncodeSink);
     fn to_authored(&self) -> AuthoredValue;
+
+    /// Add facts not established by DSNL to the typed DSRE projection.
+    fn collect_registry_extras(
+        _builder: &mut RegistryExtrasBuilder,
+        _owner: distill_core::attestation::SchemaNodeId,
+        _path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+    }
 
     fn default_writer() -> Option<DefaultWriter> {
         None
@@ -67,6 +77,18 @@ fn collect_map_defaults<P: 'static, K: AssetReflect, V: AssetReflect>(
         collector.add(node, vec![PathStep::MapValue], writer);
     }
     V::collect_default_nodes(collector);
+}
+
+fn collect_registry_child<T: AssetReflect>(
+    builder: &mut RegistryExtrasBuilder,
+    owner: distill_core::attestation::SchemaNodeId,
+    mut path: Vec<distill_core::attestation::RegistryPathStep>,
+    step: Option<distill_core::attestation::RegistryPathStep>,
+) {
+    if let Some(step) = step {
+        path.push(step);
+    }
+    T::collect_registry_extras(builder, owner, path);
 }
 
 fn scalar<T>(offset: u32, kind: ScalarKind) -> NativeLayoutNode {
@@ -265,6 +287,17 @@ impl AssetReflect for Blob {
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Blob(self.as_bytes().to_vec())
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        builder.fact(
+            owner,
+            path,
+            distill_core::attestation::RegistryExtraFact::Blob,
+        );
+    }
 }
 
 impl<T: AssetReflect> AssetReflect for Vec<T> {
@@ -301,6 +334,18 @@ impl<T: AssetReflect> AssetReflect for Vec<T> {
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::Elem),
+        );
+    }
 }
 
 impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
@@ -334,6 +379,18 @@ impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
     }
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
+    }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::Elem),
+        );
     }
 }
 
@@ -395,6 +452,18 @@ impl<T: AssetReflect> AssetReflect for Option<T> {
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::Elem),
+        );
+    }
 }
 
 impl<T: AssetReflect> AssetReflect for Box<T> {
@@ -425,6 +494,13 @@ impl<T: AssetReflect> AssetReflect for Box<T> {
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, Vec::new());
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(builder, owner, path, None);
+    }
 }
 
 impl<T: AssetReflect> AssetReflect for Arc<T> {
@@ -454,6 +530,13 @@ impl<T: AssetReflect> AssetReflect for Arc<T> {
     }
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, Vec::new());
+    }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(builder, owner, path, None);
     }
 }
 
@@ -490,6 +573,18 @@ where
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::Elem),
+        );
+    }
 }
 
 impl<T> AssetReflect for BTreeSet<T>
@@ -523,6 +618,18 @@ where
     }
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
+    }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<T>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::Elem),
+        );
     }
 }
 
@@ -565,6 +672,24 @@ where
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_map_defaults::<Self, K, V>(collector);
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<K>(
+            builder,
+            owner,
+            path.clone(),
+            Some(distill_core::attestation::RegistryPathStep::MapKey),
+        );
+        collect_registry_child::<V>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::MapValue),
+        );
+    }
 }
 
 impl<K, V> AssetReflect for BTreeMap<K, V>
@@ -604,6 +729,24 @@ where
     fn collect_default_nodes(collector: &mut DefaultCollector) {
         collect_map_defaults::<Self, K, V>(collector);
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        collect_registry_child::<K>(
+            builder,
+            owner,
+            path.clone(),
+            Some(distill_core::attestation::RegistryPathStep::MapKey),
+        );
+        collect_registry_child::<V>(
+            builder,
+            owner,
+            path,
+            Some(distill_core::attestation::RegistryPathStep::MapValue),
+        );
+    }
 }
 
 impl<T: AssetType> AssetReflect for AssetRef<T> {
@@ -635,6 +778,20 @@ impl<T: AssetType> AssetReflect for AssetRef<T> {
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Str(self.uuid().to_string())
     }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        builder.fact(
+            owner,
+            path,
+            distill_core::attestation::RegistryExtraFact::Reference {
+                strength: distill_core::attestation::ReferenceStrength::Strong,
+                target: T::TYPE_UUID,
+            },
+        );
+    }
 }
 
 impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
@@ -650,6 +807,20 @@ impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
     }
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Str(self.uuid().to_string())
+    }
+    fn collect_registry_extras(
+        builder: &mut RegistryExtrasBuilder,
+        owner: distill_core::attestation::SchemaNodeId,
+        path: Vec<distill_core::attestation::RegistryPathStep>,
+    ) {
+        builder.fact(
+            owner,
+            path,
+            distill_core::attestation::RegistryExtraFact::Reference {
+                strength: distill_core::attestation::ReferenceStrength::Weak,
+                target: T::TYPE_UUID,
+            },
+        );
     }
 }
 

@@ -27,6 +27,8 @@ pub const DSSL: [u8; 4] = *b"DSSL";
 pub const DSLP: [u8; 4] = *b"DSLP";
 /// Compiled full semantic attestation (§3, §5).
 pub const DSCA: [u8; 4] = *b"DSCA";
+/// One type's canonical RegistryExtras v1 row table (§3, §5).
+pub const DSRE: [u8; 4] = *b"DSRE";
 /// Typed local deterministic-failure detail (§5, §9).
 pub const DSLF: [u8; 4] = *b"DSLF";
 /// Typed configuration-poison reason facts (§5, §13, §17).

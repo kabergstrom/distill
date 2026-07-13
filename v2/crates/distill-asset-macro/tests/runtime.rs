@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 use std::mem::{align_of, size_of};
 
 use distill_asset::{
-    default_table, AssetHashMap, AssetReflect, AssetType, EncodeContainer, EncodeSink, PathStep,
+    default_table, AssetHashMap, AssetReflect, AssetType, Blob, EncodeContainer, EncodeSink,
+    PathStep,
 };
+use distill_core::attestation::{ReferenceStrength, RegistryExtraFact, RegistryPathStep};
 use distill_core::id::{AssetUuid, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_wire::dsnl::dsnl_hash;
@@ -81,6 +83,21 @@ struct SkipShapeB {
     value: u32,
     #[asset(skip)]
     cache: SkipB,
+}
+
+#[distill_asset_macro::asset(uuid = "40000000-0000-4000-8000-000000000001")]
+struct ReferenceTarget {
+    value: u32,
+}
+
+#[distill_asset_macro::asset(uuid = "40000000-0000-4000-8000-000000000002", build_only)]
+struct SemanticFacts {
+    strong: distill_asset::AssetRef<ReferenceTarget>,
+    weak: distill_asset::WeakAssetRef<ReferenceTarget>,
+    #[asset(blob)]
+    payload: Blob,
+    #[asset(tag)]
+    label: String,
 }
 
 #[derive(Default)]
@@ -257,4 +274,55 @@ fn fixup_identity_commits_to_nominal_skip_table_assignments() {
     let b = SkipShapeB::descriptor();
     assert_eq!(a.layout_digest, b.layout_digest);
     assert_ne!(a.fixup_identity, b.fixup_identity);
+}
+
+#[test]
+fn descriptor_exposes_typed_complete_registry_facts_and_finite_backrefs() {
+    let descriptor = SemanticFacts::descriptor();
+    let row = descriptor.compiled_type;
+    assert_eq!(row.type_uuid, descriptor.type_uuid);
+    assert_eq!(row.logical_hash, descriptor.logical_hash);
+    assert_eq!(row.native_layout_digest, descriptor.layout_digest);
+    assert!(row.build_only);
+    row.validate().unwrap();
+
+    let fact_at = |field: &str| {
+        row.registry_extras
+            .rows
+            .iter()
+            .find(|row| row.path == vec![RegistryPathStep::Field(field.to_owned())])
+    };
+    assert!(matches!(
+        fact_at("strong").map(|row| &row.fact),
+        Some(RegistryExtraFact::Reference {
+            strength: ReferenceStrength::Strong,
+            target,
+        }) if *target == ReferenceTarget::TYPE_UUID
+    ));
+    assert!(matches!(
+        fact_at("weak").map(|row| &row.fact),
+        Some(RegistryExtraFact::Reference {
+            strength: ReferenceStrength::Weak,
+            target,
+        }) if *target == ReferenceTarget::TYPE_UUID
+    ));
+    assert!(matches!(
+        fact_at("payload").map(|row| &row.fact),
+        Some(RegistryExtraFact::Blob)
+    ));
+    assert!(matches!(
+        fact_at("label").map(|row| &row.fact),
+        Some(RegistryExtraFact::Tag)
+    ));
+    assert!(row
+        .registry_extras
+        .rows
+        .iter()
+        .any(|row| matches!(row.fact, RegistryExtraFact::BuildOnly(true))));
+
+    let recursive = Recursive::descriptor().compiled_type;
+    assert!(recursive.registry_extras.rows.len() < 8);
+    assert!(recursive.registry_extras.rows.iter().any(
+        |row| matches!(row.fact, RegistryExtraFact::BackReference { target } if target.0 == 0)
+    ));
 }
