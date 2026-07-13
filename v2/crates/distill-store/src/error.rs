@@ -54,6 +54,29 @@ pub enum StoreError {
         requested: distill_core::id::LogicalHash,
         candidate: Option<distill_core::id::LogicalHash>,
     },
+    /// Retirement requires the pending candidate to omit the type entirely.
+    SchemaCandidateRetirementMismatch {
+        type_uuid: distill_core::id::TypeUuid,
+        candidate: Option<distill_core::id::LogicalHash>,
+    },
+    /// Reactivation requires the pending candidate to include the type.
+    SchemaCandidateReactivationMismatch {
+        type_uuid: distill_core::id::TypeUuid,
+    },
+    /// Retirement cannot strand authored entries or migration endpoints.
+    SchemaRetirementBlocked {
+        type_uuid: distill_core::id::TypeUuid,
+        live_assets: u64,
+        live_migration_endpoints: usize,
+    },
+    /// An explicit authority command named a row in an ineligible state.
+    InvalidAuthorityTransition {
+        type_uuid: distill_core::id::TypeUuid,
+        detail: String,
+    },
+    /// Target-set rows/digest were forged or non-canonical. The store
+    /// recomputes DSTS at every publication and schema command.
+    InvalidTargetSet(distill_core::target_set::TargetSetError),
     /// Once initialized, authoritative lineage changes may only occur
     /// through candidate-bound accept or rollback APIs.
     LineageMutationRequiresCandidate,
@@ -196,6 +219,31 @@ impl fmt::Display for StoreError {
                     "schema command requests cursor {requested} for {type_uuid}, but candidate has no such registry row"
                 ),
             },
+            StoreError::SchemaCandidateRetirementMismatch {
+                type_uuid,
+                candidate,
+            } => write!(
+                f,
+                "schema retirement for {type_uuid} requires candidate omission, got {candidate:?}"
+            ),
+            StoreError::SchemaCandidateReactivationMismatch { type_uuid } => write!(
+                f,
+                "schema reactivation for {type_uuid} requires the pending candidate to include it"
+            ),
+            StoreError::SchemaRetirementBlocked {
+                type_uuid,
+                live_assets,
+                live_migration_endpoints,
+            } => write!(
+                f,
+                "schema retirement for {type_uuid} is blocked by {live_assets} live authored entries and {live_migration_endpoints} live migration endpoints"
+            ),
+            StoreError::InvalidAuthorityTransition { type_uuid, detail } => {
+                write!(f, "schema authority transition for {type_uuid} is invalid: {detail}")
+            }
+            StoreError::InvalidTargetSet(error) => {
+                write!(f, "candidate target set fails DSTS verification: {error}")
+            }
             StoreError::LineageMutationRequiresCandidate => write!(
                 f,
                 "an initialized schema-lineage projection may change only through a stale-base-checked candidate accept or rollback"
@@ -291,6 +339,7 @@ impl std::error::Error for StoreError {
         match self {
             StoreError::Sqlite(e) => Some(e),
             StoreError::Io { source, .. } => Some(source),
+            StoreError::InvalidTargetSet(error) => Some(error),
             _ => None,
         }
     }

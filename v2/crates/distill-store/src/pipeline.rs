@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
 use rusqlite::OptionalExtension;
 
 use crate::db::{InputTxn, Store};
@@ -46,6 +47,15 @@ pub struct AcceptedSchemaEpoch {
 pub struct AcceptedTypeLineage {
     pub epochs: Vec<AcceptedSchemaEpoch>,
     pub current: u32,
+    pub authority: TypeAuthorityState,
+}
+
+/// Whether one accepted lineage participates in exact Ready registry
+/// equality. Retirement retains history and cursor authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeAuthorityState {
+    Active,
+    Retired { retired_from: u32 },
 }
 
 /// The already parsed, unique source-controlled lineage authority. The
@@ -101,6 +111,16 @@ pub struct ReverseMigrationEdge {
 pub struct SchemaRollbackRequest<'a> {
     pub type_uuid: TypeUuid,
     pub target: LogicalHash,
+    pub live_schema_hashes: &'a [LogicalHash],
+    pub reverse_edges: &'a [ReverseMigrationEdge],
+}
+
+/// Proof inputs for explicit reactivation when the candidate selects an
+/// already accepted non-current digest. Forward ancestry is sufficient;
+/// reverse/divergent selection requires these complete custom edges.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaReactivationRequest<'a> {
+    pub type_uuid: TypeUuid,
     pub live_schema_hashes: &'a [LogicalHash],
     pub reverse_edges: &'a [ReverseMigrationEdge],
 }
@@ -211,6 +231,7 @@ impl InputTxn<'_> {
     /// row instead publishes a stable `SchemaAcceptanceRequired` state while
     /// retaining the prior epoch only as `last_good` residency bookkeeping.
     pub fn publish_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
+        validate_target_set(&epoch.target_set)?;
         let basis = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
         let mismatches = schema_registry_mismatches(&epoch.schema_registry, &basis.current_cursors);
         if !mismatches.is_empty() {
@@ -244,7 +265,7 @@ impl InputTxn<'_> {
                 epoch.dylib_hash.as_slice(),
                 epoch.load_policy_digest.as_slice(),
                 epoch.compiled_types.0.as_slice(),
-                epoch.target_set_hash.as_slice(),
+                epoch.target_set.digest.0.as_slice(),
                 self.version().0 as i64,
             ],
         )?;
@@ -266,6 +287,9 @@ impl InputTxn<'_> {
         )?;
         self.txn
             .execute("DELETE FROM pipeline_candidate_schema_registry", [])?;
+        replace_target_set(&self.txn, false, &epoch.target_set)?;
+        self.txn
+            .execute("DELETE FROM pipeline_candidate_target_set", [])?;
         Ok(())
     }
 
@@ -297,7 +321,7 @@ impl InputTxn<'_> {
                 self.version().0 as i64,
                 epoch.dylib_hash.as_slice(),
                 epoch.compiled_types.0.as_slice(),
-                epoch.target_set_hash.as_slice(),
+                epoch.target_set.digest.0.as_slice(),
                 manifest.manifest_hash.0.as_slice(),
             ],
         )?;
@@ -306,6 +330,7 @@ impl InputTxn<'_> {
             "pipeline_candidate_schema_registry",
             &epoch.schema_registry,
         )?;
+        replace_target_set(&self.txn, true, &epoch.target_set)?;
         debug_assert_eq!(
             mismatches,
             schema_registry_mismatches(
@@ -343,6 +368,8 @@ impl InputTxn<'_> {
         )?;
         self.txn
             .execute("DELETE FROM pipeline_candidate_schema_registry", [])?;
+        self.txn
+            .execute("DELETE FROM pipeline_candidate_target_set", [])?;
         Ok(())
     }
 
@@ -433,6 +460,13 @@ impl InputTxn<'_> {
         let mut next_manifest = projected_manifest(&self.txn)?;
         let next = match next_manifest.types.get_mut(&type_uuid) {
             Some(lineage) => {
+                if !matches!(lineage.authority, TypeAuthorityState::Active) {
+                    return Err(StoreError::InvalidAuthorityTransition {
+                        type_uuid,
+                        detail: "ordinary acceptance cannot implicitly reactivate a retired type"
+                            .to_owned(),
+                    });
+                }
                 if let Some(position) = lineage
                     .epochs
                     .iter()
@@ -465,6 +499,7 @@ impl InputTxn<'_> {
                         forward_parent: None,
                     }],
                     current: 0,
+                    authority: TypeAuthorityState::Active,
                 };
                 next_manifest.types.insert(type_uuid, lineage.clone());
                 lineage
@@ -512,6 +547,12 @@ impl InputTxn<'_> {
                 detail: "type is absent from the accepted lineage manifest".to_owned(),
             }
         })?;
+        if !matches!(lineage.authority, TypeAuthorityState::Active) {
+            return Err(StoreError::InvalidAuthorityTransition {
+                type_uuid,
+                detail: "rollback cannot implicitly reactivate a retired type".to_owned(),
+            });
+        }
         let target_index = lineage
             .epochs
             .iter()
@@ -545,12 +586,151 @@ impl InputTxn<'_> {
         let moved = AcceptedTypeLineage {
             epochs: lineage.epochs,
             current: target_index,
+            authority: TypeAuthorityState::Active,
         };
         let mut next_manifest = projected_manifest(&self.txn)?;
         next_manifest.types.insert(type_uuid, moved.clone());
         validate_verified_transition(expected_manifest, proposed, &next_manifest)?;
         replace_lineage_projection(&self.txn, self.version(), proposed)?;
         let stamp = stamp_for(type_uuid, &moved)?;
+        self.publish_pipeline_epoch(candidate)?;
+        Ok(stamp)
+    }
+
+    /// Explicitly remove one accepted type from active registry authority.
+    /// The pending candidate must omit it, and the coordinator must prove
+    /// that neither authored entries nor migration endpoints still require
+    /// it. History, cursor, and DSSL are preserved byte-for-byte.
+    pub fn retire_schema_candidate(
+        &mut self,
+        candidate: &PipelineEpoch,
+        expected_manifest: &SchemaManifestBasis,
+        proposed: &VerifiedSchemaLineageManifest,
+        type_uuid: TypeUuid,
+        live_migration_endpoints: &[LogicalHash],
+    ) -> Result<(), StoreError> {
+        self.validate_schema_command_basis(candidate, expected_manifest)?;
+        let candidate_digest = candidate.schema_registry.get(&type_uuid).copied();
+        if candidate_digest.is_some() {
+            return Err(StoreError::SchemaCandidateRetirementMismatch {
+                type_uuid,
+                candidate: candidate_digest,
+            });
+        }
+
+        let live_assets = live_asset_count(&self.txn, type_uuid)?;
+        if live_assets != 0 || !live_migration_endpoints.is_empty() {
+            return Err(StoreError::SchemaRetirementBlocked {
+                type_uuid,
+                live_assets,
+                live_migration_endpoints: live_migration_endpoints.len(),
+            });
+        }
+
+        let mut next_manifest = projected_manifest(&self.txn)?;
+        let lineage = next_manifest.types.get_mut(&type_uuid).ok_or_else(|| {
+            StoreError::InvalidAuthorityTransition {
+                type_uuid,
+                detail: "retirement requires an accepted lineage row".to_owned(),
+            }
+        })?;
+        if !matches!(lineage.authority, TypeAuthorityState::Active) {
+            return Err(StoreError::InvalidAuthorityTransition {
+                type_uuid,
+                detail: "type is already retired".to_owned(),
+            });
+        }
+        lineage.authority = TypeAuthorityState::Retired {
+            retired_from: lineage.current,
+        };
+        let retired = lineage.clone();
+        validate_type_lineage(type_uuid, &retired)?;
+        validate_verified_transition(expected_manifest, proposed, &next_manifest)?;
+        replace_lineage_projection(&self.txn, self.version(), proposed)?;
+        self.publish_pipeline_epoch(candidate)?;
+        Ok(())
+    }
+
+    /// Explicitly return a retired type to active authority. The exact
+    /// candidate digest is selected: current is a pure authority flip, a new
+    /// digest appends, a known forward descendant advances, and all other
+    /// existing selections require rollback coverage.
+    pub fn reactivate_schema_candidate(
+        &mut self,
+        candidate: &PipelineEpoch,
+        expected_manifest: &SchemaManifestBasis,
+        proposed: &VerifiedSchemaLineageManifest,
+        request: SchemaReactivationRequest<'_>,
+    ) -> Result<LineageStamp, StoreError> {
+        self.validate_schema_command_basis(candidate, expected_manifest)?;
+        let type_uuid = request.type_uuid;
+        let requested = candidate
+            .schema_registry
+            .get(&type_uuid)
+            .copied()
+            .ok_or(StoreError::SchemaCandidateReactivationMismatch { type_uuid })?;
+        let mut next_manifest = projected_manifest(&self.txn)?;
+        let lineage = next_manifest.types.get_mut(&type_uuid).ok_or_else(|| {
+            StoreError::InvalidAuthorityTransition {
+                type_uuid,
+                detail: "reactivation requires retained accepted history".to_owned(),
+            }
+        })?;
+        if !matches!(lineage.authority, TypeAuthorityState::Retired { .. }) {
+            return Err(StoreError::InvalidAuthorityTransition {
+                type_uuid,
+                detail: "type is already active".to_owned(),
+            });
+        }
+
+        match lineage
+            .epochs
+            .iter()
+            .position(|epoch| epoch.digest == requested)
+        {
+            None => {
+                let parent = lineage.current;
+                lineage.epochs.push(AcceptedSchemaEpoch {
+                    digest: requested,
+                    forward_parent: Some(parent),
+                });
+                lineage.current = u32::try_from(lineage.epochs.len() - 1).map_err(|_| {
+                    invalid_manifest(
+                        Some(type_uuid),
+                        "accepted epoch count exceeds the DSSL u32 sequence bound",
+                    )
+                })?;
+            }
+            Some(position) => {
+                let target_index = u32::try_from(position).map_err(|_| {
+                    invalid_manifest(
+                        Some(type_uuid),
+                        "accepted epoch index exceeds the DSSL u32 cursor bound",
+                    )
+                })?;
+                if target_index != lineage.current
+                    && !is_ancestor(lineage, lineage.current, target_index)
+                {
+                    let mut required_live = request.live_schema_hashes.to_vec();
+                    required_live.extend(live_asset_schema_hashes(&self.txn, type_uuid)?);
+                    validate_rollback_coverage(
+                        type_uuid,
+                        requested,
+                        lineage,
+                        target_index,
+                        &required_live,
+                        request.reverse_edges,
+                    )?;
+                }
+                lineage.current = target_index;
+            }
+        }
+        lineage.authority = TypeAuthorityState::Active;
+        let activated = lineage.clone();
+        validate_type_lineage(type_uuid, &activated)?;
+        validate_verified_transition(expected_manifest, proposed, &next_manifest)?;
+        replace_lineage_projection(&self.txn, self.version(), proposed)?;
+        let stamp = stamp_for(type_uuid, &activated)?;
         self.publish_pipeline_epoch(candidate)?;
         Ok(stamp)
     }
@@ -562,6 +742,24 @@ impl InputTxn<'_> {
         type_uuid: TypeUuid,
         requested: LogicalHash,
     ) -> Result<(), StoreError> {
+        self.validate_schema_command_basis(candidate, expected_manifest)?;
+        let candidate_digest = candidate.schema_registry.get(&type_uuid).copied();
+        if candidate_digest != Some(requested) {
+            return Err(StoreError::SchemaCandidateCursorMismatch {
+                type_uuid,
+                requested,
+                candidate: candidate_digest,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_schema_command_basis(
+        &self,
+        candidate: &PipelineEpoch,
+        expected_manifest: &SchemaManifestBasis,
+    ) -> Result<(), StoreError> {
+        validate_target_set(&candidate.target_set)?;
         let actual_manifest = manifest_basis(&self.txn)?;
         if actual_manifest.as_ref() != Some(expected_manifest) {
             return Err(StoreError::StaleSchemaManifestBase {
@@ -569,23 +767,18 @@ impl InputTxn<'_> {
                 actual: actual_manifest.map(Box::new),
             });
         }
-        let actual_candidate = PipelineCandidateIdentity::from(candidate);
+        let actual_candidate =
+            PipelineCandidateIdentity::try_from(candidate).map_err(StoreError::InvalidTargetSet)?;
         let expected_candidate = pending_candidate_identity(&self.txn)?
             .ok_or(StoreError::LineageMutationRequiresCandidate)?;
         if actual_candidate != expected_candidate
             || load_schema_registry(&self.txn, true)? != candidate.schema_registry
+            || load_target_set(&self.txn, true, expected_candidate.target_set_hash)?
+                != candidate.target_set
         {
             return Err(StoreError::StaleSchemaCandidate {
                 expected: Box::new(expected_candidate),
                 actual: Box::new(actual_candidate),
-            });
-        }
-        let candidate_digest = candidate.schema_registry.get(&type_uuid).copied();
-        if candidate_digest != Some(requested) {
-            return Err(StoreError::SchemaCandidateCursorMismatch {
-                type_uuid,
-                requested,
-                candidate: candidate_digest,
             });
         }
         Ok(())
@@ -667,6 +860,14 @@ fn validate_type_lineage(
             "current cursor is outside the accepted epoch vector",
         ));
     }
+    if let TypeAuthorityState::Retired { retired_from } = lineage.authority {
+        if retired_from != lineage.current {
+            return Err(invalid_manifest(
+                Some(type_uuid),
+                "a retired lineage must record its preserved current cursor as retired_from",
+            ));
+        }
+    }
     let mut digests = BTreeSet::new();
     for (index, epoch) in lineage.epochs.iter().enumerate() {
         if !digests.insert(epoch.digest) {
@@ -734,7 +935,10 @@ fn manifest_basis(conn: &rusqlite::Connection) -> Result<Option<SchemaManifestBa
     let current_cursors = manifest
         .types
         .into_iter()
-        .map(|(type_uuid, lineage)| (type_uuid, lineage.epochs[lineage.current as usize].digest))
+        .filter_map(|(type_uuid, lineage)| {
+            matches!(lineage.authority, TypeAuthorityState::Active)
+                .then_some((type_uuid, lineage.epochs[lineage.current as usize].digest))
+        })
         .collect();
     Ok(Some(SchemaManifestBasis {
         manifest_hash: ContentHash(exact_blob32(manifest_hash, "source manifest hash")?),
@@ -879,6 +1083,66 @@ fn load_schema_registry(
     Ok(registry)
 }
 
+fn validate_target_set(target_set: &CanonicalTargetSet) -> Result<(), StoreError> {
+    CanonicalTargetSet::from_canonical(target_set.rows.clone(), target_set.digest)
+        .map(|_| ())
+        .map_err(StoreError::InvalidTargetSet)
+}
+
+fn replace_target_set(
+    conn: &rusqlite::Connection,
+    candidate: bool,
+    target_set: &CanonicalTargetSet,
+) -> Result<(), StoreError> {
+    validate_target_set(target_set)?;
+    let (delete, insert) = if candidate {
+        (
+            "DELETE FROM pipeline_candidate_target_set",
+            "INSERT INTO pipeline_candidate_target_set(name, target_definition_hash) VALUES (?1, ?2)",
+        )
+    } else {
+        (
+            "DELETE FROM pipeline_target_set",
+            "INSERT INTO pipeline_target_set(name, target_definition_hash) VALUES (?1, ?2)",
+        )
+    };
+    conn.execute(delete, [])?;
+    for row in &target_set.rows {
+        conn.execute(
+            insert,
+            rusqlite::params![row.name, row.target_definition_hash.as_slice()],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_target_set(
+    conn: &rusqlite::Connection,
+    candidate: bool,
+    digest: TargetSetHash,
+) -> Result<CanonicalTargetSet, StoreError> {
+    let table = if candidate {
+        "pipeline_candidate_target_set"
+    } else {
+        "pipeline_target_set"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT name, target_definition_hash FROM {table} ORDER BY CAST(name AS BLOB)"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut target_rows = Vec::new();
+    for row in rows {
+        let (name, target_definition_hash) = row?;
+        target_rows.push(TargetSetRow {
+            name,
+            target_definition_hash: exact_blob32(target_definition_hash, "target-definition hash")?,
+        });
+    }
+    CanonicalTargetSet::from_canonical(target_rows, digest).map_err(StoreError::InvalidTargetSet)
+}
+
 fn pending_candidate_identity(
     conn: &rusqlite::Connection,
 ) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
@@ -905,7 +1169,11 @@ fn pending_candidate_identity(
                     compiled_types,
                     "candidate compiled-type attestation",
                 )?),
-                target_set_hash: exact_blob32(target_set_hash, "candidate target-set hash")?,
+                target_set_hash: {
+                    let digest =
+                        TargetSetHash(exact_blob32(target_set_hash, "candidate target-set hash")?);
+                    load_target_set(conn, true, digest)?.digest
+                },
             }))
         }
         _ => Err(invalid_manifest(
@@ -926,15 +1194,16 @@ fn type_lineage(
     type_uuid: TypeUuid,
 ) -> Result<Option<AcceptedTypeLineage>, StoreError> {
     let rows = lineage_rows(conn, type_uuid)?;
-    let current_row: Option<(i64, Vec<u8>)> = conn
+    let current_row: Option<(i64, Vec<u8>, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT current_cursor, chain_digest FROM schema_lineage_current
+            "SELECT current_cursor, chain_digest, authority, retired_from
+             FROM schema_lineage_current
              WHERE type_uuid = ?1",
             [type_uuid.0.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((current, chain)) = current_row else {
+    let Some((current, chain, authority, retired_from)) = current_row else {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -946,6 +1215,23 @@ fn type_lineage(
     let current = u32::try_from(current).map_err(|_| {
         invalid_manifest(Some(type_uuid), "the projected current cursor is invalid")
     })?;
+    let authority = match (authority, retired_from) {
+        (0, None) => TypeAuthorityState::Active,
+        (1, Some(retired_from)) => TypeAuthorityState::Retired {
+            retired_from: u32::try_from(retired_from).map_err(|_| {
+                invalid_manifest(
+                    Some(type_uuid),
+                    "the projected retired_from cursor is invalid",
+                )
+            })?,
+        },
+        _ => {
+            return Err(invalid_manifest(
+                Some(type_uuid),
+                "the projected authority state is invalid",
+            ));
+        }
+    };
     let lineage = AcceptedTypeLineage {
         epochs: rows
             .into_iter()
@@ -955,6 +1241,7 @@ fn type_lineage(
             })
             .collect(),
         current,
+        authority,
     };
     validate_type_lineage(type_uuid, &lineage)?;
     let chain: [u8; 32] = chain.try_into().map_err(|_| {
@@ -1003,18 +1290,26 @@ fn write_lineage_current(
     lineage: &AcceptedTypeLineage,
 ) -> Result<(), StoreError> {
     let chain = lineage_chain_digest(type_uuid, &lineage.epochs, lineage.current);
+    let (authority, retired_from) = match lineage.authority {
+        TypeAuthorityState::Active => (0i64, None),
+        TypeAuthorityState::Retired { retired_from } => (1i64, Some(i64::from(retired_from))),
+    };
     conn.execute(
         "INSERT INTO schema_lineage_current(
-             type_uuid, current_cursor, chain_digest, input_version
-         ) VALUES (?1, ?2, ?3, ?4)
+             type_uuid, current_cursor, chain_digest, authority, retired_from, input_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(type_uuid) DO UPDATE SET
              current_cursor = excluded.current_cursor,
              chain_digest = excluded.chain_digest,
+             authority = excluded.authority,
+             retired_from = excluded.retired_from,
              input_version = excluded.input_version",
         rusqlite::params![
             type_uuid.0.as_slice(),
             i64::from(lineage.current),
             chain.as_slice(),
+            authority,
+            retired_from,
             version.0 as i64,
         ],
     )?;
@@ -1142,6 +1437,16 @@ fn live_asset_schema_hashes(
     .collect()
 }
 
+fn live_asset_count(conn: &rusqlite::Connection, type_uuid: TypeUuid) -> Result<u64, StoreError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assets WHERE type_uuid = ?1",
+        [type_uuid.0.as_slice()],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count)
+        .map_err(|_| invalid_manifest(Some(type_uuid), "the live authored-entry count is negative"))
+}
+
 fn coverage_error(
     type_uuid: TypeUuid,
     target: LogicalHash,
@@ -1236,7 +1541,13 @@ impl Store {
                         compiled_types,
                         "published compiled-type attestation",
                     )?),
-                    target_set_hash: exact_blob32(target_set_hash, "published target-set hash")?,
+                    target_set: {
+                        let digest = TargetSetHash(exact_blob32(
+                            target_set_hash,
+                            "published target-set hash",
+                        )?);
+                        load_target_set(&self.conn, false, digest)?
+                    },
                     schema_registry: load_schema_registry(&self.conn, false)?,
                     registrations,
                 }))

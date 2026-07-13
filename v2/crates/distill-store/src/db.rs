@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -167,6 +167,14 @@ CREATE TABLE pipeline_candidate_schema_registry (
     type_uuid   BLOB NOT NULL PRIMARY KEY,
     logical_hash BLOB NOT NULL
 );
+CREATE TABLE pipeline_target_set (
+    name                   TEXT NOT NULL PRIMARY KEY,
+    target_definition_hash BLOB NOT NULL
+);
+CREATE TABLE pipeline_candidate_target_set (
+    name                   TEXT NOT NULL PRIMARY KEY,
+    target_definition_hash BLOB NOT NULL
+);
 CREATE TABLE configuration_state (
     id                INTEGER PRIMARY KEY CHECK (id = 0),
     active_generation INTEGER NOT NULL,
@@ -198,6 +206,8 @@ CREATE TABLE schema_lineage_current (
     type_uuid     BLOB NOT NULL PRIMARY KEY,
     current_cursor INTEGER NOT NULL,
     chain_digest  BLOB NOT NULL,
+    authority     INTEGER NOT NULL CHECK (authority IN (0, 1)),
+    retired_from  INTEGER,
     input_version INTEGER NOT NULL
 );
 CREATE TABLE schema_lineage_state (

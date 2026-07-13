@@ -77,6 +77,8 @@ fn every_section_13_table_exists() {
         "pipeline_state",
         "pipeline_schema_registry",
         "pipeline_candidate_schema_registry",
+        "pipeline_target_set",
+        "pipeline_candidate_target_set",
         "configuration_state",
         "pending_restart",
         "registrations",
@@ -196,6 +198,8 @@ fn schema_lineage_records_the_chain_with_generations_and_digests() {
             "type_uuid",
             "current_cursor",
             "chain_digest",
+            "authority",
+            "retired_from",
             "input_version"
         ]
     );
@@ -239,6 +243,14 @@ fn pipeline_state_row_shape() {
     assert_eq!(
         columns(&conn, "pipeline_candidate_schema_registry"),
         ["type_uuid", "logical_hash"]
+    );
+    assert_eq!(
+        columns(&conn, "pipeline_target_set"),
+        ["name", "target_definition_hash"]
+    );
+    assert_eq!(
+        columns(&conn, "pipeline_candidate_target_set"),
+        ["name", "target_definition_hash"]
     );
 }
 

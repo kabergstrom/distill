@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::TypeUuid;
+use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
     load_policy_digest, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, InputVersion,
     MemoSeq, OperationKind, PipelineEpoch, PipelinePoison, PipelineState, Registration,
@@ -19,7 +20,7 @@ fn epoch() -> Arc<PipelineEpoch> {
         dylib_hash: [7u8; 32],
         load_policy_digest: [9u8; 32],
         compiled_types: CompiledAttestationDigest([10u8; 32]),
-        target_set_hash: [11u8; 32],
+        target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
         schema_registry: BTreeMap::new(),
         registrations: vec![Registration {
             kind: RegistrationKind::Processor,

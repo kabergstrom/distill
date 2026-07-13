@@ -5,11 +5,13 @@
 
 use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::target_set::CanonicalTargetSet;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::{
-    AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, VerifiedSchemaLineageManifest,
+    AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
+    VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{PipelineEpoch, PipelineState};
 use distill_store::{Store, StoreConfig, StoreError};
@@ -115,6 +117,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                                     forward_parent: None,
                                 }],
                                 current: 0,
+                                authority: TypeAuthorityState::Active,
                             },
                         )]
                         .into_iter()
@@ -127,7 +130,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 dylib_hash: [6u8; 32],
                 load_policy_digest: [7u8; 32],
                 compiled_types: CompiledAttestationDigest([8u8; 32]),
-                target_set_hash: [9u8; 32],
+                target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
                 schema_registry: [(TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))]
                     .into_iter()
                     .collect(),
@@ -263,7 +266,7 @@ fn version_poison_and_pipeline_poison_are_distinct_gates() {
                 dylib_hash: [1u8; 32],
                 load_policy_digest: [2u8; 32],
                 compiled_types: CompiledAttestationDigest([3u8; 32]),
-                target_set_hash: [4u8; 32],
+                target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
                 schema_registry: std::collections::BTreeMap::new(),
                 registrations: vec![],
             })?;

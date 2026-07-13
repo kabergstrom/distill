@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetHash};
 
 /// Advanced by watcher batches + authoring ops — module/schema artifact
 /// swaps and config edits arrive as watcher events, so epoch rotation is
@@ -111,9 +112,10 @@ pub struct PipelineEpoch {
     /// Aggregate over the complete compiled type rows. This is part of the
     /// staged-candidate identity used by explicit schema commands.
     pub compiled_types: CompiledAttestationDigest,
-    /// Hash of the validated target definition set used to construct the
-    /// candidate pipeline map.
-    pub target_set_hash: [u8; 32],
+    /// Complete canonical target-definition set used to construct the
+    /// candidate pipeline map. The store independently recomputes DSTS from
+    /// these rows before publishing and before every schema command.
+    pub target_set: CanonicalTargetSet,
     /// The candidate's complete compiled registry projection. `Ready`
     /// requires exact key/value equality with the authoritative lineage
     /// manifest's current cursors; a missing, extra, or unequal row is a
@@ -132,16 +134,22 @@ pub struct PipelineEpoch {
 pub struct PipelineCandidateIdentity {
     pub dylib_hash: [u8; 32],
     pub compiled_types: CompiledAttestationDigest,
-    pub target_set_hash: [u8; 32],
+    pub target_set_hash: TargetSetHash,
 }
 
-impl From<&PipelineEpoch> for PipelineCandidateIdentity {
-    fn from(epoch: &PipelineEpoch) -> Self {
-        Self {
+impl TryFrom<&PipelineEpoch> for PipelineCandidateIdentity {
+    type Error = TargetSetError;
+
+    fn try_from(epoch: &PipelineEpoch) -> Result<Self, Self::Error> {
+        let target_set = CanonicalTargetSet::from_canonical(
+            epoch.target_set.rows.clone(),
+            epoch.target_set.digest,
+        )?;
+        Ok(Self {
             dylib_hash: epoch.dylib_hash,
             compiled_types: epoch.compiled_types,
-            target_set_hash: epoch.target_set_hash,
-        }
+            target_set_hash: target_set.digest,
+        })
     }
 }
 

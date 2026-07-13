@@ -7,11 +7,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use distill_core::attestation::CompiledAttestationDigest;
-use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+use distill_store::bundles::AssetRecord;
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, HardStopReason, LineageClass, LineageStamp,
-    ReverseMigrationEdge, SchemaLineageManifest, SchemaRollbackRequest,
-    VerifiedSchemaLineageManifest,
+    ReverseMigrationEdge, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
+    TypeAuthorityState, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
     PipelineEpoch, PipelineState, PipelineUnavailable, Registration, RegistrationKind,
@@ -29,7 +31,11 @@ fn epoch(n: u8) -> PipelineEpoch {
         dylib_hash: [n; 32],
         load_policy_digest: [n.wrapping_add(1); 32],
         compiled_types: CompiledAttestationDigest([n.wrapping_add(2); 32]),
-        target_set_hash: [n.wrapping_add(3); 32],
+        target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
+            name: format!("target-{n}"),
+            target_definition_hash: [n.wrapping_add(3); 32],
+        }])
+        .unwrap(),
         schema_registry: BTreeMap::new(),
         registrations: vec![
             Registration {
@@ -102,6 +108,7 @@ fn publishing_an_epoch_roundtrips_identity_and_registrations() {
     let got = state.epoch().expect("ready");
     assert_eq!(got.dylib_hash, [3u8; 32]);
     assert_eq!(got.load_policy_digest, [4u8; 32]);
+    assert_eq!(got.target_set, epoch(3).target_set);
     let mut regs = got.registrations.clone();
     regs.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(regs.len(), 2);
@@ -478,6 +485,276 @@ fn candidate_bound_rollback_rejects_stale_base_then_moves_only_the_cursor() {
     assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
 }
 
+#[test]
+fn retirement_and_exact_current_reactivation_preserve_history_and_gate_ready() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                50,
+                manifest(&[(T, accepted(&[h(1), h(2)], 1))]),
+            ))
+        })
+        .unwrap();
+    let active_stamp = store.current_lineage_stamp(T).unwrap().unwrap();
+
+    let retirement_candidate = epoch_with_registry(20, &[]);
+    let base = require_candidate(&mut store, &retirement_candidate);
+    let retired_source = verified(51, manifest(&[(T, retired(&[h(1), h(2)], 1))]));
+    let stale = distill_store::state::SchemaManifestBasis {
+        manifest_hash: ContentHash([99; 32]),
+        current_cursors: base.current_cursors.clone(),
+    };
+    let err = store
+        .input_transaction(|txn| {
+            txn.retire_schema_candidate(&retirement_candidate, &stale, &retired_source, T, &[])
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::StaleSchemaManifestBase { .. }));
+    assert_eq!(store.lineage(T).unwrap().len(), 2);
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(2)));
+    assert_eq!(
+        store.current_lineage_stamp(T).unwrap().unwrap(),
+        active_stamp,
+        "authority is deliberately outside DSSL"
+    );
+
+    store
+        .input_transaction(|txn| {
+            txn.retire_schema_candidate(&retirement_candidate, &base, &retired_source, T, &[])
+        })
+        .unwrap();
+    assert_eq!(store.lineage(T).unwrap().len(), 2);
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(2)));
+    assert_eq!(
+        store.current_lineage_stamp(T).unwrap().unwrap(),
+        active_stamp,
+        "authority is deliberately outside DSSL"
+    );
+    assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
+
+    let reactivation_candidate = epoch_with_registry(21, &[(T, h(2))]);
+    let retired_base = require_candidate(&mut store, &reactivation_candidate);
+    assert!(retired_base.current_cursors.is_empty());
+    let active_source = verified(52, manifest(&[(T, accepted(&[h(1), h(2)], 1))]));
+    store
+        .input_transaction(|txn| {
+            txn.reactivate_schema_candidate(
+                &reactivation_candidate,
+                &retired_base,
+                &active_source,
+                SchemaReactivationRequest {
+                    type_uuid: T,
+                    live_schema_hashes: &[],
+                    reverse_edges: &[],
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(store.lineage(T).unwrap().len(), 2);
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(2)));
+    assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
+
+    // The exact authority state, including retired_from, survived SQLite
+    // projection and was consumed by the verified transition.
+    store
+        .input_transaction(|txn| txn.project_verified_lineage_manifest(&active_source))
+        .unwrap();
+}
+
+#[test]
+fn retirement_is_blocked_by_migration_endpoints_and_live_authored_entries() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                53,
+                manifest(&[(T, accepted(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(22, &[]);
+    let base = require_candidate(&mut store, &candidate);
+    let proposed = verified(54, manifest(&[(T, retired(&[h(1)], 0))]));
+
+    let err = store
+        .input_transaction(|txn| {
+            txn.retire_schema_candidate(&candidate, &base, &proposed, T, &[h(1)])
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::SchemaRetirementBlocked {
+            live_assets: 0,
+            live_migration_endpoints: 1,
+            ..
+        }
+    ));
+
+    store
+        .input_transaction(|txn| {
+            txn.upsert_asset(&AssetRecord {
+                asset: AssetUuid([77; 16]),
+                bundle: BundleUuid([78; 16]),
+                local_id: "live".into(),
+                type_uuid: T,
+                logical_hash: h(1),
+                authoring_only: false,
+                tags: vec![],
+            })
+        })
+        .unwrap();
+    let err = store
+        .input_transaction(|txn| txn.retire_schema_candidate(&candidate, &base, &proposed, T, &[]))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::SchemaRetirementBlocked {
+            live_assets: 1,
+            live_migration_endpoints: 0,
+            ..
+        }
+    ));
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+}
+
+#[test]
+fn reactivation_of_existing_noncurrent_digest_requires_rollback_coverage() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                55,
+                manifest(&[(T, retired(&[h(1), h(2)], 1))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(23, &[(T, h(1))]);
+    let base = require_candidate(&mut store, &candidate);
+    let proposed = verified(56, manifest(&[(T, accepted(&[h(1), h(2)], 0))]));
+
+    let err = store
+        .input_transaction(|txn| {
+            txn.reactivate_schema_candidate(
+                &candidate,
+                &base,
+                &proposed,
+                SchemaReactivationRequest {
+                    type_uuid: T,
+                    live_schema_hashes: &[],
+                    reverse_edges: &[],
+                },
+            )
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::IncompleteRollbackCoverage { .. }));
+
+    let reverse = [ReverseMigrationEdge {
+        from: h(2),
+        to: h(1),
+    }];
+    store
+        .input_transaction(|txn| {
+            txn.reactivate_schema_candidate(
+                &candidate,
+                &base,
+                &proposed,
+                SchemaReactivationRequest {
+                    type_uuid: T,
+                    live_schema_hashes: &[],
+                    reverse_edges: &reverse,
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+    assert_eq!(store.lineage(T).unwrap().len(), 2);
+}
+
+#[test]
+fn reactivation_appends_a_genuinely_new_candidate_digest() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                59,
+                manifest(&[(T, retired(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(26, &[(T, h(2))]);
+    let base = require_candidate(&mut store, &candidate);
+    let proposed = verified(60, manifest(&[(T, accepted(&[h(1), h(2)], 1))]));
+
+    store
+        .input_transaction(|txn| {
+            txn.reactivate_schema_candidate(
+                &candidate,
+                &base,
+                &proposed,
+                SchemaReactivationRequest {
+                    type_uuid: T,
+                    live_schema_hashes: &[],
+                    reverse_edges: &[],
+                },
+            )
+        })
+        .unwrap();
+    let lineage = store.lineage(T).unwrap();
+    assert_eq!(lineage.len(), 2);
+    assert_eq!(lineage[1].schema_hash, h(2));
+    assert_eq!(lineage[1].forward_parent, Some(0));
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(2)));
+}
+
+#[test]
+fn forged_dsts_is_rejected_at_publish_and_again_at_schema_commit() {
+    {
+        let (_d, mut store) = store();
+        project_empty(&mut store);
+        let mut forged = epoch(24);
+        forged.target_set.digest.0[0] ^= 1;
+        let err = store
+            .input_transaction(|txn| txn.publish_pipeline_epoch(&forged))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTargetSet(_)));
+        let mut forged_rows = epoch(24);
+        forged_rows.target_set.rows[0].name = "targe\u{301}t-24".into();
+        let err = store
+            .input_transaction(|txn| txn.publish_pipeline_epoch(&forged_rows))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTargetSet(_)));
+        assert!(store.pipeline_state().unwrap().is_none());
+    }
+
+    let (d, mut store2) = store();
+    store2
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                57,
+                manifest(&[(T, accepted(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(25, &[(T, h(2))]);
+    let base = require_candidate(&mut store2, &candidate);
+    let proposed = verified(58, manifest(&[(T, accepted(&[h(1), h(2)], 1))]));
+    let conn = rusqlite::Connection::open(d.path().join(".distill/meta.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE pipeline_candidate_target_set SET target_definition_hash = ?1",
+        [[0u8; 32].as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+    let before = store2.input_version();
+    let err = store2
+        .input_transaction(|txn| txn.accept_schema_candidate(&candidate, &base, &proposed, T, h(2)))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidTargetSet(_)));
+    assert_eq!(store2.input_version(), before);
+    assert_eq!(store2.lineage_current(T).unwrap(), Some(h(1)));
+}
+
 // ---- tools: the ToolEpoch table ----
 
 #[test]
@@ -562,6 +839,17 @@ fn accepted(hashes: &[LogicalHash], current: u32) -> AcceptedTypeLineage {
     AcceptedTypeLineage {
         epochs: epochs(hashes),
         current,
+        authority: TypeAuthorityState::Active,
+    }
+}
+
+fn retired(hashes: &[LogicalHash], current: u32) -> AcceptedTypeLineage {
+    AcceptedTypeLineage {
+        epochs: epochs(hashes),
+        current,
+        authority: TypeAuthorityState::Retired {
+            retired_from: current,
+        },
     }
 }
 
@@ -640,6 +928,7 @@ fn manifest_validation_rejects_bad_parents_duplicates_and_cursors() {
                 forward_parent: Some(0),
             }],
             current: 0,
+            authority: TypeAuthorityState::Active,
         },
         AcceptedTypeLineage {
             epochs: vec![
@@ -653,6 +942,7 @@ fn manifest_validation_rejects_bad_parents_duplicates_and_cursors() {
                 },
             ],
             current: 1,
+            authority: TypeAuthorityState::Active,
         },
         accepted(&[h(1), h(2)], 2),
     ];
@@ -799,6 +1089,7 @@ fn vector_order_never_substitutes_for_parent_reachability() {
                     AcceptedTypeLineage {
                         epochs: branch.clone(),
                         current: 3,
+                        authority: TypeAuthorityState::Active,
                     },
                 )]),
             ))
