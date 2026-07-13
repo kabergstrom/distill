@@ -4,3 +4,4 @@
 pub mod attestation;
 pub mod canonical;
 pub mod id;
+pub mod target_set;
