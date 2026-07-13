@@ -13,7 +13,7 @@ use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
 use rusqlite::OptionalExtension;
 
 use crate::db::{InputTxn, Store};
-use crate::error::StoreError;
+use crate::error::{RetiredTypeReference, StoreError};
 use crate::state::{
     InputVersion, PipelineCandidateIdentity, PipelineEpoch, PipelinePoison, PipelineState,
     Registration, RegistrationKind, SchemaAcceptanceRequired, SchemaManifestBasis,
@@ -605,10 +605,17 @@ impl InputTxn<'_> {
         &mut self,
         candidate: &PipelineEpoch,
         expected_manifest: &SchemaManifestBasis,
+        control_basis: crate::state::SnapshotStamp,
         proposed: &VerifiedSchemaLineageManifest,
         type_uuid: TypeUuid,
         live_migration_endpoints: &[LogicalHash],
     ) -> Result<(), StoreError> {
+        if control_basis != self.base_stamp() {
+            return Err(StoreError::StaleControlSnapshotBasis {
+                provided: control_basis,
+                current: self.base_stamp(),
+            });
+        }
         self.validate_schema_command_basis(candidate, expected_manifest)?;
         let candidate_digest = candidate.schema_registry.get(&type_uuid).copied();
         if candidate_digest.is_some() {
@@ -648,6 +655,42 @@ impl InputTxn<'_> {
         validate_verified_transition(expected_manifest, proposed, &next_manifest)?;
         replace_lineage_projection(&self.txn, self.version(), proposed)?;
         self.publish_pipeline_epoch(candidate)?;
+        Ok(())
+    }
+
+    /// Reject a decoded migration endpoint that names retired schema
+    /// authority. Coordinators call this for every endpoint before publishing
+    /// scanner/import results in this same input transaction.
+    pub fn ensure_migration_endpoint_type_active(
+        &self,
+        type_uuid: TypeUuid,
+        endpoint: LogicalHash,
+    ) -> Result<(), StoreError> {
+        self.ensure_type_reference_active(
+            type_uuid,
+            RetiredTypeReference::MigrationEndpoint(endpoint),
+        )
+    }
+
+    pub(crate) fn ensure_type_reference_active(
+        &self,
+        type_uuid: TypeUuid,
+        reference: RetiredTypeReference,
+    ) -> Result<(), StoreError> {
+        let authority = self
+            .txn
+            .query_row(
+                "SELECT authority FROM schema_lineage_current WHERE type_uuid = ?1",
+                [type_uuid.0.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if authority == Some(1) {
+            return Err(StoreError::RetiredTypeReferenced {
+                type_uuid,
+                reference,
+            });
+        }
         Ok(())
     }
 

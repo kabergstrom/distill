@@ -407,11 +407,13 @@ impl Store {
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
+        let base_stamp = self.stamp();
         let version = InputVersion(self.input_version + 1);
         let state_path = self.config.state_path.clone();
         let txn = self.conn.transaction()?;
         let mut input_txn = InputTxn {
             txn,
+            base_stamp,
             version,
             state_path,
         };
@@ -450,11 +452,19 @@ impl Store {
 /// everything back.
 pub struct InputTxn<'a> {
     pub(crate) txn: rusqlite::Transaction<'a>,
+    base_stamp: SnapshotStamp,
     version: InputVersion,
     pub(crate) state_path: PathBuf,
 }
 
 impl InputTxn<'_> {
+    /// The exact committed snapshot against which this transaction began.
+    /// Coordinator control reads used by authority commands must name this
+    /// stamp; a bare or stale version can never authorize publication.
+    pub fn base_stamp(&self) -> SnapshotStamp {
+        self.base_stamp
+    }
+
     /// The version this transaction will publish on commit.
     pub fn version(&self) -> InputVersion {
         self.version

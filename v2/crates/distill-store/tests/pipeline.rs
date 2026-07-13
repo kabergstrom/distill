@@ -18,7 +18,7 @@ use distill_store::pipeline::{
 use distill_store::state::{
     PipelineEpoch, PipelineState, PipelineUnavailable, Registration, RegistrationKind,
 };
-use distill_store::{Store, StoreConfig, StoreError};
+use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -507,7 +507,14 @@ fn retirement_and_exact_current_reactivation_preserve_history_and_gate_ready() {
     };
     let err = store
         .input_transaction(|txn| {
-            txn.retire_schema_candidate(&retirement_candidate, &stale, &retired_source, T, &[])
+            txn.retire_schema_candidate(
+                &retirement_candidate,
+                &stale,
+                txn.base_stamp(),
+                &retired_source,
+                T,
+                &[],
+            )
         })
         .unwrap_err();
     assert!(matches!(err, StoreError::StaleSchemaManifestBase { .. }));
@@ -521,7 +528,14 @@ fn retirement_and_exact_current_reactivation_preserve_history_and_gate_ready() {
 
     store
         .input_transaction(|txn| {
-            txn.retire_schema_candidate(&retirement_candidate, &base, &retired_source, T, &[])
+            txn.retire_schema_candidate(
+                &retirement_candidate,
+                &base,
+                txn.base_stamp(),
+                &retired_source,
+                T,
+                &[],
+            )
         })
         .unwrap();
     assert_eq!(store.lineage(T).unwrap().len(), 2);
@@ -579,7 +593,7 @@ fn retirement_is_blocked_by_migration_endpoints_and_live_authored_entries() {
 
     let err = store
         .input_transaction(|txn| {
-            txn.retire_schema_candidate(&candidate, &base, &proposed, T, &[h(1)])
+            txn.retire_schema_candidate(&candidate, &base, txn.base_stamp(), &proposed, T, &[h(1)])
         })
         .unwrap_err();
     assert!(matches!(
@@ -605,7 +619,9 @@ fn retirement_is_blocked_by_migration_endpoints_and_live_authored_entries() {
         })
         .unwrap();
     let err = store
-        .input_transaction(|txn| txn.retire_schema_candidate(&candidate, &base, &proposed, T, &[]))
+        .input_transaction(|txn| {
+            txn.retire_schema_candidate(&candidate, &base, txn.base_stamp(), &proposed, T, &[])
+        })
         .unwrap_err();
     assert!(matches!(
         err,
@@ -616,6 +632,81 @@ fn retirement_is_blocked_by_migration_endpoints_and_live_authored_entries() {
         }
     ));
     assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+}
+
+#[test]
+fn retirement_requires_exact_control_basis_and_blocks_later_type_references() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                61,
+                manifest(&[(T, accepted(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+
+    let stale_control_basis = store.stamp();
+    let candidate = epoch_with_registry(27, &[]);
+    let base = require_candidate(&mut store, &candidate);
+    let proposed = verified(62, manifest(&[(T, retired(&[h(1)], 0))]));
+    let current_control_basis = store.stamp();
+
+    let err = store
+        .input_transaction(|txn| {
+            txn.retire_schema_candidate(&candidate, &base, stale_control_basis, &proposed, T, &[])
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StaleControlSnapshotBasis {
+            provided,
+            current
+        } if provided == stale_control_basis && current == current_control_basis
+    ));
+    assert_eq!(store.stamp(), current_control_basis);
+
+    store
+        .input_transaction(|txn| {
+            txn.retire_schema_candidate(&candidate, &base, current_control_basis, &proposed, T, &[])
+        })
+        .unwrap();
+
+    let retired_stamp = store.stamp();
+    let asset = AssetUuid([79; 16]);
+    let err = store
+        .input_transaction(|txn| {
+            txn.upsert_asset(&AssetRecord {
+                asset,
+                bundle: BundleUuid([80; 16]),
+                local_id: "retired".into(),
+                type_uuid: T,
+                logical_hash: h(1),
+                authoring_only: false,
+                tags: vec![],
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::RetiredTypeReferenced {
+            type_uuid: T,
+            reference: RetiredTypeReference::Asset(found),
+        } if found == asset
+    ));
+    assert_eq!(store.stamp(), retired_stamp);
+
+    let err = store
+        .input_transaction(|txn| txn.ensure_migration_endpoint_type_active(T, h(9)))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::RetiredTypeReferenced {
+            type_uuid: T,
+            reference: RetiredTypeReference::MigrationEndpoint(endpoint),
+        } if endpoint == h(9)
+    ));
+    assert_eq!(store.stamp(), retired_stamp);
 }
 
 #[test]

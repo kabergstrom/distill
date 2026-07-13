@@ -5,6 +5,13 @@
 use std::fmt;
 use std::path::PathBuf;
 
+/// The concrete publication that attempted to use retired schema authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredTypeReference {
+    Asset(distill_core::id::AssetUuid),
+    MigrationEndpoint(distill_core::id::LogicalHash),
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     /// An underlying SQLite error.
@@ -68,6 +75,18 @@ pub enum StoreError {
         type_uuid: distill_core::id::TypeUuid,
         live_assets: u64,
         live_migration_endpoints: usize,
+    },
+    /// An authority command was derived from control reads of a different
+    /// committed store snapshot than the transaction it attempted to mutate.
+    StaleControlSnapshotBasis {
+        provided: crate::state::SnapshotStamp,
+        current: crate::state::SnapshotStamp,
+    },
+    /// A scanner/importer/CRUD publication attempted to reintroduce a type
+    /// whose retained lineage authority is explicitly retired.
+    RetiredTypeReferenced {
+        type_uuid: distill_core::id::TypeUuid,
+        reference: RetiredTypeReference,
     },
     /// An explicit authority command named a row in an ineligible state.
     InvalidAuthorityTransition {
@@ -238,6 +257,23 @@ impl fmt::Display for StoreError {
                 f,
                 "schema retirement for {type_uuid} is blocked by {live_assets} live authored entries and {live_migration_endpoints} live migration endpoints"
             ),
+            StoreError::StaleControlSnapshotBasis { provided, current } => write!(
+                f,
+                "schema authority command control basis {provided:?} is stale; current transaction basis is {current:?}"
+            ),
+            StoreError::RetiredTypeReferenced {
+                type_uuid,
+                reference,
+            } => match reference {
+                RetiredTypeReference::Asset(asset) => write!(
+                    f,
+                    "asset {asset} references retired schema authority {type_uuid}; explicit reactivation is required"
+                ),
+                RetiredTypeReference::MigrationEndpoint(endpoint) => write!(
+                    f,
+                    "migration endpoint {endpoint} references retired schema authority {type_uuid}; explicit reactivation is required"
+                ),
+            },
             StoreError::InvalidAuthorityTransition { type_uuid, detail } => {
                 write!(f, "schema authority transition for {type_uuid} is invalid: {detail}")
             }

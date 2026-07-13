@@ -21,7 +21,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid
 use rusqlite::OptionalExtension;
 
 use crate::db::{meta_get_text, meta_set_text, InputTxn, Store};
-use crate::error::StoreError;
+use crate::error::{RetiredTypeReference, StoreError};
 use crate::files::RootId;
 use crate::state::VersionPoison;
 
@@ -223,6 +223,7 @@ impl InputTxn<'_> {
 
     /// Publish (or republish) an asset row; tags replace wholesale.
     pub fn upsert_asset(&mut self, rec: &AssetRecord) -> Result<(), StoreError> {
+        self.ensure_type_reference_active(rec.type_uuid, RetiredTypeReference::Asset(rec.asset))?;
         self.txn.execute(
             "INSERT INTO assets(
                  asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only
