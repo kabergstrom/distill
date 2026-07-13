@@ -75,6 +75,8 @@ fn every_section_13_table_exists() {
         "cas_extents",
         "cas_segments",
         "pipeline_state",
+        "pipeline_schema_registry",
+        "pipeline_candidate_schema_registry",
         "configuration_state",
         "pending_restart",
         "registrations",
@@ -200,7 +202,7 @@ fn schema_lineage_records_the_chain_with_generations_and_digests() {
     assert_eq!(pk_columns(&conn, "schema_lineage_current"), ["type_uuid"]);
     assert_eq!(
         columns(&conn, "schema_lineage_state"),
-        ["id", "input_version"]
+        ["id", "input_version", "manifest_hash"]
     );
 }
 
@@ -216,13 +218,27 @@ fn pipeline_state_row_shape() {
             "id",
             "dylib_hash",
             "load_policy_digest",
+            "compiled_types",
+            "target_set_hash",
             "input_version",
-            "poison"
+            "poison",
+            "acceptance_candidate_dylib_hash",
+            "acceptance_candidate_compiled_types",
+            "acceptance_candidate_target_set_hash",
+            "acceptance_manifest_hash"
         ]
     );
     assert_eq!(
         columns(&conn, "registrations"),
         ["kind", "reg_id", "version"]
+    );
+    assert_eq!(
+        columns(&conn, "pipeline_schema_registry"),
+        ["type_uuid", "logical_hash"]
+    );
+    assert_eq!(
+        columns(&conn, "pipeline_candidate_schema_registry"),
+        ["type_uuid", "logical_hash"]
     );
 }
 

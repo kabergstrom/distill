@@ -3,8 +3,10 @@
 //! `PipelineState` valid/invalid operation classification, and the
 //! load-policy digest.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::TypeUuid;
 use distill_store::state::{
     load_policy_digest, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, InputVersion,
@@ -16,6 +18,9 @@ fn epoch() -> Arc<PipelineEpoch> {
     Arc::new(PipelineEpoch {
         dylib_hash: [7u8; 32],
         load_policy_digest: [9u8; 32],
+        compiled_types: CompiledAttestationDigest([10u8; 32]),
+        target_set_hash: [11u8; 32],
+        schema_registry: BTreeMap::new(),
         registrations: vec![Registration {
             kind: RegistrationKind::Processor,
             id: "tex-compress".to_owned(),
@@ -104,7 +109,7 @@ fn poisoned_state_epoch_is_the_named_error() {
         last_good: None,
     };
     let err = state.epoch().expect_err("poisoned version has no epoch");
-    assert!(err.error.contains("tex-compress"));
+    assert!(err.to_string().contains("tex-compress"));
 }
 
 #[test]
@@ -161,7 +166,7 @@ fn pipeline_dependent_ops_fail_deterministically_under_poison() {
         assert!(op.requires_epoch(), "{op:?} needs the pipeline");
         let err = state.check(op).expect_err("must fail under poison");
         assert!(
-            err.error.contains("tex-compress"),
+            err.to_string().contains("tex-compress"),
             "the error names the failure"
         );
     }

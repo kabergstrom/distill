@@ -34,6 +34,29 @@ pub enum StoreError {
     /// A runtime/query/pack surface attempted to select an authoring-only
     /// control entry. Tooling metadata inspection uses a separate API.
     RoleIneligible { asset: distill_core::id::AssetUuid },
+    /// An explicit schema accept/rollback command named a lineage
+    /// projection epoch that is no longer current (or expected one before
+    /// the authoritative manifest had been projected).
+    StaleSchemaManifestBase {
+        expected: Box<crate::state::SchemaManifestBasis>,
+        actual: Option<Box<crate::state::SchemaManifestBasis>>,
+    },
+    /// An explicit schema command attempted to consume a different staged
+    /// candidate from the one that published `SchemaAcceptanceRequired`.
+    StaleSchemaCandidate {
+        expected: Box<crate::state::PipelineCandidateIdentity>,
+        actual: Box<crate::state::PipelineCandidateIdentity>,
+    },
+    /// The command's requested cursor is not the digest compiled into the
+    /// named candidate registry row (or that row is absent).
+    SchemaCandidateCursorMismatch {
+        type_uuid: distill_core::id::TypeUuid,
+        requested: distill_core::id::LogicalHash,
+        candidate: Option<distill_core::id::LogicalHash>,
+    },
+    /// Once initialized, authoritative lineage changes may only occur
+    /// through candidate-bound accept or rollback APIs.
+    LineageMutationRequiresCandidate,
     /// General manifest projection refused a cursor-only move to an existing
     /// accepted epoch. It is a rollback (§11, §13), so it must use the
     /// explicit reverse-coverage validation path instead.
@@ -141,6 +164,41 @@ impl fmt::Display for StoreError {
             StoreError::RoleIneligible { asset } => write!(
                 f,
                 "asset {asset} is authoring-only and ineligible for runtime selection"
+            ),
+            StoreError::StaleSchemaManifestBase { expected, actual } => match actual {
+                Some(actual) => write!(
+                    f,
+                    "schema command manifest base {} is stale; current source manifest is {}",
+                    expected.manifest_hash, actual.manifest_hash
+                ),
+                None => write!(
+                    f,
+                    "schema command manifest base {} is stale; no authoritative manifest is projected",
+                    expected.manifest_hash
+                ),
+            },
+            StoreError::StaleSchemaCandidate { expected, actual } => write!(
+                f,
+                "schema command names stale candidate dylib {:02x?}; pending candidate is {:02x?}",
+                actual.dylib_hash, expected.dylib_hash
+            ),
+            StoreError::SchemaCandidateCursorMismatch {
+                type_uuid,
+                requested,
+                candidate,
+            } => match candidate {
+                Some(candidate) => write!(
+                    f,
+                    "schema command requests cursor {requested} for {type_uuid}, but candidate compiled {candidate}"
+                ),
+                None => write!(
+                    f,
+                    "schema command requests cursor {requested} for {type_uuid}, but candidate has no such registry row"
+                ),
+            },
+            StoreError::LineageMutationRequiresCandidate => write!(
+                f,
+                "an initialized schema-lineage projection may change only through a stale-base-checked candidate accept or rollback"
             ),
             StoreError::LineageRollback {
                 type_uuid,

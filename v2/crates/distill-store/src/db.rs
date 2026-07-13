@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -144,14 +144,28 @@ CREATE TABLE pipeline_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     dylib_hash         BLOB,
     load_policy_digest BLOB,
+    compiled_types     BLOB,
+    target_set_hash    BLOB,
     input_version      INTEGER NOT NULL,
-    poison             TEXT
+    poison             TEXT,
+    acceptance_candidate_dylib_hash BLOB,
+    acceptance_candidate_compiled_types BLOB,
+    acceptance_candidate_target_set_hash BLOB,
+    acceptance_manifest_hash BLOB
 );
 CREATE TABLE registrations (
     kind    INTEGER NOT NULL,
     reg_id  TEXT NOT NULL,
     version INTEGER NOT NULL,
     PRIMARY KEY (kind, reg_id)
+);
+CREATE TABLE pipeline_schema_registry (
+    type_uuid   BLOB NOT NULL PRIMARY KEY,
+    logical_hash BLOB NOT NULL
+);
+CREATE TABLE pipeline_candidate_schema_registry (
+    type_uuid   BLOB NOT NULL PRIMARY KEY,
+    logical_hash BLOB NOT NULL
 );
 CREATE TABLE configuration_state (
     id                INTEGER PRIMARY KEY CHECK (id = 0),
@@ -188,7 +202,8 @@ CREATE TABLE schema_lineage_current (
 );
 CREATE TABLE schema_lineage_state (
     id            INTEGER PRIMARY KEY CHECK (id = 0),
-    input_version INTEGER NOT NULL
+    input_version INTEGER NOT NULL,
+    manifest_hash BLOB NOT NULL
 );
 CREATE TABLE pins (
     kind         INTEGER NOT NULL,

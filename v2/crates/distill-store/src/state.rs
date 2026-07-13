@@ -17,10 +17,12 @@
 //! carries; residency is still expressed the spec's way (`Arc`), so pin
 //! counting composes when the module host wraps it.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use distill_core::id::TypeUuid;
+use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 
 /// Advanced by watcher batches + authoring ops — module/schema artifact
 /// swaps and config edits arrive as watcher events, so epoch rotation is
@@ -106,8 +108,69 @@ pub struct PipelineEpoch {
     /// current registry (§9, §13) — input-versioned change tracking for
     /// the deliberately unhashed `build_only` bit (§5).
     pub load_policy_digest: [u8; 32],
+    /// Aggregate over the complete compiled type rows. This is part of the
+    /// staged-candidate identity used by explicit schema commands.
+    pub compiled_types: CompiledAttestationDigest,
+    /// Hash of the validated target definition set used to construct the
+    /// candidate pipeline map.
+    pub target_set_hash: [u8; 32],
+    /// The candidate's complete compiled registry projection. `Ready`
+    /// requires exact key/value equality with the authoritative lineage
+    /// manifest's current cursors; a missing, extra, or unequal row is a
+    /// typed schema-acceptance requirement instead.
+    pub schema_registry: BTreeMap<TypeUuid, LogicalHash>,
     /// Importer/processor registrations and versions.
     pub registrations: Vec<Registration>,
+}
+
+/// Store-side identity of a candidate whose compiled schema projection is
+/// awaiting explicit acceptance or rollback. The staged dylib binds the
+/// registration/code identity, DSCA binds the complete compiled type table,
+/// and the target-set hash prevents a candidate built for different targets
+/// from consuming the pending command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineCandidateIdentity {
+    pub dylib_hash: [u8; 32],
+    pub compiled_types: CompiledAttestationDigest,
+    pub target_set_hash: [u8; 32],
+}
+
+impl From<&PipelineEpoch> for PipelineCandidateIdentity {
+    fn from(epoch: &PipelineEpoch) -> Self {
+        Self {
+            dylib_hash: epoch.dylib_hash,
+            compiled_types: epoch.compiled_types,
+            target_set_hash: epoch.target_set_hash,
+        }
+    }
+}
+
+/// One exact registry-versus-authority disagreement. `None` names a row
+/// missing from that side, so missing, extra, and unequal cases share one
+/// stable typed representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaRegistryMismatch {
+    pub type_uuid: TypeUuid,
+    pub candidate: Option<LogicalHash>,
+    pub manifest: Option<LogicalHash>,
+}
+
+/// Exact stale-base identity of the verified source-controlled manifest.
+/// The file hash prevents ABA across append-only history changes; the full
+/// sorted cursor projection makes the requested selection explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaManifestBasis {
+    pub manifest_hash: ContentHash,
+    pub current_cursors: BTreeMap<TypeUuid, LogicalHash>,
+}
+
+/// A candidate that cannot become `Ready` until explicit schema acceptance
+/// or rollback publishes another verified source-controlled manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaAcceptanceRequired {
+    pub manifest: SchemaManifestBasis,
+    pub candidate: PipelineCandidateIdentity,
+    pub mismatches: Vec<SchemaRegistryMismatch>,
 }
 
 /// The named failure that kept a candidate epoch from publishing (§3,
@@ -174,10 +237,38 @@ impl std::error::Error for VersionPoison {}
 #[derive(Debug, Clone)]
 pub enum PipelineState {
     Ready(Arc<PipelineEpoch>),
+    SchemaAcceptanceRequired {
+        required: SchemaAcceptanceRequired,
+        last_good: Option<Arc<PipelineEpoch>>,
+    },
     Poisoned {
         error: PipelinePoison,
         last_good: Option<Arc<PipelineEpoch>>,
     },
+}
+
+/// Typed reason a snapshot has no usable pipeline epoch. Schema acceptance
+/// is deliberately not collapsed into generic pipeline poison: authoring can
+/// inspect its manifest/candidate basis and issue the explicit bound command.
+#[derive(Debug, Clone, Copy)]
+pub enum PipelineUnavailable<'a> {
+    Poisoned(&'a PipelinePoison),
+    SchemaAcceptanceRequired(&'a SchemaAcceptanceRequired),
+}
+
+impl fmt::Display for PipelineUnavailable<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineUnavailable::Poisoned(error) => error.fmt(f),
+            PipelineUnavailable::SchemaAcceptanceRequired(required) => write!(
+                f,
+                "schema acceptance required for candidate dylib {:02x?} against source manifest {} ({} registry mismatch(es))",
+                required.candidate.dylib_hash,
+                required.manifest.manifest_hash,
+                required.mismatches.len()
+            ),
+        }
+    }
 }
 
 impl PipelineState {
@@ -185,19 +276,25 @@ impl PipelineState {
     /// because a pipeline-poisoned version has no `PipelineEpoch` to
     /// return (§3: a failed candidate never becomes one, and the prior
     /// epoch may not stand in).
-    pub fn epoch(&self) -> Result<&Arc<PipelineEpoch>, &PipelinePoison> {
+    pub fn epoch(&self) -> Result<&Arc<PipelineEpoch>, PipelineUnavailable<'_>> {
         match self {
             PipelineState::Ready(epoch) => Ok(epoch),
-            PipelineState::Poisoned { error, .. } => Err(error),
+            PipelineState::SchemaAcceptanceRequired { required, .. } => {
+                Err(PipelineUnavailable::SchemaAcceptanceRequired(required))
+            }
+            PipelineState::Poisoned { error, .. } => Err(PipelineUnavailable::Poisoned(error)),
         }
     }
 
     /// The §13 operation classification: pure-metadata reads remain valid
     /// under poison (`Ok(None)` — no epoch consumed); pipeline-dependent
     /// operations receive the epoch when ready (`Ok(Some(_))`) and fail
-    /// deterministically with the poison naming the registration error
+    /// deterministically with its typed poison or schema-acceptance reason
     /// otherwise.
-    pub fn check(&self, op: OperationKind) -> Result<Option<&Arc<PipelineEpoch>>, &PipelinePoison> {
+    pub fn check(
+        &self,
+        op: OperationKind,
+    ) -> Result<Option<&Arc<PipelineEpoch>>, PipelineUnavailable<'_>> {
         if !op.requires_epoch() {
             return Ok(None);
         }

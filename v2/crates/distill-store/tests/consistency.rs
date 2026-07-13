@@ -3,11 +3,14 @@
 //! all-or-nothing, WAL readers only ever observe complete input
 //! versions, and the poison classifications compose.
 
+use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
-use distill_store::pipeline::{AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest};
+use distill_store::pipeline::{
+    AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, VerifiedSchemaLineageManifest,
+};
 use distill_store::state::{PipelineEpoch, PipelineState};
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -100,24 +103,34 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 authoring_only: false,
                 tags: vec!["t".into()],
             })?;
-            txn.project_lineage_manifest(&SchemaLineageManifest {
-                types: [(
-                    TypeUuid([3u8; 16]),
-                    AcceptedTypeLineage {
-                        epochs: vec![AcceptedSchemaEpoch {
-                            digest: LogicalHash([5u8; 32]),
-                            forward_parent: None,
-                        }],
-                        current: 0,
+            txn.project_verified_lineage_manifest(
+                &VerifiedSchemaLineageManifest::from_verified_source(
+                    ContentHash([10u8; 32]),
+                    SchemaLineageManifest {
+                        types: [(
+                            TypeUuid([3u8; 16]),
+                            AcceptedTypeLineage {
+                                epochs: vec![AcceptedSchemaEpoch {
+                                    digest: LogicalHash([5u8; 32]),
+                                    forward_parent: None,
+                                }],
+                                current: 0,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
                     },
-                )]
-                .into_iter()
-                .collect(),
-            })?;
+                ),
+            )?;
             txn.stage_tool("tool", b"tool bytes")?;
             txn.publish_pipeline_epoch(&PipelineEpoch {
                 dylib_hash: [6u8; 32],
                 load_policy_digest: [7u8; 32],
+                compiled_types: CompiledAttestationDigest([8u8; 32]),
+                target_set_hash: [9u8; 32],
+                schema_registry: [(TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))]
+                    .into_iter()
+                    .collect(),
                 registrations: vec![],
             })?;
             Err(StoreError::Poisoned {
@@ -240,9 +253,18 @@ fn version_poison_and_pipeline_poison_are_distinct_gates() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     store
         .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(
+                &VerifiedSchemaLineageManifest::from_verified_source(
+                    ContentHash([11u8; 32]),
+                    SchemaLineageManifest::default(),
+                ),
+            )?;
             txn.publish_pipeline_epoch(&PipelineEpoch {
                 dylib_hash: [1u8; 32],
                 load_policy_digest: [2u8; 32],
+                compiled_types: CompiledAttestationDigest([3u8; 32]),
+                target_set_hash: [4u8; 32],
+                schema_registry: std::collections::BTreeMap::new(),
                 registrations: vec![],
             })?;
             txn.set_version_poison(Some("identity collision"))

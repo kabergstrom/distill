@@ -6,12 +6,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_core::id::{LogicalHash, TypeUuid};
+use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, HardStopReason, LineageClass, LineageStamp,
-    ReverseMigrationEdge, SchemaLineageManifest,
+    ReverseMigrationEdge, SchemaLineageManifest, SchemaRollbackRequest,
+    VerifiedSchemaLineageManifest,
 };
-use distill_store::state::{PipelineEpoch, PipelineState, Registration, RegistrationKind};
+use distill_store::state::{
+    PipelineEpoch, PipelineState, PipelineUnavailable, Registration, RegistrationKind,
+};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -24,6 +28,9 @@ fn epoch(n: u8) -> PipelineEpoch {
     PipelineEpoch {
         dylib_hash: [n; 32],
         load_policy_digest: [n.wrapping_add(1); 32],
+        compiled_types: CompiledAttestationDigest([n.wrapping_add(2); 32]),
+        target_set_hash: [n.wrapping_add(3); 32],
+        schema_registry: BTreeMap::new(),
         registrations: vec![
             Registration {
                 kind: RegistrationKind::Importer,
@@ -36,6 +43,37 @@ fn epoch(n: u8) -> PipelineEpoch {
                 version: 5,
             },
         ],
+    }
+}
+
+fn epoch_with_registry(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> PipelineEpoch {
+    let mut epoch = epoch(n);
+    epoch.schema_registry = rows.iter().copied().collect();
+    epoch
+}
+
+fn project_empty(store: &mut Store) {
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(1, SchemaLineageManifest::default()))
+        })
+        .unwrap();
+}
+
+fn verified(n: u8, manifest: SchemaLineageManifest) -> VerifiedSchemaLineageManifest {
+    VerifiedSchemaLineageManifest::from_verified_source(ContentHash([n; 32]), manifest)
+}
+
+fn require_candidate(
+    store: &mut Store,
+    candidate: &PipelineEpoch,
+) -> distill_store::state::SchemaManifestBasis {
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(candidate))
+        .unwrap();
+    match store.pipeline_state().unwrap().unwrap() {
+        PipelineState::SchemaAcceptanceRequired { required, .. } => required.manifest,
+        other => panic!("candidate unexpectedly ready: {other:?}"),
     }
 }
 
@@ -56,6 +94,7 @@ fn no_pipeline_state_until_first_publication() {
 #[test]
 fn publishing_an_epoch_roundtrips_identity_and_registrations() {
     let (_d, mut store) = store();
+    project_empty(&mut store);
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
@@ -77,6 +116,7 @@ fn a_rejected_candidate_still_publishes_as_poison() {
     // the prior epoch is never silently retained as the new version's
     // code, and the version is never dropped.
     let (_d, mut store) = store();
+    project_empty(&mut store);
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
@@ -113,6 +153,7 @@ fn poison_with_no_prior_epoch_has_no_last_good() {
 #[test]
 fn the_next_successful_swap_publishes_over_the_poison() {
     let (_d, mut store) = store();
+    project_empty(&mut store);
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
@@ -124,6 +165,317 @@ fn the_next_successful_swap_publishes_over_the_poison() {
         .unwrap();
     let state = store.pipeline_state().unwrap().expect("published");
     assert_eq!(state.epoch().expect("healed").dylib_hash, [7u8; 32]);
+}
+
+#[test]
+fn ready_requires_exact_candidate_registry_and_manifest_cursor_equality() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                2,
+                manifest(&[(T, accepted(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(3, &[(T, h(1))]);
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&candidate))
+        .unwrap();
+
+    let state = store.pipeline_state().unwrap().expect("published");
+    let ready = state.epoch().expect("exact registry is ready");
+    assert_eq!(ready.schema_registry, BTreeMap::from([(T, h(1))]));
+}
+
+#[test]
+fn candidate_publication_requires_a_verified_source_manifest() {
+    let (_d, mut store) = store();
+    let candidate = epoch_with_registry(2, &[]);
+    let err = store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&candidate))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::LineageManifestUnavailable));
+    assert_eq!(store.input_version().0, 0);
+    assert!(store.pipeline_state().unwrap().is_none());
+}
+
+#[test]
+fn missing_extra_and_unequal_registry_rows_publish_stable_acceptance_required() {
+    let other = TypeUuid([5u8; 16]);
+    let cases = [
+        (
+            manifest(&[(T, accepted(&[h(1)], 0))]),
+            epoch_with_registry(1, &[]),
+            (T, None, Some(h(1))),
+        ),
+        (
+            SchemaLineageManifest::default(),
+            epoch_with_registry(2, &[(T, h(1))]),
+            (T, Some(h(1)), None),
+        ),
+        (
+            manifest(&[(T, accepted(&[h(1)], 0)), (other, accepted(&[h(7)], 0))]),
+            epoch_with_registry(3, &[(T, h(2)), (other, h(7))]),
+            (T, Some(h(2)), Some(h(1))),
+        ),
+    ];
+
+    for (authority, candidate, expected) in cases {
+        let (_d, mut store) = store();
+        store
+            .input_transaction(|txn| {
+                txn.project_verified_lineage_manifest(&verified(3, authority.clone()))
+            })
+            .unwrap();
+        store
+            .input_transaction(|txn| txn.publish_pipeline_epoch(&candidate))
+            .unwrap();
+
+        let first = store.pipeline_state().unwrap().expect("published");
+        let second = store.pipeline_state().unwrap().expect("stable reread");
+        match (&first, &second) {
+            (
+                PipelineState::SchemaAcceptanceRequired { required: a, .. },
+                PipelineState::SchemaAcceptanceRequired { required: b, .. },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(a.candidate.dylib_hash, candidate.dylib_hash);
+                assert!(a
+                    .mismatches
+                    .iter()
+                    .any(|row| { (row.type_uuid, row.candidate, row.manifest) == expected }));
+            }
+            other => panic!("expected stable SchemaAcceptanceRequired, got {other:?}"),
+        }
+        assert!(matches!(
+            first.epoch(),
+            Err(PipelineUnavailable::SchemaAcceptanceRequired(_))
+        ));
+    }
+}
+
+#[test]
+fn candidate_bound_accept_rejects_stale_base_and_then_publishes_atomically() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                4,
+                manifest(&[(T, accepted(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(4, &[(T, h(2))]);
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&candidate))
+        .unwrap();
+    let required = match store.pipeline_state().unwrap().unwrap() {
+        PipelineState::SchemaAcceptanceRequired { required, .. } => required,
+        other => panic!("expected acceptance requirement, got {other:?}"),
+    };
+    let base = required.manifest;
+    let stale = distill_store::state::SchemaManifestBasis {
+        manifest_hash: ContentHash([99; 32]),
+        current_cursors: base.current_cursors.clone(),
+    };
+    let stale_cursors = distill_store::state::SchemaManifestBasis {
+        manifest_hash: base.manifest_hash,
+        current_cursors: BTreeMap::from([(T, h(99))]),
+    };
+    let proposed = verified(7, manifest(&[(T, accepted(&[h(1), h(2)], 1))]));
+    let before_version = store.input_version();
+
+    let err = store
+        .input_transaction(|txn| {
+            txn.accept_schema_candidate(&candidate, &stale, &proposed, T, h(2))
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StaleSchemaManifestBase { expected, actual }
+            if *expected == stale && actual.as_deref() == Some(&base)
+    ));
+    let err = store
+        .input_transaction(|txn| {
+            txn.accept_schema_candidate(&candidate, &stale_cursors, &proposed, T, h(2))
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StaleSchemaManifestBase { expected, actual }
+            if *expected == stale_cursors && actual.as_deref() == Some(&base)
+    ));
+    assert_eq!(store.input_version(), before_version);
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+    assert!(matches!(
+        store.pipeline_state().unwrap().unwrap(),
+        PipelineState::SchemaAcceptanceRequired { .. }
+    ));
+
+    store
+        .input_transaction(|txn| txn.accept_schema_candidate(&candidate, &base, &proposed, T, h(2)))
+        .unwrap();
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(2)));
+    assert_eq!(store.lineage(T).unwrap().len(), 2);
+    assert_eq!(
+        store
+            .pipeline_state()
+            .unwrap()
+            .unwrap()
+            .epoch()
+            .unwrap()
+            .dylib_hash,
+        candidate.dylib_hash
+    );
+}
+
+#[test]
+fn verified_proposed_manifest_is_the_only_authority_for_acceptance() {
+    let other = TypeUuid([8u8; 16]);
+    let (_d, mut store) = store();
+    let initial = manifest(&[(T, accepted(&[h(1)], 0)), (other, accepted(&[h(7)], 0))]);
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(40, initial.clone()))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(12, &[(T, h(2)), (other, h(7))]);
+    let base = require_candidate(&mut store, &candidate);
+    let before_version = store.input_version();
+    // T's requested append is present, but the source handoff also sneaks in
+    // an unrelated accepted epoch. The store must reject the whole verified
+    // proposal instead of treating its SQLite projection as authority.
+    let overbroad = verified(
+        41,
+        manifest(&[
+            (T, accepted(&[h(1), h(2)], 1)),
+            (other, accepted(&[h(7), h(8)], 1)),
+        ]),
+    );
+    let err = store
+        .input_transaction(|txn| {
+            txn.accept_schema_candidate(&candidate, &base, &overbroad, T, h(2))
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidLineageManifest { .. }));
+    assert_eq!(store.input_version(), before_version);
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+    assert_eq!(store.lineage(T).unwrap().len(), 1);
+    assert_eq!(store.lineage(other).unwrap().len(), 1);
+    assert!(matches!(
+        store.pipeline_state().unwrap().unwrap(),
+        PipelineState::SchemaAcceptanceRequired { .. }
+    ));
+}
+
+#[test]
+fn acceptance_is_bound_to_the_pending_candidate_and_never_partially_publishes() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                5,
+                manifest(&[(T, accepted(&[h(1)], 0))]),
+            ))
+        })
+        .unwrap();
+    let pending = epoch_with_registry(6, &[(T, h(2))]);
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&pending))
+        .unwrap();
+    let required = match store.pipeline_state().unwrap().unwrap() {
+        PipelineState::SchemaAcceptanceRequired { required, .. } => required,
+        other => panic!("expected acceptance requirement, got {other:?}"),
+    };
+    let base = required.manifest;
+    let proposed = verified(8, manifest(&[(T, accepted(&[h(1), h(2)], 1))]));
+    let wrong_candidate = epoch_with_registry(7, &[(T, h(2))]);
+    let before_version = store.input_version();
+
+    let err = store
+        .input_transaction(|txn| {
+            txn.accept_schema_candidate(&wrong_candidate, &base, &proposed, T, h(2))
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::StaleSchemaCandidate { .. }));
+    assert_eq!(store.input_version(), before_version);
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+    assert_eq!(store.lineage(T).unwrap().len(), 1);
+    match store.pipeline_state().unwrap().unwrap() {
+        PipelineState::SchemaAcceptanceRequired { required, .. } => {
+            assert_eq!(required.candidate.dylib_hash, pending.dylib_hash)
+        }
+        other => panic!("pending state changed after rejected accept: {other:?}"),
+    }
+}
+
+#[test]
+fn candidate_bound_rollback_rejects_stale_base_then_moves_only_the_cursor() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                6,
+                manifest(&[(T, accepted(&[h(1), h(2)], 1))]),
+            ))
+        })
+        .unwrap();
+    let candidate = epoch_with_registry(8, &[(T, h(1))]);
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&candidate))
+        .unwrap();
+    let required = match store.pipeline_state().unwrap().unwrap() {
+        PipelineState::SchemaAcceptanceRequired { required, .. } => required,
+        other => panic!("expected acceptance requirement, got {other:?}"),
+    };
+    let base = required.manifest;
+    let stale = distill_store::state::SchemaManifestBasis {
+        manifest_hash: ContentHash([98; 32]),
+        current_cursors: base.current_cursors.clone(),
+    };
+    let proposed = verified(9, manifest(&[(T, accepted(&[h(1), h(2)], 0))]));
+    let reverse = [ReverseMigrationEdge {
+        from: h(2),
+        to: h(1),
+    }];
+
+    let err = store
+        .input_transaction(|txn| {
+            txn.rollback_schema_candidate(
+                &candidate,
+                &stale,
+                &proposed,
+                SchemaRollbackRequest {
+                    type_uuid: T,
+                    target: h(1),
+                    live_schema_hashes: &[h(2)],
+                    reverse_edges: &reverse,
+                },
+            )
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::StaleSchemaManifestBase { .. }));
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(2)));
+
+    store
+        .input_transaction(|txn| {
+            txn.rollback_schema_candidate(
+                &candidate,
+                &base,
+                &proposed,
+                SchemaRollbackRequest {
+                    type_uuid: T,
+                    target: h(1),
+                    live_schema_hashes: &[h(2)],
+                    reverse_edges: &reverse,
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+    assert_eq!(store.lineage(T).unwrap().len(), 2);
+    assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
 }
 
 // ---- tools: the ToolEpoch table ----
@@ -256,7 +608,9 @@ fn manifest_projection_records_epochs_even_when_no_bundle_was_written() {
     let (_d, mut store) = store();
     let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(20, source.clone()))
+        })
         .unwrap();
 
     let entries = store.lineage(T).unwrap();
@@ -304,7 +658,9 @@ fn manifest_validation_rejects_bad_parents_duplicates_and_cursors() {
     ];
     for lineage in invalid {
         let err = store
-            .input_transaction(|txn| txn.project_lineage_manifest(&manifest(&[(T, lineage)])))
+            .input_transaction(|txn| {
+                txn.project_verified_lineage_manifest(&verified(21, manifest(&[(T, lineage)])))
+            })
             .unwrap_err();
         assert!(
             matches!(err, StoreError::InvalidLineageManifest { type_uuid: Some(t), .. } if t == T)
@@ -318,40 +674,40 @@ fn live_projection_is_append_only_and_cannot_bypass_rollback_validation() {
     let (_d, mut store) = store();
     let original = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&original))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(22, original.clone()))
+        })
         .unwrap();
 
     for invalid_update in [manifest(&[(T, accepted(&[h(1), h(2)], 1))]), manifest(&[])] {
         let err = store
-            .input_transaction(|txn| txn.project_lineage_manifest(&invalid_update))
+            .input_transaction(|txn| {
+                txn.project_verified_lineage_manifest(&verified(23, invalid_update))
+            })
             .unwrap_err();
-        assert!(matches!(err, StoreError::InvalidLineageManifest { .. }));
+        assert!(matches!(err, StoreError::LineageMutationRequiresCandidate));
         assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
         assert_eq!(store.lineage(T).unwrap().len(), 3);
     }
 
     let rollback_bypass = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 0))]);
     let err = store
-        .input_transaction(|txn| txn.project_lineage_manifest(&rollback_bypass))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(24, rollback_bypass))
+        })
         .unwrap_err();
-    assert!(matches!(
-        err,
-        StoreError::LineageRollback {
-            type_uuid,
-            candidate,
-            current,
-        } if type_uuid == T && candidate == h(1) && current == h(3)
-    ));
+    assert!(matches!(err, StoreError::LineageMutationRequiresCandidate));
     assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
 
-    // Ordinary acceptance is the only general projection transition: it
-    // appends and advances, preserving the complete prior vector.
+    // Even an append-only extension cannot bypass the candidate-bound,
+    // verified-source transition API.
     let extended = manifest(&[(T, accepted(&[h(1), h(2), h(3), h(4)], 3))]);
-    store
-        .input_transaction(|txn| txn.project_lineage_manifest(&extended))
-        .unwrap();
-    assert_eq!(store.lineage_current(T).unwrap(), Some(h(4)));
-    assert_eq!(store.lineage(T).unwrap().len(), 4);
+    let err = store
+        .input_transaction(|txn| txn.project_verified_lineage_manifest(&verified(25, extended)))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::LineageMutationRequiresCandidate));
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
+    assert_eq!(store.lineage(T).unwrap().len(), 3);
 }
 
 #[test]
@@ -361,7 +717,9 @@ fn state_loss_never_treats_a_bundle_stamp_as_forward_authority() {
     let mut store = Store::open(config.clone()).unwrap();
     let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(26, source.clone()))
+        })
         .unwrap();
     let old_stamp = stamp(T, epochs(&[h(1)]), 0);
 
@@ -377,7 +735,9 @@ fn state_loss_never_treats_a_bundle_stamp_as_forward_authority() {
     // Startup rebuilds only from the source-controlled manifest, never by
     // unioning the observed bundle stamp into authority.
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(26, source.clone()))
+        })
         .unwrap();
     assert_eq!(
         store
@@ -392,7 +752,9 @@ fn prefix_and_parent_proof_alone_permits_a_forward_automatic_diff() {
     let (_d, mut store) = store();
     let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(27, source.clone()))
+        })
         .unwrap();
     let s1 = stamp(T, epochs(&[h(1)]), 0);
     assert_eq!(
@@ -430,13 +792,16 @@ fn vector_order_never_substitutes_for_parent_reachability() {
     ];
     store
         .input_transaction(|txn| {
-            txn.project_lineage_manifest(&manifest(&[(
-                T,
-                AcceptedTypeLineage {
-                    epochs: branch.clone(),
-                    current: 3,
-                },
-            )]))
+            txn.project_verified_lineage_manifest(&verified(
+                28,
+                manifest(&[(
+                    T,
+                    AcceptedTypeLineage {
+                        epochs: branch.clone(),
+                        current: 3,
+                    },
+                )]),
+            ))
         })
         .unwrap();
 
@@ -466,7 +831,9 @@ fn divergent_forged_or_non_manifest_stamps_never_prove_ancestry() {
     let (_d, mut store) = store();
     let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(29, source.clone()))
+        })
         .unwrap();
     let mut bad_parent = epochs(&[h(1), h(2)]);
     bad_parent[1].forward_parent = None;
@@ -491,8 +858,12 @@ fn rollback_moves_only_the_cursor_after_complete_reverse_edge_validation() {
     let (_d, mut store) = store();
     let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(30, source.clone()))
+        })
         .unwrap();
+    let candidate = epoch_with_registry(10, &[(T, h(1))]);
+    let base = require_candidate(&mut store, &candidate);
     let reverse = [
         ReverseMigrationEdge {
             from: h(3),
@@ -503,8 +874,21 @@ fn rollback_moves_only_the_cursor_after_complete_reverse_edge_validation() {
             to: h(1),
         },
     ];
+    let proposed = verified(33, manifest(&[(T, accepted(&[h(1), h(2), h(3)], 0))]));
     let (rolled_back, _) = store
-        .input_transaction(|txn| txn.rollback_lineage(T, h(1), &[h(2), h(3)], &reverse))
+        .input_transaction(|txn| {
+            txn.rollback_schema_candidate(
+                &candidate,
+                &base,
+                &proposed,
+                SchemaRollbackRequest {
+                    type_uuid: T,
+                    target: h(1),
+                    live_schema_hashes: &[h(2), h(3)],
+                    reverse_edges: &reverse,
+                },
+            )
+        })
         .unwrap();
     assert_eq!(rolled_back, stamp(T, epochs(&[h(1), h(2), h(3)]), 0));
     assert_eq!(
@@ -538,8 +922,13 @@ fn rollback_rejects_missing_ambiguous_cyclic_and_unknown_coverage_atomically() {
     let (_d, mut store) = store();
     let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(31, source.clone()))
+        })
         .unwrap();
+    let candidate = epoch_with_registry(11, &[(T, h(1))]);
+    let base = require_candidate(&mut store, &candidate);
+    let proposed = verified(34, manifest(&[(T, accepted(&[h(1), h(2), h(3)], 0))]));
 
     let bad_cases: &[(&[LogicalHash], &[ReverseMigrationEdge])] = &[
         (
@@ -595,7 +984,19 @@ fn rollback_rejects_missing_ambiguous_cyclic_and_unknown_coverage_atomically() {
     ];
     for (live, edges) in bad_cases {
         let err = store
-            .input_transaction(|txn| txn.rollback_lineage(T, h(1), live, edges))
+            .input_transaction(|txn| {
+                txn.rollback_schema_candidate(
+                    &candidate,
+                    &base,
+                    &proposed,
+                    SchemaRollbackRequest {
+                        type_uuid: T,
+                        target: h(1),
+                        live_schema_hashes: live,
+                        reverse_edges: edges,
+                    },
+                )
+            })
             .unwrap_err();
         assert!(
             matches!(err, StoreError::IncompleteRollbackCoverage { type_uuid, target, .. } if type_uuid == T && target == h(1))
@@ -612,7 +1013,10 @@ fn projection_is_per_type_and_chain_commitments_bind_the_type() {
     let second = accepted(&[h(7)], 0);
     store
         .input_transaction(|txn| {
-            txn.project_lineage_manifest(&manifest(&[(T, first), (other, second)]))
+            txn.project_verified_lineage_manifest(&verified(
+                32,
+                manifest(&[(T, first), (other, second)]),
+            ))
         })
         .unwrap();
     assert_eq!(store.lineage(T).unwrap().len(), 1);

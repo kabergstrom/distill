@@ -7,14 +7,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use distill_core::id::{LogicalHash, TypeUuid};
+use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use rusqlite::OptionalExtension;
 
-use crate::bundles::blob32;
 use crate::db::{InputTxn, Store};
 use crate::error::StoreError;
 use crate::state::{
-    InputVersion, PipelineEpoch, PipelinePoison, PipelineState, Registration, RegistrationKind,
+    InputVersion, PipelineCandidateIdentity, PipelineEpoch, PipelinePoison, PipelineState,
+    Registration, RegistrationKind, SchemaAcceptanceRequired, SchemaManifestBasis,
+    SchemaRegistryMismatch,
 };
 
 /// One published tool mapping (§13's `tools` row): registration staged a
@@ -53,12 +55,54 @@ pub struct SchemaLineageManifest {
     pub types: BTreeMap<TypeUuid, AcceptedTypeLineage>,
 }
 
+/// Explicit trust-boundary handoff for the unique source-controlled lineage
+/// manifest. The coordinator constructs this only after parsing the complete
+/// file and verifying that `manifest_hash` is its byte-identity hash; the
+/// store persists that hash beside the disposable SQLite projection and
+/// never synthesizes a successor manifest itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSchemaLineageManifest {
+    manifest_hash: ContentHash,
+    manifest: SchemaLineageManifest,
+}
+
+impl VerifiedSchemaLineageManifest {
+    pub fn from_verified_source(
+        manifest_hash: ContentHash,
+        manifest: SchemaLineageManifest,
+    ) -> Self {
+        Self {
+            manifest_hash,
+            manifest,
+        }
+    }
+
+    pub fn manifest_hash(&self) -> ContentHash {
+        self.manifest_hash
+    }
+
+    pub fn manifest(&self) -> &SchemaLineageManifest {
+        &self.manifest
+    }
+}
+
 /// One authored custom migration edge supplied to explicit rollback
 /// validation. Automatic diffs are deliberately absent from this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReverseMigrationEdge {
     pub from: LogicalHash,
     pub to: LogicalHash,
+}
+
+/// The rollback-specific proof inputs, grouped so the candidate, verified
+/// manifest base, and verified proposed manifest remain visually distinct at
+/// the trust boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaRollbackRequest<'a> {
+    pub type_uuid: TypeUuid,
+    pub target: LogicalHash,
+    pub live_schema_hashes: &'a [LogicalHash],
+    pub reverse_edges: &'a [ReverseMigrationEdge],
 }
 
 /// The direction marker beside every `schema_hash` (§6, §11). `epochs` is
@@ -161,19 +205,46 @@ impl LineageClass {
 }
 
 impl InputTxn<'_> {
-    /// Publish a validated pipeline epoch (§3, §13): the `pipeline_state`
-    /// row plus the registration list, poison cleared.
+    /// Publish a staged pipeline candidate (§3, §13). `Ready` is possible
+    /// only when the candidate's complete registry projection exactly equals
+    /// the authoritative manifest cursors. Every missing, extra, or unequal
+    /// row instead publishes a stable `SchemaAcceptanceRequired` state while
+    /// retaining the prior epoch only as `last_good` residency bookkeeping.
     pub fn publish_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
+        let basis = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
+        let mismatches = schema_registry_mismatches(&epoch.schema_registry, &basis.current_cursors);
+        if !mismatches.is_empty() {
+            return self.publish_schema_acceptance_required(epoch, &basis, &mismatches);
+        }
+        self.publish_ready_pipeline_epoch(epoch)
+    }
+
+    fn publish_ready_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO pipeline_state(id, dylib_hash, load_policy_digest, input_version, poison)
-             VALUES (0, ?1, ?2, ?3, NULL)
+            "INSERT INTO pipeline_state(
+                 id, dylib_hash, load_policy_digest, compiled_types,
+                 target_set_hash, input_version, poison,
+                 acceptance_candidate_dylib_hash,
+                 acceptance_candidate_compiled_types,
+                 acceptance_candidate_target_set_hash,
+                 acceptance_manifest_hash
+             ) VALUES (0, ?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                dylib_hash = excluded.dylib_hash,
                load_policy_digest = excluded.load_policy_digest,
-               input_version = excluded.input_version, poison = NULL",
+               compiled_types = excluded.compiled_types,
+               target_set_hash = excluded.target_set_hash,
+               input_version = excluded.input_version,
+               poison = NULL,
+               acceptance_candidate_dylib_hash = NULL,
+               acceptance_candidate_compiled_types = NULL,
+               acceptance_candidate_target_set_hash = NULL,
+               acceptance_manifest_hash = NULL",
             rusqlite::params![
                 epoch.dylib_hash.as_slice(),
                 epoch.load_policy_digest.as_slice(),
+                epoch.compiled_types.0.as_slice(),
+                epoch.target_set_hash.as_slice(),
                 self.version().0 as i64,
             ],
         )?;
@@ -188,6 +259,62 @@ impl InputTxn<'_> {
                 rusqlite::params![kind, reg.id, reg.version],
             )?;
         }
+        replace_schema_registry(
+            &self.txn,
+            "pipeline_schema_registry",
+            &epoch.schema_registry,
+        )?;
+        self.txn
+            .execute("DELETE FROM pipeline_candidate_schema_registry", [])?;
+        Ok(())
+    }
+
+    fn publish_schema_acceptance_required(
+        &mut self,
+        epoch: &PipelineEpoch,
+        manifest: &SchemaManifestBasis,
+        mismatches: &[SchemaRegistryMismatch],
+    ) -> Result<(), StoreError> {
+        self.txn.execute(
+            "INSERT INTO pipeline_state(
+                 id, dylib_hash, load_policy_digest, compiled_types,
+                 target_set_hash, input_version, poison,
+                 acceptance_candidate_dylib_hash,
+                 acceptance_candidate_compiled_types,
+                 acceptance_candidate_target_set_hash,
+                 acceptance_manifest_hash
+             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, NULL, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               input_version = excluded.input_version,
+               poison = NULL,
+               acceptance_candidate_dylib_hash = excluded.acceptance_candidate_dylib_hash,
+               acceptance_candidate_compiled_types =
+                   excluded.acceptance_candidate_compiled_types,
+               acceptance_candidate_target_set_hash =
+                   excluded.acceptance_candidate_target_set_hash,
+               acceptance_manifest_hash = excluded.acceptance_manifest_hash",
+            rusqlite::params![
+                self.version().0 as i64,
+                epoch.dylib_hash.as_slice(),
+                epoch.compiled_types.0.as_slice(),
+                epoch.target_set_hash.as_slice(),
+                manifest.manifest_hash.0.as_slice(),
+            ],
+        )?;
+        replace_schema_registry(
+            &self.txn,
+            "pipeline_candidate_schema_registry",
+            &epoch.schema_registry,
+        )?;
+        debug_assert_eq!(
+            mismatches,
+            schema_registry_mismatches(
+                &epoch.schema_registry,
+                &manifest_basis(&self.txn)?
+                    .expect("manifest checked")
+                    .current_cursors
+            )
+        );
         Ok(())
     }
 
@@ -197,12 +324,25 @@ impl InputTxn<'_> {
     /// served as this version's code.
     pub fn publish_pipeline_poison(&mut self, error: &str) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO pipeline_state(id, dylib_hash, load_policy_digest, input_version, poison)
-             VALUES (0, NULL, NULL, ?1, ?2)
+            "INSERT INTO pipeline_state(
+                 id, dylib_hash, load_policy_digest, compiled_types,
+                 target_set_hash, input_version, poison,
+                 acceptance_candidate_dylib_hash,
+                 acceptance_candidate_compiled_types,
+                 acceptance_candidate_target_set_hash,
+                 acceptance_manifest_hash
+             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, ?2, NULL, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
-               input_version = excluded.input_version, poison = excluded.poison",
+               input_version = excluded.input_version,
+               poison = excluded.poison,
+               acceptance_candidate_dylib_hash = NULL,
+               acceptance_candidate_compiled_types = NULL,
+               acceptance_candidate_target_set_hash = NULL,
+               acceptance_manifest_hash = NULL",
             rusqlite::params![self.version().0 as i64, error],
         )?;
+        self.txn
+            .execute("DELETE FROM pipeline_candidate_schema_registry", [])?;
         Ok(())
     }
 
@@ -251,45 +391,91 @@ impl InputTxn<'_> {
         })
     }
 
-    /// Replace the disposable lineage projection from the already parsed,
-    /// unique source-controlled manifest. This is the only state-rebuild
-    /// path: bundle and migration-endpoint stamps are never unioned into
-    /// authority. Validation completes before the old projection is touched.
-    pub fn project_lineage_manifest(
+    /// Initialize the disposable lineage projection from the already parsed,
+    /// unique source-controlled manifest. Once initialized this API is
+    /// idempotent only: any changed history or cursor must use the
+    /// candidate-bound acceptance/rollback methods below. Bundle and
+    /// migration-endpoint stamps are never unioned into authority.
+    pub fn project_verified_lineage_manifest(
         &mut self,
-        manifest: &SchemaLineageManifest,
+        source: &VerifiedSchemaLineageManifest,
     ) -> Result<(), StoreError> {
-        for (type_uuid, lineage) in &manifest.types {
+        for (type_uuid, lineage) in &source.manifest.types {
             validate_type_lineage(*type_uuid, lineage)?;
         }
-        validate_projection_transition(&self.txn, manifest)?;
-
-        self.txn.execute("DELETE FROM schema_lineage_current", [])?;
-        self.txn.execute("DELETE FROM schema_lineage", [])?;
-        self.txn.execute("DELETE FROM schema_lineage_state", [])?;
-
-        for (type_uuid, lineage) in &manifest.types {
-            for (index, epoch) in lineage.epochs.iter().enumerate() {
-                self.txn.execute(
-                    "INSERT INTO schema_lineage(
-                         type_uuid, generation, schema_hash, forward_parent, input_version
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        type_uuid.0.as_slice(),
-                        (index + 1) as i64,
-                        epoch.digest.0.as_slice(),
-                        epoch.forward_parent.map(i64::from),
-                        self.version().0 as i64,
-                    ],
-                )?;
+        if manifest_available(&self.txn)? {
+            let basis = manifest_basis(&self.txn)?.expect("availability checked");
+            if basis.manifest_hash == source.manifest_hash
+                && projected_manifest(&self.txn)? == source.manifest
+            {
+                return Ok(());
             }
-            write_lineage_current(&self.txn, self.version(), *type_uuid, lineage)?;
+            return Err(StoreError::LineageMutationRequiresCandidate);
         }
-        self.txn.execute(
-            "INSERT INTO schema_lineage_state(id, input_version) VALUES (0, ?1)",
-            [self.version().0 as i64],
-        )?;
-        Ok(())
+        replace_lineage_projection(&self.txn, self.version(), source)
+    }
+
+    /// Explicitly accept one genuinely new schema digest compiled into the
+    /// pending candidate. The manifest base and candidate identity are
+    /// checked before any row changes. The accepted history appends exactly
+    /// one epoch whose parent is the prior cursor; if other candidate rows
+    /// still disagree, the state remains `SchemaAcceptanceRequired` at the
+    /// new manifest base.
+    pub fn accept_schema_candidate(
+        &mut self,
+        candidate: &PipelineEpoch,
+        expected_manifest: &SchemaManifestBasis,
+        proposed: &VerifiedSchemaLineageManifest,
+        type_uuid: TypeUuid,
+        requested: LogicalHash,
+    ) -> Result<LineageStamp, StoreError> {
+        self.validate_schema_command(candidate, expected_manifest, type_uuid, requested)?;
+        let mut next_manifest = projected_manifest(&self.txn)?;
+        let next = match next_manifest.types.get_mut(&type_uuid) {
+            Some(lineage) => {
+                if let Some(position) = lineage
+                    .epochs
+                    .iter()
+                    .position(|epoch| epoch.digest == requested)
+                {
+                    let current = lineage.epochs[lineage.current as usize].digest;
+                    return Err(StoreError::LineageRollback {
+                        type_uuid,
+                        candidate: lineage.epochs[position].digest,
+                        current,
+                    });
+                }
+                let parent = lineage.current;
+                lineage.epochs.push(AcceptedSchemaEpoch {
+                    digest: requested,
+                    forward_parent: Some(parent),
+                });
+                lineage.current = u32::try_from(lineage.epochs.len() - 1).map_err(|_| {
+                    invalid_manifest(
+                        Some(type_uuid),
+                        "accepted epoch count exceeds the DSSL u32 sequence bound",
+                    )
+                })?;
+                lineage.clone()
+            }
+            None => {
+                let lineage = AcceptedTypeLineage {
+                    epochs: vec![AcceptedSchemaEpoch {
+                        digest: requested,
+                        forward_parent: None,
+                    }],
+                    current: 0,
+                };
+                next_manifest.types.insert(type_uuid, lineage.clone());
+                lineage
+            }
+        };
+        validate_type_lineage(type_uuid, &next)?;
+        validate_verified_transition(expected_manifest, proposed, &next_manifest)?;
+        replace_lineage_projection(&self.txn, self.version(), proposed)?;
+        let stamp = stamp_for(type_uuid, &next)?;
+        self.publish_pipeline_epoch(candidate)?;
+        Ok(stamp)
     }
 
     /// Move an accepted type's current cursor to an existing non-current
@@ -299,18 +485,25 @@ impl InputTxn<'_> {
     ///
     /// The caller obtains `live_schema_hashes` (including migration
     /// endpoints) from one pinned source-tree snapshot; indexed live asset
-    /// schemas are added automatically. The coordinator publishes the same
-    /// validated cursor move to the source manifest through the journaled
-    /// authoring protocol. This method updates only the projection's cursor
-    /// row; accepted history remains append-only.
-    pub fn rollback_lineage(
+    /// schemas are added automatically. `proposed` is the coordinator's
+    /// already byte-verified result from the journaled source-manifest
+    /// authoring protocol. This method requires it to differ from the stale
+    /// base only by the requested cursor move before replacing the disposable
+    /// projection; accepted history remains append-only.
+    pub fn rollback_schema_candidate(
         &mut self,
-        type_uuid: TypeUuid,
-        target: LogicalHash,
-        live_schema_hashes: &[LogicalHash],
-        reverse_edges: &[ReverseMigrationEdge],
+        candidate: &PipelineEpoch,
+        expected_manifest: &SchemaManifestBasis,
+        proposed: &VerifiedSchemaLineageManifest,
+        request: SchemaRollbackRequest<'_>,
     ) -> Result<LineageStamp, StoreError> {
-        ensure_manifest_available(&self.txn)?;
+        let SchemaRollbackRequest {
+            type_uuid,
+            target,
+            live_schema_hashes,
+            reverse_edges,
+        } = request;
+        self.validate_schema_command(candidate, expected_manifest, type_uuid, target)?;
         let lineage = type_lineage(&self.txn, type_uuid)?.ok_or_else(|| {
             StoreError::IncompleteRollbackCoverage {
                 type_uuid,
@@ -331,7 +524,10 @@ impl InputTxn<'_> {
             })? as u32;
         let old_current = lineage.current;
         if old_current == target_index {
-            return stamp_for(type_uuid, &lineage);
+            return Err(invalid_manifest(
+                Some(type_uuid),
+                "rollback target already is the current cursor",
+            ));
         }
 
         let mut required_live = live_schema_hashes.to_vec();
@@ -350,12 +546,49 @@ impl InputTxn<'_> {
             epochs: lineage.epochs,
             current: target_index,
         };
-        write_lineage_current(&self.txn, self.version(), type_uuid, &moved)?;
-        self.txn.execute(
-            "UPDATE schema_lineage_state SET input_version = ?1 WHERE id = 0",
-            [self.version().0 as i64],
-        )?;
-        stamp_for(type_uuid, &moved)
+        let mut next_manifest = projected_manifest(&self.txn)?;
+        next_manifest.types.insert(type_uuid, moved.clone());
+        validate_verified_transition(expected_manifest, proposed, &next_manifest)?;
+        replace_lineage_projection(&self.txn, self.version(), proposed)?;
+        let stamp = stamp_for(type_uuid, &moved)?;
+        self.publish_pipeline_epoch(candidate)?;
+        Ok(stamp)
+    }
+
+    fn validate_schema_command(
+        &self,
+        candidate: &PipelineEpoch,
+        expected_manifest: &SchemaManifestBasis,
+        type_uuid: TypeUuid,
+        requested: LogicalHash,
+    ) -> Result<(), StoreError> {
+        let actual_manifest = manifest_basis(&self.txn)?;
+        if actual_manifest.as_ref() != Some(expected_manifest) {
+            return Err(StoreError::StaleSchemaManifestBase {
+                expected: Box::new(expected_manifest.clone()),
+                actual: actual_manifest.map(Box::new),
+            });
+        }
+        let actual_candidate = PipelineCandidateIdentity::from(candidate);
+        let expected_candidate = pending_candidate_identity(&self.txn)?
+            .ok_or(StoreError::LineageMutationRequiresCandidate)?;
+        if actual_candidate != expected_candidate
+            || load_schema_registry(&self.txn, true)? != candidate.schema_registry
+        {
+            return Err(StoreError::StaleSchemaCandidate {
+                expected: Box::new(expected_candidate),
+                actual: Box::new(actual_candidate),
+            });
+        }
+        let candidate_digest = candidate.schema_registry.get(&type_uuid).copied();
+        if candidate_digest != Some(requested) {
+            return Err(StoreError::SchemaCandidateCursorMismatch {
+                type_uuid,
+                requested,
+                candidate: candidate_digest,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -468,82 +701,10 @@ fn validate_type_lineage(
     Ok(())
 }
 
-fn validate_projection_transition(
-    conn: &rusqlite::Connection,
-    proposed: &SchemaLineageManifest,
-) -> Result<(), StoreError> {
-    if !manifest_available(conn)? {
-        return Ok(());
-    }
-    let recorded = projected_manifest(conn)?;
-    for (type_uuid, old) in &recorded.types {
-        let Some(new) = proposed.types.get(type_uuid) else {
-            return Err(invalid_manifest(
-                Some(*type_uuid),
-                "an accepted type cannot be removed from append-only history",
-            ));
-        };
-        if new.epochs.len() < old.epochs.len() || new.epochs[..old.epochs.len()] != old.epochs {
-            return Err(invalid_manifest(
-                Some(*type_uuid),
-                "accepted epoch history is not an append-only extension",
-            ));
-        }
-        if new.epochs.len() == old.epochs.len() {
-            if new.current != old.current {
-                return Err(StoreError::LineageRollback {
-                    type_uuid: *type_uuid,
-                    candidate: new.epochs[new.current as usize].digest,
-                    current: old.epochs[old.current as usize].digest,
-                });
-            }
-        } else {
-            validate_acceptance_extension(*type_uuid, old, new)?;
-        }
-    }
-    for (type_uuid, new) in &proposed.types {
-        if !recorded.types.contains_key(type_uuid) && new.current as usize != new.epochs.len() - 1 {
-            return Err(invalid_manifest(
-                Some(*type_uuid),
-                "a newly accepted type must select its newly appended epoch",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_acceptance_extension(
-    type_uuid: TypeUuid,
-    old: &AcceptedTypeLineage,
-    new: &AcceptedTypeLineage,
-) -> Result<(), StoreError> {
-    if new.current as usize != new.epochs.len() - 1 {
-        return Err(invalid_manifest(
-            Some(type_uuid),
-            "ordinary acceptance must advance to the newly appended epoch",
-        ));
-    }
-    if new.epochs[old.epochs.len()].forward_parent != Some(old.current) {
-        return Err(invalid_manifest(
-            Some(type_uuid),
-            "the first appended epoch must name the prior current as its forward parent",
-        ));
-    }
-    Ok(())
-}
-
 fn invalid_manifest(type_uuid: Option<TypeUuid>, detail: &str) -> StoreError {
     StoreError::InvalidLineageManifest {
         type_uuid,
         detail: detail.to_owned(),
-    }
-}
-
-fn ensure_manifest_available(conn: &rusqlite::Connection) -> Result<(), StoreError> {
-    if manifest_available(conn)? {
-        Ok(())
-    } else {
-        Err(StoreError::LineageManifestUnavailable)
     }
 }
 
@@ -556,6 +717,208 @@ fn manifest_available(conn: &rusqlite::Connection) -> Result<bool, StoreError> {
         )
         .optional()?
         .is_some())
+}
+
+fn manifest_basis(conn: &rusqlite::Connection) -> Result<Option<SchemaManifestBasis>, StoreError> {
+    let manifest_hash = conn
+        .query_row(
+            "SELECT manifest_hash FROM schema_lineage_state WHERE id = 0",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    let Some(manifest_hash) = manifest_hash else {
+        return Ok(None);
+    };
+    let manifest = projected_manifest(conn)?;
+    let current_cursors = manifest
+        .types
+        .into_iter()
+        .map(|(type_uuid, lineage)| (type_uuid, lineage.epochs[lineage.current as usize].digest))
+        .collect();
+    Ok(Some(SchemaManifestBasis {
+        manifest_hash: ContentHash(exact_blob32(manifest_hash, "source manifest hash")?),
+        current_cursors,
+    }))
+}
+
+fn validate_verified_transition(
+    expected: &SchemaManifestBasis,
+    proposed: &VerifiedSchemaLineageManifest,
+    exact_manifest: &SchemaLineageManifest,
+) -> Result<(), StoreError> {
+    for (type_uuid, lineage) in &proposed.manifest.types {
+        validate_type_lineage(*type_uuid, lineage)?;
+    }
+    if proposed.manifest_hash == expected.manifest_hash {
+        return Err(invalid_manifest(
+            None,
+            "a changed source manifest must carry its new verified byte hash",
+        ));
+    }
+    if proposed.manifest != *exact_manifest {
+        return Err(invalid_manifest(
+            None,
+            "verified source manifest is not the exact candidate-bound one-step transition",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_lineage_projection(
+    conn: &rusqlite::Connection,
+    version: InputVersion,
+    source: &VerifiedSchemaLineageManifest,
+) -> Result<(), StoreError> {
+    for (type_uuid, lineage) in &source.manifest.types {
+        validate_type_lineage(*type_uuid, lineage)?;
+    }
+    conn.execute("DELETE FROM schema_lineage_current", [])?;
+    conn.execute("DELETE FROM schema_lineage", [])?;
+    conn.execute("DELETE FROM schema_lineage_state", [])?;
+    for (type_uuid, lineage) in &source.manifest.types {
+        for (index, epoch) in lineage.epochs.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO schema_lineage(
+                     type_uuid, generation, schema_hash, forward_parent, input_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    type_uuid.0.as_slice(),
+                    (index + 1) as i64,
+                    epoch.digest.0.as_slice(),
+                    epoch.forward_parent.map(i64::from),
+                    version.0 as i64,
+                ],
+            )?;
+        }
+        write_lineage_current(conn, version, *type_uuid, lineage)?;
+    }
+    conn.execute(
+        "INSERT INTO schema_lineage_state(id, input_version, manifest_hash)
+         VALUES (0, ?1, ?2)",
+        rusqlite::params![version.0 as i64, source.manifest_hash.0.as_slice()],
+    )?;
+    Ok(())
+}
+
+fn schema_registry_mismatches(
+    candidate: &BTreeMap<TypeUuid, LogicalHash>,
+    manifest: &BTreeMap<TypeUuid, LogicalHash>,
+) -> Vec<SchemaRegistryMismatch> {
+    candidate
+        .keys()
+        .chain(manifest.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|type_uuid| {
+            let candidate = candidate.get(&type_uuid).copied();
+            let manifest = manifest.get(&type_uuid).copied();
+            (candidate != manifest).then_some(SchemaRegistryMismatch {
+                type_uuid,
+                candidate,
+                manifest,
+            })
+        })
+        .collect()
+}
+
+fn replace_schema_registry(
+    conn: &rusqlite::Connection,
+    table: &'static str,
+    registry: &BTreeMap<TypeUuid, LogicalHash>,
+) -> Result<(), StoreError> {
+    let (delete, insert) = match table {
+        "pipeline_schema_registry" => (
+            "DELETE FROM pipeline_schema_registry",
+            "INSERT INTO pipeline_schema_registry(type_uuid, logical_hash) VALUES (?1, ?2)",
+        ),
+        "pipeline_candidate_schema_registry" => (
+            "DELETE FROM pipeline_candidate_schema_registry",
+            "INSERT INTO pipeline_candidate_schema_registry(type_uuid, logical_hash) VALUES (?1, ?2)",
+        ),
+        _ => unreachable!("registry table is an internal closed choice"),
+    };
+    conn.execute(delete, [])?;
+    for (type_uuid, logical_hash) in registry {
+        conn.execute(
+            insert,
+            rusqlite::params![type_uuid.0.as_slice(), logical_hash.0.as_slice()],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_schema_registry(
+    conn: &rusqlite::Connection,
+    candidate: bool,
+) -> Result<BTreeMap<TypeUuid, LogicalHash>, StoreError> {
+    let sql = if candidate {
+        "SELECT type_uuid, logical_hash FROM pipeline_candidate_schema_registry ORDER BY type_uuid"
+    } else {
+        "SELECT type_uuid, logical_hash FROM pipeline_schema_registry ORDER BY type_uuid"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut registry = BTreeMap::new();
+    for row in rows {
+        let (type_uuid, logical_hash) = row?;
+        let type_uuid = TypeUuid(type_uuid.try_into().map_err(|_| {
+            invalid_manifest(None, "a pipeline registry UUID is not exactly 16 bytes")
+        })?);
+        let logical_hash = LogicalHash(logical_hash.try_into().map_err(|_| {
+            invalid_manifest(
+                Some(type_uuid),
+                "a pipeline registry logical hash is not exactly 32 bytes",
+            )
+        })?);
+        registry.insert(type_uuid, logical_hash);
+    }
+    Ok(registry)
+}
+
+fn pending_candidate_identity(
+    conn: &rusqlite::Connection,
+) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
+    type CandidateRow = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+    let row: Option<CandidateRow> = conn
+        .query_row(
+            "SELECT acceptance_candidate_dylib_hash,
+                    acceptance_candidate_compiled_types,
+                    acceptance_candidate_target_set_hash
+             FROM pipeline_state WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((dylib, compiled_types, target_set_hash)) = row else {
+        return Ok(None);
+    };
+    match (dylib, compiled_types, target_set_hash) {
+        (None, None, None) => Ok(None),
+        (Some(dylib), Some(compiled_types), Some(target_set_hash)) => {
+            Ok(Some(PipelineCandidateIdentity {
+                dylib_hash: exact_blob32(dylib, "candidate dylib hash")?,
+                compiled_types: CompiledAttestationDigest(exact_blob32(
+                    compiled_types,
+                    "candidate compiled-type attestation",
+                )?),
+                target_set_hash: exact_blob32(target_set_hash, "candidate target-set hash")?,
+            }))
+        }
+        _ => Err(invalid_manifest(
+            None,
+            "pipeline candidate identity columns are incomplete",
+        )),
+    }
+}
+
+fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
+    bytes
+        .try_into()
+        .map_err(|_| invalid_manifest(None, &format!("{name} is not exactly 32 bytes")))
 }
 
 fn type_lineage(
@@ -796,22 +1159,60 @@ fn coverage_error(
 impl Store {
     /// The published pipeline state, or `None` before any publication.
     pub fn pipeline_state(&self) -> Result<Option<PipelineState>, StoreError> {
-        // (dylib_hash, load_policy_digest, poison).
-        type StateRow = (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>);
+        type StateRow = (
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
         let row: Option<StateRow> = self
             .conn
             .query_row(
-                "SELECT dylib_hash, load_policy_digest, poison FROM pipeline_state WHERE id = 0",
+                "SELECT dylib_hash, load_policy_digest, compiled_types,
+                        target_set_hash, poison,
+                        acceptance_candidate_dylib_hash,
+                        acceptance_candidate_compiled_types,
+                        acceptance_candidate_target_set_hash,
+                        acceptance_manifest_hash
+                 FROM pipeline_state WHERE id = 0",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((dylib, lpd, poison)) = row else {
+        let Some((
+            dylib,
+            lpd,
+            compiled_types,
+            target_set_hash,
+            poison,
+            candidate_dylib,
+            candidate_compiled_types,
+            candidate_target_set,
+            stored_manifest_hash,
+        )) = row
+        else {
             return Ok(None);
         };
 
-        let epoch = match (dylib, lpd) {
-            (Some(dylib), Some(lpd)) => {
+        let epoch = match (dylib, lpd, compiled_types, target_set_hash) {
+            (Some(dylib), Some(lpd), Some(compiled_types), Some(target_set_hash)) => {
                 let mut stmt = self
                     .conn
                     .prepare("SELECT kind, reg_id, version FROM registrations")?;
@@ -829,19 +1230,73 @@ impl Store {
                     })?
                     .collect::<Result<_, _>>()?;
                 Some(std::sync::Arc::new(PipelineEpoch {
-                    dylib_hash: blob32(dylib),
-                    load_policy_digest: blob32(lpd),
+                    dylib_hash: exact_blob32(dylib, "published pipeline dylib hash")?,
+                    load_policy_digest: exact_blob32(lpd, "published pipeline load-policy digest")?,
+                    compiled_types: CompiledAttestationDigest(exact_blob32(
+                        compiled_types,
+                        "published compiled-type attestation",
+                    )?),
+                    target_set_hash: exact_blob32(target_set_hash, "published target-set hash")?,
+                    schema_registry: load_schema_registry(&self.conn, false)?,
                     registrations,
                 }))
             }
-            _ => None,
+            (None, None, None, None) => None,
+            _ => {
+                return Err(invalid_manifest(
+                    None,
+                    "published pipeline identity columns are incomplete",
+                ));
+            }
         };
+
+        let has_candidate = candidate_dylib.is_some()
+            || candidate_compiled_types.is_some()
+            || candidate_target_set.is_some()
+            || stored_manifest_hash.is_some();
+        if poison.is_some() && has_candidate {
+            return Err(invalid_manifest(
+                None,
+                "pipeline state is both poisoned and schema-acceptance-required",
+            ));
+        }
+        if has_candidate {
+            let candidate = pending_candidate_identity(&self.conn)?.ok_or_else(|| {
+                invalid_manifest(None, "pipeline candidate identity columns are incomplete")
+            })?;
+            let actual_manifest = manifest_basis(&self.conn)?.ok_or_else(|| {
+                invalid_manifest(None, "schema candidate has no projected source manifest")
+            })?;
+            let stored_manifest_hash = ContentHash(exact_blob32(
+                stored_manifest_hash.ok_or_else(|| {
+                    invalid_manifest(None, "schema candidate has no source manifest hash")
+                })?,
+                "stored schema candidate manifest hash",
+            )?);
+            if stored_manifest_hash != actual_manifest.manifest_hash {
+                return Err(invalid_manifest(
+                    None,
+                    "schema candidate base differs from the projected source manifest",
+                ));
+            }
+            let candidate_registry = load_schema_registry(&self.conn, true)?;
+            let mismatches =
+                schema_registry_mismatches(&candidate_registry, &actual_manifest.current_cursors);
+            return Ok(Some(PipelineState::SchemaAcceptanceRequired {
+                required: SchemaAcceptanceRequired {
+                    manifest: actual_manifest,
+                    candidate,
+                    mismatches,
+                },
+                last_good: epoch,
+            }));
+        }
 
         Ok(Some(match poison {
             None => match epoch {
-                Some(e) => PipelineState::Ready(e),
-                // A row with no identity and no poison cannot be
-                // published through this API; treat as unpublished.
+                Some(epoch) => PipelineState::Ready(epoch),
+                // A row with no identity and no typed unavailable state
+                // cannot be published through this API.
                 None => return Ok(None),
             },
             Some(error) => PipelineState::Poisoned {
