@@ -1,0 +1,12 @@
+[package]
+name = "distill-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+distill-core = { path = "../distill-core" }
+distill-json = { path = "../distill-json" }
+# The schema model is SHARED code (§5, §19): it lives in the engine
+# workspace so source-walk, the engine, and distill agree byte-for-byte.
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

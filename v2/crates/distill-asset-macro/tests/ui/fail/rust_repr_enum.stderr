@@ -1,0 +1,5 @@
+error: multi-variant asset enums require an explicit integer `#[repr(u8/u16/u32/u64/u128/i8/i16/i32/i64/i128)]` so native tag geometry is measurable
+ --> tests/ui/fail/rust_repr_enum.rs:4:6
+  |
+4 | enum Bad {
+  |      ^^^

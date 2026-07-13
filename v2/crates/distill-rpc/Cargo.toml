@@ -1,0 +1,19 @@
+[package]
+name = "distill-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+capnp = "0.26.2"
+capnp-rpc = "0.26.1"
+distill-core = { path = "../distill-core" }
+distill-store = { path = "../distill-store" }
+futures = "0.3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+unicode-normalization.workspace = true
+
+[build-dependencies]
+capnpc = "0.26.0"

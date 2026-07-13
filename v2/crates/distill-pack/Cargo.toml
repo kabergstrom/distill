@@ -1,0 +1,14 @@
+[package]
+name = "distill-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+zstd.workspace = true
+distill-core = { path = "../distill-core" }
+distill-bundle = { path = "../distill-bundle" }
+distill-build = { path = "../distill-build" }
+distill-loader = { path = "../distill-loader" }
+distill-wire = { path = "../distill-wire" }

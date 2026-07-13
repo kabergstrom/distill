@@ -1,0 +1,8 @@
+[package]
+name = "distill-json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryu = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "distill-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+unicode-normalization = { workspace = true }
+distill-core = { path = "../distill-core" }
+# The canonical structural blob path encoding is pinned in distill-bundle
+# (§6) and REUSED here: the §12 artifact blob table sorts by the same
+# encoded path bytes — one encoder, never two.
+distill-bundle = { path = "../distill-bundle" }
+# The schema model is SHARED code (§5, §19): it lives in the engine
+# workspace so source-walk, the engine, and distill agree byte-for-byte.
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

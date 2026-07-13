@@ -1,0 +1,119 @@
+//! The sole runtime IO boundary: RPC in development or pack files in shipping.
+
+use std::sync::Arc;
+
+use distill_build::query::AssetQuery;
+use distill_core::id::{AssetUuid, ContentHash};
+use distill_store::state::SnapshotStamp;
+use distill_wire::exec::Blob;
+
+use crate::basis::IoBasis;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReqId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriftedInput {
+    File(String),
+    Asset(AssetUuid),
+    Query(Box<AssetQuery>),
+    Dylib,
+    Tool(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveResult {
+    Built {
+        content_hash: ContentHash,
+        basis: IoBasis,
+    },
+    Drifted {
+        input: DriftedInput,
+        current: SnapshotStamp,
+    },
+    Failed {
+        error: String,
+    },
+    Missing,
+    Deleted {
+        at: SnapshotStamp,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathResolveResult {
+    Resolved(AssetUuid),
+    Missing,
+    Unsupported,
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchedArtifact {
+    pub structural: Arc<[u8]>,
+    pub blobs: Vec<Blob>,
+    /// Canonical DSWL body authenticated by the artifact header's
+    /// `layout_hash`; LoaderIO resolves this before completing the fetch.
+    pub wire_layout: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetDeltaState {
+    Changed,
+    Deleted,
+    Restored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectReason {
+    TargetDefinitionChanged,
+    LoadPolicyChanged,
+    StoreInstanceChanged,
+}
+
+#[derive(Debug, Clone)]
+pub enum IoEvent {
+    Resolved {
+        req: ReqId,
+        uuid: AssetUuid,
+        result: ResolveResult,
+        basis: IoBasis,
+    },
+    PathResolved {
+        req: ReqId,
+        path: String,
+        result: PathResolveResult,
+        basis: IoBasis,
+    },
+    Fetched {
+        req: ReqId,
+        content_hash: ContentHash,
+        artifact: FetchedArtifact,
+        basis: IoBasis,
+    },
+    Delta {
+        stamp: SnapshotStamp,
+        assets: Vec<(AssetUuid, AssetDeltaState)>,
+        paths: Vec<String>,
+    },
+    IoError {
+        req: Option<ReqId>,
+        message: String,
+        basis: Option<IoBasis>,
+    },
+    ReconnectRequired {
+        reason: ReconnectReason,
+    },
+}
+
+pub trait LoaderIO {
+    fn begin_sweep(&mut self) -> IoBasis;
+    fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis);
+    fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis);
+    fn resolve_path(&mut self, req: ReqId, path: &str, basis: &IoBasis);
+    fn subscribe(&mut self, uuid: AssetUuid);
+    fn unsubscribe(&mut self, uuid: AssetUuid);
+    fn subscribe_path(&mut self, path: &str);
+    fn unsubscribe_path(&mut self, path: &str);
+    fn poll(&mut self) -> Vec<IoEvent>;
+}

@@ -1,0 +1,5 @@
+error: generic asset declarations are not supported: one TypeUuid must identify one concrete layout
+ --> tests/ui/fail/generic.rs:4:11
+  |
+4 | struct Bad<T> {
+  |           ^^^

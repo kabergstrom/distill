@@ -1,0 +1,19 @@
+error: Blob fields require `#[asset(blob)]` so their schema and artifact encoding cannot disagree
+ --> tests/ui/fail/bad_blob.rs:5:12
+  |
+5 |     bytes: Blob,
+  |            ^^^^
+
+error: `#[asset(blob)]` fields must use distill_asset::Blob
+  --> tests/ui/fail/bad_blob.rs:11:12
+   |
+11 |     bytes: Vec<u8>,
+   |            ^^^^^^^
+
+warning: unused import: `Blob`
+ --> tests/ui/fail/bad_blob.rs:1:28
+  |
+1 | use distill_asset::{asset, Blob};
+  |                            ^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

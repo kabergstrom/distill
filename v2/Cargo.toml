@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/distill-asset",
+    "crates/distill-asset-macro",
+    "crates/distill-bundle",
+    "crates/distill-build",
+    "crates/distill-core",
+    "crates/distill-daemon",
+    "crates/distill-json",
+    "crates/distill-loader",
+    "crates/distill-migrate",
+    "crates/distill-pack",
+    "crates/distill-rpc",
+    "crates/distill-schema",
+    "crates/distill-store",
+    "crates/distill-wire",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+blake3 = "1"
+ryu = "1"
+unicode-normalization = "0.1"
+globset = "0.4"
+sha1_smol = "1"
+proc-macro2 = "1"
+quote = "1"
+syn = "2"
+trybuild = "1"
+zstd = "0.13"

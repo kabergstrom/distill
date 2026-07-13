@@ -1,0 +1,18 @@
+[package]
+name = "distill-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+distill-core = { path = "../distill-core" }
+blake3 = { workspace = true }
+# Bundled SQLite: compiled from source, no system dependency (§13's
+# metadata layer must not vary by host library version).
+rusqlite = { version = "0.32", features = ["bundled"] }
+getrandom = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+blake3 = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,0 +1,5 @@
+error: `#[asset(tag)]` fields must use String
+ --> tests/ui/fail/bad_tag.rs:6:13
+  |
+6 |     number: u32,
+  |             ^^^

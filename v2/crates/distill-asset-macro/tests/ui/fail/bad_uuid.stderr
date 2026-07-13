@@ -1,0 +1,5 @@
+error: malformed asset UUID; expected RFC 4122 hyphenated hexadecimal form
+ --> tests/ui/fail/bad_uuid.rs:3:16
+  |
+3 | #[asset(uuid = "not-a-uuid")]
+  |                ^^^^^^^^^^^^

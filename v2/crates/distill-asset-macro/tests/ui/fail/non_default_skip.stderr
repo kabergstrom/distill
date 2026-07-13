@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `NoDefault: Default` is not satisfied
+ --> tests/ui/fail/non_default_skip.rs:8:12
+  |
+5 | #[asset(uuid = "10e6115e-c203-48b5-8524-f6761362cba2")]
+  | ------------------------------------------------------- required by a bound introduced by this call
+...
+8 |     field: NoDefault,
+  |            ^^^^^^^^^ the trait `Default` is not implemented for `NoDefault`
+  |
+note: required by a bound in `LayoutBuilder::register_skip`
+ --> $WORKSPACE/crates/distill-asset/src/build.rs
+  |
+  |     pub fn register_skip<T: Default + 'static>(&mut self) -> SkipDefaultId {
+  |                             ^^^^^^^ required by this bound in `LayoutBuilder::register_skip`
+help: consider annotating `NoDefault` with `#[derive(Default)]`
+  |
+3 + #[derive(Default)]
+4 | struct NoDefault;
+  |

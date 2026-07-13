@@ -1,0 +1,5 @@
+error: unknown asset type option; expected `uuid`, `rev`, or `build_only`
+ --> tests/ui/fail/unknown_attr.rs:3:56
+  |
+3 | #[asset(uuid = "330cab7f-326b-4d0c-8456-f06d14635d5b", mystery)]
+  |                                                        ^^^^^^^
