@@ -5,7 +5,9 @@
 
 use std::str::FromStr;
 
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
+use distill_core::id::{
+    AssetUuid, BundleFileHash, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
+};
 
 #[test]
 fn uuid_display_parses_back() {
@@ -46,6 +48,15 @@ fn hash_display_is_64_hex_and_parses_back() {
     assert_eq!(ContentHash::from_str(&s).unwrap(), h);
     assert!(ContentHash::from_str(&s[..63]).is_err());
     assert!(ContentHash::from_str(&format!("{}0", s)).is_err());
+}
+
+#[test]
+fn bundle_file_hash_accepts_exact_malformed_observed_bytes() {
+    let malformed = b"{ not a canonical bundle\xff";
+    assert_eq!(
+        BundleFileHash::of_observed_bytes(malformed),
+        BundleFileHash(*blake3::hash(malformed).as_bytes())
+    );
 }
 
 #[test]

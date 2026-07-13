@@ -189,8 +189,15 @@ hash_newtype! {
     ContentHash
 }
 hash_newtype! {
-    /// Raw blake3 identity of one canonical bundle file (§6).
+    /// Raw blake3 identity of the exact observed bundle-file bytes, whether
+    /// valid or malformed. Parsing/canonicality is an independent gate (§6).
     BundleFileHash
+}
+
+impl BundleFileHash {
+    pub fn of_observed_bytes(bytes: &[u8]) -> Self {
+        Self(*blake3::hash(bytes).as_bytes())
+    }
 }
 hash_newtype! {
     /// blake3 of the DSLH encoding of a type's logical schema (§5).
