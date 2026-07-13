@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -174,11 +174,21 @@ CREATE TABLE schema_lineage (
     type_uuid     BLOB NOT NULL,
     generation    INTEGER NOT NULL,
     schema_hash   BLOB NOT NULL,
-    chain_digest  BLOB NOT NULL,
+    forward_parent INTEGER,
     input_version INTEGER NOT NULL,
     PRIMARY KEY (type_uuid, generation)
 );
 CREATE UNIQUE INDEX lineage_by_hash ON schema_lineage(type_uuid, schema_hash);
+CREATE TABLE schema_lineage_current (
+    type_uuid     BLOB NOT NULL PRIMARY KEY,
+    current_cursor INTEGER NOT NULL,
+    chain_digest  BLOB NOT NULL,
+    input_version INTEGER NOT NULL
+);
+CREATE TABLE schema_lineage_state (
+    id            INTEGER PRIMARY KEY CHECK (id = 0),
+    input_version INTEGER NOT NULL
+);
 CREATE TABLE pins (
     kind         INTEGER NOT NULL,
     holder       TEXT NOT NULL,

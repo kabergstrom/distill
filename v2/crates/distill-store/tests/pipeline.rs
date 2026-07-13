@@ -1,12 +1,16 @@
 //! §13 pipeline-side metadata: the `pipeline_state` row (dylib hash,
 //! load-policy digest, staged-candidate poison), the `tools` ToolEpoch
-//! table, and the `schema_lineage` forward chain that gates automatic
-//! migration diffs (§11).
+//! table, and the source-controlled schema-lineage projection that gates
+//! automatic migration diffs (§11).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use distill_core::id::{LogicalHash, TypeUuid};
-use distill_store::pipeline::{HardStopReason, LineageClass, LineageStamp};
+use distill_store::pipeline::{
+    AcceptedSchemaEpoch, AcceptedTypeLineage, HardStopReason, LineageClass, LineageStamp,
+    ReverseMigrationEdge, SchemaLineageManifest,
+};
 use distill_store::state::{PipelineEpoch, PipelineState, Registration, RegistrationKind};
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -191,255 +195,289 @@ fn a_failed_transaction_publishes_no_tool_mapping() {
 
 // ---- schema lineage (§6, §11, §13) ----
 
-/// The compact commitment to the explicit ordered digest list.
-fn dssl(t: TypeUuid, hashes: &[LogicalHash]) -> [u8; 32] {
+fn epochs(hashes: &[LogicalHash]) -> Vec<AcceptedSchemaEpoch> {
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(index, digest)| AcceptedSchemaEpoch {
+            digest: *digest,
+            forward_parent: index.checked_sub(1).map(|parent| parent as u32),
+        })
+        .collect()
+}
+
+fn accepted(hashes: &[LogicalHash], current: u32) -> AcceptedTypeLineage {
+    AcceptedTypeLineage {
+        epochs: epochs(hashes),
+        current,
+    }
+}
+
+fn manifest(types: &[(TypeUuid, AcceptedTypeLineage)]) -> SchemaLineageManifest {
+    SchemaLineageManifest {
+        types: types.iter().cloned().collect::<BTreeMap<_, _>>(),
+    }
+}
+
+/// The compact commitment to the explicit accepted-epoch prefix and cursor.
+fn dssl(t: TypeUuid, accepted: &[AcceptedSchemaEpoch], cursor: u32) -> [u8; 32] {
     let mut pre_image = Vec::new();
     pre_image.extend_from_slice(b"DSSL");
     pre_image.push(1); // version
     pre_image.extend_from_slice(&t.0);
-    pre_image.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
-    for h in hashes {
-        pre_image.extend_from_slice(&h.0);
+    pre_image.extend_from_slice(&(accepted.len() as u32).to_le_bytes());
+    for epoch in accepted {
+        pre_image.extend_from_slice(&epoch.digest.0);
+        match epoch.forward_parent {
+            None => pre_image.push(0),
+            Some(parent) => {
+                pre_image.push(1);
+                pre_image.extend_from_slice(&parent.to_le_bytes());
+            }
+        }
     }
+    pre_image.extend_from_slice(&cursor.to_le_bytes());
     *blake3::hash(&pre_image).as_bytes()
 }
 
-fn stamp(t: TypeUuid, hashes: &[LogicalHash]) -> LineageStamp {
+fn stamp(t: TypeUuid, accepted: Vec<AcceptedSchemaEpoch>, cursor: u32) -> LineageStamp {
     LineageStamp {
-        digests: hashes.to_vec(),
-        chain_digest: dssl(t, hashes),
+        chain: dssl(t, &accepted, cursor),
+        epochs: accepted,
+        cursor,
     }
 }
 
 #[test]
-fn appends_stamp_the_full_ordered_list_and_dssl_commitment() {
-    // R22/C1: generation is derived from list length. The authored stamp
-    // carries every predecessor, while DSSL remains the compact
-    // commitment. An opaque digest alone is not an ancestry proof.
+fn manifest_projection_records_epochs_even_when_no_bundle_was_written() {
+    // B was accepted but no authored bundle happened to be written while
+    // it was current. The source-controlled manifest still names it, so a
+    // later C projection cannot collapse the history to [A, C].
     let (_d, mut store) = store();
-    let (stamps, _) = store
-        .input_transaction(|txn| {
-            let s1 = txn.append_lineage(T, h(1))?;
-            let s2 = txn.append_lineage(T, h(2))?;
-            Ok((s1, s2))
-        })
+    let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
+    store
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
         .unwrap();
-    assert_eq!(stamps.0, stamp(T, &[h(1)]));
-    assert_eq!(stamps.1, stamp(T, &[h(1), h(2)]));
-    assert_eq!(stamps.0.generation(), 1);
-    assert_eq!(stamps.1.generation(), 2);
 
     let entries = store.lineage(T).unwrap();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].generation, 1);
     assert_eq!(entries[0].schema_hash, h(1));
-    assert_eq!(entries[0].chain_digest, dssl(T, &[h(1)]));
+    assert_eq!(entries[0].forward_parent, None);
     assert_eq!(entries[1].generation, 2);
     assert_eq!(entries[1].schema_hash, h(2));
-    assert_eq!(entries[1].chain_digest, dssl(T, &[h(1), h(2)]));
-    assert!(store.lineage(TypeUuid([9u8; 16])).unwrap().is_empty());
+    assert_eq!(entries[1].forward_parent, Some(0));
+    assert_eq!(entries[2].forward_parent, Some(1));
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
 
     assert_eq!(
-        store.lineage_stamp(T, h(1)).unwrap(),
-        Some(stamp(T, &[h(1)]))
+        store.current_lineage_stamp(T).unwrap(),
+        Some(stamp(T, epochs(&[h(1), h(2), h(3)]), 2))
     );
-    assert_eq!(store.lineage_stamp(T, h(9)).unwrap(), None);
 }
 
 #[test]
-fn restaging_the_head_is_idempotent() {
-    // A candidate whose digest IS the head is not a rollback — the
-    // schema is unchanged, and no duplicate entry appends (§13's staging
-    // rule guarantees a digest never re-enters a chain).
+fn manifest_validation_rejects_bad_parents_duplicates_and_cursors() {
     let (_d, mut store) = store();
-    let (stamps, _) = store
-        .input_transaction(|txn| {
-            let first = txn.append_lineage(T, h(1))?;
-            let again = txn.append_lineage(T, h(1))?;
-            Ok((first, again))
-        })
-        .unwrap();
-    assert_eq!(stamps.0, stamps.1);
-    assert_eq!(store.lineage(T).unwrap().len(), 1);
+    let invalid = [
+        AcceptedTypeLineage {
+            epochs: vec![AcceptedSchemaEpoch {
+                digest: h(1),
+                forward_parent: Some(0),
+            }],
+            current: 0,
+        },
+        AcceptedTypeLineage {
+            epochs: vec![
+                AcceptedSchemaEpoch {
+                    digest: h(1),
+                    forward_parent: None,
+                },
+                AcceptedSchemaEpoch {
+                    digest: h(1),
+                    forward_parent: Some(0),
+                },
+            ],
+            current: 1,
+        },
+        accepted(&[h(1), h(2)], 2),
+    ];
+    for lineage in invalid {
+        let err = store
+            .input_transaction(|txn| txn.project_lineage_manifest(&manifest(&[(T, lineage)])))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidLineageManifest { type_uuid: Some(t), .. } if t == T)
+        );
+        assert!(!store.lineage_manifest_available().unwrap());
+    }
 }
 
 #[test]
-fn staging_a_non_head_chain_entry_is_a_rollback_refusal() {
-    // §13: staging rejects a candidate whose digest is a non-head chain
-    // entry — a rollback. Hard stop, no append: schema-writing services
-    // refuse for the type until an explicit reverse edge lands.
+fn live_projection_is_append_only_and_cannot_bypass_rollback_validation() {
     let (_d, mut store) = store();
+    let original = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| {
-            txn.append_lineage(T, h(1))?;
-            txn.append_lineage(T, h(2))?;
-            txn.append_lineage(T, h(3))?;
-            Ok(())
-        })
+        .input_transaction(|txn| txn.project_lineage_manifest(&original))
         .unwrap();
+
+    for invalid_update in [manifest(&[(T, accepted(&[h(1), h(2)], 1))]), manifest(&[])] {
+        let err = store
+            .input_transaction(|txn| txn.project_lineage_manifest(&invalid_update))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidLineageManifest { .. }));
+        assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
+        assert_eq!(store.lineage(T).unwrap().len(), 3);
+    }
+
+    let rollback_bypass = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 0))]);
     let err = store
-        .input_transaction(|txn| txn.append_lineage(T, h(2)))
+        .input_transaction(|txn| txn.project_lineage_manifest(&rollback_bypass))
         .unwrap_err();
-    match err {
+    assert!(matches!(
+        err,
         StoreError::LineageRollback {
             type_uuid,
             candidate,
-            head,
-        } => {
-            assert_eq!(type_uuid, T);
-            assert_eq!(candidate, h(2));
-            assert_eq!(head, h(3));
-        }
-        other => panic!("expected LineageRollback, got {other:?}"),
-    }
-    // Nothing appended: the chain still ends at h(3).
-    assert_eq!(store.lineage(T).unwrap().len(), 3);
-    assert_eq!(store.lineage(T).unwrap().last().unwrap().schema_hash, h(3));
+            current,
+        } if type_uuid == T && candidate == h(1) && current == h(3)
+    ));
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
+
+    // Ordinary acceptance is the only general projection transition: it
+    // appends and advances, preserving the complete prior vector.
+    let extended = manifest(&[(T, accepted(&[h(1), h(2), h(3), h(4)], 3))]);
+    store
+        .input_transaction(|txn| txn.project_lineage_manifest(&extended))
+        .unwrap();
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(4)));
+    assert_eq!(store.lineage(T).unwrap().len(), 4);
 }
 
 #[test]
-fn classification_at_current() {
-    let (_d, mut store) = store();
+fn state_loss_never_treats_a_bundle_stamp_as_forward_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig::new(dir.path().join(".distill"));
+    let mut store = Store::open(config.clone()).unwrap();
+    let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.append_lineage(T, h(2)))
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
+        .unwrap();
+    let old_stamp = stamp(T, epochs(&[h(1)]), 0);
+
+    let mut store = Store::recreate(config).unwrap();
+    assert!(!store.lineage_manifest_available().unwrap());
+    assert_eq!(
+        store
+            .classify_lineage(T, h(1), Some(old_stamp.clone()), h(3))
+            .unwrap(),
+        LineageClass::HardStop(HardStopReason::MissingManifest)
+    );
+
+    // Startup rebuilds only from the source-controlled manifest, never by
+    // unioning the observed bundle stamp into authority.
+    store
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
         .unwrap();
     assert_eq!(
-        store.classify_lineage(T, h(2), None, h(2)).unwrap(),
-        LineageClass::AtCurrent
+        store
+            .classify_lineage(T, h(1), Some(old_stamp), h(3))
+            .unwrap(),
+        LineageClass::ForwardOnChain
     );
 }
 
 #[test]
-fn only_an_explicit_prefix_proof_permits_the_automatic_diff() {
+fn prefix_and_parent_proof_alone_permits_a_forward_automatic_diff() {
     let (_d, mut store) = store();
-    let (stamps, _) = store
-        .input_transaction(|txn| {
-            let s1 = txn.append_lineage(T, h(1))?;
-            let s2 = txn.append_lineage(T, h(2))?;
-            let s3 = txn.append_lineage(T, h(3))?;
-            Ok((s1, s2, s3))
-        })
+    let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
+    store
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
         .unwrap();
-
-    // Even a hash present in disposable store state needs the authored
-    // list. Store position is an accelerator, not ancestry proof.
+    let s1 = stamp(T, epochs(&[h(1)]), 0);
+    assert_eq!(
+        store.classify_lineage(T, h(1), Some(s1), h(3)).unwrap(),
+        LineageClass::ForwardOnChain
+    );
     assert_eq!(
         store.classify_lineage(T, h(1), None, h(3)).unwrap(),
         LineageClass::HardStop(HardStopReason::Unstamped)
     );
-    let class = store
-        .classify_lineage(T, h(1), Some(stamps.0), h(3))
-        .unwrap();
-    assert_eq!(class, LineageClass::ForwardOnChain);
-    assert!(class.permits_automatic_diff());
-
-    assert_eq!(
-        store
-            .classify_lineage(T, h(2), Some(stamps.1), h(3))
-            .unwrap(),
-        LineageClass::ForwardOnChain
-    );
 }
 
 #[test]
-fn registry_prefix_of_data_is_a_rollback_hard_stop() {
+fn vector_order_never_substitutes_for_parent_reachability() {
+    // A→B→C was followed by an accepted rollback to A and then A→D.
+    // B and C precede D in append-only history, but are not ancestors of D.
     let (_d, mut store) = store();
-    // The serving registry is at [h1,h2], while authored data proves it
-    // was written by the descendant history [h1,h2,h3].
+    let branch = vec![
+        AcceptedSchemaEpoch {
+            digest: h(1),
+            forward_parent: None,
+        },
+        AcceptedSchemaEpoch {
+            digest: h(2),
+            forward_parent: Some(0),
+        },
+        AcceptedSchemaEpoch {
+            digest: h(3),
+            forward_parent: Some(1),
+        },
+        AcceptedSchemaEpoch {
+            digest: h(4),
+            forward_parent: Some(0),
+        },
+    ];
     store
-        .input_transaction(|txn| txn.reestablish_lineage(T, h(2), stamp(T, &[h(1), h(2)])))
-        .unwrap();
-    let class = store
-        .classify_lineage(T, h(3), Some(stamp(T, &[h(1), h(2), h(3)])), h(2))
-        .unwrap();
-    assert_eq!(class, LineageClass::RegistryBehindData);
-    assert!(!class.permits_automatic_diff());
-}
-
-#[test]
-fn an_unknown_unstamped_hash_is_a_hard_stop() {
-    // §11: an unknown or unstamped schema is a hard stop requiring an
-    // explicit edge — first sight is NOT trivially forward (the R21
-    // supersession of the old NoLineage rule).
-    let (_d, mut store) = store();
-    store
-        .input_transaction(|txn| txn.append_lineage(T, h(2)))
-        .unwrap();
-    let class = store.classify_lineage(T, h(9), None, h(2)).unwrap();
-    assert_eq!(class, LineageClass::HardStop(HardStopReason::Unstamped));
-    assert!(!class.permits_automatic_diff());
-}
-
-#[test]
-fn an_empty_chain_with_no_position_is_a_hard_stop() {
-    // With no recorded lineage AND no re-established position, the
-    // registry cannot judge direction: never an automatic diff (the old
-    // "no lineage yet, trivially forward" rule is superseded).
-    let (_d, store) = store();
-    let class = store.classify_lineage(T, h(1), None, h(2)).unwrap();
-    assert_eq!(
-        class,
-        LineageClass::HardStop(HardStopReason::UnknownPosition)
-    );
-    assert!(!class.permits_automatic_diff());
-
-    let stamped = store
-        .classify_lineage(T, h(1), Some(stamp(T, &[h(1)])), h(2))
-        .unwrap();
-    assert!(!stamped.permits_automatic_diff());
-}
-
-#[test]
-fn one_full_stamp_reconstructs_missing_intermediate_positions_after_state_loss() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = distill_store::StoreConfig::new(dir.path().join(".distill"));
-    let mut store = Store::open(config.clone()).unwrap();
-    let (current_stamp, _) = store
         .input_transaction(|txn| {
-            txn.append_lineage(T, h(1))?;
-            txn.append_lineage(T, h(2))?;
-            txn.append_lineage(T, h(3))
+            txn.project_lineage_manifest(&manifest(&[(
+                T,
+                AcceptedTypeLineage {
+                    epochs: branch.clone(),
+                    current: 3,
+                },
+            )]))
         })
         .unwrap();
 
-    // State loss: the chain is gone.
-    let mut store = Store::recreate(config).unwrap();
-    assert!(store.lineage(T).unwrap().is_empty());
-
-    store
-        .input_transaction(|txn| txn.reestablish_lineage(T, h(3), current_stamp.clone()))
-        .unwrap();
-
     assert_eq!(
         store
-            .lineage(T)
-            .unwrap()
-            .iter()
-            .map(|e| e.schema_hash)
-            .collect::<Vec<_>>(),
-        [h(1), h(2), h(3)]
-    );
-    assert_eq!(
-        store
-            .classify_lineage(T, h(1), Some(stamp(T, &[h(1)])), h(3))
+            .classify_lineage(T, h(1), Some(stamp(T, branch[..1].to_vec(), 0)), h(4))
             .unwrap(),
         LineageClass::ForwardOnChain
     );
+    for (data, cursor) in [(h(2), 1), (h(3), 2)] {
+        assert_eq!(
+            store
+                .classify_lineage(
+                    T,
+                    data,
+                    Some(stamp(T, branch[..=cursor].to_vec(), cursor as u32)),
+                    h(4),
+                )
+                .unwrap(),
+            LineageClass::HardStop(HardStopReason::Divergent)
+        );
+    }
 }
 
 #[test]
-fn divergent_or_forged_lists_are_never_automatic_ancestry() {
+fn divergent_forged_or_non_manifest_stamps_never_prove_ancestry() {
     let (_d, mut store) = store();
+    let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| txn.reestablish_lineage(T, h(3), stamp(T, &[h(1), h(2), h(3)])))
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
         .unwrap();
+    let mut bad_parent = epochs(&[h(1), h(2)]);
+    bad_parent[1].forward_parent = None;
     for bad in [
-        stamp(T, &[h(1), h(9)]), // diverges from registry
+        stamp(T, epochs(&[h(1), h(9)]), 1),
+        stamp(T, bad_parent, 1),
         LineageStamp {
-            digests: vec![h(1)],
-            chain_digest: [0u8; 32],
-        }, // forged commitment
-        stamp(T, &[h(1), h(2)]), // head does not equal claimed data hash
+            epochs: epochs(&[h(1)]),
+            cursor: 0,
+            chain: [0u8; 32],
+        },
     ] {
         assert_eq!(
             store.classify_lineage(T, h(9), Some(bad), h(3)).unwrap(),
@@ -449,67 +487,144 @@ fn divergent_or_forged_lists_are_never_automatic_ancestry() {
 }
 
 #[test]
-fn reconstruction_unions_only_prefix_consistent_lists() {
+fn rollback_moves_only_the_cursor_after_complete_reverse_edge_validation() {
     let (_d, mut store) = store();
+    let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
     store
-        .input_transaction(|txn| {
-            txn.reestablish_lineage(T, h(2), stamp(T, &[h(1), h(2)]))?;
-            txn.reestablish_lineage(T, h(3), stamp(T, &[h(1), h(2), h(3)]))
-        })
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
         .unwrap();
-
-    let err = store
-        .input_transaction(|txn| txn.reestablish_lineage(T, h(9), stamp(T, &[h(1), h(9)])))
-        .unwrap_err();
-    assert!(
-        matches!(err, StoreError::LineageStampConflict { type_uuid, generation: 2, .. } if type_uuid == T)
-    );
+    let reverse = [
+        ReverseMigrationEdge {
+            from: h(3),
+            to: h(2),
+        },
+        ReverseMigrationEdge {
+            from: h(2),
+            to: h(1),
+        },
+    ];
+    let (rolled_back, _) = store
+        .input_transaction(|txn| txn.rollback_lineage(T, h(1), &[h(2), h(3)], &reverse))
+        .unwrap();
+    assert_eq!(rolled_back, stamp(T, epochs(&[h(1), h(2), h(3)]), 0));
     assert_eq!(
-        store.lineage(T).unwrap().len(),
-        3,
-        "conflicting union publishes nothing"
+        store
+            .lineage(T)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.schema_hash)
+            .collect::<Vec<_>>(),
+        [h(1), h(2), h(3)],
+        "rollback never truncates append-only history"
+    );
+    assert_eq!(store.lineage_current(T).unwrap(), Some(h(1)));
+
+    // Parent traversal, not vector order, now governs direction.
+    assert_eq!(
+        store
+            .classify_lineage(
+                T,
+                h(3),
+                Some(stamp(T, epochs(&[h(1), h(2), h(3)]), 2)),
+                h(1)
+            )
+            .unwrap(),
+        LineageClass::RegistryBehindData
     );
 }
 
 #[test]
-fn appends_extend_a_reestablished_chain() {
+fn rollback_rejects_missing_ambiguous_cyclic_and_unknown_coverage_atomically() {
     let (_d, mut store) = store();
-    let (got, _) = store
-        .input_transaction(|txn| {
-            txn.reestablish_lineage(T, h(3), stamp(T, &[h(1), h(2), h(3)]))?;
-            txn.append_lineage(T, h(4))
-        })
+    let source = manifest(&[(T, accepted(&[h(1), h(2), h(3)], 2))]);
+    store
+        .input_transaction(|txn| txn.project_lineage_manifest(&source))
         .unwrap();
-    assert_eq!(got, stamp(T, &[h(1), h(2), h(3), h(4)]));
-    let err = store
-        .input_transaction(|txn| txn.append_lineage(T, h(3)))
-        .unwrap_err();
-    assert!(matches!(err, StoreError::LineageRollback { .. }));
+
+    let bad_cases: &[(&[LogicalHash], &[ReverseMigrationEdge])] = &[
+        (
+            &[h(3)],
+            &[ReverseMigrationEdge {
+                from: h(3),
+                to: h(2),
+            }],
+        ),
+        (
+            &[h(3)],
+            &[
+                ReverseMigrationEdge {
+                    from: h(3),
+                    to: h(2),
+                },
+                ReverseMigrationEdge {
+                    from: h(3),
+                    to: h(1),
+                },
+                ReverseMigrationEdge {
+                    from: h(2),
+                    to: h(1),
+                },
+            ],
+        ),
+        (
+            &[h(3)],
+            &[
+                ReverseMigrationEdge {
+                    from: h(3),
+                    to: h(2),
+                },
+                ReverseMigrationEdge {
+                    from: h(2),
+                    to: h(3),
+                },
+            ],
+        ),
+        (
+            &[h(9)],
+            &[
+                ReverseMigrationEdge {
+                    from: h(3),
+                    to: h(2),
+                },
+                ReverseMigrationEdge {
+                    from: h(2),
+                    to: h(1),
+                },
+            ],
+        ),
+    ];
+    for (live, edges) in bad_cases {
+        let err = store
+            .input_transaction(|txn| txn.rollback_lineage(T, h(1), live, edges))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::IncompleteRollbackCoverage { type_uuid, target, .. } if type_uuid == T && target == h(1))
+        );
+        assert_eq!(store.lineage_current(T).unwrap(), Some(h(3)));
+    }
 }
 
 #[test]
-fn lineage_is_per_type() {
+fn projection_is_per_type_and_chain_commitments_bind_the_type() {
     let (_d, mut store) = store();
     let other = TypeUuid([5u8; 16]);
+    let first = accepted(&[h(1)], 0);
+    let second = accepted(&[h(7)], 0);
     store
         .input_transaction(|txn| {
-            txn.append_lineage(T, h(1))?;
-            txn.append_lineage(other, h(7))?;
-            Ok(())
+            txn.project_lineage_manifest(&manifest(&[(T, first), (other, second)]))
         })
         .unwrap();
     assert_eq!(store.lineage(T).unwrap().len(), 1);
     assert_eq!(store.lineage(other).unwrap().len(), 1);
-    // The digests bind the type uuid: identical histories for two types
-    // never share a chain digest.
     assert_ne!(
-        dssl(T, &[h(1)]),
-        dssl(other, &[h(1)]),
+        dssl(T, &epochs(&[h(1)]), 0),
+        dssl(other, &epochs(&[h(1)]), 0),
         "the type uuid is in the DSSL pre-image"
     );
     assert_eq!(
         store
-            .classify_lineage(other, h(1), Some(stamp(T, &[h(1)])), h(7))
+            .classify_lineage(other, h(1), Some(stamp(T, epochs(&[h(1)]), 0)), h(7))
             .unwrap(),
         LineageClass::HardStop(HardStopReason::Divergent),
         "another type's chain never leaks"

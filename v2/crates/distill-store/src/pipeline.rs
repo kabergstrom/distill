@@ -1,8 +1,10 @@
 //! Pipeline-side metadata (§13): the `pipeline_state` row and
 //! `registrations`, the `tools` ToolEpoch table, and the
-//! `schema_lineage` chain — full ordered schema-digest lists with
-//! `"DSSL"` commitments gating automatic migration diffs (§6, §11).
+//! source-controlled schema-lineage manifest projection: append-only
+//! accepted epochs, explicit parent links, an independent current cursor,
+//! and `"DSSL"` commitments gating automatic migration diffs (§6, §11).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use distill_core::id::{LogicalHash, TypeUuid};
@@ -27,52 +29,90 @@ pub struct StagedTool {
     pub input_version: InputVersion,
 }
 
-/// The direction marker beside every `schema_hash` (§6, §11), in the
-/// superseding R22/C1 shape. The full ordered digest list is the ancestry
-/// proof and complete predecessor record; the DSSL digest is its compact
-/// commitment. Generation is derived from `digests.len()`, never trusted
-/// as an independent authored number.
+/// One accepted schema epoch in the source-controlled lineage manifest.
+/// History is append-only; the parent records which prior current this
+/// epoch was accepted as a forward successor of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedSchemaEpoch {
+    pub digest: LogicalHash,
+    pub forward_parent: Option<u32>,
+}
+
+/// A type's append-only accepted history and independently movable current
+/// cursor. A rollback changes `current`, never `epochs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedTypeLineage {
+    pub epochs: Vec<AcceptedSchemaEpoch>,
+    pub current: u32,
+}
+
+/// The already parsed, unique source-controlled lineage authority. The
+/// metadata store holds only a disposable projection of this value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaLineageManifest {
+    pub types: BTreeMap<TypeUuid, AcceptedTypeLineage>,
+}
+
+/// One authored custom migration edge supplied to explicit rollback
+/// validation. Automatic diffs are deliberately absent from this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReverseMigrationEdge {
+    pub from: LogicalHash,
+    pub to: LogicalHash,
+}
+
+/// The direction marker beside every `schema_hash` (§6, §11). `epochs` is
+/// an exact prefix of the durable manifest, including parent links; `cursor`
+/// selects the writing epoch and `chain` commits to both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageStamp {
-    pub digests: Vec<LogicalHash>,
-    pub chain_digest: [u8; 32],
+    pub epochs: Vec<AcceptedSchemaEpoch>,
+    pub cursor: u32,
+    pub chain: [u8; 32],
 }
 
 impl LineageStamp {
     pub fn generation(&self) -> u64 {
-        self.digests.len() as u64
+        self.epochs.len() as u64
     }
 
-    fn is_valid_for(&self, type_uuid: TypeUuid, head: LogicalHash) -> bool {
-        self.digests.last() == Some(&head)
-            && self.chain_digest == lineage_chain_digest(type_uuid, &self.digests)
+    fn selected_digest(&self) -> Option<LogicalHash> {
+        self.epochs
+            .get(usize::try_from(self.cursor).ok()?)
+            .map(|epoch| epoch.digest)
     }
 }
 
-/// One recorded `schema_lineage` row (§13): a chain position with the
-/// hash it adopted and the `"DSSL"` digest assigned to it.
+/// One recorded append-only `schema_lineage` row (§13). The independently
+/// movable current cursor and full-vector DSSL commitment live in
+/// `schema_lineage_current`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineageEntry {
     pub generation: u64,
     pub schema_hash: LogicalHash,
-    pub chain_digest: [u8; 32],
+    pub forward_parent: Option<u32>,
 }
 
-/// The §6 chain-digest formula, pinned: `blake3("DSSL" ‖ version:u8 ‖
-/// type_uuid ‖ count:u32 ‖ the ordered schema digests, oldest first)` —
-/// §5's canonical sequence encoding under the registered `"DSSL"`
-/// domain.
-pub fn lineage_chain_digest(type_uuid: TypeUuid, digests: &[LogicalHash]) -> [u8; 32] {
+/// The §6 chain-digest formula over an accepted epoch prefix and its current
+/// cursor. Parent links make ancestry explicit; vector order alone is never
+/// a direction proof.
+pub fn lineage_chain_digest(
+    type_uuid: TypeUuid,
+    epochs: &[AcceptedSchemaEpoch],
+    cursor: u32,
+) -> [u8; 32] {
     distill_core::canonical::domain_digest(distill_core::canonical::DSSL, 1, |e| {
         e.raw(&type_uuid.0);
-        e.seq(digests, |e, d| e.raw(&d.0));
+        e.seq(epochs, |e, epoch| {
+            e.raw(&epoch.digest.0);
+            e.option(epoch.forward_parent, |e, parent| e.u32(*parent));
+        });
+        e.u32(cursor);
     })
 }
 
-/// Where the data's schema hash sits relative to the registry's current
-/// on the recorded chain — or, where the chain does not cover it (state
-/// loss), relative to the registry's position by lineage stamp (§6,
-/// §11, §13).
+/// Where the data's selected accepted epoch sits relative to the registry's
+/// current by explicit parent reachability (§6, §11, §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineageClass {
     /// The data is at the registry's current — the walk terminates, no
@@ -92,10 +132,13 @@ pub enum LineageClass {
     HardStop(HardStopReason),
 }
 
-/// Why a placement hard-stopped (§11): unknown, divergent, or
-/// positionless — never a heuristic tiebreak.
+/// Why a placement hard-stopped (§11): missing authority, unknown,
+/// divergent, or positionless — never a heuristic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardStopReason {
+    /// The unique source-controlled manifest has not been projected. Bundle
+    /// stamps cannot substitute for it, including after state loss.
+    MissingManifest,
     /// The hash is on no recorded chain entry and the data carries no
     /// stamp: an unknown or unstamped schema.
     Unstamped,
@@ -208,116 +251,111 @@ impl InputTxn<'_> {
         })
     }
 
-    /// Adopt a candidate schema as a type's new current (§11, §13): each
-    /// successfully staged module epoch appends the new current hash,
-    /// assigning the next **generation** and the extended `"DSSL"`
-    /// **chain digest** — the returned [`LineageStamp`] is what every
-    /// schema-writing service stamps beside `schema_hash` (§6).
-    ///
-    /// Direction-checked at staging: a candidate whose digest already
-    /// appears as a **non-head** entry is a *rollback* —
-    /// [`StoreError::LineageRollback`], a hard stop with nothing
-    /// appended. A candidate equal to the head is the unchanged schema:
-    /// idempotent, returning the head's existing stamp.
-    ///
-    /// The digest extends over the recorded history in generation order
-    /// — for a chain contiguous from generation 1 that is exactly §6's
-    /// pinned formula; after a state-loss re-establishment it extends
-    /// over the observed entries (position, not history, is what state
-    /// loss costs — comparisons only ever run against this same chain).
-    pub fn append_lineage(
+    /// Replace the disposable lineage projection from the already parsed,
+    /// unique source-controlled manifest. This is the only state-rebuild
+    /// path: bundle and migration-endpoint stamps are never unioned into
+    /// authority. Validation completes before the old projection is touched.
+    pub fn project_lineage_manifest(
         &mut self,
-        type_uuid: TypeUuid,
-        new: LogicalHash,
-    ) -> Result<LineageStamp, StoreError> {
-        let chain = lineage_rows(&self.txn, type_uuid)?;
-        if let Some(entry) = chain.iter().find(|e| e.schema_hash == new) {
-            let head = chain.last().expect("non-empty: entry found");
-            if entry.generation == head.generation {
-                // Unchanged schema: idempotent, no duplicate entry.
-                let digests = chain.iter().map(|e| e.schema_hash).collect::<Vec<_>>();
-                return Ok(LineageStamp {
-                    chain_digest: lineage_chain_digest(type_uuid, &digests),
-                    digests,
-                });
-            }
-            return Err(StoreError::LineageRollback {
-                type_uuid,
-                candidate: new,
-                head: head.schema_hash,
-            });
+        manifest: &SchemaLineageManifest,
+    ) -> Result<(), StoreError> {
+        for (type_uuid, lineage) in &manifest.types {
+            validate_type_lineage(*type_uuid, lineage)?;
         }
-        let generation = chain.last().map(|e| e.generation + 1).unwrap_or(1);
-        let mut digests: Vec<LogicalHash> = chain.iter().map(|e| e.schema_hash).collect();
-        digests.push(new);
-        let chain_digest = lineage_chain_digest(type_uuid, &digests);
+        validate_projection_transition(&self.txn, manifest)?;
+
+        self.txn.execute("DELETE FROM schema_lineage_current", [])?;
+        self.txn.execute("DELETE FROM schema_lineage", [])?;
+        self.txn.execute("DELETE FROM schema_lineage_state", [])?;
+
+        for (type_uuid, lineage) in &manifest.types {
+            for (index, epoch) in lineage.epochs.iter().enumerate() {
+                self.txn.execute(
+                    "INSERT INTO schema_lineage(
+                         type_uuid, generation, schema_hash, forward_parent, input_version
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        type_uuid.0.as_slice(),
+                        (index + 1) as i64,
+                        epoch.digest.0.as_slice(),
+                        epoch.forward_parent.map(i64::from),
+                        self.version().0 as i64,
+                    ],
+                )?;
+            }
+            write_lineage_current(&self.txn, self.version(), *type_uuid, lineage)?;
+        }
         self.txn.execute(
-            "INSERT INTO schema_lineage(type_uuid, generation, schema_hash, chain_digest, input_version)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                type_uuid.0.as_slice(),
-                generation as i64,
-                new.0.as_slice(),
-                chain_digest.as_slice(),
-                self.version().0 as i64,
-            ],
+            "INSERT INTO schema_lineage_state(id, input_version) VALUES (0, ?1)",
+            [self.version().0 as i64],
         )?;
-        Ok(LineageStamp {
-            digests,
-            chain_digest,
-        })
+        Ok(())
     }
 
-    /// Re-establish from one authored complete predecessor record. The
-    /// observed lists are unioned only when prefix-consistent; one current
-    /// stamp therefore reconstructs every missing intermediate position.
-    pub fn reestablish_lineage(
+    /// Move an accepted type's current cursor to an existing non-current
+    /// digest after validating total custom reverse paths from the old
+    /// current and every supplied live data/migration-endpoint schema that
+    /// is not already a forward ancestor of the requested cursor.
+    ///
+    /// The caller obtains `live_schema_hashes` (including migration
+    /// endpoints) from one pinned source-tree snapshot; indexed live asset
+    /// schemas are added automatically. The coordinator publishes the same
+    /// validated cursor move to the source manifest through the journaled
+    /// authoring protocol. This method updates only the projection's cursor
+    /// row; accepted history remains append-only.
+    pub fn rollback_lineage(
         &mut self,
         type_uuid: TypeUuid,
-        hash: LogicalHash,
-        stamp: LineageStamp,
-    ) -> Result<(), StoreError> {
-        let generation = stamp.generation();
-        if !stamp.is_valid_for(type_uuid, hash) {
-            return Err(StoreError::LineageStampConflict {
+        target: LogicalHash,
+        live_schema_hashes: &[LogicalHash],
+        reverse_edges: &[ReverseMigrationEdge],
+    ) -> Result<LineageStamp, StoreError> {
+        ensure_manifest_available(&self.txn)?;
+        let lineage = type_lineage(&self.txn, type_uuid)?.ok_or_else(|| {
+            StoreError::IncompleteRollbackCoverage {
                 type_uuid,
-                generation,
-                detail: "stamp head or DSSL commitment does not match its explicit list".to_owned(),
-            });
-        }
-        let chain = lineage_rows(&self.txn, type_uuid)?;
-        let recorded: Vec<LogicalHash> = chain.iter().map(|e| e.schema_hash).collect();
-        if !recorded.is_empty()
-            && !is_prefix(&recorded, &stamp.digests)
-            && !is_prefix(&stamp.digests, &recorded)
-        {
-            let mismatch = recorded
-                .iter()
-                .zip(&stamp.digests)
-                .position(|(a, b)| a != b)
-                .unwrap_or(recorded.len().min(stamp.digests.len()));
-            return Err(StoreError::LineageStampConflict {
+                target,
+                source: target,
+                detail: "type is absent from the accepted lineage manifest".to_owned(),
+            }
+        })?;
+        let target_index = lineage
+            .epochs
+            .iter()
+            .position(|epoch| epoch.digest == target)
+            .ok_or_else(|| StoreError::IncompleteRollbackCoverage {
                 type_uuid,
-                generation: mismatch as u64 + 1,
-                detail: "observed ordered list diverges from the reconstructed lineage".to_owned(),
-            });
+                target,
+                source: target,
+                detail: "target digest is not an accepted epoch".to_owned(),
+            })? as u32;
+        let old_current = lineage.current;
+        if old_current == target_index {
+            return stamp_for(type_uuid, &lineage);
         }
-        for (index, schema_hash) in stamp.digests.iter().enumerate().skip(recorded.len()) {
-            let prefix = &stamp.digests[..=index];
-            let digest = lineage_chain_digest(type_uuid, prefix);
-            self.txn.execute(
-                "INSERT INTO schema_lineage(type_uuid, generation, schema_hash, chain_digest, input_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    type_uuid.0.as_slice(),
-                    (index + 1) as i64,
-                    schema_hash.0.as_slice(),
-                    digest.as_slice(),
-                    self.version().0 as i64,
-                ],
-            )?;
-        }
-        Ok(())
+
+        let mut required_live = live_schema_hashes.to_vec();
+        required_live.extend(live_asset_schema_hashes(&self.txn, type_uuid)?);
+
+        validate_rollback_coverage(
+            type_uuid,
+            target,
+            &lineage,
+            target_index,
+            &required_live,
+            reverse_edges,
+        )?;
+
+        let moved = AcceptedTypeLineage {
+            epochs: lineage.epochs,
+            current: target_index,
+        };
+        write_lineage_current(&self.txn, self.version(), type_uuid, &moved)?;
+        self.txn.execute(
+            "UPDATE schema_lineage_state SET input_version = ?1 WHERE id = 0",
+            [self.version().0 as i64],
+        )?;
+        stamp_for(type_uuid, &moved)
     }
 }
 
@@ -326,30 +364,433 @@ fn lineage_rows(
     type_uuid: TypeUuid,
 ) -> Result<Vec<LineageEntry>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT generation, schema_hash, chain_digest FROM schema_lineage
+        "SELECT generation, schema_hash, forward_parent FROM schema_lineage
          WHERE type_uuid = ?1 ORDER BY generation",
     )?;
     let rows = stmt.query_map([type_uuid.0.as_slice()], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, Vec<u8>>(1)?,
-            r.get::<_, Vec<u8>>(2)?,
+            r.get::<_, Option<i64>>(2)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (generation, hash, digest) = row?;
+        let (generation, hash, forward_parent) = row?;
+        let expected_generation = out.len() as u64 + 1;
+        let generation = u64::try_from(generation)
+            .map_err(|_| invalid_manifest(Some(type_uuid), "a projected generation is negative"))?;
+        if generation != expected_generation {
+            return Err(invalid_manifest(
+                Some(type_uuid),
+                "projected accepted generations are not contiguous",
+            ));
+        }
+        let schema_hash = LogicalHash(hash.try_into().map_err(|_| {
+            invalid_manifest(
+                Some(type_uuid),
+                "a projected schema digest is not exactly 32 bytes",
+            )
+        })?);
+        let forward_parent = forward_parent
+            .map(|parent| {
+                u32::try_from(parent).map_err(|_| {
+                    invalid_manifest(Some(type_uuid), "a projected parent index is invalid")
+                })
+            })
+            .transpose()?;
         out.push(LineageEntry {
-            generation: generation as u64,
-            schema_hash: LogicalHash(blob32(hash)),
-            chain_digest: blob32(digest),
+            generation,
+            schema_hash,
+            forward_parent,
         });
     }
     Ok(out)
 }
 
-fn is_prefix(a: &[LogicalHash], b: &[LogicalHash]) -> bool {
-    a.len() <= b.len() && a == &b[..a.len()]
+fn validate_type_lineage(
+    type_uuid: TypeUuid,
+    lineage: &AcceptedTypeLineage,
+) -> Result<(), StoreError> {
+    if lineage.epochs.is_empty() {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "a manifest type must contain at least one accepted epoch",
+        ));
+    }
+    if lineage.epochs.len() > u32::MAX as usize {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "accepted epoch count exceeds the DSSL u32 sequence bound",
+        ));
+    }
+    if usize::try_from(lineage.current)
+        .ok()
+        .filter(|current| *current < lineage.epochs.len())
+        .is_none()
+    {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "current cursor is outside the accepted epoch vector",
+        ));
+    }
+    let mut digests = BTreeSet::new();
+    for (index, epoch) in lineage.epochs.iter().enumerate() {
+        if !digests.insert(epoch.digest) {
+            return Err(invalid_manifest(
+                Some(type_uuid),
+                "one digest appears in more than one accepted epoch",
+            ));
+        }
+        match (index, epoch.forward_parent) {
+            (0, None) => {}
+            (0, Some(_)) => {
+                return Err(invalid_manifest(
+                    Some(type_uuid),
+                    "the first accepted epoch must not have a forward parent",
+                ));
+            }
+            (_, Some(parent)) if (parent as usize) < index => {}
+            (_, Some(_)) => {
+                return Err(invalid_manifest(
+                    Some(type_uuid),
+                    "a forward parent must name an earlier accepted epoch",
+                ));
+            }
+            (_, None) => {
+                return Err(invalid_manifest(
+                    Some(type_uuid),
+                    "only the first accepted epoch may omit its forward parent",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_transition(
+    conn: &rusqlite::Connection,
+    proposed: &SchemaLineageManifest,
+) -> Result<(), StoreError> {
+    if !manifest_available(conn)? {
+        return Ok(());
+    }
+    let recorded = projected_manifest(conn)?;
+    for (type_uuid, old) in &recorded.types {
+        let Some(new) = proposed.types.get(type_uuid) else {
+            return Err(invalid_manifest(
+                Some(*type_uuid),
+                "an accepted type cannot be removed from append-only history",
+            ));
+        };
+        if new.epochs.len() < old.epochs.len() || new.epochs[..old.epochs.len()] != old.epochs {
+            return Err(invalid_manifest(
+                Some(*type_uuid),
+                "accepted epoch history is not an append-only extension",
+            ));
+        }
+        if new.epochs.len() == old.epochs.len() {
+            if new.current != old.current {
+                return Err(StoreError::LineageRollback {
+                    type_uuid: *type_uuid,
+                    candidate: new.epochs[new.current as usize].digest,
+                    current: old.epochs[old.current as usize].digest,
+                });
+            }
+        } else {
+            validate_acceptance_extension(*type_uuid, old, new)?;
+        }
+    }
+    for (type_uuid, new) in &proposed.types {
+        if !recorded.types.contains_key(type_uuid) && new.current as usize != new.epochs.len() - 1 {
+            return Err(invalid_manifest(
+                Some(*type_uuid),
+                "a newly accepted type must select its newly appended epoch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_acceptance_extension(
+    type_uuid: TypeUuid,
+    old: &AcceptedTypeLineage,
+    new: &AcceptedTypeLineage,
+) -> Result<(), StoreError> {
+    if new.current as usize != new.epochs.len() - 1 {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "ordinary acceptance must advance to the newly appended epoch",
+        ));
+    }
+    if new.epochs[old.epochs.len()].forward_parent != Some(old.current) {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "the first appended epoch must name the prior current as its forward parent",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_manifest(type_uuid: Option<TypeUuid>, detail: &str) -> StoreError {
+    StoreError::InvalidLineageManifest {
+        type_uuid,
+        detail: detail.to_owned(),
+    }
+}
+
+fn ensure_manifest_available(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+    if manifest_available(conn)? {
+        Ok(())
+    } else {
+        Err(StoreError::LineageManifestUnavailable)
+    }
+}
+
+fn manifest_available(conn: &rusqlite::Connection) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM schema_lineage_state WHERE id = 0",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn type_lineage(
+    conn: &rusqlite::Connection,
+    type_uuid: TypeUuid,
+) -> Result<Option<AcceptedTypeLineage>, StoreError> {
+    let rows = lineage_rows(conn, type_uuid)?;
+    let current_row: Option<(i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT current_cursor, chain_digest FROM schema_lineage_current
+             WHERE type_uuid = ?1",
+            [type_uuid.0.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((current, chain)) = current_row else {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "accepted history has no current cursor",
+        ));
+    };
+    let current = u32::try_from(current).map_err(|_| {
+        invalid_manifest(Some(type_uuid), "the projected current cursor is invalid")
+    })?;
+    let lineage = AcceptedTypeLineage {
+        epochs: rows
+            .into_iter()
+            .map(|entry| AcceptedSchemaEpoch {
+                digest: entry.schema_hash,
+                forward_parent: entry.forward_parent,
+            })
+            .collect(),
+        current,
+    };
+    validate_type_lineage(type_uuid, &lineage)?;
+    let chain: [u8; 32] = chain.try_into().map_err(|_| {
+        invalid_manifest(
+            Some(type_uuid),
+            "the projected DSSL commitment is not exactly 32 bytes",
+        )
+    })?;
+    if chain != lineage_chain_digest(type_uuid, &lineage.epochs, lineage.current) {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "the disposable projection's DSSL commitment does not verify",
+        ));
+    }
+    Ok(Some(lineage))
+}
+
+fn projected_manifest(conn: &rusqlite::Connection) -> Result<SchemaLineageManifest, StoreError> {
+    let mut stmt =
+        conn.prepare("SELECT type_uuid FROM schema_lineage_current ORDER BY type_uuid")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut types = BTreeMap::new();
+    for row in rows {
+        let bytes = row?;
+        let type_uuid = TypeUuid(bytes.try_into().map_err(|_| {
+            invalid_manifest(
+                None,
+                "a projected lineage type UUID is not exactly 16 bytes",
+            )
+        })?);
+        let lineage = type_lineage(conn, type_uuid)?.ok_or_else(|| {
+            invalid_manifest(
+                Some(type_uuid),
+                "a projected current cursor has no accepted history",
+            )
+        })?;
+        types.insert(type_uuid, lineage);
+    }
+    Ok(SchemaLineageManifest { types })
+}
+
+fn write_lineage_current(
+    conn: &rusqlite::Connection,
+    version: InputVersion,
+    type_uuid: TypeUuid,
+    lineage: &AcceptedTypeLineage,
+) -> Result<(), StoreError> {
+    let chain = lineage_chain_digest(type_uuid, &lineage.epochs, lineage.current);
+    conn.execute(
+        "INSERT INTO schema_lineage_current(
+             type_uuid, current_cursor, chain_digest, input_version
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(type_uuid) DO UPDATE SET
+             current_cursor = excluded.current_cursor,
+             chain_digest = excluded.chain_digest,
+             input_version = excluded.input_version",
+        rusqlite::params![
+            type_uuid.0.as_slice(),
+            i64::from(lineage.current),
+            chain.as_slice(),
+            version.0 as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn stamp_for(
+    type_uuid: TypeUuid,
+    lineage: &AcceptedTypeLineage,
+) -> Result<LineageStamp, StoreError> {
+    validate_type_lineage(type_uuid, lineage)?;
+    Ok(LineageStamp {
+        chain: lineage_chain_digest(type_uuid, &lineage.epochs, lineage.current),
+        epochs: lineage.epochs.clone(),
+        cursor: lineage.current,
+    })
+}
+
+fn is_ancestor(lineage: &AcceptedTypeLineage, ancestor: u32, descendant: u32) -> bool {
+    let mut cursor = Some(descendant);
+    while let Some(index) = cursor {
+        if index == ancestor {
+            return true;
+        }
+        cursor = lineage.epochs[index as usize].forward_parent;
+    }
+    false
+}
+
+fn validate_rollback_coverage(
+    type_uuid: TypeUuid,
+    target: LogicalHash,
+    lineage: &AcceptedTypeLineage,
+    target_index: u32,
+    live_schema_hashes: &[LogicalHash],
+    reverse_edges: &[ReverseMigrationEdge],
+) -> Result<(), StoreError> {
+    let positions: BTreeMap<_, _> = lineage
+        .epochs
+        .iter()
+        .enumerate()
+        .map(|(index, epoch)| (epoch.digest, index as u32))
+        .collect();
+    let mut outgoing: BTreeMap<LogicalHash, Vec<LogicalHash>> = BTreeMap::new();
+    for edge in reverse_edges {
+        if !positions.contains_key(&edge.from) || !positions.contains_key(&edge.to) {
+            return Err(coverage_error(
+                type_uuid,
+                target,
+                edge.from,
+                "a supplied reverse edge endpoint is not an accepted epoch",
+            ));
+        }
+        outgoing.entry(edge.from).or_default().push(edge.to);
+    }
+
+    let old_current = lineage.epochs[lineage.current as usize].digest;
+    let mut required = BTreeSet::from([old_current]);
+    for source in live_schema_hashes {
+        let Some(&position) = positions.get(source) else {
+            return Err(coverage_error(
+                type_uuid,
+                target,
+                *source,
+                "a live data or migration-endpoint schema is not accepted",
+            ));
+        };
+        if !is_ancestor(lineage, position, target_index) {
+            required.insert(*source);
+        }
+    }
+
+    for source in required {
+        let mut cursor = source;
+        let mut visited = BTreeSet::new();
+        while cursor != target {
+            if !visited.insert(cursor) {
+                return Err(coverage_error(
+                    type_uuid,
+                    target,
+                    source,
+                    "custom reverse path is cyclic",
+                ));
+            }
+            let Some(next) = outgoing.get(&cursor) else {
+                return Err(coverage_error(
+                    type_uuid,
+                    target,
+                    source,
+                    "custom reverse path is incomplete",
+                ));
+            };
+            if next.len() != 1 {
+                return Err(coverage_error(
+                    type_uuid,
+                    target,
+                    source,
+                    "custom reverse path is ambiguous",
+                ));
+            }
+            cursor = next[0];
+        }
+    }
+    Ok(())
+}
+
+fn live_asset_schema_hashes(
+    conn: &rusqlite::Connection,
+    type_uuid: TypeUuid,
+) -> Result<Vec<LogicalHash>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT logical_hash FROM assets
+         WHERE type_uuid = ?1 AND logical_hash IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([type_uuid.0.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+    rows.map(|row| {
+        let bytes = row?;
+        Ok(LogicalHash(bytes.try_into().map_err(|_| {
+            invalid_manifest(
+                Some(type_uuid),
+                "a live asset's schema digest is not exactly 32 bytes",
+            )
+        })?))
+    })
+    .collect()
+}
+
+fn coverage_error(
+    type_uuid: TypeUuid,
+    target: LogicalHash,
+    source: LogicalHash,
+    detail: &str,
+) -> StoreError {
+    StoreError::IncompleteRollbackCoverage {
+        type_uuid,
+        target,
+        source,
+        detail: detail.to_owned(),
+    }
 }
 
 impl Store {
@@ -434,29 +875,33 @@ impl Store {
             .optional()?)
     }
 
-    /// A type's recorded chain, in generation order. Possibly sparse
-    /// after a state-loss re-establishment — the covered positions are
-    /// exactly what "consistent where comparable" compares (§11).
+    /// Whether the unique source-controlled lineage manifest has been
+    /// validated and projected for this store instance.
+    pub fn lineage_manifest_available(&self) -> Result<bool, StoreError> {
+        manifest_available(&self.conn)
+    }
+
+    /// A type's append-only accepted epoch history, in manifest order.
     pub fn lineage(&self, type_uuid: TypeUuid) -> Result<Vec<LineageEntry>, StoreError> {
         lineage_rows(&self.conn, type_uuid)
     }
 
-    /// The recorded [`LineageStamp`] for a hash on a type's chain — what
-    /// a schema-writing service stamps beside `schema_hash` (§6).
-    pub fn lineage_stamp(
+    /// The digest selected by the type's independent current cursor.
+    pub fn lineage_current(&self, type_uuid: TypeUuid) -> Result<Option<LogicalHash>, StoreError> {
+        Ok(type_lineage(&self.conn, type_uuid)?
+            .map(|lineage| lineage.epochs[lineage.current as usize].digest))
+    }
+
+    /// The stamp for a value written at the accepted current cursor. It
+    /// carries the full accepted vector, so a rollback cursor may select a
+    /// non-final entry without erasing later history.
+    pub fn current_lineage_stamp(
         &self,
         type_uuid: TypeUuid,
-        hash: LogicalHash,
     ) -> Result<Option<LineageStamp>, StoreError> {
-        let chain = self.lineage(type_uuid)?;
-        let Some(index) = chain.iter().position(|e| e.schema_hash == hash) else {
-            return Ok(None);
-        };
-        let digests: Vec<_> = chain[..=index].iter().map(|e| e.schema_hash).collect();
-        Ok(Some(LineageStamp {
-            chain_digest: lineage_chain_digest(type_uuid, &digests),
-            digests,
-        }))
+        type_lineage(&self.conn, type_uuid)?
+            .map(|lineage| stamp_for(type_uuid, &lineage))
+            .transpose()
     }
 
     /// Classify `data`'s placement against `registry_current` (§11's
@@ -474,26 +919,52 @@ impl Store {
         data_stamp: Option<LineageStamp>,
         registry_current: LogicalHash,
     ) -> Result<LineageClass, StoreError> {
+        if !self.lineage_manifest_available()? {
+            return Ok(LineageClass::HardStop(HardStopReason::MissingManifest));
+        }
+        let Some(lineage) = type_lineage(&self.conn, type_uuid)? else {
+            return Ok(LineageClass::HardStop(HardStopReason::UnknownPosition));
+        };
+        let accepted_current = lineage.epochs[lineage.current as usize].digest;
+        if registry_current != accepted_current {
+            return Ok(LineageClass::HardStop(HardStopReason::UnknownPosition));
+        }
         if data == registry_current {
             return Ok(LineageClass::AtCurrent);
-        }
-        let chain = self.lineage(type_uuid)?;
-        let registry_digests: Vec<_> = chain.iter().map(|e| e.schema_hash).collect();
-        if registry_digests.last() != Some(&registry_current) {
-            return Ok(LineageClass::HardStop(HardStopReason::UnknownPosition));
         }
         let Some(stamp) = data_stamp else {
             return Ok(LineageClass::HardStop(HardStopReason::Unstamped));
         };
-        if !stamp.is_valid_for(type_uuid, data) {
+        let Some(data_position) =
+            validate_stamp_against_manifest(type_uuid, data, &stamp, &lineage)
+        else {
             return Ok(LineageClass::HardStop(HardStopReason::Divergent));
-        }
-        if is_prefix(&stamp.digests, &registry_digests) {
+        };
+        if is_ancestor(&lineage, data_position, lineage.current) {
             return Ok(LineageClass::ForwardOnChain);
         }
-        if is_prefix(&registry_digests, &stamp.digests) {
+        if is_ancestor(&lineage, lineage.current, data_position) {
             return Ok(LineageClass::RegistryBehindData);
         }
         Ok(LineageClass::HardStop(HardStopReason::Divergent))
     }
+}
+
+fn validate_stamp_against_manifest(
+    type_uuid: TypeUuid,
+    data: LogicalHash,
+    stamp: &LineageStamp,
+    lineage: &AcceptedTypeLineage,
+) -> Option<u32> {
+    let cursor = usize::try_from(stamp.cursor).ok()?;
+    if stamp.epochs.is_empty()
+        || stamp.epochs.len() > lineage.epochs.len()
+        || cursor >= stamp.epochs.len()
+        || stamp.epochs != lineage.epochs[..stamp.epochs.len()]
+        || stamp.selected_digest()? != data
+        || stamp.chain != lineage_chain_digest(type_uuid, &stamp.epochs, stamp.cursor)
+    {
+        return None;
+    }
+    Some(stamp.cursor)
 }

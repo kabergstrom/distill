@@ -31,23 +31,30 @@ pub enum StoreError {
         bundle: distill_core::id::BundleUuid,
         error: String,
     },
-    /// Staging refused: the candidate schema's digest appears as a
-    /// NON-HEAD entry in the type's recorded chain — a rollback (§11,
-    /// §13). Hard stop, nothing appended: schema-writing services and
-    /// automatic diffs refuse for the type until an explicit reverse
-    /// edge lands.
+    /// General manifest projection refused a cursor-only move to an existing
+    /// accepted epoch. It is a rollback (§11, §13), so it must use the
+    /// explicit reverse-coverage validation path instead.
     LineageRollback {
         type_uuid: distill_core::id::TypeUuid,
         candidate: distill_core::id::LogicalHash,
-        head: distill_core::id::LogicalHash,
+        current: distill_core::id::LogicalHash,
     },
-    /// A lineage re-establishment (§11's state-loss path) contradicts a
-    /// recorded entry: two observed stamps disagree about a generation,
-    /// or one digest claims two chain positions — the uniqueness the
-    /// staging rule guarantees is violated, surfaced, never merged.
-    LineageStampConflict {
+    /// The unique source-controlled lineage manifest is absent, so the
+    /// disposable projection has no authority. Observed bundle stamps may
+    /// diagnose this state but can never rebuild it.
+    LineageManifestUnavailable,
+    /// The source-controlled manifest or its disposable projection violates
+    /// the accepted-history/current-cursor invariants.
+    InvalidLineageManifest {
+        type_uuid: Option<distill_core::id::TypeUuid>,
+        detail: String,
+    },
+    /// An explicit rollback lacked one unambiguous, total custom migration
+    /// path from a required live source schema to the requested cursor.
+    IncompleteRollbackCoverage {
         type_uuid: distill_core::id::TypeUuid,
-        generation: u64,
+        target: distill_core::id::LogicalHash,
+        source: distill_core::id::LogicalHash,
         detail: String,
     },
     /// A configuration transition was structurally invalid.
@@ -128,15 +135,33 @@ impl fmt::Display for StoreError {
             StoreError::BundlePoisoned { bundle, error } => {
                 write!(f, "bundle {bundle} is poisoned: {error}")
             }
-            StoreError::LineageRollback { type_uuid, candidate, head } => write!(
+            StoreError::LineageRollback {
+                type_uuid,
+                candidate,
+                current,
+            } => write!(
                 f,
-                "schema lineage for {type_uuid}: candidate {candidate} is a non-head chain entry \
-                 (head is {head}) — a rollback; schema-writing services refuse for this type \
-                 until an explicit reverse edge lands"
+                "schema lineage for {type_uuid}: candidate current {candidate} differs from \
+                 current {current} without an appended epoch — explicit rollback validation is required"
             ),
-            StoreError::LineageStampConflict { type_uuid, generation, detail } => write!(
+            StoreError::LineageManifestUnavailable => write!(
                 f,
-                "schema lineage for {type_uuid}: stamp conflict at generation {generation}: {detail}"
+                "schema lineage manifest is unavailable; bundle stamps cannot establish authority"
+            ),
+            StoreError::InvalidLineageManifest { type_uuid, detail } => match type_uuid {
+                Some(type_uuid) => {
+                    write!(f, "schema lineage manifest for {type_uuid} is invalid: {detail}")
+                }
+                None => write!(f, "schema lineage manifest is invalid: {detail}"),
+            },
+            StoreError::IncompleteRollbackCoverage {
+                type_uuid,
+                target,
+                source,
+                detail,
+            } => write!(
+                f,
+                "schema rollback for {type_uuid} to {target} lacks complete reverse coverage from {source}: {detail}"
             ),
             StoreError::InvalidConfiguration { error } => {
                 write!(f, "invalid configuration transition: {error}")

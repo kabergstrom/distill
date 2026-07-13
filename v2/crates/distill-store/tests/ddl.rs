@@ -80,6 +80,8 @@ fn every_section_13_table_exists() {
         "registrations",
         "tools",
         "schema_lineage",
+        "schema_lineage_current",
+        "schema_lineage_state",
         "roots",
         "store_meta",
         "pins",
@@ -165,9 +167,9 @@ fn tools_table_is_the_tool_epoch() {
 
 #[test]
 fn schema_lineage_records_the_chain_with_generations_and_digests() {
-    // §13: per-type schema chain — each successfully staged module epoch
-    // appends the new current hash, assigning its generation (chain
-    // position) and "DSSL" chain digest (§5, §6), input-versioned.
+    // §13: append-only accepted history and the independently movable
+    // current cursor are different tables. A manifest-availability row
+    // distinguishes an empty manifest from missing authority.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
@@ -176,13 +178,27 @@ fn schema_lineage_records_the_chain_with_generations_and_digests() {
             "type_uuid",
             "generation",
             "schema_hash",
-            "chain_digest",
+            "forward_parent",
             "input_version"
         ]
     );
     assert_eq!(
         pk_columns(&conn, "schema_lineage"),
         ["type_uuid", "generation"]
+    );
+    assert_eq!(
+        columns(&conn, "schema_lineage_current"),
+        [
+            "type_uuid",
+            "current_cursor",
+            "chain_digest",
+            "input_version"
+        ]
+    );
+    assert_eq!(pk_columns(&conn, "schema_lineage_current"), ["type_uuid"]);
+    assert_eq!(
+        columns(&conn, "schema_lineage_state"),
+        ["id", "input_version"]
     );
 }
 

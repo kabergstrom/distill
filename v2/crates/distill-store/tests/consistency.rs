@@ -7,6 +7,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::pipeline::{AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest};
 use distill_store::state::{PipelineEpoch, PipelineState};
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -98,7 +99,20 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 logical_hash: LogicalHash([4u8; 32]),
                 tags: vec!["t".into()],
             })?;
-            txn.append_lineage(TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))?;
+            txn.project_lineage_manifest(&SchemaLineageManifest {
+                types: [(
+                    TypeUuid([3u8; 16]),
+                    AcceptedTypeLineage {
+                        epochs: vec![AcceptedSchemaEpoch {
+                            digest: LogicalHash([5u8; 32]),
+                            forward_parent: None,
+                        }],
+                        current: 0,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })?;
             txn.stage_tool("tool", b"tool bytes")?;
             txn.publish_pipeline_epoch(&PipelineEpoch {
                 dylib_hash: [6u8; 32],
