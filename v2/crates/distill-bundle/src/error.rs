@@ -171,6 +171,10 @@ pub enum BundleError {
         local_id: String,
         schema_hash: LogicalHash,
     },
+    EntryLineage {
+        local_id: String,
+        detail: &'static str,
+    },
 
     // ---- schema-directed walk ----
     /// The data value has the wrong JSON shape for the schema node at
@@ -452,6 +456,9 @@ impl fmt::Display for BundleError {
                 f,
                 "asset {local_id:?}: schema_hash {schema_hash} does not resolve in this bundle's schemas (bundles are schema-closed)"
             ),
+            E::EntryLineage { local_id, detail } => {
+                write!(f, "asset {local_id:?} has invalid entry lineage: {detail}")
+            }
             E::Shape {
                 local_id,
                 path,

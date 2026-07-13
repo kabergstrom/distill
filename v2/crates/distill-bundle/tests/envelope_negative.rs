@@ -5,7 +5,9 @@
 mod common;
 
 use common::*;
-use distill_bundle::{parse_bundle, write_bundle, Bundle, BundleError as E};
+use distill_bundle::{parse_bundle, write_bundle, Bundle, BundleError as E, EntryLineageV1};
+use distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS;
+use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
 use distill_json::AuthoredValue as V;
 use ngp_schema::{SchemaNode as N, SnapshotError};
 
@@ -113,6 +115,101 @@ fn authoring_only_is_mandatory_typed_and_reserved_entries_require_it() {
     ));
 }
 
+// ---- entry lineage ----
+
+#[test]
+fn lineage_is_mandatory() {
+    let (plain, _) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        env_entry(env, "a").remove("lineage");
+    });
+    assert!(matches!(
+        parse_bundle(&bytes),
+        Err(E::MissingEntryKey {
+            ref local_id,
+            key: "lineage"
+        }) if local_id == "a"
+    ));
+}
+
+#[test]
+fn manifest_lineage_chain_is_verified() {
+    let (plain, _) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        let lineage = env_entry(env, "a").get_mut("lineage").unwrap();
+        let manifest = as_obj(as_obj(lineage).get_mut("manifest").unwrap());
+        manifest.insert(
+            "chain".into(),
+            s("0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+    });
+    assert!(matches!(
+        parse_bundle(&bytes),
+        Err(E::EntryLineage { ref local_id, .. }) if local_id == "a"
+    ));
+}
+
+#[test]
+fn non_bootstrap_type_cannot_use_bootstrap_lineage() {
+    let (plain, _) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        env_entry(env, "a").insert(
+            "lineage".into(),
+            obj(&[("bootstrap", obj(&[("bundle_format_version", u(1))]))]),
+        );
+    });
+    assert!(matches!(
+        parse_bundle(&bytes),
+        Err(E::EntryLineage { ref local_id, .. }) if local_id == "a"
+    ));
+}
+
+#[test]
+fn bootstrap_type_cannot_use_manifest_lineage() {
+    let (plain, _) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        env_entry(env, "a").insert(
+            "type_uuid".into(),
+            s(&BOOTSTRAP_CONTROL_TYPE_UUIDS[0].to_string()),
+        );
+    });
+    assert!(matches!(
+        parse_bundle(&bytes),
+        Err(E::EntryLineage { ref local_id, .. }) if local_id == "a"
+    ));
+}
+
+#[test]
+fn writer_rejects_invalid_in_memory_lineage() {
+    let (_, mut bundle) = valid_plain();
+    bundle.assets.get_mut("a").unwrap().lineage = EntryLineageV1::Bootstrap {
+        bundle_format_version: 1,
+    };
+    assert!(matches!(
+        write_bundle(&bundle),
+        Err(E::EntryLineage { ref local_id, .. }) if local_id == "a"
+    ));
+}
+
+#[test]
+fn manifest_lineage_rejects_duplicate_epoch_digests() {
+    let (_, mut bundle) = valid_plain();
+    let entry = bundle.assets.get_mut("a").unwrap();
+    let EntryLineageV1::Manifest(stamp) = &mut entry.lineage else {
+        panic!("fixture must use manifest lineage");
+    };
+    stamp.epochs.push(AcceptedSchemaEpoch {
+        digest: entry.schema_hash,
+        forward_parent: Some(0),
+    });
+    stamp.cursor = 1;
+    stamp.chain = lineage_chain_digest(entry.type_uuid, &stamp.epochs, stamp.cursor);
+    assert!(matches!(
+        write_bundle(&bundle),
+        Err(E::EntryLineage { ref local_id, .. }) if local_id == "a"
+    ));
+}
+
 // ---- reserved local_ids ----
 
 #[test]
@@ -147,6 +244,18 @@ fn bogus_dollar_local_id_rejected_on_write() {
         matches!(&err, E::ReservedLocalId { local_id } if local_id == "$bogus"),
         "got {err:?}"
     );
+}
+
+#[test]
+fn record_local_id_rejects_a_non_import_record_type() {
+    let sc = simple_schema();
+    let mut metadata = entry(UUID_A, &sc, obj(&[("count", u(1)), ("name", s("n"))]));
+    metadata.authoring_only = true;
+    let b = bundle(&[&sc], vec![("$record", metadata)], None);
+    assert!(matches!(
+        write_bundle(&b),
+        Err(E::EntryLineage { ref local_id, .. }) if local_id == "$record"
+    ));
 }
 
 // ---- malformed ids and hashes ----

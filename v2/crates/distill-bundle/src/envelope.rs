@@ -9,11 +9,18 @@
 //! `schemas`. The `$` local_id namespace is reserved for exactly
 //! `$settings` and `$record`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use distill_core::attestation::{
+    is_bootstrap_control_type, BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS,
+    IMPORT_RECORD_TYPE_UUID,
+};
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::lineage::{
+    lineage_chain_digest, AcceptedSchemaEpoch, EntryLineageV1, LineageStamp,
+};
 use distill_json::AuthoredValue;
-use ngp_schema::{snapshot_to_json, verify_snapshot};
+use ngp_schema::{node_bytes, snapshot_to_json, verify_snapshot, LogicalSchema};
 
 use crate::error::BundleError;
 use crate::walk::{kind_name, walk_entry, WalkMode};
@@ -164,7 +171,7 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         for key in entry.keys() {
             if !matches!(
                 key.as_str(),
-                "authoring_only" | "data" | "schema_hash" | "type_uuid" | "uuid"
+                "authoring_only" | "data" | "lineage" | "schema_hash" | "type_uuid" | "uuid"
             ) {
                 return Err(BundleError::UnknownEntryKey {
                     local_id,
@@ -175,6 +182,15 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         let uuid: AssetUuid = take_id(&mut entry, &local_id, "uuid")?;
         let type_uuid: TypeUuid = take_id(&mut entry, &local_id, "type_uuid")?;
         let schema_hash: LogicalHash = take_id(&mut entry, &local_id, "schema_hash")?;
+        let lineage = decode_entry_lineage(
+            entry
+                .remove("lineage")
+                .ok_or_else(|| BundleError::MissingEntryKey {
+                    local_id: local_id.clone(),
+                    key: "lineage",
+                })?,
+            &local_id,
+        )?;
         let authoring_only = match entry.remove("authoring_only") {
             None => {
                 return Err(BundleError::MissingEntryKey {
@@ -205,6 +221,7 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
                 uuid,
                 type_uuid,
                 schema_hash,
+                lineage,
                 authoring_only,
                 data,
             },
@@ -219,6 +236,8 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
                 schema_hash: entry.schema_hash,
             });
         }
+        let schema = &schemas[&entry.schema_hash];
+        validate_entry_lineage(local_id, format_version, entry, schema)?;
     }
     if let Some(p) = &primary {
         match assets.get(p) {
@@ -273,6 +292,254 @@ fn take_id<T: std::str::FromStr>(
     }
 }
 
+fn decode_entry_lineage(
+    value: AuthoredValue,
+    local_id: &str,
+) -> Result<EntryLineageV1, BundleError> {
+    let mut outer = match value {
+        AuthoredValue::Object(value) if value.len() == 1 => value,
+        _ => return lineage_error(local_id, "lineage must be an exact one-member object"),
+    };
+    if let Some(value) = outer.remove("manifest") {
+        let mut manifest = match value {
+            AuthoredValue::Object(value) => value,
+            _ => return lineage_error(local_id, "manifest lineage must be an object"),
+        };
+        if manifest.len() != 3
+            || !manifest.contains_key("epochs")
+            || !manifest.contains_key("cursor")
+            || !manifest.contains_key("chain")
+        {
+            return lineage_error(local_id, "manifest lineage fields are not exact");
+        }
+        let epochs = match manifest.remove("epochs").unwrap() {
+            AuthoredValue::Array(values) => values
+                .into_iter()
+                .map(|value| decode_lineage_epoch(value, local_id))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return lineage_error(local_id, "lineage epochs must be an array"),
+        };
+        let cursor = match manifest.remove("cursor").unwrap() {
+            AuthoredValue::UInt(value) => {
+                u32::try_from(value).map_err(|_| BundleError::EntryLineage {
+                    local_id: local_id.to_owned(),
+                    detail: "lineage cursor exceeds u32",
+                })?
+            }
+            _ => return lineage_error(local_id, "lineage cursor must be unsigned"),
+        };
+        let chain =
+            match manifest.remove("chain").unwrap() {
+                AuthoredValue::Str(value) => value
+                    .parse::<LogicalHash>()
+                    .map(|hash| hash.0)
+                    .map_err(|_| BundleError::EntryLineage {
+                        local_id: local_id.to_owned(),
+                        detail: "lineage chain must be 32-byte lowercase hex",
+                    })?,
+                _ => return lineage_error(local_id, "lineage chain must be text"),
+            };
+        return Ok(EntryLineageV1::Manifest(LineageStamp {
+            epochs,
+            cursor,
+            chain,
+        }));
+    }
+    if let Some(value) = outer.remove("bootstrap") {
+        let mut bootstrap = match value {
+            AuthoredValue::Object(value) if value.len() == 1 => value,
+            _ => return lineage_error(local_id, "bootstrap lineage must be an exact object"),
+        };
+        let version = match bootstrap.remove("bundle_format_version") {
+            Some(AuthoredValue::UInt(value)) => {
+                u32::try_from(value).map_err(|_| BundleError::EntryLineage {
+                    local_id: local_id.to_owned(),
+                    detail: "bootstrap format version exceeds u32",
+                })?
+            }
+            _ => return lineage_error(local_id, "bootstrap format version must be unsigned"),
+        };
+        return Ok(EntryLineageV1::Bootstrap {
+            bundle_format_version: version,
+        });
+    }
+    lineage_error(local_id, "unknown entry-lineage arm")
+}
+
+fn decode_lineage_epoch(
+    value: AuthoredValue,
+    local_id: &str,
+) -> Result<AcceptedSchemaEpoch, BundleError> {
+    let mut epoch = match value {
+        AuthoredValue::Object(value) if value.len() == 2 => value,
+        _ => return lineage_error(local_id, "lineage epoch must be an exact object"),
+    };
+    let digest = match epoch.remove("digest") {
+        Some(AuthoredValue::Str(value)) => {
+            value.parse().map_err(|_| BundleError::EntryLineage {
+                local_id: local_id.to_owned(),
+                detail: "lineage epoch digest is malformed",
+            })?
+        }
+        _ => return lineage_error(local_id, "lineage epoch digest must be text"),
+    };
+    let forward_parent = match epoch.remove("forward_parent") {
+        Some(AuthoredValue::Null) => None,
+        Some(AuthoredValue::UInt(value)) => {
+            Some(u32::try_from(value).map_err(|_| BundleError::EntryLineage {
+                local_id: local_id.to_owned(),
+                detail: "lineage parent exceeds u32",
+            })?)
+        }
+        _ => return lineage_error(local_id, "lineage parent must be null or unsigned"),
+    };
+    Ok(AcceptedSchemaEpoch {
+        digest,
+        forward_parent,
+    })
+}
+
+pub(crate) fn validate_entry_lineage(
+    local_id: &str,
+    format_version: u32,
+    entry: &AssetEntry,
+    schema: &LogicalSchema,
+) -> Result<(), BundleError> {
+    if (local_id == "$record") != (entry.type_uuid == IMPORT_RECORD_TYPE_UUID) {
+        return lineage_error(
+            local_id,
+            "$record is reserved exclusively for the built-in ImportRecord type",
+        );
+    }
+    match (&entry.lineage, is_bootstrap_control_type(entry.type_uuid)) {
+        (
+            EntryLineageV1::Bootstrap {
+                bundle_format_version,
+            },
+            true,
+        ) => {
+            if *bundle_format_version != BUNDLE_FORMAT_VERSION
+                || format_version != BUNDLE_FORMAT_VERSION
+                || !entry.authoring_only
+            {
+                return lineage_error(local_id, "bootstrap lineage has invalid version or role");
+            }
+            let index = BOOTSTRAP_CONTROL_TYPE_UUIDS
+                .iter()
+                .position(|type_uuid| *type_uuid == entry.type_uuid)
+                .expect("bootstrap predicate and closed UUID table agree");
+            let expected = &BootstrapControlSpecV1::embedded()
+                .map_err(|_| BundleError::EntryLineage {
+                    local_id: local_id.to_owned(),
+                    detail: "embedded bootstrap spec is invalid",
+                })?
+                .0[index];
+            let actual_schema =
+                node_bytes(&schema.root).map_err(|_| BundleError::EntryLineage {
+                    local_id: local_id.to_owned(),
+                    detail: "bootstrap logical schema is not canonical",
+                })?;
+            if entry.schema_hash != expected.logical_hash
+                || actual_schema != expected.logical_schema
+            {
+                return lineage_error(local_id, "bootstrap schema hash does not match DSB");
+            }
+            Ok(())
+        }
+        (EntryLineageV1::Manifest(stamp), false) => {
+            if stamp.epochs.is_empty()
+                || stamp
+                    .epochs
+                    .iter()
+                    .map(|epoch| epoch.digest)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != stamp.epochs.len()
+                || usize::try_from(stamp.cursor)
+                    .ok()
+                    .is_none_or(|cursor| cursor >= stamp.epochs.len())
+                || stamp.epochs[0].forward_parent.is_some()
+                || stamp
+                    .epochs
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .any(|(index, epoch)| {
+                        epoch.forward_parent.is_none_or(|parent| {
+                            usize::try_from(parent).unwrap_or(usize::MAX) >= index
+                        })
+                    })
+                || stamp.selected_digest() != Some(entry.schema_hash)
+                || stamp.chain != lineage_chain_digest(entry.type_uuid, &stamp.epochs, stamp.cursor)
+            {
+                return lineage_error(local_id, "manifest lineage stamp is not canonical");
+            }
+            Ok(())
+        }
+        (EntryLineageV1::Bootstrap { .. }, false) => {
+            lineage_error(local_id, "non-bootstrap type used bootstrap lineage")
+        }
+        (EntryLineageV1::Manifest(_), true) => {
+            lineage_error(local_id, "bootstrap type used manifest lineage")
+        }
+    }
+}
+
+fn lineage_error<T>(local_id: &str, detail: &'static str) -> Result<T, BundleError> {
+    Err(BundleError::EntryLineage {
+        local_id: local_id.to_owned(),
+        detail,
+    })
+}
+
+fn encode_entry_lineage(lineage: &EntryLineageV1) -> AuthoredValue {
+    let mut outer = BTreeMap::new();
+    match lineage {
+        EntryLineageV1::Manifest(stamp) => {
+            let epochs = stamp
+                .epochs
+                .iter()
+                .map(|epoch| {
+                    let mut value = BTreeMap::new();
+                    value.insert(
+                        "digest".into(),
+                        AuthoredValue::Str(epoch.digest.to_string()),
+                    );
+                    value.insert(
+                        "forward_parent".into(),
+                        epoch.forward_parent.map_or(AuthoredValue::Null, |parent| {
+                            AuthoredValue::UInt(u128::from(parent))
+                        }),
+                    );
+                    AuthoredValue::Object(value)
+                })
+                .collect();
+            let mut value = BTreeMap::new();
+            value.insert("epochs".into(), AuthoredValue::Array(epochs));
+            value.insert(
+                "cursor".into(),
+                AuthoredValue::UInt(u128::from(stamp.cursor)),
+            );
+            value.insert(
+                "chain".into(),
+                AuthoredValue::Str(LogicalHash(stamp.chain).to_string()),
+            );
+            outer.insert("manifest".into(), AuthoredValue::Object(value));
+        }
+        EntryLineageV1::Bootstrap {
+            bundle_format_version,
+        } => {
+            let mut value = BTreeMap::new();
+            value.insert(
+                "bundle_format_version".into(),
+                AuthoredValue::UInt(u128::from(*bundle_format_version)),
+            );
+            outer.insert("bootstrap".into(), AuthoredValue::Object(value));
+        }
+    }
+    AuthoredValue::Object(outer)
+}
+
 /// Build the envelope JSON value for the writer. `data` carries each
 /// entry's data with blob leaves already rewritten for the target encoding
 /// (verbatim for plain — there are none — or `{"len","offset"}` for the
@@ -321,6 +588,7 @@ pub(crate) fn build(
             "schema_hash".to_string(),
             AuthoredValue::Str(entry.schema_hash.to_string()),
         );
+        m.insert("lineage".to_string(), encode_entry_lineage(&entry.lineage));
         m.insert(
             "authoring_only".to_string(),
             AuthoredValue::Bool(entry.authoring_only),

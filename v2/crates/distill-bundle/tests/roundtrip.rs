@@ -361,7 +361,7 @@ fn nonstring_map_and_set_roundtrip() {
 }
 
 #[test]
-fn reserved_settings_and_record_local_ids_accepted() {
+fn reserved_settings_local_id_is_accepted_for_authoring_metadata() {
     let sc = simple_schema();
     let mk = |uuid: &str| {
         let mut value = entry(uuid, &sc, obj(&[("count", u(1)), ("name", s("v"))]));
@@ -373,7 +373,6 @@ fn reserved_settings_and_record_local_ids_accepted() {
     let b = bundle(
         &[&sc],
         vec![
-            ("$record", mk("00000000-0000-0000-0000-000000000001")),
             ("$settings", mk("00000000-0000-0000-0000-000000000002")),
             ("content", content),
         ],

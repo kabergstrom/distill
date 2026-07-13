@@ -22,6 +22,8 @@ use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
 use ngp_schema::LogicalSchema;
 
+pub use distill_core::lineage::{AcceptedSchemaEpoch, EntryLineageV1, LineageStamp};
+
 mod container;
 mod crc32c;
 mod envelope;
@@ -78,6 +80,7 @@ pub struct AssetEntry {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
     pub schema_hash: LogicalHash,
+    pub lineage: EntryLineageV1,
     /// Authoring/control metadata is never eligible as a runtime primary,
     /// processor input, reference target, query result, or pack member.
     pub authoring_only: bool,

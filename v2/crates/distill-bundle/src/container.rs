@@ -263,6 +263,12 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
                 schema_hash: entry.schema_hash,
             });
         }
+        envelope::validate_entry_lineage(
+            local_id,
+            bundle.format_version,
+            entry,
+            &bundle.schemas[&entry.schema_hash],
+        )?;
     }
     if let Some(p) = &bundle.primary {
         match bundle.assets.get(p) {

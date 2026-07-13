@@ -12,6 +12,7 @@ use distill_core::attestation::{
     CompiledAttestationDigest, CompiledTypeTable,
 };
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
+pub use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
 use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use rusqlite::OptionalExtension;
@@ -98,15 +99,6 @@ impl std::ops::Deref for ValidatedPipelineEpoch {
     }
 }
 
-/// One accepted schema epoch in the source-controlled lineage manifest.
-/// History is append-only; the parent records which prior current this
-/// epoch was accepted as a forward successor of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AcceptedSchemaEpoch {
-    pub digest: LogicalHash,
-    pub forward_parent: Option<u32>,
-}
-
 /// A type's append-only accepted history and independently movable current
 /// cursor. A rollback changes `current`, never `epochs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,28 +183,6 @@ pub struct SchemaReactivationRequest<'a> {
     pub reverse_edges: &'a [ReverseMigrationEdge],
 }
 
-/// The direction marker beside every `schema_hash` (§6, §11). `epochs` is
-/// an exact prefix of the durable manifest, including parent links; `cursor`
-/// selects the writing epoch and `chain` commits to both.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageStamp {
-    pub epochs: Vec<AcceptedSchemaEpoch>,
-    pub cursor: u32,
-    pub chain: [u8; 32],
-}
-
-impl LineageStamp {
-    pub fn generation(&self) -> u64 {
-        self.epochs.len() as u64
-    }
-
-    fn selected_digest(&self) -> Option<LogicalHash> {
-        self.epochs
-            .get(usize::try_from(self.cursor).ok()?)
-            .map(|epoch| epoch.digest)
-    }
-}
-
 /// One recorded append-only `schema_lineage` row (§13). The independently
 /// movable current cursor and full-vector DSSL commitment live in
 /// `schema_lineage_current`.
@@ -221,24 +191,6 @@ pub struct LineageEntry {
     pub generation: u64,
     pub schema_hash: LogicalHash,
     pub forward_parent: Option<u32>,
-}
-
-/// The §6 chain-digest formula over an accepted epoch prefix and its current
-/// cursor. Parent links make ancestry explicit; vector order alone is never
-/// a direction proof.
-pub fn lineage_chain_digest(
-    type_uuid: TypeUuid,
-    epochs: &[AcceptedSchemaEpoch],
-    cursor: u32,
-) -> [u8; 32] {
-    distill_core::canonical::domain_digest(distill_core::canonical::DSSL, 1, |e| {
-        e.raw(&type_uuid.0);
-        e.seq(epochs, |e, epoch| {
-            e.raw(&epoch.digest.0);
-            e.option(epoch.forward_parent, |e, parent| e.u32(*parent));
-        });
-        e.u32(cursor);
-    })
 }
 
 /// Where the data's selected accepted epoch sits relative to the registry's
