@@ -2,9 +2,14 @@
 
 use distill_core::canonical::{CanonicalEncoder, DSTR};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_json::AuthoredValue;
+use distill_migrate::MigrationOp;
+use distill_schema::ngp_schema::LogicalSchema;
+use distill_store::pipeline::{LineageStamp, VerifiedSchemaLineageManifest};
 
 pub use crate::dslf::LocalFailureClass;
 use crate::dslf::{DslfError, DslfV1};
+use crate::import::ImportRuleId;
 use crate::query::{AssetQuery, FileQuery};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,41 +174,96 @@ impl ControlFailureFingerprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ControlValueHash(pub [u8; 32]);
 
-macro_rules! control_metadata {
-    ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct $name(Box<[u8]>);
-
-        impl $name {
-            /// Wrap already-validated canonical metadata for this one
-            /// built-in control shape.
-            pub fn from_canonical_metadata(bytes: impl Into<Box<[u8]>>) -> Self {
-                Self(bytes.into())
-            }
-
-            pub fn canonical_metadata(&self) -> &[u8] {
-                &self.0
-            }
-        }
-    };
+#[derive(Debug, Clone, PartialEq)]
+pub struct MigrationControlValue {
+    pub asset: AssetUuid,
+    pub target_type_uuid: TypeUuid,
+    pub from_hash: LogicalHash,
+    pub to_hash: LogicalHash,
+    pub from_schema: LogicalSchema,
+    pub to_schema: LogicalSchema,
+    pub from_lineage: LineageStamp,
+    pub to_lineage: LineageStamp,
+    pub kind: MigrationControlKind,
 }
 
-control_metadata!(MigrationControlValue);
-control_metadata!(PackDefinitionControlValue);
-control_metadata!(DirectoryImportRulesControlValue);
-control_metadata!(ImportSettingsControlValue);
-control_metadata!(SchemaLineageManifestControlValue);
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrationControlKind {
+    Ops(Vec<MigrationOp>),
+    Function { key: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackDefinitionControlValue {
+    pub roots: Vec<AssetQuery>,
+    pub target: String,
+    pub zstd_level: i32,
+    pub include_path_table: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirectoryGrouping {
+    PerFile,
+    ByStem,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryImportRule {
+    pub id: ImportRuleId,
+    pub matches: FileQuery,
+    pub group: DirectoryGrouping,
+    pub importer: String,
+    pub settings: AuthoredValue,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryImportRulesControlValue {
+    pub listing: FileQuery,
+    pub rules: Vec<DirectoryImportRule>,
+}
+
+/// Branded, schema-validated import settings. There is intentionally no
+/// generic `AuthoredValue` accessor; the importer bridge consumes these
+/// canonical bytes only after matching the two exposed schema identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSettingsControlValue {
+    pub settings_type: TypeUuid,
+    pub schema_hash: LogicalHash,
+    canonical_bytes: Box<[u8]>,
+}
+
+impl ImportSettingsControlValue {
+    pub fn from_validated(
+        settings_type: TypeUuid,
+        schema_hash: LogicalHash,
+        canonical_bytes: impl Into<Box<[u8]>>,
+    ) -> Self {
+        Self {
+            settings_type,
+            schema_hash,
+            canonical_bytes: canonical_bytes.into(),
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaLineageManifestControlValue(pub VerifiedSchemaLineageManifest);
 
 /// Closed decoded control values. The variant brands otherwise opaque
 /// canonical metadata without exposing `AuthoredValue`, artifacts, or any
 /// dependency carrier to control-plane consumers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ControlValue {
-    Migration(MigrationControlValue),
+    Migration(Box<MigrationControlValue>),
     PackDefinition(PackDefinitionControlValue),
     DirectoryImportRules(DirectoryImportRulesControlValue),
     ImportSettings(ImportSettingsControlValue),
-    SchemaLineageManifest(SchemaLineageManifestControlValue),
+    Lineage(SchemaLineageManifestControlValue),
 }
 
 impl ControlValue {
@@ -220,15 +280,12 @@ impl ControlValue {
                     Self::ImportSettings(_),
                     ControlSubject::ImportSettings { .. }
                 )
-                | (
-                    Self::SchemaLineageManifest(_),
-                    ControlSubject::SchemaLineageManifest
-                )
+                | (Self::Lineage(_), ControlSubject::SchemaLineageManifest)
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodedControlValue {
     pub identity: ControlValueHash,
     pub value: ControlValue,

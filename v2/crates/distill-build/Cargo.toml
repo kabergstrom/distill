@@ -11,3 +11,5 @@ globset.workspace = true
 distill-core = { path = "../distill-core" }
 distill-json = { path = "../distill-json" }
 distill-migrate = { path = "../distill-migrate" }
+distill-schema = { path = "../distill-schema" }
+distill-store = { path = "../distill-store" }

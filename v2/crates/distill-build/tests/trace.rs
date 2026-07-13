@@ -5,6 +5,8 @@ use distill_build::query::AssetQuery;
 use distill_build::trace::*;
 use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_migrate::FieldPath;
+use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
+use distill_store::pipeline::{AcceptedSchemaEpoch, LineageStamp};
 
 #[derive(Default)]
 struct Snapshot {
@@ -454,9 +456,12 @@ fn unreadable_migration_edge_is_terminal_and_never_an_empty_result() {
             subject,
             Observed::Ok(DecodedControlValue {
                 identity: ControlValueHash([17; 32]),
-                value: ControlValue::Migration(MigrationControlValue::from_canonical_metadata(
-                    Vec::new(),
-                )),
+                value: ControlValue::PackDefinition(PackDefinitionControlValue {
+                    roots: vec![],
+                    target: "unused-after-hard-stop".into(),
+                    zstd_level: 0,
+                    include_path_table: false,
+                }),
             }),
         ),
         Err(AttemptedControlBasisError::HardStopped)
@@ -467,6 +472,83 @@ fn unreadable_migration_edge_is_terminal_and_never_an_empty_result() {
         2,
         "the failed read remains in the attempted basis"
     );
+}
+
+#[test]
+fn migration_control_reads_return_the_closed_fully_decoded_value() {
+    let asset = AssetUuid([31; 16]);
+    let from = LogicalHash([32; 32]);
+    let to = LogicalHash([33; 32]);
+    let lineage = |digest| LineageStamp {
+        epochs: vec![AcceptedSchemaEpoch {
+            digest,
+            forward_parent: None,
+        }],
+        cursor: 0,
+        chain: [34; 32],
+    };
+    let value = MigrationControlValue {
+        asset,
+        target_type_uuid: TypeUuid([35; 16]),
+        from_hash: from,
+        to_hash: to,
+        from_schema: LogicalSchema {
+            root: SchemaNode::Unit,
+        },
+        to_schema: LogicalSchema {
+            root: SchemaNode::String,
+        },
+        from_lineage: lineage(from),
+        to_lineage: lineage(to),
+        kind: MigrationControlKind::Function {
+            key: "upgrade".into(),
+        },
+    };
+    let mut basis = AttemptedControlBasis::new();
+    basis
+        .query(migration_query(), Observed::Ok([36; 32]))
+        .unwrap();
+    assert_eq!(
+        basis
+            .read(
+                ControlSubject::Migration(asset),
+                Observed::Ok(DecodedControlValue {
+                    identity: ControlValueHash([37; 32]),
+                    value: ControlValue::Migration(Box::new(value.clone())),
+                }),
+            )
+            .unwrap(),
+        ControlValue::Migration(Box::new(value))
+    );
+    assert_eq!(basis.trace().len(), 2);
+}
+
+#[test]
+fn a_control_value_with_the_wrong_brand_is_a_terminal_typed_failure() {
+    let asset = AssetUuid([41; 16]);
+    let mut basis = AttemptedControlBasis::new();
+    basis
+        .query(migration_query(), Observed::Ok([42; 32]))
+        .unwrap();
+    let error = basis
+        .read(
+            ControlSubject::Migration(asset),
+            Observed::Ok(DecodedControlValue {
+                identity: ControlValueHash([43; 32]),
+                value: ControlValue::PackDefinition(PackDefinitionControlValue {
+                    roots: vec![],
+                    target: "wrong-brand".into(),
+                    zstd_level: 0,
+                    include_path_table: false,
+                }),
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AttemptedControlBasisError::ObservedFailure(StableFailureFingerprint::Control(_))
+    ));
+    assert!(basis.is_stopped());
 }
 
 #[test]
