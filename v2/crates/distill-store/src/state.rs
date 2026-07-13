@@ -512,6 +512,16 @@ pub enum PlatformFileIdentity {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LineageManifestClaimant {
+    pub root_name: String,
+    pub normalized_path: String,
+    pub bundle: BundleUuid,
+    pub local_id: String,
+    pub asset: AssetUuid,
+    pub file_hash: BundleFileHash,
+}
+
 /// Exact, closed typed facts hashed by DSCP v1. Presentation prose never
 /// enters this value; callers supply it separately when publishing poison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,7 +560,7 @@ pub enum DscpV1 {
     },
     MissingLineageManifest,
     DuplicateLineageManifest {
-        entries: Vec<AssetUuid>,
+        entries: Vec<LineageManifestClaimant>,
     },
     UnsupportedTargetIdentity {
         target: String,
@@ -660,7 +670,7 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
         }
         DscpV1::MissingLineageManifest => {}
         DscpV1::DuplicateLineageManifest { entries } => {
-            encoder.set(entries, |encoder, entry| encoder.raw(&entry.0));
+            encoder.set(entries, encode_lineage_manifest_claimant);
         }
         DscpV1::UnsupportedTargetIdentity {
             target,
@@ -677,6 +687,18 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
             encoder.u16(*failure as u16);
         }
     }
+}
+
+fn encode_lineage_manifest_claimant(
+    encoder: &mut CanonicalEncoder,
+    claimant: &LineageManifestClaimant,
+) {
+    encoder.str(&claimant.root_name);
+    encoder.str(&claimant.normalized_path);
+    encoder.raw(&claimant.bundle.0);
+    encoder.str(&claimant.local_id);
+    encoder.raw(&claimant.asset.0);
+    encoder.raw(&claimant.file_hash.0);
 }
 
 fn encode_configuration_source_path(
@@ -856,6 +878,17 @@ impl<'a> DscpDecoder<'a> {
         }
     }
 
+    fn lineage_manifest_claimant(&mut self) -> Result<LineageManifestClaimant, DscpError> {
+        Ok(LineageManifestClaimant {
+            root_name: self.string()?,
+            normalized_path: self.string()?,
+            bundle: BundleUuid(self.array()?),
+            local_id: self.string()?,
+            asset: AssetUuid(self.array()?),
+            file_hash: BundleFileHash(self.array()?),
+        })
+    }
+
     fn compilation_identity(&mut self) -> Result<CompilationIdentity, DscpError> {
         let target_triple = self.string()?;
         let rustc = self.string()?;
@@ -927,10 +960,10 @@ impl<'a> DscpDecoder<'a> {
             },
             ConfigurationPoisonCode::MissingLineageManifest => DscpV1::MissingLineageManifest,
             ConfigurationPoisonCode::DuplicateLineageManifest => {
-                let count = self.count(16)?;
+                let count = self.count(76)?;
                 DscpV1::DuplicateLineageManifest {
                     entries: (0..count)
-                        .map(|_| self.array().map(AssetUuid))
+                        .map(|_| self.lineage_manifest_claimant())
                         .collect::<Result<Vec<_>, _>>()?,
                 }
             }
@@ -972,8 +1005,21 @@ fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
         | DscpV1::InvalidParallelism { .. }
         | DscpV1::InvalidBatchReservation { .. }
         | DscpV1::MissingLineageManifest
-        | DscpV1::DuplicateLineageManifest { .. }
         | DscpV1::ConfigurationSourceUnavailable { .. } => {}
+        DscpV1::DuplicateLineageManifest { entries } => {
+            for entry in entries {
+                if validate_root_and_path(&entry.root_name, &entry.normalized_path).is_err()
+                    || validate_identifier(&entry.local_id).is_err()
+                {
+                    return Err(DscpError::InvalidText);
+                }
+                values.extend([
+                    entry.root_name.as_str(),
+                    entry.normalized_path.as_str(),
+                    entry.local_id.as_str(),
+                ]);
+            }
+        }
         DscpV1::NonLoopbackAddress { address } => values.push(address.as_str()),
         DscpV1::DuplicateRootName { normalized_name }
         | DscpV1::DuplicateTargetName { normalized_name } => {

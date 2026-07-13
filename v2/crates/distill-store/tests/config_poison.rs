@@ -2,12 +2,13 @@
 
 use std::collections::BTreeSet;
 
-use distill_core::id::AssetUuid;
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
     ConfigurationPathKey, ConfigurationPoison, ConfigurationPoisonCode,
     ConfigurationSourceFailureCode, ConfigurationSourcePath, ConfigurationState,
-    DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide, PlatformFileIdentity,
+    DirectoryAliasSide, DscpV1, LineageManifestClaimant, OwnedPathKind, OwnedPathSide,
+    PlatformFileIdentity,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use ngp_schema::identity::CompilationIdentity;
@@ -30,6 +31,17 @@ fn identity(target: &str, marker: u8) -> CompilationIdentity {
         cfgs: BTreeSet::from(["target_pointer_width=\"64\"".to_owned(), "unix".to_owned()]),
         manifest_lock_hash: [marker.wrapping_add(1); 32],
         algorithm_version: u32::from(marker),
+    }
+}
+
+fn lineage_claimant(marker: u8, asset: u8) -> LineageManifestClaimant {
+    LineageManifestClaimant {
+        root_name: "main".into(),
+        normalized_path: format!("lineage-{marker}.bundle"),
+        bundle: BundleUuid([marker; 16]),
+        local_id: format!("manifest-{marker}"),
+        asset: AssetUuid([asset; 16]),
+        file_hash: BundleFileHash([marker; 32]),
     }
 }
 
@@ -159,7 +171,7 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
         ),
         (
             DscpV1::DuplicateLineageManifest {
-                entries: vec![AssetUuid([1; 16]), AssetUuid([2; 16])],
+                entries: vec![lineage_claimant(1, 9), lineage_claimant(2, 9)],
             },
             ConfigurationPoisonCode::DuplicateLineageManifest,
         ),
@@ -197,10 +209,17 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
 
 #[test]
 fn dscp_detail_decoder_rejects_noncanonical_order_and_text() {
-    let mut unsorted = Vec::new();
+    let first = lineage_claimant(1, 9);
+    let second = lineage_claimant(2, 9);
+    let canonical = DscpV1::DuplicateLineageManifest {
+        entries: vec![first.clone(), second.clone()],
+    }
+    .canonical_detail_bytes();
+    let row_len = (canonical.len() - 4) / 2;
+    let mut unsorted = Vec::with_capacity(canonical.len());
     unsorted.extend_from_slice(&2_u32.to_le_bytes());
-    unsorted.extend_from_slice(&AssetUuid([2; 16]).0);
-    unsorted.extend_from_slice(&AssetUuid([1; 16]).0);
+    unsorted.extend_from_slice(&canonical[4 + row_len..]);
+    unsorted.extend_from_slice(&canonical[4..4 + row_len]);
     assert!(matches!(
         DscpV1::from_canonical_detail_bytes(
             ConfigurationPoisonCode::DuplicateLineageManifest,
@@ -374,14 +393,14 @@ fn configuration_defects_select_one_authority_and_retain_the_canonical_doctor_se
 }
 
 #[test]
-fn duplicate_lineage_entries_sort_and_deduplicate_raw_uuid_bytes() {
-    let a = AssetUuid([1; 16]);
-    let b = AssetUuid([2; 16]);
+fn duplicate_lineage_entries_sort_and_deduplicate_complete_claimant_rows() {
+    let a = lineage_claimant(1, 9);
+    let b = lineage_claimant(2, 9);
     let noisy = DscpV1::DuplicateLineageManifest {
-        entries: vec![b, a, b, a],
+        entries: vec![b.clone(), a.clone(), b, a.clone()],
     };
     let canonical = DscpV1::DuplicateLineageManifest {
-        entries: vec![a, b],
+        entries: vec![a.clone(), lineage_claimant(2, 9)],
     };
     assert_eq!(noisy.reason_hash(), canonical.reason_hash());
 
@@ -390,8 +409,7 @@ fn duplicate_lineage_entries_sort_and_deduplicate_raw_uuid_bytes() {
     preimage.push(1);
     preimage.extend_from_slice(&11u16.to_le_bytes());
     preimage.extend_from_slice(&2u32.to_le_bytes());
-    preimage.extend_from_slice(&a.0);
-    preimage.extend_from_slice(&b.0);
+    preimage.extend_from_slice(&canonical.canonical_detail_bytes()[4..]);
     assert_eq!(canonical.reason_hash(), *blake3::hash(&preimage).as_bytes());
 }
 
