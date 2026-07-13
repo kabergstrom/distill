@@ -243,3 +243,100 @@ fn invalid_physical_path_rejects_unknown_failure_code() {
         VersionPoisonError::UnknownFailureCode(8)
     );
 }
+
+#[test]
+fn invalid_physical_path_recomputes_lowest_applicable_platform_failure() {
+    let cases = [
+        (
+            PlatformPathBytes::Unix(vec![b'/', 0xff]),
+            PhysicalPathFailureCode::InvalidUnixUtf8,
+        ),
+        (
+            PlatformPathBytes::Unix(b"/absolute".to_vec()),
+            PhysicalPathFailureCode::Absolute,
+        ),
+        (
+            PlatformPathBytes::Unix(b"a//b".to_vec()),
+            PhysicalPathFailureCode::EmptyComponent,
+        ),
+        (
+            PlatformPathBytes::Unix(b"a/./b".to_vec()),
+            PhysicalPathFailureCode::DotComponent,
+        ),
+        (
+            PlatformPathBytes::Unix(b"a/../b".to_vec()),
+            PhysicalPathFailureCode::ParentComponent,
+        ),
+        (
+            PlatformPathBytes::Unix(b"a\\b".to_vec()),
+            PhysicalPathFailureCode::ForbiddenCharacter,
+        ),
+        (
+            PlatformPathBytes::Windows(vec![0xd800, b'\\' as u16]),
+            PhysicalPathFailureCode::UnpairedWindowsUtf16,
+        ),
+        (
+            PlatformPathBytes::Windows("C:relative".encode_utf16().collect()),
+            PhysicalPathFailureCode::Absolute,
+        ),
+        (
+            PlatformPathBytes::Windows("a\\\\b".encode_utf16().collect()),
+            PhysicalPathFailureCode::EmptyComponent,
+        ),
+        (
+            PlatformPathBytes::Windows("a/.\\b".encode_utf16().collect()),
+            PhysicalPathFailureCode::DotComponent,
+        ),
+        (
+            PlatformPathBytes::Windows("a/../b".encode_utf16().collect()),
+            PhysicalPathFailureCode::ParentComponent,
+        ),
+        (
+            PlatformPathBytes::Windows("ab:c".encode_utf16().collect()),
+            PhysicalPathFailureCode::ForbiddenCharacter,
+        ),
+    ];
+
+    for (raw_relative_path, failure) in cases {
+        VersionPoison::new(
+            VersionPoisonV1::InvalidPhysicalPath {
+                root_name: "main".into(),
+                raw_relative_path: raw_relative_path.clone(),
+                failure,
+            },
+            "canonical classification",
+        )
+        .unwrap();
+
+        let wrong = if failure == PhysicalPathFailureCode::ForbiddenCharacter {
+            PhysicalPathFailureCode::ParentComponent
+        } else {
+            PhysicalPathFailureCode::ForbiddenCharacter
+        };
+        assert_eq!(
+            VersionPoison::new(
+                VersionPoisonV1::InvalidPhysicalPath {
+                    root_name: "main".into(),
+                    raw_relative_path,
+                    failure: wrong,
+                },
+                "wrong classification",
+            )
+            .unwrap_err(),
+            VersionPoisonError::InvalidRawPath
+        );
+    }
+
+    assert_eq!(
+        VersionPoison::new(
+            VersionPoisonV1::InvalidPhysicalPath {
+                root_name: "main".into(),
+                raw_relative_path: PlatformPathBytes::Unix(b"valid/path".to_vec()),
+                failure: PhysicalPathFailureCode::ForbiddenCharacter,
+            },
+            "valid path cannot be poisoned",
+        )
+        .unwrap_err(),
+        VersionPoisonError::InvalidRawPath
+    );
+}

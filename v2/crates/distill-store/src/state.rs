@@ -1551,11 +1551,88 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
         } => {
             validate_root_and_path(root_name, normalized_path)?;
         }
-        VersionPoisonV1::InvalidPhysicalPath { root_name, .. } => {
+        VersionPoisonV1::InvalidPhysicalPath {
+            root_name,
+            raw_relative_path,
+            failure,
+        } => {
             validate_root_name(root_name)?;
+            if classify_invalid_physical_path(raw_relative_path) != Some(*failure) {
+                return Err(VersionPoisonError::InvalidRawPath);
+            }
         }
     }
     Ok(())
+}
+
+fn classify_invalid_physical_path(path: &PlatformPathBytes) -> Option<PhysicalPathFailureCode> {
+    match path {
+        PlatformPathBytes::Unix(bytes) => {
+            if std::str::from_utf8(bytes).is_err() {
+                return Some(PhysicalPathFailureCode::InvalidUnixUtf8);
+            }
+            if bytes.starts_with(b"/") {
+                return Some(PhysicalPathFailureCode::Absolute);
+            }
+            if bytes.is_empty()
+                || bytes.ends_with(b"/")
+                || bytes.windows(2).any(|pair| pair == b"//")
+            {
+                return Some(PhysicalPathFailureCode::EmptyComponent);
+            }
+            if bytes.split(|byte| *byte == b'/').any(|part| part == b".") {
+                return Some(PhysicalPathFailureCode::DotComponent);
+            }
+            if bytes.split(|byte| *byte == b'/').any(|part| part == b"..") {
+                return Some(PhysicalPathFailureCode::ParentComponent);
+            }
+            if bytes.iter().any(|byte| matches!(*byte, 0 | b'\\')) {
+                return Some(PhysicalPathFailureCode::ForbiddenCharacter);
+            }
+            None
+        }
+        PlatformPathBytes::Windows(units) => {
+            if String::from_utf16(units).is_err() {
+                return Some(PhysicalPathFailureCode::UnpairedWindowsUtf16);
+            }
+            let separator = |unit: u16| unit == u16::from(b'/') || unit == u16::from(b'\\');
+            let ascii_letter = |unit: u16| {
+                (u16::from(b'a')..=u16::from(b'z')).contains(&unit)
+                    || (u16::from(b'A')..=u16::from(b'Z')).contains(&unit)
+            };
+            let drive_prefix =
+                units.len() >= 2 && ascii_letter(units[0]) && units[1] == u16::from(b':');
+            if units.first().is_some_and(|unit| separator(*unit)) || drive_prefix {
+                return Some(PhysicalPathFailureCode::Absolute);
+            }
+            if units.is_empty()
+                || units.last().is_some_and(|unit| separator(*unit))
+                || units
+                    .windows(2)
+                    .any(|pair| separator(pair[0]) && separator(pair[1]))
+            {
+                return Some(PhysicalPathFailureCode::EmptyComponent);
+            }
+            if units
+                .split(|unit| separator(*unit))
+                .any(|part| part == [b'.' as u16])
+            {
+                return Some(PhysicalPathFailureCode::DotComponent);
+            }
+            if units
+                .split(|unit| separator(*unit))
+                .any(|part| part == [b'.' as u16, b'.' as u16])
+            {
+                return Some(PhysicalPathFailureCode::ParentComponent);
+            }
+            if units.iter().any(|unit| {
+                *unit <= 0x1f || matches!(*unit, 0x22 | 0x2a | 0x3a | 0x3c | 0x3e | 0x3f | 0x7c)
+            }) {
+                return Some(PhysicalPathFailureCode::ForbiddenCharacter);
+            }
+            None
+        }
+    }
 }
 
 fn validate_strict_two<T: Ord>(values: &[T]) -> Result<(), VersionPoisonError> {
