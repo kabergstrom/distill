@@ -34,6 +34,8 @@ struct ConfigurationStatus {
 enum ReconnectReason {
   targetDefinitionChanged @0;
   loadPolicyChanged @1;
+  storeInstanceChanged @2;
+  protocolEpochChanged @3;
 }
 
 struct ReconnectRequired {

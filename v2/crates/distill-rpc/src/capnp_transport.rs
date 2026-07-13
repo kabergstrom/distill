@@ -1152,6 +1152,8 @@ fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
             schema::ReconnectReason::TargetDefinitionChanged
         }
         ReconnectReason::LoadPolicyChanged => schema::ReconnectReason::LoadPolicyChanged,
+        ReconnectReason::StoreInstanceChanged => schema::ReconnectReason::StoreInstanceChanged,
+        ReconnectReason::ProtocolEpochChanged => schema::ReconnectReason::ProtocolEpochChanged,
     }
 }
 

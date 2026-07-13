@@ -216,6 +216,8 @@ pub type ConfigurationState = ConfigurationStatus;
 pub enum ReconnectReason {
     TargetDefinitionChanged,
     LoadPolicyChanged,
+    StoreInstanceChanged,
+    ProtocolEpochChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

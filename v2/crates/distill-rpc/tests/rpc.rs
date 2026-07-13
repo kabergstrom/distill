@@ -103,6 +103,18 @@ fn assert_reconnect<T: std::fmt::Debug>(result: RpcResult<T>, reason: ReconnectR
 }
 
 #[test]
+fn reconnect_reason_vocabulary_is_shared_and_complete() {
+    assert_ne!(
+        ReconnectReason::StoreInstanceChanged,
+        ReconnectReason::ProtocolEpochChanged
+    );
+    assert_ne!(
+        ReconnectReason::TargetDefinitionChanged,
+        ReconnectReason::LoadPolicyChanged
+    );
+}
+
+#[test]
 fn staging_accepts_only_numeric_loopback_addresses() {
     assert!(validate_bind_address("127.0.0.1:9999").is_ok());
     assert!(validate_bind_address("[::1]:9999").is_ok());
