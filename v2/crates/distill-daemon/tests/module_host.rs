@@ -7,21 +7,27 @@ use distill_core::attestation::{
     ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, RegistryPathStep,
     SchemaNodeId, BOOTSTRAP_CONTROL_TYPE_UUIDS,
 };
-use distill_core::id::{LogicalHash, TypeUuid};
+use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
     CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements,
-    CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable, EpochWorkError,
-    HostBootstrapAuthorityV1, HostCallbackBoundary, HostCallbackSurface, LoadedPipelineModule,
-    MeasuredLayout, ModuleAbiIdentity, ModuleCallError, ModuleEpochPin, ModuleHost, ModuleIdentity,
-    PipelineModuleLoader, PipelinePoisonCode, PipelinePoisonOrigin, Registration,
-    RegistrationDisposition, RegistrationKind, RegistrationResource, RegistrationSet, StagedModule,
-    TargetDefinition, UnloadOutcome,
+    CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable, DurableModuleHost,
+    DurablePublishError, EpochWorkError, HostBootstrapAuthorityV1, HostCallbackBoundary,
+    HostCallbackSurface, LoadedPipelineModule, MeasuredLayout, ModuleAbiIdentity, ModuleCallError,
+    ModuleEpochPin, ModuleHost, ModuleIdentity, PipelineModuleLoader, PipelinePoisonCode,
+    PipelinePoisonOrigin, Registration, RegistrationDisposition, RegistrationKind,
+    RegistrationResource, RegistrationSet, StagedModule, TargetDefinition, UnloadOutcome,
 };
 use distill_schema::bootstrap_gen_v1::{
     consumer_bootstrap_authority_v1, consumer_compilation_identity_v1,
 };
 use distill_schema::ngp_schema::CompilationIdentity;
+use distill_store::pipeline::{
+    AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
+    VerifiedSchemaLineageManifest,
+};
+use distill_store::state::PipelineState as StoredPipelineState;
+use distill_store::{Store, StoreConfig};
 
 #[distill_asset::asset(uuid = "30112233-4455-6677-8899-aabbccddeeff")]
 struct PanickingAssetDrop;
@@ -227,6 +233,45 @@ fn bootstrap_authority() -> &'static HostBootstrapAuthorityV1 {
 
 fn module_host(state_dir: impl AsRef<Path>) -> std::io::Result<ModuleHost> {
     ModuleHost::new_with_bootstrap_authority(state_dir, bootstrap_authority())
+}
+
+fn durable_module_host(
+    state_dir: impl AsRef<Path>,
+    requirements: &CandidateRequirements,
+) -> DurableModuleHost {
+    let state_dir = state_dir.as_ref();
+    let host = module_host(state_dir.join("modules")).unwrap();
+    let mut store = Store::open(StoreConfig::new(state_dir.join("store"))).unwrap();
+    let types = requirements
+        .compiled_types
+        .rows
+        .iter()
+        .filter(|row| !distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
+        .map(|row| {
+            (
+                row.type_uuid,
+                AcceptedTypeLineage {
+                    epochs: vec![AcceptedSchemaEpoch {
+                        digest: row.logical_hash,
+                        forward_parent: None,
+                    }],
+                    current: 0,
+                    authority: TypeAuthorityState::Active,
+                },
+            )
+        })
+        .collect();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(
+                &VerifiedSchemaLineageManifest::from_verified_source(
+                    ContentHash([0x91; 32]),
+                    SchemaLineageManifest { types },
+                ),
+            )
+        })
+        .unwrap();
+    DurableModuleHost::from_parts(host, store)
 }
 
 fn requirements(tag: u8) -> CandidateRequirements {
@@ -1240,4 +1285,126 @@ fn host_reverse_callback_boundary_preserves_explicit_status_failures() {
         })
         .unwrap_err();
     assert_eq!(error.detail(), "duplicate processor");
+}
+
+#[test]
+fn durable_publication_commits_store_before_memory_becomes_current() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 40);
+    let requirements = requirements(40);
+    let mut host = durable_module_host(temp.path().join("state"), &requirements);
+    let mut loader = FakeLoader {
+        module: Some(fake_module(40, Arc::new(Mutex::new(Calls::default())))),
+        open_error: None,
+    };
+
+    let epoch = host
+        .publish_candidate(&source, requirements, &mut loader)
+        .unwrap();
+    assert_eq!(host.snapshot().epoch().unwrap().id(), epoch.id());
+    assert!(matches!(
+        host.store().pipeline_state().unwrap(),
+        Some(StoredPipelineState::Ready(stored)) if stored.dylib_hash == epoch.dylib_hash()
+    ));
+}
+
+#[test]
+fn durable_store_failure_never_exposes_the_prepared_module() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 44);
+    let host = module_host(temp.path().join("state/modules")).unwrap();
+    let store = Store::open(StoreConfig::new(temp.path().join("state/store"))).unwrap();
+    let mut host = DurableModuleHost::from_parts(host, store);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut loader = FakeLoader {
+        module: Some(fake_module(44, calls.clone())),
+        open_error: None,
+    };
+
+    assert!(matches!(
+        host.publish_candidate(&source, requirements(44), &mut loader),
+        Err(DurablePublishError::Store { .. })
+    ));
+    assert!(host.snapshot().epoch().is_err());
+    assert!(host.store().pipeline_state().unwrap().is_none());
+    assert_eq!(calls.lock().unwrap().unload, 1);
+}
+
+#[test]
+fn candidate_failure_poison_is_committed_before_memory_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 45);
+    let requirements = requirements(45);
+    let mut host = durable_module_host(temp.path().join("state"), &requirements);
+    let mut loader = FakeLoader {
+        module: None,
+        open_error: Some("bad image"),
+    };
+
+    assert!(matches!(
+        host.publish_candidate(&source, requirements, &mut loader),
+        Err(DurablePublishError::Candidate(_))
+    ));
+    assert!(host.snapshot().epoch().is_err());
+    assert!(matches!(
+        host.store().pipeline_state().unwrap(),
+        Some(StoredPipelineState::Poisoned { error, .. })
+            if error.origin == PipelinePoisonOrigin::CandidateOpen
+    ));
+}
+
+#[test]
+fn schema_acceptance_state_retains_candidate_without_memory_swap() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 42);
+    let initial = requirements(41);
+    let candidate = requirements(42);
+    let mut host = durable_module_host(temp.path().join("state"), &initial);
+    let mut loader = FakeLoader {
+        module: Some(fake_module(42, Arc::new(Mutex::new(Calls::default())))),
+        open_error: None,
+    };
+
+    assert!(matches!(
+        host.publish_candidate(&source, candidate, &mut loader),
+        Err(DurablePublishError::SchemaAcceptanceRequired)
+    ));
+    assert!(host.snapshot().epoch().is_err());
+    assert!(host.pending_candidate().is_some());
+    assert!(matches!(
+        host.store().pipeline_state().unwrap(),
+        Some(StoredPipelineState::SchemaAcceptanceRequired { .. })
+    ));
+}
+
+#[test]
+fn runtime_callback_poison_is_fenced_and_durable_for_the_same_epoch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 43);
+    let requirements = requirements(43);
+    let mut host = durable_module_host(temp.path().join("state"), &requirements);
+    let mut loader = FakeLoader {
+        module: Some(fake_module(43, Arc::new(Mutex::new(Calls::default())))),
+        open_error: None,
+    };
+    let epoch = host
+        .publish_candidate(&source, requirements, &mut loader)
+        .unwrap();
+
+    let poison = host
+        .report_runtime_failure("published drop callback rejected")
+        .unwrap();
+    assert_eq!(poison.origin, PipelinePoisonOrigin::PublishedRuntime);
+    assert!(epoch.try_start_job().is_err());
+    assert!(host.snapshot().epoch().is_err());
+    assert!(matches!(
+        host.store().pipeline_state().unwrap(),
+        Some(StoredPipelineState::Poisoned { error, .. })
+            if error.origin == PipelinePoisonOrigin::PublishedRuntime
+    ));
 }

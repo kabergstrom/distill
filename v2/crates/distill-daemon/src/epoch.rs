@@ -24,10 +24,16 @@ pub use distill_core::target_set::TargetSetHash;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 pub use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1 as HostBootstrapAuthorityV1;
 use distill_schema::ngp_schema::CompilationIdentity;
+use distill_store::pipeline::ValidatedPipelineEpoch;
+use distill_store::state::{
+    load_policy_digest, PipelineEpoch as StoredPipelineEpoch, PipelineState as StoredPipelineState,
+    Registration as StoredRegistration, RegistrationKind as StoredRegistrationKind,
+};
 pub use distill_store::state::{
     CleanupDisposition as CandidateCleanupDisposition, PipelinePoison, PipelinePoisonCode,
     PipelinePoisonOrigin,
 };
+use distill_store::{Store, StoreError};
 
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
@@ -929,41 +935,69 @@ impl ModuleHost {
         mut requirements: CandidateRequirements,
         loader: &mut dyn PipelineModuleLoader,
     ) -> Result<PipelineEpoch, PipelinePoison> {
+        match self.prepare_candidate(source, &mut requirements, loader) {
+            Ok(epoch) => {
+                self.install_ready(epoch.clone());
+                Ok(epoch)
+            }
+            Err(poison) => {
+                self.install_poison(poison.clone());
+                Err(poison)
+            }
+        }
+    }
+
+    fn prepare_candidate(
+        &mut self,
+        source: &Path,
+        requirements: &mut CandidateRequirements,
+        loader: &mut dyn PipelineModuleLoader,
+    ) -> Result<PipelineEpoch, PipelinePoison> {
         let id = self.mint_epoch_id();
         let Some(bootstrap_authority) = self.bootstrap_authority else {
-            return Err(self.publish_candidate_poison(
+            return Err(candidate_poison_record(
                 PipelinePoisonCode::CandidateValidation,
                 "host has no decoded, DSCI-keyed bootstrap-control authority".to_owned(),
+                CandidateCleanupDisposition::None,
             ));
         };
-        let target_set = match validate_requirements(&mut requirements, bootstrap_authority) {
+        let target_set = match validate_requirements(requirements, bootstrap_authority) {
             Ok(target_set) => target_set,
             Err(error) => {
-                return Err(
-                    self.publish_candidate_poison(PipelinePoisonCode::CandidateValidation, error)
-                )
+                return Err(candidate_poison_record(
+                    PipelinePoisonCode::CandidateValidation,
+                    error,
+                    CandidateCleanupDisposition::None,
+                ))
             }
         };
         let staged = match self.stage_copy(id, source) {
             Ok(staged) => staged,
             Err(error) => {
-                return Err(self.publish_candidate_poison(PipelinePoisonCode::CandidateOpen, error))
+                return Err(candidate_poison_record(
+                    PipelinePoisonCode::CandidateOpen,
+                    error,
+                    CandidateCleanupDisposition::None,
+                ))
             }
         };
         if let Err(error) = CodeLoadingPolicy::authorize(CodeLoadRequest::HostPipelineModule {
             staged_copy: true,
             content_hash: Some(staged.content_hash),
         }) {
-            return Err(
-                self.publish_candidate_poison(PipelinePoisonCode::CandidateOpen, error.to_string())
-            );
+            return Err(candidate_poison_record(
+                PipelinePoisonCode::CandidateOpen,
+                error.to_string(),
+                CandidateCleanupDisposition::None,
+            ));
         }
         let mut module = match boundary_call("open", || loader.open_staged(&staged)) {
             Ok(module) => module,
             Err(error) => {
-                return Err(self.publish_candidate_poison(
+                return Err(candidate_poison_record(
                     PipelinePoisonCode::CandidateOpen,
                     error.to_string(),
+                    CandidateCleanupDisposition::None,
                 ))
             }
         };
@@ -976,7 +1010,7 @@ impl ModuleHost {
 
         let validation = validate_open_module(
             module.as_mut(),
-            &requirements,
+            requirements,
             bootstrap_authority,
             &mut registration_arena,
         );
@@ -984,7 +1018,7 @@ impl ModuleHost {
             Ok(registration) => registration,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
-                return Err(self.publish_candidate_poison_with_cleanup(
+                return Err(candidate_poison_with_cleanup(
                     error.code,
                     error.detail,
                     cleanup,
@@ -993,7 +1027,7 @@ impl ModuleHost {
         };
         if token.is_poisoned() {
             let cleanup = discard_candidate(module, registration_arena);
-            return Err(self.publish_candidate_poison_with_cleanup(
+            return Err(candidate_poison_with_cleanup(
                 PipelinePoisonCode::CandidateRegistration,
                 "candidate token was poisoned during registration".to_owned(),
                 cleanup,
@@ -1009,8 +1043,6 @@ impl ModuleHost {
             registration_arena,
             module,
         );
-        self.retire_published_ready();
-        self.published = Some(PublishedState::Ready(epoch.clone()));
         Ok(epoch)
     }
 
@@ -1106,43 +1138,41 @@ impl ModuleHost {
         })
     }
 
-    fn publish_candidate_poison(
-        &mut self,
-        code: PipelinePoisonCode,
-        detail: String,
-    ) -> PipelinePoison {
-        self.publish_candidate_poison_record(code, detail, CandidateCleanupDisposition::None)
-    }
-
-    fn publish_candidate_poison_with_cleanup(
-        &mut self,
-        initiating_code: PipelinePoisonCode,
-        detail: String,
-        cleanup: CandidateCleanup,
-    ) -> PipelinePoison {
-        let detail = format!(
-            "{detail}; candidate cleanup disposition={}: {}",
-            cleanup_disposition_name(cleanup.disposition),
-            cleanup.detail
-        );
-        let code = if cleanup.disposition == CandidateCleanupDisposition::CleanedAndClosed {
-            initiating_code
-        } else {
-            PipelinePoisonCode::CandidateCleanup
-        };
-        self.publish_candidate_poison_record(code, detail, cleanup.disposition)
-    }
-
-    fn publish_candidate_poison_record(
-        &mut self,
-        code: PipelinePoisonCode,
-        detail: String,
-        cleanup: CandidateCleanupDisposition,
-    ) -> PipelinePoison {
-        let poison = pipeline_poison(code, PipelinePoisonOrigin::CandidateOpen, cleanup, detail);
+    fn install_poison(&mut self, poison: PipelinePoison) {
         self.retire_published_ready();
-        self.published = Some(PublishedState::Poisoned(poison.clone()));
-        poison
+        self.published = Some(PublishedState::Poisoned(poison));
+    }
+
+    fn install_ready(&mut self, epoch: PipelineEpoch) {
+        self.retire_published_ready();
+        self.published = Some(PublishedState::Ready(epoch));
+    }
+
+    fn discard_unpublished(&mut self, epoch: PipelineEpoch) -> Option<PipelinePoison> {
+        epoch.begin_drain();
+        match unload_epoch(&epoch) {
+            Ok(()) => None,
+            Err(error) => {
+                epoch.0.poison(
+                    PipelinePoisonCode::PublishedCleanup,
+                    format!(
+                        "unpublished candidate cleanup disposition={}: {}",
+                        cleanup_disposition_name(error.disposition),
+                        error.detail
+                    ),
+                );
+                let poison = match (PipelineSnapshot {
+                    state: PublishedState::Ready(epoch.clone()),
+                })
+                .epoch()
+                {
+                    Err(poison) => poison,
+                    Ok(_) => unreachable!("discard cleanup poison must fence the epoch"),
+                };
+                self.retired.push(epoch);
+                Some(poison)
+            }
+        }
     }
 
     fn retire_published_ready(&mut self) {
@@ -1151,6 +1181,282 @@ impl ModuleHost {
             self.retired.push(epoch);
         }
     }
+}
+
+fn candidate_poison_with_cleanup(
+    initiating_code: PipelinePoisonCode,
+    detail: String,
+    cleanup: CandidateCleanup,
+) -> PipelinePoison {
+    let detail = format!(
+        "{detail}; candidate cleanup disposition={}: {}",
+        cleanup_disposition_name(cleanup.disposition),
+        cleanup.detail
+    );
+    let code = if cleanup.disposition == CandidateCleanupDisposition::CleanedAndClosed {
+        initiating_code
+    } else {
+        PipelinePoisonCode::CandidateCleanup
+    };
+    candidate_poison_record(code, detail, cleanup.disposition)
+}
+
+fn candidate_poison_record(
+    code: PipelinePoisonCode,
+    detail: String,
+    cleanup: CandidateCleanupDisposition,
+) -> PipelinePoison {
+    pipeline_poison(code, PipelinePoisonOrigin::CandidateOpen, cleanup, detail)
+}
+
+#[derive(Debug)]
+pub enum DurablePublishError {
+    Candidate(PipelinePoison),
+    Store {
+        source: Box<StoreError>,
+        cleanup_poison: Option<Box<PipelinePoison>>,
+    },
+    SchemaAcceptanceRequired,
+}
+
+/// Production publication coordinator. A prepared module remains invisible
+/// to in-memory snapshots until the exact store epoch is durably committed.
+pub struct DurableModuleHost {
+    host: ModuleHost,
+    store: Store,
+    pending: Option<PipelineEpoch>,
+}
+
+impl DurableModuleHost {
+    pub fn from_parts(host: ModuleHost, store: Store) -> Self {
+        Self {
+            host,
+            store,
+            pending: None,
+        }
+    }
+
+    pub fn snapshot(&self) -> PipelineSnapshot {
+        self.host.snapshot()
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
+    pub fn pending_candidate(&self) -> Option<&PipelineEpoch> {
+        self.pending.as_ref()
+    }
+
+    pub fn publish_candidate(
+        &mut self,
+        source: &Path,
+        mut requirements: CandidateRequirements,
+        loader: &mut dyn PipelineModuleLoader,
+    ) -> Result<PipelineEpoch, DurablePublishError> {
+        let prepared = match self
+            .host
+            .prepare_candidate(source, &mut requirements, loader)
+        {
+            Ok(epoch) => epoch,
+            Err(poison) => {
+                self.store
+                    .input_transaction(|transaction| transaction.publish_pipeline_poison(&poison))
+                    .map_err(|source| DurablePublishError::Store {
+                        source: Box::new(source),
+                        cleanup_poison: None,
+                    })?;
+                self.host.install_poison(poison.clone());
+                return Err(DurablePublishError::Candidate(poison));
+            }
+        };
+
+        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+            Ok(stored) => stored,
+            Err(source) => {
+                let cleanup_poison = self.host.discard_unpublished(prepared);
+                return Err(DurablePublishError::Store {
+                    source: Box::new(source),
+                    cleanup_poison: cleanup_poison.map(Box::new),
+                });
+            }
+        };
+        if let Err(source) = self
+            .store
+            .input_transaction(|transaction| transaction.publish_pipeline_epoch(&stored))
+        {
+            let cleanup_poison = self.host.discard_unpublished(prepared);
+            return Err(DurablePublishError::Store {
+                source: Box::new(source),
+                cleanup_poison: cleanup_poison.map(Box::new),
+            });
+        }
+
+        match self.store.pipeline_state() {
+            Ok(Some(StoredPipelineState::Ready(epoch)))
+                if epoch.dylib_hash == prepared.dylib_hash() =>
+            {
+                self.discard_pending();
+                self.host.install_ready(prepared.clone());
+                Ok(prepared)
+            }
+            Ok(Some(StoredPipelineState::SchemaAcceptanceRequired { .. })) => {
+                self.discard_pending();
+                self.pending = Some(prepared);
+                Err(DurablePublishError::SchemaAcceptanceRequired)
+            }
+            Ok(_) => {
+                let cleanup_poison = self.host.discard_unpublished(prepared);
+                Err(DurablePublishError::Store {
+                    source: Box::new(StoreError::InvalidPipelineEpoch {
+                        detail: "store did not publish the prepared candidate as Ready or acceptance-required",
+                    }),
+                    cleanup_poison: cleanup_poison.map(Box::new),
+                })
+            }
+            Err(source) => {
+                let cleanup_poison = self.host.discard_unpublished(prepared);
+                Err(DurablePublishError::Store {
+                    source: Box::new(source),
+                    cleanup_poison: cleanup_poison.map(Box::new),
+                })
+            }
+        }
+    }
+
+    /// Persist the runtime poison for the currently published dylib before
+    /// exposing the explicit report through the in-memory epoch.
+    pub fn report_runtime_failure(
+        &mut self,
+        detail: impl Into<String>,
+    ) -> Result<PipelinePoison, StoreError> {
+        let detail = detail.into();
+        let epoch = match &self.host.published {
+            Some(PublishedState::Ready(epoch)) => epoch.clone(),
+            _ => {
+                return Err(StoreError::InvalidPipelineEpoch {
+                    detail: "no ready in-memory epoch exists for runtime poison",
+                })
+            }
+        };
+        let poison = pipeline_poison(
+            PipelinePoisonCode::PublishedCallbackRejected,
+            PipelinePoisonOrigin::PublishedRuntime,
+            CandidateCleanupDisposition::PublishedEpochLeaked,
+            detail.clone(),
+        );
+        self.store
+            .poison_published_pipeline_epoch(epoch.dylib_hash(), &poison)?;
+        epoch.report_runtime_failure(detail);
+        Ok(poison)
+    }
+
+    /// Persist a poison already latched by a module-owned status token.
+    pub fn sync_runtime_poison(&mut self) -> Result<Option<PipelinePoison>, StoreError> {
+        let epoch = match &self.host.published {
+            Some(PublishedState::Ready(epoch)) => epoch.clone(),
+            _ => return Ok(None),
+        };
+        let poison = match self.host.snapshot().epoch() {
+            Ok(_) => return Ok(None),
+            Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => poison,
+            Err(_) => return Ok(None),
+        };
+        self.store
+            .poison_published_pipeline_epoch(epoch.dylib_hash(), &poison)?;
+        Ok(Some(poison))
+    }
+
+    fn discard_pending(&mut self) {
+        if let Some(epoch) = self.pending.take() {
+            let _ = self.host.discard_unpublished(epoch);
+        }
+    }
+}
+
+fn stored_pipeline_epoch(
+    prepared: &PipelineEpoch,
+    requirements: &CandidateRequirements,
+) -> Result<ValidatedPipelineEpoch, StoreError> {
+    let target_set = CanonicalTargetSet::canonical(
+        prepared
+            .targets()
+            .iter()
+            .map(|target| TargetSetRow {
+                name: target.name.clone(),
+                target_definition_hash: target.fingerprint,
+            })
+            .collect(),
+    )
+    .map_err(StoreError::InvalidTargetSet)?;
+    if target_set.digest != prepared.target_set_hash() {
+        return Err(StoreError::InvalidPipelineEpoch {
+            detail: "prepared module target set differs from its retained DSTS",
+        });
+    }
+    let policy = requirements
+        .compiled_types
+        .rows
+        .iter()
+        .map(|row| (row.type_uuid, row.build_only))
+        .collect::<Vec<_>>();
+    let schema_registry = requirements
+        .compiled_types
+        .rows
+        .iter()
+        .map(|row| (row.type_uuid, row.logical_hash))
+        .collect::<BTreeMap<_, _>>();
+    let registrations = prepared
+        .registrations()
+        .registrations
+        .iter()
+        .filter_map(|registration| {
+            let kind = match registration.kind {
+                RegistrationKind::Importer => StoredRegistrationKind::Importer,
+                RegistrationKind::Processor => StoredRegistrationKind::Processor,
+                RegistrationKind::Validator
+                | RegistrationKind::Migration
+                | RegistrationKind::Defaults
+                | RegistrationKind::Tool => return None,
+            };
+            Some(StoredRegistration {
+                kind,
+                id: registration.id.clone(),
+                version: registration.version,
+            })
+        })
+        .collect();
+    let epoch = StoredPipelineEpoch {
+        dylib_hash: prepared.dylib_hash(),
+        load_policy_digest: load_policy_digest(&policy),
+        compiled_types: requirements.compiled_types.digest,
+        target_set,
+        schema_registry,
+        registrations,
+    };
+    let authority = consumer_authority(requirements)?;
+    ValidatedPipelineEpoch::validate(epoch, &requirements.compiled_types, authority)
+}
+
+fn consumer_authority(
+    requirements: &CandidateRequirements,
+) -> Result<&'static HostBootstrapAuthorityV1, StoreError> {
+    let authority =
+        distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1().map_err(|_| {
+            StoreError::InvalidPipelineEpoch {
+                detail: "consumer bootstrap authority resource is invalid",
+            }
+        })?;
+    if &requirements.identity.compilation != authority.compilation_identity() {
+        return Err(StoreError::InvalidPipelineEpoch {
+            detail: "candidate DSCI differs from the store bootstrap authority",
+        });
+    }
+    Ok(authority)
 }
 
 fn validate_requirements(
