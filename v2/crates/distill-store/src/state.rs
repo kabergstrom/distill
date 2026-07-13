@@ -834,8 +834,6 @@ fn encode_bundle_source(encoder: &mut CanonicalEncoder, source: &ReadableBundleS
 }
 
 fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), VersionPoisonError> {
-    use unicode_normalization::UnicodeNormalization;
-
     let validate_source = |source: &ReadableBundleSource| {
         validate_root_and_path(&source.root_name, &source.normalized_path)
     };
@@ -868,9 +866,7 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
         normalized_path, ..
     } = detail
     {
-        if normalized_path.nfc().collect::<String>() != *normalized_path {
-            return Err(VersionPoisonError::InvalidPath);
-        }
+        validate_normalized_path(normalized_path)?;
     }
     Ok(())
 }
@@ -887,6 +883,12 @@ fn validate_root_and_path(
     {
         return Err(VersionPoisonError::InvalidRootName);
     }
+    validate_normalized_path(normalized_path)
+}
+
+fn validate_normalized_path(normalized_path: &str) -> Result<(), VersionPoisonError> {
+    use unicode_normalization::UnicodeNormalization;
+
     if normalized_path.is_empty()
         || normalized_path.nfc().collect::<String>() != normalized_path
         || normalized_path.contains(['\\', '\0'])
