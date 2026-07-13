@@ -42,9 +42,10 @@ pub use distill_wire::native::{
 };
 
 pub use distill_core::attestation::{
+    compute_tag_annotation_epoch, encode_tag_annotation_projection, verify_tag_annotation_epoch,
     CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable, ControlRole, ReferenceStrength,
     RegistryExtraFact, RegistryExtraRow, RegistryExtrasDigest, RegistryExtrasV1, RegistryPathStep,
-    SchemaNodeId as RegistrySchemaNodeId,
+    SchemaNodeId as RegistrySchemaNodeId, TagAnnotationEpoch,
 };
 pub use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 pub use distill_json::AuthoredValue;

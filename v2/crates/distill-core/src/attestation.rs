@@ -9,7 +9,7 @@ use std::fmt;
 
 use unicode_normalization::UnicodeNormalization;
 
-use crate::canonical::{DSCA, DSRE};
+use crate::canonical::{DSCA, DSRE, DSTA};
 use crate::id::{LogicalHash, TypeUuid};
 
 const VERSION: u8 = 1;
@@ -84,6 +84,13 @@ pub struct CompiledTypeRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompiledAttestationDigest(pub [u8; 32]);
 
+/// Digest of the complete, canonical `#[asset(tag)]` projection for one
+/// compiled type table. This value is always derived from the rows; consumers
+/// must use [`verify_tag_annotation_epoch`] rather than accepting an opaque
+/// epoch supplied across a trust boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TagAnnotationEpoch(pub [u8; 32]);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledTypeTable {
     pub rows: Vec<CompiledTypeRow>,
@@ -108,6 +115,10 @@ pub enum AttestationError {
     TypeRowsNotStrictlySorted,
     DuplicateType(TypeUuid),
     CompiledDigestMismatch,
+    TagAnnotationEpochMismatch {
+        expected: TagAnnotationEpoch,
+        observed: TagAnnotationEpoch,
+    },
     CountOverflow,
 }
 
@@ -410,6 +421,11 @@ impl CompiledTypeTable {
     pub fn validate(&self) -> Result<(), AttestationError> {
         Self::from_canonical(self.rows.clone(), self.digest).map(|_| ())
     }
+
+    /// Independently derives the tag-annotation epoch from the compiled rows.
+    pub fn tag_annotation_epoch(&self) -> Result<TagAnnotationEpoch, AttestationError> {
+        compute_tag_annotation_epoch(&self.rows)
+    }
 }
 
 pub fn compute_compiled_attestation_digest(
@@ -429,6 +445,74 @@ pub fn compute_compiled_attestation_digest(
         hash.update(&encoded);
     }
     Ok(CompiledAttestationDigest(*hash.finalize().as_bytes()))
+}
+
+/// Encodes the closed DSTA v1 projection. The result begins with the v1 byte
+/// and contains every compiled type, including types with no tag facts.
+///
+/// Callers cannot provide tag rows directly: this function validates the
+/// complete compiled table, projects only `RegistryExtraFact::Tag`, and sorts
+/// those projected records by their exact canonical bytes.
+pub fn encode_tag_annotation_projection(
+    rows: &[CompiledTypeRow],
+) -> Result<Vec<u8>, AttestationError> {
+    validate_type_rows(rows)?;
+
+    let mut out = vec![VERSION];
+    put_count(&mut out, rows.len())?;
+    for row in rows {
+        out.extend_from_slice(&row.type_uuid.0);
+
+        let mut tags = row
+            .registry_extras
+            .rows
+            .iter()
+            .filter(|extra| matches!(extra.fact, RegistryExtraFact::Tag))
+            .map(|extra| {
+                let mut encoded_path = Vec::new();
+                encode_registry_path(&mut encoded_path, &extra.path)?;
+                // DSTA's fact vocabulary is deliberately separate from the
+                // DSRE fact discriminants: SearchTag is fixed at 1.
+                Ok((extra.node.0, encoded_path, 1_u8))
+            })
+            .collect::<Result<Vec<_>, AttestationError>>()?;
+        tags.sort();
+        if tags.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(AttestationError::DuplicateExtraRow);
+        }
+        put_count(&mut out, tags.len())?;
+        for (node, path, fact) in tags {
+            out.extend_from_slice(&node.to_le_bytes());
+            out.extend_from_slice(&path);
+            out.push(fact);
+        }
+    }
+    Ok(out)
+}
+
+/// Derives `blake3("DSTA" || canonical DSTA v1 projection)` from the complete
+/// compiled rows. No caller-provided epoch participates in this computation.
+pub fn compute_tag_annotation_epoch(
+    rows: &[CompiledTypeRow],
+) -> Result<TagAnnotationEpoch, AttestationError> {
+    let encoded = encode_tag_annotation_projection(rows)?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(&DSTA);
+    hash.update(&encoded);
+    Ok(TagAnnotationEpoch(*hash.finalize().as_bytes()))
+}
+
+/// Recomputes DSTA from the complete compiled rows before comparing an epoch
+/// received from staging, publication, or dependency revalidation.
+pub fn verify_tag_annotation_epoch(
+    rows: &[CompiledTypeRow],
+    observed: TagAnnotationEpoch,
+) -> Result<(), AttestationError> {
+    let expected = compute_tag_annotation_epoch(rows)?;
+    if expected != observed {
+        return Err(AttestationError::TagAnnotationEpochMismatch { expected, observed });
+    }
+    Ok(())
 }
 
 fn validate_type_rows(rows: &[CompiledTypeRow]) -> Result<(), AttestationError> {

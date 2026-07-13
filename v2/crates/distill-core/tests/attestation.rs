@@ -179,3 +179,125 @@ fn equal_dsnl_does_not_hide_logical_policy_or_extras_drift() {
         );
     }
 }
+
+#[test]
+fn dsta_projects_all_types_and_pins_the_canonical_bytes() {
+    let first = compiled(
+        1,
+        RegistryExtrasV1::canonical(vec![
+            row(256, "z", RegistryExtraFact::Tag),
+            row(1, "y", RegistryExtraFact::Tag),
+            row(2, "re\u{301}f", RegistryExtraFact::Blob),
+            row(0, "aa", RegistryExtraFact::Tag),
+            row(0, "b", RegistryExtraFact::Tag),
+        ])
+        .unwrap(),
+    );
+    let second = compiled(
+        2,
+        RegistryExtrasV1::canonical(vec![row(0, "not-a-tag", RegistryExtraFact::Skip)]).unwrap(),
+    );
+    let table = CompiledTypeTable::canonical(vec![second, first]).unwrap();
+
+    let bytes = encode_tag_annotation_projection(&table.rows).unwrap();
+    let mut expected = vec![1, 2, 0, 0, 0];
+    expected.extend_from_slice(&[1; 16]);
+    expected.extend_from_slice(&4_u32.to_le_bytes());
+    for (node, field) in [(0_u32, "b"), (0, "aa"), (1, "y"), (256, "z")] {
+        expected.extend_from_slice(&node.to_le_bytes());
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.push(1); // RegistryPathStep::Field
+        expected.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        expected.extend_from_slice(field.as_bytes());
+        expected.push(1); // TagAnnotationFact::SearchTag
+    }
+    expected.extend_from_slice(&[2; 16]);
+    expected.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(bytes, expected);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"DSTA");
+    hasher.update(&expected);
+    assert_eq!(
+        compute_tag_annotation_epoch(&table.rows).unwrap(),
+        TagAnnotationEpoch(*hasher.finalize().as_bytes())
+    );
+}
+
+#[test]
+fn dsta_recomputes_for_comparison_and_rejects_noncanonical_inputs() {
+    let extras =
+        RegistryExtrasV1::canonical(vec![row(0, "label", RegistryExtraFact::Tag)]).unwrap();
+    let first = compiled(1, extras.clone());
+    let second = compiled(2, extras);
+    let table = CompiledTypeTable::canonical(vec![first.clone(), second.clone()]).unwrap();
+    let epoch = compute_tag_annotation_epoch(&table.rows).unwrap();
+    verify_tag_annotation_epoch(&table.rows, epoch).unwrap();
+
+    let mut forged = epoch;
+    forged.0[0] ^= 1;
+    assert_eq!(
+        verify_tag_annotation_epoch(&table.rows, forged).unwrap_err(),
+        AttestationError::TagAnnotationEpochMismatch {
+            expected: epoch,
+            observed: forged,
+        }
+    );
+    assert_eq!(
+        compute_tag_annotation_epoch(&[second, first.clone()]).unwrap_err(),
+        AttestationError::TypeRowsNotStrictlySorted
+    );
+    assert_eq!(
+        compute_tag_annotation_epoch(&[first.clone(), first]).unwrap_err(),
+        AttestationError::DuplicateType(TypeUuid([1; 16]))
+    );
+
+    let mut duplicate_tag = table.rows[0].clone();
+    duplicate_tag
+        .registry_extras
+        .rows
+        .push(duplicate_tag.registry_extras.rows[0].clone());
+    assert_eq!(
+        compute_tag_annotation_epoch(&[duplicate_tag]).unwrap_err(),
+        AttestationError::DuplicateExtraRow
+    );
+}
+
+#[test]
+fn dsta_changes_only_with_the_exact_tag_projection() {
+    let base = compiled(
+        1,
+        RegistryExtrasV1::canonical(vec![
+            row(0, "label", RegistryExtraFact::Tag),
+            row(0, "cache", RegistryExtraFact::Skip),
+        ])
+        .unwrap(),
+    );
+    let epoch = compute_tag_annotation_epoch(std::slice::from_ref(&base)).unwrap();
+
+    let unrelated_fact_changed = compiled(
+        1,
+        RegistryExtrasV1::canonical(vec![
+            row(0, "label", RegistryExtraFact::Tag),
+            row(0, "cache", RegistryExtraFact::Blob),
+        ])
+        .unwrap(),
+    );
+    assert_eq!(
+        compute_tag_annotation_epoch(&[unrelated_fact_changed]).unwrap(),
+        epoch
+    );
+
+    let tag_path_changed = compiled(
+        1,
+        RegistryExtrasV1::canonical(vec![
+            row(1, "label", RegistryExtraFact::Tag),
+            row(0, "cache", RegistryExtraFact::Skip),
+        ])
+        .unwrap(),
+    );
+    assert_ne!(
+        compute_tag_annotation_epoch(&[tag_path_changed]).unwrap(),
+        epoch
+    );
+}

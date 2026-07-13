@@ -7,7 +7,10 @@ use distill_asset::{
     default_table, AssetHashMap, AssetReflect, AssetType, Blob, EncodeContainer, EncodeSink,
     PathStep,
 };
-use distill_core::attestation::{ReferenceStrength, RegistryExtraFact, RegistryPathStep};
+use distill_core::attestation::{
+    verify_tag_annotation_epoch, CompiledTypeTable, ReferenceStrength, RegistryExtraFact,
+    RegistryPathStep,
+};
 use distill_core::id::{AssetUuid, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_wire::dsnl::dsnl_hash;
@@ -325,4 +328,27 @@ fn descriptor_exposes_typed_complete_registry_facts_and_finite_backrefs() {
     assert!(recursive.registry_extras.rows.iter().any(
         |row| matches!(row.fact, RegistryExtraFact::BackReference { target } if target.0 == 0)
     ));
+}
+
+#[test]
+fn macro_tag_facts_derive_the_candidate_tag_annotation_epoch() {
+    let table = CompiledTypeTable::canonical(vec![
+        Example::descriptor().compiled_type.clone(),
+        SemanticFacts::descriptor().compiled_type.clone(),
+    ])
+    .unwrap();
+    let epoch = table.tag_annotation_epoch().unwrap();
+    verify_tag_annotation_epoch(&table.rows, epoch).unwrap();
+
+    let tagged_rows = table
+        .rows
+        .iter()
+        .flat_map(|row| row.registry_extras.rows.iter())
+        .filter(|row| matches!(row.fact, RegistryExtraFact::Tag))
+        .collect::<Vec<_>>();
+    assert_eq!(tagged_rows.len(), 1);
+    assert_eq!(
+        tagged_rows[0].path,
+        vec![RegistryPathStep::Field("label".to_owned())]
+    );
 }

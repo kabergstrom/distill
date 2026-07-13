@@ -17,6 +17,9 @@ pub const DSCI: [u8; 4] = *b"DSCI";
 pub const DSTG: [u8; 4] = *b"DSTG";
 /// Candidate target-set identity (§5, §13, §18).
 pub const DSTS: [u8; 4] = *b"DSTS";
+/// Tag-annotation epoch — the exact compiled `#[asset(tag)]` projection
+/// (§5, §10).
+pub const DSTA: [u8; 4] = *b"DSTA";
 /// `StaticInputs` digest — the build-cache lookup key (§9).
 pub const DSSI: [u8; 4] = *b"DSSI";
 /// `TraceOp` sequences (§9).
