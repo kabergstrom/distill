@@ -25,7 +25,6 @@ pub enum DriftedInput {
 pub enum ResolveResult {
     Built {
         content_hash: ContentHash,
-        basis: IoBasis,
     },
     Drifted {
         input: DriftedInput,
@@ -69,6 +68,7 @@ pub enum ReconnectReason {
     TargetDefinitionChanged,
     LoadPolicyChanged,
     StoreInstanceChanged,
+    ProtocolEpochChanged,
 }
 
 #[derive(Debug, Clone)]

@@ -9,10 +9,12 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 
 use distill_asset::{
-    AssetRuntimeDescriptor, AssetType, ErasedValue, ModuleEpochToken, PlaceholderThunk,
+    AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, ErasedValue, ModuleEpochToken,
+    PlaceholderThunk,
 };
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_store::state::SnapshotStamp;
@@ -77,6 +79,7 @@ pub enum LoaderError {
     MissingDescriptor(TypeUuid),
     EpochFenced(GameModuleEpoch),
     OwnerEpochMismatch,
+    PlaceholderVisitorFailed(TypeUuid),
     RuntimeEpoch(RuntimeEpochError),
     Artifact(String),
 }
@@ -184,6 +187,39 @@ struct PlaceholderRecord {
     token: ModuleEpochToken,
 }
 
+type PlaceholderReferences = BTreeMap<AssetUuid, BTreeSet<TypeUuid>>;
+
+struct InspectedPlaceholder {
+    value: ErasedValue,
+    strong_references: PlaceholderReferences,
+}
+
+#[derive(Default)]
+struct ReferenceOnlySink {
+    strong_references: PlaceholderReferences,
+}
+
+impl EncodeSink for ReferenceOnlySink {
+    fn flat(&mut self, _bytes: &[u8]) {}
+
+    fn begin(&mut self, _kind: EncodeContainer, _len: u32) {}
+
+    fn push(&mut self) {}
+
+    fn finish(&mut self) {}
+
+    fn blob(&mut self, _bytes: &[u8]) {}
+
+    fn reference(&mut self, strong: bool, target: AssetUuid, expected_terminal: TypeUuid) {
+        if strong {
+            self.strong_references
+                .entry(target)
+                .or_default()
+                .insert(expected_terminal);
+        }
+    }
+}
+
 enum CandidateTerminal {
     Pending,
     Built {
@@ -197,12 +233,14 @@ enum CandidateTerminal {
     Missing,
     Deleted {
         values: BTreeMap<HandleId, ErasedValue>,
+        strong_references: PlaceholderReferences,
     },
 }
 
 struct CandidateRecord {
     basis: IoBasis,
     resolve_issued: bool,
+    expected_terminal_types: BTreeSet<TypeUuid>,
     terminal: CandidateTerminal,
 }
 
@@ -252,7 +290,7 @@ pub struct Loader<I: LoaderIO> {
     epochs: RuntimeEpochs,
     descriptors: BTreeMap<TypeUuid, DescriptorRecord>,
     placeholders: BTreeMap<TypeUuid, PlaceholderRecord>,
-    injected_placeholders: BTreeMap<HandleId, ErasedValue>,
+    injected_placeholders: BTreeMap<HandleId, InspectedPlaceholder>,
     slots: BTreeMap<HandleId, Slot>,
     direct_slots: BTreeMap<(AssetUuid, TypeUuid), HandleId>,
     path_slots: BTreeMap<(String, TypeUuid), HandleId>,
@@ -500,33 +538,62 @@ impl<I: LoaderIO> Loader<I> {
         handle: HandleId,
         value: ErasedValue,
     ) -> Result<(), LoaderError> {
-        let slot = self
+        let context = self
             .slots
             .get(&handle)
-            .ok_or(LoaderError::UnknownHandle(handle))?;
-        let uuid = slot
-            .binding
-            .uuid()
-            .ok_or(LoaderError::HandleAssetMismatch)?;
-        let type_uuid = slot
-            .current
-            .as_ref()
-            .map(|current| current.type_uuid)
-            .or(slot.expected_type)
-            .ok_or(LoaderError::HandleAssetMismatch)?;
-        self.validate_value_owner(type_uuid, &value)?;
+            .ok_or(LoaderError::UnknownHandle(handle))
+            .and_then(|slot| {
+                let uuid = slot
+                    .binding
+                    .uuid()
+                    .ok_or(LoaderError::HandleAssetMismatch)?;
+                let type_uuid = slot
+                    .current
+                    .as_ref()
+                    .map(|current| current.type_uuid)
+                    .or(slot.expected_type)
+                    .ok_or(LoaderError::HandleAssetMismatch)?;
+                Ok((uuid, type_uuid))
+            });
+        let (uuid, type_uuid) = match context {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = value.destroy();
+                return Err(error);
+            }
+        };
+        let strong_references = match self.inspect_placeholder_value(type_uuid, &value) {
+            Ok(references) => references,
+            Err(error) => {
+                let _ = value.destroy();
+                return Err(error);
+            }
+        };
         if let Some(candidate) = self
             .sweep
             .as_mut()
             .and_then(|sweep| sweep.candidates.get_mut(&uuid))
         {
-            if let CandidateTerminal::Deleted { values } = &mut candidate.terminal {
-                values.insert(handle, value);
+            if let CandidateTerminal::Deleted {
+                values,
+                strong_references: candidate_references,
+            } = &mut candidate.terminal
+            {
+                merge_placeholder_references(candidate_references, strong_references);
+                if let Some(old) = values.insert(handle, value) {
+                    let _ = old.destroy();
+                }
                 return Ok(());
             }
         }
-        if let Some(old) = self.injected_placeholders.insert(handle, value) {
-            let _ = old.destroy();
+        if let Some(old) = self.injected_placeholders.insert(
+            handle,
+            InspectedPlaceholder {
+                value,
+                strong_references,
+            },
+        ) {
+            let _ = old.value.destroy();
         }
         Ok(())
     }
@@ -549,6 +616,24 @@ impl<I: LoaderIO> Loader<I> {
     }
 
     pub fn begin_module_drain(&mut self, epoch: GameModuleEpoch) -> Result<(), LoaderError> {
+        let owner = self
+            .descriptors
+            .values()
+            .find(|record| record.epoch == epoch)
+            .map(|record| record.token.clone());
+        if let Some(owner) = owner {
+            let injected = self
+                .injected_placeholders
+                .iter()
+                .filter(|(_, placeholder)| owner.same_epoch(placeholder.value.owner_token()))
+                .map(|(handle, _)| *handle)
+                .collect::<Vec<_>>();
+            for handle in injected {
+                if let Some(placeholder) = self.injected_placeholders.remove(&handle) {
+                    let _ = placeholder.value.destroy();
+                }
+            }
+        }
         let stored = self
             .slots
             .iter()
@@ -611,6 +696,28 @@ impl<I: LoaderIO> Loader<I> {
         Ok(())
     }
 
+    fn inspect_placeholder_value(
+        &self,
+        type_uuid: TypeUuid,
+        value: &ErasedValue,
+    ) -> Result<PlaceholderReferences, LoaderError> {
+        self.validate_value_owner(type_uuid, value)?;
+        let descriptor = self.ensure_descriptor(type_uuid)?;
+        let mut sink = ReferenceOnlySink::default();
+        // Safety: value ownership/type were checked against this descriptor;
+        // encode is the descriptor's generated no-unwind visitor.
+        let visited = catch_unwind(AssertUnwindSafe(|| unsafe {
+            (descriptor.descriptor.encode)(value.as_ptr(), &mut sink)
+        }));
+        match visited {
+            Ok(Ok(())) => Ok(sink.strong_references),
+            Ok(Err(_)) | Err(_) => {
+                descriptor.token.poison();
+                Err(LoaderError::PlaceholderVisitorFailed(type_uuid))
+            }
+        }
+    }
+
     fn new_slot(
         &mut self,
         expected_type: Option<TypeUuid>,
@@ -661,6 +768,9 @@ impl<I: LoaderIO> Loader<I> {
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         for id in released {
+            if let Some(placeholder) = self.injected_placeholders.remove(&id) {
+                let _ = placeholder.value.destroy();
+            }
             if let Some(slot) = self.slots.remove(&id) {
                 if let Some(uuid) = slot.subscribed_uuid {
                     self.io.unsubscribe(uuid);
@@ -708,6 +818,7 @@ impl<I: LoaderIO> Loader<I> {
                 CandidateRecord {
                     basis: basis.clone(),
                     resolve_issued: false,
+                    expected_terminal_types: BTreeSet::new(),
                     terminal: CandidateTerminal::Pending,
                 },
             );
@@ -968,11 +1079,8 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         };
         match result {
-            ResolveResult::Built {
-                content_hash,
-                basis,
-            } => {
-                if basis != event_basis || candidate.basis != event_basis {
+            ResolveResult::Built { content_hash } => {
+                if candidate.basis != event_basis {
                     self.restart_sweep();
                     return Ok(());
                 }
@@ -1008,6 +1116,7 @@ impl<I: LoaderIO> Loader<I> {
                 candidate.terminal = if was_live {
                     CandidateTerminal::Deleted {
                         values: BTreeMap::new(),
+                        strong_references: BTreeMap::new(),
                     }
                 } else {
                     CandidateTerminal::Missing
@@ -1018,6 +1127,7 @@ impl<I: LoaderIO> Loader<I> {
                 candidate.terminal = if was_live {
                     CandidateTerminal::Deleted {
                         values: BTreeMap::new(),
+                        strong_references: BTreeMap::new(),
                     }
                 } else {
                     CandidateTerminal::Missing
@@ -1053,6 +1163,7 @@ impl<I: LoaderIO> Loader<I> {
                         sweep.candidates.entry(uuid).or_insert(CandidateRecord {
                             basis: sweep.basis.clone(),
                             resolve_issued: false,
+                            expected_terminal_types: BTreeSet::new(),
                             terminal: CandidateTerminal::Pending,
                         });
                     }
@@ -1244,25 +1355,73 @@ impl<I: LoaderIO> Loader<I> {
             let Some(type_uuid) = type_uuid else {
                 continue;
             };
-            let value = self.injected_placeholders.remove(&handle).or_else(|| {
-                let placeholder = self.placeholders.get(&type_uuid)?;
-                if !self.epochs.can_issue_work(placeholder.epoch) {
-                    return None;
-                }
-                (placeholder.thunk.make)(placeholder.token.clone()).ok()
-            });
-            if let Some(value) = value {
-                if let Some(candidate) = self
-                    .sweep
-                    .as_mut()
-                    .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-                {
-                    if let CandidateTerminal::Deleted { values } = &mut candidate.terminal {
-                        values.insert(handle, value);
+            let inspected = if let Some(injected) = self.injected_placeholders.remove(&handle) {
+                Some(Ok(injected))
+            } else {
+                self.placeholders.get(&type_uuid).map(|placeholder| {
+                    if !self.epochs.can_issue_work(placeholder.epoch) {
+                        return Err("placeholder epoch is fenced".to_owned());
+                    }
+                    let value =
+                        (placeholder.thunk.make)(placeholder.token.clone()).map_err(|_| {
+                            placeholder.token.poison();
+                            "placeholder factory callback failed".to_owned()
+                        })?;
+                    match self.inspect_placeholder_value(type_uuid, &value) {
+                        Ok(strong_references) => Ok(InspectedPlaceholder {
+                            value,
+                            strong_references,
+                        }),
+                        Err(error) => {
+                            let _ = value.destroy();
+                            Err(format!("placeholder visitor failed: {error:?}"))
+                        }
+                    }
+                })
+            };
+            match inspected {
+                Some(Ok(inspected)) => {
+                    if let Some(candidate) = self
+                        .sweep
+                        .as_mut()
+                        .and_then(|sweep| sweep.candidates.get_mut(&uuid))
+                    {
+                        if let CandidateTerminal::Deleted {
+                            values,
+                            strong_references,
+                        } = &mut candidate.terminal
+                        {
+                            merge_placeholder_references(
+                                strong_references,
+                                inspected.strong_references,
+                            );
+                            values.insert(handle, inspected.value);
+                        } else {
+                            let _ = inspected.value.destroy();
+                        }
+                    } else {
+                        let _ = inspected.value.destroy();
                     }
                 }
+                Some(Err(error)) => {
+                    self.fail_placeholder_candidate(uuid, error);
+                    break;
+                }
+                None => {}
             }
         }
+    }
+
+    fn fail_placeholder_candidate(&mut self, uuid: AssetUuid, error: String) {
+        let Some(candidate) = self
+            .sweep
+            .as_mut()
+            .and_then(|sweep| sweep.candidates.get_mut(&uuid))
+        else {
+            return;
+        };
+        let terminal = std::mem::replace(&mut candidate.terminal, CandidateTerminal::Failed(error));
+        destroy_candidate_values(terminal);
     }
 
     fn expand_dependencies(&mut self) -> Result<(), LoaderError> {
@@ -1270,19 +1429,24 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         };
         let basis = sweep.basis.clone();
-        let dependencies = sweep
-            .candidates
-            .values()
-            .filter_map(|candidate| match &candidate.terminal {
+        let mut dependencies = PlaceholderReferences::new();
+        for candidate in sweep.candidates.values() {
+            match &candidate.terminal {
                 CandidateTerminal::Built {
                     load_deps: Some(deps),
                     ..
-                } => Some(deps.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect::<BTreeSet<_>>();
-        for uuid in dependencies {
+                } => {
+                    for dependency in deps {
+                        dependencies.entry(*dependency).or_default();
+                    }
+                }
+                CandidateTerminal::Deleted {
+                    strong_references, ..
+                } => merge_placeholder_references(&mut dependencies, strong_references.clone()),
+                _ => {}
+            }
+        }
+        for (uuid, expected_terminal_types) in dependencies {
             if self.handles_for_uuid(uuid).is_empty() {
                 let (id, lease) = self.new_slot(None, Binding::Direct(uuid))?;
                 if let Some(slot) = self.slots.get_mut(&id) {
@@ -1293,7 +1457,8 @@ impl<I: LoaderIO> Loader<I> {
                     adopted_at: AdoptionId(0),
                 });
             }
-            self.sweep
+            let candidate = self
+                .sweep
                 .as_mut()
                 .expect("checked Some")
                 .candidates
@@ -1301,8 +1466,12 @@ impl<I: LoaderIO> Loader<I> {
                 .or_insert(CandidateRecord {
                     basis: basis.clone(),
                     resolve_issued: false,
+                    expected_terminal_types: BTreeSet::new(),
                     terminal: CandidateTerminal::Pending,
                 });
+            candidate
+                .expected_terminal_types
+                .extend(expected_terminal_types);
         }
         Ok(())
     }
@@ -1384,7 +1553,7 @@ impl<I: LoaderIO> Loader<I> {
                         .all(|handle| values.contains_key(handle))
             }
             CandidateTerminal::Failed(_) | CandidateTerminal::Missing => true,
-            CandidateTerminal::Deleted { values } => {
+            CandidateTerminal::Deleted { values, .. } => {
                 let handles = self.handles_for_candidate(candidate);
                 values.is_empty() || handles.iter().all(|handle| values.contains_key(handle))
             }
@@ -1410,15 +1579,19 @@ impl<I: LoaderIO> Loader<I> {
                 type_uuid: Some(value),
                 ..
             } => *value,
-            _ => self
-                .handles_for_uuid(uuid)
-                .into_iter()
-                .find_map(|handle| {
-                    self.slots.get(&handle).and_then(|slot| {
-                        slot.current
-                            .as_ref()
-                            .map(|current| current.type_uuid)
-                            .or(slot.expected_type)
+            _ => candidate
+                .expected_terminal_types
+                .iter()
+                .next()
+                .copied()
+                .or_else(|| {
+                    self.handles_for_uuid(uuid).into_iter().find_map(|handle| {
+                        self.slots.get(&handle).and_then(|slot| {
+                            slot.current
+                                .as_ref()
+                                .map(|current| current.type_uuid)
+                                .or(slot.expected_type)
+                        })
                     })
                 })
                 .unwrap_or(TypeUuid([0; 16])),
@@ -1431,12 +1604,30 @@ impl<I: LoaderIO> Loader<I> {
                 load_deps: Some(value),
                 ..
             } => value.clone(),
+            CandidateTerminal::Deleted {
+                strong_references, ..
+            } => strong_references.keys().copied().collect(),
             _ => Vec::new(),
         }
     }
 
     fn candidate_outcome(&self, uuid: AssetUuid, candidate: &CandidateRecord) -> CandidateOutcome {
         match &candidate.terminal {
+            CandidateTerminal::Built {
+                type_uuid: Some(actual),
+                ..
+            } if candidate
+                .expected_terminal_types
+                .iter()
+                .any(|expected| expected != actual) =>
+            {
+                CandidateOutcome::Failed {
+                    error: format!(
+                        "placeholder reference terminal type mismatch: expected {:?}, got {actual}",
+                        candidate.expected_terminal_types
+                    ),
+                }
+            }
             CandidateTerminal::Built { content_hash, .. } => CandidateOutcome::Ready {
                 content_hash: *content_hash,
             },
@@ -1444,7 +1635,7 @@ impl<I: LoaderIO> Loader<I> {
                 error: error.clone(),
             },
             CandidateTerminal::Missing => CandidateOutcome::Missing,
-            CandidateTerminal::Deleted { values } => CandidateOutcome::Deleted {
+            CandidateTerminal::Deleted { values, .. } => CandidateOutcome::Deleted {
                 placeholder_ready: !values.is_empty()
                     && self
                         .handles_for_uuid(uuid)
@@ -1503,7 +1694,10 @@ impl<I: LoaderIO> Loader<I> {
                         });
                     }
                 }
-                CandidateTerminal::Deleted { values } => {
+                CandidateTerminal::Deleted {
+                    values,
+                    strong_references,
+                } => {
                     for handle in self.handles_for_uuid(uuid) {
                         let Some(value) = values.remove(&handle) else {
                             continue;
@@ -1531,7 +1725,7 @@ impl<I: LoaderIO> Loader<I> {
                             uuid,
                             type_uuid,
                             content_hash: None,
-                            load_deps: Vec::new(),
+                            load_deps: strong_references.keys().copied().collect(),
                             owner_epoch: epoch,
                             token,
                             dead: true,
@@ -1795,13 +1989,24 @@ impl<I: LoaderIO> Loader<I> {
 
 fn destroy_candidate_values(terminal: CandidateTerminal) {
     let values = match terminal {
-        CandidateTerminal::Built { values, .. } | CandidateTerminal::Deleted { values } => values,
+        CandidateTerminal::Built { values, .. } | CandidateTerminal::Deleted { values, .. } => {
+            values
+        }
         CandidateTerminal::Pending | CandidateTerminal::Failed(_) | CandidateTerminal::Missing => {
             return;
         }
     };
     for value in values.into_values() {
         let _ = value.destroy();
+    }
+}
+
+fn merge_placeholder_references(
+    into: &mut PlaceholderReferences,
+    references: PlaceholderReferences,
+) {
+    for (target, expected_types) in references {
+        into.entry(target).or_default().extend(expected_types);
     }
 }
 

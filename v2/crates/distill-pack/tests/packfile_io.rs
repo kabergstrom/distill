@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 
 use distill_bundle::PathComponent;
+use distill_core::attestation::{
+    CompiledTypeRow, CompiledTypeTable, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
+    SchemaNodeId,
+};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{IoEvent, LoaderIO, PathResolveResult, ReqId, ResolveResult};
 use distill_pack::archive::{encode_archive, ArtifactPayload};
 use distill_pack::manifest::{
-    encode_manifest, ArchiveRef, EncodingRow, IndexRow, LayoutRegistryRow, LoadPolicyRow,
-    ManifestAssetRow, PackManifest, PackTarget, PathRow, WireTreeRow,
+    encode_manifest, ArchiveRef, EncodingRow, IndexRow, LoadPolicyRow, ManifestAssetRow,
+    PackManifest, PackTarget, PathRow, WireTreeRow,
 };
 use distill_pack::{MountError, PackfileIO, RuntimeAttestation};
 use distill_wire::artifact::{
@@ -77,10 +81,20 @@ fn fixture(
     let manifest = PackManifest {
         target: target.clone(),
         target_def_hash: [4; 32],
-        layout_registry: vec![LayoutRegistryRow {
+        compiled_types: CompiledTypeTable::canonical(vec![CompiledTypeRow::new(
             type_uuid,
-            digest: [5; 32],
-        }],
+            logical_hash,
+            [5; 32],
+            false,
+            RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+                node: SchemaNodeId(0),
+                path: vec![],
+                fact: RegistryExtraFact::BuildOnly(false),
+            }])
+            .unwrap(),
+        )
+        .unwrap()])
+        .unwrap(),
         load_policy: vec![LoadPolicyRow {
             type_uuid,
             build_only: false,
@@ -126,8 +140,7 @@ fn fixture(
     let runtime = RuntimeAttestation {
         target,
         target_def_hash: [4; 32],
-        layouts: BTreeMap::from([(type_uuid, [5; 32])]),
-        load_policy: BTreeMap::from([(type_uuid, false)]),
+        compiled_types: manifest.compiled_types.clone(),
     };
     (
         encode_manifest(&manifest).unwrap(),
@@ -148,8 +161,8 @@ fn packfile_io_resolves_fetches_and_resolves_paths_under_one_basis() {
     io.resolve_path(ReqId(3), "assets/a.bundle", &basis);
     let events = io.poll();
     assert!(matches!(&events[0], IoEvent::Resolved {
-        req: ReqId(1), result: ResolveResult::Built { content_hash: got, basis: inner }, basis: outer, ..
-    } if *got == content_hash && inner == &basis && outer == &basis));
+        req: ReqId(1), result: ResolveResult::Built { content_hash: got }, basis: outer, ..
+    } if *got == content_hash && outer == &basis));
     assert!(
         matches!(&events[1], IoEvent::Fetched { req: ReqId(2), artifact, basis: got, .. }
         if artifact.structural.starts_with(&ARTIFACT_MAGIC)

@@ -2,6 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use distill_core::attestation::{
+    AttestationError, CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable,
+};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 
 use crate::archive::{append_trailer, EKey, ObjectLocation, PACK_MAGIC, PACK_VERSION};
@@ -12,12 +15,6 @@ pub struct PackTarget {
     pub arch: u8,
     pub apis: Vec<u8>,
     pub options: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LayoutRegistryRow {
-    pub type_uuid: TypeUuid,
-    pub digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,7 +68,8 @@ pub struct PathRow {
 pub struct PackManifest {
     pub target: PackTarget,
     pub target_def_hash: [u8; 32],
-    pub layout_registry: Vec<LayoutRegistryRow>,
+    /// Exact complete semantic projection for the pack's type closure.
+    pub compiled_types: CompiledTypeTable,
     pub load_policy: Vec<LoadPolicyRow>,
     pub archives: Vec<ArchiveRef>,
     pub assets: Vec<ManifestAssetRow>,
@@ -100,14 +98,24 @@ pub enum ManifestError {
     MetadataMismatch,
     TargetMismatch,
     MissingRuntimeType(TypeUuid),
-    LayoutMismatch(TypeUuid),
-    PolicyMismatch(TypeUuid),
+    MissingDependency(AssetUuid),
+    CompiledAttestation(AttestationError),
+    CompiledCoverage,
+    CompiledMismatch(TypeUuid),
+}
+
+impl From<AttestationError> for ManifestError {
+    fn from(value: AttestationError) -> Self {
+        Self::CompiledAttestation(value)
+    }
 }
 
 pub fn canonicalize(mut manifest: PackManifest) -> Result<PackManifest, ManifestError> {
+    // A trust-boundary caller may not smuggle a forged DSRE/DSCA and ask the
+    // manifest encoder to bless it by recomputing the digest.
+    manifest.compiled_types.validate()?;
     manifest.target.apis.sort_unstable();
     manifest.target.apis.dedup();
-    sort_unique(&mut manifest.layout_registry, |v| v.type_uuid)?;
     sort_unique(&mut manifest.load_policy, |v| v.type_uuid)?;
     sort_unique(&mut manifest.archives, |v| v.generation)?;
     for row in &mut manifest.assets {
@@ -124,6 +132,7 @@ pub fn canonicalize(mut manifest: PackManifest) -> Result<PackManifest, Manifest
         }
         sort_unique(paths, |v| v.path.clone())?;
     }
+    verify_compiled_closure(&manifest)?;
     Ok(manifest)
 }
 
@@ -142,12 +151,11 @@ pub fn encode_manifest(manifest: &PackManifest) -> Result<Vec<u8>, ManifestError
     header.extend_from_slice(&(target.len() as u32).to_le_bytes());
     header.extend_from_slice(&target);
     header.extend_from_slice(&manifest.target_def_hash);
-    header.extend_from_slice(&(manifest.layout_registry.len() as u32).to_le_bytes());
-    for row in &manifest.layout_registry {
-        header.extend_from_slice(&row.type_uuid.0);
-        header.extend_from_slice(&row.digest);
+    header.extend_from_slice(&(manifest.compiled_types.rows.len() as u32).to_le_bytes());
+    for row in &manifest.compiled_types.rows {
+        header.extend_from_slice(&row.encode()?);
     }
-    header.extend_from_slice(&layout_registry_digest(&manifest.layout_registry));
+    header.extend_from_slice(&manifest.compiled_types.digest.0);
     header.extend_from_slice(&(manifest.load_policy.len() as u32).to_le_bytes());
     for row in &manifest.load_policy {
         header.extend_from_slice(&row.type_uuid.0);
@@ -213,18 +221,19 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
     let target_len = r.u32()? as usize;
     let target = decode_target(r.take(target_len)?)?;
     let target_def_hash = r.a32()?;
-    let layout_count = r.u32()? as usize;
-    let mut layout_registry = Vec::with_capacity(layout_count);
-    for _ in 0..layout_count {
-        layout_registry.push(LayoutRegistryRow {
-            type_uuid: TypeUuid(r.a16()?),
-            digest: r.a32()?,
-        });
+    let compiled_count = r.u32()? as usize;
+    let mut compiled_rows = Vec::with_capacity(compiled_count);
+    for _ in 0..compiled_count {
+        let start = r.pos;
+        // The row is self-framed only by the normative `extras_len`: all
+        // preceding fields have fixed widths, and there is no outer row len.
+        r.take(16 + 32 + 32 + 1 + 32)?;
+        let extras_len = r.u32()? as usize;
+        r.take(extras_len)?;
+        compiled_rows.push(CompiledTypeRow::decode(&r.bytes[start..r.pos])?);
     }
-    check_sorted(&layout_registry, |v| v.type_uuid)?;
-    if r.a32()? != layout_registry_digest(&layout_registry) {
-        return Err(ManifestError::BadDigest);
-    }
+    let compiled_types =
+        CompiledTypeTable::from_canonical(compiled_rows, CompiledAttestationDigest(r.a32()?))?;
     let policy_count = r.u32()? as usize;
     let mut load_policy = Vec::with_capacity(policy_count);
     for _ in 0..policy_count {
@@ -297,10 +306,10 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
     } else {
         None
     };
-    Ok(PackManifest {
+    let manifest = PackManifest {
         target,
         target_def_hash,
-        layout_registry,
+        compiled_types,
         load_policy,
         archives,
         assets,
@@ -308,7 +317,9 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
         index,
         wire_trees,
         paths,
-    })
+    };
+    verify_compiled_closure(&manifest)?;
+    Ok(manifest)
 }
 
 fn encode_target(target: &PackTarget) -> Vec<u8> {
@@ -546,17 +557,6 @@ fn string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u32).to_le_bytes());
     out.extend_from_slice(value.as_bytes());
 }
-pub fn layout_registry_digest(rows: &[LayoutRegistryRow]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"DSLA");
-    h.update(&[1]);
-    h.update(&(rows.len() as u32).to_le_bytes());
-    for r in rows {
-        h.update(&r.type_uuid.0);
-        h.update(&r.digest);
-    }
-    *h.finalize().as_bytes()
-}
 pub fn load_policy_digest(rows: &[LoadPolicyRow]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"DSLP");
@@ -601,29 +601,85 @@ pub fn verify_artifact_metadata(
 }
 pub fn verify_attestation(
     manifest: &PackManifest,
-    layouts: &BTreeMap<TypeUuid, [u8; 32]>,
-    policy: &BTreeMap<TypeUuid, bool>,
+    runtime: &CompiledTypeTable,
     target_def_hash: [u8; 32],
 ) -> Result<(), ManifestError> {
     if manifest.target_def_hash != target_def_hash {
         return Err(ManifestError::TargetMismatch);
     }
-    for row in &manifest.layout_registry {
-        match layouts.get(&row.type_uuid) {
+    runtime.validate()?;
+    for row in &manifest.compiled_types.rows {
+        match runtime
+            .rows
+            .binary_search_by_key(&row.type_uuid, |candidate| candidate.type_uuid)
+            .ok()
+            .map(|index| &runtime.rows[index])
+        {
             None => return Err(ManifestError::MissingRuntimeType(row.type_uuid)),
-            Some(v) if v != &row.digest => {
-                return Err(ManifestError::LayoutMismatch(row.type_uuid))
+            Some(runtime_row) if runtime_row != row => {
+                return Err(ManifestError::CompiledMismatch(row.type_uuid));
             }
             _ => {}
         }
     }
-    for row in &manifest.load_policy {
-        match policy.get(&row.type_uuid) {
-            None => return Err(ManifestError::MissingRuntimeType(row.type_uuid)),
-            Some(v) if v != &row.build_only => {
-                return Err(ManifestError::PolicyMismatch(row.type_uuid))
+    Ok(())
+}
+
+fn verify_compiled_closure(manifest: &PackManifest) -> Result<(), ManifestError> {
+    manifest.compiled_types.validate()?;
+    let used_types = manifest
+        .assets
+        .iter()
+        .flat_map(|asset| [asset.authored_type, asset.terminal_type])
+        .collect::<BTreeSet<_>>();
+    if used_types.len() != manifest.compiled_types.rows.len()
+        || manifest
+            .compiled_types
+            .rows
+            .iter()
+            .any(|row| !used_types.contains(&row.type_uuid))
+        || manifest.load_policy.len() != manifest.compiled_types.rows.len()
+    {
+        return Err(ManifestError::CompiledCoverage);
+    }
+    for row in &manifest.compiled_types.rows {
+        let policy = manifest
+            .load_policy
+            .binary_search_by_key(&row.type_uuid, |candidate| candidate.type_uuid)
+            .ok()
+            .map(|index| manifest.load_policy[index]);
+        if !matches!(policy, Some(value) if value.build_only == row.build_only) {
+            return Err(ManifestError::CompiledMismatch(row.type_uuid));
+        }
+    }
+    let asset_uuids = manifest
+        .assets
+        .iter()
+        .map(|asset| asset.asset_uuid)
+        .collect::<BTreeSet<_>>();
+    for asset in &manifest.assets {
+        for dependency in &asset.load_deps {
+            if !asset_uuids.contains(dependency) {
+                return Err(ManifestError::MissingDependency(*dependency));
             }
-            _ => {}
+        }
+        for type_uuid in [asset.authored_type, asset.terminal_type] {
+            if manifest
+                .compiled_types
+                .rows
+                .binary_search_by_key(&type_uuid, |row| row.type_uuid)
+                .is_err()
+            {
+                return Err(ManifestError::CompiledCoverage);
+            }
+        }
+        let terminal = &manifest.compiled_types.rows[manifest
+            .compiled_types
+            .rows
+            .binary_search_by_key(&asset.terminal_type, |row| row.type_uuid)
+            .map_err(|_| ManifestError::CompiledCoverage)?];
+        if terminal.logical_hash != asset.logical_hash {
+            return Err(ManifestError::CompiledMismatch(asset.terminal_type));
         }
     }
     Ok(())

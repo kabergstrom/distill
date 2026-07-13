@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_core::attestation::CompiledTypeTable;
+use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_loader::{
     FetchedArtifact, IoBasis, IoEvent, LoadPolicyAttestation, LoadPolicyRow, LoaderIO,
     ManifestHash, PathResolveResult, ReqId, ResolveResult,
@@ -22,8 +23,7 @@ use crate::manifest::{
 pub struct RuntimeAttestation {
     pub target: PackTarget,
     pub target_def_hash: [u8; 32],
-    pub layouts: BTreeMap<TypeUuid, [u8; 32]>,
-    pub load_policy: BTreeMap<TypeUuid, bool>,
+    pub compiled_types: CompiledTypeTable,
 }
 
 #[derive(Debug)]
@@ -148,12 +148,7 @@ impl PackfileIO {
         if manifest.target != runtime.target {
             return Err(MountError::TargetMismatch);
         }
-        verify_attestation(
-            manifest,
-            &runtime.layouts,
-            &runtime.load_policy,
-            runtime.target_def_hash,
-        )?;
+        verify_attestation(manifest, &runtime.compiled_types, runtime.target_def_hash)?;
         Ok(())
     }
 
@@ -308,7 +303,6 @@ impl LoaderIO for PackfileIO {
             .ok()
             .map(|index| ResolveResult::Built {
                 content_hash: self.manifest.assets[index].content_hash,
-                basis: self.basis.clone(),
             })
             .unwrap_or(ResolveResult::Missing);
         self.events.push_back(IoEvent::Resolved {
