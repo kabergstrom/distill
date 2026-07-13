@@ -10,9 +10,9 @@ use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::TypeUuid;
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
-    load_policy_digest, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, InputVersion,
-    MemoSeq, OperationKind, PipelineEpoch, PipelinePoison, PipelineState, Registration,
-    RegistrationKind, SnapshotStamp, StoreInstanceId,
+    load_policy_digest, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, DscpV1,
+    InputVersion, MemoSeq, OperationKind, PipelineEpoch, PipelinePoison, PipelineState,
+    Registration, RegistrationKind, SnapshotStamp, StoreInstanceId,
 };
 
 fn epoch() -> Arc<PipelineEpoch> {
@@ -41,9 +41,12 @@ fn configuration() -> Arc<ConfigurationEpoch> {
 }
 
 fn configuration_poison() -> ConfigurationPoison {
-    ConfigurationPoison {
-        error: "daemon.address is not loopback".to_owned(),
-    }
+    ConfigurationPoison::from_reason(
+        &DscpV1::NonLoopbackAddress {
+            address: "10.0.0.5:9999".to_owned(),
+        },
+        "daemon.address is not loopback",
+    )
 }
 
 // ---- version counters ----
@@ -190,7 +193,7 @@ fn ready_state_supplies_the_epoch_to_pipeline_ops() {
 #[test]
 fn configuration_poison_never_serves_last_good_as_current() {
     let state = ConfigurationState::Poisoned {
-        error: configuration_poison(),
+        reason: configuration_poison(),
         last_good: Some(configuration()),
     };
     assert!(state.epoch().is_err());
@@ -204,14 +207,14 @@ fn configuration_poison_never_serves_last_good_as_current() {
         let err = state
             .check(op)
             .expect_err("configuration-dependent operation must fail");
-        assert!(err.error.contains("loopback"));
+        assert!(err.message.contains("loopback"));
     }
 }
 
 #[test]
 fn configuration_poison_keeps_only_explicitly_pure_operations_available() {
     let state = ConfigurationState::Poisoned {
-        error: configuration_poison(),
+        reason: configuration_poison(),
         last_good: Some(configuration()),
     };
     for op in [

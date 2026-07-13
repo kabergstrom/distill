@@ -4,7 +4,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use distill_store::config::{change_class, ChangeClass, ConfigValidationError, RestartOnlyChange};
-use distill_store::state::{ConfigurationState, OperationKind};
+use distill_store::state::{ConfigurationState, DscpV1, OperationKind};
 use distill_store::{Store, StoreConfig};
 
 fn open() -> (tempfile::TempDir, Store) {
@@ -128,11 +128,18 @@ fn invalid_restart_value_is_rejected_before_pending_state_exists() {
 fn invalid_configuration_candidate_publishes_typed_snapshot_poison() {
     let (_dir, mut store) = open();
     store
-        .input_transaction(|txn| txn.publish_configuration_poison("non-loopback daemon address"))
+        .input_transaction(|txn| {
+            txn.publish_configuration_poison(
+                &DscpV1::NonLoopbackAddress {
+                    address: "10.0.0.5:9999".to_owned(),
+                },
+                "non-loopback daemon address",
+            )
+        })
         .unwrap();
     let state = store.configuration_state().unwrap();
     assert!(matches!(state, ConfigurationState::Poisoned { .. }));
     let err = state.check(OperationKind::TargetBoundRpc).unwrap_err();
-    assert!(err.error.contains("non-loopback"));
+    assert!(err.message.contains("non-loopback"));
     assert!(state.check(OperationKind::SnapshotRead).is_ok());
 }

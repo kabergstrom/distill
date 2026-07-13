@@ -17,7 +17,11 @@ use rusqlite::OptionalExtension;
 
 use crate::db::{InputTxn, Store};
 use crate::error::StoreError;
-use crate::state::{ConfigurationEpoch, ConfigurationPoison, ConfigurationState};
+use crate::state::{
+    ConfigurationEpoch, ConfigurationPoison, ConfigurationPoisonCode, ConfigurationState, DscpV1,
+};
+
+type PersistedConfigurationRow = (i64, Option<i64>, Option<Vec<u8>>, Option<String>);
 
 /// Store-side configuration. Defaults match §18's example config.
 #[derive(Debug, Clone)]
@@ -259,36 +263,76 @@ impl Store {
     }
 
     pub fn configuration_state(&self) -> Result<ConfigurationState, StoreError> {
-        let row: Option<(i64, Option<String>)> = self
+        let row: Option<PersistedConfigurationRow> = self
             .conn
             .query_row(
-                "SELECT active_generation, poison FROM configuration_state WHERE id = 0",
+                "SELECT active_generation, poison_code, poison_reason_hash, poison_message
+                 FROM configuration_state WHERE id = 0",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let (generation, poison) = row.unwrap_or((0, None));
+        let (generation, code, reason_hash, message) = row.unwrap_or((0, None, None, None));
         let epoch = std::sync::Arc::new(ConfigurationEpoch {
             generation: generation as u64,
         });
-        Ok(match poison {
-            None => ConfigurationState::Ready(epoch),
-            Some(error) => ConfigurationState::Poisoned {
-                error: ConfigurationPoison { error },
-                last_good: Some(epoch),
-            },
+        Ok(match (code, reason_hash, message) {
+            (None, None, None) => ConfigurationState::Ready(epoch),
+            (Some(code), Some(reason_hash), Some(message)) => {
+                let code = u16::try_from(code)
+                    .ok()
+                    .and_then(|code| ConfigurationPoisonCode::try_from(code).ok())
+                    .ok_or_else(|| StoreError::InvalidConfiguration {
+                        error: format!("unknown persisted configuration poison code {code}"),
+                    })?;
+                let reason_hash: [u8; 32] = reason_hash.try_into().map_err(|bytes: Vec<u8>| {
+                    StoreError::InvalidConfiguration {
+                        error: format!(
+                            "persisted configuration poison reason hash has length {}, expected 32",
+                            bytes.len()
+                        ),
+                    }
+                })?;
+                ConfigurationState::Poisoned {
+                    reason: ConfigurationPoison {
+                        code,
+                        reason_hash,
+                        message,
+                    },
+                    last_good: Some(epoch),
+                }
+            }
+            _ => {
+                return Err(StoreError::InvalidConfiguration {
+                    error: "persisted configuration poison fields are incomplete".to_owned(),
+                });
+            }
         })
     }
 }
 
 impl InputTxn<'_> {
-    pub fn publish_configuration_poison(&mut self, error: &str) -> Result<(), StoreError> {
+    pub fn publish_configuration_poison(
+        &mut self,
+        reason: &DscpV1,
+        message: &str,
+    ) -> Result<(), StoreError> {
+        let poison = ConfigurationPoison::from_reason(reason, message);
         self.txn.execute(
-            "INSERT INTO configuration_state(id, active_generation, input_version, poison)
-             VALUES (0, 0, ?1, ?2)
+            "INSERT INTO configuration_state(
+                 id, active_generation, input_version,
+                 poison_code, poison_reason_hash, poison_message
+             ) VALUES (0, 0, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET input_version = excluded.input_version,
-               poison = excluded.poison",
-            rusqlite::params![self.version().0 as i64, error],
+               poison_code = excluded.poison_code,
+               poison_reason_hash = excluded.poison_reason_hash,
+               poison_message = excluded.poison_message",
+            rusqlite::params![
+                self.version().0 as i64,
+                poison.code as u16,
+                poison.reason_hash.as_slice(),
+                poison.message,
+            ],
         )?;
         Ok(())
     }
@@ -305,10 +349,13 @@ impl InputTxn<'_> {
             error: "no pending-restart generation to adopt".to_owned(),
         })?;
         self.txn.execute(
-            "INSERT INTO configuration_state(id, active_generation, input_version, poison)
-             VALUES (0, ?1, ?2, NULL)
+            "INSERT INTO configuration_state(
+                 id, active_generation, input_version,
+                 poison_code, poison_reason_hash, poison_message
+             ) VALUES (0, ?1, ?2, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET active_generation = excluded.active_generation,
-               input_version = excluded.input_version, poison = NULL",
+               input_version = excluded.input_version,
+               poison_code = NULL, poison_reason_hash = NULL, poison_message = NULL",
             rusqlite::params![generation, self.version().0 as i64],
         )?;
         self.txn.execute("DELETE FROM pending_restart", [])?;

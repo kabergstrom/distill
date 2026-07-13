@@ -22,8 +22,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use distill_core::attestation::CompiledAttestationDigest;
-use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
+use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP};
+use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetHash};
+use ngp_schema::identity::CompilationIdentity;
 
 /// Advanced by watcher batches + authoring ops — module/schema artifact
 /// swaps and config edits arrive as watcher events, so epoch rotation is
@@ -196,16 +198,283 @@ pub struct ConfigurationEpoch {
     pub generation: u64,
 }
 
-/// Stable typed failure carried by a configuration-poisoned input
-/// version (R22/H4).
+/// Closed DSCP v1 discriminants. Persisted/wire values outside this set
+/// reject; there is deliberately no extensible `Other` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ConfigurationPoisonCode {
+    MalformedConfiguration = 1,
+    NonLoopbackAddress = 2,
+    DuplicateRootName = 3,
+    InvalidPath = 4,
+    OwnedPathOverlap = 5,
+    EmptyTargetApis = 6,
+    InvalidParallelism = 7,
+    InvalidBatchReservation = 8,
+    DirectoryAlias = 9,
+    MissingLineageManifest = 10,
+    DuplicateLineageManifest = 11,
+    UnsupportedTargetIdentity = 12,
+}
+
+impl TryFrom<u16> for ConfigurationPoisonCode {
+    type Error = UnknownConfigurationPoisonCode;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::MalformedConfiguration),
+            2 => Ok(Self::NonLoopbackAddress),
+            3 => Ok(Self::DuplicateRootName),
+            4 => Ok(Self::InvalidPath),
+            5 => Ok(Self::OwnedPathOverlap),
+            6 => Ok(Self::EmptyTargetApis),
+            7 => Ok(Self::InvalidParallelism),
+            8 => Ok(Self::InvalidBatchReservation),
+            9 => Ok(Self::DirectoryAlias),
+            10 => Ok(Self::MissingLineageManifest),
+            11 => Ok(Self::DuplicateLineageManifest),
+            12 => Ok(Self::UnsupportedTargetIdentity),
+            unknown => Err(UnknownConfigurationPoisonCode(unknown)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownConfigurationPoisonCode(pub u16);
+
+impl fmt::Display for UnknownConfigurationPoisonCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown ConfigurationPoisonCode {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownConfigurationPoisonCode {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConfigurationPathKey {
+    AssetRoot = 1,
+    StatePath = 2,
+    SchemaArtifact = 3,
+    PipelineModule = 4,
+    CodegenOutput = 5,
+    Quarantine = 6,
+    ImportDestination = 7,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OwnedPathKind {
+    AssetRoot = 1,
+    DaemonState = 2,
+    SchemaArtifact = 3,
+    PipelineModule = 4,
+    CodegenOutput = 5,
+    Quarantine = 6,
+    ImportDestination = 7,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedPathSide {
+    pub kind: OwnedPathKind,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryAliasSide {
+    pub normalized_path: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Exact, closed typed facts hashed by DSCP v1. Presentation prose never
+/// enters this value; callers supply it separately when publishing poison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // DSCP's public variant field types are protocol grammar.
+pub enum DscpV1 {
+    MalformedConfiguration {
+        file_hash: [u8; 32],
+    },
+    NonLoopbackAddress {
+        address: String,
+    },
+    DuplicateRootName {
+        normalized_name: String,
+    },
+    InvalidPath {
+        key: ConfigurationPathKey,
+        normalized_or_raw_path: String,
+    },
+    OwnedPathOverlap {
+        first: OwnedPathSide,
+        second: OwnedPathSide,
+    },
+    EmptyTargetApis {
+        target: String,
+    },
+    InvalidParallelism {
+        value: u32,
+    },
+    InvalidBatchReservation {
+        parallelism: u32,
+        reservation: u32,
+    },
+    DirectoryAlias {
+        first: DirectoryAliasSide,
+        second: DirectoryAliasSide,
+    },
+    MissingLineageManifest,
+    DuplicateLineageManifest {
+        entries: Vec<AssetUuid>,
+    },
+    UnsupportedTargetIdentity {
+        target: String,
+        expected: CompilationIdentity,
+        observed: CompilationIdentity,
+    },
+}
+
+impl DscpV1 {
+    pub fn code(&self) -> ConfigurationPoisonCode {
+        match self {
+            Self::MalformedConfiguration { .. } => ConfigurationPoisonCode::MalformedConfiguration,
+            Self::NonLoopbackAddress { .. } => ConfigurationPoisonCode::NonLoopbackAddress,
+            Self::DuplicateRootName { .. } => ConfigurationPoisonCode::DuplicateRootName,
+            Self::InvalidPath { .. } => ConfigurationPoisonCode::InvalidPath,
+            Self::OwnedPathOverlap { .. } => ConfigurationPoisonCode::OwnedPathOverlap,
+            Self::EmptyTargetApis { .. } => ConfigurationPoisonCode::EmptyTargetApis,
+            Self::InvalidParallelism { .. } => ConfigurationPoisonCode::InvalidParallelism,
+            Self::InvalidBatchReservation { .. } => {
+                ConfigurationPoisonCode::InvalidBatchReservation
+            }
+            Self::DirectoryAlias { .. } => ConfigurationPoisonCode::DirectoryAlias,
+            Self::MissingLineageManifest => ConfigurationPoisonCode::MissingLineageManifest,
+            Self::DuplicateLineageManifest { .. } => {
+                ConfigurationPoisonCode::DuplicateLineageManifest
+            }
+            Self::UnsupportedTargetIdentity { .. } => {
+                ConfigurationPoisonCode::UnsupportedTargetIdentity
+            }
+        }
+    }
+
+    /// `blake3("DSCP" || 0x01 || code:u16 || exact variant fields)`.
+    /// Symmetric records and unordered lineage UUIDs are canonicalized here,
+    /// so callers cannot publish an order-dependent state.
+    pub fn reason_hash(&self) -> [u8; 32] {
+        domain_digest(DSCP, 1, |encoder| {
+            encoder.u16(self.code() as u16);
+            match self {
+                Self::MalformedConfiguration { file_hash } => encoder.raw(file_hash),
+                Self::NonLoopbackAddress { address } => encoder.str(address),
+                Self::DuplicateRootName { normalized_name } => encoder.str(normalized_name),
+                Self::InvalidPath {
+                    key,
+                    normalized_or_raw_path,
+                } => {
+                    encoder.u8(*key as u8);
+                    encoder.str(normalized_or_raw_path);
+                }
+                Self::OwnedPathOverlap { first, second } => {
+                    encode_symmetric_pair(encoder, first, second, encode_owned_path_side);
+                }
+                Self::EmptyTargetApis { target } => encoder.str(target),
+                Self::InvalidParallelism { value } => encoder.u32(*value),
+                Self::InvalidBatchReservation {
+                    parallelism,
+                    reservation,
+                } => {
+                    encoder.u32(*parallelism);
+                    encoder.u32(*reservation);
+                }
+                Self::DirectoryAlias { first, second } => {
+                    encode_symmetric_pair(encoder, first, second, encode_directory_alias_side);
+                }
+                Self::MissingLineageManifest => {}
+                Self::DuplicateLineageManifest { entries } => {
+                    encoder.set(entries, |encoder, entry| encoder.raw(&entry.0));
+                }
+                Self::UnsupportedTargetIdentity {
+                    target,
+                    expected,
+                    observed,
+                } => {
+                    encoder.str(target);
+                    encode_compilation_identity(encoder, expected);
+                    encode_compilation_identity(encoder, observed);
+                }
+            }
+        })
+    }
+}
+
+fn encode_symmetric_pair<T>(
+    encoder: &mut CanonicalEncoder,
+    first: &T,
+    second: &T,
+    encode: fn(&mut CanonicalEncoder, &T),
+) {
+    let encode_one = |side: &T| {
+        let mut encoded = CanonicalEncoder::new();
+        encode(&mut encoded, side);
+        encoded.into_bytes()
+    };
+    let mut sides = [encode_one(first), encode_one(second)];
+    sides.sort();
+    encoder.raw(&sides[0]);
+    encoder.raw(&sides[1]);
+}
+
+fn encode_owned_path_side(encoder: &mut CanonicalEncoder, side: &OwnedPathSide) {
+    encoder.u8(side.kind as u8);
+    encoder.str(&side.path);
+}
+
+fn encode_directory_alias_side(encoder: &mut CanonicalEncoder, side: &DirectoryAliasSide) {
+    encoder.str(&side.normalized_path);
+    encoder.u64(side.device);
+    encoder.u64(side.inode);
+}
+
+fn encode_compilation_identity(encoder: &mut CanonicalEncoder, identity: &CompilationIdentity) {
+    encoder.str(&identity.target_triple);
+    encoder.str(&identity.rustc);
+    encoder.raw(&identity.source_fingerprint);
+    encoder.set(identity.features.iter(), |encoder, (package, feature)| {
+        encoder.str(package);
+        encoder.str(feature);
+    });
+    encoder.set(identity.cfgs.iter(), |encoder, cfg| encoder.str(cfg));
+    encoder.raw(&identity.manifest_lock_hash);
+    encoder.u32(identity.algorithm_version);
+}
+
+/// Stable typed failure carried by a configuration-poisoned input version.
+/// `message` is presentation-only; `reason_hash` is exclusively DSCP v1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationPoison {
-    pub error: String,
+    pub code: ConfigurationPoisonCode,
+    pub reason_hash: [u8; 32],
+    pub message: String,
+}
+
+impl ConfigurationPoison {
+    pub fn from_reason(reason: &DscpV1, message: impl Into<String>) -> Self {
+        Self {
+            code: reason.code(),
+            reason_hash: reason.reason_hash(),
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for ConfigurationPoison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "configuration poison: {}", self.error)
+        write!(
+            f,
+            "configuration poison {:?} ({:02x?}): {}",
+            self.code, self.reason_hash, self.message
+        )
     }
 }
 
@@ -318,7 +587,7 @@ impl PipelineState {
 pub enum ConfigurationState {
     Ready(Arc<ConfigurationEpoch>),
     Poisoned {
-        error: ConfigurationPoison,
+        reason: ConfigurationPoison,
         last_good: Option<Arc<ConfigurationEpoch>>,
     },
 }
@@ -327,7 +596,7 @@ impl ConfigurationState {
     pub fn epoch(&self) -> Result<&Arc<ConfigurationEpoch>, &ConfigurationPoison> {
         match self {
             ConfigurationState::Ready(epoch) => Ok(epoch),
-            ConfigurationState::Poisoned { error, .. } => Err(error),
+            ConfigurationState::Poisoned { reason, .. } => Err(reason),
         }
     }
 

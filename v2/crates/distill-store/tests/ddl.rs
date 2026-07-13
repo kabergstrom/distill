@@ -260,7 +260,14 @@ fn configuration_state_and_pending_restart_are_representable() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "configuration_state"),
-        ["id", "active_generation", "input_version", "poison"]
+        [
+            "id",
+            "active_generation",
+            "input_version",
+            "poison_code",
+            "poison_reason_hash",
+            "poison_message"
+        ]
     );
     assert_eq!(
         columns(&conn, "pending_restart"),
