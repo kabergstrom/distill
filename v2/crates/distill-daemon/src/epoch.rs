@@ -2,8 +2,9 @@
 //!
 //! The concrete `libloading` implementation belongs in the shared audited
 //! module-host layer. This crate owns the daemon state machine around that
-//! boundary and represents the host through [`PipelineModuleLoader`]. Identity
-//! and measured-layout probes are called before the Rust-ABI registration call.
+//! boundary and represents the host through [`PipelineModuleLoader`]. Identity,
+//! measured-layout, and complete semantic probes are called before the Rust-ABI
+//! registration call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use distill_asset::ModuleEpochToken;
+use distill_core::id::{LogicalHash, TypeUuid};
 
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
@@ -37,6 +39,86 @@ pub struct ModuleIdentity {
 pub struct MeasuredLayout {
     pub type_id: String,
     pub digest: [u8; 32],
+}
+
+/// The complete compiled semantic projection for one asset type. The opaque
+/// extras are a canonical, length-framed projection produced by source-walk
+/// and module code from every policy fact deliberately excluded from DSLH and
+/// DSNL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledTypeAttestation {
+    pub type_uuid: TypeUuid,
+    pub logical_hash: LogicalHash,
+    pub native_layout_digest: [u8; 32],
+    pub build_only: bool,
+    pub registry_extras: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledAttestationDigest(pub [u8; 32]);
+
+/// Canonical DSCA table exported by source-walk and by the loaded module.
+/// Rows must already be strictly sorted by raw TypeUuid; accepting and sorting
+/// a non-canonical module export would make the pre-ABI attestation ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledTypeTable {
+    pub rows: Vec<CompiledTypeAttestation>,
+    pub digest: CompiledAttestationDigest,
+}
+
+impl CompiledTypeTable {
+    pub fn canonical(rows: Vec<CompiledTypeAttestation>) -> Result<Self, ModuleCallError> {
+        validate_compiled_row_order(&rows, "compiled-type table").map_err(ModuleCallError::new)?;
+        let digest = compute_compiled_attestation_digest(&rows).map_err(ModuleCallError::new)?;
+        Ok(Self { rows, digest })
+    }
+}
+
+/// Audited reverse-call surfaces. New host-owned callback tables must add a
+/// named surface here so the cross-boundary inventory stays explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCallbackSurface {
+    Registry,
+    EncodeSink,
+    ProcessContext,
+}
+
+impl HostCallbackSurface {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registry => "Registry",
+            Self::EncodeSink => "EncodeSink",
+            Self::ProcessContext => "ProcessContext",
+        }
+    }
+}
+
+/// Host-owned no-unwind thunk passed to module code. Every invocation returns
+/// an explicit status; a panic in daemon callback code is caught on the host
+/// side before control can unwind through a module frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCallbackBoundary {
+    surface: HostCallbackSurface,
+}
+
+pub type HostCallbackStatus<T> = Result<T, ModuleCallError>;
+
+impl HostCallbackBoundary {
+    pub const fn new(surface: HostCallbackSurface) -> Self {
+        Self { surface }
+    }
+
+    pub fn call<T, F>(&self, operation: &str, callback: F) -> HostCallbackStatus<T>
+    where
+        F: FnOnce() -> HostCallbackStatus<T>,
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).unwrap_or_else(|_| {
+            Err(ModuleCallError::host_callback_panic(
+                self.surface,
+                operation,
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +156,7 @@ pub struct RegistrationSet {
 pub struct CandidateRequirements {
     pub identity: ModuleIdentity,
     pub measured_layouts: Vec<MeasuredLayout>,
+    pub compiled_types: CompiledTypeTable,
     pub targets: Vec<TargetDefinition>,
     pub native_dependencies: Vec<NativeDependency>,
 }
@@ -105,6 +188,13 @@ impl ModuleCallError {
             "{operation} panicked at the module boundary; exported thunks must return status"
         ))
     }
+
+    fn host_callback_panic(surface: HostCallbackSurface, operation: &str) -> Self {
+        Self::new(format!(
+            "{} host callback `{operation}` panicked; host-owned thunk returned error status",
+            surface.as_str()
+        ))
+    }
 }
 
 impl std::fmt::Display for ModuleCallError {
@@ -115,12 +205,13 @@ impl std::fmt::Display for ModuleCallError {
 
 impl std::error::Error for ModuleCallError {}
 
-/// Audited table after its repr(C) ABI prefix has been located. The first two
-/// calls must be C-ABI probes in a concrete loader; `register` is reached only
-/// after their values compare equal.
+/// Audited table after its repr(C) ABI prefix has been located. All three probe
+/// calls must be C-ABI in a concrete loader; `register` is reached only after
+/// their values compare equal.
 pub trait LoadedPipelineModule: Send {
     fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError>;
     fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError>;
+    fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError>;
     fn register(
         &mut self,
         targets: &[TargetDefinition],
@@ -571,6 +662,7 @@ fn validate_requirements(requirements: &mut CandidateRequirements) -> Result<(),
     {
         return Err("expected measured-layout table contains a duplicate type".to_owned());
     }
+    validate_compiled_table(&requirements.compiled_types, "expected")?;
     requirements
         .targets
         .sort_by(|left, right| left.name.cmp(&right.name));
@@ -602,6 +694,15 @@ fn validate_open_module(
             &layouts,
         ));
     }
+    let compiled_types = boundary_call("compiled_types", || module.compiled_types())
+        .map_err(|error| error.to_string())?;
+    validate_compiled_table(&compiled_types, "module")?;
+    if compiled_types != requirements.compiled_types {
+        return Err(compiled_type_error(
+            &requirements.compiled_types.rows,
+            &compiled_types.rows,
+        ));
+    }
     let registration = boundary_call("register", || module.register(&requirements.targets))
         .map_err(|error| error.to_string())?;
     validate_registration(&registration, &requirements.targets)?;
@@ -625,6 +726,103 @@ fn measured_layout_error(expected: &[MeasuredLayout], actual: &[MeasuredLayout])
         Some(type_id) => format!("measured layout mismatch for type `{type_id}`"),
         None => "measured layout table mismatch".to_owned(),
     }
+}
+
+fn validate_compiled_table(table: &CompiledTypeTable, role: &str) -> Result<(), String> {
+    validate_compiled_row_order(&table.rows, &format!("{role} compiled-type table"))?;
+    let recomputed = compute_compiled_attestation_digest(&table.rows)?;
+    if recomputed != table.digest {
+        return Err(format!("{role} compiled-type DSCA digest mismatch"));
+    }
+    Ok(())
+}
+
+fn validate_compiled_row_order(
+    rows: &[CompiledTypeAttestation],
+    table_name: &str,
+) -> Result<(), String> {
+    for pair in rows.windows(2) {
+        match pair[0].type_uuid.cmp(&pair[1].type_uuid) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                return Err(format!(
+                    "{table_name} contains duplicate type `{}`",
+                    pair[0].type_uuid
+                ));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(format!(
+                    "{table_name} is not strictly sorted by raw TypeUuid bytes"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compute_compiled_attestation_digest(
+    rows: &[CompiledTypeAttestation],
+) -> Result<CompiledAttestationDigest, String> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| "compiled-type table count exceeds u32".to_owned())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"DSCA");
+    hasher.update(&[1]);
+    hasher.update(&count.to_le_bytes());
+    for row in rows {
+        let extras_len = u32::try_from(row.registry_extras.len()).map_err(|_| {
+            format!(
+                "compiled-type registry extras exceed u32 for type `{}`",
+                row.type_uuid
+            )
+        })?;
+        hasher.update(&row.type_uuid.0);
+        hasher.update(&row.logical_hash.0);
+        hasher.update(&row.native_layout_digest);
+        hasher.update(&[u8::from(row.build_only)]);
+        hasher.update(&extras_len.to_le_bytes());
+        hasher.update(&row.registry_extras);
+    }
+    Ok(CompiledAttestationDigest(*hasher.finalize().as_bytes()))
+}
+
+fn compiled_type_error(
+    expected: &[CompiledTypeAttestation],
+    actual: &[CompiledTypeAttestation],
+) -> String {
+    let expected_by_type = expected
+        .iter()
+        .map(|row| (row.type_uuid, row))
+        .collect::<BTreeMap<_, _>>();
+    let actual_by_type = actual
+        .iter()
+        .map(|row| (row.type_uuid, row))
+        .collect::<BTreeMap<_, _>>();
+    let type_uuid = expected_by_type
+        .keys()
+        .chain(actual_by_type.keys())
+        .find(|type_uuid| expected_by_type.get(type_uuid) != actual_by_type.get(type_uuid));
+    let Some(type_uuid) = type_uuid else {
+        return "compiled-type attestation table mismatch".to_owned();
+    };
+    let (Some(expected), Some(actual)) = (
+        expected_by_type.get(type_uuid),
+        actual_by_type.get(type_uuid),
+    ) else {
+        return format!("compiled-type coverage mismatch for type `{type_uuid}`");
+    };
+    let field = if expected.logical_hash != actual.logical_hash {
+        "logical hash"
+    } else if expected.native_layout_digest != actual.native_layout_digest {
+        "native layout digest"
+    } else if expected.build_only != actual.build_only {
+        "build_only"
+    } else if expected.registry_extras != actual.registry_extras {
+        "registry extras"
+    } else {
+        "row"
+    };
+    format!("compiled-type {field} mismatch for type `{type_uuid}`")
 }
 
 fn validate_registration(
