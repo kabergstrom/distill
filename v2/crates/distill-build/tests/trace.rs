@@ -71,6 +71,31 @@ fn dstr_read_success_bytes_pin_one_based_operation_and_outcome_tags() {
 }
 
 #[test]
+fn dstr_tool_capability_miss_pins_typed_tool_key() {
+    let id = "shaderc".to_owned();
+    let actual = trace_canonical_bytes(&[TraceOp::Tool {
+        id: id.clone(),
+        observed: Observed::Err(StableFailureFingerprint::MissingCapability {
+            key: CapabilityKey::Tool(id.clone()),
+        }),
+    }]);
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"DSTR");
+    expected.push(1); // domain version
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.push(4); // TraceOp::Tool
+    expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    expected.extend_from_slice(id.as_bytes());
+    expected.push(2); // Observed::Err
+    expected.push(6); // StableFailureFingerprint::MissingCapability
+    expected.push(5); // CapabilityKey::Tool
+    expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    expected.extend_from_slice(id.as_bytes());
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn revalidation_compares_labeled_outcomes_in_order() {
     let asset = AssetUuid([1; 16]);
     let hash = ContentHash([2; 32]);

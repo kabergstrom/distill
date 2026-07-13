@@ -59,6 +59,7 @@ pub enum CapabilityKey {
     DefaultTable(TypeUuid),
     Importer(String),
     Processor { input: TypeUuid },
+    Tool(String),
 }
 
 /// Coordinator-private control-plane queries. This is deliberately a
@@ -818,20 +819,24 @@ fn encode_control_failure_subject(e: &mut CanonicalEncoder, subject: &ControlFai
 fn encode_capability(e: &mut CanonicalEncoder, key: &CapabilityKey) {
     match key {
         CapabilityKey::MigrationFn(v) => {
-            e.enum_variant(0);
+            e.enum_variant(1);
             e.str(v);
         }
         CapabilityKey::DefaultTable(v) => {
-            e.enum_variant(1);
+            e.enum_variant(2);
             e.raw(&v.0);
         }
         CapabilityKey::Importer(v) => {
-            e.enum_variant(2);
+            e.enum_variant(3);
             e.str(v);
         }
         CapabilityKey::Processor { input } => {
-            e.enum_variant(3);
+            e.enum_variant(4);
             e.raw(&input.0);
+        }
+        CapabilityKey::Tool(id) => {
+            e.enum_variant(5);
+            e.str(id);
         }
     }
 }

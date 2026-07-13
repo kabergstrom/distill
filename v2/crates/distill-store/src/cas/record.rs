@@ -376,6 +376,7 @@ pub enum CapabilityKey {
     DefaultTable(TypeUuid),
     Importer(String),
     Processor { input: TypeUuid },
+    Tool(String),
 }
 
 /// The class of a deterministic local failure (§9): validator error
@@ -569,20 +570,24 @@ impl ResultPayload {
                                 out.push(5);
                                 match key {
                                     CapabilityKey::MigrationFn(name) => {
-                                        out.push(0);
+                                        out.push(1);
                                         put_bytes(&mut out, name.as_bytes());
                                     }
                                     CapabilityKey::DefaultTable(ty) => {
-                                        out.push(1);
+                                        out.push(2);
                                         out.extend_from_slice(&ty.0);
                                     }
                                     CapabilityKey::Importer(name) => {
-                                        out.push(2);
+                                        out.push(3);
                                         put_bytes(&mut out, name.as_bytes());
                                     }
                                     CapabilityKey::Processor { input } => {
-                                        out.push(3);
+                                        out.push(4);
                                         out.extend_from_slice(&input.0);
+                                    }
+                                    CapabilityKey::Tool(id) => {
+                                        out.push(5);
+                                        put_bytes(&mut out, id.as_bytes());
                                     }
                                 }
                                 break;
@@ -685,12 +690,13 @@ impl ResultPayload {
                                 }
                                 5 => {
                                     let key = match r.u8()? {
-                                        0 => CapabilityKey::MigrationFn(r.string()?),
-                                        1 => CapabilityKey::DefaultTable(TypeUuid(r.array16()?)),
-                                        2 => CapabilityKey::Importer(r.string()?),
-                                        3 => CapabilityKey::Processor {
+                                        1 => CapabilityKey::MigrationFn(r.string()?),
+                                        2 => CapabilityKey::DefaultTable(TypeUuid(r.array16()?)),
+                                        3 => CapabilityKey::Importer(r.string()?),
+                                        4 => CapabilityKey::Processor {
                                             input: TypeUuid(r.array16()?),
                                         },
+                                        5 => CapabilityKey::Tool(r.string()?),
                                         _ => return Err(bad_payload("unknown capability-key tag")),
                                     };
                                     break FailureFingerprint::MissingCapability { key };

@@ -396,6 +396,9 @@ fn failure_outcomes_roundtrip_with_every_fingerprint() {
                 input: TypeUuid([7u8; 16]),
             },
         },
+        FailureFingerprint::MissingCapability {
+            key: CapabilityKey::Tool("shaderc".to_owned()),
+        },
         FailureFingerprint::Local {
             class: LocalFailureClass::Validator,
             detail: [8u8; 32],
@@ -522,7 +525,7 @@ fn failure_cause_and_fingerprint_tag_bytes_are_pinned() {
     let bytes = cap.encode();
     assert_eq!(bytes[10], 1, "cause tag: Local");
     assert_eq!(bytes[11], 5, "fingerprint tag: MissingCapability");
-    assert_eq!(bytes[12], 3, "capability-key tag: Processor");
+    assert_eq!(bytes[12], 4, "capability-key tag: Processor");
     assert_eq!(&bytes[13..29], &[7u8; 16], "the requested input type uuid");
 
     let local = ResultPayload {
