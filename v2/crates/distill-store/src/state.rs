@@ -682,6 +682,7 @@ pub enum VersionPoisonCode {
     SameRootNormalizedPathCollision = 3,
     IncompleteSkeleton = 4,
     UnreadableGlobalBundlePath = 5,
+    InvalidPhysicalPath = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,6 +703,18 @@ pub enum GlobalBundleReadFailureCode {
     InvalidFileType = 2,
     SymlinkIdentityChanged = 3,
     IoDataLoss = 4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum PhysicalPathFailureCode {
+    InvalidUnixUtf8 = 1,
+    UnpairedWindowsUtf16 = 2,
+    Absolute = 3,
+    EmptyComponent = 4,
+    DotComponent = 5,
+    ParentComponent = 6,
+    ForbiddenCharacter = 7,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -760,6 +773,11 @@ pub enum VersionPoisonV1 {
         normalized_path: String,
         failure: GlobalBundleReadFailureCode,
     },
+    InvalidPhysicalPath {
+        root_name: String,
+        raw_relative_path: PlatformPathBytes,
+        failure: PhysicalPathFailureCode,
+    },
 }
 
 /// §7/§13's closed version-global poison record. `identity` commits only to
@@ -811,6 +829,7 @@ impl VersionPoisonV1 {
             Self::UnreadableGlobalBundlePath { .. } => {
                 VersionPoisonCode::UnreadableGlobalBundlePath
             }
+            Self::InvalidPhysicalPath { .. } => VersionPoisonCode::InvalidPhysicalPath,
         }
     }
 }
@@ -871,6 +890,30 @@ impl VersionPoison {
         }
         Self::new(detail, message)
     }
+
+    /// Selects the one authoritative version poison independently of scan
+    /// discovery order. Typed identity is ordered by `(code, canonical
+    /// detail bytes)`; presentation text only resolves an otherwise identical
+    /// typed record so duplicate diagnostics cannot reintroduce ordering.
+    pub fn select_canonical(
+        poisons: impl IntoIterator<Item = Self>,
+    ) -> Result<Option<Self>, VersionPoisonError> {
+        let mut keyed = poisons
+            .into_iter()
+            .map(|poison| {
+                poison.validate()?;
+                let mut detail = CanonicalEncoder::new();
+                encode_version_poison_detail(&mut detail, &poison.detail);
+                Ok(((poison.code as u16, detail.into_bytes()), poison))
+            })
+            .collect::<Result<Vec<_>, VersionPoisonError>>()?;
+        keyed.sort_by(|(left_key, left), (right_key, right)| {
+            left_key
+                .cmp(right_key)
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        Ok(keyed.into_iter().next().map(|(_, poison)| poison))
+    }
 }
 
 impl TryFrom<u16> for VersionPoisonCode {
@@ -882,6 +925,7 @@ impl TryFrom<u16> for VersionPoisonCode {
             3 => Ok(Self::SameRootNormalizedPathCollision),
             4 => Ok(Self::IncompleteSkeleton),
             5 => Ok(Self::UnreadableGlobalBundlePath),
+            6 => Ok(Self::InvalidPhysicalPath),
             other => Err(VersionPoisonError::UnknownCode(other)),
         }
     }
@@ -1000,6 +1044,28 @@ impl<'a> VersionPoisonDecoder<'a> {
             .collect()
     }
 
+    fn platform_path(&mut self) -> Result<PlatformPathBytes, VersionPoisonError> {
+        match self.u8()? {
+            1 => {
+                let len =
+                    usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+                Ok(PlatformPathBytes::Unix(self.take(len)?.to_vec()))
+            }
+            2 => {
+                let count =
+                    usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+                if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
+                    return Err(VersionPoisonError::Truncated);
+                }
+                let units = (0..count)
+                    .map(|_| self.u16())
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PlatformPathBytes::Windows(units))
+            }
+            other => Err(VersionPoisonError::UnknownPlatformPathTag(other)),
+        }
+    }
+
     fn detail(&mut self, code: VersionPoisonCode) -> Result<VersionPoisonV1, VersionPoisonError> {
         Ok(match code {
             VersionPoisonCode::DuplicateAssetUuid => VersionPoisonV1::DuplicateAssetUuid {
@@ -1042,6 +1108,20 @@ impl<'a> VersionPoisonDecoder<'a> {
                     },
                 }
             }
+            VersionPoisonCode::InvalidPhysicalPath => VersionPoisonV1::InvalidPhysicalPath {
+                root_name: self.string()?,
+                raw_relative_path: self.platform_path()?,
+                failure: match self.u16()? {
+                    1 => PhysicalPathFailureCode::InvalidUnixUtf8,
+                    2 => PhysicalPathFailureCode::UnpairedWindowsUtf16,
+                    3 => PhysicalPathFailureCode::Absolute,
+                    4 => PhysicalPathFailureCode::EmptyComponent,
+                    5 => PhysicalPathFailureCode::DotComponent,
+                    6 => PhysicalPathFailureCode::ParentComponent,
+                    7 => PhysicalPathFailureCode::ForbiddenCharacter,
+                    other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                },
+            },
         })
     }
 }
@@ -1087,6 +1167,15 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
             encoder.str(normalized_path);
             encoder.u16(*failure as u16);
         }
+        VersionPoisonV1::InvalidPhysicalPath {
+            root_name,
+            raw_relative_path,
+            failure,
+        } => {
+            encoder.str(root_name);
+            encode_platform_path(encoder, raw_relative_path);
+            encoder.u16(*failure as u16);
+        }
     }
 }
 
@@ -1111,7 +1200,12 @@ fn encode_asset_claimant(encoder: &mut CanonicalEncoder, claimant: &AssetClaiman
 }
 
 fn encode_physical_path_claim(encoder: &mut CanonicalEncoder, claim: &PhysicalPathClaim) {
-    match &claim.raw_relative_path {
+    encode_platform_path(encoder, &claim.raw_relative_path);
+    encoder.raw(&claim.file_hash.0);
+}
+
+fn encode_platform_path(encoder: &mut CanonicalEncoder, path: &PlatformPathBytes) {
+    match path {
         PlatformPathBytes::Unix(bytes) => {
             encoder.u8(1);
             encoder.u32(u32::try_from(bytes.len()).expect("raw Unix path exceeds u32 length"));
@@ -1125,7 +1219,6 @@ fn encode_physical_path_claim(encoder: &mut CanonicalEncoder, claim: &PhysicalPa
             }
         }
     }
-    encoder.raw(&claim.file_hash.0);
 }
 
 fn encode_bundle_sources(encoder: &mut CanonicalEncoder, sources: &[ReadableBundleSource]) {
@@ -1189,6 +1282,9 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
         } => {
             validate_root_and_path(root_name, normalized_path)?;
         }
+        VersionPoisonV1::InvalidPhysicalPath { root_name, .. } => {
+            validate_root_name(root_name)?;
+        }
     }
     Ok(())
 }
@@ -1244,6 +1340,11 @@ fn validate_root_and_path(
     root_name: &str,
     normalized_path: &str,
 ) -> Result<(), VersionPoisonError> {
+    validate_root_name(root_name)?;
+    validate_normalized_path(normalized_path)
+}
+
+fn validate_root_name(root_name: &str) -> Result<(), VersionPoisonError> {
     use unicode_normalization::UnicodeNormalization;
 
     if root_name.is_empty()
@@ -1252,7 +1353,7 @@ fn validate_root_and_path(
     {
         return Err(VersionPoisonError::InvalidRootName);
     }
-    validate_normalized_path(normalized_path)
+    Ok(())
 }
 
 fn validate_normalized_path(normalized_path: &str) -> Result<(), VersionPoisonError> {

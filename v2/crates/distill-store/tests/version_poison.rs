@@ -1,8 +1,8 @@
 use distill_core::canonical::{CanonicalEncoder, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::state::{
-    AssetClaimant, PhysicalPathClaim, PlatformPathBytes, ReadableBundleSource, VersionPoison,
-    VersionPoisonCode, VersionPoisonError, VersionPoisonV1,
+    AssetClaimant, PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes,
+    ReadableBundleSource, VersionPoison, VersionPoisonCode, VersionPoisonError, VersionPoisonV1,
 };
 
 fn source(root: &str, path: &str, byte: u8) -> ReadableBundleSource {
@@ -112,5 +112,121 @@ fn same_root_path_collision_retains_lossless_distinct_physical_names() {
     assert_eq!(
         VersionPoison::from_persisted_bytes(&poison.persisted_bytes().unwrap()).unwrap(),
         poison
+    );
+}
+
+#[test]
+fn invalid_physical_path_retains_raw_bytes_and_fixed_failure_code() {
+    assert_eq!(VersionPoisonCode::InvalidPhysicalPath as u16, 6);
+    assert_eq!(PhysicalPathFailureCode::InvalidUnixUtf8 as u16, 1);
+    assert_eq!(PhysicalPathFailureCode::UnpairedWindowsUtf16 as u16, 2);
+    assert_eq!(PhysicalPathFailureCode::Absolute as u16, 3);
+    assert_eq!(PhysicalPathFailureCode::EmptyComponent as u16, 4);
+    assert_eq!(PhysicalPathFailureCode::DotComponent as u16, 5);
+    assert_eq!(PhysicalPathFailureCode::ParentComponent as u16, 6);
+    assert_eq!(PhysicalPathFailureCode::ForbiddenCharacter as u16, 7);
+
+    let poison = VersionPoison::new(
+        VersionPoisonV1::InvalidPhysicalPath {
+            root_name: "main".into(),
+            raw_relative_path: PlatformPathBytes::Unix(vec![b'b', 0xff]),
+            failure: PhysicalPathFailureCode::InvalidUnixUtf8,
+        },
+        "invalid physical name",
+    )
+    .unwrap();
+    assert_eq!(poison.code, VersionPoisonCode::InvalidPhysicalPath);
+
+    let encoded = poison.persisted_bytes().unwrap();
+    assert_eq!(
+        VersionPoison::from_persisted_bytes(&encoded).unwrap(),
+        poison
+    );
+
+    let mut expected_identity = CanonicalEncoder::new();
+    expected_identity.raw(&DSVP);
+    expected_identity.u8(1);
+    expected_identity.u16(6);
+    expected_identity.str("main");
+    expected_identity.u8(1); // Unix
+    expected_identity.u32(2);
+    expected_identity.raw(&[b'b', 0xff]);
+    expected_identity.u16(1); // InvalidUnixUtf8
+    assert_eq!(
+        poison.identity,
+        *blake3::hash(&expected_identity.into_bytes()).as_bytes()
+    );
+}
+
+#[test]
+fn canonical_winner_is_independent_of_discovery_order() {
+    let invalid_path = VersionPoison::new(
+        VersionPoisonV1::InvalidPhysicalPath {
+            root_name: "main".into(),
+            raw_relative_path: PlatformPathBytes::Windows(vec![0xd800]),
+            failure: PhysicalPathFailureCode::UnpairedWindowsUtf16,
+        },
+        "invalid path",
+    )
+    .unwrap();
+    let incomplete = VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: source("main", "broken.bundle", 7),
+            failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
+        },
+        "incomplete",
+    )
+    .unwrap();
+
+    let forward = VersionPoison::select_canonical(vec![invalid_path.clone(), incomplete.clone()])
+        .unwrap()
+        .unwrap();
+    let reverse = VersionPoison::select_canonical(vec![incomplete.clone(), invalid_path])
+        .unwrap()
+        .unwrap();
+    assert_eq!(forward, incomplete);
+    assert_eq!(reverse, incomplete);
+
+    let lexicographically_later = VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: source("main", "z.bundle", 1),
+            failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
+        },
+        "z",
+    )
+    .unwrap();
+    let lexicographically_first = VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: source("main", "a.bundle", 9),
+            failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
+        },
+        "a",
+    )
+    .unwrap();
+    assert_eq!(
+        VersionPoison::select_canonical(vec![
+            lexicographically_later,
+            lexicographically_first.clone(),
+        ])
+        .unwrap(),
+        Some(lexicographically_first)
+    );
+}
+
+#[test]
+fn invalid_physical_path_rejects_unknown_failure_code() {
+    let mut encoded = CanonicalEncoder::new();
+    encoded.raw(&DSVP);
+    encoded.u8(1);
+    encoded.u16(VersionPoisonCode::InvalidPhysicalPath as u16);
+    encoded.str("main");
+    encoded.u8(1); // Unix
+    encoded.u32(1);
+    encoded.raw(b"x");
+    encoded.u16(8); // not a PhysicalPathFailureCode
+    encoded.str("diagnostic");
+    assert_eq!(
+        VersionPoison::from_persisted_bytes(&encoded.into_bytes()).unwrap_err(),
+        VersionPoisonError::UnknownFailureCode(8)
     );
 }
