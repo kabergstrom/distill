@@ -2,7 +2,8 @@ use distill_core::canonical::{CanonicalEncoder, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::state::{
     AssetClaimant, PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes,
-    ReadableBundleSource, VersionPoison, VersionPoisonCode, VersionPoisonError, VersionPoisonV1,
+    ReadableBundleSource, ScanFailureCode, ScanSubject, VersionPoison, VersionPoisonCode,
+    VersionPoisonError, VersionPoisonV1,
 };
 
 fn source(root: &str, path: &str, byte: u8) -> ReadableBundleSource {
@@ -339,4 +340,155 @@ fn invalid_physical_path_recomputes_lowest_applicable_platform_failure() {
         .unwrap_err(),
         VersionPoisonError::InvalidRawPath
     );
+}
+
+#[test]
+fn unreadable_scan_subtree_pins_closed_subject_and_failure_encodings() {
+    assert_eq!(VersionPoisonCode::UnreadableScanSubtree as u16, 7);
+    assert_eq!(ScanFailureCode::PermissionDenied as u16, 1);
+    assert_eq!(ScanFailureCode::NotFound as u16, 2);
+    assert_eq!(ScanFailureCode::InvalidFileType as u16, 3);
+    assert_eq!(ScanFailureCode::SymlinkIdentityChanged as u16, 4);
+    assert_eq!(ScanFailureCode::IoDataLoss as u16, 5);
+
+    let root = VersionPoison::new(
+        VersionPoisonV1::UnreadableScanSubtree {
+            subject: ScanSubject::Root {
+                root_name: "main".into(),
+            },
+            failure: ScanFailureCode::PermissionDenied,
+        },
+        "cannot enumerate root",
+    )
+    .unwrap();
+    let mut expected = CanonicalEncoder::new();
+    expected.raw(&DSVP);
+    expected.u8(1);
+    expected.u16(7);
+    expected.u8(1); // ScanSubject::Root
+    expected.str("main");
+    expected.u16(1); // PermissionDenied
+    assert_eq!(
+        root.identity,
+        *blake3::hash(&expected.into_bytes()).as_bytes()
+    );
+
+    let failures = [
+        ScanFailureCode::PermissionDenied,
+        ScanFailureCode::NotFound,
+        ScanFailureCode::InvalidFileType,
+        ScanFailureCode::SymlinkIdentityChanged,
+        ScanFailureCode::IoDataLoss,
+    ];
+    let subjects = [
+        ScanSubject::Root {
+            root_name: "main".into(),
+        },
+        ScanSubject::Subtree {
+            root_name: "main".into(),
+            raw_relative_path: PlatformPathBytes::Unix(b"assets/nested".to_vec()),
+        },
+        ScanSubject::Subtree {
+            root_name: "main".into(),
+            raw_relative_path: PlatformPathBytes::Windows(
+                "assets\\nested".encode_utf16().collect(),
+            ),
+        },
+    ];
+    for subject in subjects {
+        for failure in failures {
+            let poison = VersionPoison::new(
+                VersionPoisonV1::UnreadableScanSubtree {
+                    subject: subject.clone(),
+                    failure,
+                },
+                "scan failed",
+            )
+            .unwrap();
+            assert_eq!(poison.code, VersionPoisonCode::UnreadableScanSubtree);
+            assert_eq!(
+                VersionPoison::from_persisted_bytes(&poison.persisted_bytes().unwrap()).unwrap(),
+                poison
+            );
+        }
+    }
+}
+
+#[test]
+fn unreadable_scan_subtree_rejects_open_tags_and_failure_codes() {
+    let mut unknown_subject = CanonicalEncoder::new();
+    unknown_subject.raw(&DSVP);
+    unknown_subject.u8(1);
+    unknown_subject.u16(VersionPoisonCode::UnreadableScanSubtree as u16);
+    unknown_subject.u8(3);
+    assert_eq!(
+        VersionPoison::from_persisted_bytes(&unknown_subject.into_bytes()).unwrap_err(),
+        VersionPoisonError::UnknownScanSubjectTag(3)
+    );
+
+    let mut unknown_failure = CanonicalEncoder::new();
+    unknown_failure.raw(&DSVP);
+    unknown_failure.u8(1);
+    unknown_failure.u16(VersionPoisonCode::UnreadableScanSubtree as u16);
+    unknown_failure.u8(1);
+    unknown_failure.str("main");
+    unknown_failure.u16(6);
+    unknown_failure.str("diagnostic");
+    assert_eq!(
+        VersionPoison::from_persisted_bytes(&unknown_failure.into_bytes()).unwrap_err(),
+        VersionPoisonError::UnknownFailureCode(6)
+    );
+}
+
+#[test]
+fn unreadable_scan_subtree_accepts_only_valid_relative_raw_paths() {
+    let invalid = [
+        PlatformPathBytes::Unix(b"../outside".to_vec()),
+        PlatformPathBytes::Unix(vec![b'x', 0xff]),
+        PlatformPathBytes::Windows("C:\\absolute".encode_utf16().collect()),
+        PlatformPathBytes::Windows(vec![0xd800]),
+    ];
+    for raw_relative_path in invalid {
+        assert_eq!(
+            VersionPoison::new(
+                VersionPoisonV1::UnreadableScanSubtree {
+                    subject: ScanSubject::Subtree {
+                        root_name: "main".into(),
+                        raw_relative_path,
+                    },
+                    failure: ScanFailureCode::IoDataLoss,
+                },
+                "invalid subject",
+            )
+            .unwrap_err(),
+            VersionPoisonError::InvalidRawPath
+        );
+    }
+}
+
+#[test]
+fn unreadable_scan_subtree_identity_and_dedup_include_exact_subject_and_failure() {
+    let poison = |path: &[u8], failure| {
+        VersionPoison::new(
+            VersionPoisonV1::UnreadableScanSubtree {
+                subject: ScanSubject::Subtree {
+                    root_name: "main".into(),
+                    raw_relative_path: PlatformPathBytes::Unix(path.to_vec()),
+                },
+                failure,
+            },
+            "scan failed",
+        )
+        .unwrap()
+    };
+    let first = poison(b"a", ScanFailureCode::NotFound);
+    let duplicate = VersionPoison::new(first.detail.clone(), "different prose").unwrap();
+    let different_path = poison(b"b", ScanFailureCode::NotFound);
+    let different_failure = poison(b"a", ScanFailureCode::PermissionDenied);
+    assert_ne!(first.identity, different_path.identity);
+    assert_ne!(first.identity, different_failure.identity);
+    let canonical =
+        VersionPoison::canonical_set([different_path, duplicate, different_failure, first])
+            .unwrap();
+    assert_eq!(canonical.len(), 3);
 }

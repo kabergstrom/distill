@@ -1156,6 +1156,7 @@ pub enum VersionPoisonCode {
     IncompleteSkeleton = 4,
     UnreadableGlobalBundlePath = 5,
     InvalidPhysicalPath = 6,
+    UnreadableScanSubtree = 7,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1190,6 +1191,16 @@ pub enum PhysicalPathFailureCode {
     ForbiddenCharacter = 7,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ScanFailureCode {
+    PermissionDenied = 1,
+    NotFound = 2,
+    InvalidFileType = 3,
+    SymlinkIdentityChanged = 4,
+    IoDataLoss = 5,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReadableBundleSource {
     pub root_name: String,
@@ -1214,6 +1225,17 @@ pub enum AssetClaimant {
 pub enum PlatformPathBytes {
     Unix(Vec<u8>),
     Windows(Vec<u16>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScanSubject {
+    Root {
+        root_name: String,
+    },
+    Subtree {
+        root_name: String,
+        raw_relative_path: PlatformPathBytes,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1251,6 +1273,10 @@ pub enum VersionPoisonV1 {
         raw_relative_path: PlatformPathBytes,
         failure: PhysicalPathFailureCode,
     },
+    UnreadableScanSubtree {
+        subject: ScanSubject,
+        failure: ScanFailureCode,
+    },
 }
 
 /// §7/§13's closed version-global poison record. `identity` commits only to
@@ -1270,6 +1296,7 @@ pub enum VersionPoisonError {
     UnknownFailureCode(u16),
     UnknownClaimantTag(u8),
     UnknownPlatformPathTag(u8),
+    UnknownScanSubjectTag(u8),
     Truncated,
     TrailingBytes,
     InvalidUtf8,
@@ -1303,6 +1330,7 @@ impl VersionPoisonV1 {
                 VersionPoisonCode::UnreadableGlobalBundlePath
             }
             Self::InvalidPhysicalPath { .. } => VersionPoisonCode::InvalidPhysicalPath,
+            Self::UnreadableScanSubtree { .. } => VersionPoisonCode::UnreadableScanSubtree,
         }
     }
 }
@@ -1409,6 +1437,7 @@ impl TryFrom<u16> for VersionPoisonCode {
             4 => Ok(Self::IncompleteSkeleton),
             5 => Ok(Self::UnreadableGlobalBundlePath),
             6 => Ok(Self::InvalidPhysicalPath),
+            7 => Ok(Self::UnreadableScanSubtree),
             other => Err(VersionPoisonError::UnknownCode(other)),
         }
     }
@@ -1586,6 +1615,26 @@ impl<'a> VersionPoisonDecoder<'a> {
                     other => return Err(VersionPoisonError::UnknownFailureCode(other)),
                 },
             },
+            VersionPoisonCode::UnreadableScanSubtree => VersionPoisonV1::UnreadableScanSubtree {
+                subject: match self.u8()? {
+                    1 => ScanSubject::Root {
+                        root_name: self.string()?,
+                    },
+                    2 => ScanSubject::Subtree {
+                        root_name: self.string()?,
+                        raw_relative_path: self.platform_path()?,
+                    },
+                    other => return Err(VersionPoisonError::UnknownScanSubjectTag(other)),
+                },
+                failure: match self.u16()? {
+                    1 => ScanFailureCode::PermissionDenied,
+                    2 => ScanFailureCode::NotFound,
+                    3 => ScanFailureCode::InvalidFileType,
+                    4 => ScanFailureCode::SymlinkIdentityChanged,
+                    5 => ScanFailureCode::IoDataLoss,
+                    other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                },
+            },
         })
     }
 }
@@ -1638,6 +1687,23 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
         } => {
             encoder.str(root_name);
             encode_platform_path(encoder, raw_relative_path);
+            encoder.u16(*failure as u16);
+        }
+        VersionPoisonV1::UnreadableScanSubtree { subject, failure } => {
+            match subject {
+                ScanSubject::Root { root_name } => {
+                    encoder.u8(1);
+                    encoder.str(root_name);
+                }
+                ScanSubject::Subtree {
+                    root_name,
+                    raw_relative_path,
+                } => {
+                    encoder.u8(2);
+                    encoder.str(root_name);
+                    encode_platform_path(encoder, raw_relative_path);
+                }
+            }
             encoder.u16(*failure as u16);
         }
     }
@@ -1756,6 +1822,18 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
                 return Err(VersionPoisonError::InvalidRawPath);
             }
         }
+        VersionPoisonV1::UnreadableScanSubtree { subject, .. } => match subject {
+            ScanSubject::Root { root_name } => validate_root_name(root_name)?,
+            ScanSubject::Subtree {
+                root_name,
+                raw_relative_path,
+            } => {
+                validate_root_name(root_name)?;
+                if classify_invalid_physical_path(raw_relative_path).is_some() {
+                    return Err(VersionPoisonError::InvalidRawPath);
+                }
+            }
+        },
     }
     Ok(())
 }
