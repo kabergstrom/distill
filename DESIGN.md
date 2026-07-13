@@ -62,10 +62,12 @@ This invariant governs the whole design:
    file-tracking state. Fully derived from (1) + (2). Never committed to
    version control. `rm -rf .distill/` costs a rebuild, never content or
    migration direction: the durable lineage manifest is rescanned before any
-   schema-dependent work. Bundle lineage stamps are independently verifiable
-   snapshots of an accepted manifest prefix, useful for detecting corruption
-   and diagnosing stale data, but they are not authority for accepting a new
-   epoch. If the manifest is absent after state loss, no observed bundle,
+   schema-dependent work. Non-bootstrap bundle lineage stamps are independently
+   verifiable snapshots of an accepted manifest prefix, useful for detecting
+   corruption and diagnosing stale data, but they are not authority for
+   accepting a new epoch. The exact five format-bootstrap control types use
+   their sealed `EntryLineageV1::Bootstrap` arm instead (§6). If the manifest
+   is absent after state loss, no observed bundle,
    registry head, or matching hash constitutes forward proof; the type
    hard-stops until its accepted history is restored through the explicit
    repair/acceptance controls.
@@ -288,8 +290,8 @@ that one file, so a dependent `.so`/`.dylib`/DLL loaded at runtime could
 change while every cache key stayed put. Runtime `dlopen` by pipeline
 code is therefore **banned outright**: there is deliberately no staged-
 library resolution/open API. Anything dynamic is a §9 tool subprocess
-invoked through `run_tool`, whose executable is staged and hashed through
-the content-addressed ToolEpoch mechanism. (The daemon module host's own
+invoked through `run_tool`, whose complete hermetic execution closure is
+staged and hashed as a content-addressed `ToolExecutionCapsule` (§9). (The daemon module host's own
 staged `dlopen` of the pipeline cdylib above is the hosting boundary, not
 pipeline code.) The system runtime (libc, libSystem)
 is acknowledged as part of `CompilationIdentity`'s (target, rustc) pair
@@ -524,14 +526,25 @@ pub struct BootstrapControlTableV1(pub [CompiledTypeRow; 5]);
 /// encoded_type and terminal_type } UNION { every expected_terminal on every
 /// load-dependency edge } UNION { the five bootstrap TypeUuids }`.
 ///
-/// Rows are deduplicated by raw TypeUuid, strictly sorted, and DSCA and DSLP
-/// are recomputed over exactly `B(C)`. For a pack, `C` is the complete pack
-/// manifest closure. For RPC, `C` is the client's declared/held runtime
-/// manifest closure; connect and reattest requests project the local registry
-/// to exactly `B(C)`, and RpcIO expands/reconnects or reattests before admitting
-/// a newly requested closure whose `B(C)` is larger. The server independently
-/// derives the same set for every closure it resolves or serves and rejects
-/// data whose required set is not exactly covered by the accepted projection.
+/// Rows are deduplicated by raw TypeUuid and strictly sorted. For a pack, `C`
+/// is the complete pack manifest closure and DSCA/DSLP are recomputed over
+/// exactly `B(C)`. RPC instead binds a canonical **accepted superset** `A`:
+/// connect and reattest carry one complete CompiledTypeRow and load-policy row
+/// for every TypeUuid in `A`, including the five bootstrap types, with no row
+/// outside `A`; both lists are raw-TypeUuid sorted/unique and their DSCA/DSLP
+/// are recomputed over exactly `A`. The server verifies every submitted row
+/// against its pinned daemon compiled table before a Hub can bind `A`.
+///
+/// Before serving any resolve, artifact fetch, entry, manifest, or wire-tree
+/// closure `served`, the server independently derives its actual `B(served)`
+/// from verified metadata/artifact bytes and requires `B(served) subset A`.
+/// If not, it returns `AttestationExpansionRequired` with the pinned snapshot,
+/// canonical closure identity, and exactly the raw-TypeUuid-sorted set
+/// `B(served) \ A`, and exposes no artifact bytes or nested capability. The
+/// client reattests `A union required` and retries the same operation. A
+/// changed daemon projection for a row already in `A` is instead
+/// `CompiledAttestationChanged`; ordinary expansion never uses that reason.
+/// Packs remain exact-`B(C)` boundaries and have no accepted-superset rule.
 /// Authored policy types are included even when processing changes the encoded
 /// or terminal type, so `build_only` on an authored `A -> B` asset cannot be
 /// laundered by shipping only B.
@@ -627,13 +640,12 @@ impl Registry {
     pub fn defaults<T: AssetType>(&mut self, table: &'static DefaultTable<T>)
         -> RegistrationStatus;
     /// Tool registry behind ctx.run_tool (§9). Registration is an input
-    /// event: the daemon stages a content-addressed COPY of the
-    /// executable under daemon state and publishes (id → staged path +
-    /// hash) as input-versioned ToolEpoch state (§9, §13) — jobs resolve
-    /// the tool through their pinned snapshot and execute the staged
-    /// copy, never this live path, so a snapshot's tool bytes are as
-    /// immutable as its other inputs.
-    pub fn tool(&mut self, id: &str, exe: PathBuf) -> RegistrationStatus;
+    /// event: the daemon resolves, stages, and verifies the complete
+    /// ToolExecutionCapsule closure and publishes (id → capsule object +
+    /// DSCT hash) as input-versioned state (§9, §13) — jobs resolve the
+    /// tool through their pinned snapshot and launch only that capsule,
+    /// never this live path or an ambient dependency.
+    pub fn tool(&mut self, id: &str, spec: ToolRegistration) -> RegistrationStatus;
 }
 
 /// Generated by #[asset], never hand-written. `parent` is present iff
@@ -1059,6 +1071,8 @@ spec defect, since that is how two meanings come to share bytes:
 | `"DSNL"` | measured native-layout digest — native tree, table ids excluded (§12) |
 | `"DSRE"` | one type's canonical RegistryExtras v1 row table (§3, §5) |
 | `"DSCA"` | compiled per-type attestation aggregate — sorted TypeUuid/logical hash/DSNL/build_only/RegistryExtras v1 projection (§3, §5, §§15–17) |
+| `"DSAE"` | RPC served-closure identity in `AttestationExpansionRequired` — pinned snapshot/request subject plus verified canonical closure rows (§3, §§15, §17) |
+| `"DSCT"` | complete hermetic `ToolExecutionCapsule` identity — staged bytes, launch closure/metadata, sanitized environment, cwd policy, and platform/runtime declaration (§9, §13) |
 | `"DSWL"` | layout hash — the wire tree (§12) |
 | `"DSFT"` | fixup-table identity — the measured digest extended with the binary's generated-table assignment (§5, §12) |
 | `"DSSI"` | static-input key (§9) |
@@ -1375,7 +1389,8 @@ domainless because their meaning is byte equality rather than a semantic
 record: `ContentHash` over complete DSTL artifact bytes; tracked raw-file and
 `BundleFileHash` values over the exact observed file bytes, whether valid or
 malformed (canonical bundle validation is independent); staged pipeline-
-dylib and tool hashes over the executable bytes; CAS record
+dylib hashes over the executable bytes; each `ToolCapsuleFile.bytes_hash` over
+that exact staged member's bytes (the DSCT aggregate remains semantic); CAS record
 `content_hash` values over payload bytes; and pack/archive per-file
 trailers and archive-reference file hashes over the preceding/full named
 file bytes as §16 specifies. This list is closed: a new domainless digest
@@ -1696,8 +1711,9 @@ tree per type, backrefs for recursion); re-deriving a hash re-encodes the
 decoded AST to this grammar, so verification needs no other input — and a
 snapshot's content is **exactly** what its hash covers, nothing unhashed
 rides along (tag markers live in the current registry, never in snapshots,
-§10; the lineage stamp is entry metadata *beside* `schema_hash`, §6 —
-direction rides in the file without entering snapshot content). The
+§10; `EntryLineageV1` is entry metadata *beside* `schema_hash`, §6 —
+the manifest arm carries user-lineage direction while the closed bootstrap arm
+binds format control facts, neither entering snapshot content). The
 snapshot is the *projection*, not the model record: embedding
 `TypeDef`s would carry paths, layout tables, and walk-scoped
 `SchemaTypeId`s — bytes the hash deliberately excludes, riding along
@@ -1882,7 +1898,7 @@ artifact format's `DSTL` (§12).
 | `uuid` | string | This asset's stable UUID, explicit in the file |
 | `type_uuid` | string | Asset type UUID |
 | `schema_hash` | string | Logical hash the entry was last written with |
-| `lineage` | object | The entry's verifiable **lineage stamp** (`LineageStamp`, below): an accepted manifest prefix, explicit parent links, the writing cursor, and its `"DSSL"` commitment. It diagnoses and proves ancestry against the durable manifest but never accepts an epoch by itself (§2, §11, §13). |
+| `lineage` | object | The closed `EntryLineageV1` sum below. Non-bootstrap entries carry a verifiable manifest stamp; the exact five format-bootstrap control types carry the sealed format-version arm. |
 | `authoring_only` | bool | Per-entry role. `true` entries are visible only to an explicit authoring-tool query, never eligible as `primary`, runtime query results, processor inputs, references, pack roots, or shipped pack members. |
 | `data` | object | Field values (JSON mapping as in v1: primitives, arrays, objects, enum `{ "Variant": {…} }`, refs per §4) |
 | `blobs` | — | `#[asset(blob)]` fields; only in container encoding |
@@ -1902,10 +1918,45 @@ pub struct AssetEntry {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
     pub schema_hash: LogicalHash,
-    pub lineage: LineageStamp,
+    pub lineage: EntryLineageV1,
     pub authoring_only: bool,
     pub data: AuthoredValue,
 }
+
+/// Closed entry-lineage carrier. Its canonical record encoding is
+/// `version:u8=1 || tag:u8 || payload`, with `Manifest=1` followed by the
+/// canonical LineageStamp record and `Bootstrap=2` followed by
+/// `bundle_format_version:u32-LE`; unknown versions/tags and trailing bytes
+/// reject. Canonical JSON is exactly the one-member object
+/// `{ "manifest": <LineageStamp> }` or
+/// `{ "bootstrap": { "bundle_format_version": 1 } }`; those lowercase keys,
+/// the nested key, and the numeric value are literal, and aliases, additional
+/// members, or the wrong arm reject.
+#[repr(u8)]
+pub enum EntryLineageV1 {
+    Manifest(LineageStamp) = 1,
+    Bootstrap { bundle_format_version: u32 } = 2,
+}
+
+`EntryLineageV1::Bootstrap` is legal and mandatory iff `type_uuid` is one of
+the five closed `BootstrapControlTableV1` TypeUuids: `SchemaLineageManifest`,
+`Migration`, `ImportRecord`, `DirectoryImportRules`, or `PackDefinition`.
+It requires both the enclosing bundle and arm to say format version 1,
+`schema_hash` to equal that type's sealed table-row DSLH, and the bundle's
+`schemas[schema_hash]` canonical logical graph to equal the DSB-sealed logical
+graph, not merely hash to caller-supplied bytes. It also enforces that type's
+closed control role and namespace rules (including `authoring_only = true`,
+`$record` only for `ImportRecord`, and every type-specific control-value
+invariant). Bootstrap entries never consult `SchemaLineageManifest`, never
+become its type rows, and never enter user lineage comparison or migration.
+
+`EntryLineageV1::Manifest` is legal and mandatory for every other TypeUuid.
+Its stamp must validate as the exact accepted manifest prefix, parent graph,
+cursor, schema equality, and DSSL commitment described below. Entry decode,
+bundle schema-closure validation, scanner publication, adoption, importer and
+editor/RPC writes, disk migration, repair validation, and every `ControlRead`
+all call this same arm/type validator; none may accept a bootstrap type with a
+manifest stamp or a non-bootstrap type with the bootstrap arm.
 
 /// A verifiable snapshot beside every `schema_hash` (§11). `epochs` is an
 /// exact prefix of the durable manifest's append-only epoch vector, including
@@ -2049,8 +2100,12 @@ exact, descriptor-relatively reopens the destination, requires its
 `Absent|Occupied { file_hash, kind }` state to match byte-for-byte, and checks
 that no manifest claimant has appeared. It validates the proposed bytes as one
 canonical bundle containing a built-in `SchemaLineageManifest` entry marked
-`authoring_only`; the manifest's canonical type map and every lineage record
-must validate, and bootstrap-control TypeUuids are forbidden.
+`authoring_only` whose lineage is the required
+`EntryLineageV1::Bootstrap { bundle_format_version: 1 }`; the entry's sealed
+schema facts/control role and the manifest's canonical non-bootstrap type map
+and lineage records must validate, and bootstrap-control TypeUuids remain
+forbidden from that `types` map. Thus the first manifest is installable while
+authority is absent without inventing a self-referential user-lineage stamp.
 
 For an `Absent` basis it journals an atomic **no-replace** creation. For an
 occupied canonical bundle it requires the replacement to preserve every
@@ -2072,7 +2127,8 @@ made unrecoverable.
 one explicit user-selected survivor whose entire claimant tuple must be an
 exact member. The coordinator reopens every named physical file, validates
 all exact `BundleFileHash` preimages and the survivor's canonical built-in,
-authoring-only, non-bootstrap manifest, and stales without mutation on any
+authoring-only manifest with required format-v1 bootstrap lineage and a
+bootstrap-free `types` map, and stales without mutation on any
 instance/stamp/state/claimant/byte drift. It then journals removal of every
 non-surviving manifest claimant: a file containing no retained entries is
 renamed no-replace into its per-filesystem quarantine, while a file sharing
@@ -3165,8 +3221,92 @@ pub struct ToolOutput { pub status: i32, pub stdout: Vec<u8>, pub stderr: Vec<u8
 `run_tool` is the **only** dynamic-execution carrier available to
 pipeline code. Runtime `dlopen` is forbidden in importers, processors,
 validators, migrations, and default materializers, and no API resolves a
-ToolEpoch entry to a library path or handle; code that must vary outside
-the statically linked pipeline cdylib runs as the staged §9 subprocess.
+tool entry to a library path or handle; code that must vary outside the
+statically linked pipeline cdylib runs as the staged §9 subprocess.
+
+Tool identity is the complete hermetic execution closure, not the launcher
+file alone:
+
+```rust
+pub struct ToolRegistration {
+    pub launcher: PathBuf,
+    pub declared_resources: Vec<ToolResourceDeclaration>,
+    pub plugins: Vec<ToolResourceDeclaration>,
+    pub environment: Vec<(String, String)>,
+    pub cwd_policy: ToolCwdPolicy,
+    pub platform: ToolPlatformBinding,
+}
+pub struct ToolResourceDeclaration {
+    pub source: PathBuf,
+    pub capsule_path: String,
+}
+pub struct ToolExecutionCapsuleV1 {
+    pub files: Vec<ToolCapsuleFile>,
+    pub resolved_interpreter: Option<String>, // canonical capsule path
+    pub launch: ToolLaunchMetadataV1,
+    pub environment: Vec<(String, String)>,
+    pub cwd_policy: ToolCwdPolicy,
+    pub platform: ToolPlatformBinding,
+}
+#[repr(u8)]
+pub enum ToolCapsuleFileRole {
+    Launcher = 1, Interpreter = 2, NonSystemDso = 3,
+    Plugin = 4, DeclaredResource = 5,
+}
+pub struct ToolCapsuleFile {
+    pub path: String, pub role: ToolCapsuleFileRole,
+    pub executable: bool, pub len: u64, pub bytes_hash: [u8; 32],
+}
+#[repr(u8)]
+pub enum ToolCwdPolicy {
+    EmptyScratch = 1, ReadOnlyCapsuleRoot = 2,
+    ReadOnlyDeclaredSubdir(String) = 3,
+}
+#[repr(u8)]
+pub enum ToolPlatformBinding {
+    Pinned { platform_id: String, system_runtime_id: String } = 1,
+    ExplicitResidual { platform_id: String,
+                       system_runtime_class: String } = 2,
+}
+pub struct ToolLaunchMetadataV1 {
+    pub argv0: String,                 // canonical capsule path
+    pub interpreter_args: Vec<String>, // shebang/loader arguments
+}
+pub struct ToolExecutionCapsule {
+    pub object: ToolExecutionCapsuleV1,
+    pub hash: [u8; 32],                // DSCT aggregate below
+}
+```
+
+Registration resolves the launcher or script bytes, its resolved interpreter,
+the complete executable non-system DSO closure, every declared plugin and
+resource byte, and executable mode/launch metadata before publication. Capsule
+paths are NFC UTF-8 with `/`, relative, traversal-free, unique, and sorted by
+`(path bytes, role)`; each `bytes_hash` is raw blake3 of the staged bytes and
+`len` is checked. Environment keys/values are NFC strings, keys are unique and
+raw-byte sorted, and the published vector is the complete sanitized environment
+used at launch: ambient variables including `PATH`, locale, home, and temp are
+cleared unless present literally. The cwd-policy tags above are closed; the
+declared subdirectory must name a staged directory. Platform/runtime binding is
+also closed: either it pins the platform plus system-runtime identity, or it
+commits the explicit named residual class rather than silently inheriting one.
+All platform/runtime strings are nonempty NFC UTF-8; `Pinned` equality is
+rechecked against the configured platform resolver before launch, while an
+`ExplicitResidual` literally commits the named ambient class and may never be
+encoded as an empty or generic "current" value.
+
+`DSCT v1 = blake3("DSCT" || 0x01 || canonical ToolExecutionCapsuleV1)` using
+§5's record codec and the fixed tags above. Because the canonical file rows
+commit every byte hash, DSCT transitively commits the launcher/script,
+interpreter, non-system DSO/plugin closure, and resources as well as launch
+metadata, environment, cwd, and platform/runtime policy. Registration stages
+every file content-addressed with no-replace semantics, reopens and verifies
+the complete closure, then atomically publishes the capsule object and DSCT
+hash as snapshot input. An unresolved interpreter/DSO/plugin/resource,
+ambiguous dependency, noncanonical metadata, or incomplete platform binding
+refuses registration and publishes no tool row. A closure that cannot be
+revalidated at execution time yields only the transient nonmemoized launch
+outcome below; it can never be treated as a cacheable tool invocation.
 
 ### Pipeline map
 
@@ -3228,7 +3368,8 @@ Typing rules that follow:
   connection fence. Closure validation (§15's adoption sweep, §16's pack
   builds) depends on the appropriate boundary projection: packs carry their
   artifact-closure set union the exact five bootstrap rows, and each RPC Hub
-  carries its accepted client runtime set union those rows. Every
+  carries canonical accepted superset `A`, which already includes those rows.
+  Every
   consuming binary's descriptor exposes its own bit (§4), so the
   policy is checkable on every IO base, not just over RPC. `build_only` is deliberately unhashed (§5 — toggling policy
   must not mint migrations), so the digest is its change-tracking, the
@@ -3272,7 +3413,7 @@ canonically ordered sequence of every context operation *with its label
 and its observed outcome*: each entry records
 `Observed<T> = Ok(T) | Err(StableFailureFingerprint)` (declared below) —
 `read(uuid) → ContentHash`, `resolve(path) → uuid | NONE`,
-`query(selector) → result-set hash`, `tool(id) → staged binary hash` on
+`query(selector) → result-set hash`, `tool(id) → DSCT capsule hash` on
 success; on failure a typed, content-derived fingerprint (ambiguity: the
 sorted conflicting ids; poison: the poison row's identity; a missing
 strong reference: the query and expected terminal; a descendant build
@@ -3288,27 +3429,28 @@ unmemoized. External tool
 binaries invoked as subprocesses are trace operations, never static
 inputs (which tool runs can depend on inputs, and the dylib hash cannot
 see them), revalidated on every lookup like all trace entries.
-Tool and pipeline-dylib hashes are §5 byte-identity digests: raw blake3 of
-the staged executable bytes, not unregistered semantic constructions.
+Pipeline-dylib hashes are §5 byte-identity digests over the staged dylib.
+Tool identity is instead the domain-separated semantic/composite DSCT capsule
+aggregate above; a launcher byte hash alone is never a trace identity.
 Subprocesses launch only through `ctx.run_tool(id, args)`, and the tool
 a job runs is a **snapshot input**: registering or replacing a tool
-(`Registry::tool`, §3) stages a content-addressed copy under daemon
-state and publishes the (tool key → staged path + hash) mapping as
+(`Registry::tool`, §3) stages and verifies a complete content-addressed
+capsule under daemon state and publishes the (tool key → capsule object +
+DSCT hash) mapping as
 input-versioned **ToolEpoch** state (§13) — a registration change
 advances the input version like any other input event. A job resolves
-`id` through its pinned snapshot and executes the staged copy the
-published hash names — never the live registered path — so the executed
-bytes are exactly the recorded bytes, one snapshot can never select
-different tool bytes before and after a swap (a snapshot denotes
-immutable inputs, tools included), and a swap mid-epoch invalidates
-traces into rebuilds that run the new copy at the new version. Staged
+`id` through its pinned snapshot and launches the exact capsule the
+published DSCT names — never the live registered path, ambient interpreter,
+DSO, plugin, resource, environment, or cwd — so one snapshot can never select
+a different execution closure before and after a swap. A swap mid-epoch
+invalidates traces into rebuilds that run the new capsule. Staged
 versions coexist; `DriftedInput::Tool` (§15) covers an old basis whose
-staged bytes have been evicted.
+capsule closure has been evicted.
 If `id` is absent from that snapshot's ToolEpoch, `run_tool` records the
 terminal `TraceOp::Tool` miss and `MissingCapability { Tool(id) }` specified
 below; it does not attempt a launch and cannot use `ToolLaunch` as an alias.
-PATH lookups, symlink retargets, and tool-adjacent files beyond that are
-the determinism contract's territory. Hashing
+PATH lookup, symlink retargeting, or access to undeclared adjacent files is
+not a conforming capsule launch. Hashing
 labeled operations rather than a sorted multiset of
 content hashes means two dependencies that swap contents change the key.
 
@@ -3425,12 +3567,14 @@ pub enum StableFailureFingerprint {
     /// plus `blake3("DSLF" || v1 canonical local-failure detail)` (§5).
     Local { class: LocalFailureClass, detail: [u8; 32] },
 }
-pub enum ToolErrorClass { NotExecutable, MissingInterpreter, SpawnDenied }
+pub enum ToolErrorClass {
+    NotExecutable, MissingInterpreter, SpawnDenied, CapsuleClosureUnavailable,
+}
 /// A post-lookup execution outcome. It is returned only to the attempted
 /// caller and never enters StableFailureFingerprint, DSTR, or a memo bucket.
 pub struct TransientToolLaunchFailure {
     pub id: String,
-    pub staged_hash: [u8; 32],
+    pub capsule_hash: [u8; 32],
     pub class: ToolErrorClass,
 }
 // LocalFailureClass and its exact DSLF payload grammar are declared in §5.
@@ -3466,7 +3610,7 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
                                            // Ok(None) is a first-class miss,
                                            // never a failure
     Query   { query: AssetQuery, observed: Observed<[u8; 32]> },  // domain-prefixed (§10)
-    /// The tool key and the staged binary hash the snapshot's ToolEpoch
+    /// The tool key and aggregate DSCT capsule hash the snapshot's ToolEpoch
     /// (§13) resolved it to — snapshot-pinned, never a live path. A miss is
     /// Observed::Err(MissingCapability { key: CapabilityKey::Tool(id) }).
     Tool    { id: String, observed: Observed<[u8; 32]> },
@@ -3518,11 +3662,12 @@ followed by the declared NFC string or raw TypeUuid fields. A ToolEpoch lookup
 miss records `TraceOp::Tool { id, observed:
 Err(MissingCapability { key: Tool(id) }) }` as the terminal operation and sets
 `FailureCause::Op`; revalidation against a later snapshot heals when `id`
-resolves to a staged executable hash. A lookup hit records
-`Observed::Ok(staged_hash)` before execution. If that exact staged executable
-then yields `NotExecutable`, `MissingInterpreter`, or `SpawnDenied`, the whole
+resolves to a verified capsule hash. A lookup hit records
+`Observed::Ok(capsule_hash)` before execution. If that exact capsule
+then yields `NotExecutable`, `MissingInterpreter`, `SpawnDenied`, or
+`CapsuleClosureUnavailable`, the whole
 attempted result and its trace are discarded and the caller receives
-`TransientToolLaunchFailure { id, staged_hash, class }`; it is never memoized.
+`TransientToolLaunchFailure { id, capsule_hash, class }`; it is never memoized.
 DSTR v1 tag 4 is permanently reserved under the historical name `ToolLaunch`
 and every decoder MUST reject it. It has no payload grammar and can never be an
 alias for a ToolEpoch miss, a successful `Tool` observation, or a transient
@@ -5011,9 +5156,9 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `deps` | recorded content / resolution / query dependencies + selector indexes |
 | `schemas` | logical hash → schema JSON (cache, rebuilt from bundle snapshots) |
 | `artifacts` | static-input-key digest → candidate bucket: (trace digest → trace + output table), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
-| `pipeline_state` | importer/processor registrations and versions; the pipeline dylib content hash (a input-hash input wherever pipeline code runs); a never-reused daemon compiled-table generation plus complete rows/DSCA; and the full **load-policy table** — sorted `(type_uuid, build_only)` rows and `blake3("DSLP" ‖ version:u8 ‖ count:u32 ‖ rows)` (§9). Every compiled table publication advances that full-table generation even if a later table returns to byte equality; it exists for staging/build invalidation and the §17 reattest validate/install race CAS, not as a global Hub fence. Packs and RPC carry the same grammar over §3's exact `B(C)`, §§16–17. Load-policy changes are input-versioned, re-run affected closure validation, emit component invalidations, and advance/fence only a Hub whose own accepted-set projection changed |
-| `tools` | **ToolEpoch** state (§9): tool key → (staged copy path, content hash) — input-versioned; registering or replacing a tool stages a content-addressed copy under daemon state and publishes the mapping at an input version, so snapshots pin their tool bytes and jobs execute exactly the staged copy as subprocesses through `run_tool`. No row can be resolved to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
-| `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; entry and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing/duplicate manifest leaves this table unavailable and hard-stops schema-dependent work; only §6's unbound exact-basis local repair surface remains mutable until one valid authority publishes |
+| `pipeline_state` | importer/processor registrations and versions; the pipeline dylib content hash (a input-hash input wherever pipeline code runs); a never-reused daemon compiled-table generation plus complete rows/DSCA; and the full **load-policy table** — sorted `(type_uuid, build_only)` rows and `blake3("DSLP" ‖ version:u8 ‖ count:u32 ‖ rows)` (§9). Every compiled table publication advances that full-table generation even if a later table returns to byte equality; it exists for staging/build invalidation and the §17 reattest validate/install race CAS, not as a global Hub fence. Packs use the shared grammar over exact §3 `B(C)`; RPC Hubs use it over accepted `A`, §§16–17. Load-policy changes are input-versioned, re-run affected closure validation, emit component invalidations, and advance/fence only a Hub whose own accepted-set projection changed |
+| `tools` | **ToolEpoch** state (§9): tool key → (verified `ToolExecutionCapsuleV1` object, DSCT hash) — input-versioned; registering or replacing a tool stages the full launcher/interpreter/non-system DSO/plugin/resource closure no-replace and publishes it at an input version, so snapshots pin the complete launch closure and jobs execute only that capsule through `run_tool`. No row can be resolved to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
+| `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; non-bootstrap `EntryLineageV1::Manifest` stamps and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing/duplicate manifest leaves this table unavailable and hard-stops schema-dependent work; only §6's unbound exact-basis local repair surface remains mutable until one valid authority publishes |
 
 Each published input-version header stores either no global poison or the exact
 canonical `VersionPoisonV1` code/detail plus recomputed DSVP identity (§7).
@@ -5943,7 +6088,7 @@ pub enum IoBasis {
     Rpc { snapshot: SnapshotStamp,
           load_policy: Arc<LoadPolicyAttestation>,
           /// DSCA recomputed from the daemon's current rows projected onto
-          /// exactly this Hub's accepted §3 B(C).
+          /// exactly this Hub's canonical accepted superset A.
           daemon_compiled_projection: CompiledAttestationDigest,
           policy_generation: u64,
           target_generation: u64,
@@ -5957,7 +6102,7 @@ pub struct ManifestHash(pub [u8; 32]);
 pub struct LoadPolicyRow { pub type_uuid: TypeUuid, pub build_only: bool }
 pub struct LoadPolicyAttestation {
     pub rows: Vec<LoadPolicyRow>,      // type-uuid sorted, duplicates forbidden;
-                                       // exact §3 B(C)
+                                       // pack: exact §3 B(C); RPC: accepted A
     pub digest: [u8; 32],              // recomputed "DSLP" over exactly rows
 }
 
@@ -6005,7 +6150,7 @@ pub enum DriftedInput {             // resolve names exactly what drifted
     Query(AssetQuery),
     Dylib,
     /// The named tool's staged bytes for this basis were evicted — the
-    /// snapshot's ToolEpoch mapping (§9, §13) can no longer be honored.
+    /// snapshot's ToolEpoch capsule mapping (§9, §13) can no longer be honored.
     Tool(String),
 }
 ```
@@ -6349,15 +6494,15 @@ pub struct FetchedArtifact { pub structural: Arc<[u8]>, pub blobs: Vec<Blob> }
 **Attestation is epoch-bound.** Every live `LoaderIO` instance is bound
 to the complete attestation it opened with — `GameModuleEpoch`, target-
 definition hash, complete sorted `CompiledTypeRow`s/`"DSCA"`, and load-policy
-rows/`"DSLP"` over the exact §3 boundary set `B(C)` — at connect
-or mount. A successful RPC connect returns the server-accepted policy, target,
-and attestation generations plus the daemon DSCA projection and exact
-server-recomputed load-policy rows/DSLP for the accepted `B(C)` in its typed
-success. RpcIO
+rows/`"DSLP"`. PackfileIO uses the exact §3 `B(C)` of the complete pack
+closure. RpcIO uses the canonical accepted superset `A` from §3. A successful
+RPC connect returns the server-accepted policy, target, and attestation
+generations plus the daemon DSCA projection and exact server-recomputed
+load-policy rows/DSLP for `A` in its typed success. RpcIO
 canonically validates those returned rows/digest and derives its first basis
 only from that record, never from request values and never by invention.
 Daemon-only additions whose
-TypeUuids are outside that union do not change the projection and do not
+TypeUuids are outside `A` do not change the projection and do not
 fence the Hub. `register_types` for a successor epoch invalidates that
 binding: the loader issues no new loads through the instance until it
 re-attests — RpcIO re-runs the connect-time check (§17's
@@ -6387,7 +6532,7 @@ base returns typed `StaleAttestationBase`; target, policy, store, protocol, or
 compiled-table drift returns its exact `ReconnectRequired` reason. Neither case
 mutates state or can be rescued by late completion. Typed `ReattestSuccess`
 echoes both the installed successor and the freshly recomputed daemon DSCA
-projection for the newly accepted exact `B(C)`. RpcIO atomically rotates its
+projection for the newly accepted `A`. RpcIO atomically rotates its
 active `IoBasis::Rpc` and connection epoch from that record, discards every
 outstanding old-attestation event, and only then unblocks traffic; this success
 record is the sole successor-generation source. The inverse direction — the *daemon's* target
@@ -6410,26 +6555,53 @@ subscription, or one that calls before consuming the event, can never
 pull data under an unattested definition.
 Load-policy generation changes use the identical fence and reconnect flow
 with `ReconnectRequired::LoadPolicyChanged`; every `IoBasis::Rpc` stores
-the Hub-sensitive verified projection over its accepted exact §3 `B(C)`, so
+the Hub-sensitive verified projection over its accepted `A`, so
 even a delayed completion remains bound to
 the policy under which it was answered. Independently, every target-bound call
-recomputes the daemon compiled rows projected onto the Hub's accepted exact
-`B(C)` and compares their DSCA with the bound
+recomputes the daemon compiled rows projected onto the Hub's accepted `A`
+and compares their DSCA with the bound
 `daemon_compiled_projection`. Any removal or field change in that projection
 returns `ReconnectRequired::CompiledAttestationChanged` and no data. Additions
 strictly outside the set are irrelevant. The check is server-side on every
 method and does not depend on observing a subscription event.
 
 That projection is also a data-coverage ceiling, not merely a change fence.
-Before `resolve`, artifact `fetch`, or any closure/manifest/wire-tree response
-can expose data, the server derives §3 `B(C)` from authored policy types,
-verified artifact headers, typed load edges, and bootstrap and proves every row
-is in the Hub's accepted boundary. Bootstrap rows never substitute for a
-runtime row. Discovering a required type outside the set returns
-`ReconnectRequired::CompiledAttestationChanged` before any payload; the next
-connect can then report the exact `MissingCompiledType` attestation failure.
-Thus a daemon-only type added outside a Hub's set neither fences unrelated
-work nor enters data later served through that Hub.
+Before `resolve`, artifact `fetch`, `Snapshot.entry`, or any closure/manifest/
+wire-tree response can expose data, the server derives the actual §3
+`B(served)` from authored policy types, verified artifact headers, typed load
+edges, and bootstrap and proves `B(served) subset A`. Bootstrap rows never
+substitute for a runtime row. A missing row returns the typed challenge below
+before any payload or nested capability:
+
+```rust
+pub struct AttestationExpansionRequired {
+    pub snapshot: SnapshotStamp,
+    pub closure_identity: [u8; 32], // DSAE
+    pub required: Vec<TypeUuid>,
+}
+```
+
+`required` is exactly `B(served) \ A`, raw-TypeUuid sorted, unique, nonempty,
+and includes no row already in `A`. `DSAE v1 = blake3("DSAE" || 0x01 ||
+canonical(snapshot, request_subject, closure_rows))`, where `request_subject`
+is the method tag plus requested AssetUuid/ContentHash/layout hash and
+`closure_rows` is the complete raw-AssetUuid-sorted verified set of
+`(asset_uuid, content_hash, authored_type, encoded_type, terminal_type,
+sorted unique load edges(asset_uuid, expected_terminal))` used to derive
+`B(served)`. The response repeats the pinned snapshot separately for direct
+CAS checking; the client recomputes no closure from withheld artifact data.
+Unknown method tags, noncanonical rows, or an identity mismatch reject.
+
+RpcIO unions the challenge set with `A`, projects complete local compiled and
+policy rows for exactly that union, reattests, atomically rotates the basis,
+and retries the original request against the same snapshot/closure identity.
+Snapshot or closure drift follows the ordinary typed drift path and restarts
+the operation; inability to supply a required local row is an attestation
+failure. The challenge itself never carries artifact data and never changes
+Hub state. `CompiledAttestationChanged` is reserved for daemon projection
+drift of a row already bound in `A`, never for expansion. Thus a daemon-only
+type outside `A` neither fences unrelated work nor enters data until explicit
+successful expansion attestation.
 
 ### Carried over from v1
 
@@ -6967,17 +7139,16 @@ store version; change subscriptions deliver events tagged with the version
 that produced them. Every resolve is snapshot-based (§15); `resolve(uuid)`
 is sugar for latest-snapshot plus internal retry-refreshed. Every answer
 a snapshot gives is tagged with that snapshot's instance-qualified stamp
-(§13), and `Root.connect`/`reattest` carry the exact §3 boundary set `B(C)` as complete
-sorted `CompiledTypeRow`s plus recomputed `"DSCA"`, together with sorted
-load-policy rows and `"DSLP"`, exactly as §16's pack manifest does.
-The server verifies every overlapping compiled row field-for-field under the
-registered-set subset/daemon-superset coverage rule, then verifies policy
-against the snapshot projection
-under the same coverage rule. It independently verifies all five bootstrap
+(§13), and `Root.connect`/`reattest` carry the canonical accepted TypeUuid
+superset `A` as complete sorted `CompiledTypeRow`s plus recomputed `"DSCA"`,
+together with sorted load-policy rows and `"DSLP"` over exactly the same `A`.
+The server requires both submitted row lists to have exactly the keys of `A`,
+verifies every compiled and policy row field-for-field against one pinned
+daemon table, and recomputes both aggregates. It independently verifies all five bootstrap
 rows against its own embedded DSCI-keyed table and requires the client to have
 embedded and sent the matching rows; they are not runtime closure/policy
-eligibility. The Hub stores the exact accepted closure and `B(C)`, with DSCA
-recomputed from the daemon table projected onto that boundary,
+eligibility. The Hub stores `A`, with DSCA
+recomputed from the daemon table projected onto that accepted superset,
 in addition to the accepted client rows/digest, Hub-sensitive policy generation,
 target generation, and initial attestation generation. The typed connect
 success returns all three generations, the daemon compiled projection digest,
@@ -7050,8 +7221,8 @@ interface Root {               # the bootstrap capability
                                # ConnectSuccess carries the daemon's
                                # StoreInstanceId (§13, 16 bytes), the Hub,
                                # and the accepted policy/target/attestation
-                               # generations plus the server-recomputed
-                               # exact-B(C) load-policy rows/digest.
+                               # generations plus server-recomputed accepted-A
+                               # load-policy rows/digest.
                                # RpcIO constructs no basis until this typed
                                # success arrives and never reuses sent values.
                                # Every version field on this connection is
@@ -7064,24 +7235,20 @@ interface Root {               # the bootstrap capability
                                # Connect binds the connection target (§15) and
                                # verifies BOTH sides: the client sends the
                                # target-definition hash it was built against
-                               # and its complete sorted boundary rows over
-                               # the exact §3 B(C) authored-policy/header/
-                               # load-edge/bootstrap set for its declared
-                               # runtime closure —
+                               # and complete sorted rows whose keys define
+                               # canonical accepted superset A —
                                # TypeUuid, DSLH, DSNL, build_only, canonical
                                # RegistryExtras v1 bytes/DSRE — plus DSCA,
-                               # AND the same registered-set projection as
-                               # the pack manifest: sorted (TypeUuid,
-                               # build_only) rows plus recomputed "DSLP".
-                               # Coverage rule pinned as at pack mount, over
-                               # that exact B(C): bootstrap rows first match each
+                               # AND sorted (TypeUuid, build_only) rows over
+                               # exactly A plus recomputed "DSLP".
+                               # Bootstrap rows first match each
                                # local consumer's embedded DSCI-keyed table;
                                # every client runtime row must be present and
                                # field-equal in the
-                               # daemon's compiled table for the target —
+                               # daemon's pinned compiled table for the target —
                                # missing or mismatched types are connect
                                # errors naming the type; policy is projected
-                               # over the same exact B(C) and
+                               # over the same exact A and
                                # a mismatch is a
                                # typed connect error. Daemon-side extras
                                # are ignored (a client legitimately compiles
@@ -7111,10 +7278,9 @@ struct ConnectSuccess {
   targetGeneration @3 :UInt64;
   attestationGeneration @4 :UInt64;
   daemonCompiledProjection @5 :Data; # exactly 32-byte DSCA over the daemon
-                                     # rows projected to this Hub's exact
-                                     # accepted §3 B(C)
+                                     # rows projected to this Hub's accepted A
   loadPolicy @6 :List(LoadPolicyEntry); # exact server-recomputed rows over
-                                     # that same exact accepted B(C)
+                                     # that same accepted A
   policyDigest @7 :Data;             # exactly 32-byte recomputed DSLP
 }
 enum AttestationFailureCode {
@@ -7300,7 +7466,7 @@ interface Hub {                # target-bound at connect (above), and
                                # for a successor game-module epoch (§15) —
                                # the same complete attestation connect verifies: the
                                # epoch, its target-definition hash, and
-                               # its complete exact §3 B(C)
+                               # its complete canonical accepted superset A
                                # CompiledTypeRows with "DSCA" aggregate and
                                # load-policy rows with "DSLP"
                                # (same coverage rule, same
@@ -7852,8 +8018,8 @@ struct RpcError { code @0 :UInt16; message @1 :Text; }
 struct ReattestSuccess {
   installedAttestationGeneration @0 :UInt64;
   daemonCompiledProjection @1 :Data; # exactly 32-byte DSCA for the newly
-                                     # accepted exact §3 B(C)
-  loadPolicy @2 :List(LoadPolicyEntry); # same exact B(C)
+                                     # accepted canonical A
+  loadPolicy @2 :List(LoadPolicyEntry); # same exact A
   policyDigest @3 :Data;             # exactly 32-byte recomputed DSLP
   policyGeneration @4 :UInt64;       # Hub-sensitive; advances iff this
                                      # accepted-set projection changed
@@ -7870,6 +8036,13 @@ struct ReattestResult { union {
   leaseFailure @6 :LeaseFailure;
   error @7 :RpcError;
 } }
+
+struct AttestationExpansionRequired {
+  snapshot @0 :SnapshotStampValue;     # pinned identity used for B(served)
+  closureIdentity @1 :Data;            # exactly 32-byte recomputed DSAE
+  requiredTypeUuids @2 :List(Data);    # nonempty, exactly B(served) \ A;
+                                        # each 16 bytes, raw sorted/unique
+}
 
 # Cap'n Proto has no parameterized result structs. Each method therefore uses
 # a method-specific union with a statically typed success field and the same
@@ -7914,11 +8087,13 @@ struct ChunkStreamCall { union {
   success @0 :ChunkStream; reconnectRequired @1 :ReconnectRequired;
   configurationPoisoned @2 :ConfigurationPoison;
   leaseFailure @3 :LeaseFailure; error @4 :RpcError;
+  attestationExpansionRequired @5 :AttestationExpansionRequired;
 } }
 struct DataCall { union {
   success @0 :Data; reconnectRequired @1 :ReconnectRequired;
   configurationPoisoned @2 :ConfigurationPoison;
   leaseFailure @3 :LeaseFailure; error @4 :RpcError;
+  attestationExpansionRequired @5 :AttestationExpansionRequired;
 } }
 struct UuidListCall { union {
   success @0 :List(Uuid); reconnectRequired @1 :ReconnectRequired;
@@ -7931,12 +8106,14 @@ struct EntryMetaCall { union {
   configurationPoisoned @2 :ConfigurationPoison;
   leaseFailure @3 :LeaseFailure; error @4 :RpcError;
   versionPoisoned @5 :VersionPoison;
+  attestationExpansionRequired @6 :AttestationExpansionRequired;
 } }
 struct ResolveCall { union {
   success @0 :ResolveResult; reconnectRequired @1 :ReconnectRequired;
   configurationPoisoned @2 :ConfigurationPoison;
   leaseFailure @3 :LeaseFailure; error @4 :RpcError;
   versionPoisoned @5 :VersionPoison;
+  attestationExpansionRequired @6 :AttestationExpansionRequired;
 } }
 struct PathResolveCall { union {
   success @0 :PathResolveResult; reconnectRequired @1 :ReconnectRequired;
@@ -7956,6 +8133,8 @@ struct AuthoringInspectCall { union {
 Every target-bound method — including metadata, snapshot/refresh,
 subscription, authoring, immutable fetch, and reattestation calls — uses a
 method-specific result union. Ordinary methods share the five common arms;
+the artifact-bearing `ResolveCall`, `EntryMetaCall`, `ChunkStreamCall`, and
+`DataCall` additionally carry the typed no-data attestation-expansion arm;
 `AuthoringInspectCall` adds typed missing/role outcomes and
 `ReattestResult` adds structured attestation, stale-base, and overflow arms.
 Namespace-facing methods additionally carry the exact §7 `VersionPoison`
@@ -7971,7 +8150,7 @@ branch uniformly before decoding success.
 The target-bound bootstrap has its own equally typed `ConnectResult`: success
 is the only source of Hub, StoreInstanceId, and **initial**
 policy/target/attestation generations, accepted daemon compiled projection,
-and server-recomputed exact-`B(C)` load-policy rows/digest;
+and server-recomputed accepted-`A` load-policy rows/digest;
 the other arms are typed attestation, configuration, protocol, and ordinary
 RPC failures plus the closed `PipelineUnavailableDiagnostic` sum for pipeline
 poison, schema acceptance required, or retired-type authority. A fresh connect
@@ -7984,7 +8163,7 @@ successful-attestation loop against the same unavailable state.
 Hub or lease exists. RpcIO constructs its initial `IoBasis::Rpc` only from
 `ConnectSuccess`, never from values it sent or locally guessed. Before
 constructing that basis it validates the returned policy rows for strict
-TypeUuid order, uniqueness, exact accepted §3 `B(C)`
+TypeUuid order, uniqueness, exact accepted `A`
 coverage, canonical row encoding, and equality of the recomputed DSLP with
 `policyDigest`; malformed rows, a wrong-width digest, or mismatch is a hard
 protocol failure and no Hub data is admitted. These fields have exactly the
@@ -8014,7 +8193,7 @@ ordinal/payload grammar as `ReattestResult` and `AuthoringInspectCall` do;
 **Target-bound methods are generation-fenced.** Every `Hub`, `Snapshot`, and
 target-minted `AuthoringSnapshot` capability binds the **target-definition
 generation**, Hub-sensitive **load-policy generation**, accepted client runtime
-closure `C`, and daemon DSCA/DSLP projections over the exact §3 `B(C)` current
+superset `A`, and daemon DSCA/DSLP projections over exactly `A` current
 at `connect`, carried into
 every snapshot and `IoBasis::Rpc` it produces. When the daemon's definition for
 the bound target, that Hub's load-policy projection, or any compiled row in the
@@ -8031,7 +8210,7 @@ fails through an unspecified RPC exception.
 
 Both live registry fences are projection-sensitive. Each call recomputes DSCA
 and DSLP from the current daemon rows whose TypeUuids are in the Hub's stored
-accepted `B(C)`. A different DSCA
+accepted `A`. A different DSCA
 returns `CompiledAttestationChanged`; an addition outside the set leaves both
 digests equal and does not reconnect. A changed DSLP advances this Hub's
 never-reused `policy_generation` and returns `LoadPolicyChanged`; there is no
@@ -8041,17 +8220,18 @@ is stored only in reattestation's validate/install CAS to reject a race even
 when projected bytes later return to equality; it is not a live-call fence or
 a reason to disconnect an otherwise unchanged Hub.
 
-Before serving resolve, artifact fetch, or closure/manifest/wire-tree data,
-the same gate checks that every required runtime TypeUuid lies in the accepted
-runtime set; bootstrap rows are not runtime coverage. An outside-set
-requirement returns `CompiledAttestationChanged` before any data. The caller
-reconnects, where the ordinary typed `missingType`/MissingCompiledType
-attestation outcome can name the newly required row.
+Before serving resolve, artifact fetch, entry, or closure/manifest/wire-tree
+data, the same gate recomputes actual `B(served)` and requires it to be a
+subset of `A`; bootstrap rows are mandatory but not substitutes for runtime
+coverage. An outside-set requirement returns the canonical
+`AttestationExpansionRequired` challenge before any data. RpcIO reattests
+`A union required` and retries; only a current row already in `A` drifting
+uses `CompiledAttestationChanged`.
 
 Reattestation is an additional compare-and-swap fence within those connection
 generations. Each Hub owns a tuple of `attestation_generation`, bound target
 and projection-sensitive policy generations, StoreInstanceId, protocol epoch,
-and accepted closure/`B(C)` projection. Validation also
+and accepted `A` projection. Validation also
 captures the daemon's full compiled-table generation as a temporary CAS
 precondition; it is not installed as durable Hub fence state. A request's base
 and successor must be current and exactly `base + 1`; validation captures that
@@ -8059,11 +8239,11 @@ tuple with one pinned daemon snapshot, and install CASes the **whole tuple**
 only after validation. Stale/overflow return their dedicated typed arms;
 target, policy, store, protocol, or compiled-table drift returns the exact
 reconnect reason. None mutate. Success echoes the installed generation and
-new exact-`B(C)` daemon DSCA and DSLP projections; RpcIO atomically rotates
+new exact-`A` daemon DSCA and DSLP projections; RpcIO atomically rotates
 its active basis/connection epoch from that typed record, discards all
 outstanding old-generation events, and only then unblocks, so concurrent
 completion order cannot reinstall or briefly expose an obsolete attestation.
-The server CAS changes `(attestation_generation, accepted runtime TypeUuid set,
+The server CAS changes `(attestation_generation, accepted A TypeUuid set,
 accepted client rows, daemon_compiled_projection, policy projection/digest,
 policy_generation)` as one Hub-state write; every failure leaves the old tuple
 intact.
@@ -8135,6 +8315,8 @@ pub enum ReconnectReason {
     LoadPolicyChanged = 1,
     StoreInstanceChanged = 2,
     ProtocolEpochChanged = 3,
+    /// A daemon row already bound in accepted A drifted. Expansion is the
+    /// separate AttestationExpansionRequired result, never this reconnect.
     CompiledAttestationChanged = 4,
 }
 ```
@@ -8306,7 +8488,7 @@ ships; an unclassified key is a spec defect:
 | `assets.lineage_manifest` | input-versioned epoch | normalized rooted destination for Missing-manifest repair; staging requires a named configured root and valid §10 path, and changing it cannot move or select an existing manifest |
 | `[targets]` definitions | input-versioned epoch | joins the combined execution candidate (§3): the pipeline map re-validates against the new target set; bound Hubs receive `ReconnectRequired` (§17) |
 | `modules.pipeline_dylib` | input-versioned epoch | module epoch rotation (§3) through the staged-candidate mechanism |
-| tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a staged, content-addressed copy publishes at an input version |
+| tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a fully resolved, verified, content-addressed ToolExecutionCapsule plus DSCT hash publishes at an input version |
 | `pipeline.parallelism` | operational-live | must remain ≥1; the pool resizes, re-clamps `batch_reserved_workers`, and lets already-active excess slots drain; no identity, key, or version implication |
 | `pipeline.max_dependency_depth` | operational-live | the next request runs under the new budget — safe because depth exhaustion is never memoized (§9) |
 | `pipeline.batch_reserved_workers` | operational-live | staging requires `1 <= value <= max(1, parallelism - 1)`; live changes re-clamp at the next scheduling decision while active slots drain (§13) |
@@ -8607,7 +8789,9 @@ ordinary §10 dependency kinds.
   trace operations resolved through the snapshot's ToolEpoch state (§9,
   §13: the staged binary hash the snapshot published); in-flight
   coalescing keys on the static-input key, with
-  per-waiter revalidation across snapshots.
+  per-waiter revalidation across snapshots. (Refined in R31: the observed
+  hash is the aggregate DSCT `ToolExecutionCapsule` identity, not the launcher
+  byte hash.)
 - **Build results are output tables** (§9, §13): the cache unit is
   `output_key → ContentHash` plus the trace, committed atomically with a
   derived-output index (`child uuid → parent, key` — stage-free,
@@ -8750,7 +8934,9 @@ ordinary §10 dependency kinds.
   and `DSCA` aggregate — TypeUuid, DSLH, DSNL, build_only, and every remaining
   excluded semantic/policy bit — checked before registration and on reload;
   every reverse host callback is independently contained by a host-side
-  status thunk.)
+  status thunk.) (Refined in R31: dylibs retain byte identity, but tools now
+  stage and hash the complete hermetic `ToolExecutionCapsuleV1` under DSCT;
+  launcher-only copy/hash identity is superseded.)
 - **Version domains** (§13): input versions (fs/code/authoring) and the
   memo sequence (build commits) are separate; builds never advance an
   input version. The store partitions by the same authority:
@@ -9041,7 +9227,9 @@ ordinary §10 dependency kinds.
   missing/mismatched types error naming the type, counterparty extras
   are ignored, equal aggregates short-circuit. (Refined in R30: both sides now
   derive exact §3 `B(C)` including authored policy, artifact encoded/terminal,
-  load-edge expected-terminal, and bootstrap types.)
+  load-edge expected-terminal, and bootstrap types.) (Refined in R31: packs
+  stay exact; RPC attests accepted superset `A` and derives actual
+  `B(served)` only for the per-response subset gate.)
 - **Multi-root identity reaches file deps** (§8, §13): `RootedPath`
   (root + normalized path; serialized and hashed as the normalized
   root name, never an ordinal) in `sources()`, `enumerate`, `FILQ`
@@ -9488,7 +9676,9 @@ ordinary §10 dependency kinds.
   their snapshot, never the live registered path — one snapshot can
   never select different tool bytes before and after a swap — and
   `DriftedInput::Tool` covers an old basis whose staged bytes were
-  evicted.
+  evicted. (Refined in R31: the published object is the complete verified
+  `ToolExecutionCapsuleV1` plus DSCT hash; launcher-only staging is no longer a
+  cacheable tool identity.)
 - **Pipeline-only native deps link statically** (§3, §20): the dylib
   hash is the module's code identity and covers only that one file, so
   pipeline-only libraries must be statically linked into the cdylib; a
@@ -9499,7 +9689,9 @@ ordinary §10 dependency kinds.
   drift is not tracked. (Refined in R22: the staged-library alternative
   is withdrawn. Pipeline runtime `dlopen` is banned and no library-open
   API exists; dynamic tools run only as `run_tool` subprocesses, §§3,
-  9, 13.)
+  9, 13.) (Refined in R31: each subprocess capsule commits its resolved
+  interpreter, non-system DSO/plugin/resource closure and explicit
+  platform/system-runtime binding or residual.)
 - **`build_only` has a load-policy digest** (§5, §9, §13, §15, §16):
   blake3 over the sorted (type_uuid, build_only) pairs of the current
   registry, input-versioned; closure validation (loader sweep, pack
@@ -9529,6 +9721,9 @@ ordinary §10 dependency kinds.
   reverse custom edge. (Refined in R21: the chain assigns per-type
   generations and a `"DSSL"` chain digest, staging rejects non-head
   re-entries as rollbacks, and every entry carries a `LineageStamp`
+  (Refined in R31: that historical statement now means every non-bootstrap
+  entry carries `EntryLineageV1::Manifest`; the exact five bootstrap types
+  instead require the sealed `Bootstrap` arm and never enter user lineage.)
   beside its `schema_hash` — the "no lineage yet, trivially forward"
   case is withdrawn; first-sight diffs are legal only from a strictly
   lower-generation stamp, §6, §11. (Refined in R22: generation plus an
@@ -9670,6 +9865,9 @@ ordinary §10 dependency kinds.
   automatic diff from *any* embedded schema to current, and blind
   append could record a rollback as a forward edge or a cycle. Now
   direction rides in the data: every entry carries a `LineageStamp`
+  (Refined in R31: non-bootstrap entries carry that stamp in
+  `EntryLineageV1::Manifest`; the five bootstrap types require the sealed
+  `Bootstrap` arm and are excluded from user lineage and migration.)
   (per-type generation + `"DSSL"` chain digest, assigned at adoption)
   beside its `schema_hash`; staging rejects a candidate schema whose
   digest is a non-head chain entry (a rollback — schema-writing
@@ -9727,7 +9925,8 @@ ordinary §10 dependency kinds.
   while post-hit launch failure is distinct. Refined in R30: it is a transient
   `{id, staged_hash, class}` that discards the attempt and never memoizes;
   historical DSTR tag 4 `ToolLaunch` is permanently reserved/rejected, and
-  the successful/missing Tool observation is tag 10.)
+  the successful/missing Tool observation is tag 10. Refined in R31: the field
+  is `capsule_hash`, the aggregate DSCT identity; transience is unchanged.)
 - **Deletion is exchange-and-verify too** (§2, §14, §17): whole-bundle
   deletion was a bare unlink behind a base-version check — exactly the
   TOCTOU the replacement protocol closes for rewrites. Every deletion
@@ -9931,6 +10130,8 @@ ordinary §10 dependency kinds.
   policy rows plus `"DSLP"`; verified rows/digest/generation bind to
   `IoBasis::Rpc`, Pack bases bind their manifest projection, and policy
   changes generation-fence capabilities like target-definition changes.
+  (Refined in R31: "pack-identical" means the row/DSLP grammar only; packs
+  cover exact `B(C)`, while RPC covers canonical accepted superset `A`.)
 - **Codegen names are globally unique and batch-validated** (§7, §10,
   §20): the escaped normalized bundle-local `local_id` is suffixed with
   `_` plus full lowercase AssetUuid hex. The generator validates the
@@ -10335,7 +10536,9 @@ ordinary §10 dependency kinds.
   its typed success also carries and atomically rotates that set's
   union-bootstrap policy rows/digest/generation; target generation remains
   connect-only. Refined in R29: connect success symmetrically carries the
-  server-recomputed initial union-bootstrap policy rows/digest.)
+  server-recomputed initial union-bootstrap policy rows/digest. Refined in
+  R31: the replaceable set is canonical accepted `A`; an expansion challenge
+  reattests `A union required` before retry.)
 - **Authoring inspection is exact, branded, and non-shippable** (§10, §17):
   every response repeats its precise SnapshotStamp and returns only the closed
   metadata/canonical-value/blob schema, with typed missing and role failures;
@@ -10369,7 +10572,9 @@ ordinary §10 dependency kinds.
   atomically without mutation on drift. (Refined in R28: DSLP and its
   generation are Hub-sensitive over the same union; full-table generation is
   only a reattest race CAS, and outside-set runtime closure data is refused
-  before service.)
+  before service.) (Refined in R31: refusal is the no-data
+  `AttestationExpansionRequired` challenge; expansion reattests `A union
+  required`, while `CompiledAttestationChanged` remains projection drift.)
 - **Poison-safe metadata has an unbound bootstrap** (§§13, 17–18):
   `Root.metadata` requires no target, compiled, policy, or PipelineEpoch
   attestation and succeeds under configuration/pipeline/version poison and
@@ -10442,7 +10647,9 @@ ordinary §10 dependency kinds.
   unchanged. (Refined in R30: the complete boundary is exact §3 `B(C)`—every
   manifest-node authored policy type, artifact encoded/terminal type,
   load-edge expected terminal, and bootstrap type—so processing cannot launder
-  authored `build_only` policy.)
+  authored `build_only` policy.) (Refined in R31: packs remain exact `B(C)`;
+  RPC connect/reattest bind a canonical accepted superset `A` including
+  bootstrap and gate each actual `B(served)` by subset.)
 - **RPC registry and policy fences are Hub projections** (§§9, 13, 15, 17):
   DSCA, DSLP, and policy generation cover exactly the accepted runtime set
   union bootstrap; daemon additions outside it neither fence nor become
@@ -10450,6 +10657,9 @@ ordinary §10 dependency kinds.
   validate/install race CAS and atomically rotates successor projections.
   (Refined in R29: `ConnectSuccess` carries the server-recomputed initial DSLP
   rows/digest at ordinals 6/7; request values are never the initial basis.)
+  (Refined in R31: that projection is accepted `A`; outside-`A` served
+  closures return `AttestationExpansionRequired`, reattest expands `A`, and
+  `CompiledAttestationChanged` is only drift of a row already in `A`.)
 - **Pipeline poison has interoperable DSPP v1 identity** (§§3, 5, 13, 17):
   fixed codes, origins, cleanup dispositions, and their exhaustive allowed
   matrix hash under `DSPP`; unknown/mismatched tuples reject, presentation
@@ -10466,7 +10676,9 @@ ordinary §10 dependency kinds.
   verification are identical to `ReattestSuccess`. (Refined in R30: both now
   carry §3's exact authored-policy/header/load-edge/bootstrap `B(C)`, and a
   fresh unavailable pipeline returns the typed connect arm without minting a
-  Hub or spinning attestation.)
+  Hub or spinning attestation.) (Refined in R31: for RPC those rows now cover
+  canonical accepted superset `A`; actual served `B(served)` is checked as a
+  subset and expands through typed reattestation. Pack rows remain exact.)
 - **Missing/duplicate lineage authority has one narrow recovery path** (§§2, 6,
   13–14, 17–18): only current DSCP 10/11 enables unbound `Root.lineageRepair`
   for the explicit local repair command. Inspection returns instance, exact
@@ -10499,7 +10711,9 @@ ordinary §10 dependency kinds.
   resolves a staged hash. (Refined in R30: a hit records
   `Observed::Ok(staged_hash)`; post-hit launch failures are transient,
   trace-discarding, and never memoized, while DSTR v1 tag 4 `ToolLaunch` is
-  permanently reserved and decode-rejected and `Tool` uses tag 10.)
+  permanently reserved and decode-rejected and `Tool` uses tag 10.) (Refined
+  in R31: both historical hash references now mean the aggregate DSCT capsule
+  hash, and the transient carrier field is `capsule_hash`.)
 - **Configuration poison carries its complete DSCP reason** (§§5, 13, 17–18):
   Rust state, persistence, and Cap'n Proto now carry the exact same-code typed
   `DscpV1` detail in addition to code/hash/message. Decode validates version,
@@ -10521,7 +10735,9 @@ ordinary §10 dependency kinds.
   MissingInterpreter, and SpawnDenied return transient
   `{id, staged_hash, class}` and discard the attempted trace/result. DSTR v1
   tag 4 `ToolLaunch` is permanently reserved and decode-rejected; `Tool` is
-  fixed tag 10.
+  fixed tag 10. (Refined in R31: a hit records the aggregate DSCT
+  `capsule_hash` and the transient carrier uses that field; the R30
+  trace-discarding/nonmemoized outcome rule is unchanged.)
 - **Missing-lineage repair has destination-aware exact preimages** (§§6,
   13–14, 17): inspection distinguishes `Absent`, occupied canonical bundle,
   and occupied opaque bytes by exact hash/kind. Creation is no-replace;
@@ -10573,8 +10789,39 @@ ordinary §10 dependency kinds.
   verified artifact encoded/terminal type, every load edge's expected terminal
   type, and bootstrap. Pack construction/mount and RPC connect, coverage,
   reattest, and RpcIO recompute that set for DSCA/DSLP, preventing authored
-  `build_only` laundering through processing.
+  `build_only` laundering through processing. (Refined in R31: pack boundaries
+  still attest exact `B(C)`; RPC derives the same `B(served)` per response but
+  connect/reattest attest canonical superset `A`, with a typed expansion
+  challenge when the subset proof fails.)
 <!-- R30_LEDGER_END -->
+
+<!-- R31_LEDGER_BEGIN count=3 -->
+- **Entry lineage has a closed bootstrap arm** (§§3, 6, 11, 13): bundle
+  entries carry canonical `EntryLineageV1 = Manifest(LineageStamp) |
+  Bootstrap { bundle_format_version }` with fixed record/JSON tags. The
+  Bootstrap arm is legal and required for exactly the five sealed format-v1
+  control TypeUuids, whose schema facts and authoring/control roles must equal
+  `BootstrapControlTableV1`; every non-bootstrap type requires the exact
+  manifest-prefix arm. Scanner, schema closure, adoption, repair, and control
+  reads share that validator, so missing-manifest repair can install the first
+  bootstrap manifest without putting any bootstrap entry in user migration.
+- **Lazy RPC attestation binds an accepted superset** (§§3, 15, 17): connect
+  and reattest send complete canonical rows and DSCA/DSLP for accepted `A`, and
+  the Hub binds that set after daemon-table verification. Each actual served
+  closure recomputes `B(served)` and proves it is a subset; otherwise the
+  no-data `AttestationExpansionRequired` arm carries its pinned snapshot/DSAE
+  identity and exact required TypeUuid set, RpcIO reattests `A union required`,
+  and retries. `CompiledAttestationChanged` now means only drift inside `A`;
+  pack boundaries remain exact `B(C)`.
+- **Tool traces commit a hermetic execution capsule** (§§3, 5, 9, 13): DSCT
+  covers launcher/script bytes, resolved interpreter, executable non-system
+  DSO/plugin/resource closure, launch metadata, sanitized environment, cwd
+  policy, and pinned platform/system-runtime identity or explicit residual.
+  Registration stages and verifies that full closure no-replace and refuses an
+  incomplete cacheable row; `TraceOp::Tool::Ok` and revalidation use the DSCT
+  capsule hash, while R30 post-lookup launch outcomes and execution-time
+  `CapsuleClosureUnavailable` remain transient and nonmemoized.
+<!-- R31_LEDGER_END -->
 
 ### Open — remaining
 
