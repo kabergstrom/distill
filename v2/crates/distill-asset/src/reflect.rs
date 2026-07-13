@@ -12,12 +12,12 @@ use distill_wire::exec::Blob;
 use distill_wire::native::{NativeLayoutNode, ScalarKind};
 
 use crate::build::{checked_align, checked_len, checked_size, LayoutBuilder, LogicalBuilder};
-use crate::defaults::{DefaultWriter, PathStep};
+use crate::defaults::{DefaultCollector, DefaultWriter, PathStep};
 use crate::hasher::DeterministicState;
 use crate::types::{AssetRef, EncodeContainer, EncodeSink, WeakAssetRef};
 use crate::AssetType;
 
-pub type DefaultNode = (Vec<PathStep>, DefaultWriter);
+pub use crate::defaults::DefaultNode;
 
 /// Implemented by generated asset records and the framework's closed
 /// set of serializable leaves/containers. The trait is public because
@@ -33,11 +33,40 @@ pub trait AssetReflect: 'static {
         None
     }
 
-    fn collect_default_nodes(_prefix: &mut Vec<PathStep>, _out: &mut Vec<DefaultNode>) {}
+    fn collect_default_nodes(_collector: &mut DefaultCollector) {}
 
     fn string_key(&self) -> Option<&str> {
         None
     }
+}
+
+fn collect_child_defaults<P: 'static, T: AssetReflect>(
+    collector: &mut DefaultCollector,
+    path: Vec<PathStep>,
+) {
+    let Some(node) = collector.begin::<P>() else {
+        return;
+    };
+    if let Some(writer) = T::default_writer() {
+        collector.add(node, path, writer);
+    }
+    T::collect_default_nodes(collector);
+}
+
+fn collect_map_defaults<P: 'static, K: AssetReflect, V: AssetReflect>(
+    collector: &mut DefaultCollector,
+) {
+    let Some(node) = collector.begin::<P>() else {
+        return;
+    };
+    if let Some(writer) = K::default_writer() {
+        collector.add(node, vec![PathStep::MapKey], writer);
+    }
+    K::collect_default_nodes(collector);
+    if let Some(writer) = V::default_writer() {
+        collector.add(node, vec![PathStep::MapValue], writer);
+    }
+    V::collect_default_nodes(collector);
 }
 
 fn scalar<T>(offset: u32, kind: ScalarKind) -> NativeLayoutNode {
@@ -269,13 +298,8 @@ impl<T: AssetReflect> AssetReflect for Vec<T> {
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::Elem);
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
 }
 
@@ -308,13 +332,8 @@ impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Array(self.iter().map(AssetReflect::to_authored).collect())
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::Elem);
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
 }
 
@@ -373,13 +392,8 @@ impl<T: AssetReflect> AssetReflect for Option<T> {
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::Elem);
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
 }
 
@@ -408,11 +422,8 @@ impl<T: AssetReflect> AssetReflect for Box<T> {
     fn to_authored(&self) -> AuthoredValue {
         (**self).to_authored()
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out)
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, Vec::new());
     }
 }
 
@@ -441,11 +452,8 @@ impl<T: AssetReflect> AssetReflect for Arc<T> {
     fn to_authored(&self) -> AuthoredValue {
         (**self).to_authored()
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out)
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, Vec::new());
     }
 }
 
@@ -479,13 +487,8 @@ where
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::Elem);
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
 }
 
@@ -518,13 +521,8 @@ where
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::Elem);
-        if let Some(writer) = T::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        T::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_child_defaults::<Self, T>(collector, vec![PathStep::Elem]);
     }
 }
 
@@ -564,19 +562,8 @@ where
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::MapKey);
-        if let Some(writer) = K::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        K::collect_default_nodes(prefix, out);
-        prefix.pop();
-        prefix.push(PathStep::MapValue);
-        if let Some(writer) = V::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        V::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_map_defaults::<Self, K, V>(collector);
     }
 }
 
@@ -614,19 +601,8 @@ where
     fn default_writer() -> Option<DefaultWriter> {
         Some(crate::defaults::write_default::<Self>)
     }
-    fn collect_default_nodes(prefix: &mut Vec<PathStep>, out: &mut Vec<DefaultNode>) {
-        prefix.push(PathStep::MapKey);
-        if let Some(writer) = K::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        K::collect_default_nodes(prefix, out);
-        prefix.pop();
-        prefix.push(PathStep::MapValue);
-        if let Some(writer) = V::default_writer() {
-            out.push((prefix.clone(), writer));
-        }
-        V::collect_default_nodes(prefix, out);
-        prefix.pop();
+    fn collect_default_nodes(collector: &mut DefaultCollector) {
+        collect_map_defaults::<Self, K, V>(collector);
     }
 }
 

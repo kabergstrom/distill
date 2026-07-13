@@ -41,6 +41,13 @@ struct Nested {
     values: Vec<Inner>,
 }
 
+#[derive(Default)]
+#[distill_asset_macro::asset(uuid = "12110101-0202-4303-8404-050505050505")]
+struct Recursive {
+    child: Option<Box<Recursive>>,
+    number: u32,
+}
+
 #[distill_asset_macro::asset(uuid = "20000000-0000-4000-8000-000000000001")]
 struct SameShapeA {
     value: u32,
@@ -138,11 +145,11 @@ fn macro_generates_logical_hash_defaults_and_deterministic_encoding() {
     assert!(table
         .nodes
         .iter()
-        .any(|(path, _)| path == &[PathStep::Field("name")]));
+        .any(|(_, path, _)| path == &[PathStep::Field("name")]));
     assert!(!table
         .nodes
         .iter()
-        .any(|(path, _)| path == &[PathStep::Field("cache")]));
+        .any(|(_, path, _)| path == &[PathStep::Field("cache")]));
     let parent = (table.parent.unwrap())().unwrap();
     let AuthoredValue::Object(parent) = parent else {
         panic!("object")
@@ -219,13 +226,29 @@ fn logical_identity_is_structural_and_revision_sensitive() {
 #[test]
 fn default_table_covers_nested_container_paths() {
     let table = default_table::<Nested>();
-    assert!(table.nodes.iter().any(|(path, _)| {
-        path == &[
-            PathStep::Field("values"),
-            PathStep::Elem,
-            PathStep::Field("number"),
-        ]
-    }));
+    assert!(table
+        .nodes
+        .iter()
+        .any(|(node, path, _)| node.0 == 0 && path == &[PathStep::Field("values")]));
+    assert!(table
+        .nodes
+        .iter()
+        .any(|(node, path, _)| node.0 == 1 && path == &[PathStep::Elem]));
+    assert!(table
+        .nodes
+        .iter()
+        .any(|(node, path, _)| node.0 == 2 && path == &[PathStep::Field("number")]));
+}
+
+#[test]
+fn recursive_default_table_reuses_schema_node_ids_and_is_finite() {
+    let table = default_table::<Recursive>();
+    assert!(table.nodes.len() <= 6, "recursive schema was unrolled");
+    assert_eq!(table.nodes.iter().map(|(node, _, _)| node.0).max(), Some(2));
+    assert!(table
+        .nodes
+        .iter()
+        .any(|(node, path, _)| node.0 == 0 && path == &[PathStep::Field("child")]));
 }
 
 #[test]

@@ -385,10 +385,10 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
                 #default_probe
             }
 
-            fn collect_default_nodes(
-                prefix: &mut Vec<::distill_asset::PathStep>,
-                out: &mut Vec<::distill_asset::reflect::DefaultNode>,
-            ) {
+            fn collect_default_nodes(collector: &mut ::distill_asset::DefaultCollector) {
+                let Some(node) = collector.begin::<Self>() else {
+                    return;
+                };
                 #(#defaults)*
             }
         }
@@ -434,12 +434,10 @@ fn default_collect_field(field: &&FieldInfo) -> TokenStream2 {
     let name = &field.name;
     let ty = &field.ty;
     quote! {
-        prefix.push(::distill_asset::PathStep::Field(#name));
         if let Some(writer) = <#ty as ::distill_asset::AssetReflect>::default_writer() {
-            out.push((prefix.clone(), writer));
+            collector.add(node, vec![::distill_asset::PathStep::Field(#name)], writer);
         }
-        <#ty as ::distill_asset::AssetReflect>::collect_default_nodes(prefix, out);
-        prefix.pop();
+        <#ty as ::distill_asset::AssetReflect>::collect_default_nodes(collector);
     }
 }
 
@@ -477,14 +475,11 @@ fn common_impls(
                 static TABLE: ::std::sync::OnceLock<::distill_asset::DefaultTable<#ident>> =
                     ::std::sync::OnceLock::new();
                 TABLE.get_or_init(|| {
-                    let mut nodes = Vec::new();
-                    <#ident as ::distill_asset::AssetReflect>::collect_default_nodes(
-                        &mut Vec::new(),
-                        &mut nodes,
-                    );
+                    let mut collector = ::distill_asset::DefaultCollector::default();
+                    <#ident as ::distill_asset::AssetReflect>::collect_default_nodes(&mut collector);
                     ::distill_asset::defaults::make_table::<#ident>(
                         <#ident as ::distill_asset::AssetReflect>::default_writer(),
-                        nodes,
+                        collector.finish(),
                     )
                 })
             }
@@ -700,10 +695,10 @@ fn enum_reflect(
                 #default_probe
             }
 
-            fn collect_default_nodes(
-                prefix: &mut Vec<::distill_asset::PathStep>,
-                out: &mut Vec<::distill_asset::reflect::DefaultNode>,
-            ) {
+            fn collect_default_nodes(collector: &mut ::distill_asset::DefaultCollector) {
+                let Some(node) = collector.begin::<Self>() else {
+                    return;
+                };
                 #(#default_collect)*
             }
         }
@@ -860,27 +855,30 @@ fn enum_authored_arm(variant: &VariantInfo) -> TokenStream2 {
 }
 
 fn enum_default_collect(variant: &VariantInfo) -> TokenStream2 {
-    let name = variant.ident.to_string();
+    let variant_name = variant.ident.to_string();
     let fields = variant
         .fields
         .iter()
         .filter(|field| !field.args.skip)
         .map(|field| {
-            let name = &field.name;
+            let field_name = &field.name;
             let ty = &field.ty;
             quote! {
-                prefix.push(::distill_asset::PathStep::Field(#name));
                 if let Some(writer) = <#ty as ::distill_asset::AssetReflect>::default_writer() {
-                    out.push((prefix.clone(), writer));
+                    collector.add(
+                        node,
+                        vec![
+                            ::distill_asset::PathStep::Variant(#variant_name),
+                            ::distill_asset::PathStep::Field(#field_name),
+                        ],
+                        writer,
+                    );
                 }
-                <#ty as ::distill_asset::AssetReflect>::collect_default_nodes(prefix, out);
-                prefix.pop();
+                <#ty as ::distill_asset::AssetReflect>::collect_default_nodes(collector);
             }
         });
     quote! {
-        prefix.push(::distill_asset::PathStep::Variant(#name));
         #(#fields)*
-        prefix.pop();
     }
 }
 

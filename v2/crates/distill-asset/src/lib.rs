@@ -19,7 +19,10 @@ pub mod reflect;
 pub mod thunks;
 pub mod types;
 
-pub use defaults::{default_table, AssetDefaults, DefaultTable, DefaultWriter, PathStep};
+pub use defaults::{
+    default_table, AssetDefaults, DefaultCollector, DefaultNode, DefaultTable, DefaultWriter,
+    PathStep, SchemaNodeId,
+};
 pub use distill_asset_macro::asset;
 pub use hasher::{AssetHashMap, AssetHashSet, DeterministicState};
 pub use reflect::AssetReflect;
