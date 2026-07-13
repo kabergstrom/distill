@@ -4,6 +4,7 @@
 //! folds, keys, validation, trace revalidation, and stack-safe traversal.
 
 pub mod cache;
+pub mod codegen;
 pub mod import;
 pub mod keys;
 pub mod outputs;
