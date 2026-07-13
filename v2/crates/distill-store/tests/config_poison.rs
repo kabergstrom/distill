@@ -173,7 +173,39 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
     ];
     for (reason, expected) in cases {
         assert_eq!(reason.code(), expected);
+        let bytes = reason.canonical_detail_bytes();
+        assert_eq!(
+            DscpV1::from_canonical_detail_bytes(expected, &bytes).unwrap(),
+            reason
+        );
     }
+}
+
+#[test]
+fn dscp_detail_decoder_rejects_noncanonical_order_and_text() {
+    let mut unsorted = Vec::new();
+    unsorted.extend_from_slice(&2_u32.to_le_bytes());
+    unsorted.extend_from_slice(&AssetUuid([2; 16]).0);
+    unsorted.extend_from_slice(&AssetUuid([1; 16]).0);
+    assert!(matches!(
+        DscpV1::from_canonical_detail_bytes(
+            ConfigurationPoisonCode::DuplicateLineageManifest,
+            &unsorted,
+        ),
+        Err(distill_store::state::DscpError::NonCanonical)
+    ));
+
+    let mut decomposed = Vec::new();
+    decomposed.extend_from_slice(&6_u32.to_le_bytes());
+    decomposed.extend_from_slice(b"cafe\xcc\x81");
+    assert_eq!(
+        DscpV1::from_canonical_detail_bytes(
+            ConfigurationPoisonCode::DuplicateRootName,
+            &decomposed,
+        )
+        .unwrap_err(),
+        distill_store::state::DscpError::InvalidText
+    );
 }
 
 #[test]

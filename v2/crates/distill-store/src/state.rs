@@ -845,7 +845,7 @@ impl<'a> DscpDecoder<'a> {
 fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
     use unicode_normalization::UnicodeNormalization;
 
-    let is_nfc = |value: &str| value.nfc().eq(value.chars());
+    let is_nfc = |value: &str| value.nfc().collect::<String>() == value;
     let mut values = Vec::new();
     match detail {
         DscpV1::MalformedConfiguration { .. }
