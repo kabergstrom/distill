@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -400,6 +400,15 @@ impl<T> RpcResult<T> {
             _ => None,
         }
     }
+
+    pub fn map_success<U>(self, map: impl FnOnce(T) -> U) -> RpcResult<U> {
+        match self {
+            Self::Success(value) => RpcResult::Success(map(value)),
+            Self::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
+            Self::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
+            Self::Failure(error) => RpcResult::Failure(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +451,11 @@ pub enum ResolveResult {
     Deleted {
         at: SnapshotStamp,
     },
+    /// The UUID exists, but its authored row is tooling-only and must never
+    /// enter the runtime build/load path.
+    RoleIneligible {
+        observed: AuthoringEntryRole,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +476,77 @@ pub enum PathResolveResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathResolveFailure {
     Ambiguous { candidates: Vec<AssetUuid> },
+}
+
+/// Closed query subset exposed by the pinned authoring RPC capability.
+/// `None` is the explicitly tooling-only whole-tree enumeration; ordinary
+/// runtime query surfaces do not accept that form.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AssetQuery {
+    pub uuid: Option<AssetUuid>,
+    pub bundle_path: Option<String>,
+    pub local_id: Option<String>,
+    pub bundle_uuid: Option<BundleUuid>,
+    pub authored_type: Option<TypeUuid>,
+    pub terminal_type: Option<TypeUuid>,
+    pub tag: Option<TagSelector>,
+    pub path_prefix: Option<String>,
+    pub path_glob: Option<String>,
+    pub authoring_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagSelector {
+    pub tag: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoringEntryRole {
+    Runtime,
+    AuthoringOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoringValue {
+    /// Canonical authored-value bytes. This branded carrier is deliberately
+    /// not a `ContentHash` and cannot be fetched as an artifact.
+    pub canonical_value: Arc<[u8]>,
+    pub blobs: Vec<Arc<[u8]>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoringEntry {
+    pub uuid: AssetUuid,
+    pub bundle: BundleUuid,
+    pub local_id: String,
+    pub normalized_path: String,
+    pub type_uuid: TypeUuid,
+    pub terminal_type: TypeUuid,
+    pub schema_hash: LogicalHash,
+    pub role: AuthoringEntryRole,
+    pub tags: BTreeMap<String, Option<String>>,
+    pub value: AuthoringValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoringInspection {
+    pub stamp: SnapshotStamp,
+    pub uuid: AssetUuid,
+    pub bundle: BundleUuid,
+    pub local_id: String,
+    pub normalized_path: String,
+    pub type_uuid: TypeUuid,
+    pub schema_hash: LogicalHash,
+    pub role: AuthoringEntryRole,
+    pub value: AuthoringValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoringInspectResult {
+    Inspection(AuthoringInspection),
+    Missing,
+    RoleIneligible { observed: AuthoringEntryRole },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +696,12 @@ pub enum AssetMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoringMutation {
+    Set(AuthoringEntry),
+    Remove { uuid: AssetUuid },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathMutation {
     Set {
         path: String,
@@ -624,6 +715,7 @@ pub enum PathMutation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Commit {
     pub assets: Vec<AssetMutation>,
+    pub authoring: Vec<AuthoringMutation>,
     pub paths: Vec<PathMutation>,
     pub configuration: Option<ConfigurationStatus>,
 }
@@ -633,6 +725,7 @@ pub enum AdminError {
     UnknownTarget { target: String },
     InvalidTargetAttestation(crate::AttestationShapeError),
     DuplicateAssetMutation { uuid: AssetUuid },
+    DuplicateAuthoringMutation { uuid: AssetUuid },
     DuplicatePathMutation { path: String },
     InvalidPath { path: String },
     EmptyPathCandidates { path: String },

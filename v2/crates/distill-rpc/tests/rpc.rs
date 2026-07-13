@@ -131,6 +131,253 @@ fn assert_reconnect<T: std::fmt::Debug>(result: RpcResult<T>, reason: ReconnectR
     ));
 }
 
+fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
+    AuthoringEntry {
+        uuid: asset_id(byte),
+        bundle: BundleUuid([byte.wrapping_add(1); 16]),
+        local_id: format!("entry-{byte}"),
+        normalized_path: format!("bundle-{byte}.asset"),
+        type_uuid: type_id(byte),
+        terminal_type: type_id(byte),
+        schema_hash: LogicalHash([byte.wrapping_add(10); 32]),
+        role,
+        tags: std::collections::BTreeMap::from([(
+            "group".to_owned(),
+            Some(format!("group-{byte}")),
+        )]),
+        value: AuthoringValue {
+            canonical_value: Arc::from(&b"[0]"[..]),
+            blobs: vec![Arc::from([byte.wrapping_add(2)])],
+        },
+    }
+}
+
+fn authoring_snapshot(hub: &Hub) -> AuthoringSnapshot {
+    match hub.authoring_snapshot() {
+        RpcResult::Success(snapshot) => snapshot,
+        other => panic!("expected authoring snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
+    let server = server_with(&[(1, false), (2, false)]);
+    let runtime = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let tooling = authoring_entry(2, AuthoringEntryRole::AuthoringOnly);
+    let stamp = server
+        .commit(Commit {
+            assets: vec![
+                set_asset(
+                    tooling.uuid,
+                    StoredResolve::Built {
+                        content_hash: content_hash(9),
+                    },
+                    AssetDeltaState::Changed,
+                ),
+                set_asset(
+                    asset_id(99),
+                    StoredResolve::Built {
+                        content_hash: content_hash(10),
+                    },
+                    AssetDeltaState::Changed,
+                ),
+            ],
+            authoring: vec![
+                AuthoringMutation::Set(runtime.clone()),
+                AuthoringMutation::Set(tooling.clone()),
+            ],
+            ..Commit::default()
+        })
+        .unwrap();
+    let hub = connect(&server, &[(1, false), (2, false)]);
+    let pinned = authoring_snapshot(&hub);
+
+    assert_eq!(pinned.stamp(), stamp);
+    assert_eq!(pinned.basis().target_generation, 0);
+    assert_eq!(pinned.basis().policy_generation, 0);
+    assert_eq!(pinned.basis().attestation_generation, 0);
+    assert_eq!(pinned.version(), RpcResult::Success(stamp.version));
+    assert_eq!(
+        pinned.query(AssetQuery {
+            authoring_only: Some(false),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Success(vec![runtime.uuid])
+    );
+    assert_eq!(
+        pinned.query(AssetQuery {
+            authoring_only: Some(true),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Success(vec![tooling.uuid])
+    );
+    assert_eq!(
+        pinned.query(AssetQuery {
+            uuid: Some(tooling.uuid),
+            bundle_path: Some(tooling.normalized_path.clone()),
+            local_id: Some(tooling.local_id.clone()),
+            bundle_uuid: Some(tooling.bundle),
+            authored_type: Some(tooling.type_uuid),
+            terminal_type: Some(tooling.terminal_type),
+            tag: Some(TagSelector {
+                tag: "group".to_owned(),
+                value: Some("group-2".to_owned()),
+            }),
+            path_prefix: Some("bundle-".to_owned()),
+            path_glob: Some("bundle-?.asset".to_owned()),
+            authoring_only: Some(true),
+        }),
+        RpcResult::Success(vec![tooling.uuid])
+    );
+    match pinned.inspect(tooling.uuid) {
+        RpcResult::Success(AuthoringInspectResult::Inspection(inspection)) => {
+            assert_eq!(inspection.stamp, stamp);
+            assert_eq!(inspection.uuid, tooling.uuid);
+            assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
+            assert_eq!(inspection.value, tooling.value);
+        }
+        other => panic!("expected pinned inspection, got {other:?}"),
+    }
+    assert_eq!(
+        pinned.inspect(asset_id(99)),
+        RpcResult::Success(AuthoringInspectResult::RoleIneligible {
+            observed: AuthoringEntryRole::Runtime,
+        })
+    );
+    assert_eq!(
+        pinned.inspect(asset_id(98)),
+        RpcResult::Success(AuthoringInspectResult::Missing)
+    );
+
+    let runtime_snapshot = snapshot(&hub);
+    assert!(matches!(
+        runtime_snapshot.resolve(tooling.uuid),
+        RpcResult::Success(TerminalEvent {
+            value: ResolveResult::RoleIneligible {
+                observed: AuthoringEntryRole::AuthoringOnly
+            },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
+    let server = server_with(&[(1, false)]);
+    let first_entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
+    let first_stamp = server
+        .commit(Commit {
+            authoring: vec![AuthoringMutation::Set(first_entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+    let first = authoring_snapshot(&hub);
+
+    let mut replacement = first_entry.clone();
+    replacement.value.canonical_value = Arc::from(&b"{\"blob\":0}"[..]);
+    let second_stamp = server
+        .commit(Commit {
+            authoring: vec![AuthoringMutation::Set(replacement.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let old = first.inspect(first_entry.uuid).success().unwrap();
+    let refreshed = first.refresh().success().unwrap();
+    let new = refreshed.inspect(first_entry.uuid).success().unwrap();
+    assert_eq!(first.stamp(), first_stamp);
+    assert_eq!(refreshed.stamp(), second_stamp);
+    assert_eq!(
+        refreshed.basis().target_generation,
+        first.basis().target_generation
+    );
+    assert_eq!(
+        refreshed.basis().policy_generation,
+        first.basis().policy_generation
+    );
+    assert_eq!(
+        refreshed.basis().attestation_generation,
+        first.basis().attestation_generation
+    );
+    assert!(
+        matches!(old, AuthoringInspectResult::Inspection(value) if value.stamp == first_stamp && value.value == first_entry.value)
+    );
+    assert!(
+        matches!(new, AuthoringInspectResult::Inspection(value) if value.stamp == second_stamp && value.value == replacement.value)
+    );
+}
+
+#[test]
+fn every_authoring_snapshot_method_is_lease_and_generation_fenced() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let expired = authoring_snapshot(&hub);
+    expired.expire_lease();
+    assert_eq!(
+        expired.version(),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    );
+    assert_eq!(
+        expired.query(AssetQuery::default()),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    );
+    assert_eq!(
+        expired.inspect(asset_id(1)),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    );
+    assert!(matches!(
+        expired.refresh(),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    ));
+
+    let stale = authoring_snapshot(&hub);
+    server
+        .replace_target(target_with(8, &[(1, false)]))
+        .unwrap();
+    let reason = ReconnectReason::TargetDefinitionChanged;
+    assert_reconnect(hub.authoring_snapshot(), reason);
+    assert_reconnect(stale.version(), reason);
+    assert_reconnect(stale.query(AssetQuery::default()), reason);
+    assert_reconnect(stale.inspect(asset_id(1)), reason);
+    assert_reconnect(stale.refresh(), reason);
+}
+
+#[test]
+fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_poison() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
+    let poison = ConfigurationPoison::new(
+        ConfigurationPoisonCode::INVALID_CANDIDATE,
+        "authoring-test/poison",
+        "invalid staged configuration",
+    );
+    let poisoned_stamp = server
+        .commit(Commit {
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            configuration: Some(ConfigurationStatus::Poisoned(poison)),
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let pinned = authoring_snapshot(&hub);
+    assert_eq!(pinned.stamp(), poisoned_stamp);
+    assert_eq!(
+        pinned.query(AssetQuery {
+            uuid: Some(entry.uuid),
+            authoring_only: Some(true),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Success(vec![entry.uuid])
+    );
+    assert!(matches!(
+        pinned.inspect(entry.uuid),
+        RpcResult::Success(AuthoringInspectResult::Inspection(value))
+            if value.stamp == poisoned_stamp
+    ));
+}
+
 #[test]
 fn reconnect_reason_vocabulary_is_shared_and_complete() {
     assert_ne!(
@@ -688,6 +935,7 @@ fn resolve_path_and_fetch_terminal_outcomes_all_carry_the_snapshot_basis() {
                 ),
                 set_asset(deleted, StoredResolve::Deleted, AssetDeltaState::Deleted),
             ],
+            authoring: Vec::new(),
             paths: vec![
                 PathMutation::Set {
                     path: "textures/a.asset".to_owned(),
@@ -906,6 +1154,7 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
                 },
                 AssetDeltaState::Changed,
             )],
+            authoring: Vec::new(),
             paths: vec![PathMutation::Set {
                 path: "watched.asset".to_owned(),
                 candidates: BTreeSet::from([watched]),
@@ -919,6 +1168,7 @@ fn initial_subscription_delta_is_cursor_bound_ordered_and_filters_assets_and_pat
                 set_asset(watched, StoredResolve::Deleted, AssetDeltaState::Deleted),
                 set_asset(ignored, StoredResolve::Deleted, AssetDeltaState::Deleted),
             ],
+            authoring: Vec::new(),
             paths: vec![PathMutation::Remove {
                 path: "watched.asset".to_owned(),
             }],

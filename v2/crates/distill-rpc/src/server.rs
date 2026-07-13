@@ -41,6 +41,17 @@ pub struct Snapshot {
 }
 
 #[derive(Clone)]
+pub struct AuthoringSnapshot {
+    server: Server,
+    connection: Arc<Mutex<ConnectionState>>,
+    connection_id: u64,
+    epoch: GameModuleEpoch,
+    view: Arc<VersionView>,
+    basis: RpcBasis,
+    lease_alive: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
 pub struct DeltaStream {
     connection: Arc<Mutex<ConnectionState>>,
 }
@@ -75,6 +86,16 @@ impl fmt::Debug for Snapshot {
     }
 }
 
+impl fmt::Debug for AuthoringSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthoringSnapshot")
+            .field("connection_id", &self.connection_id)
+            .field("epoch", &self.epoch)
+            .field("stamp", &self.basis.snapshot)
+            .finish()
+    }
+}
+
 impl fmt::Debug for DeltaStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeltaStream").finish_non_exhaustive()
@@ -101,6 +122,7 @@ struct VersionView {
     stamp: SnapshotStamp,
     configuration: ConfigurationStatus,
     assets: BTreeMap<AssetUuid, VersionResolve>,
+    authoring: BTreeMap<AssetUuid, AuthoringEntry>,
     paths: BTreeMap<String, BTreeSet<AssetUuid>>,
 }
 
@@ -201,6 +223,7 @@ impl Server {
             stamp,
             configuration: ConfigurationStatus::Ready,
             assets: BTreeMap::new(),
+            authoring: BTreeMap::new(),
             paths: BTreeMap::new(),
         });
         let mut views = BTreeMap::new();
@@ -325,6 +348,16 @@ impl Server {
                 AssetMutation::Remove { uuid, delta } => {
                     view.assets.remove(&uuid);
                     asset_deltas.push((uuid, delta));
+                }
+            }
+        }
+        for mutation in commit.authoring {
+            match mutation {
+                AuthoringMutation::Set(entry) => {
+                    view.authoring.insert(entry.uuid, entry);
+                }
+                AuthoringMutation::Remove { uuid } => {
+                    view.authoring.remove(&uuid);
                 }
             }
         }
@@ -582,6 +615,23 @@ impl Hub {
             return RpcResult::ReconnectRequired { reason };
         }
         RpcResult::Success(snapshot_from(
+            &self.server,
+            &state,
+            &connection,
+            self.connection.clone(),
+        ))
+    }
+
+    /// Pin a tooling-only view. It shares the same immutable store stamp and
+    /// complete connection-generation fence as the runtime snapshot, but has
+    /// no resolve, fetch, dependency, or pack capability.
+    pub fn authoring_snapshot(&self) -> RpcResult<AuthoringSnapshot> {
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(reason) = generation_fence(&state, &connection) {
+            return RpcResult::ReconnectRequired { reason };
+        }
+        RpcResult::Success(authoring_snapshot_from(
             &self.server,
             &state,
             &connection,
@@ -888,19 +938,30 @@ impl Snapshot {
         if let ConfigurationStatus::Poisoned(poison) = &self.view.configuration {
             return RpcResult::ConfigurationPoisoned(poison.clone());
         }
-        let value = match self.view.assets.get(&uuid) {
-            Some(VersionResolve::Built { content_hash }) => ResolveResult::Built {
-                content_hash: *content_hash,
-            },
-            Some(VersionResolve::Drifted { input }) => ResolveResult::Drifted {
-                input: input.clone(),
-                current: stamp(&state),
-            },
-            Some(VersionResolve::Failed { error }) => ResolveResult::Failed {
-                error: error.clone(),
-            },
-            Some(VersionResolve::Deleted { at }) => ResolveResult::Deleted { at: *at },
-            None => ResolveResult::Missing,
+        let value = if self
+            .view
+            .authoring
+            .get(&uuid)
+            .is_some_and(|entry| entry.role == AuthoringEntryRole::AuthoringOnly)
+        {
+            ResolveResult::RoleIneligible {
+                observed: AuthoringEntryRole::AuthoringOnly,
+            }
+        } else {
+            match self.view.assets.get(&uuid) {
+                Some(VersionResolve::Built { content_hash }) => ResolveResult::Built {
+                    content_hash: *content_hash,
+                },
+                Some(VersionResolve::Drifted { input }) => ResolveResult::Drifted {
+                    input: input.clone(),
+                    current: stamp(&state),
+                },
+                Some(VersionResolve::Failed { error }) => ResolveResult::Failed {
+                    error: error.clone(),
+                },
+                Some(VersionResolve::Deleted { at }) => ResolveResult::Deleted { at: *at },
+                None => ResolveResult::Missing,
+            }
         };
         RpcResult::Success(TerminalEvent {
             basis: self.basis.clone(),
@@ -948,6 +1009,149 @@ impl Snapshot {
             basis: self.basis.clone(),
             value: chunk_payload(payload, state.chunk_size),
         })
+    }
+
+    fn preflight<T>(
+        &self,
+        state: &ServerState,
+        connection: &ConnectionState,
+    ) -> Option<RpcResult<T>> {
+        if let Some(reason) = generation_fence(state, connection) {
+            return Some(RpcResult::ReconnectRequired { reason });
+        }
+        if connection.epoch != self.epoch {
+            return Some(RpcResult::Failure(RpcFailure::ClientEpochChanged {
+                snapshot: self.epoch,
+                current: connection.epoch,
+            }));
+        }
+        if !self.lease_alive.load(Ordering::Acquire) {
+            return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
+        }
+        None
+    }
+}
+
+impl AuthoringSnapshot {
+    pub fn stamp(&self) -> SnapshotStamp {
+        self.basis.snapshot
+    }
+
+    pub fn version(&self) -> RpcResult<InputVersion> {
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(result) = self.preflight(&state, &connection) {
+            return result;
+        }
+        RpcResult::Success(self.basis.snapshot.version)
+    }
+
+    pub fn basis(&self) -> &RpcBasis {
+        &self.basis
+    }
+
+    pub fn expire_lease(&self) {
+        self.lease_alive.store(false, Ordering::Release);
+    }
+
+    pub fn query(&self, query: AssetQuery) -> RpcResult<Vec<AssetUuid>> {
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(result) = self.preflight(&state, &connection) {
+            return result;
+        }
+        let role = if query.authoring_only.unwrap_or(false) {
+            AuthoringEntryRole::AuthoringOnly
+        } else {
+            AuthoringEntryRole::Runtime
+        };
+        let values = self
+            .view
+            .authoring
+            .iter()
+            .filter(|(uuid, entry)| {
+                query.uuid.is_none_or(|wanted| wanted == **uuid)
+                    && query
+                        .bundle_path
+                        .as_ref()
+                        .is_none_or(|path| path == &entry.normalized_path)
+                    && query
+                        .local_id
+                        .as_ref()
+                        .is_none_or(|local_id| local_id == &entry.local_id)
+                    && query
+                        .bundle_uuid
+                        .is_none_or(|bundle| bundle == entry.bundle)
+                    && query
+                        .authored_type
+                        .is_none_or(|type_uuid| type_uuid == entry.type_uuid)
+                    && query
+                        .terminal_type
+                        .is_none_or(|type_uuid| type_uuid == entry.terminal_type)
+                    && query.tag.as_ref().is_none_or(|tag| {
+                        entry.tags.get(&tag.tag).is_some_and(|value| {
+                            tag.value.as_ref().is_none_or(|wanted| {
+                                value.as_ref().is_some_and(|actual| actual == wanted)
+                            })
+                        })
+                    })
+                    && query
+                        .path_prefix
+                        .as_ref()
+                        .is_none_or(|prefix| entry.normalized_path.starts_with(prefix))
+                    && query
+                        .path_glob
+                        .as_ref()
+                        .is_none_or(|glob| path_glob_matches(glob, &entry.normalized_path))
+                    && entry.role == role
+            })
+            .map(|(uuid, _)| *uuid)
+            .collect();
+        RpcResult::Success(values)
+    }
+
+    pub fn inspect(&self, uuid: AssetUuid) -> RpcResult<AuthoringInspectResult> {
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(result) = self.preflight(&state, &connection) {
+            return result;
+        }
+        let Some(entry) = self.view.authoring.get(&uuid) else {
+            if self.view.assets.contains_key(&uuid) {
+                return RpcResult::Success(AuthoringInspectResult::RoleIneligible {
+                    observed: AuthoringEntryRole::Runtime,
+                });
+            }
+            return RpcResult::Success(AuthoringInspectResult::Missing);
+        };
+        RpcResult::Success(AuthoringInspectResult::Inspection(AuthoringInspection {
+            stamp: self.basis.snapshot,
+            uuid: entry.uuid,
+            bundle: entry.bundle,
+            local_id: entry.local_id.clone(),
+            normalized_path: entry.normalized_path.clone(),
+            type_uuid: entry.type_uuid,
+            schema_hash: entry.schema_hash,
+            role: entry.role,
+            value: entry.value.clone(),
+        }))
+    }
+
+    pub fn refresh(&self) -> RpcResult<AuthoringSnapshot> {
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(reason) = generation_fence(&state, &connection) {
+            return RpcResult::ReconnectRequired { reason };
+        }
+        if !self.lease_alive.load(Ordering::Acquire) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
+        RpcResult::Success(authoring_snapshot_from(
+            &self.server,
+            &state,
+            &connection,
+            self.connection.clone(),
+        ))
     }
 
     fn preflight<T>(
@@ -1075,6 +1279,28 @@ fn snapshot_from(
         .expect("current view must exist")
         .clone();
     Snapshot {
+        server: server.clone(),
+        connection: connection_arc,
+        connection_id: connection.id,
+        epoch: connection.epoch,
+        basis: basis_for(connection, view.stamp),
+        view,
+        lease_alive: Arc::new(AtomicBool::new(true)),
+    }
+}
+
+fn authoring_snapshot_from(
+    server: &Server,
+    state: &ServerState,
+    connection: &ConnectionState,
+    connection_arc: Arc<Mutex<ConnectionState>>,
+) -> AuthoringSnapshot {
+    let view = state
+        .views
+        .get(&state.current)
+        .expect("current view must exist")
+        .clone();
+    AuthoringSnapshot {
         server: server.clone(),
         connection: connection_arc,
         connection_id: connection.id,
@@ -1266,6 +1492,16 @@ fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
             return Err(AdminError::DuplicateAssetMutation { uuid });
         }
     }
+    let mut authoring = BTreeSet::new();
+    for mutation in &commit.authoring {
+        let uuid = match mutation {
+            AuthoringMutation::Set(entry) => entry.uuid,
+            AuthoringMutation::Remove { uuid } => *uuid,
+        };
+        if !authoring.insert(uuid) {
+            return Err(AdminError::DuplicateAuthoringMutation { uuid });
+        }
+    }
     let mut paths = BTreeSet::new();
     for mutation in &commit.paths {
         let path = match mutation {
@@ -1297,6 +1533,34 @@ fn valid_logical_path(path: &str) -> bool {
                 && component != ".."
                 && component.nfc().eq(component.chars())
         })
+}
+
+fn path_glob_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let path = path.as_bytes();
+    let mut previous = vec![false; path.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; path.len() + 1];
+        match token {
+            b'*' => {
+                current[0] = previous[0];
+                for index in 1..=path.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            b'?' => {
+                current[1..].copy_from_slice(&previous[..path.len()]);
+            }
+            literal => {
+                for index in 1..=path.len() {
+                    current[index] = previous[index - 1] && path[index - 1] == *literal;
+                }
+            }
+        }
+        previous = current;
+    }
+    previous[path.len()]
 }
 
 fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {

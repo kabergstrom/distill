@@ -103,6 +103,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     assert!(!source.contains("-> (status"));
     for name in [
         "SnapshotCall",
+        "AuthoringSnapshotCall",
         "SubscribeCall",
         "VoidCall",
         "UInt64Call",
@@ -155,6 +156,304 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         assert!(reattest.contains(arm), "missing reattest arm {arm}");
     }
     assert!(source.contains("-> (result :ReattestResult);"));
+
+    let inspect = source
+        .split_once("struct AuthoringInspectCall {")
+        .expect("dedicated AuthoringInspectCall")
+        .1
+        .split_once("\n  }\n}")
+        .expect("terminated AuthoringInspectCall")
+        .0;
+    for arm in [
+        "success @0 :AuthoringInspection",
+        "reconnectRequired @1 :ReconnectRequired",
+        "configurationPoisoned @2 :ConfigurationPoison",
+        "leaseFailure @3 :LeaseFailure",
+        "error @4 :RpcError",
+        "missing @5 :Void",
+        "roleIneligible @6 :AuthoringRoleFailure",
+    ] {
+        assert!(inspect.contains(arm), "missing authoring inspect arm {arm}");
+    }
+    assert!(source.contains("authoringSnapshot @10 () -> (result :AuthoringSnapshotCall);"));
+    assert!(source.contains("interface AuthoringSnapshot {"));
+    assert!(source.contains("version @0 () -> (result :UInt64Call);"));
+    assert!(source.contains("query @1 (query :AssetQuery) -> (result :UuidListCall);"));
+    assert!(source.contains("inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);"));
+    assert!(source.contains("refresh @3 () -> (result :AuthoringSnapshotCall);"));
+    for field in [
+        "uuid @0 :OptionalData",
+        "bundlePath @1 :OptionalText",
+        "localId @2 :OptionalText",
+        "bundleUuid @3 :OptionalData",
+        "authoredType @4 :OptionalData",
+        "terminalType @5 :OptionalData",
+        "tag @6 :OptionalTagSelector",
+        "pathPrefix @7 :OptionalText",
+        "pathGlob @8 :OptionalText",
+        "authoringOnly @9 :OptionalBool",
+    ] {
+        assert!(source.contains(field), "missing AssetQuery field {field}");
+    }
+    assert!(source.contains("stamp @0 :SnapshotStampValue"));
+    assert!(source.contains("inputVersion @1 :UInt64"));
+}
+
+fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
+    AuthoringEntry {
+        uuid: AssetUuid([byte; 16]),
+        bundle: BundleUuid([byte.wrapping_add(1); 16]),
+        local_id: format!("entry-{byte}"),
+        normalized_path: format!("bundle-{byte}.asset"),
+        type_uuid: TypeUuid([1; 16]),
+        terminal_type: TypeUuid([1; 16]),
+        schema_hash: LogicalHash([byte.wrapping_add(2); 32]),
+        role,
+        tags: std::collections::BTreeMap::from([(
+            "group".to_owned(),
+            Some(format!("group-{byte}")),
+        )]),
+        value: AuthoringValue {
+            canonical_value: Arc::from(&b"[0]"[..]),
+            blobs: vec![Arc::from([byte.wrapping_add(2)])],
+        },
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_fence() {
+    LocalSet::new()
+        .run_until(async {
+            let server = server();
+            let entry = authoring_entry(3, AuthoringEntryRole::AuthoringOnly);
+            let derived_uuid = AssetUuid([5; 16]);
+            let hash = ContentHash([4; 32]);
+            let first_stamp = server
+                .commit(Commit {
+                    assets: vec![
+                        AssetMutation::Set {
+                            uuid: entry.uuid,
+                            resolution: StoredResolve::Built { content_hash: hash },
+                            delta: AssetDeltaState::Changed,
+                        },
+                        AssetMutation::Set {
+                            uuid: derived_uuid,
+                            resolution: StoredResolve::Built { content_hash: hash },
+                            delta: AssetDeltaState::Changed,
+                        },
+                    ],
+                    authoring: vec![AuthoringMutation::Set(entry.clone())],
+                    ..Commit::default()
+                })
+                .unwrap();
+
+            let listener = Rc::new(
+                StagedListener::bind(server.root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let server_listener = listener.clone();
+            let server_task =
+                tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = match client.connect(&request()).await.unwrap() {
+                RemoteConnectOutcome::Connected { hub, .. } => hub,
+                other => panic!("expected connected, got {other:?}"),
+            };
+
+            let response = hub
+                .authoring_snapshot_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            let snapshot = match result.which().unwrap() {
+                schema::authoring_snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                _ => panic!("expected authoring snapshot"),
+            };
+
+            let mut query = snapshot.query_request();
+            {
+                let mut query_value = query.get().init_query();
+                query_value.reborrow().init_authoring_only().set_value(true);
+            }
+            let query_response = query.send().promise.await.unwrap();
+            let query_result = query_response.get().unwrap().get_result().unwrap();
+            match query_result.which().unwrap() {
+                schema::uuid_list_call::Which::Success(values) => {
+                    let values = values.unwrap();
+                    assert_eq!(values.len(), 1);
+                    assert_eq!(values.get(0).get_bytes().unwrap(), &entry.uuid.0);
+                }
+                _ => panic!("expected authoring-only query result"),
+            }
+
+            let mut inspect = snapshot.inspect_request();
+            inspect.get().set_uuid(&entry.uuid.0);
+            let inspect_response = inspect.send().promise.await.unwrap();
+            let inspect_result = inspect_response.get().unwrap().get_result().unwrap();
+            match inspect_result.which().unwrap() {
+                schema::authoring_inspect_call::Which::Success(inspection) => {
+                    let inspection = inspection.unwrap();
+                    let stamp = inspection.get_stamp().unwrap();
+                    assert_eq!(stamp.get_instance().unwrap(), &first_stamp.instance.0);
+                    assert_eq!(stamp.get_input_version(), first_stamp.version.0);
+                    assert_eq!(inspection.get_uuid().unwrap(), &entry.uuid.0);
+                    assert_eq!(
+                        inspection.get_role().unwrap(),
+                        schema::AuthoringEntryRole::AuthoringOnly
+                    );
+                    assert_eq!(
+                        inspection
+                            .get_value()
+                            .unwrap()
+                            .get_canonical_value()
+                            .unwrap(),
+                        &*entry.value.canonical_value
+                    );
+                }
+                _ => panic!("expected authoring inspection"),
+            }
+
+            let mut wrong_role = snapshot.inspect_request();
+            wrong_role.get().set_uuid(&derived_uuid.0);
+            let wrong_role_response = wrong_role.send().promise.await.unwrap();
+            match wrong_role_response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::authoring_inspect_call::Which::RoleIneligible(failure) => {
+                    assert_eq!(
+                        failure.unwrap().get_observed().unwrap(),
+                        schema::AuthoringEntryRole::Runtime
+                    );
+                }
+                _ => panic!("expected typed authoring wrong-role result"),
+            }
+
+            let runtime_response = hub.snapshot_request().send().promise.await.unwrap();
+            let runtime = match runtime_response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                _ => panic!("expected runtime snapshot"),
+            };
+            let mut resolve = runtime.resolve_request();
+            resolve.get().set_uuid(&entry.uuid.0);
+            let resolve_response = resolve.send().promise.await.unwrap();
+            let terminal = match resolve_response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::resolve_call::Which::Success(terminal) => terminal.unwrap(),
+                _ => panic!("expected typed terminal role failure"),
+            };
+            assert!(matches!(
+                terminal.get_result().unwrap().which().unwrap(),
+                schema::resolve_result::Which::RoleIneligible(_)
+            ));
+
+            let mut replacement = entry;
+            replacement.value.canonical_value = Arc::from(&b"{\"blob\":0}"[..]);
+            let second_stamp = server
+                .commit(Commit {
+                    authoring: vec![AuthoringMutation::Set(replacement)],
+                    ..Commit::default()
+                })
+                .unwrap();
+            let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
+            let refreshed = match refresh_response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::authoring_snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                _ => panic!("expected refreshed authoring snapshot"),
+            };
+            let version_response = refreshed.version_request().send().promise.await.unwrap();
+            match version_response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::u_int64_call::Which::Success(version) => {
+                    assert_eq!(version, second_stamp.version.0)
+                }
+                _ => panic!("expected refreshed version"),
+            }
+
+            let poison = ConfigurationPoison::new(
+                ConfigurationPoisonCode::INVALID_CANDIDATE,
+                "authoring-wire/poison",
+                "invalid staged configuration",
+            );
+            let poisoned_stamp = server
+                .commit(Commit {
+                    configuration: Some(ConfigurationStatus::Poisoned(poison)),
+                    ..Commit::default()
+                })
+                .unwrap();
+            let poisoned_refresh = refreshed.refresh_request().send().promise.await.unwrap();
+            let poisoned = match poisoned_refresh
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::authoring_snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                _ => panic!("pure authoring metadata refresh must survive configuration poison"),
+            };
+            let poisoned_version = poisoned.version_request().send().promise.await.unwrap();
+            assert!(matches!(
+                poisoned_version
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                schema::u_int64_call::Which::Success(version)
+                    if version == poisoned_stamp.version.0
+            ));
+
+            server.replace_target(target_with_definition(8)).unwrap();
+            let fenced = poisoned.version_request().send().promise.await.unwrap();
+            assert!(matches!(
+                fenced.get().unwrap().get_result().unwrap().which().unwrap(),
+                schema::u_int64_call::Which::ReconnectRequired(_)
+            ));
+
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

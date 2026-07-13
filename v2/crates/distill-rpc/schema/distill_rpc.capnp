@@ -139,6 +139,16 @@ struct SnapshotCall {
   }
 }
 
+struct AuthoringSnapshotCall {
+  union {
+    success @0 :AuthoringSnapshot;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationPoisoned @2 :ConfigurationPoison;
+    leaseFailure @3 :LeaseFailure;
+    error @4 :RpcError;
+  }
+}
+
 struct SubscribeCall {
   union {
     success @0 :Subscription;
@@ -217,6 +227,95 @@ struct UuidListCall {
   }
 }
 
+struct OptionalData {
+  union {
+    absent @0 :Void;
+    value @1 :Data;
+  }
+}
+
+struct OptionalText {
+  union {
+    absent @0 :Void;
+    value @1 :Text;
+  }
+}
+
+struct OptionalBool {
+  union {
+    absent @0 :Void;
+    value @1 :Bool;
+  }
+}
+
+struct TagSelector {
+  tag @0 :Text;
+  value @1 :OptionalText;
+}
+
+struct OptionalTagSelector {
+  union {
+    absent @0 :Void;
+    value @1 :TagSelector;
+  }
+}
+
+struct AssetQuery {
+  uuid @0 :OptionalData;
+  bundlePath @1 :OptionalText;
+  localId @2 :OptionalText;
+  bundleUuid @3 :OptionalData;
+  authoredType @4 :OptionalData;
+  terminalType @5 :OptionalData;
+  tag @6 :OptionalTagSelector;
+  pathPrefix @7 :OptionalText;
+  pathGlob @8 :OptionalText;
+  authoringOnly @9 :OptionalBool;
+}
+
+enum AuthoringEntryRole {
+  runtime @0;
+  authoringOnly @1;
+}
+
+struct AuthoringValue {
+  canonicalValue @0 :Data;
+  blobs @1 :List(Data);
+}
+
+struct SnapshotStampValue {
+  instance @0 :Data;
+  inputVersion @1 :UInt64;
+}
+
+struct AuthoringInspection {
+  stamp @0 :SnapshotStampValue;
+  uuid @1 :Data;
+  bundle @2 :Data;
+  localId @3 :Text;
+  normalizedPath @4 :Text;
+  typeUuid @5 :Data;
+  schemaHash @6 :Data;
+  role @7 :AuthoringEntryRole;
+  value @8 :AuthoringValue;
+}
+
+struct AuthoringRoleFailure {
+  observed @0 :AuthoringEntryRole;
+}
+
+struct AuthoringInspectCall {
+  union {
+    success @0 :AuthoringInspection;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationPoisoned @2 :ConfigurationPoison;
+    leaseFailure @3 :LeaseFailure;
+    error @4 :RpcError;
+    missing @5 :Void;
+    roleIneligible @6 :AuthoringRoleFailure;
+  }
+}
+
 struct EntryMeta {
   bytes @0 :Data;
 }
@@ -253,6 +352,7 @@ struct ResolveResult {
     failed @2 :Text;
     missing @3 :Void;
     deleted @4 :SnapshotStamp;
+    roleIneligible @5 :AuthoringRoleFailure;
   }
 }
 
@@ -326,11 +426,12 @@ interface Hub {
            -> (result :ReattestResult);
   unsubscribe @9 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
+  authoringSnapshot @10 () -> (result :AuthoringSnapshotCall);
 }
 
 interface Snapshot {
   version @0 () -> (result :UInt64Call);
-  query @1 (query :Data) -> (result :UuidListCall);
+  query @1 (query :AssetQuery) -> (result :UuidListCall);
   entry @2 (uuid :Data) -> (result :EntryMetaCall);
   resolve @3 (uuid :Data) -> (result :ResolveCall);
   refresh @4 () -> (result :SnapshotCall);
@@ -341,6 +442,13 @@ interface Snapshot {
   reserved9 @9 () -> (result :VoidCall);
   resolvePath @10 (path :Text) -> (result :PathResolveCall);
   configuration @11 () -> (result :VoidCall);
+}
+
+interface AuthoringSnapshot {
+  version @0 () -> (result :UInt64Call);
+  query @1 (query :AssetQuery) -> (result :UuidListCall);
+  inspect @2 (uuid :Data) -> (result :AuthoringInspectCall);
+  refresh @3 () -> (result :AuthoringSnapshotCall);
 }
 
 interface ChunkStream {

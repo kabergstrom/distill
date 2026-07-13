@@ -18,12 +18,14 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
-    AssetDeltaState, AssetEvent, AssetUuid, ChunkStream, CompiledAttestationDigest,
+    AssetDeltaState, AssetEvent, AssetQuery, AssetUuid, AuthoringEntryRole, AuthoringInspectResult,
+    AuthoringInspection, AuthoringSnapshot, ChunkStream, CompiledAttestationDigest,
     CompiledTypeRow, ConfigurationPoison, ConfigurationStatus, ConnectOutcome, ConnectRequest,
     ContentHash, Delta, DeltaStream, DriftedInput, GameModuleEpoch, Hub, InputVersion,
     LoadPolicyEntry, PathResolveFailure, PathResolveResult, ReattestRequest, ReconnectReason,
     RegistryExtrasDigest, RegistryExtrasV1, ResolveResult, Root, RpcFailure, RpcResult, Snapshot,
-    SnapshotStamp, StoreInstanceId, TargetDefinitionFailureSubject, TargetDefinitionHash, TypeUuid,
+    SnapshotStamp, StoreInstanceId, TagSelector, TargetDefinitionFailureSubject,
+    TargetDefinitionHash, TypeUuid,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -473,6 +475,20 @@ impl schema::hub::Server for HubService {
             Ok(())
         }
     }
+
+    fn authoring_snapshot(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::hub::AuthoringSnapshotParams,
+        mut results: schema::hub::AuthoringSnapshotResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            write_authoring_snapshot_result(
+                results.get().init_result(),
+                self.hub.authoring_snapshot(),
+            );
+            Ok(())
+        }
+    }
 }
 
 struct SnapshotService {
@@ -649,6 +665,77 @@ impl schema::snapshot::Server for SnapshotService {
     }
 }
 
+struct AuthoringSnapshotService {
+    snapshot: AuthoringSnapshot,
+}
+
+#[allow(clippy::manual_async_fn)]
+impl schema::authoring_snapshot::Server for AuthoringSnapshotService {
+    fn version(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::authoring_snapshot::VersionParams,
+        mut results: schema::authoring_snapshot::VersionResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            write_uint64_result(
+                results.get().init_result(),
+                self.snapshot.version().map_success(|version| version.0),
+            );
+            Ok(())
+        }
+    }
+
+    fn query(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::QueryParams,
+        mut results: schema::authoring_snapshot::QueryResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            let query = match decode_asset_query(params.get()?.get_query()?) {
+                Ok(query) => query,
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_uuid_list_result(results.get().init_result(), self.snapshot.query(query));
+            Ok(())
+        }
+    }
+
+    fn inspect(
+        self: capnp::capability::Rc<Self>,
+        params: schema::authoring_snapshot::InspectParams,
+        mut results: schema::authoring_snapshot::InspectResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            let uuid = match decode_uuid(params.get()?.get_uuid()?, "uuid") {
+                Ok(uuid) => AssetUuid(uuid),
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_authoring_inspect_result(
+                results.get().init_result(),
+                self.snapshot.inspect(uuid),
+            );
+            Ok(())
+        }
+    }
+
+    fn refresh(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::authoring_snapshot::RefreshParams,
+        mut results: schema::authoring_snapshot::RefreshResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            write_authoring_snapshot_result(results.get().init_result(), self.snapshot.refresh());
+            Ok(())
+        }
+    }
+}
+
 struct ChunkStreamService {
     stream: Mutex<ChunkStream>,
 }
@@ -715,6 +802,15 @@ impl schema::delta_stream::Server for DeltaStreamService {
 struct WireFailure {
     code: u16,
     message: String,
+}
+
+impl From<capnp::Error> for WireFailure {
+    fn from(error: capnp::Error) -> Self {
+        Self {
+            code: WIRE_INVALID_ATTESTATION,
+            message: format!("wire field could not be read: {error}"),
+        }
+    }
 }
 
 enum DecodeError {
@@ -855,6 +951,103 @@ fn decode_uuid_list(
                 .and_then(|value| decode_uuid(value, &format!("{field}[{index}]")).map(AssetUuid))
         })
         .collect()
+}
+
+fn decode_asset_query(reader: schema::asset_query::Reader<'_>) -> Result<AssetQuery, WireFailure> {
+    Ok(AssetQuery {
+        uuid: decode_optional_uuid(reader.get_uuid()?, "query.uuid")?.map(AssetUuid),
+        bundle_path: decode_optional_text(reader.get_bundle_path()?, "query.bundlePath")?,
+        local_id: decode_optional_text(reader.get_local_id()?, "query.localId")?,
+        bundle_uuid: decode_optional_uuid(reader.get_bundle_uuid()?, "query.bundleUuid")?
+            .map(crate::BundleUuid),
+        authored_type: decode_optional_uuid(reader.get_authored_type()?, "query.authoredType")?
+            .map(TypeUuid),
+        terminal_type: decode_optional_uuid(reader.get_terminal_type()?, "query.terminalType")?
+            .map(TypeUuid),
+        tag: decode_optional_tag(reader.get_tag()?)?,
+        path_prefix: decode_optional_text(reader.get_path_prefix()?, "query.pathPrefix")?,
+        path_glob: decode_optional_text(reader.get_path_glob()?, "query.pathGlob")?,
+        authoring_only: decode_optional_bool(reader.get_authoring_only()?)?,
+    })
+}
+
+fn decode_optional_uuid(
+    reader: schema::optional_data::Reader<'_>,
+    field: &str,
+) -> Result<Option<[u8; 16]>, WireFailure> {
+    match reader.which().map_err(|error| WireFailure {
+        code: WIRE_INVALID_UUID,
+        message: format!("{field} selector is invalid: {error}"),
+    })? {
+        schema::optional_data::Which::Absent(()) => Ok(None),
+        schema::optional_data::Which::Value(value) => {
+            let value = value.map_err(|error| WireFailure {
+                code: WIRE_INVALID_UUID,
+                message: format!("{field} could not be read: {error}"),
+            })?;
+            decode_uuid(value, field).map(Some)
+        }
+    }
+}
+
+fn decode_optional_text(
+    reader: schema::optional_text::Reader<'_>,
+    field: &str,
+) -> Result<Option<String>, WireFailure> {
+    match reader.which().map_err(|error| WireFailure {
+        code: WIRE_INVALID_UTF8,
+        message: format!("{field} selector is invalid: {error}"),
+    })? {
+        schema::optional_text::Which::Absent(()) => Ok(None),
+        schema::optional_text::Which::Value(value) => value
+            .map_err(|error| WireFailure {
+                code: WIRE_INVALID_UTF8,
+                message: format!("{field} could not be read: {error}"),
+            })
+            .and_then(|value| decode_text(value, field))
+            .map(Some),
+    }
+}
+
+fn decode_optional_bool(
+    reader: schema::optional_bool::Reader<'_>,
+) -> Result<Option<bool>, WireFailure> {
+    match reader.which().map_err(|error| WireFailure {
+        code: WIRE_INVALID_ATTESTATION,
+        message: format!("query.authoringOnly selector is invalid: {error}"),
+    })? {
+        schema::optional_bool::Which::Absent(()) => Ok(None),
+        schema::optional_bool::Which::Value(value) => Ok(Some(value)),
+    }
+}
+
+fn decode_optional_tag(
+    reader: schema::optional_tag_selector::Reader<'_>,
+) -> Result<Option<TagSelector>, WireFailure> {
+    match reader.which().map_err(|error| WireFailure {
+        code: WIRE_INVALID_UTF8,
+        message: format!("query.tag selector is invalid: {error}"),
+    })? {
+        schema::optional_tag_selector::Which::Absent(()) => Ok(None),
+        schema::optional_tag_selector::Which::Value(value) => {
+            let value = value.map_err(|error| WireFailure {
+                code: WIRE_INVALID_UTF8,
+                message: format!("query.tag could not be read: {error}"),
+            })?;
+            let tag = value.get_tag().map_err(|error| WireFailure {
+                code: WIRE_INVALID_UTF8,
+                message: format!("query.tag.tag could not be read: {error}"),
+            })?;
+            let optional_value = value.get_value().map_err(|error| WireFailure {
+                code: WIRE_INVALID_UTF8,
+                message: format!("query.tag.value could not be read: {error}"),
+            })?;
+            Ok(Some(TagSelector {
+                tag: decode_text(tag, "query.tag.tag")?,
+                value: decode_optional_text(optional_value, "query.tag.value")?,
+            }))
+        }
+    }
 }
 
 fn decode_text_list(
@@ -1075,6 +1268,117 @@ fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: Rp
     }
 }
 
+fn write_authoring_snapshot_result(
+    result: schema::authoring_snapshot_call::Builder<'_>,
+    outcome: RpcResult<AuthoringSnapshot>,
+) {
+    match outcome {
+        RpcResult::Success(snapshot) => {
+            let client: schema::authoring_snapshot::Client =
+                capnp_rpc::new_client(AuthoringSnapshotService { snapshot });
+            let mut result = result;
+            result.set_success(client);
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationPoisoned(poison) => {
+            write_poison(result.init_configuration_poisoned(), &poison)
+        }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
+            result.init_lease_failure(),
+            "authoring snapshot lease expired",
+        ),
+        RpcResult::Failure(error) => {
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_uuid_list_result(
+    mut result: schema::uuid_list_call::Builder<'_>,
+    outcome: RpcResult<Vec<AssetUuid>>,
+) {
+    match outcome {
+        RpcResult::Success(uuids) => {
+            let mut list = result.reborrow().init_success(uuids.len() as u32);
+            for (index, uuid) in uuids.iter().enumerate() {
+                list.reborrow().get(index as u32).set_bytes(&uuid.0);
+            }
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationPoisoned(poison) => {
+            write_poison(result.init_configuration_poisoned(), &poison)
+        }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
+            result.init_lease_failure(),
+            "authoring snapshot lease expired",
+        ),
+        RpcResult::Failure(error) => {
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_authoring_inspect_result(
+    mut result: schema::authoring_inspect_call::Builder<'_>,
+    outcome: RpcResult<AuthoringInspectResult>,
+) {
+    match outcome {
+        RpcResult::Success(AuthoringInspectResult::Inspection(inspection)) => {
+            write_authoring_inspection(result.reborrow().init_success(), &inspection);
+        }
+        RpcResult::Success(AuthoringInspectResult::Missing) => result.set_missing(()),
+        RpcResult::Success(AuthoringInspectResult::RoleIneligible { observed }) => {
+            result
+                .init_role_ineligible()
+                .set_observed(wire_authoring_role(observed));
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationPoisoned(poison) => {
+            write_poison(result.init_configuration_poisoned(), &poison)
+        }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
+            result.init_lease_failure(),
+            "authoring snapshot lease expired",
+        ),
+        RpcResult::Failure(error) => {
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_authoring_inspection(
+    mut output: schema::authoring_inspection::Builder<'_>,
+    inspection: &AuthoringInspection,
+) {
+    write_authoring_stamp(output.reborrow().init_stamp(), inspection.stamp);
+    output.set_uuid(&inspection.uuid.0);
+    output.set_bundle(&inspection.bundle.0);
+    output.set_local_id(inspection.local_id.as_str());
+    output.set_normalized_path(inspection.normalized_path.as_str());
+    output.set_type_uuid(&inspection.type_uuid.0);
+    output.set_schema_hash(&inspection.schema_hash.0);
+    output.set_role(wire_authoring_role(inspection.role));
+    let mut value = output.init_value();
+    value.set_canonical_value(&inspection.value.canonical_value);
+    let mut blobs = value.init_blobs(inspection.value.blobs.len() as u32);
+    for (index, blob) in inspection.value.blobs.iter().enumerate() {
+        blobs.set(index as u32, blob);
+    }
+}
+
+fn wire_authoring_role(role: AuthoringEntryRole) -> schema::AuthoringEntryRole {
+    match role {
+        AuthoringEntryRole::Runtime => schema::AuthoringEntryRole::Runtime,
+        AuthoringEntryRole::AuthoringOnly => schema::AuthoringEntryRole::AuthoringOnly,
+    }
+}
+
 fn write_subscribe_result(
     result: schema::subscribe_call::Builder<'_>,
     outcome: RpcResult<crate::SubscriptionInstall>,
@@ -1196,6 +1500,9 @@ fn write_resolve_result(
                 ResolveResult::Failed { error } => value.set_failed(error.as_str()),
                 ResolveResult::Missing => value.set_missing(()),
                 ResolveResult::Deleted { at } => write_stamp(value.init_deleted(), at),
+                ResolveResult::RoleIneligible { observed } => value
+                    .init_role_ineligible()
+                    .set_observed(wire_authoring_role(observed)),
             }
         }
         RpcResult::ReconnectRequired { reason } => {
@@ -1349,6 +1656,14 @@ fn write_configuration_result(
 fn write_stamp(mut output: schema::snapshot_stamp::Builder<'_>, stamp: SnapshotStamp) {
     output.set_instance(&stamp.instance.0);
     output.set_version(stamp.version.0);
+}
+
+fn write_authoring_stamp(
+    mut output: schema::snapshot_stamp_value::Builder<'_>,
+    stamp: SnapshotStamp,
+) {
+    output.set_instance(&stamp.instance.0);
+    output.set_input_version(stamp.version.0);
 }
 
 fn write_poison(
