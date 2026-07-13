@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_asset::{ErasedValue, ModuleEpochToken};
+use distill_asset::{ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken};
 use distill_core::id::TypeUuid;
 use distill_wire::native::CallbackPanic;
 
@@ -212,7 +212,9 @@ impl RuntimeEpochs {
                 }
                 Err(_) => {
                     let record = self.records.get_mut(&epoch).expect("epoch checked above");
-                    record.token.poison();
+                    record
+                        .token
+                        .poison_with(ModuleEpochPoisonCause::CallbackPanic);
                     first_failure.get_or_insert(adoption);
                 }
             }

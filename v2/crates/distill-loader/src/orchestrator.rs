@@ -13,8 +13,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 
 use distill_asset::{
-    AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, ErasedValue, ModuleEpochToken,
-    PlaceholderThunk,
+    AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, ErasedValue,
+    ModuleEpochPoisonCause, ModuleEpochToken, PlaceholderThunk,
 };
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_store::state::SnapshotStamp;
@@ -712,7 +712,9 @@ impl<I: LoaderIO> Loader<I> {
         match visited {
             Ok(Ok(())) => Ok(sink.strong_references),
             Ok(Err(_)) | Err(_) => {
-                descriptor.token.poison();
+                descriptor
+                    .token
+                    .poison_with(ModuleEpochPoisonCause::CallbackPanic);
                 Err(LoaderError::PlaceholderVisitorFailed(type_uuid))
             }
         }
@@ -1364,7 +1366,9 @@ impl<I: LoaderIO> Loader<I> {
                     }
                     let value =
                         (placeholder.thunk.make)(placeholder.token.clone()).map_err(|_| {
-                            placeholder.token.poison();
+                            placeholder
+                                .token
+                                .poison_with(ModuleEpochPoisonCause::CallbackPanic);
                             "placeholder factory callback failed".to_owned()
                         })?;
                     match self.inspect_placeholder_value(type_uuid, &value) {
@@ -1940,13 +1944,17 @@ impl<I: LoaderIO> Loader<I> {
             .values()
             .find(|record| record.epoch == epoch)
         {
-            record.token.poison();
+            record
+                .token
+                .poison_with(ModuleEpochPoisonCause::CallbackPanic);
         } else if let Some(record) = self
             .placeholders
             .values()
             .find(|record| record.epoch == epoch)
         {
-            record.token.poison();
+            record
+                .token
+                .poison_with(ModuleEpochPoisonCause::CallbackPanic);
         }
     }
 
@@ -2039,7 +2047,7 @@ fn construct_value(
     let fixed_up = unsafe { execute_fixup(plans, PlanId(0), fixed, variable, &env, allocation) };
     if let Err(error) = fixed_up {
         if matches!(error, ExecError::Callback { .. }) {
-            owner.poison();
+            owner.poison_with(ModuleEpochPoisonCause::CallbackPanic);
         }
         // Safety: execute_fixup guarantees the destination is uninitialized
         // again on failure, so only the raw allocation remains.
@@ -2057,7 +2065,7 @@ fn construct_value(
     match finalized {
         Ok(value) => Ok(value),
         Err(_) => {
-            owner.poison();
+            owner.poison_with(ModuleEpochPoisonCause::CallbackPanic);
             Err("asset finalizer callback failed".to_owned())
         }
     }

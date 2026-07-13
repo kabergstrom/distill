@@ -7,7 +7,7 @@ use std::sync::{
 
 use distill_asset::{
     default_table, placeholder, AssetHashMap, DeterministicState, EncodeContainer, EncodeSink,
-    EpochToken, ErasedValue,
+    EpochToken, ErasedValue, ModuleEpochPoisonCause,
 };
 use distill_core::id::{AssetUuid, TypeUuid};
 
@@ -75,7 +75,22 @@ fn failed_erased_drop_is_contained_and_poisons_the_exact_epoch() {
     let value = ErasedValue::new_in(PanickingDrop, owner.clone());
     assert!(value.destroy().is_err());
     assert!(owner.is_poisoned());
+    assert_eq!(
+        owner.poison_cause(),
+        Some(ModuleEpochPoisonCause::CallbackPanic)
+    );
     assert!(!other.is_poisoned());
+}
+
+#[test]
+fn module_epoch_token_latches_the_first_typed_poison_cause() {
+    let owner = EpochToken::new(17);
+    owner.poison_with(ModuleEpochPoisonCause::CallbackRejected);
+    owner.poison_with(ModuleEpochPoisonCause::CallbackPanic);
+    assert_eq!(
+        owner.poison_cause(),
+        Some(ModuleEpochPoisonCause::CallbackRejected)
+    );
 }
 
 #[test]

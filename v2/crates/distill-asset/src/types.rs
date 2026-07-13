@@ -5,7 +5,7 @@
 
 use core::marker::PhantomData;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc,
 };
 
@@ -104,14 +104,21 @@ pub type EpochToken = ModuleEpochToken;
 
 struct EpochState {
     id: u64,
-    poisoned: AtomicBool,
+    poison_cause: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ModuleEpochPoisonCause {
+    CallbackPanic = 1,
+    CallbackRejected = 2,
 }
 
 impl ModuleEpochToken {
     pub fn new(id: u64) -> Self {
         Self(Arc::new(EpochState {
             id,
-            poisoned: AtomicBool::new(false),
+            poison_cause: AtomicU8::new(0),
         }))
     }
 
@@ -120,12 +127,32 @@ impl ModuleEpochToken {
     }
 
     pub fn is_poisoned(&self) -> bool {
-        self.0.poisoned.load(Ordering::Acquire)
+        self.poison_cause().is_some()
     }
 
-    /// Fence this published epoch permanently. Poisoning is monotonic.
+    /// Compatibility spelling for a returned failure status. Callers that
+    /// caught a panic use [`Self::poison_with`] to retain that distinction.
     pub fn poison(&self) {
-        self.0.poisoned.store(true, Ordering::Release);
+        self.poison_with(ModuleEpochPoisonCause::CallbackRejected);
+    }
+
+    /// Fence this epoch permanently while latching its first typed cause.
+    pub fn poison_with(&self, cause: ModuleEpochPoisonCause) {
+        let _ = self.0.poison_cause.compare_exchange(
+            0,
+            cause as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn poison_cause(&self) -> Option<ModuleEpochPoisonCause> {
+        match self.0.poison_cause.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(ModuleEpochPoisonCause::CallbackPanic),
+            2 => Some(ModuleEpochPoisonCause::CallbackRejected),
+            _ => unreachable!("ModuleEpochToken stores only closed poison-cause tags"),
+        }
     }
 
     pub fn same_epoch(&self, other: &Self) -> bool {
@@ -209,7 +236,8 @@ impl ErasedValue {
         // Safety: constructor contract — ptr/thunk pairing.
         let result = unsafe { (self.drop_thunk)(self.ptr) };
         if result.is_err() {
-            self.owner.poison();
+            self.owner
+                .poison_with(ModuleEpochPoisonCause::CallbackPanic);
         }
         result
     }

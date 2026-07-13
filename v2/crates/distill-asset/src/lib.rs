@@ -29,7 +29,7 @@ pub use hasher::{AssetHashMap, AssetHashSet, DeterministicState};
 pub use reflect::AssetReflect;
 pub use types::{
     AssetRef, AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, EpochToken,
-    ErasedValue, ModuleEpochToken, PlaceholderThunk, WeakAssetRef,
+    ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken, PlaceholderThunk, WeakAssetRef,
 };
 
 // The §12 vocabulary, re-exported for generated code and consumers —
