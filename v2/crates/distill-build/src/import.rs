@@ -11,8 +11,8 @@ use crate::query::{
     RootedPath,
 };
 use crate::trace::{
-    CapabilityKey, Observed, RawFileFailureClass, RawFileOp, RawFileSubject,
-    StableFailureFingerprint,
+    local_failure_fingerprint, CapabilityKey, Observed, RawFileFailureClass, RawFileOp,
+    RawFileSubject, StableFailureFingerprint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,10 +205,10 @@ fn raw_failure(
 
 fn intake_failure(_: IntakeError) -> ImportError {
     ImportError {
-        fingerprint: StableFailureFingerprint::Local {
-            class: crate::trace::LocalFailureClass::Processor,
-            detail: *blake3::hash(b"invalid import input").as_bytes(),
-        },
+        fingerprint: local_failure_fingerprint(
+            crate::trace::LocalFailureClass::Processor,
+            |encoder| encoder.u16(1), // invalid normalized import input
+        ),
     }
 }
 

@@ -1,6 +1,6 @@
 //! Outcome-bearing build/import traces and verifying-trace lookup (§§8–10).
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSTR};
+use distill_core::canonical::{domain_digest, CanonicalEncoder, DSLF, DSTR};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 
 use crate::query::{AssetQuery, FileQuery};
@@ -92,6 +92,21 @@ pub enum StableFailureFingerprint {
 pub enum FailureCause {
     Op,
     Local(StableFailureFingerprint),
+}
+
+/// Construct a local stable fingerprint from typed canonical facts. Human
+/// presentation text is deliberately not accepted by this API.
+pub fn local_failure_fingerprint(
+    class: LocalFailureClass,
+    facts: impl FnOnce(&mut CanonicalEncoder),
+) -> StableFailureFingerprint {
+    StableFailureFingerprint::Local {
+        class,
+        detail: domain_digest(DSLF, 1, |encoder| {
+            encoder.u16(class as u16);
+            facts(encoder);
+        }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

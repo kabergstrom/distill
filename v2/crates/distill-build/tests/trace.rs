@@ -112,3 +112,25 @@ fn failure_cause_grammar_is_checked() {
     .validate()
     .is_ok());
 }
+
+#[test]
+fn local_failure_details_are_dslf_domain_separated_typed_facts() {
+    let a = local_failure_fingerprint(LocalFailureClass::Validator, |e| {
+        e.u16(4);
+        e.str("field");
+    });
+    let b = local_failure_fingerprint(LocalFailureClass::Validator, |e| {
+        e.u16(4);
+        e.str("field");
+    });
+    let changed = local_failure_fingerprint(LocalFailureClass::Validator, |e| {
+        e.u16(5);
+        e.str("field");
+    });
+    assert_eq!(a, b);
+    assert_ne!(a, changed);
+    let StableFailureFingerprint::Local { detail, .. } = a else {
+        unreachable!()
+    };
+    assert_ne!(detail, *blake3::hash(b"field").as_bytes());
+}

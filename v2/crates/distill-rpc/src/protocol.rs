@@ -183,15 +183,19 @@ impl ConfigurationPoison {
         message: impl Into<String>,
     ) -> Self {
         let key = reason_key.as_ref();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"DSCP");
-        hasher.update(&[1]);
-        hasher.update(&code.0.to_le_bytes());
-        hasher.update(&(key.len() as u32).to_le_bytes());
-        hasher.update(key);
+        let reason_hash =
+            distill_core::canonical::domain_digest(distill_core::canonical::DSCP, 1, |encoder| {
+                encoder.u16(code.0);
+                encoder.raw(
+                    &u32::try_from(key.len())
+                        .expect("configuration poison reason key exceeds u32")
+                        .to_le_bytes(),
+                );
+                encoder.raw(key);
+            });
         Self {
             code,
-            reason_hash: *hasher.finalize().as_bytes(),
+            reason_hash,
             message: message.into(),
         }
     }

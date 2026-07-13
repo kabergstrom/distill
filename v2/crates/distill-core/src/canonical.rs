@@ -25,6 +25,12 @@ pub const DSSL: [u8; 4] = *b"DSSL";
 /// Load-policy digest — sorted (type_uuid, build_only) pairs (§9, §13,
 /// §16).
 pub const DSLP: [u8; 4] = *b"DSLP";
+/// Compiled full semantic attestation (§3, §5).
+pub const DSCA: [u8; 4] = *b"DSCA";
+/// Typed local deterministic-failure detail (§5, §9).
+pub const DSLF: [u8; 4] = *b"DSLF";
+/// Typed configuration-poison reason facts (§5, §13, §17).
+pub const DSCP: [u8; 4] = *b"DSCP";
 
 /// Append-only encoder for the canonical record encoding. Composites encode
 /// their fields in declaration order by calling these methods; there is no

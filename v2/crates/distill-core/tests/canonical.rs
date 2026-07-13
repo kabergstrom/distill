@@ -5,7 +5,9 @@
 //! marker + payload; enums as u8 discriminant + payload; digests
 //! domain-prefixed and versioned.
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCI, DSSI, DSTG, DSTR};
+use distill_core::canonical::{
+    domain_digest, CanonicalEncoder, DSCA, DSCI, DSCP, DSLF, DSLP, DSSI, DSSL, DSTG, DSTR,
+};
 
 fn enc(f: impl FnOnce(&mut CanonicalEncoder)) -> Vec<u8> {
     let mut e = CanonicalEncoder::new();
@@ -145,7 +147,7 @@ fn domain_digests_are_domain_and_version_separated() {
 
 #[test]
 fn all_domains_are_distinct() {
-    let ds = [DSCI, DSTG, DSSI, DSTR];
+    let ds = [DSCI, DSTG, DSSI, DSTR, DSSL, DSLP, DSCA, DSLF, DSCP];
     for (i, a) in ds.iter().enumerate() {
         for b in &ds[i + 1..] {
             assert_ne!(a, b);
@@ -155,4 +157,7 @@ fn all_domains_are_distinct() {
     assert_eq!(&DSTG, b"DSTG");
     assert_eq!(&DSSI, b"DSSI");
     assert_eq!(&DSTR, b"DSTR");
+    assert_eq!(&DSCA, b"DSCA");
+    assert_eq!(&DSLF, b"DSLF");
+    assert_eq!(&DSCP, b"DSCP");
 }
