@@ -6,7 +6,7 @@ use distill_core::id::AssetUuid;
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
     ConfigurationPathKey, ConfigurationPoison, ConfigurationPoisonCode, ConfigurationState,
-    DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide,
+    DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide, PlatformFileIdentity,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use ngp_schema::identity::CompilationIdentity;
@@ -87,8 +87,10 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
     };
     let alias = DirectoryAliasSide {
         normalized_path: "assets".to_owned(),
-        device: 1,
-        inode: 2,
+        identity: PlatformFileIdentity::Unix {
+            device: 1,
+            inode: 2,
+        },
     };
     let compilation = identity("aarch64-apple-darwin", 1);
     let cases = [
@@ -230,13 +232,17 @@ fn symmetric_pairs_have_one_canonical_order() {
 
     let physical = DirectoryAliasSide {
         normalized_path: "assets/a".to_owned(),
-        device: 7,
-        inode: 9,
+        identity: PlatformFileIdentity::Unix {
+            device: 7,
+            inode: 9,
+        },
     };
     let alias = DirectoryAliasSide {
         normalized_path: "linked-assets/a".to_owned(),
-        device: 7,
-        inode: 9,
+        identity: PlatformFileIdentity::Unix {
+            device: 7,
+            inode: 9,
+        },
     };
     assert_eq!(
         DscpV1::DirectoryAlias {
@@ -250,6 +256,51 @@ fn symmetric_pairs_have_one_canonical_order() {
         }
         .reason_hash()
     );
+}
+
+#[test]
+fn directory_alias_identity_is_closed_and_lossless_on_both_platforms() {
+    let unix = DscpV1::DirectoryAlias {
+        first: DirectoryAliasSide {
+            normalized_path: "a".into(),
+            identity: PlatformFileIdentity::Unix {
+                device: 7,
+                inode: 9,
+            },
+        },
+        second: DirectoryAliasSide {
+            normalized_path: "b".into(),
+            identity: PlatformFileIdentity::Unix {
+                device: 7,
+                inode: 9,
+            },
+        },
+    };
+    let windows = DscpV1::DirectoryAlias {
+        first: DirectoryAliasSide {
+            normalized_path: "a".into(),
+            identity: PlatformFileIdentity::Windows {
+                volume_serial: 11,
+                file_id: [0xaa; 16],
+            },
+        },
+        second: DirectoryAliasSide {
+            normalized_path: "b".into(),
+            identity: PlatformFileIdentity::Windows {
+                volume_serial: 11,
+                file_id: [0xaa; 16],
+            },
+        },
+    };
+
+    for detail in [unix, windows] {
+        let bytes = detail.canonical_detail_bytes();
+        assert_eq!(
+            DscpV1::from_canonical_detail_bytes(ConfigurationPoisonCode::DirectoryAlias, &bytes)
+                .unwrap(),
+            detail
+        );
+    }
 }
 
 #[test]

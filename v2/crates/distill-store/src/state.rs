@@ -429,6 +429,7 @@ pub enum DscpError {
     CodeDetailMismatch,
     UnknownPathKey(u8),
     UnknownOwnedPathKind(u8),
+    UnknownPlatformFileIdentity(u8),
     Truncated,
     TrailingBytes,
     InvalidUtf8,
@@ -477,8 +478,19 @@ pub struct OwnedPathSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryAliasSide {
     pub normalized_path: String,
-    pub device: u64,
-    pub inode: u64,
+    pub identity: PlatformFileIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformFileIdentity {
+    Unix {
+        device: u64,
+        inode: u64,
+    },
+    Windows {
+        volume_serial: u64,
+        file_id: [u8; 16],
+    },
 }
 
 /// Exact, closed typed facts hashed by DSCP v1. Presentation prose never
@@ -661,8 +673,21 @@ fn encode_owned_path_side(encoder: &mut CanonicalEncoder, side: &OwnedPathSide) 
 
 fn encode_directory_alias_side(encoder: &mut CanonicalEncoder, side: &DirectoryAliasSide) {
     encoder.str(&side.normalized_path);
-    encoder.u64(side.device);
-    encoder.u64(side.inode);
+    match side.identity {
+        PlatformFileIdentity::Unix { device, inode } => {
+            encoder.u8(1);
+            encoder.u64(device);
+            encoder.u64(inode);
+        }
+        PlatformFileIdentity::Windows {
+            volume_serial,
+            file_id,
+        } => {
+            encoder.u8(2);
+            encoder.u64(volume_serial);
+            encoder.raw(&file_id);
+        }
+    }
 }
 
 fn encode_compilation_identity(encoder: &mut CanonicalEncoder, identity: &CompilationIdentity) {
@@ -745,8 +770,17 @@ impl<'a> DscpDecoder<'a> {
     fn directory_alias_side(&mut self) -> Result<DirectoryAliasSide, DscpError> {
         Ok(DirectoryAliasSide {
             normalized_path: self.string()?,
-            device: self.u64()?,
-            inode: self.u64()?,
+            identity: match self.u8()? {
+                1 => PlatformFileIdentity::Unix {
+                    device: self.u64()?,
+                    inode: self.u64()?,
+                },
+                2 => PlatformFileIdentity::Windows {
+                    volume_serial: self.u64()?,
+                    file_id: self.array()?,
+                },
+                unknown => return Err(DscpError::UnknownPlatformFileIdentity(unknown)),
+            },
         })
     }
 
