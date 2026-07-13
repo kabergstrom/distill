@@ -21,7 +21,14 @@ use crate::state::{
     ConfigurationEpoch, ConfigurationPoison, ConfigurationPoisonCode, ConfigurationState, DscpV1,
 };
 
-type PersistedConfigurationRow = (i64, Option<i64>, Option<Vec<u8>>, Option<String>);
+type PersistedConfigurationRow = (
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<String>,
+);
 
 /// Store-side configuration. Defaults match §18's example config.
 #[derive(Debug, Clone)]
@@ -266,19 +273,30 @@ impl Store {
         let row: Option<PersistedConfigurationRow> = self
             .conn
             .query_row(
-                "SELECT active_generation, poison_code, poison_reason_hash, poison_message
+                "SELECT active_generation, poison_code, poison_detail_version, poison_detail,
+                        poison_reason_hash, poison_message
                  FROM configuration_state WHERE id = 0",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let (generation, code, reason_hash, message) = row.unwrap_or((0, None, None, None));
+        let (generation, code, detail_version, detail, reason_hash, message) =
+            row.unwrap_or((0, None, None, None, None, None));
         let epoch = std::sync::Arc::new(ConfigurationEpoch {
             generation: generation as u64,
         });
-        Ok(match (code, reason_hash, message) {
-            (None, None, None) => ConfigurationState::Ready(epoch),
-            (Some(code), Some(reason_hash), Some(message)) => {
+        Ok(match (code, detail_version, detail, reason_hash, message) {
+            (None, None, None, None, None) => ConfigurationState::Ready(epoch),
+            (Some(code), Some(detail_version), Some(detail), Some(reason_hash), Some(message)) => {
                 let code = u16::try_from(code)
                     .ok()
                     .and_then(|code| ConfigurationPoisonCode::try_from(code).ok())
@@ -293,12 +311,38 @@ impl Store {
                         ),
                     }
                 })?;
+                let detail_version =
+                    u8::try_from(detail_version).map_err(|_| StoreError::InvalidConfiguration {
+                        error: format!(
+                            "unknown persisted configuration poison detail version {detail_version}"
+                        ),
+                    })?;
+                if detail_version != 1 {
+                    return Err(StoreError::InvalidConfiguration {
+                        error: format!(
+                            "unknown persisted configuration poison detail version {detail_version}"
+                        ),
+                    });
+                }
+                let detail =
+                    DscpV1::from_canonical_detail_bytes(code, &detail).map_err(|error| {
+                        StoreError::InvalidConfiguration {
+                            error: error.to_string(),
+                        }
+                    })?;
+                let reason = ConfigurationPoison {
+                    code,
+                    reason_hash,
+                    detail: Box::new(detail),
+                    message,
+                };
+                reason
+                    .validate()
+                    .map_err(|error| StoreError::InvalidConfiguration {
+                        error: error.to_string(),
+                    })?;
                 ConfigurationState::Poisoned {
-                    reason: ConfigurationPoison {
-                        code,
-                        reason_hash,
-                        message,
-                    },
+                    reason,
                     last_good: Some(epoch),
                 }
             }
@@ -318,18 +362,28 @@ impl InputTxn<'_> {
         message: &str,
     ) -> Result<(), StoreError> {
         let poison = ConfigurationPoison::from_reason(reason, message);
+        poison
+            .validate()
+            .map_err(|error| StoreError::InvalidConfiguration {
+                error: error.to_string(),
+            })?;
+        let detail = poison.detail.canonical_detail_bytes();
         self.txn.execute(
             "INSERT INTO configuration_state(
                  id, active_generation, input_version,
-                 poison_code, poison_reason_hash, poison_message
-             ) VALUES (0, 0, ?1, ?2, ?3, ?4)
+                 poison_code, poison_detail_version, poison_detail,
+                 poison_reason_hash, poison_message
+             ) VALUES (0, 0, ?1, ?2, 1, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET input_version = excluded.input_version,
                poison_code = excluded.poison_code,
+               poison_detail_version = excluded.poison_detail_version,
+               poison_detail = excluded.poison_detail,
                poison_reason_hash = excluded.poison_reason_hash,
                poison_message = excluded.poison_message",
             rusqlite::params![
                 self.version().0 as i64,
                 poison.code as u16,
+                detail,
                 poison.reason_hash.as_slice(),
                 poison.message,
             ],
@@ -351,11 +405,16 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO configuration_state(
                  id, active_generation, input_version,
-                 poison_code, poison_reason_hash, poison_message
-             ) VALUES (0, ?1, ?2, NULL, NULL, NULL)
+                 poison_code, poison_detail_version, poison_detail,
+                 poison_reason_hash, poison_message
+             ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET active_generation = excluded.active_generation,
                input_version = excluded.input_version,
-               poison_code = NULL, poison_reason_hash = NULL, poison_message = NULL",
+               poison_code = NULL,
+               poison_detail_version = NULL,
+               poison_detail = NULL,
+               poison_reason_hash = NULL,
+               poison_message = NULL",
             rusqlite::params![generation, self.version().0 as i64],
         )?;
         self.txn.execute("DELETE FROM pending_restart", [])?;

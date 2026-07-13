@@ -17,7 +17,7 @@
 //! carries; residency is still expressed the spec's way (`Arc`), so pin
 //! counting composes when the module host wraps it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -423,6 +423,27 @@ impl fmt::Display for UnknownConfigurationPoisonCode {
 
 impl std::error::Error for UnknownConfigurationPoisonCode {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DscpError {
+    UnsupportedVersion(u8),
+    CodeDetailMismatch,
+    UnknownPathKey(u8),
+    UnknownOwnedPathKind(u8),
+    Truncated,
+    TrailingBytes,
+    InvalidUtf8,
+    NonCanonical,
+    InvalidText,
+}
+
+impl fmt::Display for DscpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid DSCP detail: {self:?}")
+    }
+}
+
+impl std::error::Error for DscpError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConfigurationPathKey {
@@ -541,48 +562,78 @@ impl DscpV1 {
     pub fn reason_hash(&self) -> [u8; 32] {
         domain_digest(DSCP, 1, |encoder| {
             encoder.u16(self.code() as u16);
-            match self {
-                Self::MalformedConfiguration { file_hash } => encoder.raw(file_hash),
-                Self::NonLoopbackAddress { address } => encoder.str(address),
-                Self::DuplicateRootName { normalized_name } => encoder.str(normalized_name),
-                Self::InvalidPath {
-                    key,
-                    normalized_or_raw_path,
-                } => {
-                    encoder.u8(*key as u8);
-                    encoder.str(normalized_or_raw_path);
-                }
-                Self::OwnedPathOverlap { first, second } => {
-                    encode_symmetric_pair(encoder, first, second, encode_owned_path_side);
-                }
-                Self::EmptyTargetApis { target } => encoder.str(target),
-                Self::InvalidParallelism { value } => encoder.u32(*value),
-                Self::InvalidBatchReservation {
-                    parallelism,
-                    reservation,
-                } => {
-                    encoder.u32(*parallelism);
-                    encoder.u32(*reservation);
-                }
-                Self::DirectoryAlias { first, second } => {
-                    encode_symmetric_pair(encoder, first, second, encode_directory_alias_side);
-                }
-                Self::MissingLineageManifest => {}
-                Self::DuplicateLineageManifest { entries } => {
-                    encoder.set(entries, |encoder, entry| encoder.raw(&entry.0));
-                }
-                Self::UnsupportedTargetIdentity {
-                    target,
-                    expected,
-                    observed,
-                } => {
-                    encoder.str(target);
-                    encode_compilation_identity(encoder, expected);
-                    encode_compilation_identity(encoder, observed);
-                }
-                Self::DuplicateTargetName { normalized_name } => encoder.str(normalized_name),
-            }
+            encoder.raw(&self.canonical_detail_bytes());
         })
+    }
+
+    /// Exact bytes stored beside the explicit DSCP version and code.
+    pub fn canonical_detail_bytes(&self) -> Vec<u8> {
+        let mut encoder = CanonicalEncoder::new();
+        encode_dscp_detail(&mut encoder, self);
+        encoder.into_bytes()
+    }
+
+    pub fn from_canonical_detail_bytes(
+        code: ConfigurationPoisonCode,
+        bytes: &[u8],
+    ) -> Result<Self, DscpError> {
+        let mut decoder = DscpDecoder { bytes, cursor: 0 };
+        let detail = decoder.detail(code)?;
+        if decoder.cursor != bytes.len() {
+            return Err(DscpError::TrailingBytes);
+        }
+        validate_dscp_text(&detail)?;
+        if detail.code() != code {
+            return Err(DscpError::CodeDetailMismatch);
+        }
+        if detail.canonical_detail_bytes() != bytes {
+            return Err(DscpError::NonCanonical);
+        }
+        Ok(detail)
+    }
+}
+
+fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
+    match detail {
+        DscpV1::MalformedConfiguration { file_hash } => encoder.raw(file_hash),
+        DscpV1::NonLoopbackAddress { address } => encoder.str(address),
+        DscpV1::DuplicateRootName { normalized_name } => encoder.str(normalized_name),
+        DscpV1::InvalidPath {
+            key,
+            normalized_or_raw_path,
+        } => {
+            encoder.u8(*key as u8);
+            encoder.str(normalized_or_raw_path);
+        }
+        DscpV1::OwnedPathOverlap { first, second } => {
+            encode_symmetric_pair(encoder, first, second, encode_owned_path_side);
+        }
+        DscpV1::EmptyTargetApis { target } => encoder.str(target),
+        DscpV1::InvalidParallelism { value } => encoder.u32(*value),
+        DscpV1::InvalidBatchReservation {
+            parallelism,
+            reservation,
+        } => {
+            encoder.u32(*parallelism);
+            encoder.u32(*reservation);
+        }
+        DscpV1::DirectoryAlias { first, second } => {
+            encode_symmetric_pair(encoder, first, second, encode_directory_alias_side);
+        }
+        DscpV1::MissingLineageManifest => {}
+        DscpV1::DuplicateLineageManifest { entries } => {
+            encoder.set(entries, |encoder, entry| encoder.raw(&entry.0));
+        }
+        DscpV1::UnsupportedTargetIdentity {
+            target,
+            expected,
+            observed,
+        } => {
+            encoder.str(target);
+            encode_compilation_identity(encoder, expected);
+            encode_compilation_identity(encoder, observed);
+        }
+        DscpV1::DuplicateTargetName { normalized_name } => encoder.str(normalized_name),
     }
 }
 
@@ -627,12 +678,230 @@ fn encode_compilation_identity(encoder: &mut CanonicalEncoder, identity: &Compil
     encoder.u32(identity.algorithm_version);
 }
 
+struct DscpDecoder<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> DscpDecoder<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], DscpError> {
+        let end = self.cursor.checked_add(count).ok_or(DscpError::Truncated)?;
+        let value = self
+            .bytes
+            .get(self.cursor..end)
+            .ok_or(DscpError::Truncated)?;
+        self.cursor = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, DscpError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, DscpError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, DscpError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], DscpError> {
+        Ok(self.take(N)?.try_into().unwrap())
+    }
+
+    fn string(&mut self) -> Result<String, DscpError> {
+        let len = usize::try_from(self.u32()?).map_err(|_| DscpError::Truncated)?;
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_owned)
+            .map_err(|_| DscpError::InvalidUtf8)
+    }
+
+    fn count(&mut self, minimum_row_size: usize) -> Result<usize, DscpError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| DscpError::Truncated)?;
+        if count > self.bytes.len().saturating_sub(self.cursor) / minimum_row_size.max(1) {
+            return Err(DscpError::Truncated);
+        }
+        Ok(count)
+    }
+
+    fn owned_path_side(&mut self) -> Result<OwnedPathSide, DscpError> {
+        let kind = match self.u8()? {
+            1 => OwnedPathKind::AssetRoot,
+            2 => OwnedPathKind::DaemonState,
+            3 => OwnedPathKind::SchemaArtifact,
+            4 => OwnedPathKind::PipelineModule,
+            5 => OwnedPathKind::CodegenOutput,
+            6 => OwnedPathKind::Quarantine,
+            7 => OwnedPathKind::ImportDestination,
+            unknown => return Err(DscpError::UnknownOwnedPathKind(unknown)),
+        };
+        Ok(OwnedPathSide {
+            kind,
+            path: self.string()?,
+        })
+    }
+
+    fn directory_alias_side(&mut self) -> Result<DirectoryAliasSide, DscpError> {
+        Ok(DirectoryAliasSide {
+            normalized_path: self.string()?,
+            device: self.u64()?,
+            inode: self.u64()?,
+        })
+    }
+
+    fn compilation_identity(&mut self) -> Result<CompilationIdentity, DscpError> {
+        let target_triple = self.string()?;
+        let rustc = self.string()?;
+        let source_fingerprint = self.array()?;
+        let mut features = BTreeSet::new();
+        for _ in 0..self.count(8)? {
+            if !features.insert((self.string()?, self.string()?)) {
+                return Err(DscpError::NonCanonical);
+            }
+        }
+        let mut cfgs = BTreeSet::new();
+        for _ in 0..self.count(4)? {
+            if !cfgs.insert(self.string()?) {
+                return Err(DscpError::NonCanonical);
+            }
+        }
+        Ok(CompilationIdentity {
+            target_triple,
+            rustc,
+            source_fingerprint,
+            features,
+            cfgs,
+            manifest_lock_hash: self.array()?,
+            algorithm_version: self.u32()?,
+        })
+    }
+
+    fn detail(&mut self, code: ConfigurationPoisonCode) -> Result<DscpV1, DscpError> {
+        Ok(match code {
+            ConfigurationPoisonCode::MalformedConfiguration => DscpV1::MalformedConfiguration {
+                file_hash: self.array()?,
+            },
+            ConfigurationPoisonCode::NonLoopbackAddress => DscpV1::NonLoopbackAddress {
+                address: self.string()?,
+            },
+            ConfigurationPoisonCode::DuplicateRootName => DscpV1::DuplicateRootName {
+                normalized_name: self.string()?,
+            },
+            ConfigurationPoisonCode::InvalidPath => DscpV1::InvalidPath {
+                key: match self.u8()? {
+                    1 => ConfigurationPathKey::AssetRoot,
+                    2 => ConfigurationPathKey::StatePath,
+                    3 => ConfigurationPathKey::SchemaArtifact,
+                    4 => ConfigurationPathKey::PipelineModule,
+                    5 => ConfigurationPathKey::CodegenOutput,
+                    6 => ConfigurationPathKey::Quarantine,
+                    7 => ConfigurationPathKey::ImportDestination,
+                    unknown => return Err(DscpError::UnknownPathKey(unknown)),
+                },
+                normalized_or_raw_path: self.string()?,
+            },
+            ConfigurationPoisonCode::OwnedPathOverlap => DscpV1::OwnedPathOverlap {
+                first: self.owned_path_side()?,
+                second: self.owned_path_side()?,
+            },
+            ConfigurationPoisonCode::EmptyTargetApis => DscpV1::EmptyTargetApis {
+                target: self.string()?,
+            },
+            ConfigurationPoisonCode::InvalidParallelism => {
+                DscpV1::InvalidParallelism { value: self.u32()? }
+            }
+            ConfigurationPoisonCode::InvalidBatchReservation => DscpV1::InvalidBatchReservation {
+                parallelism: self.u32()?,
+                reservation: self.u32()?,
+            },
+            ConfigurationPoisonCode::DirectoryAlias => DscpV1::DirectoryAlias {
+                first: self.directory_alias_side()?,
+                second: self.directory_alias_side()?,
+            },
+            ConfigurationPoisonCode::MissingLineageManifest => DscpV1::MissingLineageManifest,
+            ConfigurationPoisonCode::DuplicateLineageManifest => {
+                let count = self.count(16)?;
+                DscpV1::DuplicateLineageManifest {
+                    entries: (0..count)
+                        .map(|_| self.array().map(AssetUuid))
+                        .collect::<Result<Vec<_>, _>>()?,
+                }
+            }
+            ConfigurationPoisonCode::UnsupportedTargetIdentity => {
+                DscpV1::UnsupportedTargetIdentity {
+                    target: self.string()?,
+                    expected: self.compilation_identity()?,
+                    observed: self.compilation_identity()?,
+                }
+            }
+            ConfigurationPoisonCode::DuplicateTargetName => DscpV1::DuplicateTargetName {
+                normalized_name: self.string()?,
+            },
+        })
+    }
+}
+
+fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
+    use unicode_normalization::UnicodeNormalization;
+
+    let is_nfc = |value: &str| value.nfc().eq(value.chars());
+    let mut values = Vec::new();
+    match detail {
+        DscpV1::MalformedConfiguration { .. }
+        | DscpV1::InvalidParallelism { .. }
+        | DscpV1::InvalidBatchReservation { .. }
+        | DscpV1::MissingLineageManifest
+        | DscpV1::DuplicateLineageManifest { .. } => {}
+        DscpV1::NonLoopbackAddress { address } => values.push(address.as_str()),
+        DscpV1::DuplicateRootName { normalized_name }
+        | DscpV1::DuplicateTargetName { normalized_name } => {
+            values.push(normalized_name.as_str());
+        }
+        DscpV1::InvalidPath {
+            normalized_or_raw_path,
+            ..
+        } => values.push(normalized_or_raw_path.as_str()),
+        DscpV1::OwnedPathOverlap { first, second } => {
+            values.extend([first.path.as_str(), second.path.as_str()]);
+        }
+        DscpV1::EmptyTargetApis { target } => values.push(target.as_str()),
+        DscpV1::DirectoryAlias { first, second } => values.extend([
+            first.normalized_path.as_str(),
+            second.normalized_path.as_str(),
+        ]),
+        DscpV1::UnsupportedTargetIdentity {
+            target,
+            expected,
+            observed,
+        } => {
+            values.push(target.as_str());
+            for identity in [expected, observed] {
+                values.extend([identity.target_triple.as_str(), identity.rustc.as_str()]);
+                values.extend(
+                    identity
+                        .features
+                        .iter()
+                        .flat_map(|(package, feature)| [package.as_str(), feature.as_str()]),
+                );
+                values.extend(identity.cfgs.iter().map(String::as_str));
+            }
+        }
+    }
+    if values.into_iter().all(is_nfc) {
+        Ok(())
+    } else {
+        Err(DscpError::InvalidText)
+    }
+}
+
 /// Stable typed failure carried by a configuration-poisoned input version.
 /// `message` is presentation-only; `reason_hash` is exclusively DSCP v1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationPoison {
     pub code: ConfigurationPoisonCode,
     pub reason_hash: [u8; 32],
+    pub detail: Box<DscpV1>,
     pub message: String,
 }
 
@@ -641,8 +910,17 @@ impl ConfigurationPoison {
         Self {
             code: reason.code(),
             reason_hash: reason.reason_hash(),
+            detail: Box::new(reason.clone()),
             message: message.into(),
         }
+    }
+
+    pub fn validate(&self) -> Result<(), DscpError> {
+        validate_dscp_text(&self.detail)?;
+        if self.code != self.detail.code() || self.reason_hash != self.detail.reason_hash() {
+            return Err(DscpError::CodeDetailMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -1017,27 +1295,8 @@ impl<'a> VersionPoisonDecoder<'a> {
         }
         (0..count)
             .map(|_| {
-                let raw_relative_path = match self.u8()? {
-                    1 => {
-                        let len = usize::try_from(self.u32()?)
-                            .map_err(|_| VersionPoisonError::Truncated)?;
-                        PlatformPathBytes::Unix(self.take(len)?.to_vec())
-                    }
-                    2 => {
-                        let count = usize::try_from(self.u32()?)
-                            .map_err(|_| VersionPoisonError::Truncated)?;
-                        if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
-                            return Err(VersionPoisonError::Truncated);
-                        }
-                        let units = (0..count)
-                            .map(|_| self.u16())
-                            .collect::<Result<Vec<_>, _>>()?;
-                        PlatformPathBytes::Windows(units)
-                    }
-                    other => return Err(VersionPoisonError::UnknownPlatformPathTag(other)),
-                };
                 Ok(PhysicalPathClaim {
-                    raw_relative_path,
+                    raw_relative_path: self.platform_path()?,
                     file_hash: BundleFileHash(self.array()?),
                 })
             })

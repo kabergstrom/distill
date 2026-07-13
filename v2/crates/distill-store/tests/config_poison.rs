@@ -285,6 +285,7 @@ fn typed_configuration_poison_roundtrips_and_message_is_not_hashed() {
     };
     assert_eq!(poison.code, ConfigurationPoisonCode::NonLoopbackAddress);
     assert_eq!(poison.reason_hash, expected_hash);
+    assert_eq!(poison.detail.as_ref(), &facts);
     assert_eq!(poison.message, "daemon address is not loopback");
     assert_eq!(
         facts.reason_hash(),
@@ -330,8 +331,9 @@ fn unknown_persisted_code_is_rejected_instead_of_becoming_an_other_variant() {
     conn.execute(
         "INSERT INTO configuration_state(
              id, active_generation, input_version,
-             poison_code, poison_reason_hash, poison_message
-         ) VALUES (0, 0, 1, 65535, ?1, 'future')",
+             poison_code, poison_detail_version, poison_detail,
+             poison_reason_hash, poison_message
+         ) VALUES (0, 0, 1, 65535, 1, X'', ?1, 'future')",
         [[7u8; 32].as_slice()],
     )
     .unwrap();
@@ -355,9 +357,16 @@ fn noncanonical_persisted_poison_shape_is_rejected() {
     conn.execute(
         "INSERT INTO configuration_state(
              id, active_generation, input_version,
-             poison_code, poison_reason_hash, poison_message
-         ) VALUES (0, 0, 1, 2, ?1, 'truncated hash')",
-        [[7u8; 31].as_slice()],
+             poison_code, poison_detail_version, poison_detail,
+             poison_reason_hash, poison_message
+         ) VALUES (0, 0, 1, 2, 1, ?1, ?2, 'truncated hash')",
+        rusqlite::params![
+            DscpV1::NonLoopbackAddress {
+                address: "127.0.0.1:1".to_owned(),
+            }
+            .canonical_detail_bytes(),
+            [7u8; 31].as_slice(),
+        ],
     )
     .unwrap();
     drop(conn);
@@ -367,4 +376,74 @@ fn noncanonical_persisted_poison_shape_is_rejected() {
         reopened.configuration_state(),
         Err(StoreError::InvalidConfiguration { .. })
     ));
+}
+
+#[test]
+fn persisted_configuration_poison_recomputes_detail_authority() {
+    let cases = ["version", "trailing-detail", "wrong-code", "wrong-digest"];
+    for case in cases {
+        let (dir, mut store) = open();
+        let state_path = dir.path().join(".distill");
+        store
+            .input_transaction(|txn| {
+                txn.publish_configuration_poison(
+                    &DscpV1::NonLoopbackAddress {
+                        address: "10.0.0.5:9999".to_owned(),
+                    },
+                    "invalid address",
+                )
+            })
+            .unwrap();
+        drop(store);
+
+        let conn = rusqlite::Connection::open(state_path.join("meta.sqlite")).unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        match case {
+            "version" => {
+                conn.execute(
+                    "UPDATE configuration_state SET poison_detail_version = 2 WHERE id = 0",
+                    [],
+                )
+                .unwrap();
+            }
+            "trailing-detail" => {
+                let mut detail: Vec<u8> = conn
+                    .query_row(
+                        "SELECT poison_detail FROM configuration_state WHERE id = 0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                detail.push(0);
+                conn.execute(
+                    "UPDATE configuration_state SET poison_detail = ?1 WHERE id = 0",
+                    [detail],
+                )
+                .unwrap();
+            }
+            "wrong-code" => {
+                conn.execute(
+                    "UPDATE configuration_state SET poison_code = 7 WHERE id = 0",
+                    [],
+                )
+                .unwrap();
+            }
+            "wrong-digest" => {
+                conn.execute(
+                    "UPDATE configuration_state SET poison_reason_hash = ?1 WHERE id = 0",
+                    [[0xabu8; 32].as_slice()],
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(conn);
+
+        let reopened = Store::open(StoreConfig::new(&state_path)).unwrap();
+        assert!(matches!(
+            reopened.configuration_state(),
+            Err(StoreError::InvalidConfiguration { .. })
+        ));
+    }
 }

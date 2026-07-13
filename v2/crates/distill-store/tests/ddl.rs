@@ -269,6 +269,8 @@ fn configuration_state_and_pending_restart_are_representable() {
             "active_generation",
             "input_version",
             "poison_code",
+            "poison_detail_version",
+            "poison_detail",
             "poison_reason_hash",
             "poison_message"
         ]
