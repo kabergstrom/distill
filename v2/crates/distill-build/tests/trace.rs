@@ -290,7 +290,8 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
         ControlFailureSubject::Query(query.clone()),
         ControlFailureCode::Ambiguous,
         vec![b, a, b],
-    );
+    )
+    .unwrap();
     let actual = trace_canonical_bytes(&[TraceOp::Control {
         query,
         observed: Observed::Err(failure),
@@ -301,13 +302,13 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
     expected.push(1); // domain version
     expected.extend_from_slice(&1_u32.to_le_bytes()); // trace entry count
     expected.push(7); // TraceOp::Control
-    expected.push(0); // ControlQuery::MigrationEdges
+    expected.push(1); // ControlQuery::MigrationEdges
     expected.extend_from_slice(&[10; 16]);
     expected.extend_from_slice(&[11; 32]);
     expected.push(1); // Observed::Err
     expected.push(9); // StableFailureFingerprint::Control
-    expected.push(0); // ControlFailureSubject::Query
-    expected.push(0); // ControlQuery::MigrationEdges
+    expected.push(1); // ControlFailureSubject::Query
+    expected.push(1); // ControlQuery::MigrationEdges
     expected.extend_from_slice(&[10; 16]);
     expected.extend_from_slice(&[11; 32]);
     expected.extend_from_slice(&3_u16.to_le_bytes()); // Ambiguous
@@ -325,7 +326,8 @@ fn dstr_control_read_failure_pins_read_subject_tag() {
         ControlFailureSubject::Read(subject.clone()),
         ControlFailureCode::Missing,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let actual = trace_canonical_bytes(&[TraceOp::ControlRead {
         subject,
         observed: Observed::Err(failure),
@@ -336,12 +338,12 @@ fn dstr_control_read_failure_pins_read_subject_tag() {
     expected.push(1);
     expected.extend_from_slice(&1_u32.to_le_bytes());
     expected.push(8); // TraceOp::ControlRead
-    expected.push(0); // ControlSubject::Migration
+    expected.push(1); // ControlSubject::Migration
     expected.extend_from_slice(&asset.0);
     expected.push(1); // Observed::Err
     expected.push(9); // StableFailureFingerprint::Control
-    expected.push(1); // ControlFailureSubject::Read
-    expected.push(0); // ControlSubject::Migration
+    expected.push(2); // ControlFailureSubject::Read
+    expected.push(1); // ControlSubject::Migration
     expected.extend_from_slice(&asset.0);
     expected.extend_from_slice(&2_u16.to_le_bytes()); // Missing
     expected.extend_from_slice(&0_u32.to_le_bytes()); // no conflicting entries
@@ -372,15 +374,17 @@ fn control_failure_entries_are_sorted_and_deduplicated_before_revalidation() {
     assert_eq!(entries.as_slice(), &[a, b]);
 
     let left = control_failure_fingerprint(
-        ControlFailureSubject::Query(ControlQuery::DirectoryImportRules),
+        ControlFailureSubject::Query(ControlQuery::DirectoryImportRuleSet),
         ControlFailureCode::Ambiguous,
         vec![b, a, b],
-    );
+    )
+    .unwrap();
     let right = control_failure_fingerprint(
-        ControlFailureSubject::Query(ControlQuery::DirectoryImportRules),
+        ControlFailureSubject::Query(ControlQuery::DirectoryImportRuleSet),
         ControlFailureCode::Ambiguous,
         vec![a, b],
-    );
+    )
+    .unwrap();
     assert_eq!(left, right);
 }
 
@@ -407,7 +411,8 @@ fn successful_and_failed_control_reads_revalidate_and_heal() {
         ControlFailureSubject::Read(subject.clone()),
         ControlFailureCode::Malformed,
         Vec::new(),
-    );
+    )
+    .unwrap();
     let failed = TraceOp::ControlRead {
         subject: subject.clone(),
         observed: Observed::Err(failure.clone()),
@@ -435,8 +440,9 @@ fn unreadable_migration_edge_is_terminal_and_never_an_empty_result() {
     let unreadable = control_failure_fingerprint(
         ControlFailureSubject::Read(subject.clone()),
         ControlFailureCode::Malformed,
-        vec![asset],
-    );
+        Vec::new(),
+    )
+    .unwrap();
     assert!(matches!(
         basis.read(subject.clone(), Observed::Err(unreadable)),
         Err(AttemptedControlBasisError::ObservedFailure(_))
@@ -471,11 +477,38 @@ fn directory_rule_enumeration_is_distinct_control_trace_data() {
         observed: Observed::Ok(empty),
     };
     let directory_rules = TraceOp::Control {
-        query: ControlQuery::DirectoryImportRules,
+        query: ControlQuery::DirectoryImportRuleSet,
         observed: Observed::Ok(empty),
     };
     assert_ne!(
         trace_canonical_bytes(&[migrations]),
         trace_canonical_bytes(&[directory_rules])
+    );
+}
+
+#[test]
+fn control_failure_entry_cardinality_is_closed_by_code() {
+    let subject = ControlFailureSubject::Query(ControlQuery::DirectoryImportRuleSet);
+    let a = AssetUuid([1; 16]);
+    let b = AssetUuid([2; 16]);
+    assert_eq!(
+        control_failure_fingerprint(
+            subject.clone(),
+            ControlFailureCode::RoleViolation,
+            Vec::new(),
+        ),
+        Err(ControlFailureError::EntriesRequired {
+            code: ControlFailureCode::RoleViolation,
+        })
+    );
+    assert_eq!(
+        control_failure_fingerprint(subject.clone(), ControlFailureCode::Ambiguous, vec![a]),
+        Err(ControlFailureError::AmbiguousNeedsTwoEntries { observed: 1 })
+    );
+    assert_eq!(
+        control_failure_fingerprint(subject, ControlFailureCode::Missing, vec![a, b]),
+        Err(ControlFailureError::EntriesForbidden {
+            code: ControlFailureCode::Missing,
+        })
     );
 }

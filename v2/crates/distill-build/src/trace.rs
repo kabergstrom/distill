@@ -66,7 +66,7 @@ pub enum ControlQuery {
         from_hash: LogicalHash,
     },
     /// Enumerate all directory-import-rule controls at the pinned basis.
-    DirectoryImportRules,
+    DirectoryImportRuleSet,
 }
 
 /// The exact non-artifact control value a coordinator read attempted.
@@ -104,6 +104,13 @@ pub enum ControlFailureCode {
     SchemaClosure = 9,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlFailureError {
+    EntriesRequired { code: ControlFailureCode },
+    AmbiguousNeedsTwoEntries { observed: usize },
+    EntriesForbidden { code: ControlFailureCode },
+}
+
 /// Canonical conflicting/duplicate entry identities carried by a control
 /// failure. Construction sorts and deduplicates the entries so equality and
 /// revalidation have the same semantics as their DSTR encoding.
@@ -129,6 +136,30 @@ impl ControlFailureEntries {
 impl From<Vec<AssetUuid>> for ControlFailureEntries {
     fn from(entries: Vec<AssetUuid>) -> Self {
         Self::new(entries)
+    }
+}
+
+/// Canonical, cardinality-checked control failure payload. Its fields are
+/// private so a DSTR fingerprint cannot represent a forbidden code/entry
+/// combination.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ControlFailureFingerprint {
+    subject: ControlFailureSubject,
+    code: ControlFailureCode,
+    entries: ControlFailureEntries,
+}
+
+impl ControlFailureFingerprint {
+    pub fn subject(&self) -> &ControlFailureSubject {
+        &self.subject
+    }
+
+    pub fn code(&self) -> ControlFailureCode {
+        self.code
+    }
+
+    pub fn entries(&self) -> &[AssetUuid] {
+        self.entries.as_slice()
     }
 }
 
@@ -219,11 +250,7 @@ pub enum StableFailureFingerprint {
         asset: AssetUuid,
         observed_role: EntryRole,
     },
-    Control {
-        subject: ControlFailureSubject,
-        code: ControlFailureCode,
-        entries: ControlFailureEntries,
-    },
+    Control(ControlFailureFingerprint),
     Descendant {
         asset: AssetUuid,
         fingerprint: Box<Self>,
@@ -250,12 +277,35 @@ pub fn control_failure_fingerprint(
     subject: ControlFailureSubject,
     code: ControlFailureCode,
     entries: impl Into<ControlFailureEntries>,
-) -> StableFailureFingerprint {
-    StableFailureFingerprint::Control {
-        subject,
-        code,
-        entries: entries.into(),
+) -> Result<StableFailureFingerprint, ControlFailureError> {
+    let entries = entries.into();
+    let count = entries.as_slice().len();
+    match code {
+        ControlFailureCode::RoleViolation | ControlFailureCode::Poisoned if count == 0 => {
+            return Err(ControlFailureError::EntriesRequired { code });
+        }
+        ControlFailureCode::Ambiguous if count < 2 => {
+            return Err(ControlFailureError::AmbiguousNeedsTwoEntries { observed: count });
+        }
+        ControlFailureCode::Missing
+        | ControlFailureCode::Malformed
+        | ControlFailureCode::WrongBuiltInType
+        | ControlFailureCode::WrongRole
+        | ControlFailureCode::UnsupportedFormat
+        | ControlFailureCode::SchemaClosure
+            if count != 0 =>
+        {
+            return Err(ControlFailureError::EntriesForbidden { code });
+        }
+        _ => {}
     }
+    Ok(StableFailureFingerprint::Control(
+        ControlFailureFingerprint {
+            subject,
+            code,
+            entries,
+        },
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -399,7 +449,8 @@ impl AttemptedControlBasis {
                     ControlFailureSubject::Read(subject.clone()),
                     ControlFailureCode::WrongBuiltInType,
                     Vec::new(),
-                );
+                )
+                .expect("WrongBuiltInType carries no entry identities");
                 (
                     Observed::Err(failure.clone()),
                     Err(AttemptedControlBasisError::ObservedFailure(failure)),
@@ -591,45 +642,45 @@ fn encode_control_query(e: &mut CanonicalEncoder, query: &ControlQuery) {
             type_uuid,
             from_hash,
         } => {
-            e.enum_variant(0);
+            e.enum_variant(1);
             e.raw(&type_uuid.0);
             e.raw(&from_hash.0);
         }
-        ControlQuery::DirectoryImportRules => e.enum_variant(1),
+        ControlQuery::DirectoryImportRuleSet => e.enum_variant(2),
     }
 }
 
 fn encode_control_subject(e: &mut CanonicalEncoder, subject: &ControlSubject) {
     match subject {
         ControlSubject::Migration(asset) => {
-            e.enum_variant(0);
-            e.raw(&asset.0);
-        }
-        ControlSubject::PackDefinition(asset) => {
             e.enum_variant(1);
             e.raw(&asset.0);
         }
-        ControlSubject::DirectoryImportRules(asset) => {
+        ControlSubject::PackDefinition(asset) => {
             e.enum_variant(2);
             e.raw(&asset.0);
         }
-        ControlSubject::ImportSettings { bundle, local_id } => {
+        ControlSubject::DirectoryImportRules(asset) => {
             e.enum_variant(3);
+            e.raw(&asset.0);
+        }
+        ControlSubject::ImportSettings { bundle, local_id } => {
+            e.enum_variant(4);
             e.raw(&bundle.0);
             e.str(local_id);
         }
-        ControlSubject::SchemaLineageManifest => e.enum_variant(4),
+        ControlSubject::SchemaLineageManifest => e.enum_variant(5),
     }
 }
 
 fn encode_control_failure_subject(e: &mut CanonicalEncoder, subject: &ControlFailureSubject) {
     match subject {
         ControlFailureSubject::Query(query) => {
-            e.enum_variant(0);
+            e.enum_variant(1);
             encode_control_query(e, query);
         }
         ControlFailureSubject::Read(subject) => {
-            e.enum_variant(1);
+            e.enum_variant(2);
             encode_control_subject(e, subject);
         }
     }
@@ -698,15 +749,11 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
             e.raw(&asset.0);
             e.u8(*observed_role as u8);
         }
-        StableFailureFingerprint::Control {
-            subject,
-            code,
-            entries,
-        } => {
+        StableFailureFingerprint::Control(failure) => {
             e.enum_variant(9);
-            encode_control_failure_subject(e, subject);
-            e.u16(*code as u16);
-            e.set(entries.as_slice(), |e, id| e.raw(&id.0));
+            encode_control_failure_subject(e, failure.subject());
+            e.u16(failure.code() as u16);
+            e.set(failure.entries(), |e, id| e.raw(&id.0));
         }
         StableFailureFingerprint::Descendant { asset, fingerprint } => {
             e.enum_variant(3);
