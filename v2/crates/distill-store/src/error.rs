@@ -124,6 +124,17 @@ pub enum StoreError {
     /// Target-set rows/digest were forged or non-canonical. The store
     /// recomputes DSTS at every publication and schema command.
     InvalidTargetSet(distill_core::target_set::TargetSetError),
+    /// A proposed ToolEpoch capsule was incomplete or noncanonical.
+    InvalidToolCapsule(distill_core::tool::ToolCapsuleError),
+    /// Tool keys are nonempty NFC text and cannot carry NUL.
+    InvalidToolKey,
+    /// A published capsule object can no longer be revalidated against its
+    /// staged closure. This is a transient launch refusal, never memoized.
+    ToolCapsuleUnavailable {
+        key: String,
+        path: PathBuf,
+        detail: &'static str,
+    },
     /// Once initialized, authoritative lineage changes may only occur
     /// through candidate-bound accept or rollback APIs.
     LineageMutationRequiresCandidate,
@@ -340,6 +351,17 @@ impl fmt::Display for StoreError {
             StoreError::InvalidTargetSet(error) => {
                 write!(f, "candidate target set fails DSTS verification: {error}")
             }
+            StoreError::InvalidToolCapsule(error) => {
+                write!(f, "tool execution capsule is invalid: {error}")
+            }
+            StoreError::InvalidToolKey => {
+                write!(f, "tool key must be nonempty NFC text without NUL")
+            }
+            StoreError::ToolCapsuleUnavailable { key, path, detail } => write!(
+                f,
+                "tool capsule {key:?} is unavailable at {}: {detail}",
+                path.display()
+            ),
             StoreError::LineageMutationRequiresCandidate => write!(
                 f,
                 "an initialized schema-lineage projection may change only through a stale-base-checked candidate accept or rollback"
@@ -436,6 +458,7 @@ impl std::error::Error for StoreError {
             StoreError::Sqlite(e) => Some(e),
             StoreError::Io { source, .. } => Some(source),
             StoreError::InvalidTargetSet(error) => Some(error),
+            StoreError::InvalidToolCapsule(error) => Some(error),
             StoreError::InvalidPipelinePoison(error) => Some(error),
             StoreError::InvalidVersionPoison(error) => Some(error),
             _ => None,

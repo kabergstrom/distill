@@ -12,11 +12,15 @@ use distill_core::attestation::{
 };
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+use distill_core::tool::{
+    ToolCapsuleFileRole, ToolCwdPolicy, ToolLaunchMetadataV1, ToolPlatformBinding,
+};
 use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_store::bundles::AssetRecord;
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, HardStopReason, LineageClass, LineageStamp,
-    ReverseMigrationEdge, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
+    ResolvedToolCapsuleFile, ReverseMigrationEdge, SchemaLineageManifest,
+    SchemaReactivationRequest, SchemaRollbackRequest, ToolCapsuleRegistrationV1,
     TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
@@ -29,6 +33,36 @@ fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
     (dir, s)
+}
+
+fn tool_capsule(launcher: &[u8], resource: &[u8]) -> ToolCapsuleRegistrationV1 {
+    ToolCapsuleRegistrationV1 {
+        files: vec![
+            ResolvedToolCapsuleFile {
+                path: "bin/tool".into(),
+                role: ToolCapsuleFileRole::Launcher,
+                executable: true,
+                bytes: launcher.to_vec(),
+            },
+            ResolvedToolCapsuleFile {
+                path: "share/config".into(),
+                role: ToolCapsuleFileRole::DeclaredResource,
+                executable: false,
+                bytes: resource.to_vec(),
+            },
+        ],
+        resolved_interpreter: None,
+        launch: ToolLaunchMetadataV1 {
+            argv0: "bin/tool".into(),
+            interpreter_args: vec![],
+        },
+        environment: vec![("LANG".into(), "C.UTF-8".into())],
+        cwd_policy: ToolCwdPolicy::EmptyScratch,
+        platform: ToolPlatformBinding::ExplicitResidual {
+            platform_id: "test-platform".into(),
+            system_runtime_class: "test-kernel-abi".into(),
+        },
+    }
 }
 
 fn compiled_table(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> CompiledTypeTable {
@@ -1096,49 +1130,51 @@ fn forged_dsts_is_rejected_at_publish_and_again_at_schema_commit() {
 
 #[test]
 fn staging_a_tool_is_content_addressed_and_input_versioned() {
-    // §13: tool key → (staged copy path, content hash) — registering
-    // stages a content-addressed copy under daemon state and publishes
-    // the mapping at an input version.
+    // §13: tool key → (complete staged capsule, DSCT) at an input version.
     let (_d, mut store) = store();
     let binary = b"#!/bin/sh\necho v1\n";
-    let expected_hash = *blake3::hash(binary).as_bytes();
 
     let (staged, v) = store
-        .input_transaction(|txn| txn.stage_tool("shaderc", binary))
+        .input_transaction(|txn| txn.stage_tool("shaderc", tool_capsule(binary, b"cfg v1")))
         .unwrap();
-    assert_eq!(staged.content_hash, expected_hash);
     assert_eq!(staged.input_version, v);
-    assert!(staged.path.is_file(), "the staged copy exists");
-    assert_eq!(std::fs::read(&staged.path).unwrap(), binary);
+    assert!(staged.root.join("bin/tool").is_file());
+    assert_eq!(std::fs::read(staged.root.join("bin/tool")).unwrap(), binary);
+    assert_eq!(
+        std::fs::read(staged.root.join("share/config")).unwrap(),
+        b"cfg v1"
+    );
+    assert_ne!(staged.capsule_hash, *blake3::hash(binary).as_bytes());
 
     let resolved = store.tool("shaderc").unwrap().expect("registered");
-    assert_eq!(resolved.content_hash, expected_hash);
-    assert_eq!(resolved.path, staged.path);
+    assert_eq!(resolved.capsule_hash, staged.capsule_hash);
+    assert_eq!(resolved.capsule, staged.capsule);
+    assert_eq!(resolved.root, staged.root);
     assert!(store.tool("unknown-tool").unwrap().is_none());
 }
 
 #[test]
 fn replacing_a_tool_republishes_and_staged_copies_coexist() {
     // §9: staged versions coexist — a swap mid-epoch invalidates traces
-    // into rebuilds that run the new copy at the new version; an old
-    // snapshot's staged bytes stay where its ToolEpoch mapping put them.
+    // into rebuilds that run the new capsule at the new version.
     let (_d, mut store) = store();
     let (v1, _) = store
-        .input_transaction(|txn| txn.stage_tool("shaderc", b"tool v1"))
+        .input_transaction(|txn| {
+            txn.stage_tool("shaderc", tool_capsule(b"same launcher", b"resource v1"))
+        })
         .unwrap();
     let (v2, ver2) = store
-        .input_transaction(|txn| txn.stage_tool("shaderc", b"tool v2"))
+        .input_transaction(|txn| {
+            txn.stage_tool("shaderc", tool_capsule(b"same launcher", b"resource v2"))
+        })
         .unwrap();
-    assert_ne!(v1.content_hash, v2.content_hash);
-    assert_ne!(
-        v1.path, v2.path,
-        "content-addressed: different bytes, different path"
-    );
-    assert!(v1.path.is_file(), "the old staged copy coexists");
-    assert!(v2.path.is_file());
+    assert_ne!(v1.capsule_hash, v2.capsule_hash);
+    assert_ne!(v1.root, v2.root);
+    assert!(v1.root.join("share/config").is_file());
+    assert!(v2.root.join("share/config").is_file());
 
     let current = store.tool("shaderc").unwrap().unwrap();
-    assert_eq!(current.content_hash, v2.content_hash);
+    assert_eq!(current.capsule_hash, v2.capsule_hash);
     assert_eq!(current.input_version, ver2);
 }
 
@@ -1147,7 +1183,7 @@ fn a_failed_transaction_publishes_no_tool_mapping() {
     let (_d, mut store) = store();
     let err = store
         .input_transaction::<(), _>(|txn| {
-            txn.stage_tool("shaderc", b"tool v1")?;
+            txn.stage_tool("shaderc", tool_capsule(b"tool v1", b"resource"))?;
             Err(StoreError::Poisoned {
                 error: "abort".into(),
             })
@@ -1157,6 +1193,45 @@ fn a_failed_transaction_publishes_no_tool_mapping() {
     // The mapping never published; the content-addressed orphan file is
     // inert (unreferenced by any row).
     assert!(store.tool("shaderc").unwrap().is_none());
+}
+
+#[test]
+fn invalid_capsule_registration_publishes_nothing() {
+    let (_d, mut store) = store();
+    let mut capsule = tool_capsule(b"tool", b"resource");
+    capsule.files[0].path = "../tool".into();
+    let before = store.input_version();
+    assert!(matches!(
+        store.input_transaction(|txn| txn.stage_tool("tool", capsule)),
+        Err(StoreError::InvalidToolCapsule(_))
+    ));
+    assert_eq!(store.input_version(), before);
+    assert!(store.tool("tool").unwrap().is_none());
+}
+
+#[test]
+fn staged_capsule_is_revalidated_immediately_before_launch() {
+    let (_d, mut store) = store();
+    let (staged, _) = store
+        .input_transaction(|txn| txn.stage_tool("tool", tool_capsule(b"launcher", b"resource")))
+        .unwrap();
+    staged
+        .validate_launch_platform("test-platform", "ignored-for-residual")
+        .unwrap();
+    assert!(matches!(
+        staged.validate_launch_platform("other-platform", "ignored"),
+        Err(StoreError::ToolCapsuleUnavailable { .. })
+    ));
+
+    std::fs::remove_file(staged.root.join("share/config")).unwrap();
+    assert!(matches!(
+        staged.revalidate(),
+        Err(StoreError::ToolCapsuleUnavailable { .. })
+    ));
+    assert!(matches!(
+        store.tool("tool"),
+        Err(StoreError::ToolCapsuleUnavailable { .. })
+    ));
 }
 
 // ---- schema lineage (§6, §11, §13) ----

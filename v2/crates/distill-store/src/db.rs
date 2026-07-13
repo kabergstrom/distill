@@ -204,10 +204,10 @@ CREATE TABLE pending_restart (
     PRIMARY KEY (generation, config_key)
 );
 CREATE TABLE tools (
-    tool_key      TEXT NOT NULL PRIMARY KEY,
-    staged_path   TEXT NOT NULL,
-    content_hash  BLOB NOT NULL,
-    input_version INTEGER NOT NULL
+    tool_key       TEXT NOT NULL PRIMARY KEY,
+    capsule_object BLOB NOT NULL,
+    capsule_hash   BLOB NOT NULL CHECK (length(capsule_hash) = 32),
+    input_version  INTEGER NOT NULL
 );
 CREATE TABLE schema_lineage (
     type_uuid     BLOB NOT NULL,

@@ -107,6 +107,24 @@ impl ToolExecutionCapsuleV1 {
     const RECORD_VERSION: u8 = 1;
 
     pub fn validate(&self) -> Result<(), ToolCapsuleError> {
+        if u32::try_from(self.files.len()).is_err()
+            || u32::try_from(self.launch.interpreter_args.len()).is_err()
+            || u32::try_from(self.environment.len()).is_err()
+            || self
+                .files
+                .iter()
+                .any(|file| u32::try_from(file.path.len()).is_err())
+            || self
+                .launch
+                .interpreter_args
+                .iter()
+                .any(|value| u32::try_from(value.len()).is_err())
+            || self.environment.iter().any(|(key, value)| {
+                u32::try_from(key.len()).is_err() || u32::try_from(value.len()).is_err()
+            })
+        {
+            return Err(ToolCapsuleError::CountOverflow);
+        }
         if self.files.is_empty()
             || self
                 .files
@@ -148,6 +166,14 @@ impl ToolExecutionCapsuleV1 {
             _ => return Err(ToolCapsuleError::InterpreterMismatch),
         }
         if self
+            .resolved_interpreter
+            .as_ref()
+            .is_some_and(|value| u32::try_from(value.len()).is_err())
+            || u32::try_from(self.launch.argv0.len()).is_err()
+        {
+            return Err(ToolCapsuleError::CountOverflow);
+        }
+        if self
             .launch
             .interpreter_args
             .iter()
@@ -173,6 +199,9 @@ impl ToolExecutionCapsuleV1 {
         }
 
         if let ToolCwdPolicy::ReadOnlyDeclaredSubdir(path) = &self.cwd_policy {
+            if u32::try_from(path.len()).is_err() {
+                return Err(ToolCapsuleError::CountOverflow);
+            }
             if !valid_capsule_path(path)
                 || !self.files.iter().any(|file| {
                     file.path
@@ -184,6 +213,19 @@ impl ToolExecutionCapsuleV1 {
             }
         }
 
+        let platform_fields_fit = match &self.platform {
+            ToolPlatformBinding::Pinned {
+                platform_id,
+                system_runtime_id,
+            } => string_fits(platform_id) && string_fits(system_runtime_id),
+            ToolPlatformBinding::ExplicitResidual {
+                platform_id,
+                system_runtime_class,
+            } => string_fits(platform_id) && string_fits(system_runtime_class),
+        };
+        if !platform_fields_fit {
+            return Err(ToolCapsuleError::CountOverflow);
+        }
         match &self.platform {
             ToolPlatformBinding::Pinned {
                 platform_id,
@@ -331,6 +373,10 @@ fn valid_capsule_path(value: &str) -> bool {
 
 fn valid_nonempty_text(value: &str) -> bool {
     !value.is_empty() && valid_text(value, false)
+}
+
+fn string_fits(value: &str) -> bool {
+    u32::try_from(value.len()).is_ok()
 }
 
 fn valid_text(value: &str, allow_empty: bool) -> bool {

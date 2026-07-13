@@ -161,12 +161,17 @@ fn assets_row_shape() {
 
 #[test]
 fn tools_table_is_the_tool_epoch() {
-    // §13: tool key → (staged copy path, content hash) — input-versioned.
+    // §13: tool key → (verified capsule object, aggregate DSCT hash) — input-versioned.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "tools"),
-        ["tool_key", "staged_path", "content_hash", "input_version"]
+        [
+            "tool_key",
+            "capsule_object",
+            "capsule_hash",
+            "input_version"
+        ]
     );
     assert_eq!(pk_columns(&conn, "tools"), ["tool_key"]);
 }

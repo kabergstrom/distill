@@ -9,6 +9,9 @@ use distill_core::attestation::{
 };
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
+use distill_core::tool::{
+    ToolCapsuleFileRole, ToolCwdPolicy, ToolLaunchMetadataV1, ToolPlatformBinding,
+};
 use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
@@ -17,6 +20,7 @@ use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
     ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
+use distill_store::pipeline::{ResolvedToolCapsuleFile, ToolCapsuleRegistrationV1};
 use distill_store::state::{
     load_policy_digest, CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
     PipelinePoisonOrigin, PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison,
@@ -202,7 +206,28 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                     },
                 ),
             )?;
-            txn.stage_tool("tool", b"tool bytes")?;
+            txn.stage_tool(
+                "tool",
+                ToolCapsuleRegistrationV1 {
+                    files: vec![ResolvedToolCapsuleFile {
+                        path: "bin/tool".into(),
+                        role: ToolCapsuleFileRole::Launcher,
+                        executable: true,
+                        bytes: b"tool bytes".to_vec(),
+                    }],
+                    resolved_interpreter: None,
+                    launch: ToolLaunchMetadataV1 {
+                        argv0: "bin/tool".into(),
+                        interpreter_args: vec![],
+                    },
+                    environment: vec![],
+                    cwd_policy: ToolCwdPolicy::EmptyScratch,
+                    platform: ToolPlatformBinding::ExplicitResidual {
+                        platform_id: "test-platform".into(),
+                        system_runtime_class: "test-runtime".into(),
+                    },
+                },
+            )?;
             txn.publish_pipeline_epoch(&validated_epoch(
                 [6u8; 32],
                 Some((TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))),
