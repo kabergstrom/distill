@@ -27,6 +27,10 @@ fn batch_reservation_has_a_declared_operational_live_change_class() {
         change_class("targets"),
         Some(ChangeClass::InputVersionedEpoch)
     );
+    assert_eq!(
+        change_class("assets.lineage_manifest"),
+        Some(ChangeClass::InputVersionedEpoch)
+    );
     assert_eq!(change_class("future.unclassified"), None);
 }
 

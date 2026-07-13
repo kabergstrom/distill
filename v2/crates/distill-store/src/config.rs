@@ -104,9 +104,12 @@ pub enum ChangeClass {
 /// one without adding a row is a detectable spec/implementation defect.
 pub fn change_class(key: &str) -> Option<ChangeClass> {
     Some(match key {
-        "assets.roots" | "assets.schema_path" | "targets" | "modules.pipeline_dylib" | "tools" => {
-            ChangeClass::InputVersionedEpoch
-        }
+        "assets.roots"
+        | "assets.schema_path"
+        | "assets.lineage_manifest"
+        | "targets"
+        | "modules.pipeline_dylib"
+        | "tools" => ChangeClass::InputVersionedEpoch,
         "pipeline.parallelism"
         | "pipeline.max_dependency_depth"
         | "pipeline.batch_reserved_workers"
