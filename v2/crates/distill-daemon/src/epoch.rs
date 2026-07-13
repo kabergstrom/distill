@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -130,10 +131,15 @@ pub struct RegistrationSet {
 /// This has deliberately no `Drop` implementation: if its thunk reports an
 /// error or panics, retaining or even dropping the host-side wrapper leaks the
 /// module object instead of running unchecked module drop glue.
-pub struct ErasedRegistrationCapsule {
+pub struct ErasedRegistrationCapsule(NonNull<RegistrationCapsuleNode>);
+
+struct RegistrationCapsuleNode {
     pointer: *mut u8,
     owner: ModuleEpochToken,
     cleanup: unsafe fn(*mut u8) -> Result<(), ModuleCallError>,
+    next: Option<NonNull<RegistrationCapsuleNode>>,
+    installation_seq: u64,
+    registration: Option<Registration>,
 }
 
 // SAFETY: construction requires the caller to promise that the opaque object
@@ -143,8 +149,7 @@ unsafe impl Send for ErasedRegistrationCapsule {}
 impl std::fmt::Debug for ErasedRegistrationCapsule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ErasedRegistrationCapsule")
-            .field("pointer", &self.pointer)
-            .field("owner", &self.owner)
+            .field("node", &self.0)
             .finish_non_exhaustive()
     }
 }
@@ -165,19 +170,18 @@ impl ErasedRegistrationCapsule {
         owner: ModuleEpochToken,
         cleanup: unsafe fn(*mut u8) -> Result<(), ModuleCallError>,
     ) -> Self {
-        Self {
+        let node = Box::new(RegistrationCapsuleNode {
             pointer,
             owner,
             cleanup,
-        }
-    }
-
-    fn cleanup(&self) -> Result<(), ModuleCallError> {
-        boundary_call("registration cleanup", || {
-            // SAFETY: upheld by `from_raw`; the arena calls this at most once
-            // and retains the record without another call after any failure.
-            unsafe { (self.cleanup)(self.pointer) }
-        })
+            next: None,
+            installation_seq: 0,
+            registration: None,
+        });
+        // SAFETY: Box never produces a null pointer. The no-Drop capsule is
+        // linked into exactly one arena, which frees the node after successful
+        // payload cleanup and retains it after failure.
+        Self(unsafe { NonNull::new_unchecked(Box::into_raw(node)) })
     }
 }
 
@@ -204,13 +208,6 @@ impl RegistrationStatus {
         debug_assert_eq!(self.disposition, RegistrationDisposition::Consumed);
         self.result
     }
-}
-
-#[derive(Debug)]
-struct CandidateRegistration {
-    installation_seq: u64,
-    registration: Registration,
-    capsule: ErasedRegistrationCapsule,
 }
 
 /// A tracked residency capability for a module-owned value. Registration and
@@ -252,15 +249,21 @@ impl ModuleEpochPin {
 pub struct CandidateRegistrationArena {
     owner: ModuleEpochToken,
     residency: Arc<EpochResidency>,
-    entries: Vec<CandidateRegistration>,
+    head: Option<NonNull<RegistrationCapsuleNode>>,
+    installed_len: usize,
     next_installation_seq: u64,
+    rejected: Option<ModuleCallError>,
 }
+
+// SAFETY: every intrusive node originates in a `Send` capsule; the arena has
+// exclusive access while unpublished and is mutex-protected after publication.
+unsafe impl Send for CandidateRegistrationArena {}
 
 impl std::fmt::Debug for CandidateRegistrationArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CandidateRegistrationArena")
             .field("owner", &self.owner)
-            .field("entries", &self.entries.len())
+            .field("entries", &self.installed_len)
             .field("fenced", &self.is_fenced())
             .field("pins", &self.pin_count())
             .finish()
@@ -274,8 +277,10 @@ impl CandidateRegistrationArena {
             residency: Arc::new(EpochResidency {
                 fenced: AtomicBool::new(false),
             }),
-            entries: Vec::new(),
+            head: None,
+            installed_len: 0,
             next_installation_seq: 0,
+            rejected: None,
         }
     }
 
@@ -298,17 +303,39 @@ impl CandidateRegistrationArena {
         registration: Registration,
         capsule: ErasedRegistrationCapsule,
     ) -> RegistrationStatus {
-        // Ownership transfers before checking the fence, token, duplicate
-        // metadata, or any other rejectable condition. A later failure is
-        // therefore cleaned only by `cleanup_reverse`.
+        // The first host operation is a pure move into this callback-local
+        // guard, already inside the host boundary. The capsule owns its
+        // intrusive node, so linking it into the arena performs no allocation.
+        let mut ingress = CallbackIngressGuard {
+            capsule: Some(capsule),
+        };
         let installation_seq = self.next_installation_seq;
+        let mut node = ingress.capsule.as_ref().expect("ingress is armed").0;
+        let prior_head = self.head;
+        // SAFETY: the capsule exclusively owns this live boxed node until it
+        // is linked here. All fields are assigned by pure moves/writes.
+        unsafe {
+            node.as_mut().installation_seq = installation_seq;
+            node.as_mut().registration = Some(registration);
+            node.as_mut().next = prior_head;
+        }
+        self.head = Some(node);
+        self.installed_len = self.installed_len.saturating_add(1);
+        ingress.capsule = None;
+
+        // Only after the allocation-free link owns the capsule may any
+        // validation reject it. A panic from here is still cleaned by the
+        // arena because the node is reachable from `head`.
         let was_fenced = self.is_fenced();
-        let owner_matches = capsule.owner.same_epoch(&self.owner);
-        self.entries.push(CandidateRegistration {
-            installation_seq,
-            registration,
-            capsule,
-        });
+        let owner_matches = unsafe { node.as_ref().owner.same_epoch(&self.owner) };
+        let installed = unsafe {
+            node.as_ref()
+                .registration
+                .as_ref()
+                .expect("linked registration node has metadata")
+        };
+        let duplicate = installed.kind != RegistrationKind::Validator
+            && Self::contains_registration_from(prior_head, installed.kind, &installed.id);
         let result = if was_fenced {
             Err(ModuleCallError::new(
                 "candidate registration arena is fenced",
@@ -317,6 +344,8 @@ impl CandidateRegistrationArena {
             Err(ModuleCallError::new(
                 "registration capsule belongs to a different module epoch",
             ))
+        } else if duplicate {
+            Err(ModuleCallError::new("duplicate non-validator registration"))
         } else {
             match self.next_installation_seq.checked_add(1) {
                 Some(next) => {
@@ -328,6 +357,11 @@ impl CandidateRegistrationArena {
                 )),
             }
         };
+        if let Err(error) = &result {
+            if self.rejected.is_none() {
+                self.rejected = Some(error.clone());
+            }
+        }
         RegistrationStatus {
             disposition: RegistrationDisposition::Consumed,
             result,
@@ -335,18 +369,52 @@ impl CandidateRegistrationArena {
     }
 
     pub fn installed_len(&self) -> usize {
-        self.entries.len()
+        self.installed_len
     }
 
     fn registration_set(&self, pipeline_targets: BTreeSet<String>) -> RegistrationSet {
+        let mut registrations = Vec::with_capacity(self.installed_len);
+        let mut cursor = self.head;
+        while let Some(node) = cursor {
+            // SAFETY: every linked node remains live until cleanup.
+            let node = unsafe { node.as_ref() };
+            registrations.push(
+                node.registration
+                    .as_ref()
+                    .expect("linked registration node has metadata")
+                    .clone(),
+            );
+            cursor = node.next;
+        }
+        registrations.reverse();
         RegistrationSet {
-            registrations: self
-                .entries
-                .iter()
-                .map(|entry| entry.registration.clone())
-                .collect(),
+            registrations,
             pipeline_targets,
         }
+    }
+
+    fn contains_registration_from(
+        mut cursor: Option<NonNull<RegistrationCapsuleNode>>,
+        kind: RegistrationKind,
+        id: &str,
+    ) -> bool {
+        while let Some(node) = cursor {
+            // SAFETY: every linked node remains live until cleanup.
+            let node = unsafe { node.as_ref() };
+            if node
+                .registration
+                .as_ref()
+                .is_some_and(|registration| registration.kind == kind && registration.id == id)
+            {
+                return true;
+            }
+            cursor = node.next;
+        }
+        false
+    }
+
+    fn rejected(&self) -> Option<&ModuleCallError> {
+        self.rejected.as_ref()
     }
 
     fn fence(&mut self) {
@@ -364,23 +432,65 @@ impl CandidateRegistrationArena {
     fn cleanup_reverse(&mut self) -> Result<(), ModuleCallError> {
         self.fence();
         let mut errors = Vec::new();
-        for index in (0..self.entries.len()).rev() {
-            let sequence = self.entries[index].installation_seq;
-            match self.entries[index].capsule.cleanup() {
+        let mut cursor = self.head.take();
+        let mut retained_head: Option<NonNull<RegistrationCapsuleNode>> = None;
+        let mut retained_tail: Option<NonNull<RegistrationCapsuleNode>> = None;
+        while let Some(mut node) = cursor {
+            // SAFETY: `node` is linked and live. Save the next pointer before
+            // cleanup; success frees this node, failure relinks it below.
+            let next = unsafe { node.as_ref().next };
+            let sequence = unsafe { node.as_ref().installation_seq };
+            let cleanup = boundary_call("registration cleanup", || {
+                // SAFETY: upheld by `from_raw`; each node is called at most
+                // once after success and retained without retry after error.
+                unsafe { (node.as_ref().cleanup)(node.as_ref().pointer) }
+            });
+            match cleanup {
                 Ok(()) => {
-                    self.entries.remove(index);
+                    self.installed_len = self.installed_len.saturating_sub(1);
+                    // SAFETY: successful payload cleanup disarms the capsule;
+                    // this is the unique Box pointer allocated by from_raw.
+                    drop(unsafe { Box::from_raw(node.as_ptr()) });
                 }
                 Err(error) => {
                     self.owner.poison();
                     errors.push(format!("registration cleanup #{sequence} failed: {error}"));
+                    // SAFETY: retain failed nodes in cleanup-attempt order
+                    // without allocating a side table.
+                    unsafe { node.as_mut().next = None };
+                    if let Some(mut tail) = retained_tail {
+                        unsafe { tail.as_mut().next = Some(node) };
+                    } else {
+                        retained_head = Some(node);
+                    }
+                    retained_tail = Some(node);
                 }
             }
+            cursor = next;
         }
+        self.head = retained_head;
         if errors.is_empty() {
             Ok(())
         } else {
             Err(ModuleCallError::new(errors.join("; ")))
         }
+    }
+}
+
+/// Allocation-free callback-local ingress owner. It intentionally has no
+/// Drop implementation: a panic before the pure pointer link leaks the node
+/// and forces the candidate boundary to retain the library rather than calling
+/// module destruction or allowing automatic drop.
+struct CallbackIngressGuard {
+    capsule: Option<ErasedRegistrationCapsule>,
+}
+
+impl Drop for CallbackIngressGuard {
+    fn drop(&mut self) {
+        // An armed guard deliberately leaks its no-Drop capsule node. The
+        // surrounding boundary latches candidate failure and retains the
+        // library; it must never run module cleanup through unwinding.
+        let _ = self.capsule.take();
     }
 }
 
@@ -1064,10 +1174,15 @@ fn validate_open_module(
             &compiled_types.rows,
         ));
     }
-    let pipeline_targets = boundary_call("register", || {
+    let registration_result = boundary_call("register", || {
         module.register(&requirements.targets, registration_arena)
-    })
-    .map_err(|error| error.to_string())?;
+    });
+    if let Some(rejected) = registration_arena.rejected() {
+        return Err(format!(
+            "host latched rejected registration even though module registration returned: {rejected}"
+        ));
+    }
+    let pipeline_targets = registration_result.map_err(|error| error.to_string())?;
     let registration = registration_arena.registration_set(pipeline_targets);
     validate_registration(&registration, &requirements.targets)?;
     Ok(registration)

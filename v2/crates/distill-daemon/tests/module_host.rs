@@ -85,6 +85,7 @@ struct FakeModule {
     poison_during_register: bool,
     capsule_owner_mismatch: bool,
     panic_after_registration: bool,
+    ignore_registration_errors: bool,
     pin_sink: Option<Arc<Mutex<Option<ModuleEpochPin>>>>,
 }
 
@@ -143,7 +144,10 @@ impl LoadedPipelineModule for FakeModule {
             };
             let status = arena.install(registration.clone(), resource);
             assert_eq!(status.disposition, RegistrationDisposition::Consumed);
-            status.into_result()?;
+            let result = status.into_result();
+            if !self.ignore_registration_errors {
+                result?;
+            }
         }
         assert!(
             !self.panic_after_registration,
@@ -244,6 +248,7 @@ fn fake_module(tag: u8, calls: Arc<Mutex<Calls>>) -> FakeModule {
         poison_during_register: false,
         capsule_owner_mismatch: false,
         panic_after_registration: false,
+        ignore_registration_errors: false,
         pin_sink: None,
     }
 }
@@ -455,6 +460,35 @@ fn partial_duplicate_registration_cleans_the_complete_arena_in_reverse_order() {
         .publish_candidate(&source, requirements(10), &mut loader)
         .unwrap_err();
 
+    assert_eq!(
+        poison.cleanup_disposition,
+        Some(CandidateCleanupDisposition::CleanedAndClosed)
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.cleanup_order, ["first#2", "middle#1", "first#0"]);
+    assert_eq!(calls.unload, 1);
+    assert_eq!(calls.dlclose, 1);
+}
+
+#[test]
+fn host_latch_rejects_candidate_when_module_ignores_duplicate_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 21);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut module = duplicate_registration_module(21, calls.clone(), vec![CleanupBehavior::Ok; 3]);
+    module.ignore_registration_errors = true;
+    let mut loader = FakeLoader {
+        module: Some(module),
+        open_error: None,
+    };
+    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+    let poison = host
+        .publish_candidate(&source, requirements(21), &mut loader)
+        .unwrap_err();
+
+    assert!(poison.detail.contains("host latched rejected registration"));
     assert_eq!(
         poison.cleanup_disposition,
         Some(CandidateCleanupDisposition::CleanedAndClosed)
