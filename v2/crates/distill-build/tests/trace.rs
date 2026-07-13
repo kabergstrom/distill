@@ -51,6 +51,26 @@ impl TraceSource for Snapshot {
 }
 
 #[test]
+fn dstr_read_success_bytes_pin_one_based_operation_and_outcome_tags() {
+    let asset = AssetUuid([0x11; 16]);
+    let hash = ContentHash([0x22; 32]);
+    let actual = trace_canonical_bytes(&[TraceOp::Read {
+        asset,
+        observed: Observed::Ok(hash),
+    }]);
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"DSTR");
+    expected.push(1);
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.push(1); // TraceOp::Read
+    expected.extend_from_slice(&asset.0);
+    expected.push(1); // Observed::Ok
+    expected.extend_from_slice(&hash.0);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn revalidation_compares_labeled_outcomes_in_order() {
     let asset = AssetUuid([1; 16]);
     let hash = ContentHash([2; 32]);
@@ -303,11 +323,11 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
     expected.extend_from_slice(b"DSTR");
     expected.push(1); // domain version
     expected.extend_from_slice(&1_u32.to_le_bytes()); // trace entry count
-    expected.push(7); // TraceOp::Control
+    expected.push(8); // TraceOp::Control
     expected.push(1); // ControlQuery::MigrationEdges
     expected.extend_from_slice(&[10; 16]);
     expected.extend_from_slice(&[11; 32]);
-    expected.push(1); // Observed::Err
+    expected.push(2); // Observed::Err
     expected.push(9); // StableFailureFingerprint::Control
     expected.push(1); // ControlFailureSubject::Query
     expected.push(1); // ControlQuery::MigrationEdges
@@ -339,10 +359,10 @@ fn dstr_control_read_failure_pins_read_subject_tag() {
     expected.extend_from_slice(b"DSTR");
     expected.push(1);
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(8); // TraceOp::ControlRead
+    expected.push(9); // TraceOp::ControlRead
     expected.push(1); // ControlSubject::Migration
     expected.extend_from_slice(&asset.0);
-    expected.push(1); // Observed::Err
+    expected.push(2); // Observed::Err
     expected.push(9); // StableFailureFingerprint::Control
     expected.push(2); // ControlFailureSubject::Read
     expected.push(1); // ControlSubject::Migration

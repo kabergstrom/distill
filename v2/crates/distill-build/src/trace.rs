@@ -697,11 +697,11 @@ fn observed<T>(
 ) {
     match value {
         Observed::Ok(v) => {
-            e.enum_variant(0);
+            e.enum_variant(1);
             ok(e, v);
         }
         Observed::Err(f) => {
-            e.enum_variant(1);
+            e.enum_variant(2);
             encode_failure(e, f, 0);
         }
     }
@@ -710,27 +710,27 @@ fn observed<T>(
 fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
     match op {
         TraceOp::Read { asset, observed: o } => {
-            e.enum_variant(0);
+            e.enum_variant(1);
             e.raw(&asset.0);
             observed(e, o, |e, h| e.raw(&h.0));
         }
         TraceOp::Resolve { path, observed: o } => {
-            e.enum_variant(1);
+            e.enum_variant(2);
             e.str(path);
             observed(e, o, |e, id| e.option(*id, |e, id| e.raw(&id.0)));
         }
         TraceOp::Query { query, observed: o } => {
-            e.enum_variant(2);
+            e.enum_variant(3);
             encode_query(e, query);
             observed(e, o, |e, h| e.raw(h));
         }
         TraceOp::Tool { id, observed: o } => {
-            e.enum_variant(3);
+            e.enum_variant(4);
             e.str(id);
             observed(e, o, |e, h| e.raw(h));
         }
         TraceOp::Capability { key, observed: o } => {
-            e.enum_variant(4);
+            e.enum_variant(5);
             encode_capability(e, key);
             observed(e, o, |e, h| e.raw(h));
         }
@@ -739,18 +739,18 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
             expected_terminal,
             observed: o,
         } => {
-            e.enum_variant(5);
+            e.enum_variant(6);
             e.raw(&asset.0);
             e.raw(&expected_terminal.0);
             observed(e, o, |e, ty| e.option(*ty, |e, ty| e.raw(&ty.0)));
         }
         TraceOp::RoleCheck { asset, observed: o } => {
-            e.enum_variant(6);
+            e.enum_variant(7);
             e.raw(&asset.0);
             observed(e, o, |e, role| e.option(*role, |e, role| e.u8(*role as u8)));
         }
         TraceOp::Control { query, observed: o } => {
-            e.enum_variant(7);
+            e.enum_variant(8);
             encode_control_query(e, query);
             observed(e, o, |e, hash| e.raw(hash));
         }
@@ -758,7 +758,7 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
             subject,
             observed: o,
         } => {
-            e.enum_variant(8);
+            e.enum_variant(9);
             encode_control_subject(e, subject);
             observed(e, o, |e, hash| e.raw(&hash.0));
         }
