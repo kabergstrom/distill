@@ -42,6 +42,8 @@ pub const DSCP: [u8; 4] = *b"DSCP";
 pub const DSVP: [u8; 4] = *b"DSVP";
 /// Typed pipeline-poison identity (§3, §13, §17).
 pub const DSPP: [u8; 4] = *b"DSPP";
+/// Complete hermetic tool-execution capsule identity (§9, §13).
+pub const DSCT: [u8; 4] = *b"DSCT";
 
 /// Append-only encoder for the canonical record encoding. Composites encode
 /// their fields in declaration order by calling these methods; there is no

@@ -6,3 +6,4 @@ pub mod canonical;
 pub mod id;
 pub mod lineage;
 pub mod target_set;
+pub mod tool;
