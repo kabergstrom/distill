@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::attestation::{bootstrap_control_logical_registry_v1, CompiledAttestationDigest};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_store::bundles::AssetRecord;
@@ -37,7 +37,7 @@ fn epoch(n: u8) -> PipelineEpoch {
             target_definition_hash: [n.wrapping_add(3); 32],
         }])
         .unwrap(),
-        schema_registry: BTreeMap::new(),
+        schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
         registrations: vec![
             Registration {
                 kind: RegistrationKind::Importer,
@@ -55,7 +55,7 @@ fn epoch(n: u8) -> PipelineEpoch {
 
 fn epoch_with_registry(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> PipelineEpoch {
     let mut epoch = epoch(n);
-    epoch.schema_registry = rows.iter().copied().collect();
+    epoch.schema_registry.extend(rows.iter().copied());
     epoch
 }
 
@@ -65,6 +65,79 @@ fn project_empty(store: &mut Store) {
             txn.project_verified_lineage_manifest(&verified(1, SchemaLineageManifest::default()))
         })
         .unwrap();
+}
+
+#[test]
+fn published_runtime_poison_is_durable_without_a_new_input_version() {
+    let (_dir, mut store) = store();
+    project_empty(&mut store);
+    let ready = epoch(41);
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
+        .unwrap();
+    let version = store.input_version();
+    let poison = PipelinePoison::new(
+        PipelinePoisonCode::PublishedCallbackPanic,
+        PipelinePoisonOrigin::PublishedRuntime,
+        CleanupDisposition::PublishedEpochLeaked,
+        "drop thunk panicked",
+    )
+    .unwrap();
+    store
+        .poison_published_pipeline_epoch(ready.dylib_hash, &poison)
+        .unwrap();
+    assert_eq!(store.input_version(), version);
+    assert!(matches!(
+        store.pipeline_state().unwrap(),
+        Some(PipelineState::Poisoned {
+            error,
+            last_good: Some(_),
+        }) if error == poison
+    ));
+    assert!(matches!(
+        store.poison_published_pipeline_epoch(ready.dylib_hash, &poison),
+        Err(StoreError::StalePublishedPipeline {
+            already_unavailable: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn runtime_poison_cas_cannot_fence_another_epoch_or_use_candidate_origin() {
+    let (_dir, mut store) = store();
+    project_empty(&mut store);
+    let ready = epoch(42);
+    store
+        .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
+        .unwrap();
+    let runtime = PipelinePoison::new(
+        PipelinePoisonCode::PublishedCallbackRejected,
+        PipelinePoisonOrigin::PublishedRuntime,
+        CleanupDisposition::PublishedEpochLeaked,
+        "callback rejected",
+    )
+    .unwrap();
+    assert!(matches!(
+        store.poison_published_pipeline_epoch([0xff; 32], &runtime),
+        Err(StoreError::StalePublishedPipeline { .. })
+    ));
+    assert!(matches!(
+        store.pipeline_state().unwrap(),
+        Some(PipelineState::Ready(_))
+    ));
+
+    let candidate = PipelinePoison::new(
+        PipelinePoisonCode::CandidateOpen,
+        PipelinePoisonOrigin::CandidateOpen,
+        CleanupDisposition::None,
+        "open failed",
+    )
+    .unwrap();
+    assert!(matches!(
+        store.poison_published_pipeline_epoch(ready.dylib_hash, &candidate),
+        Err(StoreError::InvalidPipelinePoison(_))
+    ));
 }
 
 fn verified(n: u8, manifest: SchemaLineageManifest) -> VerifiedSchemaLineageManifest {
@@ -82,6 +155,63 @@ fn require_candidate(
         PipelineState::SchemaAcceptanceRequired { required, .. } => required.manifest,
         other => panic!("candidate unexpectedly ready: {other:?}"),
     }
+}
+
+#[test]
+fn ready_requires_exact_dsb_bootstrap_projection_and_manifest_omits_it() {
+    let (_dir, mut primary_store) = store();
+    project_empty(&mut primary_store);
+    let type_uuid = distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
+
+    let mut missing = epoch(1);
+    missing.schema_registry.remove(&type_uuid);
+    assert!(matches!(
+        primary_store.input_transaction(|txn| txn.publish_pipeline_epoch(&missing)),
+        Err(StoreError::InvalidBootstrapRegistry {
+            type_uuid: observed,
+            observed: None,
+            ..
+        }) if observed == type_uuid
+    ));
+
+    let mut changed = epoch(2);
+    changed
+        .schema_registry
+        .insert(type_uuid, LogicalHash([0xff; 32]));
+    assert!(matches!(
+        primary_store.input_transaction(|txn| txn.publish_pipeline_epoch(&changed)),
+        Err(StoreError::InvalidBootstrapRegistry {
+            type_uuid: observed,
+            observed: Some(_),
+            ..
+        }) if observed == type_uuid
+    ));
+
+    let invalid_manifest = SchemaLineageManifest {
+        types: [(
+            type_uuid,
+            AcceptedTypeLineage {
+                epochs: vec![AcceptedSchemaEpoch {
+                    digest: LogicalHash([1; 32]),
+                    forward_parent: None,
+                }],
+                current: 0,
+                authority: TypeAuthorityState::Active,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let (_other_dir, mut other_store) = store();
+    assert!(matches!(
+        other_store.input_transaction(|txn| txn.project_verified_lineage_manifest(
+            &verified(9, invalid_manifest)
+        )),
+        Err(StoreError::InvalidLineageManifest {
+            type_uuid: Some(observed),
+            ..
+        }) if observed == type_uuid
+    ));
 }
 
 fn h(n: u8) -> LogicalHash {
@@ -207,7 +337,9 @@ fn ready_requires_exact_candidate_registry_and_manifest_cursor_equality() {
 
     let state = store.pipeline_state().unwrap().expect("published");
     let ready = state.epoch().expect("exact registry is ready");
-    assert_eq!(ready.schema_registry, BTreeMap::from([(T, h(1))]));
+    let mut expected_registry = bootstrap_control_logical_registry_v1().unwrap();
+    expected_registry.insert(T, h(1));
+    assert_eq!(ready.schema_registry, expected_registry);
 }
 
 #[test]

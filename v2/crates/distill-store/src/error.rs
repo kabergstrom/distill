@@ -33,6 +33,23 @@ pub enum StoreError {
     InvalidVersionPoison(crate::state::VersionPoisonError),
     /// Persisted DSPP fields were unknown, noncanonical, or inconsistent.
     InvalidPipelinePoison(crate::state::PipelinePoisonError),
+    /// The checked-in DSB format authority could not be parsed. A binary
+    /// built in this state cannot advertise bundle format v1 or reach Ready.
+    InvalidBootstrapSpec(distill_core::attestation::BootstrapSpecError),
+    /// A candidate omitted or changed one of the five format-owned logical
+    /// control rows before active lineage equality was evaluated.
+    InvalidBootstrapRegistry {
+        type_uuid: distill_core::id::TypeUuid,
+        expected: distill_core::id::LogicalHash,
+        observed: Option<distill_core::id::LogicalHash>,
+    },
+    /// A published-runtime poison attempted to fence a different or already
+    /// unavailable epoch. The first durable transition remains authority.
+    StalePublishedPipeline {
+        expected: [u8; 32],
+        actual: Option<[u8; 32]>,
+        already_unavailable: bool,
+    },
     /// A path resolvable in more than one asset root (§13/§18): an
     /// ambiguity error, never a tiebreak.
     AmbiguousPath { path: String, roots: Vec<String> },
@@ -201,6 +218,27 @@ impl fmt::Display for StoreError {
             StoreError::Poisoned { error } => write!(f, "version poison: {error}"),
             StoreError::InvalidVersionPoison(error) => error.fmt(f),
             StoreError::InvalidPipelinePoison(error) => error.fmt(f),
+            StoreError::InvalidBootstrapSpec(error) => {
+                write!(f, "bundle-format bootstrap authority is invalid: {error}")
+            }
+            StoreError::InvalidBootstrapRegistry {
+                type_uuid,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "candidate bootstrap control {type_uuid} expected logical hash {expected}, got {observed:?}"
+            ),
+            StoreError::StalePublishedPipeline {
+                expected,
+                actual,
+                already_unavailable,
+            } => write!(
+                f,
+                "published pipeline changed before runtime poison: expected {}, actual {}, already unavailable={already_unavailable}",
+                hex(expected),
+                actual.map_or_else(|| "none".to_owned(), |hash| hex(&hash)),
+            ),
             StoreError::AmbiguousPath { path, roots } => write!(
                 f,
                 "path `{path}` resolves in more than one asset root: {}",

@@ -3,7 +3,7 @@
 //! all-or-nothing, WAL readers only ever observe complete input
 //! versions, and the poison classifications compose.
 
-use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::attestation::{bootstrap_control_logical_registry_v1, CompiledAttestationDigest};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::bundles::{AssetRecord, BundleMeta};
@@ -159,8 +159,10 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 load_policy_digest: [7u8; 32],
                 compiled_types: CompiledAttestationDigest([8u8; 32]),
                 target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-                schema_registry: [(TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))]
+                schema_registry: bootstrap_control_logical_registry_v1()
+                    .unwrap()
                     .into_iter()
+                    .chain([(TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))])
                     .collect(),
                 registrations: vec![],
             })?;
@@ -295,7 +297,7 @@ fn version_poison_and_pipeline_poison_are_distinct_gates() {
                 load_policy_digest: [2u8; 32],
                 compiled_types: CompiledAttestationDigest([3u8; 32]),
                 target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-                schema_registry: std::collections::BTreeMap::new(),
+                schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
                 registrations: vec![],
             })?;
             let poison = version_poison("identity collision");

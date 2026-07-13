@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::attestation::{
+    bootstrap_control_logical_registry_v1, is_bootstrap_control_type, CompiledAttestationDigest,
+};
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
 use rusqlite::OptionalExtension;
@@ -232,6 +234,7 @@ impl InputTxn<'_> {
     /// retaining the prior epoch only as `last_good` residency bookkeeping.
     pub fn publish_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
         validate_target_set(&epoch.target_set)?;
+        validate_bootstrap_schema_registry(&epoch.schema_registry)?;
         let basis = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
         let mismatches = schema_registry_mismatches(&epoch.schema_registry, &basis.current_cursors);
         if !mismatches.is_empty() {
@@ -455,6 +458,7 @@ impl InputTxn<'_> {
         &mut self,
         source: &VerifiedSchemaLineageManifest,
     ) -> Result<(), StoreError> {
+        reject_bootstrap_manifest_rows(&source.manifest)?;
         for (type_uuid, lineage) in &source.manifest.types {
             validate_type_lineage(*type_uuid, lineage)?;
         }
@@ -831,6 +835,7 @@ impl InputTxn<'_> {
         expected_manifest: &SchemaManifestBasis,
     ) -> Result<(), StoreError> {
         validate_target_set(&candidate.target_set)?;
+        validate_bootstrap_schema_registry(&candidate.schema_registry)?;
         let actual_manifest = manifest_basis(&self.txn)?;
         if actual_manifest.as_ref() != Some(expected_manifest) {
             return Err(StoreError::StaleSchemaManifestBase {
@@ -1045,6 +1050,7 @@ fn replace_lineage_projection(
     version: InputVersion,
     source: &VerifiedSchemaLineageManifest,
 ) -> Result<(), StoreError> {
+    reject_bootstrap_manifest_rows(&source.manifest)?;
     for (type_uuid, lineage) in &source.manifest.types {
         validate_type_lineage(*type_uuid, lineage)?;
     }
@@ -1086,6 +1092,7 @@ fn schema_registry_mismatches(
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .filter(|type_uuid| !is_bootstrap_control_type(*type_uuid))
         .filter_map(|type_uuid| {
             let candidate = candidate.get(&type_uuid).copied();
             let manifest = manifest.get(&type_uuid).copied();
@@ -1096,6 +1103,39 @@ fn schema_registry_mismatches(
             })
         })
         .collect()
+}
+
+fn validate_bootstrap_schema_registry(
+    candidate: &BTreeMap<TypeUuid, LogicalHash>,
+) -> Result<(), StoreError> {
+    let expected =
+        bootstrap_control_logical_registry_v1().map_err(StoreError::InvalidBootstrapSpec)?;
+    for (type_uuid, expected_hash) in expected {
+        let observed = candidate.get(&type_uuid).copied();
+        if observed != Some(expected_hash) {
+            return Err(StoreError::InvalidBootstrapRegistry {
+                type_uuid,
+                expected: expected_hash,
+                observed,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_bootstrap_manifest_rows(manifest: &SchemaLineageManifest) -> Result<(), StoreError> {
+    if let Some(type_uuid) = manifest
+        .types
+        .keys()
+        .copied()
+        .find(|type_uuid| is_bootstrap_control_type(*type_uuid))
+    {
+        return Err(invalid_manifest(
+            Some(type_uuid),
+            "bootstrap-control types are format authority and must be omitted from the lineage manifest",
+        ));
+    }
+    Ok(())
 }
 
 fn replace_schema_registry(
@@ -1533,6 +1573,75 @@ fn coverage_error(
 }
 
 impl Store {
+    /// Persist the first poison discovered in an already-published module
+    /// epoch without minting a new input version. This is a narrow monotonic
+    /// runtime-lifecycle transition, guarded by the exact dylib identity.
+    pub fn poison_published_pipeline_epoch(
+        &mut self,
+        expected_dylib_hash: [u8; 32],
+        poison: &PipelinePoison,
+    ) -> Result<(), StoreError> {
+        poison
+            .validate()
+            .map_err(StoreError::InvalidPipelinePoison)?;
+        if poison.origin != crate::state::PipelinePoisonOrigin::PublishedRuntime {
+            return Err(StoreError::InvalidPipelinePoison(
+                crate::state::PipelinePoisonError::InvalidMatrix,
+            ));
+        }
+
+        let transaction = self.conn.transaction()?;
+        let row: Option<(Option<Vec<u8>>, Option<i64>)> = transaction
+            .query_row(
+                "SELECT dylib_hash, poison_code FROM pipeline_state WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (actual, already_unavailable) = match row {
+            Some((actual, poison_code)) => (
+                actual
+                    .map(|bytes| exact_blob32(bytes, "published pipeline dylib hash"))
+                    .transpose()?,
+                poison_code.is_some(),
+            ),
+            None => (None, false),
+        };
+        if actual != Some(expected_dylib_hash) || already_unavailable {
+            return Err(StoreError::StalePublishedPipeline {
+                expected: expected_dylib_hash,
+                actual,
+                already_unavailable,
+            });
+        }
+        let changed = transaction.execute(
+            "UPDATE pipeline_state SET
+                 poison_code = ?1,
+                 poison_origin = ?2,
+                 poison_cleanup = ?3,
+                 poison_identity = ?4,
+                 poison_message = ?5
+             WHERE id = 0 AND dylib_hash = ?6 AND poison_code IS NULL",
+            rusqlite::params![
+                poison.code as u16,
+                poison.origin as u16,
+                poison.cleanup as u16,
+                poison.identity.as_slice(),
+                poison.message,
+                expected_dylib_hash.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StalePublishedPipeline {
+                expected: expected_dylib_hash,
+                actual,
+                already_unavailable: true,
+            });
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// The published pipeline state, or `None` before any publication.
     pub fn pipeline_state(&self) -> Result<Option<PipelineState>, StoreError> {
         type StateRow = (

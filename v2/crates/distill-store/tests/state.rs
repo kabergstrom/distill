@@ -3,10 +3,9 @@
 //! `PipelineState` valid/invalid operation classification, and the
 //! load-policy digest.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_core::attestation::CompiledAttestationDigest;
+use distill_core::attestation::{bootstrap_control_logical_registry_v1, CompiledAttestationDigest};
 use distill_core::id::TypeUuid;
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
@@ -22,7 +21,7 @@ fn epoch() -> Arc<PipelineEpoch> {
         load_policy_digest: [9u8; 32],
         compiled_types: CompiledAttestationDigest([10u8; 32]),
         target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-        schema_registry: BTreeMap::new(),
+        schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
         registrations: vec![Registration {
             kind: RegistrationKind::Processor,
             id: "tex-compress".to_owned(),
