@@ -1,4 +1,6 @@
 use distill_core::id::ContentHash;
+#![cfg(not(windows))]
+
 use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
 use distill_store::{Store, StoreConfig, StoreError};
 

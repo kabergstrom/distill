@@ -5,6 +5,7 @@
 //! sweep (§18's `displaced_retention_days`).
 
 use distill_core::id::ContentHash;
+use distill_store::journal::RenameAsideState;
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
@@ -51,6 +52,7 @@ fn intents_persist_with_their_full_shape() {
     assert_eq!(intent.pre_image_hash, Some(hash(b"pre-image bytes")));
     assert_eq!(intent.proposed_hash, hash(b"proposed bytes"));
     assert!(intent.quarantine_paths.is_empty());
+    assert_eq!(intent.rename_aside_state, RenameAsideState::Prepared);
     assert!(!intent.retired);
 }
 

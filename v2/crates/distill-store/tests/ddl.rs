@@ -388,6 +388,7 @@ fn write_intent_journal_shape() {
             "conflict_path",
             "pre_image_hash",
             "proposed_hash",
+            "rename_aside_state",
             "retired"
         ]
     );

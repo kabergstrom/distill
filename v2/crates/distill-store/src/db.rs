@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -233,6 +233,8 @@ CREATE TABLE write_intents (
     conflict_path   TEXT NOT NULL,
     pre_image_hash  BLOB,
     proposed_hash   BLOB NOT NULL,
+    rename_aside_state INTEGER NOT NULL DEFAULT 0
+        CHECK (rename_aside_state IN (0, 1, 2, 3, 4, 5, 6, 7)),
     retired         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE displaced (
@@ -539,32 +541,4 @@ fn meta_get_u64_or_init(conn: &Connection, key: &str) -> Result<u64, StoreError>
             Ok(0)
         }
     }
-}
-
-pub(crate) fn meta_get_text(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
-    Ok(conn
-        .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| {
-            r.get(0)
-        })
-        .optional()?)
-}
-
-pub(crate) fn meta_set_text(
-    conn: &Connection,
-    key: &str,
-    value: Option<&str>,
-) -> Result<(), StoreError> {
-    match value {
-        Some(v) => {
-            conn.execute(
-                "INSERT INTO store_meta(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![key, v],
-            )?;
-        }
-        None => {
-            conn.execute("DELETE FROM store_meta WHERE key = ?1", [key])?;
-        }
-    }
-    Ok(())
 }

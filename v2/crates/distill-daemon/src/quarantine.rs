@@ -72,6 +72,24 @@ pub struct QuarantineDriver {
     roots: Vec<QuarantineRoot>,
 }
 
+/// Admission token for Windows authored-file publication. It can only be
+/// constructed after every recoverable unfinished rewrite has been resumed;
+/// publication code never receives a raw, unreconciled Windows rewrite API.
+#[cfg(windows)]
+pub struct WindowsPublicationDriver<'a> {
+    quarantine: &'a QuarantineDriver,
+    store: &'a mut Store,
+    recovered: Vec<(i64, WindowsRecoveryOutcome)>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsRecoveryOutcome {
+    Rewrite(distill_store::journal::RenameAsideOutcome),
+    Deletion(distill_store::journal::DeletionRecoveryOutcome),
+    Creation(distill_store::journal::CreationRecoveryOutcome),
+}
+
 impl QuarantineDriver {
     pub fn new(roots: impl IntoIterator<Item = QuarantineRoot>) -> Result<Self, QuarantineError> {
         let mut roots = roots.into_iter().collect::<Vec<_>>();
@@ -102,6 +120,7 @@ impl QuarantineDriver {
     /// Record a deletion intent, rename the inode to its intent-ID-derived
     /// quarantine name, verify the displaced bytes, then retire the intent.
     /// The store restores mismatched bytes and returns a typed conflict.
+    #[cfg(not(windows))]
     pub fn journaled_delete(
         &self,
         store: &mut Store,
@@ -123,6 +142,7 @@ impl QuarantineDriver {
     }
 
     /// Attach a rewrite/swap displacement to an already journaled intent.
+    #[cfg(not(windows))]
     pub fn quarantine_displaced(
         &self,
         store: &mut Store,
@@ -135,11 +155,142 @@ impl QuarantineDriver {
             .map_err(Into::into)
     }
 
+    /// Windows rewrite publication uses the store's journaled no-replace
+    /// state machine. This is the only daemon entry point for replacing an
+    /// existing authored file on Windows; callers must not use a replace-style
+    /// rename API.
+    /// Resume every unfinished Windows rewrite before admitting any new
+    /// publication. Durable states after `Prepared` recover from their
+    /// journaled physical paths; root mapping is consulted only for an intent
+    /// that has not yet performed its first filesystem mutation.
+    #[cfg(windows)]
+    fn startup_reconcile_windows(
+        &self,
+        store: &mut Store,
+    ) -> Result<Vec<(i64, WindowsRecoveryOutcome)>, QuarantineError> {
+        let intents = store.unretired_intents()?;
+        let mut outcomes = Vec::new();
+        for intent in intents {
+            let target = PathBuf::from(&intent.target_path);
+            if intent.pre_image_hash.is_none() {
+                let outcome = store.reconcile_windows_creation(intent.intent_id)?;
+                outcomes.push((intent.intent_id, WindowsRecoveryOutcome::Creation(outcome)));
+                continue;
+            }
+            let quarantine = if intent.rename_aside_state
+                == distill_store::journal::RenameAsideState::Prepared
+            {
+                self.quarantine_for(&target)?
+            } else {
+                intent
+                    .quarantine_paths
+                    .first()
+                    .and_then(|path| path.parent())
+                    .ok_or_else(|| {
+                        QuarantineError::Store(Box::new(StoreError::BadIntent {
+                            intent_id: intent.intent_id,
+                            detail: "post-Prepared Windows intent has no journaled aside path"
+                                .into(),
+                        }))
+                    })?
+            };
+            if intent.temp_path.is_empty() {
+                let outcome = store.reconcile_windows_deletion(intent.intent_id, quarantine)?;
+                outcomes.push((intent.intent_id, WindowsRecoveryOutcome::Deletion(outcome)));
+            } else {
+                let outcome = store.publish_windows_rename_aside(intent.intent_id, quarantine)?;
+                outcomes.push((intent.intent_id, WindowsRecoveryOutcome::Rewrite(outcome)));
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Reconcile unfinished Windows work and mint the sole daemon rewrite
+    /// publication capability. Failure leaves publication unadmitted.
+    #[cfg(windows)]
+    pub fn admit_windows_publication<'a>(
+        &'a self,
+        store: &'a mut Store,
+    ) -> Result<WindowsPublicationDriver<'a>, QuarantineError> {
+        let recovered = self.startup_reconcile_windows(store)?;
+        Ok(WindowsPublicationDriver {
+            quarantine: self,
+            store,
+            recovered,
+        })
+    }
+
     pub fn doctor_verify(&self, store: &Store) -> Result<Vec<RecoveredEdit>, QuarantineError> {
         store.verify_quarantine().map_err(Into::into)
     }
 
     pub fn doctor_clean(&self, store: &mut Store, now_secs: i64) -> Result<usize, QuarantineError> {
         store.sweep_displaced(now_secs).map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPublicationDriver<'_> {
+    pub fn recovered(&self) -> &[(i64, WindowsRecoveryOutcome)] {
+        &self.recovered
+    }
+
+    pub fn journaled_replace(
+        &mut self,
+        target: &Path,
+        proposed_temp: &Path,
+        expected_preimage: ContentHash,
+        proposed_hash: ContentHash,
+    ) -> Result<distill_store::journal::RenameAsideOutcome, QuarantineError> {
+        let quarantine = self.quarantine.quarantine_for(target)?;
+        let conflict = target.with_extension("distill-conflict");
+        let intent_id = self.store.record_intent(
+            &target.to_string_lossy(),
+            &proposed_temp.to_string_lossy(),
+            &conflict.to_string_lossy(),
+            Some(expected_preimage),
+            proposed_hash,
+        )?;
+        self.store
+            .publish_windows_rename_aside(intent_id, quarantine)
+            .map_err(Into::into)
+    }
+
+    pub fn journaled_delete(
+        &mut self,
+        target: &Path,
+        expected_preimage: ContentHash,
+    ) -> Result<distill_store::journal::DeletionRecoveryOutcome, QuarantineError> {
+        let quarantine = self.quarantine.quarantine_for(target)?;
+        let conflict = target.with_extension("distill-conflict");
+        let intent_id = self.store.record_intent(
+            &target.to_string_lossy(),
+            "",
+            &conflict.to_string_lossy(),
+            Some(expected_preimage),
+            ContentHash(*blake3::hash(b"").as_bytes()),
+        )?;
+        self.store
+            .reconcile_windows_deletion(intent_id, quarantine)
+            .map_err(Into::into)
+    }
+
+    pub fn journaled_create(
+        &mut self,
+        target: &Path,
+        proposed_temp: &Path,
+        proposed_hash: ContentHash,
+    ) -> Result<distill_store::journal::CreationRecoveryOutcome, QuarantineError> {
+        let conflict = target.with_extension("distill-conflict");
+        let intent_id = self.store.record_intent(
+            &target.to_string_lossy(),
+            &proposed_temp.to_string_lossy(),
+            &conflict.to_string_lossy(),
+            None,
+            proposed_hash,
+        )?;
+        self.store
+            .reconcile_windows_creation(intent_id)
+            .map_err(Into::into)
     }
 }
