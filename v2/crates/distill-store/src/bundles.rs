@@ -81,6 +81,7 @@ pub struct AssetRecord {
     pub local_id: String,
     pub type_uuid: TypeUuid,
     pub logical_hash: LogicalHash,
+    pub authoring_only: bool,
     pub tags: Vec<String>,
 }
 
@@ -110,6 +111,7 @@ pub struct SkeletonEntry {
     pub asset: AssetUuid,
     pub local_id: String,
     pub type_uuid: TypeUuid,
+    pub authoring_only: bool,
     pub tags: Vec<String>,
 }
 
@@ -121,6 +123,7 @@ pub struct EntryMeta {
     pub local_id: String,
     pub type_uuid: TypeUuid,
     pub logical_hash: LogicalHash,
+    pub authoring_only: bool,
     pub tags: Vec<String>,
 }
 
@@ -221,17 +224,20 @@ impl InputTxn<'_> {
     /// Publish (or republish) an asset row; tags replace wholesale.
     pub fn upsert_asset(&mut self, rec: &AssetRecord) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO assets(asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO assets(
+                 asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(asset_uuid) DO UPDATE SET
                bundle_uuid = excluded.bundle_uuid, local_id = excluded.local_id,
-               type_uuid = excluded.type_uuid, logical_hash = excluded.logical_hash",
+               type_uuid = excluded.type_uuid, logical_hash = excluded.logical_hash,
+               authoring_only = excluded.authoring_only",
             rusqlite::params![
                 rec.asset.0.as_slice(),
                 rec.bundle.0.as_slice(),
                 rec.local_id,
                 rec.type_uuid.0.as_slice(),
                 rec.logical_hash.0.as_slice(),
+                i64::from(rec.authoring_only),
             ],
         )?;
         self.txn.execute(
@@ -254,6 +260,17 @@ impl InputTxn<'_> {
         root: RootId,
         asset: AssetUuid,
     ) -> Result<(), StoreError> {
+        let role: Option<i64> = self
+            .txn
+            .query_row(
+                "SELECT authoring_only FROM assets WHERE asset_uuid = ?1",
+                [asset.0.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if role == Some(1) {
+            return Err(StoreError::RoleIneligible { asset });
+        }
         self.txn.execute(
             "INSERT INTO path_index(path, root_id, asset_uuid) VALUES (?1, ?2, ?3)
              ON CONFLICT(path, root_id) DO UPDATE SET asset_uuid = excluded.asset_uuid",
@@ -343,13 +360,15 @@ impl InputTxn<'_> {
             // the version-global poison for those, and the constraint
             // failure surfaces rather than silently reassigning the row.
             self.txn.execute(
-                "INSERT INTO assets(asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash)
-                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                "INSERT INTO assets(
+                     asset_uuid, bundle_uuid, local_id, type_uuid, logical_hash, authoring_only
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
                 rusqlite::params![
                     entry.asset.0.as_slice(),
                     skeleton.bundle.0.as_slice(),
                     entry.local_id,
                     entry.type_uuid.0.as_slice(),
+                    i64::from(entry.authoring_only),
                 ],
             )?;
             for tag in &entry.tags {
@@ -457,7 +476,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT bundle_uuid, local_id, type_uuid, logical_hash FROM assets
+                "SELECT bundle_uuid, local_id, type_uuid, logical_hash, authoring_only FROM assets
                  WHERE asset_uuid = ?1",
                 [asset.0.as_slice()],
                 |r| {
@@ -469,11 +488,12 @@ impl Store {
                         // bundle is poisoned — the poison gate below
                         // fires before this is ever consumed.
                         r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
             .optional()?;
-        let Some((bundle_bytes, local_id, type_bytes, hash_bytes)) = row else {
+        let Some((bundle_bytes, local_id, type_bytes, hash_bytes, authoring_only)) = row else {
             return Ok(None);
         };
         if let Some(error) = self.bundle_poison(&bundle_bytes)? {
@@ -507,8 +527,19 @@ impl Store {
             local_id,
             type_uuid: TypeUuid(blob16(type_bytes)),
             logical_hash: LogicalHash(blob32(hash_bytes)),
+            authoring_only,
             tags,
         }))
+    }
+
+    /// Runtime direct-UUID lookup. Authoring/control rows remain visible to
+    /// `entry()` for tooling metadata, but can never enter a runtime closure.
+    pub fn runtime_entry(&self, asset: AssetUuid) -> Result<Option<EntryMeta>, StoreError> {
+        let entry = self.entry(asset)?;
+        if entry.as_ref().is_some_and(|entry| entry.authoring_only) {
+            return Err(StoreError::RoleIneligible { asset });
+        }
+        Ok(entry)
     }
 
     /// §13 `MetadataSnapshot::resolve_path` semantics: `Ok(None)` is a
@@ -548,21 +579,26 @@ impl Store {
                 let asset = AssetUuid(blob16(rows.into_iter().next().unwrap().1));
                 // A resolution reaching a poisoned bundle is the stable
                 // Failed, not a silent success (§13).
-                let owner: Option<(Vec<u8>, Option<String>)> = self
+                let owner: Option<(Vec<u8>, Option<String>, bool)> = self
                     .conn
                     .query_row(
-                        "SELECT b.bundle_uuid, b.poison FROM assets a
+                        "SELECT b.bundle_uuid, b.poison, a.authoring_only FROM assets a
                          JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
                          WHERE a.asset_uuid = ?1",
                         [asset.0.as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
                     )
                     .optional()?;
-                if let Some((bundle_bytes, Some(error))) = owner {
-                    return Err(StoreError::BundlePoisoned {
-                        bundle: BundleUuid(blob16(bundle_bytes)),
-                        error,
-                    });
+                if let Some((bundle_bytes, poison, authoring_only)) = owner {
+                    if let Some(error) = poison {
+                        return Err(StoreError::BundlePoisoned {
+                            bundle: BundleUuid(blob16(bundle_bytes)),
+                            error,
+                        });
+                    }
+                    if authoring_only {
+                        return Err(StoreError::RoleIneligible { asset });
+                    }
                 }
                 Ok(Some(asset))
             }
@@ -585,10 +621,36 @@ impl Store {
             "SELECT a.asset_uuid, b.bundle_uuid, b.poison FROM asset_tags t
              JOIN assets a ON a.asset_uuid = t.asset_uuid
              JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-             WHERE t.tag = ?1 ORDER BY a.asset_uuid",
+             WHERE t.tag = ?1 AND a.authoring_only = 0 ORDER BY a.asset_uuid",
         )?;
         let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>)> = stmt
             .query_map([tag], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (asset_bytes, bundle_bytes, poison) in rows {
+            if let Some(error) = poison {
+                return Err(StoreError::BundlePoisoned {
+                    bundle: BundleUuid(blob16(bundle_bytes)),
+                    error,
+                });
+            }
+            out.push(AssetUuid(blob16(asset_bytes)));
+        }
+        Ok(out)
+    }
+
+    /// Explicit tooling-only tag lookup. This surface cannot be used as a
+    /// processor-input, runtime-reference, or pack-root selector.
+    pub fn authoring_assets_by_tag(&self, tag: &str) -> Result<Vec<AssetUuid>, StoreError> {
+        self.check_version_poison()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT a.asset_uuid, b.bundle_uuid, b.poison FROM asset_tags t
+             JOIN assets a ON a.asset_uuid = t.asset_uuid
+             JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
+             WHERE t.tag = ?1 AND a.authoring_only = 1 ORDER BY a.asset_uuid",
+        )?;
+        let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>)> = stmt
+            .query_map([tag], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?;
         let mut out = Vec::with_capacity(rows.len());
         for (asset_bytes, bundle_bytes, poison) in rows {

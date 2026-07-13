@@ -97,6 +97,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 local_id: "e".into(),
                 type_uuid: TypeUuid([3u8; 16]),
                 logical_hash: LogicalHash([4u8; 32]),
+                authoring_only: false,
                 tags: vec!["t".into()],
             })?;
             txn.project_lineage_manifest(&SchemaLineageManifest {

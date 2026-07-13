@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -75,6 +75,7 @@ CREATE TABLE assets (
     bundle_uuid  BLOB NOT NULL,
     local_id     TEXT NOT NULL,
     type_uuid    BLOB NOT NULL,
+    authoring_only INTEGER NOT NULL CHECK (authoring_only IN (0, 1)),
     -- NULL only for a poisoned bundle's skeleton rows (§7, §13): the
     -- schema closure may be exactly what failed, and no read path
     -- serves a skeleton row's metadata while the poison stands.

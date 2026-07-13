@@ -136,8 +136,9 @@ fn bundles_carry_the_physical_key_poison_and_directory_origin() {
 
 #[test]
 fn assets_row_shape() {
-    // §13: asset uuid → bundle uuid, local_id, type_uuid, logical hash,
-    // search tags (tags normalized into asset_tags).
+    // §13: asset uuid → bundle uuid, local_id, type_uuid, explicit
+    // authoring/runtime role, logical hash, and search tags (tags
+    // normalized into asset_tags).
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
@@ -147,6 +148,7 @@ fn assets_row_shape() {
             "bundle_uuid",
             "local_id",
             "type_uuid",
+            "authoring_only",
             "logical_hash"
         ]
     );

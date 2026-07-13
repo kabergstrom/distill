@@ -31,6 +31,9 @@ pub enum StoreError {
         bundle: distill_core::id::BundleUuid,
         error: String,
     },
+    /// A runtime/query/pack surface attempted to select an authoring-only
+    /// control entry. Tooling metadata inspection uses a separate API.
+    RoleIneligible { asset: distill_core::id::AssetUuid },
     /// General manifest projection refused a cursor-only move to an existing
     /// accepted epoch. It is a rollback (§11, §13), so it must use the
     /// explicit reverse-coverage validation path instead.
@@ -135,6 +138,10 @@ impl fmt::Display for StoreError {
             StoreError::BundlePoisoned { bundle, error } => {
                 write!(f, "bundle {bundle} is poisoned: {error}")
             }
+            StoreError::RoleIneligible { asset } => write!(
+                f,
+                "asset {asset} is authoring-only and ineligible for runtime selection"
+            ),
             StoreError::LineageRollback {
                 type_uuid,
                 candidate,

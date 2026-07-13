@@ -35,6 +35,7 @@ fn asset_record(asset_n: u8, bundle_n: u8, tags: &[&str]) -> AssetRecord {
         local_id: format!("entry-{asset_n}"),
         type_uuid: TypeUuid([9u8; 16]),
         logical_hash: LogicalHash([8u8; 32]),
+        authoring_only: false,
         tags: tags.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -185,6 +186,41 @@ fn upsert_asset_replaces_tags_wholesale() {
 }
 
 #[test]
+fn authoring_only_entries_are_visible_to_tooling_but_ineligible_at_runtime() {
+    let (_d, mut store) = store();
+    let root = seed(&mut store);
+    let mut control = asset_record(11, 1, &["control"]);
+    control.authoring_only = true;
+    store
+        .input_transaction(|txn| txn.upsert_asset(&control))
+        .unwrap();
+
+    let metadata = store.entry(control.asset).unwrap().unwrap();
+    assert!(metadata.authoring_only);
+    assert!(matches!(
+        store.runtime_entry(control.asset).unwrap_err(),
+        StoreError::RoleIneligible { asset } if asset == control.asset
+    ));
+    assert!(store.assets_by_tag("control").unwrap().is_empty());
+    assert_eq!(
+        store.authoring_assets_by_tag("control").unwrap(),
+        [control.asset]
+    );
+
+    let err = store
+        .input_transaction(|txn| txn.set_path_entry("tex/control.bundle", root, control.asset))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::RoleIneligible { asset } if asset == control.asset
+    ));
+    assert_eq!(store.resolve_path("tex/control.bundle").unwrap(), None);
+
+    let runtime = store.runtime_entry(AssetUuid([10u8; 16])).unwrap().unwrap();
+    assert!(!runtime.authoring_only);
+}
+
+#[test]
 fn remove_bundle_cascades_to_assets_and_tags() {
     let (_d, mut store) = store();
     seed(&mut store);
@@ -317,6 +353,7 @@ fn skeleton_entry(asset_n: u8, tags: &[&str]) -> SkeletonEntry {
         asset: AssetUuid([asset_n; 16]),
         local_id: format!("entry-{asset_n}"),
         type_uuid: TypeUuid([9u8; 16]),
+        authoring_only: false,
         tags: tags.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -432,6 +469,31 @@ fn bundle_scoped_poison_needs_no_prior_row() {
     ));
     // The unrelated seeded bundle still answers.
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
+}
+
+#[test]
+fn tooling_authoring_query_propagates_matching_bundle_poison() {
+    let (_d, mut store) = store();
+    let root = seed(&mut store);
+    let mut control = skeleton_entry(78, &["control"]);
+    control.authoring_only = true;
+    let malformed = NamespaceSkeleton {
+        bundle: BundleUuid([77u8; 16]),
+        root,
+        path: "tex/77.bundle".to_owned(),
+        format_version: 1,
+        content_hash: ContentHash([0x77; 32]),
+        entries: vec![control],
+    };
+    store
+        .input_transaction(|txn| txn.poison_bundle(&malformed, "truncated control entry"))
+        .unwrap();
+
+    assert!(matches!(
+        store.authoring_assets_by_tag("control").unwrap_err(),
+        StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([77u8; 16])
+    ));
+    assert!(store.assets_by_tag("control").unwrap().is_empty());
 }
 
 #[test]
