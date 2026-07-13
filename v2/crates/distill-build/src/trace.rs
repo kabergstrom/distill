@@ -19,10 +19,23 @@ pub enum ToolErrorClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
 pub enum LocalFailureClass {
-    Validator,
-    MigrationPlan,
-    Processor,
+    Validator = 1,
+    MigrationPlan = 2,
+    Processor = 3,
+    MigrationFunction = 4,
+    OutputBinding = 5,
+    Importer = 6,
+    ImportIntake = 7,
+    ArtifactEncoding = 8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum EntryRole {
+    Runtime = 0,
+    AuthoringOnly = 1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,6 +78,10 @@ pub enum StableFailureFingerprint {
     MissingRef {
         query: Box<AssetQuery>,
         expected_terminal: TypeUuid,
+    },
+    RoleIneligible {
+        asset: AssetUuid,
+        observed_role: EntryRole,
     },
     Descendant {
         asset: AssetUuid,
@@ -136,6 +153,10 @@ pub enum TraceOp {
         expected_terminal: TypeUuid,
         observed: Observed<Option<TypeUuid>>,
     },
+    RoleCheck {
+        asset: AssetUuid,
+        observed: Observed<Option<EntryRole>>,
+    },
 }
 
 impl TraceOp {
@@ -147,6 +168,7 @@ impl TraceOp {
             Self::Tool { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::Capability { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::RefCheck { observed, .. } => matches!(observed, Observed::Err(_)),
+            Self::RoleCheck { observed, .. } => matches!(observed, Observed::Err(_)),
         }
     }
 }
@@ -158,6 +180,7 @@ pub trait TraceSource {
     fn tool(&self, id: &str) -> Observed<[u8; 32]>;
     fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]>;
     fn ref_check(&self, asset: AssetUuid, expected: TypeUuid) -> Observed<Option<TypeUuid>>;
+    fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>>;
 }
 
 pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
@@ -172,6 +195,7 @@ pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
             expected_terminal,
             observed,
         } => &source.ref_check(*asset, *expected_terminal) == observed,
+        TraceOp::RoleCheck { asset, observed } => &source.role_check(*asset) == observed,
     })
 }
 
@@ -260,6 +284,11 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
             e.raw(&expected_terminal.0);
             observed(e, o, |e, ty| e.option(*ty, |e, ty| e.raw(&ty.0)));
         }
+        TraceOp::RoleCheck { asset, observed: o } => {
+            e.enum_variant(6);
+            e.raw(&asset.0);
+            observed(e, o, |e, role| e.option(*role, |e, role| e.u8(*role as u8)));
+        }
     }
 }
 
@@ -322,6 +351,14 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
             encode_query(e, query);
             e.raw(&expected_terminal.0);
         }
+        StableFailureFingerprint::RoleIneligible {
+            asset,
+            observed_role,
+        } => {
+            e.enum_variant(8);
+            e.raw(&asset.0);
+            e.u8(*observed_role as u8);
+        }
         StableFailureFingerprint::Descendant { asset, fingerprint } => {
             e.enum_variant(3);
             e.raw(&asset.0);
@@ -354,7 +391,7 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
         }
         StableFailureFingerprint::Local { class, detail } => {
             e.enum_variant(7);
-            e.u8(*class as u8);
+            e.u16(*class as u16);
             e.raw(detail);
         }
     }

@@ -23,6 +23,9 @@ impl TraceSource for Source {
     fn ref_check(&self, _: AssetUuid, _: TypeUuid) -> Observed<Option<TypeUuid>> {
         Observed::Ok(None)
     }
+    fn role_check(&self, _: AssetUuid) -> Observed<Option<EntryRole>> {
+        Observed::Ok(None)
+    }
 }
 
 #[test]

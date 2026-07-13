@@ -8,6 +8,7 @@ use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 struct Snapshot {
     reads: BTreeMap<AssetUuid, Observed<ContentHash>>,
     resolves: BTreeMap<String, Observed<Option<AssetUuid>>>,
+    roles: BTreeMap<AssetUuid, Observed<Option<EntryRole>>>,
 }
 
 impl TraceSource for Snapshot {
@@ -28,6 +29,12 @@ impl TraceSource for Snapshot {
     }
     fn ref_check(&self, _: AssetUuid, _: TypeUuid) -> Observed<Option<TypeUuid>> {
         Observed::Ok(None)
+    }
+    fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>> {
+        self.roles
+            .get(&asset)
+            .cloned()
+            .unwrap_or(Observed::Ok(None))
     }
 }
 
@@ -133,4 +140,48 @@ fn local_failure_details_are_dslf_domain_separated_typed_facts() {
         unreachable!()
     };
     assert_ne!(detail, *blake3::hash(b"field").as_bytes());
+}
+
+#[test]
+fn authoring_only_role_failures_are_distinct_from_missing_and_heal_on_role_change() {
+    let asset = AssetUuid([12; 16]);
+    let failure = StableFailureFingerprint::RoleIneligible {
+        asset,
+        observed_role: EntryRole::AuthoringOnly,
+    };
+    let trace = vec![TraceOp::RoleCheck {
+        asset,
+        observed: Observed::Err(failure.clone()),
+    }];
+    let mut snapshot = Snapshot::default();
+    snapshot.roles.insert(asset, Observed::Err(failure.clone()));
+    assert!(revalidate(&trace, &snapshot));
+
+    snapshot
+        .roles
+        .insert(asset, Observed::Ok(Some(EntryRole::Runtime)));
+    assert!(!revalidate(&trace, &snapshot));
+    assert_ne!(
+        trace_digest(&trace),
+        trace_digest(&[TraceOp::RoleCheck {
+            asset,
+            observed: Observed::Ok(None),
+        }]),
+        "role-ineligible is never encoded as an ordinary miss"
+    );
+}
+
+#[test]
+fn every_dslf_local_failure_class_has_a_stable_nonzero_code() {
+    let classes = [
+        LocalFailureClass::Validator,
+        LocalFailureClass::MigrationPlan,
+        LocalFailureClass::Processor,
+        LocalFailureClass::MigrationFunction,
+        LocalFailureClass::OutputBinding,
+        LocalFailureClass::Importer,
+        LocalFailureClass::ImportIntake,
+        LocalFailureClass::ArtifactEncoding,
+    ];
+    assert_eq!(classes.map(|class| class as u16), [1, 2, 3, 4, 5, 6, 7, 8]);
 }
