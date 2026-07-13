@@ -1176,6 +1176,15 @@ impl VersionPoison {
     pub fn select_canonical(
         poisons: impl IntoIterator<Item = Self>,
     ) -> Result<Option<Self>, VersionPoisonError> {
+        Ok(Self::canonical_set(poisons)?.into_iter().next())
+    }
+
+    /// Returns the complete doctor-diagnostic set in the same canonical
+    /// order used to select publication authority. Duplicate typed details
+    /// collapse even when their presentation messages differ.
+    pub fn canonical_set(
+        poisons: impl IntoIterator<Item = Self>,
+    ) -> Result<Vec<Self>, VersionPoisonError> {
         let mut keyed = poisons
             .into_iter()
             .map(|poison| {
@@ -1190,7 +1199,8 @@ impl VersionPoison {
                 .cmp(right_key)
                 .then_with(|| left.message.cmp(&right.message))
         });
-        Ok(keyed.into_iter().next().map(|(_, poison)| poison))
+        keyed.dedup_by(|(left_key, _), (right_key, _)| left_key == right_key);
+        Ok(keyed.into_iter().map(|(_, poison)| poison).collect())
     }
 }
 

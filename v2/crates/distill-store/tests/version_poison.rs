@@ -211,6 +211,19 @@ fn canonical_winner_is_independent_of_discovery_order() {
         .unwrap(),
         Some(lexicographically_first)
     );
+
+    let duplicate_a = VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: source("main", "same.bundle", 3),
+            failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
+        },
+        "z diagnostic",
+    )
+    .unwrap();
+    let duplicate_b = VersionPoison::new(duplicate_a.detail.clone(), "a diagnostic").unwrap();
+    let set = VersionPoison::canonical_set([duplicate_a, duplicate_b]).unwrap();
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].message, "a diagnostic");
 }
 
 #[test]

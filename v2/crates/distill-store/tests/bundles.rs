@@ -591,3 +591,31 @@ fn version_poison_is_global_and_uniform() {
     assert!(store.version_poison().unwrap().is_none());
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
 }
+
+#[test]
+fn scanner_poison_batch_persists_canonical_winner_and_returns_full_set() {
+    let (_d, mut store) = store();
+    let make = |path: &str, byte: u8| {
+        VersionPoison::new(
+            VersionPoisonV1::IncompleteSkeleton {
+                source: ReadableBundleSource {
+                    root_name: "main".into(),
+                    normalized_path: path.into(),
+                    file_hash: BundleFileHash([byte; 32]),
+                },
+                failure: SkeletonFailureCode::EnvelopeMalformed,
+            },
+            path,
+        )
+        .unwrap()
+    };
+    let first = make("a.bundle", 1);
+    let later = make("z.bundle", 2);
+    let (diagnostics, _) = store
+        .input_transaction(|txn| {
+            txn.set_version_poisons([later.clone(), first.clone(), later.clone()])
+        })
+        .unwrap();
+    assert_eq!(diagnostics, vec![first.clone(), later]);
+    assert_eq!(store.version_poison().unwrap(), Some(first));
+}

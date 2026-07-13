@@ -399,6 +399,19 @@ impl InputTxn<'_> {
             }
         }
     }
+
+    /// Scanner publication boundary for simultaneous version-global defects.
+    /// The full canonical set is returned for doctor diagnostics; only its
+    /// deterministic first row becomes namespace authority.
+    pub fn set_version_poisons(
+        &mut self,
+        poisons: impl IntoIterator<Item = VersionPoison>,
+    ) -> Result<Vec<VersionPoison>, StoreError> {
+        let canonical =
+            VersionPoison::canonical_set(poisons).map_err(StoreError::InvalidVersionPoison)?;
+        self.set_version_poison(canonical.first())?;
+        Ok(canonical)
+    }
 }
 
 impl Store {
