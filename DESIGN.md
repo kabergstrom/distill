@@ -51,8 +51,10 @@ This invariant governs the whole design:
    import-settings entries (with their recorded read-sets, §8), primary
    selection, the UUIDs and schema snapshots written into them, and the
    source-controlled `SchemaLineageManifest` (§6, §11). The lineage manifest
-   is updated only by an explicit schema-acceptance command and records every
-   accepted type epoch even if no ordinary bundle is rewritten.
+   authority contents are updated only by explicit schema-acceptance commands
+   and record every accepted type epoch even if no ordinary bundle is
+   rewritten; §6's narrow local repair command may create an absent manifest or
+   remove duplicate claimants, but cannot edit a unique valid authority.
    Human/tool-owned, version-controlled, sacred.
 2. **Code** — the asset-types crate, the pipeline module, registered
    processors/importers/migration functions, and source-walk output.
@@ -65,7 +67,8 @@ This invariant governs the whole design:
    and diagnosing stale data, but they are not authority for accepting a new
    epoch. If the manifest is absent after state loss, no observed bundle,
    registry head, or matching hash constitutes forward proof; the type
-   hard-stops until its accepted history is restored or explicitly accepted.
+   hard-stops until its accepted history is restored through the explicit
+   repair/acceptance controls.
    Authority and executable code meet only by exact equality over **active**
    authority plus the closed bundle-format bootstrap exception (§3): a
    `Ready(PipelineEpoch)` exists iff every non-bootstrap compiled registry
@@ -732,7 +735,9 @@ pub struct TypeUuid(pub [u8; 16]);    // #[asset(uuid = "…")]
 pub struct LogicalHash(pub [u8; 32]); // blake3 over the §5 grammar
 pub struct LayoutHash(pub [u8; 32]);  // blake3 over the §12 DSWL grammar
 pub struct ContentHash(pub [u8; 32]);        // blake3 of artifact bytes (§12)
-pub struct BundleFileHash(pub [u8; 32]);     // raw blake3 of canonical bundle bytes
+/// Raw blake3 of the exact observed bundle-file bytes, valid or malformed.
+/// This is byte identity only; canonical bundle validation is a separate gate.
+pub struct BundleFileHash(pub [u8; 32]);
 
 /// Implemented by #[asset]; never hand-written.
 pub trait AssetType: 'static {
@@ -1219,7 +1224,7 @@ pub enum DscpV1 { // tag is the ConfigurationPoisonCode value
 #[repr(u8)]
 pub enum ConfigurationPathKey {
     AssetRoot = 1, StatePath = 2, SchemaPath = 3,
-    PipelineDylib = 4, CodegenRsModPath = 5,
+    PipelineDylib = 4, CodegenRsModPath = 5, LineageManifest = 6,
 }
 #[repr(u8)]
 pub enum OwnedPathKind {
@@ -1232,6 +1237,9 @@ pub struct DirectoryAliasSide {
 }
 pub struct ConfigurationPoison {
     pub code: ConfigurationPoisonCode,
+    /// Exact same-code canonical DSCP v1 payload. This is the typed reason;
+    /// `message` is never allowed to substitute for it.
+    pub detail: DscpV1,
     pub reason_hash: [u8; 32],
     pub message: String, // presentation only; never hashed
 }
@@ -1261,6 +1269,11 @@ and carries exactly the one NFC-normalized colliding name. It is the required
 mapping for DSTS duplicate-name rejection and is never reported as
 `DuplicateRootName` or a parser catch-all.
 Presentation messages, backtraces, OS prose, and parser prose are excluded.
+`ConfigurationPoison` persistence stores the explicit DSCP version plus the
+complete canonical detail bytes, never only the code/digest. Decode requires
+the detail variant's tag to equal `code`, recomputes `reason_hash`, and rejects
+an unknown version/tag, a wrong code/detail pair, noncanonical detail, or a
+digest mismatch.
 An unknown version/code is a hard failure on persisted or RPC decode; a new
 variant requires a grammar version bump unless it consumes a previously
 reserved discriminant whose optional-field framing was already pinned. These
@@ -1300,8 +1313,9 @@ DSTA before comparing the epoch. A caller-supplied epoch is never trusted.
 The explicit exception class is **byte-identity digests**. These are raw
 `blake3` over exactly the bytes their name identifies, deliberately
 domainless because their meaning is byte equality rather than a semantic
-record: `ContentHash` over complete DSTL artifact bytes; tracked raw-file
-and canonical bundle-file hashes over the file bytes; staged pipeline-
+record: `ContentHash` over complete DSTL artifact bytes; tracked raw-file and
+`BundleFileHash` values over the exact observed file bytes, whether valid or
+malformed (canonical bundle validation is independent); staged pipeline-
 dylib and tool hashes over the executable bytes; CAS record
 `content_hash` values over payload bytes; and pack/archive per-file
 trailers and archive-reference file hashes over the preceding/full named
@@ -1875,9 +1889,12 @@ pub enum TypeAuthorityState {
 /// A unique, source-controlled, built-in authoring asset. It is parsed by
 /// bundle `format_version` bootstrap code and is itself never migrated through
 /// the user migration graph. Only the explicit schema-acceptance command may
-/// rewrite it; source-walk, module reload, import, migration, and ordinary
-/// bundle writes are readers. Every accepted epoch is recorded even when no
-/// data bundle happens to be written in that epoch.
+/// rewrite the unique valid manifest's authority contents. The narrow local
+/// repair command below may create an absent manifest or remove duplicate
+/// claimants, but cannot edit a unique valid manifest; source-walk, module
+/// reload, import, migration, and ordinary bundle writes are readers. Every
+/// accepted epoch is recorded even when no data bundle happens to be written
+/// in that epoch.
 pub struct SchemaLineageManifest {
     pub types: BTreeMap<TypeUuid, AcceptedTypeLineage>,
 }
@@ -1885,9 +1902,12 @@ pub struct SchemaLineageManifest {
 Exactly one `SchemaLineageManifest` entry MUST exist in the configured asset
 tree, with `authoring_only = true`; missing or duplicate manifests publish a
 typed configuration poison and no schema-dependent service starts. The
-explicit acceptance/rollback command rewrites it through §14's journaled
+explicit acceptance/rollback command for an existing unique manifest rewrites
+it through §14's journaled
 swap protocol. Its request carries the base manifest `BundleFileHash`, every
 affected type's base cursor, and the staged candidate epoch identity. The
+base hash is only the exact observed-byte CAS precondition; manifest decode and
+canonical validation are separate and mandatory before mutation. The
 decoder and coordinator both recompute that identity's DSTS from normalized
 candidate targets (§5); supplied target-set bytes are never trusted. The
 transaction refuses unless that base still matches **and** each digest it
@@ -1905,6 +1925,74 @@ validated independently before the manifest is decoded. The manifest's
 consulted to parse or validate those entries. All other compiled types MUST
 match its Active rows exactly; there is no role-, plugin-, or name-based
 exception.
+
+Missing/duplicate recovery is a separate, deliberately tiny control plane:
+
+```rust
+pub struct LineageManifestClaimant {
+    pub asset: AssetUuid,
+    pub root_name: RootName,
+    pub normalized_path: String,
+    /// Raw blake3 of the exact physical preimage bytes (§5), not a canonicality
+    /// assertion.
+    pub file_hash: BundleFileHash,
+}
+pub enum LineageRepairState {
+    Missing { configured_path: RootedPath },
+    Duplicate { claimants: Vec<LineageManifestClaimant> },
+}
+pub struct LineageRepairInspection {
+    pub instance: StoreInstanceId,
+    pub stamp: SnapshotStamp,
+    pub state: LineageRepairState,
+}
+```
+
+`Root.lineageRepair` (§17) is unbound and is usable only by the explicit local
+repair command while the **current** DSCP detail is exactly
+`MissingLineageManifest` or `DuplicateLineageManifest`. It is not
+`MetadataHub`, never consults `last_good`, and exposes no query, inspection of
+ordinary authored values, build, resolve, import, general write, acceptance,
+rollback, retirement, or reactivation capability. `inspect` returns the
+current StoreInstanceId and exact SnapshotStamp plus either `Missing` at the
+normalized `assets.lineage_manifest` rooted destination (§18), or every
+duplicate physical claimant strictly sorted and deduplicated by
+`(root_name, normalized_path, raw AssetUuid bytes, file_hash)` canonical bytes.
+
+`createMissing` accepts that complete `Missing` inspection as its
+absence-aware basis plus proposed bundle bytes. Inside one coordinator action
+it requires StoreInstanceId/stamp/configured path and missing DSCP to remain
+exact, descriptor-relatively rechecks that the destination is absent and that
+no manifest claimant has appeared, and validates the proposed bytes as one
+canonical bundle containing a built-in `SchemaLineageManifest` entry marked
+`authoring_only`; the manifest's canonical type map and every lineage record
+must validate, and bootstrap-control TypeUuids are forbidden. It journals an
+atomic **no-replace** creation, fsyncs the file and containing directory under
+§14's crash protocol; the absence/basis CAS is repeated immediately before the
+no-replace link, and the input version advances only after the resulting unique
+manifest rescans successfully. A destination appearance, state drift, or basis
+drift is typed stale/conflict;
+the command never overwrites.
+
+`resolveDuplicate` likewise accepts the complete `Duplicate` inspection and
+one explicit user-selected survivor whose entire claimant tuple must be an
+exact member. The coordinator reopens every named physical file, validates
+all exact `BundleFileHash` preimages and the survivor's canonical built-in,
+authoring-only, non-bootstrap manifest, and stales without mutation on any
+instance/stamp/state/claimant/byte drift. It then journals removal of every
+non-surviving manifest claimant: a file containing no retained entries is
+renamed no-replace into its per-filesystem quarantine, while a file sharing
+unrelated or surviving entries is atomically replaced by its canonical form
+with only non-surviving manifest entries removed and its exact preimage retained
+in quarantine. The multi-path journal and file/quarantine/directory fsyncs make
+restart recovery resume or roll back before publication; no scan order chooses
+a winner. Only after a rescan proves the selected AssetUuid at its selected
+root/path—under either its unchanged preimage hash or the journal-derived
+canonical replacement hash when co-located entries were removed—and no other
+manifest claimant does the coordinator publish the healing input version.
+Until either operation
+finishes durably, normal target `Root.connect` remains
+`ConfigurationPoisoned`; the repair surface never serves prior authority.
 
 Type removal and return are explicit authority transitions, never side effects
 of a candidate's set difference. Retirement requires the same stale manifest
@@ -2113,10 +2201,12 @@ pub enum VersionPoisonCode {
     SameRootNormalizedPathCollision = 3,
     IncompleteSkeleton = 4,
     UnreadableGlobalBundlePath = 5,
+    InvalidPhysicalPath = 6,
 }
 pub struct ReadableBundleSource {
     pub root_name: RootName,
     pub normalized_path: String,
+    /// Exact observed file bytes; readability/canonicality are separate facts.
     pub file_hash: BundleFileHash,
 }
 /// Exact claimant identity for an AssetUuid collision. Variant tags are the
@@ -2146,6 +2236,7 @@ pub enum PlatformPathBytes {
 }
 pub struct PhysicalPathClaim {
     pub raw_relative_path: PlatformPathBytes,
+    /// Exact observed file bytes, not proof that the bundle is canonical.
     pub file_hash: BundleFileHash,
 }
 #[repr(u16)]
@@ -2163,6 +2254,16 @@ pub enum GlobalBundleReadFailureCode {
     InvalidFileType = 2,
     SymlinkIdentityChanged = 3,
     IoDataLoss = 4,
+}
+#[repr(u16)]
+pub enum PhysicalPathFailureCode {
+    InvalidUnixUtf8 = 1,
+    UnpairedWindowsUtf16 = 2,
+    Absolute = 3,
+    EmptyComponent = 4,
+    DotComponent = 5,
+    ParentComponent = 6,
+    ForbiddenCharacter = 7, // slash/backslash/NUL as applicable
 }
 pub enum VersionPoisonV1 {
     DuplicateAssetUuid {
@@ -2186,6 +2287,13 @@ pub enum VersionPoisonV1 {
         root_name: RootName,
         normalized_path: String,
         failure: GlobalBundleReadFailureCode,
+    },
+    /// A physical pathname rejected before a normalized logical-path String
+    /// exists. The raw platform arm is complete and lossless.
+    InvalidPhysicalPath {
+        root_name: RootName,
+        raw_relative_path: PlatformPathBytes,
+        failure: PhysicalPathFailureCode,
     },
 }
 pub struct VersionPoison {
@@ -2214,7 +2322,17 @@ case fold is introduced into §10's case-sensitive logical path key. The same no
 logical path in two different roots is never DSVP: it remains the ordinary
 `Ambiguous(roots)` multimap state and only path-dependent operations fail.
 Root names, normalized paths, local ids, and output keys use §10 normalization;
-raw physical names use the lossless platform/path grammar above. Enum values
+raw physical names use the lossless platform/path grammar above. An
+`InvalidPhysicalPath` uses no normalized path: it hashes the exact raw platform
+arm followed by its fixed `PhysicalPathFailureCode`. The scanner publishes it
+for intake-invalid physical names, including invalid Unix UTF-8, unpaired
+Windows UTF-16, absolute names, empty/`.`/`..` components, and the applicable
+forbidden separator or NUL; healing compares that complete raw identity.
+`InvalidUnixUtf8` admits only the Unix arm and `UnpairedWindowsUtf16` only the
+Windows arm; the remaining reasons admit either platform arm only when the raw
+sequence exhibits the named defect. A wrong arm/reason or bytes that do not
+prove the reason reject as noncanonical on persistence and RPC decode.
+Enum values
 and claimant/path tags are the fixed values above. Equality and healing compare the complete canonical detail
 (the digest is only its compact key), so hash equality never authorizes a
 different payload. Unknown codes, wrong code/payload pairs, noncanonical
@@ -2231,6 +2349,16 @@ usable. A version poison is never inserted into the bundle-failure table,
 never represented as `StableFailureFingerprint::Poisoned { bundle }`, and
 never memoized in a build trace; healing is publication of a later input
 version whose global validation succeeds.
+
+One published header still carries exactly one `VersionPoison`, but selection
+is not scan-order-dependent. Before publication the scanner enumerates the
+complete candidate set of version-global defects, canonical-encodes each
+`(code:u16-LE, exact VersionPoisonV1 detail)`, sorts by `(code, detail bytes)`,
+deduplicates identical encodings, and publishes the first row. Presentation messages
+never participate. `doctor` may retain and display the complete sorted set as
+non-authoritative diagnostics, but persistence, snapshots, invalidations, RPC,
+equality, and healing use only the selected first value; no filesystem walk or
+thread completion order is a tiebreak.
 
 ## 8. Import Pipeline
 
@@ -3038,6 +3166,9 @@ immutable inputs, tools included), and a swap mid-epoch invalidates
 traces into rebuilds that run the new copy at the new version. Staged
 versions coexist; `DriftedInput::Tool` (§15) covers an old basis whose
 staged bytes have been evicted.
+If `id` is absent from that snapshot's ToolEpoch, `run_tool` records the
+terminal `TraceOp::Tool` miss and `MissingCapability { Tool(id) }` specified
+below; it does not attempt a launch and cannot use `ToolLaunch` as an alias.
 PATH lookups, symlink retargets, and tool-adjacent files beyond that are
 the determinism contract's territory. Hashing
 labeled operations rather than a sorted multiset of
@@ -3148,10 +3279,10 @@ pub enum StableFailureFingerprint {
     /// listing wakes as soon as it heals.
     RawFile { op: RawFileOp, subject: RawFileSubject,
               class: RawFileFailureClass },
-    /// A required pipeline capability was not registered
-    /// (TraceOp::Capability, below): the requested key. Revalidates
-    /// against the snapshot's epoch, so the record heals on the first
-    /// epoch that supplies the registration.
+    /// A required pipeline or ToolEpoch capability was not registered. A
+    /// pipeline miss terminates TraceOp::Capability; Tool(id) terminates
+    /// TraceOp::Tool. Revalidation heals on the first snapshot epoch that
+    /// supplies the registration.
     MissingCapability { key: CapabilityKey },
     /// A deterministic LOCAL failure that arose from no context
     /// operation (FailureCause::Local, below): fingerprinted by class
@@ -3161,13 +3292,15 @@ pub enum StableFailureFingerprint {
 pub enum ToolErrorClass { NotExecutable, MissingInterpreter, SpawnDenied }
 // LocalFailureClass and its exact DSLF payload grammar are declared in §5.
 
-/// What a capability lookup asked the pipeline epoch for — the
-/// identity a recorded miss carries (TraceOp::Capability, §8, §11).
+/// What a capability lookup asked the pipeline or ToolEpoch for — the
+/// identity a recorded miss carries. Tags are fixed by the DSTR grammar.
+#[repr(u8)]
 pub enum CapabilityKey {
-    MigrationFn(String),
-    DefaultTable(TypeUuid),
-    Importer(String),
-    Processor { input: TypeUuid },
+    MigrationFn(String) = 1,
+    DefaultTable(TypeUuid) = 2,
+    Importer(String) = 3,
+    Processor { input: TypeUuid } = 4,
+    Tool(String) = 5,
 }
 
 /// A failure record's terminal cause (§13): a failure memoizes as a
@@ -3191,7 +3324,8 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
                                            // never a failure
     Query   { query: AssetQuery, observed: Observed<[u8; 32]> },  // domain-prefixed (§10)
     /// The tool key and the staged binary hash the snapshot's ToolEpoch
-    /// (§13) resolved it to — snapshot-pinned, never a live path.
+    /// (§13) resolved it to — snapshot-pinned, never a live path. A miss is
+    /// Observed::Err(MissingCapability { key: CapabilityKey::Tool(id) }).
     Tool    { id: String, observed: Observed<[u8; 32]> },
     /// Pipeline capability resolution (§8, §11): every lookup of a
     /// registered capability — MigrationFn key, DefaultTable, importer,
@@ -3233,6 +3367,17 @@ remain in observation order (they are a sequence, not a set), with `u8` tags
 field order declared above by the §5 canonical record codec. `Observed` uses
 `Ok=1` and `Err=2`, followed by its declared payload. Repeated operations are
 retained because multiplicity and order are part of the witnessed attempt.
+
+`CapabilityKey` has its own fixed `u8` tags:
+`MigrationFn=1`, `DefaultTable=2`, `Importer=3`, `Processor=4`, and `Tool=5`,
+followed by the declared NFC string or raw TypeUuid fields. A ToolEpoch lookup
+miss records `TraceOp::Tool { id, observed:
+Err(MissingCapability { key: Tool(id) }) }` as the terminal operation and sets
+`FailureCause::Op`; revalidation against a later snapshot heals when `id`
+resolves to a staged executable hash. `ToolLaunch` is reserved for a lookup hit
+whose staged executable then fails to launch as `NotExecutable`,
+`MissingInterpreter`, or `SpawnDenied`; it never represents absence from the
+ToolEpoch.
 
 The control subgrammar is fixed rather than inheriting declaration order.
 `ControlQuery` uses the `ControlQueryTag` `u8` above followed by
@@ -3617,6 +3762,10 @@ the lexical rule governs path *strings* only; what the daemon physically
 opens is additionally governed by §14's descriptor-relative opens and
 symlink identity revalidation, so a retargeted link cannot turn a
 lexically contained path into an out-of-root read.
+For a physical scan name rejected before this normalized String exists, the
+scanner publishes §7's `InvalidPhysicalPath` DSVP using the complete lossless
+Unix-byte or Windows-UTF-16 arm and exact failure code; it never repairs the
+name or invents a lossy `normalized_path`.
 Comparison is byte-exact after NFC normalization (case-sensitive; `doctor`
 flags trees differing only by case — a hazard on case-insensitive
 filesystems). Two physical directory entries in one root that normalize to
@@ -4715,10 +4864,15 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `artifacts` | static-input-key digest → candidate bucket: (trace digest → trace + output table), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
 | `pipeline_state` | importer/processor registrations and versions; the pipeline dylib content hash (a input-hash input wherever pipeline code runs); a never-reused daemon compiled-table generation plus complete rows/DSCA; and the full **load-policy table** — sorted `(type_uuid, build_only)` rows and `blake3("DSLP" ‖ version:u8 ‖ count:u32 ‖ rows)` (§9). Every compiled table publication advances that full-table generation even if a later table returns to byte equality; it exists for staging/build invalidation and the §17 reattest validate/install race CAS, not as a global Hub fence. Packs and RPC carry the same grammar over their boundary set `(requested runtime set UNION five bootstrap rows)`, §§16–17. Load-policy changes are input-versioned, re-run affected closure validation, emit component invalidations, and advance/fence only a Hub whose own accepted-set projection changed |
 | `tools` | **ToolEpoch** state (§9): tool key → (staged copy path, content hash) — input-versioned; registering or replacing a tool stages a content-addressed copy under daemon state and publishes the mapping at an input version, so snapshots pin their tool bytes and jobs execute exactly the staged copy as subprocesses through `run_tool`. No row can be resolved to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
-| `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; entry and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing manifest leaves this table unavailable and hard-stops schema-dependent work |
+| `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; entry and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing/duplicate manifest leaves this table unavailable and hard-stops schema-dependent work; only §6's unbound exact-basis local repair surface remains mutable until one valid authority publishes |
 
 Each published input-version header stores either no global poison or the exact
 canonical `VersionPoisonV1` code/detail plus recomputed DSVP identity (§7).
+If validation discovers more than one global defect, this is §7's first
+canonical `(code, detail-bytes)` row after complete-set enumeration, never the
+first filesystem/scanner result; the remaining sorted rows are doctor-only
+diagnostics and have no persistence, snapshot, equality, healing, or RPC
+authority.
 Startup rejects a noncanonical stored tuple rather than synthesizing a bundle
 row. Query/RPC projections decode that same record and never rebuild identity
 from presentation text.
@@ -5197,6 +5351,8 @@ pub enum PipelineState {
 
 pub enum ConfigurationState {
     Ready(Arc<ConfigurationEpoch>),
+    /// Persists code plus the complete versioned canonical DscpV1 detail and
+    /// recomputed reason_hash; message remains presentation-only.
     Poisoned { reason: ConfigurationPoison,
                last_good: Option<Arc<ConfigurationEpoch>> },
 }
@@ -5211,6 +5367,10 @@ reads, ContentHash fetch, and lease pinning — remain valid (a query that
 asks for pipeline-derived terminal type is not pure). Authoring operations
 all fail with `ConfigurationPoisoned(reason)`: they may depend on roots,
 output paths, or publication policy and never silently use `last_good`.
+The sole mutation exception is §6/§17's unbound `LineageRepair`, and only for
+current MissingLineageManifest or DuplicateLineageManifest DSCP: it can create
+the configured missing file or remove explicitly rejected duplicate claimants,
+but exposes no ordinary authoring operation and still never uses `last_good`.
 Build/resolve and every target/config-dependent RPC operation fail with
 that same stable typed result; snapshot/refresh/subscription and immutable
 ContentHash fetch remain available. The prior configuration serves only
@@ -5509,13 +5669,18 @@ v2 improvements over v1's tracker:
   and the deletion publishes, the quarantined inode retained per the
   window above; mismatch: the displaced bytes are restored to the
   original path and the operation fails as a conflict, exactly like a
-  rewrite conflict. **Creation** (a new bundle from import or an editor) has no
+  rewrite conflict. **Creation** (a new bundle from import, an editor, or §6's
+  Missing-lineage repair) has no
   target to exchange: it publishes by atomic no-replace linkage
   (`O_CREAT | O_EXCL` semantics, temp linked into place) — if the
   destination appeared externally in the meantime, both objects are
   preserved under conflict naming and the operation stops or retries,
   under the same invariant: the daemon only ever deletes bytes it
-  authored. **Crash recovery reconciles every unfinished intent at
+  authored. Duplicate-lineage repair uses one durable parent intent naming
+  every exact claimant preimage and child rewrite/quarantine intent; recovery
+  completes or restores all children before the parent may publish its unique-
+  survivor rescan, so an intermediate crash remains configuration-poisoned and
+  can never expose an implicit winner. **Crash recovery reconciles every unfinished intent at
   startup**, before any other publication runs: each path the intent
   names (target, temp, conflict, quarantine) is classified by hashing
   what sits
@@ -6035,10 +6200,12 @@ definition hash, complete sorted `CompiledTypeRow`s/`"DSCA"`, and load-policy
 rows/`"DSLP"` over the boundary set `(loader's requested runtime set UNION the
 exact five bootstrap rows)` — at connect
 or mount. A successful RPC connect returns the server-accepted policy, target,
-and attestation generations plus the daemon DSCA projection for exactly the
-accepted client runtime TypeUuid set union the five bootstrap rows in its
-typed success; RpcIO derives its first
-basis only from that record and never invents one. Daemon-only additions whose
+and attestation generations plus the daemon DSCA projection and exact
+server-recomputed load-policy rows/DSLP for the accepted client runtime
+TypeUuid set union the five bootstrap rows in its typed success. RpcIO
+canonically validates those returned rows/digest and derives its first basis
+only from that record, never from request values and never by invention.
+Daemon-only additions whose
 TypeUuids are outside that union do not change the projection and do not
 fence the Hub. `register_types` for a successor epoch invalidates that
 binding: the loader issues no new loads through the instance until it
@@ -6708,6 +6875,14 @@ terminal-type projection, target, or policy state. The bootstrap and every
 child capability bind the current StoreInstanceId and protocol epoch; drift is
 a typed metadata reconnect, and snapshot/CAS pins use ordinary typed leases.
 
+Lineage recovery does not widen that bootstrap. The separate
+`Root.lineageRepair` entry returns only §6's repair capability, only to the
+explicit local repair command, and only while the current configuration poison
+is MissingLineageManifest or DuplicateLineageManifest. It has its own typed
+inspection/CAS envelopes below, performs no target/pipeline/policy attestation,
+never uses `last_good`, and cannot be reached through or converted into a
+`MetadataHub`, `Hub`, snapshot, query, build, or general authoring capability.
+
 ```capnp
 interface Root {               # the bootstrap capability
   connect @0 (target :Text, targetDefHash :Data,
@@ -6717,9 +6892,10 @@ interface Root {               # the bootstrap capability
                                # ConnectSuccess carries the daemon's
                                # StoreInstanceId (§13, 16 bytes), the Hub,
                                # and the accepted policy/target/attestation
-                               # generations. RpcIO constructs no basis until
-                               # this typed success arrives and never invents
-                               # a generation.
+                               # generations plus the server-recomputed
+                               # union-bootstrap load-policy rows/digest.
+                               # RpcIO constructs no basis until this typed
+                               # success arrives and never reuses sent values.
                                # Every version field on this connection is
                                # interpreted within that instance —
                                # versions from two instances never compare;
@@ -6763,6 +6939,10 @@ interface Root {               # the bootstrap capability
                                # succeed while configuration/pipeline poison
                                # or SchemaAcceptanceRequired is current, and
                                # exposes only the closed MetadataHub surface.
+  lineageRepair @2 (protocol :UInt32) -> (result :LineageRepairConnectResult);
+                               # Narrow local repair bootstrap, successful only
+                               # for current DSCP code 10 or 11. It exposes no
+                               # MetadataHub/Hub or ordinary authoring method.
 }
 
 struct ConnectSuccess {
@@ -6775,6 +6955,10 @@ struct ConnectSuccess {
                                      # rows projected to this Hub's accepted
                                      # client runtime TypeUuid set UNION the
                                      # exact five bootstrap rows
+  loadPolicy @6 :List(LoadPolicyEntry); # exact server-recomputed rows over
+                                     # that same accepted runtime set UNION
+                                     # the exact five bootstrap rows
+  policyDigest @7 :Data;             # exactly 32-byte recomputed DSLP
 }
 enum AttestationFailureCode {
   malformedTable @0; duplicateType @1; missingType @2;
@@ -7062,11 +7246,159 @@ struct AuthoringRoleFailure { observed @0 :AuthoringEntryRole; }
 # logicalSchema and blobs are branded inspection data; neither is a DSTL
 # artifact, ContentHash carrier, dependency token, or pack/root capability.
 
+enum ConfigurationPathKeyValue {
+  assetRoot @0; statePath @1; schemaPath @2; pipelineDylib @3;
+  codegenRsModPath @4; lineageManifest @5;
+}                              # Cap'n Proto ordinal + 1 is §5's exact u8 value
+enum ConfigurationOwnedPathKind {
+  assetRoot @0; daemonState @1; schemaArtifact @2; pipelineModule @3;
+  codegenOutput @4; quarantine @5;
+}                              # Cap'n Proto ordinal + 1 is §5's exact u8 value
+struct ConfigurationOwnedPathSide {
+  kind @0 :ConfigurationOwnedPathKind; path @1 :Text;
+}
+struct ConfigurationDirectoryAliasSide {
+  normalizedPath @0 :Text; device @1 :UInt64; inode @2 :UInt64;
+}
+struct ConfigurationFeature { package @0 :Text; feature @1 :Text; }
+struct ConfigurationCompilationIdentity {
+  targetTriple @0 :Text;
+  rustc @1 :Text;
+  sourceFingerprint @2 :Data;  # exactly 32 bytes
+  features @3 :List(ConfigurationFeature); # strict (package, feature) order
+  cfgs @4 :List(Text);         # strict canonical byte order
+  manifestLockHash @5 :Data;   # exactly 32 bytes
+  algorithmVersion @6 :UInt32;
+}
+struct DscpMalformedConfiguration { fileHash @0 :Data; } # exactly 32 bytes
+struct DscpNonLoopbackAddress { address @0 :Text; }
+struct DscpDuplicateRootName { normalizedName @0 :Text; }
+struct DscpInvalidPath {
+  key @0 :ConfigurationPathKeyValue; normalizedOrRawPath @1 :Text;
+}
+struct DscpOwnedPathOverlap {
+  first @0 :ConfigurationOwnedPathSide; second @1 :ConfigurationOwnedPathSide;
+}
+struct DscpEmptyTargetApis { target @0 :Text; }
+struct DscpInvalidParallelism { value @0 :UInt32; }
+struct DscpInvalidBatchReservation { parallelism @0 :UInt32; reservation @1 :UInt32; }
+struct DscpDirectoryAlias {
+  first @0 :ConfigurationDirectoryAliasSide;
+  second @1 :ConfigurationDirectoryAliasSide;
+}
+struct DscpDuplicateLineageManifest { entries @0 :List(Uuid); }
+struct DscpUnsupportedTargetIdentity {
+  target @0 :Text;
+  expected @1 :ConfigurationCompilationIdentity;
+  observed @2 :ConfigurationCompilationIdentity;
+}
+struct DscpDuplicateTargetName { normalizedName @0 :Text; }
+struct ConfigurationPoisonDetail { union {
+  malformedConfiguration @0 :DscpMalformedConfiguration;
+  nonLoopbackAddress @1 :DscpNonLoopbackAddress;
+  duplicateRootName @2 :DscpDuplicateRootName;
+  invalidPath @3 :DscpInvalidPath;
+  ownedPathOverlap @4 :DscpOwnedPathOverlap;
+  emptyTargetApis @5 :DscpEmptyTargetApis;
+  invalidParallelism @6 :DscpInvalidParallelism;
+  invalidBatchReservation @7 :DscpInvalidBatchReservation;
+  directoryAlias @8 :DscpDirectoryAlias;
+  missingLineageManifest @9 :Void;
+  duplicateLineageManifest @10 :DscpDuplicateLineageManifest;
+  unsupportedTargetIdentity @11 :DscpUnsupportedTargetIdentity;
+  duplicateTargetName @12 :DscpDuplicateTargetName;
+} }                            # union ordinal + 1 is ConfigurationPoisonCode;
+                               # no arm admits another code
 struct ConfigurationPoison {
   code @0 :UInt16;             # stable ConfigurationPoisonCode discriminant
-  reasonHash @1 :Data;         # blake3("DSCP" || v1 canonical reason facts), §5
-  message @2 :Text;            # human diagnostic, not the type carrier
+  reasonHash @1 :Data;         # exactly 32 bytes; recomputed DSCP v1, §5
+  message @2 :Text;            # human diagnostic, never the type carrier
+  detail @3 :ConfigurationPoisonDetail;
+  detailVersion @4 :UInt8;     # exactly 1; every other value rejects
+}                              # decode validates DSCP v1 framing, normalization,
+                               # ordering, widths, same-code arm, and digest;
+                               # unknown/noncanonical/mismatched values reject
+
+struct LineageManifestClaimant {
+  asset @0 :Uuid;
+  rootName @1 :Text;
+  normalizedPath @2 :Text;
+  fileHash @3 :Data;           # exactly 32-byte raw BundleFileHash
 }
+struct MissingLineageRepairState {
+  configuredRoot @0 :Text;
+  configuredPath @1 :Text;
+}
+struct DuplicateLineageRepairState {
+  claimants @0 :List(LineageManifestClaimant);
+}                              # at least two, strict canonical order by
+                               # (root,path,raw asset UUID,file hash)
+struct LineageRepairState { union {
+  missing @0 :MissingLineageRepairState;
+  duplicate @1 :DuplicateLineageRepairState;
+} }
+struct LineageRepairInspection {
+  instance @0 :Data;           # exactly 16 bytes, equals stamp.instance
+  stamp @1 :SnapshotStampValue;
+  state @2 :LineageRepairState;
+}
+struct LineageRepairUnavailable { union {
+  configurationReady @0 :Void;
+  otherConfigurationPoison @1 :ConfigurationPoison;
+} }                            # success is possible only for same-code
+                               # Missing/Duplicate DSCP details
+struct LineageRepairConnectResult { union {
+  success @0 :LineageRepair;
+  unavailable @1 :LineageRepairUnavailable;
+  protocolFailure @2 :ProtocolFailure;
+  error @3 :RpcError;
+} }
+enum LineageRepairInvalidCode {
+  wrongBasisState @0;
+  nonCanonicalBundle @1;
+  missingManifestEntry @2;
+  notAuthoringOnly @3;
+  bootstrapTypePresent @4;
+  invalidLineage @5;
+  survivorNotClaimant @6;
+}
+struct LineageRepairInvalid {
+  code @0 :LineageRepairInvalidCode;
+  message @1 :Text;            # presentation only; code is the type carrier
+}
+enum LineageRepairStaleCode {
+  stampChanged @0; stateChanged @1; destinationAppeared @2;
+  claimantChanged @3; preimageChanged @4;
+}
+struct LineageRepairStale {
+  code @0 :LineageRepairStaleCode;
+  observedStamp @1 :SnapshotStampValue;
+}
+struct LineageRepairCommitted { stamp @0 :SnapshotStampValue; }
+struct LineageRepairInspectResult { union {
+  success @0 :LineageRepairInspection;
+  unavailable @1 :LineageRepairUnavailable;
+  reconnectRequired @2 :MetadataReconnectRequired;
+  error @3 :RpcError;
+} }
+struct LineageRepairMutationResult { union {
+  success @0 :LineageRepairCommitted;
+  staleBasis @1 :LineageRepairStale;
+  invalid @2 :LineageRepairInvalid;
+  unavailable @3 :LineageRepairUnavailable;
+  reconnectRequired @4 :MetadataReconnectRequired;
+  error @5 :RpcError;
+} }
+interface LineageRepair {
+  inspect @0 () -> (result :LineageRepairInspectResult);
+  createMissing @1 (basis :LineageRepairInspection,
+                    canonicalManifestBundle :Data)
+                -> (result :LineageRepairMutationResult);
+  resolveDuplicate @2 (basis :LineageRepairInspection,
+                       survivor :LineageManifestClaimant)
+                -> (result :LineageRepairMutationResult);
+}                              # methods bind Root's instance/protocol and
+                               # recheck current DSCP 10/11; no other capability
 
 enum PipelinePoisonCode {
   candidateOpen @0; candidateAttestation @1; candidateRegistration @2;
@@ -7094,7 +7426,7 @@ struct PipelinePoison {
 
 struct VersionPoisonSource {
   rootName @0 :Text; normalizedPath @1 :Text; fileHash @2 :Data;
-}
+}                                # fileHash is exactly 32-byte raw BundleFileHash
 struct AuthoredAssetClaimant {
   source @0 :VersionPoisonSource; bundle @1 :Uuid; localId @2 :Text;
 }
@@ -7120,13 +7452,24 @@ struct IncompleteSkeletonPoison { source @0 :VersionPoisonSource; failureCode @1
 struct UnreadableGlobalPathPoison {
   rootName @0 :Text; normalizedPath @1 :Text; failureCode @2 :UInt16;
 }
+enum PhysicalPathFailureCodeValue {
+  invalidUnixUtf8 @0; unpairedWindowsUtf16 @1; absolute @2;
+  emptyComponent @3; dotComponent @4; parentComponent @5;
+  forbiddenCharacter @6;
+}                                # Cap'n Proto ordinal + 1 is §7's u16 code 1..7
+struct InvalidPhysicalPathPoison {
+  rootName @0 :Text;
+  rawRelativePath @1 :PlatformPathBytes;
+  failure @2 :PhysicalPathFailureCodeValue;
+}
 struct VersionPoisonDetail { union {
   duplicateAssetUuid @0 :DuplicateAssetPoison;
   duplicateBundleUuid @1 :DuplicateBundlePoison;
   sameRootNormalizedPathCollision @2 :SameRootNormalizedPathPoison;
   incompleteSkeleton @3 :IncompleteSkeletonPoison;
   unreadableGlobalBundlePath @4 :UnreadableGlobalPathPoison;
-} }
+  invalidPhysicalPath @5 :InvalidPhysicalPathPoison;
+} }                              # union ordinal + 1 is VersionPoisonCode 1..6
 struct VersionPoison {
   code @0 :UInt16;              # exact VersionPoisonCode discriminant
   identity @1 :Data;            # exactly 32 bytes, recomputed DSVP
@@ -7389,11 +7732,20 @@ branch uniformly before decoding success.
 
 The target-bound bootstrap has its own equally typed `ConnectResult`: success
 is the only source of Hub, StoreInstanceId, and **initial**
-policy/target/attestation generations;
+policy/target/attestation generations, accepted daemon compiled projection,
+and server-recomputed accepted-set-union-bootstrap load-policy rows/digest;
 the other arms are typed attestation, configuration, protocol, and ordinary
 RPC failures. `ReconnectRequired` and lease failure are inapplicable before a
 Hub or lease exists. RpcIO constructs its initial `IoBasis::Rpc` only from
-`ConnectSuccess`, never from values it sent or locally guessed. Thereafter
+`ConnectSuccess`, never from values it sent or locally guessed. Before
+constructing that basis it validates the returned policy rows for strict
+TypeUuid order, uniqueness, exact accepted-runtime-set UNION five-bootstrap
+coverage, canonical row encoding, and equality of the recomputed DSLP with
+`policyDigest`; malformed rows, a wrong-width digest, or mismatch is a hard
+protocol failure and no Hub data is admitted. These fields have exactly the
+same `LoadPolicyEntry` grammar, server recomputation, boundary coverage, and
+DSLP verification semantics as `ReattestSuccess.loadPolicy/policyDigest`.
+Thereafter
 only `ReattestSuccess` may rotate the attestation field, daemon compiled
 projection, and accepted-set load-policy rows/digest/generation as one basis
 update; it is not a second source for the target generation. Separately,
@@ -7401,7 +7753,11 @@ update; it is not a second source for the target generation. Separately,
 its diagnostics rather than a bootstrap failure, and its capabilities have no
 target/compiler/policy carriers. Metadata envelopes use only typed
 store/protocol reconnect, lease, RPC, and (where namespace-facing)
-VersionPoison arms.
+VersionPoison arms. The third bootstrap, `Root.lineageRepair`, has the separate
+closed connect/inspect/mutation results above: it succeeds only under current
+missing/duplicate lineage DSCP, binds store/protocol, and returns only typed
+unavailable, stale-basis, validation, reconnect, and RPC outcomes around its
+two repair mutations.
 
 The declarations above exhaustively map every method to a typed success arm.
 A new ordinary target-bound method must declare its own result union with the
@@ -7491,6 +7847,10 @@ intact.
   fixpoints (§8), rebuild indexes. `migration new
   <type>` scaffolds a migration bundle with both endpoint schemas embedded
   (current from source-walk, prior from the archive) and a stub function key.
+  `lineage repair inspect|create-missing|resolve-duplicate` is the sole local
+  command family allowed to obtain `Root.lineageRepair`; it displays the exact
+  §6 basis, requires an explicit survivor for duplicates, and has no generic
+  authoring fallback.
 - **Watching** — subscribe to asset events:
 
 ```rust
@@ -7558,6 +7918,10 @@ displaced_retention_days = 7
 # one merged namespace for every read and query.
 roots = { main = "assets/", engine = "engine-assets/" }
 schema_path = "target/asset-schema.json"
+# Source-controlled destination used only when the explicit local lineage
+# repair command creates a missing manifest. Discovery still rejects any
+# second SchemaLineageManifest anywhere in the configured roots.
+lineage_manifest = { root = "main", path = "schema/schema-lineage.bundle" }
 
 [modules]
 # Rebuilt by the project's dev-process supervisor (as newgameplus already
@@ -7617,7 +7981,9 @@ unspecified restart behavior.** The daemon watches its own configuration
 file; an edit to the `[assets]` roots or `[targets]` definitions lands
 through the input-version mechanism (§13): the coordinator stages a
 **candidate configuration epoch**, validates it whole — root names
-normalized and unique, paths well-formed, `daemon.address` **loopback**
+normalized and unique, paths well-formed, the
+`assets.lineage_manifest` rooted destination naming an existing configured
+root, `daemon.address` **loopback**
 (a non-loopback bind is a typed error at staging: the RPC surface is
 unauthenticated by design, §17, and remote access is a named open item,
 §22), `state_path`, module artifact paths, and every daemon-owned
@@ -7670,7 +8036,10 @@ valid edit heals. At the poisoned version, snapshot creation/refresh and
 pure metadata/CAS reads remain valid; all authoring and target/config-
 dependent operations return the stable typed
 `ConfigurationPoisoned(reason)` carried by §17, never prior values under a
-new version (§13's exact classification).
+new version (§13's exact classification). The one closed exception is the
+unbound local `LineageRepair` surface while the reason is exactly missing or
+duplicate lineage authority; it performs only §6's absence/duplicate repair
+and cannot serve or mutate ordinary authored state.
 
 **Every configuration key has a declared change class.** Three classes,
 total over the surface — a future key must declare its class before it
@@ -7680,6 +8049,7 @@ ships; an unclassified key is a spec defect:
 |---|---|---|
 | `assets.roots` | input-versioned epoch | staged candidate epoch (above); root changes reconcile through the scanner (§14); existing snapshots keep their configuration |
 | `assets.schema_path` | input-versioned epoch | the schema artifact is watched at the new path; a swap lands as a schema input event (§3, §5) |
+| `assets.lineage_manifest` | input-versioned epoch | normalized rooted destination for Missing-manifest repair; staging requires a named configured root and valid §10 path, and changing it cannot move or select an existing manifest |
 | `[targets]` definitions | input-versioned epoch | joins the combined execution candidate (§3): the pipeline map re-validates against the new target set; bound Hubs receive `ReconnectRequired` (§17) |
 | `modules.pipeline_dylib` | input-versioned epoch | module epoch rotation (§3) through the staged-candidate mechanism |
 | tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a staged, content-addressed copy publishes at an input version |
@@ -9069,7 +9439,9 @@ ordinary §10 dependency kinds.
   same-root normalized-path collisions, incomplete skeletons, and stable
   unreadable-path classes, maps
   identically through snapshot/query/RPC, and never memoizes as a bundle
-  sentinel.)
+  sentinel. Refined in R29: code 6 losslessly carries a physical path that
+  cannot normalize, and simultaneous global defects select only after complete
+  canonical-set enumeration rather than scan order.)
 - **Import publication revalidates its read-set** (§8, §13, §14): a
   source event consumed between an importer's reads and its commit
   would never re-fire once the stale result installed its read-set — a
@@ -9088,7 +9460,9 @@ ordinary §10 dependency kinds.
   `TraceOp::Capability { key, observed }` in the §9 `Observed` grammar:
   Ok(dylib hash) on hit, `Err(MissingCapability)` carrying the
   requested `CapabilityKey` on miss — so the failure record invalidates
-  on the first epoch that supplies the registration.
+  on the first epoch that supplies the registration. (Refined in R29: tool is
+  fixed `CapabilityKey` tag 5; a ToolEpoch miss terminates `TraceOp::Tool`,
+  while `ToolLaunch` remains post-hit launch failure only.)
 - **Deletion is exchange-and-verify too** (§2, §14, §17): whole-bundle
   deletion was a bare unlink behind a base-version check — exactly the
   TOCTOU the replacement protocol closes for rewrites. Every deletion
@@ -9284,6 +9658,9 @@ ordinary §10 dependency kinds.
   pipeline state. Snapshots and pure metadata/CAS reads remain valid;
   authoring and target/config-dependent work return the stable typed RPC
   poison result, and prior configuration never serves under the new version.
+  (Refined in R29: the sole mutation exception is the unbound, no-last-good
+  local repair capability under missing/duplicate lineage DSCP, with no general
+  authoring surface.)
 - **RPC bases carry load-policy attestation** (§4, §9, §13, §15, §16,
   §17): `Root.connect` and `reattest` carry the pack-identical sorted
   policy rows plus `"DSLP"`; verified rows/digest/generation bind to
@@ -9369,7 +9746,10 @@ ordinary §10 dependency kinds.
   state loss, missing manifest authority is never forward proof. (Refined in
   R24: `Ready` additionally requires exact registry TypeUuid/current-digest
   equality, and a mismatch retains the named candidate as
-  `SchemaAcceptanceRequired`.)
+  `SchemaAcceptanceRequired`.) (Refined in R29: current missing/duplicate
+  authority alone enables a separate unbound local repair capability whose
+  exact-basis operations can create the configured absent file or remove
+  explicitly selected duplicates, never edit a unique valid manifest.)
 - **Lineage separates append-only history from the current cursor** (§6, §11,
   §13): a forward acceptance appends `(digest, forward_parent=old_current)`
   and advances; deliberate rollback moves only the cursor and requires
@@ -9608,7 +9988,9 @@ ordinary §10 dependency kinds.
   declare the same normalization rule. (Refined in R26: invalid-path keys and
   owned-path kinds are fixed numeric enums, and DSTR v1 pins control query/read
   subject tags, `ControlFailureCode` u16 encoding, entry ordering/deduplication,
-  and noncanonical-decode rejection.)
+  and noncanonical-decode rejection. Refined in R29: persisted and RPC poison
+  values carry the complete typed same-code `DscpV1` detail; decode recomputes
+  DSCP and rejects unknown, noncanonical, mismatched, or digest-invalid data.)
 - **Authoring reads are snapshot-consistent** (§10, §17): Hub mints a
   tooling-only `AuthoringSnapshot` pinned to one SnapshotStamp and lease;
   authoring query and value inspection both execute at that basis and refresh
@@ -9631,7 +10013,9 @@ ordinary §10 dependency kinds.
   metadata bootstrap has its own store/protocol-only basis and cannot mint
   RpcIO.) (Refined in R28: `ReattestSuccess` may also supply the successor
   accepted-set policy projection/digest/generation, while target generation
-  remains connect-only.)
+  remains connect-only. Refined in R29: `ConnectSuccess` next ordinals carry
+  the server-recomputed initial policy rows/digest, canonically validated by
+  RpcIO instead of reusing request values.)
 <!-- R25_LEDGER_END -->
 
 <!-- R26_LEDGER_BEGIN count=11 -->
@@ -9685,7 +10069,8 @@ ordinary §10 dependency kinds.
   (Refined in R28: because reattestation may replace the accepted runtime set,
   its typed success also carries and atomically rotates that set's
   union-bootstrap policy rows/digest/generation; target generation remains
-  connect-only.)
+  connect-only. Refined in R29: connect success symmetrically carries the
+  server-recomputed initial union-bootstrap policy rows/digest.)
 - **Authoring inspection is exact, branded, and non-shippable** (§10, §17):
   every response repeats its precise SnapshotStamp and returns only the closed
   metadata/canonical-value/blob schema, with typed missing and role failures;
@@ -9756,7 +10141,9 @@ ordinary §10 dependency kinds.
   never becomes a bundle sentinel or build memo. (Refined in R28: asset UUID
   poison carries tagged authored/derived claimants, same-root path poison
   carries lossless raw physical claimants, and cross-root same-path files stay
-  the ordinary `Ambiguous(roots)` index state.)
+  the ordinary `Ambiguous(roots)` index state. Refined in R29: invalid physical
+  names have code 6/raw platform bytes/reason, and the one authoritative poison
+  is the canonical first of the completely enumerated defect set.)
 - **Authoring blob inspection is schema-authenticated** (§§6, 10, 17): only a
   logical Blob node interprets the exact `{"$distill_blob":u32}` JSON token;
   indices cover the blob table 0..N-1 exactly once, all other JSON stays
@@ -9790,12 +10177,55 @@ ordinary §10 dependency kinds.
   union bootstrap; daemon additions outside it neither fence nor become
   servable closure data. Reattest alone uses the full-table generation for its
   validate/install race CAS and atomically rotates successor projections.
+  (Refined in R29: `ConnectSuccess` carries the server-recomputed initial DSLP
+  rows/digest at ordinals 6/7; request values are never the initial basis.)
 - **Pipeline poison has interoperable DSPP v1 identity** (§§3, 5, 13, 17):
   fixed codes, origins, cleanup dispositions, and their exhaustive allowed
   matrix hash under `DSPP`; unknown/mismatched tuples reject, presentation
   messages are excluded, and Cap'n Proto diagnostics carry the explicit typed
   record rather than opaque `Data`.
 <!-- R28_LEDGER_END -->
+
+<!-- R29_LEDGER_BEGIN count=7 -->
+- **Connect success carries the complete initial policy basis** (§§15, 17):
+  `ConnectSuccess` ordinals 6/7 contain the server-recomputed, strictly sorted
+  load-policy rows and DSLP over the accepted runtime set union the exact five
+  bootstrap rows. RpcIO canonically verifies those success fields and constructs
+  its first `IoBasis::Rpc` from them, never from request values; the grammar and
+  verification are identical to `ReattestSuccess`.
+- **Missing/duplicate lineage authority has one narrow recovery path** (§§2, 6,
+  13–14, 17–18): only current DSCP 10/11 enables unbound `Root.lineageRepair`
+  for the explicit local repair command. Inspection returns instance, exact
+  stamp, configured missing path or sorted physical claimants; absence/preimage
+  CAS, canonical non-bootstrap manifest validation, explicit survivor choice,
+  no-replace journal/quarantine/fsync, and crash recovery precede publication,
+  with no MetadataHub, general authoring, `last_good`, or silent tiebreak.
+- **DSVP represents physical names that cannot normalize** (§§7, 10, 13, 17):
+  code 6 carries root, lossless Unix-byte/Windows-UTF-16 path, and fixed reason
+  1..7 for invalid encoding, absolute/empty/dot/parent components, or forbidden
+  characters. It needs no normalized String; scanner publication, DSVP hashing,
+  wire decode, equality, and healing all use the exact raw arm and reason.
+- **Simultaneous global defects have deterministic singular authority** (§§7,
+  13): the scanner completely enumerates, canonical-encodes, deduplicates, and
+  sorts all candidate defects by `(code, detail bytes)` before selecting the
+  first as the one persisted/snapshot/RPC `VersionPoison`. The remaining sorted
+  set is doctor-only diagnostics; scan or thread completion order never wins.
+- **ToolEpoch misses are closed, memoizable capability failures** (§§9, 13):
+  `CapabilityKey::Tool(String)` is fixed tag 5 after tags 1..4. An absent tool
+  terminates `TraceOp::Tool` with
+  `Observed::Err(MissingCapability { Tool(id) })` and heals when revalidation
+  resolves a staged hash; `ToolLaunch` remains only post-hit launch failure.
+- **Configuration poison carries its complete DSCP reason** (§§5, 13, 17–18):
+  Rust state, persistence, and Cap'n Proto now carry the exact same-code typed
+  `DscpV1` detail in addition to code/hash/message. Decode validates version,
+  tags, payload widths/order/normalization, code/detail pairing, and recomputed
+  reason hash; presentation text never supplies missing type facts.
+- **BundleFileHash is observed-byte identity, not canonicality proof** (§§5–7,
+  9, 11, 13): it is raw blake3 of the exact file bytes for valid and malformed
+  bundles alike, making incomplete-skeleton and repair preimages representable.
+  Bundle parsing/canonical validation remains an independent mandatory gate;
+  no hash equality authorizes malformed bytes as canonical.
+<!-- R29_LEDGER_END -->
 
 ### Open — remaining
 
