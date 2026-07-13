@@ -5,9 +5,9 @@
 use distill_core::canonical::{domain_digest, DSTR};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use distill_store::cas::record::{
-    decode_record, encode_record, AuxRow, CapabilityKey, FailureCause, FailureFingerprint, KeyKind,
-    LocalFailureClass, OutputRow, Record, RecordKind, ResultOutcome, ResultPayload, ToolErrorClass,
-    RECORD_HEADER_LEN,
+    decode_record, encode_record, AuxRow, CapabilityKey, EntryRole, FailureCause,
+    FailureFingerprint, KeyKind, LocalFailureClass, OutputRow, Record, RecordKind, ResultOutcome,
+    ResultPayload, ToolErrorClass, RECORD_HEADER_LEN,
 };
 use distill_store::StoreError;
 
@@ -367,6 +367,10 @@ fn failure_outcomes_roundtrip_with_every_fingerprint() {
             query: b"canonical ASTQ bytes".to_vec(),
             expected_terminal: TypeUuid([4u8; 16]),
         },
+        FailureFingerprint::RoleIneligible {
+            asset: AssetUuid([11u8; 16]),
+            observed_role: EntryRole::AuthoringOnly,
+        },
         FailureFingerprint::Descendant {
             asset: AssetUuid([5u8; 16]),
             fingerprint: Box::new(FailureFingerprint::ToolLaunch {
@@ -403,6 +407,26 @@ fn failure_outcomes_roundtrip_with_every_fingerprint() {
         FailureFingerprint::Local {
             class: LocalFailureClass::Processor,
             detail: [10u8; 32],
+        },
+        FailureFingerprint::Local {
+            class: LocalFailureClass::MigrationFunction,
+            detail: [11u8; 32],
+        },
+        FailureFingerprint::Local {
+            class: LocalFailureClass::OutputBinding,
+            detail: [12u8; 32],
+        },
+        FailureFingerprint::Local {
+            class: LocalFailureClass::Importer,
+            detail: [13u8; 32],
+        },
+        FailureFingerprint::Local {
+            class: LocalFailureClass::ImportIntake,
+            detail: [14u8; 32],
+        },
+        FailureFingerprint::Local {
+            class: LocalFailureClass::ArtifactEncoding,
+            detail: [15u8; 32],
         },
     ];
     for fp in fingerprints {
@@ -468,7 +492,7 @@ fn local_failures_memoize_with_an_empty_trace() {
 fn failure_cause_and_fingerprint_tag_bytes_are_pinned() {
     // The failure arm's grammar, byte by byte: outcome tag, cause tag
     // (0 = Op, 1 = Local), fingerprint tag (5 = MissingCapability,
-    // 6 = Local), capability-key tag, class byte.
+    // 6 = Local, 7 = RoleIneligible), capability-key tag, class u16.
     let op = ResultPayload {
         key_kind: KeyKind::Processor,
         static_inputs_canonical: Vec::new(),
@@ -514,8 +538,24 @@ fn failure_cause_and_fingerprint_tag_bytes_are_pinned() {
     };
     let bytes = local.encode();
     assert_eq!(bytes[11], 6, "fingerprint tag: Local");
-    assert_eq!(bytes[12], 1, "class byte: MigrationPlan");
-    assert_eq!(&bytes[13..45], &[3u8; 32], "the stable diagnostic hash");
+    assert_eq!(&bytes[12..14], &2_u16.to_le_bytes(), "class: MigrationPlan");
+    assert_eq!(&bytes[14..46], &[3u8; 32], "the stable diagnostic hash");
+
+    let role = ResultPayload {
+        key_kind: KeyKind::Processor,
+        static_inputs_canonical: Vec::new(),
+        trace: Vec::new(),
+        outcome: ResultOutcome::Failure {
+            cause: FailureCause::Local(FailureFingerprint::RoleIneligible {
+                asset: AssetUuid([9; 16]),
+                observed_role: EntryRole::AuthoringOnly,
+            }),
+        },
+    };
+    let bytes = role.encode();
+    assert_eq!(bytes[11], 7, "fingerprint tag: RoleIneligible");
+    assert_eq!(&bytes[12..28], &[9; 16]);
+    assert_eq!(bytes[28], 1, "role: AuthoringOnly");
 }
 
 #[test]

@@ -323,6 +323,13 @@ pub enum FailureFingerprint {
         query: Vec<u8>,
         expected_terminal: TypeUuid,
     },
+    /// Exact resolution found an entry whose observed role cannot enter the
+    /// attempted runtime/dependency carrier. Revalidation consults the role
+    /// index so a role edit heals the memo.
+    RoleIneligible {
+        asset: AssetUuid,
+        observed_role: EntryRole,
+    },
     /// A descendant build failed: the child's own fingerprint.
     Descendant {
         asset: AssetUuid,
@@ -344,6 +351,23 @@ pub enum FailureFingerprint {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EntryRole {
+    Runtime = 0,
+    AuthoringOnly = 1,
+}
+
+impl EntryRole {
+    fn from_byte(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Runtime,
+            1 => Self::AuthoringOnly,
+            _ => return None,
+        })
+    }
+}
+
 /// What a capability lookup asked the pipeline epoch for (§9) — the
 /// identity a recorded miss carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,18 +381,29 @@ pub enum CapabilityKey {
 /// The class of a deterministic local failure (§9): validator error
 /// diagnostics, migration-plan validation, a processor `BuildError`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum LocalFailureClass {
-    Validator = 0,
-    MigrationPlan = 1,
-    Processor = 2,
+    Validator = 1,
+    MigrationPlan = 2,
+    Processor = 3,
+    MigrationFunction = 4,
+    OutputBinding = 5,
+    Importer = 6,
+    ImportIntake = 7,
+    ArtifactEncoding = 8,
 }
 
 impl LocalFailureClass {
-    fn from_byte(b: u8) -> Option<LocalFailureClass> {
-        Some(match b {
-            0 => LocalFailureClass::Validator,
-            1 => LocalFailureClass::MigrationPlan,
-            2 => LocalFailureClass::Processor,
+    fn from_u16(value: u16) -> Option<LocalFailureClass> {
+        Some(match value {
+            1 => LocalFailureClass::Validator,
+            2 => LocalFailureClass::MigrationPlan,
+            3 => LocalFailureClass::Processor,
+            4 => LocalFailureClass::MigrationFunction,
+            5 => LocalFailureClass::OutputBinding,
+            6 => LocalFailureClass::Importer,
+            7 => LocalFailureClass::ImportIntake,
+            8 => LocalFailureClass::ArtifactEncoding,
             _ => return None,
         })
     }
@@ -554,8 +589,17 @@ impl ResultPayload {
                             }
                             FailureFingerprint::Local { class, detail } => {
                                 out.push(6);
-                                out.push(*class as u8);
+                                out.extend_from_slice(&(*class as u16).to_le_bytes());
                                 out.extend_from_slice(detail);
+                                break;
+                            }
+                            FailureFingerprint::RoleIneligible {
+                                asset,
+                                observed_role,
+                            } => {
+                                out.push(7);
+                                out.extend_from_slice(&asset.0);
+                                out.push(*observed_role as u8);
                                 break;
                             }
                         }
@@ -653,12 +697,21 @@ impl ResultPayload {
                                 }
                                 6 => {
                                     let class =
-                                        LocalFailureClass::from_byte(r.u8()?).ok_or_else(|| {
+                                        LocalFailureClass::from_u16(r.u16()?).ok_or_else(|| {
                                             bad_payload("unknown local failure class")
                                         })?;
                                     break FailureFingerprint::Local {
                                         class,
                                         detail: r.array32()?,
+                                    };
+                                }
+                                7 => {
+                                    let asset = AssetUuid(r.array16()?);
+                                    let observed_role = EntryRole::from_byte(r.u8()?)
+                                        .ok_or_else(|| bad_payload("unknown entry role"))?;
+                                    break FailureFingerprint::RoleIneligible {
+                                        asset,
+                                        observed_role,
                                     };
                                 }
                                 _ => return Err(bad_payload("unknown fingerprint tag")),
@@ -747,6 +800,10 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Result<u32, StoreError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u16(&mut self) -> Result<u16, StoreError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
 
     /// A count whose elements each occupy at least one byte: bounded by
