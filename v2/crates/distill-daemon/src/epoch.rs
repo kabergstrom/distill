@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use distill_asset::ModuleEpochToken;
-use distill_core::id::{LogicalHash, TypeUuid};
+pub use distill_core::attestation::{
+    CompiledAttestationDigest, CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
+};
 
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
@@ -39,39 +41,6 @@ pub struct ModuleIdentity {
 pub struct MeasuredLayout {
     pub type_id: String,
     pub digest: [u8; 32],
-}
-
-/// The complete compiled semantic projection for one asset type. The opaque
-/// extras are a canonical, length-framed projection produced by source-walk
-/// and module code from every policy fact deliberately excluded from DSLH and
-/// DSNL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledTypeAttestation {
-    pub type_uuid: TypeUuid,
-    pub logical_hash: LogicalHash,
-    pub native_layout_digest: [u8; 32],
-    pub build_only: bool,
-    pub registry_extras: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompiledAttestationDigest(pub [u8; 32]);
-
-/// Canonical DSCA table exported by source-walk and by the loaded module.
-/// Rows must already be strictly sorted by raw TypeUuid; accepting and sorting
-/// a non-canonical module export would make the pre-ABI attestation ambiguous.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledTypeTable {
-    pub rows: Vec<CompiledTypeAttestation>,
-    pub digest: CompiledAttestationDigest,
-}
-
-impl CompiledTypeTable {
-    pub fn canonical(rows: Vec<CompiledTypeAttestation>) -> Result<Self, ModuleCallError> {
-        validate_compiled_row_order(&rows, "compiled-type table").map_err(ModuleCallError::new)?;
-        let digest = compute_compiled_attestation_digest(&rows).map_err(ModuleCallError::new)?;
-        Ok(Self { rows, digest })
-    }
 }
 
 /// Audited reverse-call surfaces. New host-owned callback tables must add a
@@ -152,6 +121,211 @@ pub struct RegistrationSet {
     pub pipeline_targets: BTreeSet<String>,
 }
 
+/// A module-owned installed object represented without automatic Rust drop.
+/// The status thunk is the only operation permitted to destroy `pointer`.
+///
+/// This has deliberately no `Drop` implementation: if its thunk reports an
+/// error or panics, retaining or even dropping the host-side wrapper leaks the
+/// module object instead of running unchecked module drop glue.
+pub struct RegistrationResource {
+    pointer: *mut u8,
+    cleanup: unsafe fn(*mut u8) -> Result<(), ModuleCallError>,
+}
+
+// SAFETY: construction requires the caller to promise that the opaque object
+// and its thunk may be transferred to the module host thread.
+unsafe impl Send for RegistrationResource {}
+
+impl std::fmt::Debug for RegistrationResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistrationResource")
+            .field("pointer", &self.pointer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RegistrationResource {
+    /// Construct the raw, status-bearing ownership record installed into a
+    /// candidate arena.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must remain valid until `cleanup` returns `Ok`. The thunk must
+    /// fully destroy/deallocate it on `Ok`, leave it valid and deliberately
+    /// leaked on `Err`, contain all module panics, and be safe to call exactly
+    /// once. The pointed-to object and thunk must be safe to transfer to the
+    /// module-host thread.
+    pub unsafe fn from_raw(
+        pointer: *mut u8,
+        cleanup: unsafe fn(*mut u8) -> Result<(), ModuleCallError>,
+    ) -> Self {
+        Self { pointer, cleanup }
+    }
+
+    fn cleanup(&self) -> Result<(), ModuleCallError> {
+        boundary_call("registration cleanup", || {
+            // SAFETY: upheld by `from_raw`; the arena calls this at most once
+            // and retains the record without another call after any failure.
+            unsafe { (self.cleanup)(self.pointer) }
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CandidateRegistration {
+    installation_seq: u64,
+    registration: Registration,
+    resource: RegistrationResource,
+}
+
+/// A tracked residency capability for a module-owned value. Registration and
+/// generated value constructors use this instead of manufacturing an
+/// untracked token clone; the host can therefore prove that no candidate pin
+/// remains before `dlclose`.
+#[derive(Clone)]
+pub struct ModuleEpochPin {
+    token: ModuleEpochToken,
+    residency: Arc<EpochResidency>,
+}
+
+struct EpochResidency {
+    fenced: AtomicBool,
+}
+
+impl std::fmt::Debug for ModuleEpochPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleEpochPin")
+            .field("token", &self.token)
+            .field("fenced", &self.is_fenced())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModuleEpochPin {
+    pub fn token(&self) -> &ModuleEpochToken {
+        &self.token
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.residency.fenced.load(Ordering::Acquire)
+    }
+}
+
+/// Host-owned state minted immediately after a candidate image opens and
+/// before any registration call. Entries are installed in order and cleaned
+/// exclusively through their status thunks in reverse order.
+pub struct CandidateRegistrationArena {
+    owner: ModuleEpochToken,
+    residency: Arc<EpochResidency>,
+    entries: Vec<CandidateRegistration>,
+}
+
+impl std::fmt::Debug for CandidateRegistrationArena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandidateRegistrationArena")
+            .field("owner", &self.owner)
+            .field("entries", &self.entries.len())
+            .field("fenced", &self.is_fenced())
+            .field("pins", &self.pin_count())
+            .finish()
+    }
+}
+
+impl CandidateRegistrationArena {
+    fn new(owner: ModuleEpochToken) -> Self {
+        Self {
+            owner,
+            residency: Arc::new(EpochResidency {
+                fenced: AtomicBool::new(false),
+            }),
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn owner_token(&self) -> &ModuleEpochToken {
+        &self.owner
+    }
+
+    pub fn owner_pin(&self) -> ModuleEpochPin {
+        ModuleEpochPin {
+            token: self.owner.clone(),
+            residency: Arc::clone(&self.residency),
+        }
+    }
+
+    /// Transfer one module-owned object into the unpublished arena. Metadata
+    /// validation is intentionally performed only after `register` returns so
+    /// even a later duplicate is already owned and can be rolled back safely.
+    pub fn install(
+        &mut self,
+        registration: Registration,
+        resource: RegistrationResource,
+    ) -> Result<(), ModuleCallError> {
+        if self.is_fenced() {
+            return Err(ModuleCallError::new(
+                "candidate registration arena is fenced",
+            ));
+        }
+        let installation_seq = u64::try_from(self.entries.len())
+            .map_err(|_| ModuleCallError::new("candidate registration sequence exhausted"))?;
+        self.entries.push(CandidateRegistration {
+            installation_seq,
+            registration,
+            resource,
+        });
+        Ok(())
+    }
+
+    pub fn installed_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn registration_set(&self, pipeline_targets: BTreeSet<String>) -> RegistrationSet {
+        RegistrationSet {
+            registrations: self
+                .entries
+                .iter()
+                .map(|entry| entry.registration.clone())
+                .collect(),
+            pipeline_targets,
+        }
+    }
+
+    fn fence(&mut self) {
+        self.residency.fenced.store(true, Ordering::Release);
+    }
+
+    fn is_fenced(&self) -> bool {
+        self.residency.fenced.load(Ordering::Acquire)
+    }
+
+    fn pin_count(&self) -> usize {
+        Arc::strong_count(&self.residency).saturating_sub(1)
+    }
+
+    fn cleanup_reverse(&mut self) -> Result<(), ModuleCallError> {
+        self.fence();
+        let mut errors = Vec::new();
+        for index in (0..self.entries.len()).rev() {
+            let sequence = self.entries[index].installation_seq;
+            match self.entries[index].resource.cleanup() {
+                Ok(()) => {
+                    self.entries.remove(index);
+                }
+                Err(error) => {
+                    self.owner.poison();
+                    errors.push(format!("registration cleanup #{sequence} failed: {error}"));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ModuleCallError::new(errors.join("; ")))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateRequirements {
     pub identity: ModuleIdentity,
@@ -215,7 +389,8 @@ pub trait LoadedPipelineModule: Send {
     fn register(
         &mut self,
         targets: &[TargetDefinition],
-    ) -> Result<RegistrationSet, ModuleCallError>;
+        arena: &mut CandidateRegistrationArena,
+    ) -> Result<BTreeSet<String>, ModuleCallError>;
     fn unload(&mut self) -> Result<(), ModuleCallError>;
     fn dlclose(&mut self);
 }
@@ -235,10 +410,38 @@ pub enum PoisonEntryPoint {
     PublishedRuntime,
 }
 
+/// Stable outcome of the explicit teardown attempted for an opened but
+/// unpublished candidate. `CleanedAndClosed` means the candidate failed its
+/// validation but left no resident module state; every other variant means the
+/// complete arena + library bundle was deliberately retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateCleanupDisposition {
+    CleanedAndClosed,
+    RegistrationCleanupFailed,
+    ModuleUnloadFailed,
+    TokenPoisoned,
+    TokenPinned,
+    DlcloseFailed,
+}
+
+impl CandidateCleanupDisposition {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::CleanedAndClosed => "CleanedAndClosed",
+            Self::RegistrationCleanupFailed => "RegistrationCleanupFailed",
+            Self::ModuleUnloadFailed => "ModuleUnloadFailed",
+            Self::TokenPoisoned => "TokenPoisoned",
+            Self::TokenPinned => "TokenPinned",
+            Self::DlcloseFailed => "DlcloseFailed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelinePoison {
     pub entry_point: PoisonEntryPoint,
     pub detail: String,
+    pub cleanup_disposition: Option<CandidateCleanupDisposition>,
 }
 
 impl std::fmt::Display for PipelinePoison {
@@ -280,6 +483,7 @@ struct EpochInner {
     accepting: AtomicBool,
     active_jobs: AtomicUsize,
     lifecycle: Mutex<EpochLifecycle>,
+    registration_arena: Mutex<Option<CandidateRegistrationArena>>,
     module: Mutex<Option<Box<dyn LoadedPipelineModule>>>,
 }
 
@@ -294,19 +498,22 @@ impl PipelineEpoch {
     fn new(
         id: u64,
         staged: StagedModule,
+        token: ModuleEpochToken,
         targets: Vec<TargetDefinition>,
         registration: RegistrationSet,
+        registration_arena: CandidateRegistrationArena,
         module: Box<dyn LoadedPipelineModule>,
     ) -> Self {
         Self(Arc::new(EpochInner {
             id,
             staged,
-            token: ModuleEpochToken::new(id),
+            token,
             targets,
             registration,
             accepting: AtomicBool::new(true),
             active_jobs: AtomicUsize::new(0),
             lifecycle: Mutex::new(EpochLifecycle::default()),
+            registration_arena: Mutex::new(Some(registration_arena)),
             module: Mutex::new(Some(module)),
         }))
     }
@@ -325,6 +532,16 @@ impl PipelineEpoch {
 
     pub fn module_token(&self) -> &ModuleEpochToken {
         &self.0.token
+    }
+
+    /// Mint a residency-tracked clone of the epoch token for a module-owned
+    /// value whose lifetime is not already represented by a `PipelineEpoch`
+    /// `Arc` pin.
+    pub fn module_pin(&self) -> ModuleEpochPin {
+        lock_unpoisoned(&self.0.registration_arena)
+            .as_ref()
+            .expect("published epoch registration arena must be resident")
+            .owner_pin()
     }
 
     pub fn targets(&self) -> &[TargetDefinition] {
@@ -406,10 +623,12 @@ impl EpochInner {
             Some(detail) => PipelinePoison {
                 entry_point: PoisonEntryPoint::PublishedRuntime,
                 detail: detail.clone(),
+                cleanup_disposition: None,
             },
             None => PipelinePoison {
                 entry_point: PoisonEntryPoint::CandidateOpen,
                 detail: "epoch is retired and no longer accepts new work".to_owned(),
+                cleanup_disposition: None,
             },
         }
     }
@@ -418,6 +637,11 @@ impl EpochInner {
 impl Drop for EpochInner {
     fn drop(&mut self) {
         if self.token.is_poisoned() {
+            let arena = self
+                .registration_arena
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             let module = self
                 .module
                 .get_mut()
@@ -428,6 +652,9 @@ impl Drop for EpochInner {
                 // library handle is intentionally leaked rather than allowing
                 // a host wrapper's Drop to dlclose it.
                 std::mem::forget(module);
+            }
+            if let Some(arena) = arena {
+                std::mem::forget(arena);
             }
         }
     }
@@ -465,6 +692,7 @@ impl PipelineSnapshot {
                     Err(PipelinePoison {
                         entry_point: PoisonEntryPoint::PublishedRuntime,
                         detail: detail.clone(),
+                        cleanup_disposition: None,
                     })
                 } else {
                     Ok(epoch)
@@ -506,6 +734,7 @@ impl ModuleHost {
             PublishedState::Poisoned(PipelinePoison {
                 entry_point: PoisonEntryPoint::CandidateOpen,
                 detail: "no pipeline epoch has been published".to_owned(),
+                cleanup_disposition: None,
             })
         });
         PipelineSnapshot { state }
@@ -539,16 +768,38 @@ impl ModuleHost {
             Err(error) => return Err(self.publish_candidate_poison(error.to_string())),
         };
 
-        let validation = validate_open_module(module.as_mut(), &requirements);
+        // Mint ownership immediately after open, before any probe can reach a
+        // Rust-ABI registration surface. The exact token and arena either move
+        // into the published epoch or remain paired with the leaked candidate.
+        let token = ModuleEpochToken::new(id);
+        let mut registration_arena = CandidateRegistrationArena::new(token.clone());
+
+        let validation =
+            validate_open_module(module.as_mut(), &requirements, &mut registration_arena);
         let registration = match validation {
             Ok(registration) => registration,
             Err(error) => {
-                discard_candidate(module);
-                return Err(self.publish_candidate_poison(error));
+                let cleanup = discard_candidate(module, registration_arena);
+                return Err(self.publish_candidate_poison_with_cleanup(error, cleanup));
             }
         };
+        if token.is_poisoned() {
+            let cleanup = discard_candidate(module, registration_arena);
+            return Err(self.publish_candidate_poison_with_cleanup(
+                "candidate token was poisoned during registration".to_owned(),
+                cleanup,
+            ));
+        }
 
-        let epoch = PipelineEpoch::new(id, staged, requirements.targets, registration, module);
+        let epoch = PipelineEpoch::new(
+            id,
+            staged,
+            token,
+            requirements.targets,
+            registration,
+            registration_arena,
+            module,
+        );
         self.retire_published_ready();
         self.published = Some(PublishedState::Ready(epoch.clone()));
         Ok(epoch)
@@ -585,7 +836,11 @@ impl ModuleHost {
                     self.retired.remove(index);
                 }
                 Err(error) => {
-                    epoch.0.poison(format!("module unload failed: {error}"));
+                    epoch.0.poison(format!(
+                        "epoch cleanup disposition={}: {}",
+                        error.disposition.code(),
+                        error.detail
+                    ));
                     outcomes.push(UnloadOutcome::LeakedPoisoned(id));
                     index += 1;
                 }
@@ -628,9 +883,31 @@ impl ModuleHost {
     }
 
     fn publish_candidate_poison(&mut self, detail: String) -> PipelinePoison {
+        self.publish_candidate_poison_with_optional_cleanup(detail, None)
+    }
+
+    fn publish_candidate_poison_with_cleanup(
+        &mut self,
+        detail: String,
+        cleanup: CandidateCleanup,
+    ) -> PipelinePoison {
+        let detail = format!(
+            "{detail}; candidate cleanup disposition={}: {}",
+            cleanup.disposition.code(),
+            cleanup.detail
+        );
+        self.publish_candidate_poison_with_optional_cleanup(detail, Some(cleanup.disposition))
+    }
+
+    fn publish_candidate_poison_with_optional_cleanup(
+        &mut self,
+        detail: String,
+        cleanup_disposition: Option<CandidateCleanupDisposition>,
+    ) -> PipelinePoison {
         let poison = PipelinePoison {
             entry_point: PoisonEntryPoint::CandidateOpen,
             detail,
+            cleanup_disposition,
         };
         self.retire_published_ready();
         self.published = Some(PublishedState::Poisoned(poison.clone()));
@@ -679,6 +956,7 @@ fn validate_requirements(requirements: &mut CandidateRequirements) -> Result<(),
 fn validate_open_module(
     module: &mut dyn LoadedPipelineModule,
     requirements: &CandidateRequirements,
+    registration_arena: &mut CandidateRegistrationArena,
 ) -> Result<RegistrationSet, String> {
     let identity =
         boundary_call("identity", || module.identity()).map_err(|error| error.to_string())?;
@@ -703,8 +981,11 @@ fn validate_open_module(
             &compiled_types.rows,
         ));
     }
-    let registration = boundary_call("register", || module.register(&requirements.targets))
-        .map_err(|error| error.to_string())?;
+    let pipeline_targets = boundary_call("register", || {
+        module.register(&requirements.targets, registration_arena)
+    })
+    .map_err(|error| error.to_string())?;
+    let registration = registration_arena.registration_set(pipeline_targets);
     validate_registration(&registration, &requirements.targets)?;
     Ok(registration)
 }
@@ -729,61 +1010,9 @@ fn measured_layout_error(expected: &[MeasuredLayout], actual: &[MeasuredLayout])
 }
 
 fn validate_compiled_table(table: &CompiledTypeTable, role: &str) -> Result<(), String> {
-    validate_compiled_row_order(&table.rows, &format!("{role} compiled-type table"))?;
-    let recomputed = compute_compiled_attestation_digest(&table.rows)?;
-    if recomputed != table.digest {
-        return Err(format!("{role} compiled-type DSCA digest mismatch"));
-    }
-    Ok(())
-}
-
-fn validate_compiled_row_order(
-    rows: &[CompiledTypeAttestation],
-    table_name: &str,
-) -> Result<(), String> {
-    for pair in rows.windows(2) {
-        match pair[0].type_uuid.cmp(&pair[1].type_uuid) {
-            std::cmp::Ordering::Less => {}
-            std::cmp::Ordering::Equal => {
-                return Err(format!(
-                    "{table_name} contains duplicate type `{}`",
-                    pair[0].type_uuid
-                ));
-            }
-            std::cmp::Ordering::Greater => {
-                return Err(format!(
-                    "{table_name} is not strictly sorted by raw TypeUuid bytes"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn compute_compiled_attestation_digest(
-    rows: &[CompiledTypeAttestation],
-) -> Result<CompiledAttestationDigest, String> {
-    let count = u32::try_from(rows.len())
-        .map_err(|_| "compiled-type table count exceeds u32".to_owned())?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"DSCA");
-    hasher.update(&[1]);
-    hasher.update(&count.to_le_bytes());
-    for row in rows {
-        let extras_len = u32::try_from(row.registry_extras.len()).map_err(|_| {
-            format!(
-                "compiled-type registry extras exceed u32 for type `{}`",
-                row.type_uuid
-            )
-        })?;
-        hasher.update(&row.type_uuid.0);
-        hasher.update(&row.logical_hash.0);
-        hasher.update(&row.native_layout_digest);
-        hasher.update(&[u8::from(row.build_only)]);
-        hasher.update(&extras_len.to_le_bytes());
-        hasher.update(&row.registry_extras);
-    }
-    Ok(CompiledAttestationDigest(*hasher.finalize().as_bytes()))
+    table
+        .validate()
+        .map_err(|error| format!("{role} compiled-type table/DSCA invalid: {error}"))
 }
 
 fn compiled_type_error(
@@ -817,7 +1046,9 @@ fn compiled_type_error(
         "native layout digest"
     } else if expected.build_only != actual.build_only {
         "build_only"
-    } else if expected.registry_extras != actual.registry_extras {
+    } else if expected.registry_extras_digest != actual.registry_extras_digest
+        || expected.registry_extras != actual.registry_extras
+    {
         "registry extras"
     } else {
         "row"
@@ -864,25 +1095,127 @@ fn boundary_call<T>(
         .map_err(|_| ModuleCallError::boundary_panic(operation))?
 }
 
-fn discard_candidate(mut module: Box<dyn LoadedPipelineModule>) {
-    if boundary_call("candidate unload", || module.unload()).is_err() {
-        std::mem::forget(module);
-        return;
-    }
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).is_err() {
-        std::mem::forget(module);
+struct CandidateCleanup {
+    disposition: CandidateCleanupDisposition,
+    detail: String,
+}
+
+struct EpochCleanupError {
+    disposition: CandidateCleanupDisposition,
+    detail: String,
+}
+
+fn retain_candidate(
+    module: Box<dyn LoadedPipelineModule>,
+    arena: CandidateRegistrationArena,
+    disposition: CandidateCleanupDisposition,
+    detail: String,
+) -> CandidateCleanup {
+    std::mem::forget(module);
+    std::mem::forget(arena);
+    CandidateCleanup {
+        disposition,
+        detail,
     }
 }
 
-fn unload_epoch(epoch: &PipelineEpoch) -> Result<(), ModuleCallError> {
+fn discard_candidate(
+    mut module: Box<dyn LoadedPipelineModule>,
+    mut arena: CandidateRegistrationArena,
+) -> CandidateCleanup {
+    arena.fence();
+    if let Err(error) = arena.cleanup_reverse() {
+        return retain_candidate(
+            module,
+            arena,
+            CandidateCleanupDisposition::RegistrationCleanupFailed,
+            error.to_string(),
+        );
+    }
+
+    if let Err(error) = boundary_call("candidate unload", || module.unload()) {
+        arena.owner.poison();
+        return retain_candidate(
+            module,
+            arena,
+            CandidateCleanupDisposition::ModuleUnloadFailed,
+            error.to_string(),
+        );
+    }
+    if arena.owner.is_poisoned() {
+        return retain_candidate(
+            module,
+            arena,
+            CandidateCleanupDisposition::TokenPoisoned,
+            "candidate token was poisoned before dlclose".to_owned(),
+        );
+    }
+    let pins = arena.pin_count();
+    if pins != 0 {
+        return retain_candidate(
+            module,
+            arena,
+            CandidateCleanupDisposition::TokenPinned,
+            format!("candidate token retains {pins} residency pin(s)"),
+        );
+    }
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).is_err() {
+        arena.owner.poison();
+        return retain_candidate(
+            module,
+            arena,
+            CandidateCleanupDisposition::DlcloseFailed,
+            ModuleCallError::boundary_panic("candidate dlclose").to_string(),
+        );
+    }
+    CandidateCleanup {
+        disposition: CandidateCleanupDisposition::CleanedAndClosed,
+        detail: "all registrations cleaned, module unloaded, and library closed".to_owned(),
+    }
+}
+
+fn unload_epoch(epoch: &PipelineEpoch) -> Result<(), EpochCleanupError> {
+    let mut arena_guard = lock_unpoisoned(&epoch.0.registration_arena);
+    let arena = arena_guard.as_mut().ok_or_else(|| EpochCleanupError {
+        disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
+        detail: "registration arena is absent".to_owned(),
+    })?;
+    arena.fence();
+    arena.cleanup_reverse().map_err(|error| EpochCleanupError {
+        disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
+        detail: error.to_string(),
+    })?;
+
     let mut module_guard = lock_unpoisoned(&epoch.0.module);
-    let module = module_guard
-        .as_mut()
-        .ok_or_else(|| ModuleCallError::new("module handle is absent"))?;
-    boundary_call("unload", || module.unload())?;
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose()))
-        .map_err(|_| ModuleCallError::boundary_panic("dlclose"))?;
+    let module = module_guard.as_mut().ok_or_else(|| EpochCleanupError {
+        disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
+        detail: "module handle is absent".to_owned(),
+    })?;
+    boundary_call("unload", || module.unload()).map_err(|error| EpochCleanupError {
+        disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
+        detail: error.to_string(),
+    })?;
+    if epoch.0.token.is_poisoned() {
+        return Err(EpochCleanupError {
+            disposition: CandidateCleanupDisposition::TokenPoisoned,
+            detail: "epoch token was poisoned before dlclose".to_owned(),
+        });
+    }
+    let pins = arena.pin_count();
+    if pins != 0 {
+        return Err(EpochCleanupError {
+            disposition: CandidateCleanupDisposition::TokenPinned,
+            detail: format!("epoch token retains {pins} residency pin(s)"),
+        });
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).map_err(|_| {
+        EpochCleanupError {
+            disposition: CandidateCleanupDisposition::DlcloseFailed,
+            detail: ModuleCallError::boundary_panic("dlclose").to_string(),
+        }
+    })?;
     module_guard.take();
+    arena_guard.take();
     lock_unpoisoned(&epoch.0.lifecycle).unloaded = true;
     Ok(())
 }

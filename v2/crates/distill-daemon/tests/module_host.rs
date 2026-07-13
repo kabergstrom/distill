@@ -3,12 +3,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use distill_asset::ErasedValue;
+use distill_core::attestation::{
+    ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, RegistryPathStep,
+    SchemaNodeId,
+};
 use distill_core::id::{LogicalHash, TypeUuid};
 use distill_daemon::epoch::{
-    CandidateRequirements, CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable,
-    HostCallbackBoundary, HostCallbackSurface, LoadedPipelineModule, MeasuredLayout,
-    ModuleAbiIdentity, ModuleCallError, ModuleHost, ModuleIdentity, PipelineModuleLoader,
-    PoisonEntryPoint, Registration, RegistrationKind, RegistrationSet, StagedModule,
+    CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements,
+    CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable, HostCallbackBoundary,
+    HostCallbackSurface, LoadedPipelineModule, MeasuredLayout, ModuleAbiIdentity, ModuleCallError,
+    ModuleEpochPin, ModuleHost, ModuleIdentity, PipelineModuleLoader, PoisonEntryPoint,
+    Registration, RegistrationKind, RegistrationResource, RegistrationSet, StagedModule,
     TargetDefinition, UnloadOutcome,
 };
 
@@ -26,6 +31,44 @@ struct Calls {
     register: usize,
     unload: usize,
     dlclose: usize,
+    cleanup_order: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupBehavior {
+    Ok,
+    Error,
+    Panic,
+}
+
+struct TestRegistrationResource {
+    label: String,
+    behavior: CleanupBehavior,
+    calls: Arc<Mutex<Calls>>,
+}
+
+unsafe fn cleanup_test_registration(pointer: *mut u8) -> Result<(), ModuleCallError> {
+    // SAFETY: every pointer passed here was produced by Box::into_raw for this
+    // exact type and the arena invokes the thunk at most once after success.
+    let resource = unsafe { &*pointer.cast::<TestRegistrationResource>() };
+    resource
+        .calls
+        .lock()
+        .unwrap()
+        .cleanup_order
+        .push(resource.label.clone());
+    match resource.behavior {
+        CleanupBehavior::Ok => {
+            // SAFETY: this successful status consumes the still-owned box.
+            drop(unsafe { Box::from_raw(pointer.cast::<TestRegistrationResource>()) });
+            Ok(())
+        }
+        CleanupBehavior::Error => Err(ModuleCallError::new(format!(
+            "{} cleanup failed",
+            resource.label
+        ))),
+        CleanupBehavior::Panic => panic!("{} cleanup panicked", resource.label),
+    }
 }
 
 struct FakeModule {
@@ -34,6 +77,11 @@ struct FakeModule {
     compiled_types: CompiledTypeTable,
     registration: RegistrationSet,
     calls: Arc<Mutex<Calls>>,
+    cleanup_behaviors: Vec<CleanupBehavior>,
+    unload_error: Option<&'static str>,
+    unload_panics: bool,
+    poison_during_register: bool,
+    pin_sink: Option<Arc<Mutex<Option<ModuleEpochPin>>>>,
 }
 
 impl LoadedPipelineModule for FakeModule {
@@ -52,13 +100,44 @@ impl LoadedPipelineModule for FakeModule {
     fn register(
         &mut self,
         _targets: &[TargetDefinition],
-    ) -> Result<RegistrationSet, ModuleCallError> {
+        arena: &mut CandidateRegistrationArena,
+    ) -> Result<BTreeSet<String>, ModuleCallError> {
         self.calls.lock().unwrap().register += 1;
-        Ok(self.registration.clone())
+        if let Some(pin_sink) = &self.pin_sink {
+            *pin_sink.lock().unwrap() = Some(arena.owner_pin());
+        }
+        if self.poison_during_register {
+            arena.owner_token().poison();
+        }
+        for (index, registration) in self.registration.registrations.iter().enumerate() {
+            let resource = Box::new(TestRegistrationResource {
+                label: format!("{}#{index}", registration.id),
+                behavior: self
+                    .cleanup_behaviors
+                    .get(index)
+                    .copied()
+                    .unwrap_or(CleanupBehavior::Ok),
+                calls: Arc::clone(&self.calls),
+            });
+            // SAFETY: `cleanup_test_registration` has the exact pointee type,
+            // owns the allocation on success, and preserves it on failure.
+            let resource = unsafe {
+                RegistrationResource::from_raw(
+                    Box::into_raw(resource).cast(),
+                    cleanup_test_registration,
+                )
+            };
+            arena.install(registration.clone(), resource)?;
+        }
+        Ok(self.registration.pipeline_targets.clone())
     }
 
     fn unload(&mut self) -> Result<(), ModuleCallError> {
         self.calls.lock().unwrap().unload += 1;
+        assert!(!self.unload_panics, "configured unload panic");
+        if let Some(error) = self.unload_error {
+            return Err(ModuleCallError::new(error));
+        }
         Ok(())
     }
 
@@ -139,17 +218,31 @@ fn fake_module(tag: u8, calls: Arc<Mutex<Calls>>) -> FakeModule {
             pipeline_targets: BTreeSet::from(["desktop".into()]),
         },
         calls,
+        cleanup_behaviors: vec![CleanupBehavior::Ok],
+        unload_error: None,
+        unload_panics: false,
+        poison_during_register: false,
+        pin_sink: None,
     }
 }
 
 fn compiled_type(tag: u8) -> CompiledTypeAttestation {
-    CompiledTypeAttestation {
-        type_uuid: TypeUuid([tag; 16]),
-        logical_hash: LogicalHash([tag.wrapping_add(1); 32]),
-        native_layout_digest: [tag; 32],
-        build_only: false,
-        registry_extras: vec![tag.wrapping_add(2)],
-    }
+    CompiledTypeAttestation::new(
+        TypeUuid([tag; 16]),
+        LogicalHash([tag.wrapping_add(1); 32]),
+        [tag; 32],
+        false,
+        RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+            node: SchemaNodeId(0),
+            path: vec![RegistryPathStep::Field("reference".into())],
+            fact: RegistryExtraFact::Reference {
+                strength: ReferenceStrength::Strong,
+                target: TypeUuid([tag.wrapping_add(2); 16]),
+            },
+        }])
+        .unwrap(),
+    )
+    .unwrap()
 }
 
 fn write_module(path: &Path, byte: u8) {
@@ -195,6 +288,188 @@ fn boundary_panic_is_converted_to_candidate_poison_instead_of_unwinding() {
         .unwrap_err();
     assert_eq!(poison.entry_point, PoisonEntryPoint::CandidateOpen);
     assert!(poison.detail.contains("must return status"));
+}
+
+fn duplicate_registration_module(
+    tag: u8,
+    calls: Arc<Mutex<Calls>>,
+    cleanup_behaviors: Vec<CleanupBehavior>,
+) -> FakeModule {
+    let mut module = fake_module(tag, calls);
+    module.registration.registrations = vec![
+        Registration {
+            kind: RegistrationKind::Processor,
+            id: "first".into(),
+            version: 1,
+        },
+        Registration {
+            kind: RegistrationKind::Importer,
+            id: "middle".into(),
+            version: 1,
+        },
+        Registration {
+            kind: RegistrationKind::Processor,
+            id: "first".into(),
+            version: 2,
+        },
+    ];
+    module.cleanup_behaviors = cleanup_behaviors;
+    module
+}
+
+#[test]
+fn partial_duplicate_registration_cleans_the_complete_arena_in_reverse_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 10);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut loader = FakeLoader {
+        module: Some(duplicate_registration_module(
+            10,
+            calls.clone(),
+            vec![CleanupBehavior::Ok; 3],
+        )),
+        open_error: None,
+    };
+    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+    let poison = host
+        .publish_candidate(&source, requirements(10), &mut loader)
+        .unwrap_err();
+
+    assert_eq!(
+        poison.cleanup_disposition,
+        Some(CandidateCleanupDisposition::CleanedAndClosed)
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.cleanup_order, ["first#2", "middle#1", "first#0"]);
+    assert_eq!(calls.unload, 1);
+    assert_eq!(calls.dlclose, 1);
+}
+
+#[test]
+fn cleanup_error_or_panic_leaks_candidate_without_unload_or_dlclose() {
+    for behavior in [CleanupBehavior::Error, CleanupBehavior::Panic] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("pipeline.dylib");
+        write_module(&source, 11);
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut loader = FakeLoader {
+            module: Some(duplicate_registration_module(
+                11,
+                calls.clone(),
+                vec![CleanupBehavior::Ok, behavior, CleanupBehavior::Ok],
+            )),
+            open_error: None,
+        };
+        let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+        let poison = host
+            .publish_candidate(&source, requirements(11), &mut loader)
+            .unwrap_err();
+
+        assert_eq!(
+            poison.cleanup_disposition,
+            Some(CandidateCleanupDisposition::RegistrationCleanupFailed)
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.cleanup_order, ["first#2", "middle#1", "first#0"]);
+        assert_eq!(calls.unload, 0);
+        assert_eq!(calls.dlclose, 0);
+    }
+}
+
+#[test]
+fn unload_error_or_panic_leaks_candidate_without_dlclose() {
+    for unload_panics in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("pipeline.dylib");
+        write_module(&source, 12);
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut module = fake_module(12, calls.clone());
+        module.identity = identity(99);
+        module.unload_panics = unload_panics;
+        module.unload_error = (!unload_panics).then_some("unload refused");
+        let mut loader = FakeLoader {
+            module: Some(module),
+            open_error: None,
+        };
+        let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+        let poison = host
+            .publish_candidate(&source, requirements(12), &mut loader)
+            .unwrap_err();
+
+        assert_eq!(
+            poison.cleanup_disposition,
+            Some(CandidateCleanupDisposition::ModuleUnloadFailed)
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.register, 0);
+        assert_eq!(calls.unload, 1);
+        assert_eq!(calls.dlclose, 0);
+    }
+}
+
+#[test]
+fn leaked_unpublished_token_pin_leaks_candidate_after_unload() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 13);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let pin_sink = Arc::new(Mutex::new(None));
+    let mut module = duplicate_registration_module(13, calls.clone(), vec![CleanupBehavior::Ok; 3]);
+    module.pin_sink = Some(pin_sink.clone());
+    let mut loader = FakeLoader {
+        module: Some(module),
+        open_error: None,
+    };
+    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+    let poison = host
+        .publish_candidate(&source, requirements(13), &mut loader)
+        .unwrap_err();
+
+    assert_eq!(
+        poison.cleanup_disposition,
+        Some(CandidateCleanupDisposition::TokenPinned)
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.unload, 1);
+    assert_eq!(calls.dlclose, 0);
+    drop(calls);
+    let pin = pin_sink.lock().unwrap().take().unwrap();
+    assert!(pin.is_fenced());
+    drop(pin);
+}
+
+#[test]
+fn token_poisoned_during_registration_never_publishes_or_dlcloses() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 14);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut module = fake_module(14, calls.clone());
+    module.poison_during_register = true;
+    let mut loader = FakeLoader {
+        module: Some(module),
+        open_error: None,
+    };
+    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+    let poison = host
+        .publish_candidate(&source, requirements(14), &mut loader)
+        .unwrap_err();
+
+    assert_eq!(
+        poison.cleanup_disposition,
+        Some(CandidateCleanupDisposition::TokenPoisoned)
+    );
+    assert!(host.snapshot().epoch().is_err());
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.cleanup_order, ["cook#0"]);
+    assert_eq!(calls.unload, 1);
+    assert_eq!(calls.dlclose, 0);
 }
 
 #[test]
@@ -276,6 +551,7 @@ fn clean_epoch_waits_for_snapshot_pin_then_unloads_and_closes() {
         .any(|outcome| matches!(outcome, UnloadOutcome::Unloaded(_))));
     let calls = calls.lock().unwrap();
     assert_eq!(calls.register, 1);
+    assert_eq!(calls.cleanup_order, ["cook#0"]);
     assert_eq!(calls.unload, 1);
     assert_eq!(calls.dlclose, 1);
 }
@@ -306,26 +582,52 @@ fn publish_with_compiled_types(
 #[test]
 fn compiled_attestation_rejects_semantic_drift_before_register_when_dsnl_is_equal() {
     let expected = requirements(7).compiled_types;
-    for (field, mutate) in [
+    let base = &expected.rows[0];
+    let weak_extras = RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+        node: SchemaNodeId(0),
+        path: vec![RegistryPathStep::Field("reference".into())],
+        fact: RegistryExtraFact::Reference {
+            strength: ReferenceStrength::Weak,
+            target: TypeUuid([99; 16]),
+        },
+    }])
+    .unwrap();
+    for (field, changed) in [
         (
             "logical hash",
-            (|row: &mut CompiledTypeAttestation| row.logical_hash = LogicalHash([91; 32]))
-                as fn(&mut CompiledTypeAttestation),
+            CompiledTypeAttestation::new(
+                base.type_uuid,
+                LogicalHash([91; 32]),
+                base.native_layout_digest,
+                base.build_only,
+                base.registry_extras.clone(),
+            )
+            .unwrap(),
         ),
         (
             "build_only",
-            (|row: &mut CompiledTypeAttestation| row.build_only = true)
-                as fn(&mut CompiledTypeAttestation),
+            CompiledTypeAttestation::new(
+                base.type_uuid,
+                base.logical_hash,
+                base.native_layout_digest,
+                true,
+                base.registry_extras.clone(),
+            )
+            .unwrap(),
         ),
         (
             "registry extras",
-            (|row: &mut CompiledTypeAttestation| row.registry_extras = vec![92])
-                as fn(&mut CompiledTypeAttestation),
+            CompiledTypeAttestation::new(
+                base.type_uuid,
+                base.logical_hash,
+                base.native_layout_digest,
+                base.build_only,
+                weak_extras.clone(),
+            )
+            .unwrap(),
         ),
     ] {
-        let mut rows = expected.rows.clone();
-        mutate(&mut rows[0]);
-        let actual = CompiledTypeTable::canonical(rows).unwrap();
+        let actual = CompiledTypeTable::canonical(vec![changed]).unwrap();
         assert_eq!(actual.rows[0].native_layout_digest, [7; 32]);
         let (poison, calls) = publish_with_compiled_types(expected.clone(), actual);
         assert!(poison.detail.contains(field), "{}", poison.detail);
@@ -341,7 +643,7 @@ fn compiled_attestation_rejects_unsorted_and_duplicate_module_rows_before_regist
     unsorted.rows.swap(0, 1);
     let (poison, calls) = publish_with_compiled_types(expected.clone(), unsorted);
     assert!(
-        poison.detail.contains("strictly sorted"),
+        poison.detail.contains("TypeRowsNotStrictlySorted"),
         "{}",
         poison.detail
     );
@@ -350,7 +652,7 @@ fn compiled_attestation_rejects_unsorted_and_duplicate_module_rows_before_regist
     let mut duplicate = expected.clone();
     duplicate.rows[1] = duplicate.rows[0].clone();
     let (poison, calls) = publish_with_compiled_types(expected, duplicate);
-    assert!(poison.detail.contains("duplicate"), "{}", poison.detail);
+    assert!(poison.detail.contains("DuplicateType"), "{}", poison.detail);
     assert_eq!(calls.lock().unwrap().register, 0);
 }
 
@@ -363,7 +665,7 @@ fn candidate_expectations_must_be_canonical_and_module_dsca_must_recompute() {
     assert!(
         poison
             .detail
-            .contains("expected compiled-type table is not strictly sorted"),
+            .contains("expected compiled-type table/DSCA invalid: TypeRowsNotStrictlySorted"),
         "{}",
         poison.detail
     );
@@ -373,7 +675,7 @@ fn candidate_expectations_must_be_canonical_and_module_dsca_must_recompute() {
     bad_digest.digest = CompiledAttestationDigest([255; 32]);
     let (poison, calls) = publish_with_compiled_types(canonical, bad_digest);
     assert!(
-        poison.detail.contains("DSCA digest mismatch"),
+        poison.detail.contains("CompiledDigestMismatch"),
         "{}",
         poison.detail
     );

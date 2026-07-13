@@ -25,13 +25,13 @@ impl QuarantineRoot {
 pub enum QuarantineError {
     NoFilesystemRoot { target: PathBuf },
     EmptyRoots,
-    Store(StoreError),
+    Store(Box<StoreError>),
 }
 
 impl QuarantineError {
     pub fn store_error(&self) -> Option<&StoreError> {
         match self {
-            Self::Store(error) => Some(error),
+            Self::Store(error) => Some(error.as_ref()),
             Self::NoFilesystemRoot { .. } | Self::EmptyRoots => None,
         }
     }
@@ -54,7 +54,7 @@ impl std::fmt::Display for QuarantineError {
 impl std::error::Error for QuarantineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Store(error) => Some(error),
+            Self::Store(error) => Some(error.as_ref()),
             Self::NoFilesystemRoot { .. } | Self::EmptyRoots => None,
         }
     }
@@ -62,7 +62,7 @@ impl std::error::Error for QuarantineError {
 
 impl From<StoreError> for QuarantineError {
     fn from(value: StoreError) -> Self {
-        Self::Store(value)
+        Self::Store(Box::new(value))
     }
 }
 
