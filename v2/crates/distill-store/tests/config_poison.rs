@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use distill_core::id::AssetUuid;
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
-    ConfigurationPathKey, ConfigurationPoison, ConfigurationPoisonCode, ConfigurationState,
+    ConfigurationPathKey, ConfigurationPoison, ConfigurationPoisonCode,
+    ConfigurationSourceFailureCode, ConfigurationSourcePath, ConfigurationState,
     DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide, PlatformFileIdentity,
 };
 use distill_store::{Store, StoreConfig, StoreError};
@@ -50,6 +51,10 @@ fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
         12
     );
     assert_eq!(ConfigurationPoisonCode::DuplicateTargetName as u16, 13);
+    assert_eq!(
+        ConfigurationPoisonCode::ConfigurationSourceUnavailable as u16,
+        14
+    );
     assert_eq!(ConfigurationPathKey::AssetRoot as u8, 1);
     assert_eq!(ConfigurationPathKey::StatePath as u8, 2);
     assert_eq!(ConfigurationPathKey::SchemaArtifact as u8, 3);
@@ -171,6 +176,13 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
                 normalized_name: "ship".to_owned(),
             },
             ConfigurationPoisonCode::DuplicateTargetName,
+        ),
+        (
+            DscpV1::ConfigurationSourceUnavailable {
+                path: ConfigurationSourcePath::Unix(vec![b'c', 0xff]),
+                failure: ConfigurationSourceFailureCode::Missing,
+            },
+            ConfigurationPoisonCode::ConfigurationSourceUnavailable,
         ),
     ];
     for (reason, expected) in cases {
@@ -298,6 +310,36 @@ fn directory_alias_identity_is_closed_and_lossless_on_both_platforms() {
         assert_eq!(
             DscpV1::from_canonical_detail_bytes(ConfigurationPoisonCode::DirectoryAlias, &bytes)
                 .unwrap(),
+            detail
+        );
+    }
+}
+
+#[test]
+fn unavailable_configuration_source_preserves_raw_paths_and_closed_failures() {
+    assert_eq!(ConfigurationSourceFailureCode::Missing as u16, 1);
+    assert_eq!(ConfigurationSourceFailureCode::PermissionDenied as u16, 2);
+    assert_eq!(ConfigurationSourceFailureCode::InvalidFileType as u16, 3);
+    assert_eq!(ConfigurationSourceFailureCode::IoDataLoss as u16, 4);
+
+    let details = [
+        DscpV1::ConfigurationSourceUnavailable {
+            path: ConfigurationSourcePath::Unix(vec![b'c', 0xff]),
+            failure: ConfigurationSourceFailureCode::PermissionDenied,
+        },
+        DscpV1::ConfigurationSourceUnavailable {
+            path: ConfigurationSourcePath::Windows(vec![b'C' as u16, b':' as u16, 0xd800]),
+            failure: ConfigurationSourceFailureCode::IoDataLoss,
+        },
+    ];
+    for detail in details {
+        let bytes = detail.canonical_detail_bytes();
+        assert_eq!(
+            DscpV1::from_canonical_detail_bytes(
+                ConfigurationPoisonCode::ConfigurationSourceUnavailable,
+                &bytes,
+            )
+            .unwrap(),
             detail
         );
     }

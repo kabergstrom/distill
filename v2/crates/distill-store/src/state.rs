@@ -387,6 +387,7 @@ pub enum ConfigurationPoisonCode {
     DuplicateLineageManifest = 11,
     UnsupportedTargetIdentity = 12,
     DuplicateTargetName = 13,
+    ConfigurationSourceUnavailable = 14,
 }
 
 impl TryFrom<u16> for ConfigurationPoisonCode {
@@ -407,6 +408,7 @@ impl TryFrom<u16> for ConfigurationPoisonCode {
             11 => Ok(Self::DuplicateLineageManifest),
             12 => Ok(Self::UnsupportedTargetIdentity),
             13 => Ok(Self::DuplicateTargetName),
+            14 => Ok(Self::ConfigurationSourceUnavailable),
             unknown => Err(UnknownConfigurationPoisonCode(unknown)),
         }
     }
@@ -430,6 +432,8 @@ pub enum DscpError {
     UnknownPathKey(u8),
     UnknownOwnedPathKind(u8),
     UnknownPlatformFileIdentity(u8),
+    UnknownConfigurationSourcePath(u8),
+    UnknownConfigurationSourceFailure(u16),
     Truncated,
     TrailingBytes,
     InvalidUtf8,
@@ -455,6 +459,21 @@ pub enum ConfigurationPathKey {
     CodegenOutput = 5,
     Quarantine = 6,
     ImportDestination = 7,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigurationSourcePath {
+    Unix(Vec<u8>),
+    Windows(Vec<u16>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ConfigurationSourceFailureCode {
+    Missing = 1,
+    PermissionDenied = 2,
+    InvalidFileType = 3,
+    IoDataLoss = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,6 +560,10 @@ pub enum DscpV1 {
     DuplicateTargetName {
         normalized_name: String,
     },
+    ConfigurationSourceUnavailable {
+        path: ConfigurationSourcePath,
+        failure: ConfigurationSourceFailureCode,
+    },
 }
 
 impl DscpV1 {
@@ -565,6 +588,9 @@ impl DscpV1 {
                 ConfigurationPoisonCode::UnsupportedTargetIdentity
             }
             Self::DuplicateTargetName { .. } => ConfigurationPoisonCode::DuplicateTargetName,
+            Self::ConfigurationSourceUnavailable { .. } => {
+                ConfigurationPoisonCode::ConfigurationSourceUnavailable
+            }
         }
     }
 
@@ -646,6 +672,30 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
             encode_compilation_identity(encoder, observed);
         }
         DscpV1::DuplicateTargetName { normalized_name } => encoder.str(normalized_name),
+        DscpV1::ConfigurationSourceUnavailable { path, failure } => {
+            encode_configuration_source_path(encoder, path);
+            encoder.u16(*failure as u16);
+        }
+    }
+}
+
+fn encode_configuration_source_path(
+    encoder: &mut CanonicalEncoder,
+    path: &ConfigurationSourcePath,
+) {
+    match path {
+        ConfigurationSourcePath::Unix(bytes) => {
+            encoder.u8(1);
+            encoder.u32(u32::try_from(bytes.len()).expect("configuration path exceeds u32"));
+            encoder.raw(bytes);
+        }
+        ConfigurationSourcePath::Windows(units) => {
+            encoder.u8(2);
+            encoder.u32(u32::try_from(units.len()).expect("configuration path exceeds u32"));
+            for unit in units {
+                encoder.u16(*unit);
+            }
+        }
     }
 }
 
@@ -727,6 +777,10 @@ impl<'a> DscpDecoder<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    fn u16(&mut self) -> Result<u16, DscpError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
     fn u64(&mut self) -> Result<u64, DscpError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -782,6 +836,24 @@ impl<'a> DscpDecoder<'a> {
                 unknown => return Err(DscpError::UnknownPlatformFileIdentity(unknown)),
             },
         })
+    }
+
+    fn configuration_source_path(&mut self) -> Result<ConfigurationSourcePath, DscpError> {
+        match self.u8()? {
+            1 => {
+                let len = self.count(1)?;
+                Ok(ConfigurationSourcePath::Unix(self.take(len)?.to_vec()))
+            }
+            2 => {
+                let count = self.count(2)?;
+                Ok(ConfigurationSourcePath::Windows(
+                    (0..count)
+                        .map(|_| self.u16())
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            }
+            unknown => Err(DscpError::UnknownConfigurationSourcePath(unknown)),
+        }
     }
 
     fn compilation_identity(&mut self) -> Result<CompilationIdentity, DscpError> {
@@ -872,6 +944,20 @@ impl<'a> DscpDecoder<'a> {
             ConfigurationPoisonCode::DuplicateTargetName => DscpV1::DuplicateTargetName {
                 normalized_name: self.string()?,
             },
+            ConfigurationPoisonCode::ConfigurationSourceUnavailable => {
+                DscpV1::ConfigurationSourceUnavailable {
+                    path: self.configuration_source_path()?,
+                    failure: match self.u16()? {
+                        1 => ConfigurationSourceFailureCode::Missing,
+                        2 => ConfigurationSourceFailureCode::PermissionDenied,
+                        3 => ConfigurationSourceFailureCode::InvalidFileType,
+                        4 => ConfigurationSourceFailureCode::IoDataLoss,
+                        unknown => {
+                            return Err(DscpError::UnknownConfigurationSourceFailure(unknown))
+                        }
+                    },
+                }
+            }
         })
     }
 }
@@ -886,7 +972,8 @@ fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
         | DscpV1::InvalidParallelism { .. }
         | DscpV1::InvalidBatchReservation { .. }
         | DscpV1::MissingLineageManifest
-        | DscpV1::DuplicateLineageManifest { .. } => {}
+        | DscpV1::DuplicateLineageManifest { .. }
+        | DscpV1::ConfigurationSourceUnavailable { .. } => {}
         DscpV1::NonLoopbackAddress { address } => values.push(address.as_str()),
         DscpV1::DuplicateRootName { normalized_name }
         | DscpV1::DuplicateTargetName { normalized_name } => {
