@@ -922,6 +922,34 @@ impl ConfigurationPoison {
         }
         Ok(())
     }
+
+    /// Select the authoritative defect independently of discovery order.
+    /// Typed facts order by `(code, canonical detail bytes)`; prose only
+    /// chooses a stable representative of an otherwise duplicate fact.
+    pub fn select_canonical(
+        poisons: impl IntoIterator<Item = Self>,
+    ) -> Result<Option<Self>, DscpError> {
+        Ok(Self::canonical_set(poisons)?.into_iter().next())
+    }
+
+    /// Complete canonically ordered set retained for doctor diagnostics.
+    pub fn canonical_set(poisons: impl IntoIterator<Item = Self>) -> Result<Vec<Self>, DscpError> {
+        let mut keyed = poisons
+            .into_iter()
+            .map(|poison| {
+                poison.validate()?;
+                let key = (poison.code as u16, poison.detail.canonical_detail_bytes());
+                Ok((key, poison))
+            })
+            .collect::<Result<Vec<_>, DscpError>>()?;
+        keyed.sort_by(|(left_key, left), (right_key, right)| {
+            left_key
+                .cmp(right_key)
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        keyed.dedup_by(|(left_key, _), (right_key, _)| left_key == right_key);
+        Ok(keyed.into_iter().map(|(_, poison)| poison).collect())
+    }
 }
 
 impl fmt::Display for ConfigurationPoison {

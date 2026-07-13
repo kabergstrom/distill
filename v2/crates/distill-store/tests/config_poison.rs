@@ -253,6 +253,34 @@ fn symmetric_pairs_have_one_canonical_order() {
 }
 
 #[test]
+fn configuration_defects_select_one_authority_and_retain_the_canonical_doctor_set() {
+    let later =
+        ConfigurationPoison::from_reason(&DscpV1::InvalidParallelism { value: 0 }, "parallelism");
+    let first = ConfigurationPoison::from_reason(
+        &DscpV1::NonLoopbackAddress {
+            address: "192.0.2.1:5000".into(),
+        },
+        "network",
+    );
+    let duplicate = ConfigurationPoison::from_reason(
+        &DscpV1::NonLoopbackAddress {
+            address: "192.0.2.1:5000".into(),
+        },
+        "a network diagnostic",
+    );
+
+    let set = ConfigurationPoison::canonical_set([later.clone(), first.clone(), duplicate.clone()])
+        .unwrap();
+    assert_eq!(set.len(), 2);
+    assert_eq!(set[0], duplicate);
+    assert_eq!(set[1], later);
+    assert_eq!(
+        ConfigurationPoison::select_canonical([later, first, duplicate]).unwrap(),
+        Some(set[0].clone())
+    );
+}
+
+#[test]
 fn duplicate_lineage_entries_sort_and_deduplicate_raw_uuid_bytes() {
     let a = AssetUuid([1; 16]);
     let b = AssetUuid([2; 16]);
