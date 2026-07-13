@@ -335,8 +335,6 @@ pub enum FailureFingerprint {
         asset: AssetUuid,
         fingerprint: Box<FailureFingerprint>,
     },
-    /// A tool failed to launch.
-    ToolLaunch { id: String, class: ToolErrorClass },
     /// A required pipeline capability was not registered
     /// (§9's `TraceOp::Capability`): the requested key. Revalidates
     /// against the snapshot's epoch, so the record heals on the first
@@ -422,24 +420,6 @@ pub enum FailureCause {
     /// The trace's terminal entry (an `Observed::Err` op) is the cause.
     Op,
     Local(FailureFingerprint),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolErrorClass {
-    NotExecutable = 0,
-    MissingInterpreter = 1,
-    SpawnDenied = 2,
-}
-
-impl ToolErrorClass {
-    fn from_byte(b: u8) -> Option<ToolErrorClass> {
-        Some(match b {
-            0 => ToolErrorClass::NotExecutable,
-            1 => ToolErrorClass::MissingInterpreter,
-            2 => ToolErrorClass::SpawnDenied,
-            _ => return None,
-        })
-    }
 }
 
 /// A build's outcome as the result record stores it: a success carries
@@ -560,12 +540,6 @@ impl ResultPayload {
                                 out.extend_from_slice(&asset.0);
                                 fp = fingerprint;
                             }
-                            FailureFingerprint::ToolLaunch { id, class } => {
-                                out.push(4);
-                                put_bytes(&mut out, id.as_bytes());
-                                out.push(*class as u8);
-                                break;
-                            }
                             FailureFingerprint::MissingCapability { key } => {
                                 out.push(5);
                                 match key {
@@ -683,10 +657,9 @@ impl ResultPayload {
                                 }
                                 3 => ancestors.push(AssetUuid(r.array16()?)),
                                 4 => {
-                                    let id = r.string()?;
-                                    let class = ToolErrorClass::from_byte(r.u8()?)
-                                        .ok_or_else(|| bad_payload("unknown tool error class"))?;
-                                    break FailureFingerprint::ToolLaunch { id, class };
+                                    return Err(bad_payload(
+                                        "fingerprint tag 4 is permanently reserved",
+                                    ));
                                 }
                                 5 => {
                                     let key = match r.u8()? {

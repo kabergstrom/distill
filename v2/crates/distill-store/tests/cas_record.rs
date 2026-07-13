@@ -7,7 +7,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use distill_store::cas::record::{
     decode_record, encode_record, AuxRow, CapabilityKey, EntryRole, FailureCause,
     FailureFingerprint, KeyKind, LocalFailureClass, OutputRow, Record, RecordKind, ResultOutcome,
-    ResultPayload, ToolErrorClass, RECORD_HEADER_LEN,
+    ResultPayload, RECORD_HEADER_LEN,
 };
 use distill_store::StoreError;
 
@@ -373,14 +373,9 @@ fn failure_outcomes_roundtrip_with_every_fingerprint() {
         },
         FailureFingerprint::Descendant {
             asset: AssetUuid([5u8; 16]),
-            fingerprint: Box::new(FailureFingerprint::ToolLaunch {
-                id: "shaderc".to_owned(),
-                class: ToolErrorClass::MissingInterpreter,
+            fingerprint: Box::new(FailureFingerprint::MissingCapability {
+                key: CapabilityKey::Tool("shaderc".to_owned()),
             }),
-        },
-        FailureFingerprint::ToolLaunch {
-            id: "dxc".to_owned(),
-            class: ToolErrorClass::SpawnDenied,
         },
         FailureFingerprint::MissingCapability {
             key: CapabilityKey::MigrationFn("legacy-v2-to-v3".to_owned()),
@@ -527,6 +522,14 @@ fn failure_cause_and_fingerprint_tag_bytes_are_pinned() {
     assert_eq!(bytes[11], 5, "fingerprint tag: MissingCapability");
     assert_eq!(bytes[12], 4, "capability-key tag: Processor");
     assert_eq!(&bytes[13..29], &[7u8; 16], "the requested input type uuid");
+
+    let mut reserved = bytes;
+    reserved[11] = 4;
+    assert!(matches!(
+        ResultPayload::decode(&reserved),
+        Err(StoreError::BadResultPayload { detail })
+            if detail == "fingerprint tag 4 is permanently reserved"
+    ));
 
     let local = ResultPayload {
         key_kind: KeyKind::Processor,

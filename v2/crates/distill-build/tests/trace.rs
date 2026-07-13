@@ -96,6 +96,27 @@ fn dstr_tool_capability_miss_pins_typed_tool_key() {
 }
 
 #[test]
+fn dstr_tool_lookup_hit_records_the_exact_staged_hash() {
+    let id = "shaderc".to_owned();
+    let staged_hash = [0x5a; 32];
+    let actual = trace_canonical_bytes(&[TraceOp::Tool {
+        id: id.clone(),
+        observed: Observed::Ok(staged_hash),
+    }]);
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"DSTR");
+    expected.push(1);
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.push(4);
+    expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    expected.extend_from_slice(id.as_bytes());
+    expected.push(1);
+    expected.extend_from_slice(&staged_hash);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn revalidation_compares_labeled_outcomes_in_order() {
     let asset = AssetUuid([1; 16]);
     let hash = ContentHash([2; 32]);
@@ -164,9 +185,8 @@ fn failure_cause_grammar_is_checked() {
     .is_err());
     let op = TraceOp::Tool {
         id: "shaderc".into(),
-        observed: Observed::Err(StableFailureFingerprint::ToolLaunch {
-            id: "shaderc".into(),
-            class: ToolErrorClass::NotExecutable,
+        observed: Observed::Err(StableFailureFingerprint::MissingCapability {
+            key: CapabilityKey::Tool("shaderc".into()),
         }),
     };
     assert!(FailureRecord {

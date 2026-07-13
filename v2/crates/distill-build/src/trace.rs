@@ -18,8 +18,19 @@ pub enum Observed<T> {
     Err(StableFailureFingerprint),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ToolErrorClass {
+/// Diagnostic for an execution failure after a successful, traced tool
+/// lookup. This type is intentionally absent from
+/// [`StableFailureFingerprint`]: launch outcomes are transient and an
+/// attempted build/import result carrying one must be discarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolLaunchDiagnostic {
+    pub id: String,
+    pub staged_hash: [u8; 32],
+    pub class: ToolLaunchFailureClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolLaunchFailureClass {
     NotExecutable,
     MissingInterpreter,
     SpawnDenied,
@@ -312,10 +323,6 @@ pub enum StableFailureFingerprint {
     Descendant {
         asset: AssetUuid,
         fingerprint: Box<Self>,
-    },
-    ToolLaunch {
-        id: String,
-        class: ToolErrorClass,
     },
     RawFile {
         op: RawFileOp,
@@ -893,11 +900,6 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
             e.enum_variant(3);
             e.raw(&asset.0);
             encode_failure(e, fingerprint, depth + 1);
-        }
-        StableFailureFingerprint::ToolLaunch { id, class } => {
-            e.enum_variant(4);
-            e.str(id);
-            e.u8(*class as u8);
         }
         StableFailureFingerprint::RawFile { op, subject, class } => {
             e.enum_variant(5);
