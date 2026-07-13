@@ -301,3 +301,132 @@ fn dsta_changes_only_with_the_exact_tag_projection() {
         epoch
     );
 }
+
+#[test]
+fn embedded_bootstrap_spec_is_closed_canonical_and_byte_pinned() {
+    let spec = BootstrapControlSpecV1::embedded().unwrap();
+    assert_eq!(spec.type_uuids(), BOOTSTRAP_CONTROL_TYPE_UUIDS);
+    assert_eq!(BOOTSTRAP_CONTROL_SPEC_V1_BYTES.len(), 6_633);
+    assert_eq!(
+        *blake3::hash(BOOTSTRAP_CONTROL_SPEC_V1_BYTES).as_bytes(),
+        [
+            224, 249, 146, 111, 7, 217, 173, 146, 202, 8, 99, 38, 123, 147, 63, 164, 124, 126, 194,
+            112, 37, 56, 212, 238, 221, 220, 211, 95, 192, 45, 118, 136,
+        ]
+    );
+    assert!(BOOTSTRAP_CONTROL_TYPE_UUIDS
+        .iter()
+        .all(|uuid| is_bootstrap_control_type(*uuid)));
+}
+
+#[test]
+fn bootstrap_spec_requires_complete_blob_and_back_reference_facts() {
+    let spec = BootstrapControlSpecV1::embedded().unwrap();
+    for symbol in [
+        BootstrapControlSymbol::Migration,
+        BootstrapControlSymbol::DirectoryImportRules,
+    ] {
+        let row = spec.0.iter().find(|row| row.symbol == symbol).unwrap();
+        assert!(row
+            .registry_extras
+            .rows
+            .iter()
+            .any(|extra| matches!(extra.fact, RegistryExtraFact::Blob)));
+        assert!(row
+            .registry_extras
+            .rows
+            .iter()
+            .any(|extra| matches!(extra.fact, RegistryExtraFact::BackReference { .. })));
+    }
+
+    let mut without_blob = spec.clone();
+    without_blob
+        .0
+        .iter_mut()
+        .find(|row| row.symbol == BootstrapControlSymbol::Migration)
+        .unwrap()
+        .registry_extras
+        .rows
+        .retain(|extra| !matches!(extra.fact, RegistryExtraFact::Blob));
+    assert_eq!(
+        without_blob.encode(),
+        Err(BootstrapSpecError::MissingRegistryFact("Blob"))
+    );
+
+    let mut without_backrefs = spec;
+    without_backrefs
+        .0
+        .iter_mut()
+        .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
+        .unwrap()
+        .registry_extras
+        .rows
+        .retain(|extra| !matches!(extra.fact, RegistryExtraFact::BackReference { .. }));
+    assert_eq!(
+        without_backrefs.encode(),
+        Err(BootstrapSpecError::MissingRegistryFact("BackReference"))
+    );
+}
+
+#[test]
+fn bootstrap_spec_rejects_truncation_unknown_symbols_and_uuid_drift() {
+    assert_eq!(
+        BootstrapControlSpecV1::parse(&BOOTSTRAP_CONTROL_SPEC_V1_BYTES[..10]),
+        Err(BootstrapSpecError::Truncated)
+    );
+    let mut unknown = BOOTSTRAP_CONTROL_SPEC_V1_BYTES.to_vec();
+    unknown[5] = 99;
+    assert_eq!(
+        BootstrapControlSpecV1::parse(&unknown),
+        Err(BootstrapSpecError::UnknownSymbol(99))
+    );
+    let mut wrong_uuid = BOOTSTRAP_CONTROL_SPEC_V1_BYTES.to_vec();
+    wrong_uuid[6] ^= 1;
+    assert!(matches!(
+        BootstrapControlSpecV1::parse(&wrong_uuid),
+        Err(BootstrapSpecError::SymbolUuidMismatch { .. })
+    ));
+}
+
+#[test]
+fn full_bootstrap_authority_compares_native_rows_after_dsb_facts() {
+    let spec = BootstrapControlSpecV1::embedded().unwrap();
+    let rows = spec
+        .0
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            CompiledTypeRow::new(
+                row.type_uuid,
+                row.logical_hash,
+                [index as u8; 32],
+                true,
+                row.registry_extras.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let expected = BootstrapControlTableV1::canonical(rows).unwrap();
+    validate_bootstrap_authority(expected.rows(), &expected, BundleFormatVersion::V1).unwrap();
+    let mut changed = expected.rows().to_vec();
+    changed[0].native_layout_digest[0] ^= 1;
+    assert!(validate_bootstrap_authority(&changed, &expected, BundleFormatVersion::V1).is_err());
+
+    let runtime = compiled(250, RegistryExtrasV1::default());
+    let mut all_rows = expected.rows().to_vec();
+    all_rows.push(runtime.clone());
+    let all = CompiledTypeTable::canonical(all_rows).unwrap();
+    let projected = all
+        .project_with_bootstrap(&std::collections::BTreeSet::from([runtime.type_uuid]))
+        .unwrap();
+    assert_eq!(projected.rows.len(), BOOTSTRAP_CONTROL_COUNT + 1);
+    assert!(projected
+        .rows
+        .iter()
+        .all(|row| row.type_uuid == runtime.type_uuid || is_bootstrap_control_type(row.type_uuid)));
+    assert_eq!(
+        all.project_with_bootstrap(&std::collections::BTreeSet::from([TypeUuid([249; 16])]))
+            .unwrap_err(),
+        AttestationError::ProjectionMissingType(TypeUuid([249; 16]))
+    );
+}

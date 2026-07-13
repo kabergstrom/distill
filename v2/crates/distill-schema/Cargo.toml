@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
+distill-asset = { path = "../distill-asset" }
 distill-core = { path = "../distill-core" }
+distill-wire = { path = "../distill-wire" }
 # The schema model itself is SHARED code (§5, §19): it lives in the engine
 # workspace so source-walk, the engine, and distill agree byte-for-byte.
 # This crate holds only the daemon-side registry on top of it.
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
+unicode-normalization = { workspace = true }

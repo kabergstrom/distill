@@ -931,15 +931,15 @@ fn enum_authored_arm(variant: &VariantInfo) -> TokenStream2 {
         let field_name = &field.name;
         let binding = &field.binding;
         quote! {
-            payload.insert(#field_name.to_owned(), ::distill_asset::AssetReflect::to_authored(#binding));
+            __distill_authored_payload.insert(#field_name.to_owned(), ::distill_asset::AssetReflect::to_authored(#binding));
         }
     });
     quote! {
         #pattern => {
-            let mut payload = ::std::collections::BTreeMap::new();
+            let mut __distill_authored_payload = ::std::collections::BTreeMap::new();
             #(#fields)*
             let mut value = ::std::collections::BTreeMap::new();
-            value.insert(#name.to_owned(), ::distill_asset::AuthoredValue::Object(payload));
+            value.insert(#name.to_owned(), ::distill_asset::AuthoredValue::Object(__distill_authored_payload));
             ::distill_asset::AuthoredValue::Object(value)
         }
     }

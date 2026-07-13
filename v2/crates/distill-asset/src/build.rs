@@ -264,13 +264,22 @@ impl LogicalBuilder {
 }
 
 pub fn logical_hash<T: AssetReflect>() -> LogicalHash {
-    let mut builder = LogicalBuilder::default();
-    T::logical(&mut builder);
+    let bytes = logical_schema_bytes::<T>();
     let mut hash = blake3::Hasher::new();
     hash.update(b"DSLH");
     hash.update(&[1]);
-    hash.update(&builder.bytes);
+    hash.update(&bytes);
     LogicalHash(*hash.finalize().as_bytes())
+}
+
+/// Exact canonical logical SchemaGraph bytes emitted by the macro walk.
+///
+/// Format-release generators need the expanded bytes, not merely DSLH, so
+/// that the checked-in authority can be audited and independently rehashed.
+pub fn logical_schema_bytes<T: AssetReflect>() -> Vec<u8> {
+    let mut builder = LogicalBuilder::default();
+    T::logical(&mut builder);
+    builder.bytes
 }
 
 pub fn build_descriptor<T>(metadata: AssetMetadata) -> AssetRuntimeDescriptor
