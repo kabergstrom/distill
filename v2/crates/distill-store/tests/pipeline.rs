@@ -16,7 +16,8 @@ use distill_store::pipeline::{
     TypeAuthorityState, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    PipelineEpoch, PipelineState, PipelineUnavailable, Registration, RegistrationKind,
+    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+    PipelineState, PipelineUnavailable, Registration, RegistrationKind,
 };
 use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
 
@@ -89,6 +90,16 @@ fn h(n: u8) -> LogicalHash {
 
 const T: TypeUuid = TypeUuid([4u8; 16]);
 
+fn candidate_poison(message: &str) -> PipelinePoison {
+    PipelinePoison::new(
+        PipelinePoisonCode::CandidateRegistration,
+        PipelinePoisonOrigin::CandidateOpen,
+        CleanupDisposition::CleanedAndClosed,
+        message,
+    )
+    .unwrap()
+}
+
 // ---- pipeline_state row ----
 
 #[test]
@@ -128,13 +139,15 @@ fn a_rejected_candidate_still_publishes_as_poison() {
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
     store
-        .input_transaction(|txn| txn.publish_pipeline_poison("dup processor id `tex`"))
+        .input_transaction(|txn| {
+            txn.publish_pipeline_poison(&candidate_poison("dup processor id `tex`"))
+        })
         .unwrap();
 
     let state = store.pipeline_state().unwrap().expect("still published");
     match &state {
         PipelineState::Poisoned { error, last_good } => {
-            assert!(error.error.contains("dup processor id"));
+            assert!(error.message.contains("dup processor id"));
             // last_good is residency bookkeeping only — present, but
             // epoch() still refuses.
             let last: &Arc<PipelineEpoch> = last_good.as_ref().expect("prior epoch recorded");
@@ -149,7 +162,9 @@ fn a_rejected_candidate_still_publishes_as_poison() {
 fn poison_with_no_prior_epoch_has_no_last_good() {
     let (_d, mut store) = store();
     store
-        .input_transaction(|txn| txn.publish_pipeline_poison("first candidate invalid"))
+        .input_transaction(|txn| {
+            txn.publish_pipeline_poison(&candidate_poison("first candidate invalid"))
+        })
         .unwrap();
     match store.pipeline_state().unwrap().expect("published") {
         PipelineState::Poisoned { last_good, .. } => assert!(last_good.is_none()),
@@ -165,7 +180,7 @@ fn the_next_successful_swap_publishes_over_the_poison() {
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
     store
-        .input_transaction(|txn| txn.publish_pipeline_poison("bad candidate"))
+        .input_transaction(|txn| txn.publish_pipeline_poison(&candidate_poison("bad candidate")))
         .unwrap();
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(7)))

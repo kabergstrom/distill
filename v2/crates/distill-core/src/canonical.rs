@@ -40,6 +40,8 @@ pub const DSLF: [u8; 4] = *b"DSLF";
 pub const DSCP: [u8; 4] = *b"DSCP";
 /// Typed version-global poison identity (§7, §13, §17).
 pub const DSVP: [u8; 4] = *b"DSVP";
+/// Typed pipeline-poison identity (§3, §13, §17).
+pub const DSPP: [u8; 4] = *b"DSPP";
 
 /// Append-only encoder for the canonical record encoding. Composites encode
 /// their fields in declaration order by calling these methods; there is no

@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -147,11 +147,19 @@ CREATE TABLE pipeline_state (
     compiled_types     BLOB,
     target_set_hash    BLOB,
     input_version      INTEGER NOT NULL,
-    poison             TEXT,
+    poison_code        INTEGER CHECK (poison_code BETWEEN 1 AND 8),
+    poison_origin      INTEGER CHECK (poison_origin BETWEEN 1 AND 2),
+    poison_cleanup     INTEGER CHECK (poison_cleanup BETWEEN 0 AND 7),
+    poison_identity    BLOB,
+    poison_message     TEXT,
     acceptance_candidate_dylib_hash BLOB,
     acceptance_candidate_compiled_types BLOB,
     acceptance_candidate_target_set_hash BLOB,
-    acceptance_manifest_hash BLOB
+    acceptance_manifest_hash BLOB,
+    CHECK ((poison_code IS NULL AND poison_origin IS NULL AND poison_cleanup IS NULL
+            AND poison_identity IS NULL AND poison_message IS NULL)
+        OR (poison_code IS NOT NULL AND poison_origin IS NOT NULL AND poison_cleanup IS NOT NULL
+            AND poison_identity IS NOT NULL AND poison_message IS NOT NULL))
 );
 CREATE TABLE registrations (
     kind    INTEGER NOT NULL,

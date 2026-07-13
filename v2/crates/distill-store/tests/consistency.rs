@@ -14,8 +14,8 @@ use distill_store::pipeline::{
     VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    PipelineEpoch, PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison,
-    VersionPoisonV1,
+    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+    PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -33,6 +33,16 @@ fn version_poison(message: &str) -> VersionPoison {
             },
             failure: SkeletonFailureCode::IncompleteAssetIdentity,
         },
+        message,
+    )
+    .unwrap()
+}
+
+fn pipeline_poison(message: &str) -> PipelinePoison {
+    PipelinePoison::new(
+        PipelinePoisonCode::CandidateRegistration,
+        PipelinePoisonOrigin::CandidateOpen,
+        CleanupDisposition::CleanedAndClosed,
         message,
     )
     .unwrap()
@@ -249,7 +259,7 @@ fn pure_metadata_reads_survive_a_pipeline_poison() {
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
             txn.set_path_entry("a.bundle", root, AssetUuid([2u8; 16]))?;
-            txn.publish_pipeline_poison("candidate rejected: duplicate type uuid")
+            txn.publish_pipeline_poison(&pipeline_poison("candidate rejected: duplicate type uuid"))
         })
         .unwrap();
 

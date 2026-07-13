@@ -244,19 +244,25 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, load_policy_digest, compiled_types,
-                 target_set_hash, input_version, poison,
+                 target_set_hash, input_version,
+                 poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
                  acceptance_candidate_compiled_types,
                  acceptance_candidate_target_set_hash,
                  acceptance_manifest_hash
-             ) VALUES (0, ?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)
+             ) VALUES (0, ?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                dylib_hash = excluded.dylib_hash,
                load_policy_digest = excluded.load_policy_digest,
                compiled_types = excluded.compiled_types,
                target_set_hash = excluded.target_set_hash,
                input_version = excluded.input_version,
-               poison = NULL,
+               poison_code = NULL,
+               poison_origin = NULL,
+               poison_cleanup = NULL,
+               poison_identity = NULL,
+               poison_message = NULL,
                acceptance_candidate_dylib_hash = NULL,
                acceptance_candidate_compiled_types = NULL,
                acceptance_candidate_target_set_hash = NULL,
@@ -302,15 +308,21 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, load_policy_digest, compiled_types,
-                 target_set_hash, input_version, poison,
+                 target_set_hash, input_version,
+                 poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
                  acceptance_candidate_compiled_types,
                  acceptance_candidate_target_set_hash,
                  acceptance_manifest_hash
-             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, NULL, ?2, ?3, ?4, ?5)
+             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, NULL,
+                       ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
                input_version = excluded.input_version,
-               poison = NULL,
+               poison_code = NULL,
+               poison_origin = NULL,
+               poison_cleanup = NULL,
+               poison_identity = NULL,
+               poison_message = NULL,
                acceptance_candidate_dylib_hash = excluded.acceptance_candidate_dylib_hash,
                acceptance_candidate_compiled_types =
                    excluded.acceptance_candidate_compiled_types,
@@ -347,24 +359,40 @@ impl InputTxn<'_> {
     /// pipeline poison naming the error. The prior epoch's identity
     /// columns are retained as `last_good` residency bookkeeping — never
     /// served as this version's code.
-    pub fn publish_pipeline_poison(&mut self, error: &str) -> Result<(), StoreError> {
+    pub fn publish_pipeline_poison(&mut self, poison: &PipelinePoison) -> Result<(), StoreError> {
+        poison
+            .validate()
+            .map_err(StoreError::InvalidPipelinePoison)?;
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, load_policy_digest, compiled_types,
-                 target_set_hash, input_version, poison,
+                 target_set_hash, input_version,
+                 poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
                  acceptance_candidate_compiled_types,
                  acceptance_candidate_target_set_hash,
                  acceptance_manifest_hash
-             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, ?2, NULL, NULL, NULL, NULL)
+             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6,
+                       NULL, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                input_version = excluded.input_version,
-               poison = excluded.poison,
+               poison_code = excluded.poison_code,
+               poison_origin = excluded.poison_origin,
+               poison_cleanup = excluded.poison_cleanup,
+               poison_identity = excluded.poison_identity,
+               poison_message = excluded.poison_message,
                acceptance_candidate_dylib_hash = NULL,
                acceptance_candidate_compiled_types = NULL,
                acceptance_candidate_target_set_hash = NULL,
                acceptance_manifest_hash = NULL",
-            rusqlite::params![self.version().0 as i64, error],
+            rusqlite::params![
+                self.version().0 as i64,
+                poison.code as u16,
+                poison.origin as u16,
+                poison.cleanup as u16,
+                poison.identity.as_slice(),
+                poison.message,
+            ],
         )?;
         self.txn
             .execute("DELETE FROM pipeline_candidate_schema_registry", [])?;
@@ -1512,6 +1540,10 @@ impl Store {
             Option<Vec<u8>>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<Vec<u8>>,
             Option<String>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
@@ -1522,7 +1554,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT dylib_hash, load_policy_digest, compiled_types,
-                        target_set_hash, poison,
+                        target_set_hash, poison_code, poison_origin, poison_cleanup,
+                        poison_identity, poison_message,
                         acceptance_candidate_dylib_hash,
                         acceptance_candidate_compiled_types,
                         acceptance_candidate_target_set_hash,
@@ -1540,6 +1573,10 @@ impl Store {
                         r.get(6)?,
                         r.get(7)?,
                         r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
                     ))
                 },
             )
@@ -1549,7 +1586,11 @@ impl Store {
             lpd,
             compiled_types,
             target_set_hash,
-            poison,
+            poison_code,
+            poison_origin,
+            poison_cleanup,
+            poison_identity,
+            poison_message,
             candidate_dylib,
             candidate_compiled_types,
             candidate_target_set,
@@ -1608,6 +1649,44 @@ impl Store {
             || candidate_compiled_types.is_some()
             || candidate_target_set.is_some()
             || stored_manifest_hash.is_some();
+        let poison = match (
+            poison_code,
+            poison_origin,
+            poison_cleanup,
+            poison_identity,
+            poison_message,
+        ) {
+            (None, None, None, None, None) => None,
+            (Some(code), Some(origin), Some(cleanup), Some(identity), Some(message)) => Some(
+                PipelinePoison::from_wire(
+                    u16::try_from(code).map_err(|_| {
+                        StoreError::InvalidPipelinePoison(
+                            crate::state::PipelinePoisonError::UnknownCode(code as u16),
+                        )
+                    })?,
+                    u16::try_from(origin).map_err(|_| {
+                        StoreError::InvalidPipelinePoison(
+                            crate::state::PipelinePoisonError::UnknownOrigin(origin as u16),
+                        )
+                    })?,
+                    u16::try_from(cleanup).map_err(|_| {
+                        StoreError::InvalidPipelinePoison(
+                            crate::state::PipelinePoisonError::UnknownCleanup(cleanup as u16),
+                        )
+                    })?,
+                    exact_blob32(identity, "pipeline-poison identity")?,
+                    message,
+                )
+                .map_err(StoreError::InvalidPipelinePoison)?,
+            ),
+            _ => {
+                return Err(invalid_manifest(
+                    None,
+                    "pipeline poison columns are incomplete",
+                ));
+            }
+        };
+
         if poison.is_some() && has_candidate {
             return Err(invalid_manifest(
                 None,
@@ -1654,7 +1733,7 @@ impl Store {
                 None => return Ok(None),
             },
             Some(error) => PipelineState::Poisoned {
-                error: PipelinePoison { error },
+                error,
                 last_good: epoch,
             },
         }))

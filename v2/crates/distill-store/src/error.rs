@@ -31,6 +31,8 @@ pub enum StoreError {
     Poisoned { error: String },
     /// Persisted DSVP bytes were malformed or non-canonical.
     InvalidVersionPoison(crate::state::VersionPoisonError),
+    /// Persisted DSPP fields were unknown, noncanonical, or inconsistent.
+    InvalidPipelinePoison(crate::state::PipelinePoisonError),
     /// A path resolvable in more than one asset root (§13/§18): an
     /// ambiguity error, never a tiebreak.
     AmbiguousPath { path: String, roots: Vec<String> },
@@ -198,6 +200,7 @@ impl fmt::Display for StoreError {
             ),
             StoreError::Poisoned { error } => write!(f, "version poison: {error}"),
             StoreError::InvalidVersionPoison(error) => error.fmt(f),
+            StoreError::InvalidPipelinePoison(error) => error.fmt(f),
             StoreError::AmbiguousPath { path, roots } => write!(
                 f,
                 "path `{path}` resolves in more than one asset root: {}",
@@ -379,6 +382,8 @@ impl std::error::Error for StoreError {
             StoreError::Sqlite(e) => Some(e),
             StoreError::Io { source, .. } => Some(source),
             StoreError::InvalidTargetSet(error) => Some(error),
+            StoreError::InvalidPipelinePoison(error) => Some(error),
+            StoreError::InvalidVersionPoison(error) => Some(error),
             _ => None,
         }
     }

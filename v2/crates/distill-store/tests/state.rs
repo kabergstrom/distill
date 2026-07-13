@@ -10,9 +10,10 @@ use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::id::TypeUuid;
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
-    load_policy_digest, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, DscpV1,
-    InputVersion, MemoSeq, OperationKind, PipelineEpoch, PipelinePoison, PipelineState,
-    Registration, RegistrationKind, SnapshotStamp, StoreInstanceId,
+    load_policy_digest, CleanupDisposition, ConfigurationEpoch, ConfigurationPoison,
+    ConfigurationState, DscpV1, InputVersion, MemoSeq, OperationKind, PipelineEpoch,
+    PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin, PipelineState, Registration,
+    RegistrationKind, SnapshotStamp, StoreInstanceId,
 };
 
 fn epoch() -> Arc<PipelineEpoch> {
@@ -31,9 +32,13 @@ fn epoch() -> Arc<PipelineEpoch> {
 }
 
 fn poison() -> PipelinePoison {
-    PipelinePoison {
-        error: "duplicate processor id `tex-compress`".to_owned(),
-    }
+    PipelinePoison::new(
+        PipelinePoisonCode::CandidateRegistration,
+        PipelinePoisonOrigin::CandidateOpen,
+        CleanupDisposition::CleanedAndClosed,
+        "duplicate processor id `tex-compress`",
+    )
+    .unwrap()
 }
 
 fn configuration() -> Arc<ConfigurationEpoch> {

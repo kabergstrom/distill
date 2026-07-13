@@ -22,7 +22,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use distill_core::attestation::CompiledAttestationDigest;
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSVP};
+use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetHash};
 use ngp_schema::identity::CompilationIdentity;
@@ -183,12 +183,183 @@ pub struct SchemaAcceptanceRequired {
     pub mismatches: Vec<SchemaRegistryMismatch>,
 }
 
-/// The named failure that kept a candidate epoch from publishing (§3,
-/// §13): identity checks, registration, configuration validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum PipelinePoisonCode {
+    CandidateOpen = 1,
+    CandidateAttestation = 2,
+    CandidateRegistration = 3,
+    CandidateValidation = 4,
+    CandidateCleanup = 5,
+    PublishedCallbackPanic = 6,
+    PublishedCallbackRejected = 7,
+    PublishedCleanup = 8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum PipelinePoisonOrigin {
+    CandidateOpen = 1,
+    PublishedRuntime = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum CleanupDisposition {
+    None = 0,
+    CleanedAndClosed = 1,
+    RegistrationCleanupFailed = 2,
+    ModuleUnloadFailed = 3,
+    TokenPoisoned = 4,
+    TokenPinned = 5,
+    DlcloseFailed = 6,
+    PublishedEpochLeaked = 7,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelinePoison {
-    pub error: String,
+    pub code: PipelinePoisonCode,
+    pub origin: PipelinePoisonOrigin,
+    pub cleanup: CleanupDisposition,
+    pub identity: [u8; 32],
+    pub message: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelinePoisonError {
+    UnknownCode(u16),
+    UnknownOrigin(u16),
+    UnknownCleanup(u16),
+    InvalidMatrix,
+    IdentityMismatch,
+}
+
+impl PipelinePoison {
+    pub fn new(
+        code: PipelinePoisonCode,
+        origin: PipelinePoisonOrigin,
+        cleanup: CleanupDisposition,
+        message: impl Into<String>,
+    ) -> Result<Self, PipelinePoisonError> {
+        validate_pipeline_poison_matrix(code, origin, cleanup)?;
+        Ok(Self {
+            code,
+            origin,
+            cleanup,
+            identity: pipeline_poison_identity(code, origin, cleanup),
+            message: message.into(),
+        })
+    }
+
+    pub fn from_wire(
+        code: u16,
+        origin: u16,
+        cleanup: u16,
+        identity: [u8; 32],
+        message: impl Into<String>,
+    ) -> Result<Self, PipelinePoisonError> {
+        let value = Self::new(
+            PipelinePoisonCode::try_from(code)?,
+            PipelinePoisonOrigin::try_from(origin)?,
+            CleanupDisposition::try_from(cleanup)?,
+            message,
+        )?;
+        if value.identity != identity {
+            return Err(PipelinePoisonError::IdentityMismatch);
+        }
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), PipelinePoisonError> {
+        validate_pipeline_poison_matrix(self.code, self.origin, self.cleanup)?;
+        if self.identity != pipeline_poison_identity(self.code, self.origin, self.cleanup) {
+            return Err(PipelinePoisonError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn pipeline_poison_identity(
+    code: PipelinePoisonCode,
+    origin: PipelinePoisonOrigin,
+    cleanup: CleanupDisposition,
+) -> [u8; 32] {
+    let mut encoder = CanonicalEncoder::new();
+    encoder.raw(&DSPP);
+    encoder.u8(1);
+    encoder.u16(code as u16);
+    encoder.u16(origin as u16);
+    encoder.u16(cleanup as u16);
+    *blake3::hash(&encoder.into_bytes()).as_bytes()
+}
+
+fn validate_pipeline_poison_matrix(
+    code: PipelinePoisonCode,
+    origin: PipelinePoisonOrigin,
+    cleanup: CleanupDisposition,
+) -> Result<(), PipelinePoisonError> {
+    let valid = match origin {
+        PipelinePoisonOrigin::CandidateOpen => match code {
+            PipelinePoisonCode::CandidateOpen
+            | PipelinePoisonCode::CandidateAttestation
+            | PipelinePoisonCode::CandidateRegistration
+            | PipelinePoisonCode::CandidateValidation => matches!(
+                cleanup,
+                CleanupDisposition::None | CleanupDisposition::CleanedAndClosed
+            ),
+            PipelinePoisonCode::CandidateCleanup => matches!(
+                cleanup,
+                CleanupDisposition::RegistrationCleanupFailed
+                    | CleanupDisposition::ModuleUnloadFailed
+                    | CleanupDisposition::TokenPoisoned
+                    | CleanupDisposition::TokenPinned
+                    | CleanupDisposition::DlcloseFailed
+            ),
+            PipelinePoisonCode::PublishedCallbackPanic
+            | PipelinePoisonCode::PublishedCallbackRejected
+            | PipelinePoisonCode::PublishedCleanup => false,
+        },
+        PipelinePoisonOrigin::PublishedRuntime => {
+            matches!(
+                code,
+                PipelinePoisonCode::PublishedCallbackPanic
+                    | PipelinePoisonCode::PublishedCallbackRejected
+                    | PipelinePoisonCode::PublishedCleanup
+            ) && cleanup == CleanupDisposition::PublishedEpochLeaked
+        }
+    };
+    valid
+        .then_some(())
+        .ok_or(PipelinePoisonError::InvalidMatrix)
+}
+
+macro_rules! pipeline_poison_try_from {
+    ($type:ty, $error:ident, {$($value:literal => $variant:ident),+ $(,)?}) => {
+        impl TryFrom<u16> for $type {
+            type Error = PipelinePoisonError;
+            fn try_from(value: u16) -> Result<Self, Self::Error> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    other => Err(PipelinePoisonError::$error(other)),
+                }
+            }
+        }
+    };
+}
+
+pipeline_poison_try_from!(PipelinePoisonCode, UnknownCode, {
+    1 => CandidateOpen, 2 => CandidateAttestation, 3 => CandidateRegistration,
+    4 => CandidateValidation, 5 => CandidateCleanup, 6 => PublishedCallbackPanic,
+    7 => PublishedCallbackRejected, 8 => PublishedCleanup,
+});
+pipeline_poison_try_from!(PipelinePoisonOrigin, UnknownOrigin, {
+    1 => CandidateOpen, 2 => PublishedRuntime,
+});
+pipeline_poison_try_from!(CleanupDisposition, UnknownCleanup, {
+    0 => None, 1 => CleanedAndClosed, 2 => RegistrationCleanupFailed,
+    3 => ModuleUnloadFailed, 4 => TokenPoisoned, 5 => TokenPinned,
+    6 => DlcloseFailed, 7 => PublishedEpochLeaked,
+});
 
 /// Snapshot-pinned identity of a validated configuration generation.
 /// Full values are owned by the daemon configuration layer; the store
@@ -489,11 +660,19 @@ impl std::error::Error for ConfigurationPoison {}
 
 impl fmt::Display for PipelinePoison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pipeline poison: {}", self.error)
+        write!(f, "pipeline poison: {}", self.message)
     }
 }
 
 impl std::error::Error for PipelinePoison {}
+
+impl fmt::Display for PipelinePoisonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid pipeline poison: {self:?}")
+    }
+}
+
+impl std::error::Error for PipelinePoisonError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
