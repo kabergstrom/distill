@@ -3,13 +3,16 @@
 //! never overwrite, derived-output assertion verification, wire trees as
 //! first-class records, and segment rolling.
 
-use distill_core::id::{AssetUuid, ContentHash};
+use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
 use distill_store::cas::manifest::{read_current, write_current, GenerationManifest, SegmentKind};
 use distill_store::cas::record::{
     decode_record, CapabilityKey, FailureCause, FailureFingerprint, KeyKind, LocalFailureClass,
     ResultOutcome,
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::state::{
+    ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -19,6 +22,21 @@ fn store() -> (tempfile::TempDir, Store) {
 }
 
 const PARENT: AssetUuid = AssetUuid([7u8; 16]);
+
+fn version_poison(message: &str) -> VersionPoison {
+    VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: ReadableBundleSource {
+                root_name: "main".into(),
+                normalized_path: "broken.bundle".into(),
+                file_hash: BundleFileHash([9; 32]),
+            },
+            failure: SkeletonFailureCode::IncompleteAssetIdentity,
+        },
+        message,
+    )
+    .unwrap()
+}
 
 fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
     BuildCommit {
@@ -421,7 +439,10 @@ fn resolve_child_is_namespace_facing_under_version_poison() {
     let (_d, mut store) = store();
     let child = declare_child(&mut store, PARENT, "normals");
     store
-        .input_transaction(|txn| txn.set_version_poison(Some("collision")))
+        .input_transaction(|txn| {
+            let poison = version_poison("collision");
+            txn.set_version_poison(Some(&poison))
+        })
         .unwrap();
     assert!(matches!(
         store.resolve_child(child),

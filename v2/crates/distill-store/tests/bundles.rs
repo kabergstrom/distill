@@ -3,18 +3,36 @@
 //! records with selector indexes, the schema cache — and the two poison
 //! shapes: bundle-scoped rows and the version-global poison.
 
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{
     AssetRecord, BundleMeta, DepKind, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
     SkeletonEntry,
 };
 use distill_store::files::RootId;
+use distill_store::state::{
+    ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
     (dir, s)
+}
+
+fn version_poison(message: &str) -> VersionPoison {
+    VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: ReadableBundleSource {
+                root_name: "main".into(),
+                normalized_path: "broken.bundle".into(),
+                file_hash: BundleFileHash([9; 32]),
+            },
+            failure: SkeletonFailureCode::IncompleteAssetIdentity,
+        },
+        message,
+    )
+    .unwrap()
 }
 
 fn bundle_meta(root: RootId, n: u8) -> BundleMeta {
@@ -544,7 +562,8 @@ fn version_poison_is_global_and_uniform() {
     seed(&mut store);
     store
         .input_transaction(|txn| {
-            txn.set_version_poison(Some("uuid 0a… authored twice: tex/1.bundle, tex/9.bundle"))
+            let poison = version_poison("uuid 0a… authored twice: tex/1.bundle, tex/9.bundle");
+            txn.set_version_poison(Some(&poison))
         })
         .unwrap();
 

@@ -4,7 +4,7 @@
 //! versions, and the poison classifications compose.
 
 use distill_core::attestation::CompiledAttestationDigest;
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
@@ -13,11 +13,29 @@ use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
     VerifiedSchemaLineageManifest,
 };
-use distill_store::state::{PipelineEpoch, PipelineState};
+use distill_store::state::{
+    PipelineEpoch, PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison,
+    VersionPoisonV1,
+};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
     StoreConfig::new(dir.path().join(".distill"))
+}
+
+fn version_poison(message: &str) -> VersionPoison {
+    VersionPoison::new(
+        VersionPoisonV1::IncompleteSkeleton {
+            source: ReadableBundleSource {
+                root_name: "main".into(),
+                normalized_path: "broken.bundle".into(),
+                file_hash: BundleFileHash([9; 32]),
+            },
+            failure: SkeletonFailureCode::IncompleteAssetIdentity,
+        },
+        message,
+    )
+    .unwrap()
 }
 
 fn commit(store: &mut Store, key: u8) {
@@ -270,7 +288,8 @@ fn version_poison_and_pipeline_poison_are_distinct_gates() {
                 schema_registry: std::collections::BTreeMap::new(),
                 registrations: vec![],
             })?;
-            txn.set_version_poison(Some("identity collision"))
+            let poison = version_poison("identity collision");
+            txn.set_version_poison(Some(&poison))
         })
         .unwrap();
 

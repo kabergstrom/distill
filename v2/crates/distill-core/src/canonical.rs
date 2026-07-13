@@ -38,6 +38,8 @@ pub const DSRE: [u8; 4] = *b"DSRE";
 pub const DSLF: [u8; 4] = *b"DSLF";
 /// Typed configuration-poison reason facts (§5, §13, §17).
 pub const DSCP: [u8; 4] = *b"DSCP";
+/// Typed version-global poison identity (§7, §13, §17).
+pub const DSVP: [u8; 4] = *b"DSVP";
 
 /// Append-only encoder for the canonical record encoding. Composites encode
 /// their fields in declaration order by calling these methods; there is no

@@ -29,6 +29,8 @@ pub enum StoreError {
     /// carrying an identity-validation failure, and every
     /// namespace-facing operation fails with this same error.
     Poisoned { error: String },
+    /// Persisted DSVP bytes were malformed or non-canonical.
+    InvalidVersionPoison(crate::state::VersionPoisonError),
     /// A path resolvable in more than one asset root (§13/§18): an
     /// ambiguity error, never a tiebreak.
     AmbiguousPath { path: String, roots: Vec<String> },
@@ -195,6 +197,7 @@ impl fmt::Display for StoreError {
                  daemon state is disposable — recreate it"
             ),
             StoreError::Poisoned { error } => write!(f, "version poison: {error}"),
+            StoreError::InvalidVersionPoison(error) => error.fmt(f),
             StoreError::AmbiguousPath { path, roots } => write!(
                 f,
                 "path `{path}` resolves in more than one asset root: {}",

@@ -12,6 +12,7 @@ blake3 = { workspace = true }
 # metadata layer must not vary by host library version).
 rusqlite = { version = "0.32", features = ["bundled"] }
 getrandom = "0.2"
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

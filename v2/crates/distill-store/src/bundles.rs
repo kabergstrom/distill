@@ -20,7 +20,7 @@
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use rusqlite::OptionalExtension;
 
-use crate::db::{meta_get_text, meta_set_text, InputTxn, Store};
+use crate::db::{meta_get_blob, meta_set_blob, InputTxn, Store};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::files::RootId;
 use crate::state::VersionPoison;
@@ -383,15 +383,30 @@ impl InputTxn<'_> {
     }
 
     /// Set or clear §7/§13's version-global poison.
-    pub fn set_version_poison(&mut self, error: Option<&str>) -> Result<(), StoreError> {
-        meta_set_text(&self.txn, "version_poison", error)
+    pub fn set_version_poison(&mut self, poison: Option<&VersionPoison>) -> Result<(), StoreError> {
+        match poison {
+            Some(poison) => meta_set_blob(
+                &self.txn,
+                "version_poison",
+                &poison
+                    .persisted_bytes()
+                    .map_err(StoreError::InvalidVersionPoison)?,
+            ),
+            None => {
+                self.txn
+                    .execute("DELETE FROM store_meta WHERE key = 'version_poison'", [])?;
+                Ok(())
+            }
+        }
     }
 }
 
 impl Store {
     fn check_version_poison(&self) -> Result<(), StoreError> {
-        if let Some(error) = meta_get_text(&self.conn, "version_poison")? {
-            return Err(StoreError::Poisoned { error });
+        if let Some(poison) = self.version_poison()? {
+            return Err(StoreError::Poisoned {
+                error: poison.message,
+            });
         }
         Ok(())
     }
@@ -399,7 +414,12 @@ impl Store {
     /// The current version's global poison, if any (§13's
     /// `MetadataSnapshot::poisoned`).
     pub fn version_poison(&self) -> Result<Option<VersionPoison>, StoreError> {
-        Ok(meta_get_text(&self.conn, "version_poison")?.map(|error| VersionPoison { error }))
+        meta_get_blob(&self.conn, "version_poison")?
+            .map(|bytes| {
+                VersionPoison::from_persisted_bytes(&bytes)
+                    .map_err(StoreError::InvalidVersionPoison)
+            })
+            .transpose()
     }
 
     /// One bundle's physical row. Poisoned bundles still *have* a row —

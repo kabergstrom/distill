@@ -699,7 +699,7 @@ impl Store {
     ) -> Result<Option<(AssetUuid, String)>, StoreError> {
         if let Some(poison) = self.version_poison()? {
             return Err(StoreError::Poisoned {
-                error: poison.error,
+                error: poison.message,
             });
         }
         use rusqlite::OptionalExtension;

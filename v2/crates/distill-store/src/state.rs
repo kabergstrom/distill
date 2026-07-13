@@ -22,8 +22,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use distill_core::attestation::CompiledAttestationDigest;
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP};
-use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSVP};
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetHash};
 use ngp_schema::identity::CompilationIdentity;
 
@@ -495,19 +495,413 @@ impl fmt::Display for PipelinePoison {
 
 impl std::error::Error for PipelinePoison {}
 
-/// §7/§13's **version-global** poison: `current` advanced carrying an
-/// identity-validation failure. Uniform — every namespace-facing
-/// operation fails with this same error, never one surviving duplicate,
-/// never last-good metadata from a projection that happens not to touch
-/// the colliding rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum VersionPoisonCode {
+    DuplicateAssetUuid = 1,
+    DuplicateBundleUuid = 2,
+    CrossFileLogicalPathCollision = 3,
+    IncompleteSkeleton = 4,
+    UnreadableGlobalBundlePath = 5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum SkeletonFailureCode {
+    EnvelopeMalformed = 1,
+    MissingFormatVersion = 2,
+    InvalidBundleUuid = 3,
+    IncompleteAssetIdentity = 4,
+    IncompleteTypeIdentity = 5,
+    IncompleteTagIdentity = 6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum GlobalBundleReadFailureCode {
+    PermissionDenied = 1,
+    InvalidFileType = 2,
+    SymlinkIdentityChanged = 3,
+    IoDataLoss = 4,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReadableBundleSource {
+    pub root_name: String,
+    pub normalized_path: String,
+    pub file_hash: BundleFileHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionPoisonV1 {
+    DuplicateAssetUuid {
+        asset: AssetUuid,
+        sources: Vec<ReadableBundleSource>,
+    },
+    DuplicateBundleUuid {
+        bundle: BundleUuid,
+        sources: Vec<ReadableBundleSource>,
+    },
+    CrossFileLogicalPathCollision {
+        normalized_path: String,
+        sources: Vec<ReadableBundleSource>,
+    },
+    IncompleteSkeleton {
+        source: ReadableBundleSource,
+        failure: SkeletonFailureCode,
+    },
+    UnreadableGlobalBundlePath {
+        root_name: String,
+        normalized_path: String,
+        failure: GlobalBundleReadFailureCode,
+    },
+}
+
+/// §7/§13's closed version-global poison record. `identity` commits only to
+/// the typed facts; `message` is presentation text and cannot affect healing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionPoison {
-    pub error: String,
+    pub code: VersionPoisonCode,
+    pub identity: [u8; 32],
+    pub detail: VersionPoisonV1,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionPoisonError {
+    UnsupportedVersion(u8),
+    UnknownCode(u16),
+    UnknownFailureCode(u16),
+    Truncated,
+    TrailingBytes,
+    InvalidUtf8,
+    InvalidRootName,
+    InvalidPath,
+    NonCanonicalSources,
+    InsufficientSources,
+    IdentityMismatch,
+}
+
+impl fmt::Display for VersionPoisonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid version poison: {self:?}")
+    }
+}
+
+impl std::error::Error for VersionPoisonError {}
+
+impl VersionPoisonV1 {
+    pub fn code(&self) -> VersionPoisonCode {
+        match self {
+            Self::DuplicateAssetUuid { .. } => VersionPoisonCode::DuplicateAssetUuid,
+            Self::DuplicateBundleUuid { .. } => VersionPoisonCode::DuplicateBundleUuid,
+            Self::CrossFileLogicalPathCollision { .. } => {
+                VersionPoisonCode::CrossFileLogicalPathCollision
+            }
+            Self::IncompleteSkeleton { .. } => VersionPoisonCode::IncompleteSkeleton,
+            Self::UnreadableGlobalBundlePath { .. } => {
+                VersionPoisonCode::UnreadableGlobalBundlePath
+            }
+        }
+    }
+}
+
+impl VersionPoison {
+    pub fn new(
+        detail: VersionPoisonV1,
+        message: impl Into<String>,
+    ) -> Result<Self, VersionPoisonError> {
+        validate_version_poison_detail(&detail)?;
+        let code = detail.code();
+        let identity = version_poison_identity(code, &detail);
+        Ok(Self {
+            code,
+            identity,
+            detail,
+            message: message.into(),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), VersionPoisonError> {
+        if self.code != self.detail.code() {
+            return Err(VersionPoisonError::IdentityMismatch);
+        }
+        validate_version_poison_detail(&self.detail)?;
+        if self.identity != version_poison_identity(self.code, &self.detail) {
+            return Err(VersionPoisonError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn persisted_bytes(&self) -> Result<Vec<u8>, VersionPoisonError> {
+        self.validate()?;
+        let mut encoder = CanonicalEncoder::new();
+        encoder.raw(&DSVP);
+        encoder.u8(1);
+        encoder.u16(self.code as u16);
+        encode_version_poison_detail(&mut encoder, &self.detail);
+        encoder.str(&self.message);
+        Ok(encoder.into_bytes())
+    }
+
+    pub fn from_persisted_bytes(bytes: &[u8]) -> Result<Self, VersionPoisonError> {
+        let mut decoder = VersionPoisonDecoder { bytes, cursor: 0 };
+        if decoder.take(4)? != DSVP {
+            return Err(VersionPoisonError::UnknownCode(0));
+        }
+        let version = decoder.u8()?;
+        if version != 1 {
+            return Err(VersionPoisonError::UnsupportedVersion(version));
+        }
+        let code_raw = decoder.u16()?;
+        let code = VersionPoisonCode::try_from(code_raw)?;
+        let detail = decoder.detail(code)?;
+        let message = decoder.string()?;
+        if decoder.cursor != bytes.len() {
+            return Err(VersionPoisonError::TrailingBytes);
+        }
+        Self::new(detail, message)
+    }
+}
+
+impl TryFrom<u16> for VersionPoisonCode {
+    type Error = VersionPoisonError;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::DuplicateAssetUuid),
+            2 => Ok(Self::DuplicateBundleUuid),
+            3 => Ok(Self::CrossFileLogicalPathCollision),
+            4 => Ok(Self::IncompleteSkeleton),
+            5 => Ok(Self::UnreadableGlobalBundlePath),
+            other => Err(VersionPoisonError::UnknownCode(other)),
+        }
+    }
+}
+
+struct VersionPoisonDecoder<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> VersionPoisonDecoder<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], VersionPoisonError> {
+        let end = self
+            .cursor
+            .checked_add(count)
+            .ok_or(VersionPoisonError::Truncated)?;
+        let value = self
+            .bytes
+            .get(self.cursor..end)
+            .ok_or(VersionPoisonError::Truncated)?;
+        self.cursor = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, VersionPoisonError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, VersionPoisonError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32, VersionPoisonError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], VersionPoisonError> {
+        Ok(self.take(N)?.try_into().unwrap())
+    }
+
+    fn string(&mut self) -> Result<String, VersionPoisonError> {
+        let len = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_owned)
+            .map_err(|_| VersionPoisonError::InvalidUtf8)
+    }
+
+    fn source(&mut self) -> Result<ReadableBundleSource, VersionPoisonError> {
+        Ok(ReadableBundleSource {
+            root_name: self.string()?,
+            normalized_path: self.string()?,
+            file_hash: BundleFileHash(self.array()?),
+        })
+    }
+
+    fn sources(&mut self) -> Result<Vec<ReadableBundleSource>, VersionPoisonError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+        if count > self.bytes.len().saturating_sub(self.cursor) / 40 {
+            return Err(VersionPoisonError::Truncated);
+        }
+        (0..count).map(|_| self.source()).collect()
+    }
+
+    fn detail(&mut self, code: VersionPoisonCode) -> Result<VersionPoisonV1, VersionPoisonError> {
+        Ok(match code {
+            VersionPoisonCode::DuplicateAssetUuid => VersionPoisonV1::DuplicateAssetUuid {
+                asset: AssetUuid(self.array()?),
+                sources: self.sources()?,
+            },
+            VersionPoisonCode::DuplicateBundleUuid => VersionPoisonV1::DuplicateBundleUuid {
+                bundle: BundleUuid(self.array()?),
+                sources: self.sources()?,
+            },
+            VersionPoisonCode::CrossFileLogicalPathCollision => {
+                VersionPoisonV1::CrossFileLogicalPathCollision {
+                    normalized_path: self.string()?,
+                    sources: self.sources()?,
+                }
+            }
+            VersionPoisonCode::IncompleteSkeleton => VersionPoisonV1::IncompleteSkeleton {
+                source: self.source()?,
+                failure: match self.u16()? {
+                    1 => SkeletonFailureCode::EnvelopeMalformed,
+                    2 => SkeletonFailureCode::MissingFormatVersion,
+                    3 => SkeletonFailureCode::InvalidBundleUuid,
+                    4 => SkeletonFailureCode::IncompleteAssetIdentity,
+                    5 => SkeletonFailureCode::IncompleteTypeIdentity,
+                    6 => SkeletonFailureCode::IncompleteTagIdentity,
+                    other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                },
+            },
+            VersionPoisonCode::UnreadableGlobalBundlePath => {
+                VersionPoisonV1::UnreadableGlobalBundlePath {
+                    root_name: self.string()?,
+                    normalized_path: self.string()?,
+                    failure: match self.u16()? {
+                        1 => GlobalBundleReadFailureCode::PermissionDenied,
+                        2 => GlobalBundleReadFailureCode::InvalidFileType,
+                        3 => GlobalBundleReadFailureCode::SymlinkIdentityChanged,
+                        4 => GlobalBundleReadFailureCode::IoDataLoss,
+                        other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                    },
+                }
+            }
+        })
+    }
+}
+
+fn version_poison_identity(code: VersionPoisonCode, detail: &VersionPoisonV1) -> [u8; 32] {
+    let mut encoder = CanonicalEncoder::new();
+    encoder.raw(&DSVP);
+    encoder.u8(1);
+    encoder.u16(code as u16);
+    encode_version_poison_detail(&mut encoder, detail);
+    *blake3::hash(&encoder.into_bytes()).as_bytes()
+}
+
+fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &VersionPoisonV1) {
+    match detail {
+        VersionPoisonV1::DuplicateAssetUuid { asset, sources } => {
+            encoder.raw(&asset.0);
+            encode_bundle_sources(encoder, sources);
+        }
+        VersionPoisonV1::DuplicateBundleUuid { bundle, sources } => {
+            encoder.raw(&bundle.0);
+            encode_bundle_sources(encoder, sources);
+        }
+        VersionPoisonV1::CrossFileLogicalPathCollision {
+            normalized_path,
+            sources,
+        } => {
+            encoder.str(normalized_path);
+            encode_bundle_sources(encoder, sources);
+        }
+        VersionPoisonV1::IncompleteSkeleton { source, failure } => {
+            encode_bundle_source(encoder, source);
+            encoder.u16(*failure as u16);
+        }
+        VersionPoisonV1::UnreadableGlobalBundlePath {
+            root_name,
+            normalized_path,
+            failure,
+        } => {
+            encoder.str(root_name);
+            encoder.str(normalized_path);
+            encoder.u16(*failure as u16);
+        }
+    }
+}
+
+fn encode_bundle_sources(encoder: &mut CanonicalEncoder, sources: &[ReadableBundleSource]) {
+    encoder.seq(sources, encode_bundle_source);
+}
+
+fn encode_bundle_source(encoder: &mut CanonicalEncoder, source: &ReadableBundleSource) {
+    encoder.str(&source.root_name);
+    encoder.str(&source.normalized_path);
+    encoder.raw(&source.file_hash.0);
+}
+
+fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), VersionPoisonError> {
+    use unicode_normalization::UnicodeNormalization;
+
+    let validate_source = |source: &ReadableBundleSource| {
+        validate_root_and_path(&source.root_name, &source.normalized_path)
+    };
+    let validate_collision_sources = |sources: &[ReadableBundleSource]| {
+        if sources.len() < 2 {
+            return Err(VersionPoisonError::InsufficientSources);
+        }
+        if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(VersionPoisonError::NonCanonicalSources);
+        }
+        sources.iter().try_for_each(validate_source)
+    };
+
+    match detail {
+        VersionPoisonV1::DuplicateAssetUuid { sources, .. }
+        | VersionPoisonV1::DuplicateBundleUuid { sources, .. }
+        | VersionPoisonV1::CrossFileLogicalPathCollision { sources, .. } => {
+            validate_collision_sources(sources)?;
+        }
+        VersionPoisonV1::IncompleteSkeleton { source, .. } => validate_source(source)?,
+        VersionPoisonV1::UnreadableGlobalBundlePath {
+            root_name,
+            normalized_path,
+            ..
+        } => {
+            validate_root_and_path(root_name, normalized_path)?;
+        }
+    }
+    if let VersionPoisonV1::CrossFileLogicalPathCollision {
+        normalized_path, ..
+    } = detail
+    {
+        if normalized_path.nfc().collect::<String>() != *normalized_path {
+            return Err(VersionPoisonError::InvalidPath);
+        }
+    }
+    Ok(())
+}
+
+fn validate_root_and_path(
+    root_name: &str,
+    normalized_path: &str,
+) -> Result<(), VersionPoisonError> {
+    use unicode_normalization::UnicodeNormalization;
+
+    if root_name.is_empty()
+        || root_name.nfc().collect::<String>() != root_name
+        || root_name.contains(['/', '\\', '\0'])
+    {
+        return Err(VersionPoisonError::InvalidRootName);
+    }
+    if normalized_path.is_empty()
+        || normalized_path.nfc().collect::<String>() != normalized_path
+        || normalized_path.contains(['\\', '\0'])
+        || normalized_path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err(VersionPoisonError::InvalidPath);
+    }
+    Ok(())
 }
 
 impl fmt::Display for VersionPoison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "version poison: {}", self.error)
+        write!(f, "version poison: {}", self.message)
     }
 }
 

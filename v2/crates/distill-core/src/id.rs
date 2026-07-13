@@ -189,6 +189,10 @@ hash_newtype! {
     ContentHash
 }
 hash_newtype! {
+    /// Raw blake3 identity of one canonical bundle file (§6).
+    BundleFileHash
+}
+hash_newtype! {
     /// blake3 of the DSLH encoding of a type's logical schema (§5).
     LogicalHash
 }
