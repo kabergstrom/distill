@@ -8,10 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use distill_core::attestation::{
-    bootstrap_control_logical_registry_v1, is_bootstrap_control_type, CompiledAttestationDigest,
+    bootstrap_control_logical_registry_v1, is_bootstrap_control_type, BundleFormatVersion,
+    CompiledAttestationDigest, CompiledTypeTable,
 };
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
+use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use rusqlite::OptionalExtension;
 
 use crate::db::{InputTxn, Store};
@@ -32,6 +34,68 @@ pub struct StagedTool {
     pub path: PathBuf,
     pub content_hash: [u8; 32],
     pub input_version: InputVersion,
+}
+
+/// Sealed publication input tying the store summary to the independently
+/// validated full compiled table and the current consumer's unforgeable
+/// bootstrap authority. There is no raw publication path.
+#[derive(Debug, Clone)]
+pub struct ValidatedPipelineEpoch {
+    epoch: PipelineEpoch,
+}
+
+impl ValidatedPipelineEpoch {
+    pub fn validate(
+        epoch: PipelineEpoch,
+        compiled_types: &CompiledTypeTable,
+        bootstrap_authority: &ConsumerBootstrapAuthorityV1,
+    ) -> Result<Self, StoreError> {
+        compiled_types
+            .validate()
+            .map_err(StoreError::InvalidCompiledAttestation)?;
+        bootstrap_authority
+            .validate_boundary_rows(&compiled_types.rows, BundleFormatVersion::V1)
+            .map_err(StoreError::InvalidBootstrapAuthority)?;
+        validate_target_set(&epoch.target_set)?;
+        if epoch.compiled_types != compiled_types.digest {
+            return Err(StoreError::InvalidPipelineEpoch {
+                detail: "DSCA summary does not match the full compiled table",
+            });
+        }
+        let schema_registry = compiled_types
+            .rows
+            .iter()
+            .map(|row| (row.type_uuid, row.logical_hash))
+            .collect::<BTreeMap<_, _>>();
+        if epoch.schema_registry != schema_registry {
+            return Err(StoreError::InvalidPipelineEpoch {
+                detail: "schema registry is not the full compiled-table projection",
+            });
+        }
+        let policy = compiled_types
+            .rows
+            .iter()
+            .map(|row| (row.type_uuid, row.build_only))
+            .collect::<Vec<_>>();
+        if epoch.load_policy_digest != crate::state::load_policy_digest(&policy) {
+            return Err(StoreError::InvalidPipelineEpoch {
+                detail: "load-policy digest is not derived from the full compiled table",
+            });
+        }
+        Ok(Self { epoch })
+    }
+
+    pub fn epoch(&self) -> &PipelineEpoch {
+        &self.epoch
+    }
+}
+
+impl std::ops::Deref for ValidatedPipelineEpoch {
+    type Target = PipelineEpoch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.epoch
+    }
 }
 
 /// One accepted schema epoch in the source-controlled lineage manifest.
@@ -232,7 +296,10 @@ impl InputTxn<'_> {
     /// the authoritative manifest cursors. Every missing, extra, or unequal
     /// row instead publishes a stable `SchemaAcceptanceRequired` state while
     /// retaining the prior epoch only as `last_good` residency bookkeeping.
-    pub fn publish_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
+    pub fn publish_pipeline_epoch(
+        &mut self,
+        epoch: &ValidatedPipelineEpoch,
+    ) -> Result<(), StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
         let basis = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
@@ -482,7 +549,7 @@ impl InputTxn<'_> {
     /// new manifest base.
     pub fn accept_schema_candidate(
         &mut self,
-        candidate: &PipelineEpoch,
+        candidate: &ValidatedPipelineEpoch,
         expected_manifest: &SchemaManifestBasis,
         proposed: &VerifiedSchemaLineageManifest,
         type_uuid: TypeUuid,
@@ -559,7 +626,7 @@ impl InputTxn<'_> {
     /// projection; accepted history remains append-only.
     pub fn rollback_schema_candidate(
         &mut self,
-        candidate: &PipelineEpoch,
+        candidate: &ValidatedPipelineEpoch,
         expected_manifest: &SchemaManifestBasis,
         proposed: &VerifiedSchemaLineageManifest,
         request: SchemaRollbackRequest<'_>,
@@ -635,7 +702,7 @@ impl InputTxn<'_> {
     /// it. History, cursor, and DSSL are preserved byte-for-byte.
     pub fn retire_schema_candidate(
         &mut self,
-        candidate: &PipelineEpoch,
+        candidate: &ValidatedPipelineEpoch,
         expected_manifest: &SchemaManifestBasis,
         control_basis: crate::state::SnapshotStamp,
         proposed: &VerifiedSchemaLineageManifest,
@@ -732,7 +799,7 @@ impl InputTxn<'_> {
     /// existing selections require rollback coverage.
     pub fn reactivate_schema_candidate(
         &mut self,
-        candidate: &PipelineEpoch,
+        candidate: &ValidatedPipelineEpoch,
         expected_manifest: &SchemaManifestBasis,
         proposed: &VerifiedSchemaLineageManifest,
         request: SchemaReactivationRequest<'_>,

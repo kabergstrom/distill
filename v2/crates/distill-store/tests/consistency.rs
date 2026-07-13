@@ -3,24 +3,73 @@
 //! all-or-nothing, WAL readers only ever observe complete input
 //! versions, and the poison classifications compose.
 
-use distill_core::attestation::{bootstrap_control_logical_registry_v1, CompiledAttestationDigest};
+use distill_core::attestation::{
+    CompiledTypeRow, CompiledTypeTable, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
+    SchemaNodeId,
+};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
+use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
-    VerifiedSchemaLineageManifest,
+    ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
-    PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+    load_policy_digest, CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
+    PipelinePoisonOrigin, PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison,
+    VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
     StoreConfig::new(dir.path().join(".distill"))
+}
+
+fn validated_epoch(
+    dylib_hash: [u8; 32],
+    custom: Option<(TypeUuid, LogicalHash)>,
+) -> ValidatedPipelineEpoch {
+    let authority = consumer_bootstrap_authority_v1().unwrap();
+    let mut rows = authority.rows().to_vec();
+    if let Some((type_uuid, logical_hash)) = custom {
+        rows.push(
+            CompiledTypeRow::new(
+                type_uuid,
+                logical_hash,
+                [4; 32],
+                false,
+                RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+                    node: SchemaNodeId(0),
+                    path: vec![],
+                    fact: RegistryExtraFact::BuildOnly(false),
+                }])
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    let table = CompiledTypeTable::canonical(rows).unwrap();
+    let policy = table
+        .rows
+        .iter()
+        .map(|row| (row.type_uuid, row.build_only))
+        .collect::<Vec<_>>();
+    let epoch = PipelineEpoch {
+        dylib_hash,
+        load_policy_digest: load_policy_digest(&policy),
+        compiled_types: table.digest,
+        target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
+        schema_registry: table
+            .rows
+            .iter()
+            .map(|row| (row.type_uuid, row.logical_hash))
+            .collect(),
+        registrations: vec![],
+    };
+    ValidatedPipelineEpoch::validate(epoch, &table, authority).unwrap()
 }
 
 fn version_poison(message: &str) -> VersionPoison {
@@ -154,18 +203,10 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 ),
             )?;
             txn.stage_tool("tool", b"tool bytes")?;
-            txn.publish_pipeline_epoch(&PipelineEpoch {
-                dylib_hash: [6u8; 32],
-                load_policy_digest: [7u8; 32],
-                compiled_types: CompiledAttestationDigest([8u8; 32]),
-                target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-                schema_registry: bootstrap_control_logical_registry_v1()
-                    .unwrap()
-                    .into_iter()
-                    .chain([(TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))])
-                    .collect(),
-                registrations: vec![],
-            })?;
+            txn.publish_pipeline_epoch(&validated_epoch(
+                [6u8; 32],
+                Some((TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))),
+            ))?;
             Err(StoreError::Poisoned {
                 error: "abort everything".into(),
             })
@@ -292,14 +333,7 @@ fn version_poison_and_pipeline_poison_are_distinct_gates() {
                     SchemaLineageManifest::default(),
                 ),
             )?;
-            txn.publish_pipeline_epoch(&PipelineEpoch {
-                dylib_hash: [1u8; 32],
-                load_policy_digest: [2u8; 32],
-                compiled_types: CompiledAttestationDigest([3u8; 32]),
-                target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-                schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
-                registrations: vec![],
-            })?;
+            txn.publish_pipeline_epoch(&validated_epoch([1u8; 32], None))?;
             let poison = version_poison("identity collision");
             txn.set_version_poison(Some(&poison))
         })

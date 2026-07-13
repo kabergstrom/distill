@@ -6,18 +6,22 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_core::attestation::{bootstrap_control_logical_registry_v1, CompiledAttestationDigest};
+use distill_core::attestation::{
+    bootstrap_control_logical_registry_v1, CompiledTypeRow, CompiledTypeTable, RegistryExtraFact,
+    RegistryExtraRow, RegistryExtrasV1, SchemaNodeId,
+};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_store::bundles::AssetRecord;
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, HardStopReason, LineageClass, LineageStamp,
     ReverseMigrationEdge, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
-    TypeAuthorityState, VerifiedSchemaLineageManifest,
+    TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
-    PipelineState, PipelineUnavailable, Registration, RegistrationKind,
+    load_policy_digest, CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
+    PipelinePoisonOrigin, PipelineState, PipelineUnavailable, Registration, RegistrationKind,
 };
 use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
 
@@ -27,17 +31,46 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
-fn epoch(n: u8) -> PipelineEpoch {
+fn compiled_table(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> CompiledTypeTable {
+    let mut compiled = consumer_bootstrap_authority_v1().unwrap().rows().to_vec();
+    compiled.extend(rows.iter().map(|(type_uuid, logical_hash)| {
+        CompiledTypeRow::new(
+            *type_uuid,
+            *logical_hash,
+            [n; 32],
+            false,
+            RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+                node: SchemaNodeId(0),
+                path: vec![],
+                fact: RegistryExtraFact::BuildOnly(false),
+            }])
+            .unwrap(),
+        )
+        .unwrap()
+    }));
+    CompiledTypeTable::canonical(compiled).unwrap()
+}
+
+fn raw_epoch_from_table(n: u8, compiled_types: &CompiledTypeTable) -> PipelineEpoch {
+    let policy = compiled_types
+        .rows
+        .iter()
+        .map(|row| (row.type_uuid, row.build_only))
+        .collect::<Vec<_>>();
     PipelineEpoch {
         dylib_hash: [n; 32],
-        load_policy_digest: [n.wrapping_add(1); 32],
-        compiled_types: CompiledAttestationDigest([n.wrapping_add(2); 32]),
+        load_policy_digest: load_policy_digest(&policy),
+        compiled_types: compiled_types.digest,
         target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: format!("target-{n}"),
             target_definition_hash: [n.wrapping_add(3); 32],
         }])
         .unwrap(),
-        schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
+        schema_registry: compiled_types
+            .rows
+            .iter()
+            .map(|row| (row.type_uuid, row.logical_hash))
+            .collect(),
         registrations: vec![
             Registration {
                 kind: RegistrationKind::Importer,
@@ -53,10 +86,24 @@ fn epoch(n: u8) -> PipelineEpoch {
     }
 }
 
-fn epoch_with_registry(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> PipelineEpoch {
-    let mut epoch = epoch(n);
-    epoch.schema_registry.extend(rows.iter().copied());
-    epoch
+fn raw_epoch(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> (PipelineEpoch, CompiledTypeTable) {
+    let compiled_types = compiled_table(n, rows);
+    let epoch = raw_epoch_from_table(n, &compiled_types);
+    (epoch, compiled_types)
+}
+
+fn epoch(n: u8) -> ValidatedPipelineEpoch {
+    epoch_with_registry(n, &[])
+}
+
+fn epoch_with_registry(n: u8, rows: &[(TypeUuid, LogicalHash)]) -> ValidatedPipelineEpoch {
+    let (epoch, compiled_types) = raw_epoch(n, rows);
+    ValidatedPipelineEpoch::validate(
+        epoch,
+        &compiled_types,
+        consumer_bootstrap_authority_v1().unwrap(),
+    )
+    .unwrap()
 }
 
 fn project_empty(store: &mut Store) {
@@ -146,7 +193,7 @@ fn verified(n: u8, manifest: SchemaLineageManifest) -> VerifiedSchemaLineageMani
 
 fn require_candidate(
     store: &mut Store,
-    candidate: &PipelineEpoch,
+    candidate: &ValidatedPipelineEpoch,
 ) -> distill_store::state::SchemaManifestBasis {
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(candidate))
@@ -159,32 +206,37 @@ fn require_candidate(
 
 #[test]
 fn ready_requires_exact_dsb_bootstrap_projection_and_manifest_omits_it() {
-    let (_dir, mut primary_store) = store();
-    project_empty(&mut primary_store);
     let type_uuid = distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
 
-    let mut missing = epoch(1);
-    missing.schema_registry.remove(&type_uuid);
+    let mut missing_table = compiled_table(1, &[]);
+    missing_table.rows.retain(|row| row.type_uuid != type_uuid);
+    missing_table = CompiledTypeTable::canonical(missing_table.rows).unwrap();
+    let missing = raw_epoch_from_table(1, &missing_table);
     assert!(matches!(
-        primary_store.input_transaction(|txn| txn.publish_pipeline_epoch(&missing)),
-        Err(StoreError::InvalidBootstrapRegistry {
-            type_uuid: observed,
-            observed: None,
-            ..
-        }) if observed == type_uuid
+        ValidatedPipelineEpoch::validate(
+            missing,
+            &missing_table,
+            consumer_bootstrap_authority_v1().unwrap(),
+        ),
+        Err(StoreError::InvalidBootstrapAuthority(_))
     ));
 
-    let mut changed = epoch(2);
-    changed
-        .schema_registry
-        .insert(type_uuid, LogicalHash([0xff; 32]));
+    let mut changed_table = compiled_table(2, &[]);
+    let row = changed_table
+        .rows
+        .iter_mut()
+        .find(|row| row.type_uuid == type_uuid)
+        .unwrap();
+    row.native_layout_digest[0] ^= 1;
+    changed_table = CompiledTypeTable::canonical(changed_table.rows).unwrap();
+    let changed = raw_epoch_from_table(2, &changed_table);
     assert!(matches!(
-        primary_store.input_transaction(|txn| txn.publish_pipeline_epoch(&changed)),
-        Err(StoreError::InvalidBootstrapRegistry {
-            type_uuid: observed,
-            observed: Some(_),
-            ..
-        }) if observed == type_uuid
+        ValidatedPipelineEpoch::validate(
+            changed,
+            &changed_table,
+            consumer_bootstrap_authority_v1().unwrap(),
+        ),
+        Err(StoreError::InvalidBootstrapAuthority(_))
     ));
 
     let invalid_manifest = SchemaLineageManifest {
@@ -211,6 +263,47 @@ fn ready_requires_exact_dsb_bootstrap_projection_and_manifest_omits_it() {
             type_uuid: Some(observed),
             ..
         }) if observed == type_uuid
+    ));
+}
+
+#[test]
+fn sealed_epoch_recomputes_dsca_registry_and_load_policy_summaries() {
+    let (raw, table) = raw_epoch(19, &[(T, h(1))]);
+
+    let mut wrong_dsca = raw.clone();
+    wrong_dsca.compiled_types.0[0] ^= 1;
+    assert!(matches!(
+        ValidatedPipelineEpoch::validate(
+            wrong_dsca,
+            &table,
+            consumer_bootstrap_authority_v1().unwrap(),
+        ),
+        Err(StoreError::InvalidPipelineEpoch { detail })
+            if detail.contains("DSCA summary")
+    ));
+
+    let mut wrong_registry = raw.clone();
+    wrong_registry.schema_registry.remove(&T);
+    assert!(matches!(
+        ValidatedPipelineEpoch::validate(
+            wrong_registry,
+            &table,
+            consumer_bootstrap_authority_v1().unwrap(),
+        ),
+        Err(StoreError::InvalidPipelineEpoch { detail })
+            if detail.contains("schema registry")
+    ));
+
+    let mut wrong_policy = raw;
+    wrong_policy.load_policy_digest[0] ^= 1;
+    assert!(matches!(
+        ValidatedPipelineEpoch::validate(
+            wrong_policy,
+            &table,
+            consumer_bootstrap_authority_v1().unwrap(),
+        ),
+        Err(StoreError::InvalidPipelineEpoch { detail })
+            if detail.contains("load-policy digest")
     ));
 }
 
@@ -248,7 +341,7 @@ fn publishing_an_epoch_roundtrips_identity_and_registrations() {
     let state = store.pipeline_state().unwrap().expect("published");
     let got = state.epoch().expect("ready");
     assert_eq!(got.dylib_hash, [3u8; 32]);
-    assert_eq!(got.load_policy_digest, [4u8; 32]);
+    assert_eq!(got.load_policy_digest, epoch(3).load_policy_digest);
     assert_eq!(got.target_set, epoch(3).target_set);
     let mut regs = got.registrations.clone();
     regs.sort_by(|a, b| a.id.cmp(&b.id));
@@ -950,17 +1043,23 @@ fn forged_dsts_is_rejected_at_publish_and_again_at_schema_commit() {
     {
         let (_d, mut store) = store();
         project_empty(&mut store);
-        let mut forged = epoch(24);
+        let (mut forged, compiled_types) = raw_epoch(24, &[]);
         forged.target_set.digest.0[0] ^= 1;
-        let err = store
-            .input_transaction(|txn| txn.publish_pipeline_epoch(&forged))
-            .unwrap_err();
+        let err = ValidatedPipelineEpoch::validate(
+            forged,
+            &compiled_types,
+            consumer_bootstrap_authority_v1().unwrap(),
+        )
+        .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTargetSet(_)));
-        let mut forged_rows = epoch(24);
+        let (mut forged_rows, compiled_types) = raw_epoch(24, &[]);
         forged_rows.target_set.rows[0].name = "targe\u{301}t-24".into();
-        let err = store
-            .input_transaction(|txn| txn.publish_pipeline_epoch(&forged_rows))
-            .unwrap_err();
+        let err = ValidatedPipelineEpoch::validate(
+            forged_rows,
+            &compiled_types,
+            consumer_bootstrap_authority_v1().unwrap(),
+        )
+        .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTargetSet(_)));
         assert!(store.pipeline_state().unwrap().is_none());
     }
