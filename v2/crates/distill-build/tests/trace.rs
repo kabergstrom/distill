@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 
 use distill_build::query::AssetQuery;
 use distill_build::trace::*;
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 
 #[derive(Default)]
 struct Snapshot {
     reads: BTreeMap<AssetUuid, Observed<ContentHash>>,
     resolves: BTreeMap<String, Observed<Option<AssetUuid>>>,
     roles: BTreeMap<AssetUuid, Observed<Option<EntryRole>>>,
+    controls: BTreeMap<ControlQuery, Observed<[u8; 32]>>,
+    control_reads: BTreeMap<ControlSubject, Observed<ControlValueHash>>,
 }
 
 impl TraceSource for Snapshot {
@@ -35,6 +37,12 @@ impl TraceSource for Snapshot {
             .get(&asset)
             .cloned()
             .unwrap_or(Observed::Ok(None))
+    }
+    fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]> {
+        self.controls[query].clone()
+    }
+    fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
+        self.control_reads[subject].clone()
     }
 }
 
@@ -184,4 +192,210 @@ fn every_dslf_local_failure_class_has_a_stable_nonzero_code() {
         LocalFailureClass::ArtifactEncoding,
     ];
     assert_eq!(classes.map(|class| class as u16), [1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+fn migration_query() -> ControlQuery {
+    ControlQuery::MigrationEdges {
+        type_uuid: TypeUuid([10; 16]),
+        from_hash: LogicalHash([11; 32]),
+    }
+}
+
+#[test]
+fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
+    let query = migration_query();
+    let a = AssetUuid([1; 16]);
+    let b = AssetUuid([2; 16]);
+    let failure = control_failure_fingerprint(
+        ControlFailureSubject::Query(query.clone()),
+        ControlFailureCode::Ambiguous,
+        vec![b, a, b],
+    );
+    let actual = trace_canonical_bytes(&[TraceOp::Control {
+        query,
+        observed: Observed::Err(failure),
+    }]);
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"DSTR");
+    expected.push(1); // domain version
+    expected.extend_from_slice(&1_u32.to_le_bytes()); // trace entry count
+    expected.push(7); // TraceOp::Control
+    expected.push(0); // ControlQuery::MigrationEdges
+    expected.extend_from_slice(&[10; 16]);
+    expected.extend_from_slice(&[11; 32]);
+    expected.push(1); // Observed::Err
+    expected.push(9); // StableFailureFingerprint::Control
+    expected.push(0); // ControlFailureSubject::Query
+    expected.push(0); // ControlQuery::MigrationEdges
+    expected.extend_from_slice(&[10; 16]);
+    expected.extend_from_slice(&[11; 32]);
+    expected.extend_from_slice(&3_u16.to_le_bytes()); // Ambiguous
+    expected.extend_from_slice(&2_u32.to_le_bytes()); // sorted/dedup entries
+    expected.extend_from_slice(&a.0);
+    expected.extend_from_slice(&b.0);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn dstr_control_read_failure_pins_read_subject_tag() {
+    let asset = AssetUuid([21; 16]);
+    let subject = ControlSubject::Migration(asset);
+    let failure = control_failure_fingerprint(
+        ControlFailureSubject::Read(subject.clone()),
+        ControlFailureCode::Missing,
+        Vec::new(),
+    );
+    let actual = trace_canonical_bytes(&[TraceOp::ControlRead {
+        subject,
+        observed: Observed::Err(failure),
+    }]);
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"DSTR");
+    expected.push(1);
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.push(8); // TraceOp::ControlRead
+    expected.push(0); // ControlSubject::Migration
+    expected.extend_from_slice(&asset.0);
+    expected.push(1); // Observed::Err
+    expected.push(9); // StableFailureFingerprint::Control
+    expected.push(1); // ControlFailureSubject::Read
+    expected.push(0); // ControlSubject::Migration
+    expected.extend_from_slice(&asset.0);
+    expected.extend_from_slice(&2_u16.to_le_bytes()); // Missing
+    expected.extend_from_slice(&0_u32.to_le_bytes()); // no conflicting entries
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn every_control_failure_code_has_its_pinned_nonzero_u16_value() {
+    let codes = [
+        ControlFailureCode::RoleViolation,
+        ControlFailureCode::Missing,
+        ControlFailureCode::Ambiguous,
+        ControlFailureCode::Poisoned,
+        ControlFailureCode::Malformed,
+        ControlFailureCode::WrongBuiltInType,
+        ControlFailureCode::WrongRole,
+        ControlFailureCode::UnsupportedFormat,
+        ControlFailureCode::SchemaClosure,
+    ];
+    assert_eq!(codes.map(|code| code as u16), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn control_failure_entries_are_sorted_and_deduplicated_before_revalidation() {
+    let a = AssetUuid([1; 16]);
+    let b = AssetUuid([2; 16]);
+    let entries = ControlFailureEntries::new(vec![b, a, b]);
+    assert_eq!(entries.as_slice(), &[a, b]);
+
+    let left = control_failure_fingerprint(
+        ControlFailureSubject::Query(ControlQuery::DirectoryImportRules),
+        ControlFailureCode::Ambiguous,
+        vec![b, a, b],
+    );
+    let right = control_failure_fingerprint(
+        ControlFailureSubject::Query(ControlQuery::DirectoryImportRules),
+        ControlFailureCode::Ambiguous,
+        vec![a, b],
+    );
+    assert_eq!(left, right);
+}
+
+#[test]
+fn successful_and_failed_control_reads_revalidate_and_heal() {
+    let asset = AssetUuid([12; 16]);
+    let subject = ControlSubject::Migration(asset);
+    let identity = ControlValueHash([13; 32]);
+    let success = TraceOp::ControlRead {
+        subject: subject.clone(),
+        observed: Observed::Ok(identity),
+    };
+    let mut snapshot = Snapshot::default();
+    snapshot
+        .control_reads
+        .insert(subject.clone(), Observed::Ok(identity));
+    assert!(revalidate(std::slice::from_ref(&success), &snapshot));
+    snapshot
+        .control_reads
+        .insert(subject.clone(), Observed::Ok(ControlValueHash([14; 32])));
+    assert!(!revalidate(std::slice::from_ref(&success), &snapshot));
+
+    let failure = control_failure_fingerprint(
+        ControlFailureSubject::Read(subject.clone()),
+        ControlFailureCode::Malformed,
+        Vec::new(),
+    );
+    let failed = TraceOp::ControlRead {
+        subject: subject.clone(),
+        observed: Observed::Err(failure.clone()),
+    };
+    snapshot
+        .control_reads
+        .insert(subject.clone(), Observed::Err(failure));
+    assert!(revalidate(std::slice::from_ref(&failed), &snapshot));
+    snapshot
+        .control_reads
+        .insert(subject, Observed::Ok(identity));
+    assert!(!revalidate(std::slice::from_ref(&failed), &snapshot));
+}
+
+#[test]
+fn unreadable_migration_edge_is_terminal_and_never_an_empty_result() {
+    let asset = AssetUuid([15; 16]);
+    let subject = ControlSubject::Migration(asset);
+    let mut basis = AttemptedControlBasis::new();
+    assert_eq!(
+        basis.query(migration_query(), Observed::Ok([16; 32])),
+        Ok([16; 32])
+    );
+
+    let unreadable = control_failure_fingerprint(
+        ControlFailureSubject::Read(subject.clone()),
+        ControlFailureCode::Malformed,
+        vec![asset],
+    );
+    assert!(matches!(
+        basis.read(subject.clone(), Observed::Err(unreadable)),
+        Err(AttemptedControlBasisError::ObservedFailure(_))
+    ));
+    assert!(basis.is_stopped());
+    assert!(basis.trace().last().is_some_and(TraceOp::failed));
+    assert_eq!(
+        basis.read(
+            subject,
+            Observed::Ok(DecodedControlValue {
+                identity: ControlValueHash([17; 32]),
+                value: ControlValue::Migration(MigrationControlValue::from_canonical_metadata(
+                    Vec::new(),
+                )),
+            }),
+        ),
+        Err(AttemptedControlBasisError::HardStopped)
+    );
+    let trace = basis.into_trace().unwrap();
+    assert_eq!(
+        trace.len(),
+        2,
+        "the failed read remains in the attempted basis"
+    );
+}
+
+#[test]
+fn directory_rule_enumeration_is_distinct_control_trace_data() {
+    let empty = [0; 32];
+    let migrations = TraceOp::Control {
+        query: migration_query(),
+        observed: Observed::Ok(empty),
+    };
+    let directory_rules = TraceOp::Control {
+        query: ControlQuery::DirectoryImportRules,
+        observed: Observed::Ok(empty),
+    };
+    assert_ne!(
+        trace_canonical_bytes(&[migrations]),
+        trace_canonical_bytes(&[directory_rules])
+    );
 }

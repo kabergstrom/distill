@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use globset::Glob;
 use unicode_normalization::UnicodeNormalization;
 
@@ -140,6 +140,18 @@ pub struct TagSelector {
     pub value: Option<String>,
 }
 
+/// Ordinary asset-query grammar. Migration control lookup is intentionally
+/// not a selector here; it exists only as `trace::ControlQuery`.
+///
+/// ```compile_fail
+/// use distill_build::query::AssetQuery;
+/// use distill_core::id::{LogicalHash, TypeUuid};
+///
+/// let _ = AssetQuery {
+///     migration_edge: Some((TypeUuid([1; 16]), LogicalHash([2; 32]))),
+///     ..AssetQuery::default()
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct AssetQuery {
     pub uuid: Option<AssetUuid>,
@@ -151,7 +163,6 @@ pub struct AssetQuery {
     pub tag: Option<TagSelector>,
     pub path_prefix: Option<String>,
     pub path_glob: Option<String>,
-    pub migration_edge: Option<(TypeUuid, LogicalHash)>,
 }
 
 impl AssetQuery {
@@ -191,7 +202,6 @@ impl AssetQuery {
             self.tag.is_some(),
             self.path_prefix.is_some(),
             self.path_glob.is_some(),
-            self.migration_edge.is_some(),
         ]
         .into_iter()
         .filter(|v| *v)

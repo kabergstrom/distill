@@ -26,6 +26,12 @@ impl TraceSource for Source {
     fn role_check(&self, _: AssetUuid) -> Observed<Option<EntryRole>> {
         Observed::Ok(None)
     }
+    fn control(&self, _: &ControlQuery) -> Observed<[u8; 32]> {
+        Observed::Ok([0; 32])
+    }
+    fn control_read(&self, _: &ControlSubject) -> Observed<ControlValueHash> {
+        Observed::Ok(ControlValueHash([0; 32]))
+    }
 }
 
 #[test]

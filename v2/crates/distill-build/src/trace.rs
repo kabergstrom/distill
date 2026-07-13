@@ -1,7 +1,7 @@
 //! Outcome-bearing build/import traces and verifying-trace lookup (§§8–10).
 
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSLF, DSTR};
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 
 use crate::query::{AssetQuery, FileQuery};
 
@@ -67,6 +67,153 @@ pub enum CapabilityKey {
     Processor { input: TypeUuid },
 }
 
+/// Coordinator-private control-plane queries. This is deliberately a
+/// separate vocabulary from [`AssetQuery`], so an ordinary runtime/process
+/// query cannot opt authoring-only control entries into its result set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControlQuery {
+    MigrationEdges {
+        type_uuid: TypeUuid,
+        from_hash: LogicalHash,
+    },
+    /// Enumerate all directory-import-rule controls at the pinned basis.
+    DirectoryImportRules,
+}
+
+/// The exact non-artifact control value a coordinator read attempted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControlSubject {
+    Migration(AssetUuid),
+    PackDefinition(AssetUuid),
+    DirectoryImportRules(AssetUuid),
+    ImportSettings {
+        bundle: BundleUuid,
+        local_id: String,
+    },
+    SchemaLineageManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControlFailureSubject {
+    Query(ControlQuery),
+    Read(ControlSubject),
+}
+
+/// Stable coordinator-control failure codes. Zero is permanently reserved;
+/// these numeric values are part of the DSTR v1 grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum ControlFailureCode {
+    RoleViolation = 1,
+    Missing = 2,
+    Ambiguous = 3,
+    Poisoned = 4,
+    Malformed = 5,
+    WrongBuiltInType = 6,
+    WrongRole = 7,
+    UnsupportedFormat = 8,
+    SchemaClosure = 9,
+}
+
+/// Canonical conflicting/duplicate entry identities carried by a control
+/// failure. Construction sorts and deduplicates the entries so equality and
+/// revalidation have the same semantics as their DSTR encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ControlFailureEntries(Vec<AssetUuid>);
+
+impl ControlFailureEntries {
+    pub fn new(mut entries: Vec<AssetUuid>) -> Self {
+        entries.sort_unstable();
+        entries.dedup();
+        Self(entries)
+    }
+
+    pub fn as_slice(&self) -> &[AssetUuid] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<AssetUuid>> for ControlFailureEntries {
+    fn from(entries: Vec<AssetUuid>) -> Self {
+        Self::new(entries)
+    }
+}
+
+/// Identity of the exact canonical bundle bytes from which a control value
+/// was decoded. A successful ControlRead traces this identity, not an
+/// artifact/content dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ControlValueHash(pub [u8; 32]);
+
+macro_rules! control_metadata {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $name(Box<[u8]>);
+
+        impl $name {
+            /// Wrap already-validated canonical metadata for this one
+            /// built-in control shape.
+            pub fn from_canonical_metadata(bytes: impl Into<Box<[u8]>>) -> Self {
+                Self(bytes.into())
+            }
+
+            pub fn canonical_metadata(&self) -> &[u8] {
+                &self.0
+            }
+        }
+    };
+}
+
+control_metadata!(MigrationControlValue);
+control_metadata!(PackDefinitionControlValue);
+control_metadata!(DirectoryImportRulesControlValue);
+control_metadata!(ImportSettingsControlValue);
+control_metadata!(SchemaLineageManifestControlValue);
+
+/// Closed decoded control values. The variant brands otherwise opaque
+/// canonical metadata without exposing `AuthoredValue`, artifacts, or any
+/// dependency carrier to control-plane consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlValue {
+    Migration(MigrationControlValue),
+    PackDefinition(PackDefinitionControlValue),
+    DirectoryImportRules(DirectoryImportRulesControlValue),
+    ImportSettings(ImportSettingsControlValue),
+    SchemaLineageManifest(SchemaLineageManifestControlValue),
+}
+
+impl ControlValue {
+    pub fn matches_subject(&self, subject: &ControlSubject) -> bool {
+        matches!(
+            (self, subject),
+            (Self::Migration(_), ControlSubject::Migration(_))
+                | (Self::PackDefinition(_), ControlSubject::PackDefinition(_))
+                | (
+                    Self::DirectoryImportRules(_),
+                    ControlSubject::DirectoryImportRules(_)
+                )
+                | (
+                    Self::ImportSettings(_),
+                    ControlSubject::ImportSettings { .. }
+                )
+                | (
+                    Self::SchemaLineageManifest(_),
+                    ControlSubject::SchemaLineageManifest
+                )
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedControlValue {
+    pub identity: ControlValueHash,
+    pub value: ControlValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StableFailureFingerprint {
     Ambiguous {
@@ -82,6 +229,11 @@ pub enum StableFailureFingerprint {
     RoleIneligible {
         asset: AssetUuid,
         observed_role: EntryRole,
+    },
+    Control {
+        subject: ControlFailureSubject,
+        code: ControlFailureCode,
+        entries: ControlFailureEntries,
     },
     Descendant {
         asset: AssetUuid,
@@ -103,6 +255,18 @@ pub enum StableFailureFingerprint {
         class: LocalFailureClass,
         detail: [u8; 32],
     },
+}
+
+pub fn control_failure_fingerprint(
+    subject: ControlFailureSubject,
+    code: ControlFailureCode,
+    entries: impl Into<ControlFailureEntries>,
+) -> StableFailureFingerprint {
+    StableFailureFingerprint::Control {
+        subject,
+        code,
+        entries: entries.into(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -157,6 +321,14 @@ pub enum TraceOp {
         asset: AssetUuid,
         observed: Observed<Option<EntryRole>>,
     },
+    Control {
+        query: ControlQuery,
+        observed: Observed<[u8; 32]>,
+    },
+    ControlRead {
+        subject: ControlSubject,
+        observed: Observed<ControlValueHash>,
+    },
 }
 
 impl TraceOp {
@@ -169,7 +341,118 @@ impl TraceOp {
             Self::Capability { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::RefCheck { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::RoleCheck { observed, .. } => matches!(observed, Observed::Err(_)),
+            Self::Control { observed, .. } => matches!(observed, Observed::Err(_)),
+            Self::ControlRead { observed, .. } => matches!(observed, Observed::Err(_)),
         }
+    }
+}
+
+/// Construction errors for a coordinator's focused control attempted basis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptedControlBasisError {
+    QueryRequired,
+    QueryAlreadyRecorded,
+    HardStopped,
+    ObservedFailure(StableFailureFingerprint),
+}
+
+/// A control operation sequence that cannot silently discard failed reads.
+/// Exactly one enumeration/query begins the attempt; every decoded read is
+/// appended through `read`, and the first stable failure is retained as the
+/// terminal op and hard-stops the attempt.
+#[derive(Debug, Default)]
+pub struct AttemptedControlBasis {
+    trace: Vec<TraceOp>,
+    has_query: bool,
+    stopped: bool,
+}
+
+impl AttemptedControlBasis {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn query(
+        &mut self,
+        query: ControlQuery,
+        observed: Observed<[u8; 32]>,
+    ) -> Result<[u8; 32], AttemptedControlBasisError> {
+        if self.stopped {
+            return Err(AttemptedControlBasisError::HardStopped);
+        }
+        if self.has_query {
+            return Err(AttemptedControlBasisError::QueryAlreadyRecorded);
+        }
+        self.has_query = true;
+        let result = match &observed {
+            Observed::Ok(hash) => Ok(*hash),
+            Observed::Err(failure) => {
+                self.stopped = true;
+                Err(AttemptedControlBasisError::ObservedFailure(failure.clone()))
+            }
+        };
+        self.trace.push(TraceOp::Control { query, observed });
+        result
+    }
+
+    pub fn read(
+        &mut self,
+        subject: ControlSubject,
+        observed: Observed<DecodedControlValue>,
+    ) -> Result<ControlValue, AttemptedControlBasisError> {
+        if !self.has_query {
+            return Err(AttemptedControlBasisError::QueryRequired);
+        }
+        if self.stopped {
+            return Err(AttemptedControlBasisError::HardStopped);
+        }
+
+        let (trace_observed, result) = match observed {
+            Observed::Ok(decoded) if decoded.value.matches_subject(&subject) => {
+                (Observed::Ok(decoded.identity), Ok(decoded.value))
+            }
+            Observed::Ok(_) => {
+                let failure = control_failure_fingerprint(
+                    ControlFailureSubject::Read(subject.clone()),
+                    ControlFailureCode::WrongBuiltInType,
+                    Vec::new(),
+                );
+                (
+                    Observed::Err(failure.clone()),
+                    Err(AttemptedControlBasisError::ObservedFailure(failure)),
+                )
+            }
+            Observed::Err(failure) => (
+                Observed::Err(failure.clone()),
+                Err(AttemptedControlBasisError::ObservedFailure(failure)),
+            ),
+        };
+        if result.is_err() {
+            self.stopped = true;
+        }
+        self.trace.push(TraceOp::ControlRead {
+            subject,
+            observed: trace_observed,
+        });
+        result
+    }
+
+    pub fn trace(&self) -> &[TraceOp] {
+        &self.trace
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Finalize both successful and failed attempts. A failed attempt still
+    /// returns its complete terminal-failure trace; only omission of the
+    /// required query is rejected.
+    pub fn into_trace(self) -> Result<Vec<TraceOp>, AttemptedControlBasisError> {
+        if !self.has_query {
+            return Err(AttemptedControlBasisError::QueryRequired);
+        }
+        Ok(self.trace)
     }
 }
 
@@ -181,6 +464,8 @@ pub trait TraceSource {
     fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]>;
     fn ref_check(&self, asset: AssetUuid, expected: TypeUuid) -> Observed<Option<TypeUuid>>;
     fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>>;
+    fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]>;
+    fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash>;
 }
 
 pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
@@ -196,6 +481,8 @@ pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
             observed,
         } => &source.ref_check(*asset, *expected_terminal) == observed,
         TraceOp::RoleCheck { asset, observed } => &source.role_check(*asset) == observed,
+        TraceOp::Control { query, observed } => &source.control(query) == observed,
+        TraceOp::ControlRead { subject, observed } => &source.control_read(subject) == observed,
     })
 }
 
@@ -227,7 +514,17 @@ impl FailureRecord {
 }
 
 pub fn trace_digest(trace: &[TraceOp]) -> [u8; 32] {
-    domain_digest(DSTR, 1, |e| e.seq(trace, encode_trace_op))
+    *blake3::hash(&trace_canonical_bytes(trace)).as_bytes()
+}
+
+/// The exact DSTR v1 hash preimage. Exposing the bytes makes protocol tests
+/// pin enum tags, integer widths, and variable-length framing directly.
+pub fn trace_canonical_bytes(trace: &[TraceOp]) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new();
+    encoder.raw(&DSTR);
+    encoder.u8(1);
+    encoder.seq(trace, encode_trace_op);
+    encoder.into_bytes()
 }
 
 fn observed<T>(
@@ -289,6 +586,69 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
             e.raw(&asset.0);
             observed(e, o, |e, role| e.option(*role, |e, role| e.u8(*role as u8)));
         }
+        TraceOp::Control { query, observed: o } => {
+            e.enum_variant(7);
+            encode_control_query(e, query);
+            observed(e, o, |e, hash| e.raw(hash));
+        }
+        TraceOp::ControlRead {
+            subject,
+            observed: o,
+        } => {
+            e.enum_variant(8);
+            encode_control_subject(e, subject);
+            observed(e, o, |e, hash| e.raw(&hash.0));
+        }
+    }
+}
+
+fn encode_control_query(e: &mut CanonicalEncoder, query: &ControlQuery) {
+    match query {
+        ControlQuery::MigrationEdges {
+            type_uuid,
+            from_hash,
+        } => {
+            e.enum_variant(0);
+            e.raw(&type_uuid.0);
+            e.raw(&from_hash.0);
+        }
+        ControlQuery::DirectoryImportRules => e.enum_variant(1),
+    }
+}
+
+fn encode_control_subject(e: &mut CanonicalEncoder, subject: &ControlSubject) {
+    match subject {
+        ControlSubject::Migration(asset) => {
+            e.enum_variant(0);
+            e.raw(&asset.0);
+        }
+        ControlSubject::PackDefinition(asset) => {
+            e.enum_variant(1);
+            e.raw(&asset.0);
+        }
+        ControlSubject::DirectoryImportRules(asset) => {
+            e.enum_variant(2);
+            e.raw(&asset.0);
+        }
+        ControlSubject::ImportSettings { bundle, local_id } => {
+            e.enum_variant(3);
+            e.raw(&bundle.0);
+            e.str(local_id);
+        }
+        ControlSubject::SchemaLineageManifest => e.enum_variant(4),
+    }
+}
+
+fn encode_control_failure_subject(e: &mut CanonicalEncoder, subject: &ControlFailureSubject) {
+    match subject {
+        ControlFailureSubject::Query(query) => {
+            e.enum_variant(0);
+            encode_control_query(e, query);
+        }
+        ControlFailureSubject::Read(subject) => {
+            e.enum_variant(1);
+            encode_control_subject(e, subject);
+        }
     }
 }
 
@@ -326,10 +686,6 @@ fn encode_query(e: &mut CanonicalEncoder, q: &AssetQuery) {
     });
     e.option(q.path_prefix.as_deref(), |e, v| e.str(v));
     e.option(q.path_glob.as_deref(), |e, v| e.str(v));
-    e.option(q.migration_edge, |e, v| {
-        e.raw(&v.0 .0);
-        e.raw(&v.1 .0);
-    });
 }
 
 fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, depth: usize) {
@@ -358,6 +714,16 @@ fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, 
             e.enum_variant(8);
             e.raw(&asset.0);
             e.u8(*observed_role as u8);
+        }
+        StableFailureFingerprint::Control {
+            subject,
+            code,
+            entries,
+        } => {
+            e.enum_variant(9);
+            encode_control_failure_subject(e, subject);
+            e.u16(*code as u16);
+            e.set(entries.as_slice(), |e, id| e.raw(&id.0));
         }
         StableFailureFingerprint::Descendant { asset, fingerprint } => {
             e.enum_variant(3);
