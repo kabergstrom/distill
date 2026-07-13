@@ -421,6 +421,78 @@ pub enum TraceOp {
     },
 }
 
+/// The exact consumed inputs of one `load_current` attempt. The single trace
+/// sequence is authoritative; typed slices are derived views so query, read,
+/// and capability interleaving can never be reconstructed incorrectly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadInputs {
+    pub migration_bundles: Vec<(BundleUuid, [u8; 32])>,
+    trace: Vec<TraceOp>,
+    pub planner_version: u32,
+    pub dylib_hash: Option<[u8; 32]>,
+    stopped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadInputsError {
+    TerminalFailureAlreadyRecorded,
+}
+
+impl LoadInputs {
+    pub fn new(planner_version: u32) -> Self {
+        Self {
+            migration_bundles: Vec::new(),
+            trace: Vec::new(),
+            planner_version,
+            dylib_hash: None,
+            stopped: false,
+        }
+    }
+
+    pub fn record(&mut self, op: TraceOp) -> Result<(), LoadInputsError> {
+        if self.stopped {
+            return Err(LoadInputsError::TerminalFailureAlreadyRecorded);
+        }
+        self.stopped = op.failed();
+        self.trace.push(op);
+        Ok(())
+    }
+
+    pub fn record_pipeline_code(&mut self, dylib_hash: [u8; 32]) {
+        self.dylib_hash = Some(dylib_hash);
+    }
+
+    pub fn trace(&self) -> &[TraceOp] {
+        &self.trace
+    }
+
+    pub fn control_queries(&self) -> impl Iterator<Item = &TraceOp> {
+        self.trace
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Control { .. }))
+    }
+
+    pub fn control_reads(&self) -> impl Iterator<Item = &TraceOp> {
+        self.trace
+            .iter()
+            .filter(|op| matches!(op, TraceOp::ControlRead { .. }))
+    }
+
+    pub fn capabilities(&self) -> impl Iterator<Item = &TraceOp> {
+        self.trace
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Capability { .. }))
+    }
+
+    pub fn validate(&self) -> Result<(), LoadInputsError> {
+        let first_failure = self.trace.iter().position(TraceOp::failed);
+        if first_failure.is_some_and(|index| index + 1 != self.trace.len()) {
+            return Err(LoadInputsError::TerminalFailureAlreadyRecorded);
+        }
+        Ok(())
+    }
+}
+
 impl TraceOp {
     pub fn failed(&self) -> bool {
         match self {

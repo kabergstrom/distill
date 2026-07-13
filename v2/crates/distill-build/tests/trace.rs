@@ -594,3 +594,63 @@ fn control_failure_entry_cardinality_is_closed_by_code() {
         })
     );
 }
+
+#[test]
+fn load_inputs_preserves_one_interleaved_trace_and_terminal_failure_prefix() {
+    let asset = AssetUuid([51; 16]);
+    let subject = ControlSubject::Migration(asset);
+    let mut inputs = LoadInputs::new(7);
+    inputs
+        .record(TraceOp::Control {
+            query: migration_query(),
+            observed: Observed::Ok([52; 32]),
+        })
+        .unwrap();
+    inputs
+        .record(TraceOp::ControlRead {
+            subject: subject.clone(),
+            observed: Observed::Ok(ControlValueHash([53; 32])),
+        })
+        .unwrap();
+    inputs
+        .record(TraceOp::Capability {
+            key: CapabilityKey::MigrationFn("edge".into()),
+            observed: Observed::Ok([54; 32]),
+        })
+        .unwrap();
+    inputs
+        .record(TraceOp::Control {
+            query: ControlQuery::DirectoryImportRuleSet,
+            observed: Observed::Ok([55; 32]),
+        })
+        .unwrap();
+    assert!(matches!(inputs.trace()[0], TraceOp::Control { .. }));
+    assert!(matches!(inputs.trace()[1], TraceOp::ControlRead { .. }));
+    assert!(matches!(inputs.trace()[2], TraceOp::Capability { .. }));
+    assert!(matches!(inputs.trace()[3], TraceOp::Control { .. }));
+    assert_eq!(inputs.control_queries().count(), 2);
+    assert_eq!(inputs.control_reads().count(), 1);
+    assert_eq!(inputs.capabilities().count(), 1);
+    inputs.validate().unwrap();
+
+    let failure = control_failure_fingerprint(
+        ControlFailureSubject::Read(subject.clone()),
+        ControlFailureCode::Malformed,
+        Vec::new(),
+    )
+    .unwrap();
+    inputs
+        .record(TraceOp::ControlRead {
+            subject,
+            observed: Observed::Err(failure),
+        })
+        .unwrap();
+    assert_eq!(
+        inputs.record(TraceOp::Capability {
+            key: CapabilityKey::DefaultTable(TypeUuid([56; 16])),
+            observed: Observed::Ok([57; 32]),
+        }),
+        Err(LoadInputsError::TerminalFailureAlreadyRecorded)
+    );
+    inputs.validate().unwrap();
+}
