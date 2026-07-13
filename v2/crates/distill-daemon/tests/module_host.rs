@@ -8,6 +8,7 @@ use distill_core::attestation::{
     SchemaNodeId,
 };
 use distill_core::id::{LogicalHash, TypeUuid};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
     CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements,
     CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable, HostCallbackBoundary,
@@ -32,6 +33,7 @@ struct Calls {
     unload: usize,
     dlclose: usize,
     cleanup_order: Vec<String>,
+    target_order: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,10 +103,14 @@ impl LoadedPipelineModule for FakeModule {
 
     fn register(
         &mut self,
-        _targets: &[TargetDefinition],
+        targets: &[TargetDefinition],
         arena: &mut CandidateRegistrationArena,
     ) -> Result<BTreeSet<String>, ModuleCallError> {
-        self.calls.lock().unwrap().register += 1;
+        {
+            let mut calls = self.calls.lock().unwrap();
+            calls.register += 1;
+            calls.target_order = targets.iter().map(|target| target.name.clone()).collect();
+        }
         if let Some(pin_sink) = &self.pin_sink {
             *pin_sink.lock().unwrap() = Some(arena.owner_pin());
         }
@@ -291,6 +297,102 @@ fn candidate_open_failure_publishes_poison_and_next_good_candidate_heals() {
         .publish_candidate(&source, requirements(1), &mut good)
         .unwrap();
     assert_eq!(host.snapshot().epoch().unwrap().id(), epoch.id());
+}
+
+#[test]
+fn candidate_target_set_is_normalized_sorted_hashed_and_retained() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 19);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut module = fake_module(19, calls.clone());
+    module.registration.pipeline_targets = BTreeSet::from(["aa".to_owned()]);
+    let mut loader = FakeLoader {
+        module: Some(module),
+        open_error: None,
+    };
+    let mut candidate = requirements(19);
+    candidate.targets = vec![
+        TargetDefinition {
+            name: "z".to_owned(),
+            fingerprint: [9; 32],
+        },
+        TargetDefinition {
+            name: "e\u{301}".to_owned(),
+            fingerprint: [8; 32],
+        },
+        TargetDefinition {
+            name: "aa".to_owned(),
+            fingerprint: [7; 32],
+        },
+    ];
+    let expected = CanonicalTargetSet::canonical(vec![
+        TargetSetRow {
+            name: "z".to_owned(),
+            target_definition_hash: [9; 32],
+        },
+        TargetSetRow {
+            name: "e\u{301}".to_owned(),
+            target_definition_hash: [8; 32],
+        },
+        TargetSetRow {
+            name: "aa".to_owned(),
+            target_definition_hash: [7; 32],
+        },
+    ])
+    .unwrap();
+    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+    let epoch = host
+        .publish_candidate(&source, candidate, &mut loader)
+        .unwrap();
+
+    assert_eq!(epoch.target_set_hash(), expected.digest);
+    assert_eq!(
+        epoch
+            .targets()
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect::<Vec<_>>(),
+        ["aa", "z", "é"]
+    );
+    assert_eq!(calls.lock().unwrap().target_order, ["aa", "z", "é"]);
+}
+
+#[test]
+fn nfc_equivalent_target_names_are_rejected_before_open_or_register() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 20);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut loader = FakeLoader {
+        module: Some(fake_module(20, calls.clone())),
+        open_error: None,
+    };
+    let mut candidate = requirements(20);
+    candidate.targets = vec![
+        TargetDefinition {
+            name: "é".to_owned(),
+            fingerprint: [1; 32],
+        },
+        TargetDefinition {
+            name: "e\u{301}".to_owned(),
+            fingerprint: [2; 32],
+        },
+    ];
+    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+    let poison = host
+        .publish_candidate(&source, candidate, &mut loader)
+        .unwrap_err();
+
+    assert!(
+        poison.detail.contains("DuplicateTarget"),
+        "{}",
+        poison.detail
+    );
+    assert_eq!(calls.lock().unwrap().register, 0);
+    assert!(loader.module.is_some(), "module open must not be attempted");
 }
 
 #[test]

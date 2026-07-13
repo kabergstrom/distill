@@ -15,6 +15,8 @@ use distill_asset::ModuleEpochToken;
 pub use distill_core::attestation::{
     CompiledAttestationDigest, CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
 };
+pub use distill_core::target_set::TargetSetHash;
+use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
@@ -535,6 +537,7 @@ struct EpochInner {
     staged: StagedModule,
     token: ModuleEpochToken,
     targets: Vec<TargetDefinition>,
+    target_set_hash: TargetSetHash,
     registration: RegistrationSet,
     accepting: AtomicBool,
     active_jobs: AtomicUsize,
@@ -555,7 +558,7 @@ impl PipelineEpoch {
         id: u64,
         staged: StagedModule,
         token: ModuleEpochToken,
-        targets: Vec<TargetDefinition>,
+        target_set: CanonicalTargetSet,
         registration: RegistrationSet,
         registration_arena: CandidateRegistrationArena,
         module: Box<dyn LoadedPipelineModule>,
@@ -564,7 +567,15 @@ impl PipelineEpoch {
             id,
             staged,
             token,
-            targets,
+            targets: target_set
+                .rows
+                .into_iter()
+                .map(|row| TargetDefinition {
+                    name: row.name,
+                    fingerprint: row.target_definition_hash,
+                })
+                .collect(),
+            target_set_hash: target_set.digest,
             registration,
             accepting: AtomicBool::new(true),
             active_jobs: AtomicUsize::new(0),
@@ -602,6 +613,10 @@ impl PipelineEpoch {
 
     pub fn targets(&self) -> &[TargetDefinition] {
         &self.0.targets
+    }
+
+    pub fn target_set_hash(&self) -> TargetSetHash {
+        self.0.target_set_hash
     }
 
     pub fn registrations(&self) -> &RegistrationSet {
@@ -806,9 +821,10 @@ impl ModuleHost {
         loader: &mut dyn PipelineModuleLoader,
     ) -> Result<PipelineEpoch, PipelinePoison> {
         let id = self.mint_epoch_id();
-        if let Err(error) = validate_requirements(&mut requirements) {
-            return Err(self.publish_candidate_poison(error));
-        }
+        let target_set = match validate_requirements(&mut requirements) {
+            Ok(target_set) => target_set,
+            Err(error) => return Err(self.publish_candidate_poison(error)),
+        };
         let staged = match self.stage_copy(id, source) {
             Ok(staged) => staged,
             Err(error) => return Err(self.publish_candidate_poison(error)),
@@ -851,7 +867,7 @@ impl ModuleHost {
             id,
             staged,
             token,
-            requirements.targets,
+            target_set,
             registration,
             registration_arena,
             module,
@@ -978,7 +994,9 @@ impl ModuleHost {
     }
 }
 
-fn validate_requirements(requirements: &mut CandidateRequirements) -> Result<(), String> {
+fn validate_requirements(
+    requirements: &mut CandidateRequirements,
+) -> Result<CanonicalTargetSet, String> {
     validate_candidate_linkage(&requirements.native_dependencies)
         .map_err(|error| error.to_string())?;
     if requirements.identity.module_abi.panic_strategy != "unwind" {
@@ -996,17 +1014,26 @@ fn validate_requirements(requirements: &mut CandidateRequirements) -> Result<(),
         return Err("expected measured-layout table contains a duplicate type".to_owned());
     }
     validate_compiled_table(&requirements.compiled_types, "expected")?;
-    requirements
-        .targets
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    if requirements
-        .targets
-        .windows(2)
-        .any(|pair| pair[0].name == pair[1].name)
-    {
-        return Err("target configuration contains a duplicate target name".to_owned());
-    }
-    Ok(())
+    let canonical_targets = CanonicalTargetSet::canonical(
+        requirements
+            .targets
+            .iter()
+            .map(|target| TargetSetRow {
+                name: target.name.clone(),
+                target_definition_hash: target.fingerprint,
+            })
+            .collect(),
+    )
+    .map_err(|error| format!("target configuration is not canonical: {error}"))?;
+    requirements.targets = canonical_targets
+        .rows
+        .iter()
+        .map(|row| TargetDefinition {
+            name: row.name.clone(),
+            fingerprint: row.target_definition_hash,
+        })
+        .collect();
+    Ok(canonical_targets)
 }
 
 fn validate_open_module(
