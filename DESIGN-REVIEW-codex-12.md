@@ -1,0 +1,30 @@
+codex
+1. **CRITICAL — §8, §13 — build-import cache keys do not identify the entry being built.**  
+   A bundle containing two entries of the same type supplies identical inputs to the stated key formula: the same canonical bundle bytes, logical hash, layout hash, format version, and—when neither has references—the same empty dependency results. This is realistic for shader bundles containing several sibling `ShaderStage` entries. The cache can therefore return entry A’s artifact, including A’s UUID and data, when resolving entry B. Neither the build-import key nor a separate build-import action-key declaration includes `asset_uuid` or `local_id`; `fetch(ckey)` cannot detect the mismatch by itself.  
+   **Fix direction:** define a normative build-import action key containing at least the entry `AssetUuid` (and preferably bundle UUID/local ID and type UUID), and require cache-hit/result-record/header association checks before publication. Clarify whether a build-import result is per entry or per bundle; the current CAS result shape only supports the former.
+
+2. **HIGH — §12, §9 — decoding standard `HashMap` injects unkeyed randomness into processor inputs.**  
+   `ConstructMap` uses the concrete map’s real `BuildHasher`. The default `std::collections::HashMap` uses randomly seeded `RandomState`, so decoding the same verified artifact twice creates observably different iteration orders. A processor that purely iterates an input map into an order-sensitive `Vec` can consequently emit different artifacts for the same action key without performing forbidden I/O. Canonical map ordering during artifact encoding does not repair order already observed by the processor.  
+   **Fix direction:** require a deterministic hasher for serializable/processor-visible hash maps, replace them with a deterministic map representation, or explicitly prohibit iteration-dependent processing and provide a canonical iteration API. The framework itself should not introduce entropy absent from the key.
+
+3. **HIGH — §9, §13 — derived-output authority remains contradictory about versioning.**  
+   §9 and the §13 table make the derived namespace input-versioned and authoritative, but §13’s consistency contract still classifies “derived-output rows” as monotone memo state “never versioned.” §9 also initially says result commit writes a derived-output index row, before later distinguishing commit data from the precomputed index. An implementation following the memo-state sentence can resurrect a retired child UUID from an old result record or conflict with an authored asset that legitimately reuses that retired UUID.  
+   **Fix direction:** declare two differently named relations: an input-versioned `(version, child) → (parent, key)` namespace index created at publication, and a CAS-result assertion used only to verify memo consistency. Remove authoritative “derived-output rows” from the memo-state list.
+
+4. **HIGH — §12 — rollback ownership for completed structs/enums with custom `Drop` can double-drop.**  
+   The prose says every completed container pushes a rollback entry and also requires per-type drop glue for completed schema structs/enums with custom `Drop`. For a completed nested `Inner { vec: Vec<_> }` with custom `Drop`, followed by failure constructing a later outer field, retaining both entries causes `drop_in_place::<Inner>` to drop `vec`, after which the earlier vector entry drops it again—UB. Retaining only child entries skips `Inner::drop`. No declared drop table, `DropId`, or stack-frame operation transfers child ownership into the completed enclosing value.  
+   **Fix direction:** specify rollback frames and ownership transfer: completing a droppable aggregate must disarm its child entries and replace them with exactly one enclosing drop entry. Add the generated per-type drop table and its IDs to the normative declarations.
+
+5. **MEDIUM — §12 — `CtorEntry::finish` cannot satisfy its stated error contract.**  
+   `finish(cur: CtorCursor, ...)` consumes the cursor, yet its comment says that on `Err` the cursor still owns the partial value and the caller must abort it. The caller no longer has the cursor. A caught panic also cannot generally promise both that `dst` is untouched and that the cursor remains recoverable.  
+   **Fix direction:** take `&mut CtorCursor` with an explicit state transition, return the cursor on failure, or require `finish` to abort internally on every error. Define an infallible commit point after all fallible work.
+
+6. **MEDIUM — §9, §18 — `TargetSelector` overlap is incorrect for admitted empty API sets.**  
+   `Target.apis` has no non-empty invariant. A target with `apis = ∅` satisfies `target.apis ⊆ selector.apis` for every selector. Thus processors selecting disjoint `{Metal}` and `{Vulkan}` sets are declared non-overlapping but both match the empty-API target. Empty `Some` selector sets are similarly underspecified.  
+   **Fix direction:** reject empty target API sets and empty present selector sets, or define headless targets explicitly and compute overlap over the full admitted target domain.
+
+7. **MEDIUM — §9, §12, §16 — multi-stage artifacts lack an unambiguous actual-value type identity.**  
+   For `A → B → C`, the stage-one artifact contains a `B`, but `B` is neither the authored type `A` nor the pipeline terminal type `C`. The DSTL header provides only `authored_type` and `terminal_type`. Treating `terminal_type` as `B` contradicts §9’s fixpoint meaning; treating it as `C` leaves no TypeUuid identifying the layout actually encoded. Logical and layout hashes cannot substitute because both deliberately permit same-shaped types with different TypeUuids to collide. §16 also declares only one manifest `type_uuid`, despite §9 requiring authored and terminal UUIDs.  
+   **Fix direction:** add an explicit `value_type`/`encoded_type` field to every artifact, distinct from root authored and final terminal types, and require it in fixup/cache validation. Give pack manifests separate authored and terminal type fields.
+
+Remaining CRITICAL issues: 1. Remaining HIGH issues: 2, 3, 4.
