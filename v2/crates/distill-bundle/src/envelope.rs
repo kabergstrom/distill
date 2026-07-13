@@ -162,7 +162,10 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
             }
         };
         for key in entry.keys() {
-            if !matches!(key.as_str(), "data" | "schema_hash" | "type_uuid" | "uuid") {
+            if !matches!(
+                key.as_str(),
+                "authoring_only" | "data" | "schema_hash" | "type_uuid" | "uuid"
+            ) {
                 return Err(BundleError::UnknownEntryKey {
                     local_id,
                     key: key.clone(),
@@ -172,6 +175,24 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         let uuid: AssetUuid = take_id(&mut entry, &local_id, "uuid")?;
         let type_uuid: TypeUuid = take_id(&mut entry, &local_id, "type_uuid")?;
         let schema_hash: LogicalHash = take_id(&mut entry, &local_id, "schema_hash")?;
+        let authoring_only = match entry.remove("authoring_only") {
+            None => {
+                return Err(BundleError::MissingEntryKey {
+                    local_id,
+                    key: "authoring_only",
+                })
+            }
+            Some(AuthoredValue::Bool(value)) => value,
+            Some(other) => {
+                return Err(BundleError::AuthoringOnlyNotBool {
+                    local_id,
+                    found: kind_name(&other),
+                })
+            }
+        };
+        if local_id.starts_with('$') && !authoring_only {
+            return Err(BundleError::ReservedEntryMustBeAuthoringOnly { local_id });
+        }
         let data = entry
             .remove("data")
             .ok_or_else(|| BundleError::MissingEntryKey {
@@ -184,6 +205,7 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
                 uuid,
                 type_uuid,
                 schema_hash,
+                authoring_only,
                 data,
             },
         );
@@ -199,8 +221,12 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         }
     }
     if let Some(p) = &primary {
-        if !assets.contains_key(p) {
-            return Err(BundleError::PrimaryNotFound { primary: p.clone() });
+        match assets.get(p) {
+            None => return Err(BundleError::PrimaryNotFound { primary: p.clone() }),
+            Some(entry) if entry.authoring_only => {
+                return Err(BundleError::PrimaryIsAuthoringOnly { primary: p.clone() })
+            }
+            Some(_) => {}
         }
     }
 
@@ -294,6 +320,10 @@ pub(crate) fn build(
         m.insert(
             "schema_hash".to_string(),
             AuthoredValue::Str(entry.schema_hash.to_string()),
+        );
+        m.insert(
+            "authoring_only".to_string(),
+            AuthoredValue::Bool(entry.authoring_only),
         );
         m.insert("data".to_string(), data_value);
         assets.insert(local_id.clone(), AuthoredValue::Object(m));

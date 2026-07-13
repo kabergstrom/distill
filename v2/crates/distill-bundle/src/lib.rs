@@ -78,6 +78,9 @@ pub struct AssetEntry {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
     pub schema_hash: LogicalHash,
+    /// Authoring/control metadata is never eligible as a runtime primary,
+    /// processor input, reference target, query result, or pack member.
+    pub authoring_only: bool,
     pub data: AuthoredValue,
 }
 

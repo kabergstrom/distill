@@ -118,6 +118,7 @@ pub fn entry(uuid: &str, schema: &LogicalSchema, data: V) -> AssetEntry {
         uuid: uuid.parse().expect("fixture asset uuid"),
         type_uuid: TYPE_A.parse().expect("fixture type uuid"),
         schema_hash: lh(schema),
+        authoring_only: false,
         data,
     }
 }
@@ -218,6 +219,7 @@ pub fn envelope_value(b: &Bundle) -> V {
         m.insert("uuid".to_string(), V::Str(e.uuid.to_string()));
         m.insert("type_uuid".to_string(), V::Str(e.type_uuid.to_string()));
         m.insert("schema_hash".to_string(), V::Str(e.schema_hash.to_string()));
+        m.insert("authoring_only".to_string(), V::Bool(e.authoring_only));
         m.insert("data".to_string(), e.data.clone());
         assets.insert(id.clone(), V::Object(m));
     }

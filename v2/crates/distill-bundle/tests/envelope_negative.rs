@@ -70,6 +70,49 @@ fn primary_must_name_an_existing_entry() {
     );
 }
 
+#[test]
+fn authoring_only_is_mandatory_typed_and_reserved_entries_require_it() {
+    let sc = simple_schema();
+    let b = bundle(
+        &[&sc],
+        vec![(
+            "a",
+            entry(UUID_A, &sc, obj(&[("count", u(1)), ("name", s("x"))])),
+        )],
+        None,
+    );
+    let bytes = write_bundle(&b).unwrap();
+
+    let missing = mutate_envelope(&bytes, |env| {
+        env_entry(env, "a").remove("authoring_only");
+    });
+    assert!(matches!(
+        parse_bundle(&missing),
+        Err(E::MissingEntryKey {
+            key: "authoring_only",
+            ..
+        })
+    ));
+
+    let wrong = mutate_envelope(&bytes, |env| {
+        env_entry(env, "a").insert("authoring_only".into(), s("false"));
+    });
+    assert!(matches!(
+        parse_bundle(&wrong),
+        Err(E::AuthoringOnlyNotBool { .. })
+    ));
+
+    let reserved = mutate_envelope(&bytes, |env| {
+        let assets = as_obj(as_obj(env).get_mut("assets").unwrap());
+        let entry = assets.remove("a").unwrap();
+        assets.insert("$settings".into(), entry);
+    });
+    assert!(matches!(
+        parse_bundle(&reserved),
+        Err(E::ReservedEntryMustBeAuthoringOnly { .. })
+    ));
+}
+
 // ---- reserved local_ids ----
 
 #[test]

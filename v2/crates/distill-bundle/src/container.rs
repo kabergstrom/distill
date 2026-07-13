@@ -252,6 +252,11 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
     }
     for (local_id, entry) in &bundle.assets {
         envelope::check_local_id(local_id)?;
+        if local_id.starts_with('$') && !entry.authoring_only {
+            return Err(E::ReservedEntryMustBeAuthoringOnly {
+                local_id: local_id.clone(),
+            });
+        }
         if !bundle.schemas.contains_key(&entry.schema_hash) {
             return Err(E::MissingSchema {
                 local_id: local_id.clone(),
@@ -260,8 +265,12 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
         }
     }
     if let Some(p) = &bundle.primary {
-        if !bundle.assets.contains_key(p) {
-            return Err(E::PrimaryNotFound { primary: p.clone() });
+        match bundle.assets.get(p) {
+            None => return Err(E::PrimaryNotFound { primary: p.clone() }),
+            Some(entry) if entry.authoring_only => {
+                return Err(E::PrimaryIsAuthoringOnly { primary: p.clone() })
+            }
+            Some(_) => {}
         }
     }
 

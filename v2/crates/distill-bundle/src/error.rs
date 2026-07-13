@@ -108,6 +108,10 @@ pub enum BundleError {
     PrimaryNotFound {
         primary: String,
     },
+    /// A bundle primary must be runtime content.
+    PrimaryIsAuthoringOnly {
+        primary: String,
+    },
     SchemasNotObject {
         found: &'static str,
     },
@@ -146,6 +150,13 @@ pub enum BundleError {
     MissingEntryKey {
         local_id: String,
         key: &'static str,
+    },
+    AuthoringOnlyNotBool {
+        local_id: String,
+        found: &'static str,
+    },
+    ReservedEntryMustBeAuthoringOnly {
+        local_id: String,
     },
     /// `uuid` / `type_uuid` / `schema_hash` failed to parse; `field` names
     /// which.
@@ -389,6 +400,9 @@ impl fmt::Display for BundleError {
             E::PrimaryNotFound { primary } => {
                 write!(f, "primary {primary:?} names no entry in assets")
             }
+            E::PrimaryIsAuthoringOnly { primary } => {
+                write!(f, "primary {primary:?} is authoring-only runtime-ineligible metadata")
+            }
             E::SchemasNotObject { found } => {
                 write!(f, "schemas must be a JSON object, found {found}")
             }
@@ -418,6 +432,14 @@ impl fmt::Display for BundleError {
             E::MissingEntryKey { local_id, key } => {
                 write!(f, "asset {local_id:?}: missing entry key {key:?}")
             }
+            E::AuthoringOnlyNotBool { local_id, found } => write!(
+                f,
+                "asset {local_id:?}: authoring_only must be a boolean, found {found}"
+            ),
+            E::ReservedEntryMustBeAuthoringOnly { local_id } => write!(
+                f,
+                "reserved control entry {local_id:?} must set authoring_only=true"
+            ),
             E::BadEntryId {
                 local_id,
                 field,

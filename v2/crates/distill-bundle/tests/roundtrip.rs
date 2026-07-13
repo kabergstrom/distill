@@ -363,13 +363,19 @@ fn nonstring_map_and_set_roundtrip() {
 #[test]
 fn reserved_settings_and_record_local_ids_accepted() {
     let sc = simple_schema();
-    let mk = |uuid: &str| entry(uuid, &sc, obj(&[("count", u(1)), ("name", s("v"))]));
+    let mk = |uuid: &str| {
+        let mut value = entry(uuid, &sc, obj(&[("count", u(1)), ("name", s("v"))]));
+        value.authoring_only = true;
+        value
+    };
+    let mut content = mk(UUID_A);
+    content.authoring_only = false;
     let b = bundle(
         &[&sc],
         vec![
             ("$record", mk("00000000-0000-0000-0000-000000000001")),
             ("$settings", mk("00000000-0000-0000-0000-000000000002")),
-            ("content", mk(UUID_A)),
+            ("content", content),
         ],
         Some("content"),
     );
@@ -377,6 +383,22 @@ fn reserved_settings_and_record_local_ids_accepted() {
     let p = parse_bundle(&bytes).unwrap();
     assert_eq!(p, b);
     assert_eq!(write_bundle(&p).unwrap(), bytes);
+}
+
+#[test]
+fn authoring_role_roundtrips_and_cannot_be_primary() {
+    let sc = simple_schema();
+    let mut metadata = entry(UUID_A, &sc, obj(&[("count", u(1)), ("name", s("meta"))]));
+    metadata.authoring_only = true;
+    let mut b = bundle(&[&sc], vec![("metadata", metadata)], None);
+    let bytes = write_bundle(&b).unwrap();
+    assert_eq!(parse_bundle(&bytes).unwrap(), b);
+
+    b.primary = Some("metadata".into());
+    assert!(matches!(
+        write_bundle(&b),
+        Err(distill_bundle::BundleError::PrimaryIsAuthoringOnly { .. })
+    ));
 }
 
 #[test]
