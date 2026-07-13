@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use distill_asset::ErasedValue;
+use distill_asset::{ErasedValue, ModuleEpochToken};
 use distill_core::attestation::{
     ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, RegistryPathStep,
     SchemaNodeId,
@@ -13,8 +13,8 @@ use distill_daemon::epoch::{
     CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable, HostCallbackBoundary,
     HostCallbackSurface, LoadedPipelineModule, MeasuredLayout, ModuleAbiIdentity, ModuleCallError,
     ModuleEpochPin, ModuleHost, ModuleIdentity, PipelineModuleLoader, PoisonEntryPoint,
-    Registration, RegistrationKind, RegistrationResource, RegistrationSet, StagedModule,
-    TargetDefinition, UnloadOutcome,
+    Registration, RegistrationDisposition, RegistrationKind, RegistrationResource, RegistrationSet,
+    StagedModule, TargetDefinition, UnloadOutcome,
 };
 
 #[distill_asset::asset(uuid = "30112233-4455-6677-8899-aabbccddeeff")]
@@ -81,6 +81,8 @@ struct FakeModule {
     unload_error: Option<&'static str>,
     unload_panics: bool,
     poison_during_register: bool,
+    capsule_owner_mismatch: bool,
+    panic_after_registration: bool,
     pin_sink: Option<Arc<Mutex<Option<ModuleEpochPin>>>>,
 }
 
@@ -121,14 +123,26 @@ impl LoadedPipelineModule for FakeModule {
             });
             // SAFETY: `cleanup_test_registration` has the exact pointee type,
             // owns the allocation on success, and preserves it on failure.
+            let owner = if self.capsule_owner_mismatch {
+                ModuleEpochToken::new(u64::MAX)
+            } else {
+                arena.owner_token().clone()
+            };
             let resource = unsafe {
                 RegistrationResource::from_raw(
                     Box::into_raw(resource).cast(),
+                    owner,
                     cleanup_test_registration,
                 )
             };
-            arena.install(registration.clone(), resource)?;
+            let status = arena.install(registration.clone(), resource);
+            assert_eq!(status.disposition, RegistrationDisposition::Consumed);
+            status.into_result()?;
         }
+        assert!(
+            !self.panic_after_registration,
+            "configured panic after capsule transfer"
+        );
         Ok(self.registration.pipeline_targets.clone())
     }
 
@@ -222,6 +236,8 @@ fn fake_module(tag: u8, calls: Arc<Mutex<Calls>>) -> FakeModule {
         unload_error: None,
         unload_panics: false,
         poison_during_register: false,
+        capsule_owner_mismatch: false,
+        panic_after_registration: false,
         pin_sink: None,
     }
 }
@@ -345,6 +361,50 @@ fn partial_duplicate_registration_cleans_the_complete_arena_in_reverse_order() {
     assert_eq!(calls.cleanup_order, ["first#2", "middle#1", "first#0"]);
     assert_eq!(calls.unload, 1);
     assert_eq!(calls.dlclose, 1);
+}
+
+#[test]
+fn rejected_or_panicking_registration_keeps_every_capsule_arena_owned() {
+    for panics_after_transfer in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("pipeline.dylib");
+        write_module(&source, 18);
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut module = fake_module(18, calls.clone());
+        module.capsule_owner_mismatch = !panics_after_transfer;
+        module.panic_after_registration = panics_after_transfer;
+        let mut loader = FakeLoader {
+            module: Some(module),
+            open_error: None,
+        };
+        let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
+
+        let poison = host
+            .publish_candidate(&source, requirements(18), &mut loader)
+            .unwrap_err();
+
+        if panics_after_transfer {
+            assert!(
+                poison.detail.contains("register panicked"),
+                "{}",
+                poison.detail
+            );
+        } else {
+            assert!(
+                poison.detail.contains("different module epoch"),
+                "{}",
+                poison.detail
+            );
+        }
+        assert_eq!(
+            poison.cleanup_disposition,
+            Some(CandidateCleanupDisposition::CleanedAndClosed)
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.cleanup_order, ["cook#0"]);
+        assert_eq!(calls.unload, 1);
+        assert_eq!(calls.dlclose, 1);
+    }
 }
 
 #[test]

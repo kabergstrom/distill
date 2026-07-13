@@ -121,30 +121,33 @@ pub struct RegistrationSet {
     pub pipeline_targets: BTreeSet<String>,
 }
 
-/// A module-owned installed object represented without automatic Rust drop.
-/// The status thunk is the only operation permitted to destroy `pointer`.
+/// A generated erased registration capsule. Module-side construction suppresses
+/// automatic drop; ownership transfers to the host callback on entry and the
+/// status thunk is the only operation permitted to destroy `pointer`.
 ///
 /// This has deliberately no `Drop` implementation: if its thunk reports an
 /// error or panics, retaining or even dropping the host-side wrapper leaks the
 /// module object instead of running unchecked module drop glue.
-pub struct RegistrationResource {
+pub struct ErasedRegistrationCapsule {
     pointer: *mut u8,
+    owner: ModuleEpochToken,
     cleanup: unsafe fn(*mut u8) -> Result<(), ModuleCallError>,
 }
 
 // SAFETY: construction requires the caller to promise that the opaque object
 // and its thunk may be transferred to the module host thread.
-unsafe impl Send for RegistrationResource {}
+unsafe impl Send for ErasedRegistrationCapsule {}
 
-impl std::fmt::Debug for RegistrationResource {
+impl std::fmt::Debug for ErasedRegistrationCapsule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegistrationResource")
+        f.debug_struct("ErasedRegistrationCapsule")
             .field("pointer", &self.pointer)
+            .field("owner", &self.owner)
             .finish_non_exhaustive()
     }
 }
 
-impl RegistrationResource {
+impl ErasedRegistrationCapsule {
     /// Construct the raw, status-bearing ownership record installed into a
     /// candidate arena.
     ///
@@ -157,9 +160,14 @@ impl RegistrationResource {
     /// module-host thread.
     pub unsafe fn from_raw(
         pointer: *mut u8,
+        owner: ModuleEpochToken,
         cleanup: unsafe fn(*mut u8) -> Result<(), ModuleCallError>,
     ) -> Self {
-        Self { pointer, cleanup }
+        Self {
+            pointer,
+            owner,
+            cleanup,
+        }
     }
 
     fn cleanup(&self) -> Result<(), ModuleCallError> {
@@ -171,11 +179,36 @@ impl RegistrationResource {
     }
 }
 
+/// Compatibility spelling for callers generated before the capsule handoff
+/// was made explicit. It has the same no-Drop, consumed-on-entry semantics.
+pub type RegistrationResource = ErasedRegistrationCapsule;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationDisposition {
+    Consumed,
+}
+
+/// Every object-bearing host callback returns an explicit consumed status on
+/// both success and failure. There is deliberately no returned-to-caller arm.
+#[derive(Debug)]
+#[must_use = "registration ownership was consumed; inspect the nested result"]
+pub struct RegistrationStatus {
+    pub disposition: RegistrationDisposition,
+    pub result: Result<(), ModuleCallError>,
+}
+
+impl RegistrationStatus {
+    pub fn into_result(self) -> Result<(), ModuleCallError> {
+        debug_assert_eq!(self.disposition, RegistrationDisposition::Consumed);
+        self.result
+    }
+}
+
 #[derive(Debug)]
 struct CandidateRegistration {
     installation_seq: u64,
     registration: Registration,
-    resource: RegistrationResource,
+    capsule: ErasedRegistrationCapsule,
 }
 
 /// A tracked residency capability for a module-owned value. Registration and
@@ -218,6 +251,7 @@ pub struct CandidateRegistrationArena {
     owner: ModuleEpochToken,
     residency: Arc<EpochResidency>,
     entries: Vec<CandidateRegistration>,
+    next_installation_seq: u64,
 }
 
 impl std::fmt::Debug for CandidateRegistrationArena {
@@ -239,6 +273,7 @@ impl CandidateRegistrationArena {
                 fenced: AtomicBool::new(false),
             }),
             entries: Vec::new(),
+            next_installation_seq: 0,
         }
     }
 
@@ -259,21 +294,42 @@ impl CandidateRegistrationArena {
     pub fn install(
         &mut self,
         registration: Registration,
-        resource: RegistrationResource,
-    ) -> Result<(), ModuleCallError> {
-        if self.is_fenced() {
-            return Err(ModuleCallError::new(
-                "candidate registration arena is fenced",
-            ));
-        }
-        let installation_seq = u64::try_from(self.entries.len())
-            .map_err(|_| ModuleCallError::new("candidate registration sequence exhausted"))?;
+        capsule: ErasedRegistrationCapsule,
+    ) -> RegistrationStatus {
+        // Ownership transfers before checking the fence, token, duplicate
+        // metadata, or any other rejectable condition. A later failure is
+        // therefore cleaned only by `cleanup_reverse`.
+        let installation_seq = self.next_installation_seq;
+        let was_fenced = self.is_fenced();
+        let owner_matches = capsule.owner.same_epoch(&self.owner);
         self.entries.push(CandidateRegistration {
             installation_seq,
             registration,
-            resource,
+            capsule,
         });
-        Ok(())
+        let result = if was_fenced {
+            Err(ModuleCallError::new(
+                "candidate registration arena is fenced",
+            ))
+        } else if !owner_matches {
+            Err(ModuleCallError::new(
+                "registration capsule belongs to a different module epoch",
+            ))
+        } else {
+            match self.next_installation_seq.checked_add(1) {
+                Some(next) => {
+                    self.next_installation_seq = next;
+                    Ok(())
+                }
+                None => Err(ModuleCallError::new(
+                    "candidate registration sequence exhausted",
+                )),
+            }
+        };
+        RegistrationStatus {
+            disposition: RegistrationDisposition::Consumed,
+            result,
+        }
     }
 
     pub fn installed_len(&self) -> usize {
@@ -308,7 +364,7 @@ impl CandidateRegistrationArena {
         let mut errors = Vec::new();
         for index in (0..self.entries.len()).rev() {
             let sequence = self.entries[index].installation_seq;
-            match self.entries[index].resource.cleanup() {
+            match self.entries[index].capsule.cleanup() {
                 Ok(()) => {
                     self.entries.remove(index);
                 }
