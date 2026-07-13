@@ -500,7 +500,7 @@ impl std::error::Error for PipelinePoison {}
 pub enum VersionPoisonCode {
     DuplicateAssetUuid = 1,
     DuplicateBundleUuid = 2,
-    CrossFileLogicalPathCollision = 3,
+    SameRootNormalizedPathCollision = 3,
     IncompleteSkeleton = 4,
     UnreadableGlobalBundlePath = 5,
 }
@@ -532,19 +532,45 @@ pub struct ReadableBundleSource {
     pub file_hash: BundleFileHash,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AssetClaimant {
+    Authored {
+        source: ReadableBundleSource,
+        bundle: BundleUuid,
+        local_id: String,
+    },
+    Derived {
+        parent: AssetUuid,
+        output_key: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlatformPathBytes {
+    Unix(Vec<u8>),
+    Windows(Vec<u16>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhysicalPathClaim {
+    pub raw_relative_path: PlatformPathBytes,
+    pub file_hash: BundleFileHash,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionPoisonV1 {
     DuplicateAssetUuid {
         asset: AssetUuid,
-        sources: Vec<ReadableBundleSource>,
+        claimants: Vec<AssetClaimant>,
     },
     DuplicateBundleUuid {
         bundle: BundleUuid,
         sources: Vec<ReadableBundleSource>,
     },
-    CrossFileLogicalPathCollision {
+    SameRootNormalizedPathCollision {
+        root_name: String,
         normalized_path: String,
-        sources: Vec<ReadableBundleSource>,
+        claims: Vec<PhysicalPathClaim>,
     },
     IncompleteSkeleton {
         source: ReadableBundleSource,
@@ -572,11 +598,15 @@ pub enum VersionPoisonError {
     UnsupportedVersion(u8),
     UnknownCode(u16),
     UnknownFailureCode(u16),
+    UnknownClaimantTag(u8),
+    UnknownPlatformPathTag(u8),
     Truncated,
     TrailingBytes,
     InvalidUtf8,
     InvalidRootName,
     InvalidPath,
+    InvalidClaimant,
+    InvalidRawPath,
     NonCanonicalSources,
     InsufficientSources,
     IdentityMismatch,
@@ -595,8 +625,8 @@ impl VersionPoisonV1 {
         match self {
             Self::DuplicateAssetUuid { .. } => VersionPoisonCode::DuplicateAssetUuid,
             Self::DuplicateBundleUuid { .. } => VersionPoisonCode::DuplicateBundleUuid,
-            Self::CrossFileLogicalPathCollision { .. } => {
-                VersionPoisonCode::CrossFileLogicalPathCollision
+            Self::SameRootNormalizedPathCollision { .. } => {
+                VersionPoisonCode::SameRootNormalizedPathCollision
             }
             Self::IncompleteSkeleton { .. } => VersionPoisonCode::IncompleteSkeleton,
             Self::UnreadableGlobalBundlePath { .. } => {
@@ -670,7 +700,7 @@ impl TryFrom<u16> for VersionPoisonCode {
         match value {
             1 => Ok(Self::DuplicateAssetUuid),
             2 => Ok(Self::DuplicateBundleUuid),
-            3 => Ok(Self::CrossFileLogicalPathCollision),
+            3 => Ok(Self::SameRootNormalizedPathCollision),
             4 => Ok(Self::IncompleteSkeleton),
             5 => Ok(Self::UnreadableGlobalBundlePath),
             other => Err(VersionPoisonError::UnknownCode(other)),
@@ -736,20 +766,76 @@ impl<'a> VersionPoisonDecoder<'a> {
         (0..count).map(|_| self.source()).collect()
     }
 
+    fn claimants(&mut self) -> Result<Vec<AssetClaimant>, VersionPoisonError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+        if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
+            return Err(VersionPoisonError::Truncated);
+        }
+        (0..count)
+            .map(|_| match self.u8()? {
+                1 => Ok(AssetClaimant::Authored {
+                    source: self.source()?,
+                    bundle: BundleUuid(self.array()?),
+                    local_id: self.string()?,
+                }),
+                2 => Ok(AssetClaimant::Derived {
+                    parent: AssetUuid(self.array()?),
+                    output_key: self.string()?,
+                }),
+                other => Err(VersionPoisonError::UnknownClaimantTag(other)),
+            })
+            .collect()
+    }
+
+    fn path_claims(&mut self) -> Result<Vec<PhysicalPathClaim>, VersionPoisonError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+        if count > self.bytes.len().saturating_sub(self.cursor) / 6 {
+            return Err(VersionPoisonError::Truncated);
+        }
+        (0..count)
+            .map(|_| {
+                let raw_relative_path = match self.u8()? {
+                    1 => {
+                        let len = usize::try_from(self.u32()?)
+                            .map_err(|_| VersionPoisonError::Truncated)?;
+                        PlatformPathBytes::Unix(self.take(len)?.to_vec())
+                    }
+                    2 => {
+                        let count = usize::try_from(self.u32()?)
+                            .map_err(|_| VersionPoisonError::Truncated)?;
+                        if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
+                            return Err(VersionPoisonError::Truncated);
+                        }
+                        let units = (0..count)
+                            .map(|_| self.u16())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        PlatformPathBytes::Windows(units)
+                    }
+                    other => return Err(VersionPoisonError::UnknownPlatformPathTag(other)),
+                };
+                Ok(PhysicalPathClaim {
+                    raw_relative_path,
+                    file_hash: BundleFileHash(self.array()?),
+                })
+            })
+            .collect()
+    }
+
     fn detail(&mut self, code: VersionPoisonCode) -> Result<VersionPoisonV1, VersionPoisonError> {
         Ok(match code {
             VersionPoisonCode::DuplicateAssetUuid => VersionPoisonV1::DuplicateAssetUuid {
                 asset: AssetUuid(self.array()?),
-                sources: self.sources()?,
+                claimants: self.claimants()?,
             },
             VersionPoisonCode::DuplicateBundleUuid => VersionPoisonV1::DuplicateBundleUuid {
                 bundle: BundleUuid(self.array()?),
                 sources: self.sources()?,
             },
-            VersionPoisonCode::CrossFileLogicalPathCollision => {
-                VersionPoisonV1::CrossFileLogicalPathCollision {
+            VersionPoisonCode::SameRootNormalizedPathCollision => {
+                VersionPoisonV1::SameRootNormalizedPathCollision {
+                    root_name: self.string()?,
                     normalized_path: self.string()?,
-                    sources: self.sources()?,
+                    claims: self.path_claims()?,
                 }
             }
             VersionPoisonCode::IncompleteSkeleton => VersionPoisonV1::IncompleteSkeleton {
@@ -792,20 +878,22 @@ fn version_poison_identity(code: VersionPoisonCode, detail: &VersionPoisonV1) ->
 
 fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &VersionPoisonV1) {
     match detail {
-        VersionPoisonV1::DuplicateAssetUuid { asset, sources } => {
+        VersionPoisonV1::DuplicateAssetUuid { asset, claimants } => {
             encoder.raw(&asset.0);
-            encode_bundle_sources(encoder, sources);
+            encoder.seq(claimants, encode_asset_claimant);
         }
         VersionPoisonV1::DuplicateBundleUuid { bundle, sources } => {
             encoder.raw(&bundle.0);
             encode_bundle_sources(encoder, sources);
         }
-        VersionPoisonV1::CrossFileLogicalPathCollision {
+        VersionPoisonV1::SameRootNormalizedPathCollision {
+            root_name,
             normalized_path,
-            sources,
+            claims,
         } => {
+            encoder.str(root_name);
             encoder.str(normalized_path);
-            encode_bundle_sources(encoder, sources);
+            encoder.seq(claims, encode_physical_path_claim);
         }
         VersionPoisonV1::IncompleteSkeleton { source, failure } => {
             encode_bundle_source(encoder, source);
@@ -821,6 +909,44 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
             encoder.u16(*failure as u16);
         }
     }
+}
+
+fn encode_asset_claimant(encoder: &mut CanonicalEncoder, claimant: &AssetClaimant) {
+    match claimant {
+        AssetClaimant::Authored {
+            source,
+            bundle,
+            local_id,
+        } => {
+            encoder.u8(1);
+            encode_bundle_source(encoder, source);
+            encoder.raw(&bundle.0);
+            encoder.str(local_id);
+        }
+        AssetClaimant::Derived { parent, output_key } => {
+            encoder.u8(2);
+            encoder.raw(&parent.0);
+            encoder.str(output_key);
+        }
+    }
+}
+
+fn encode_physical_path_claim(encoder: &mut CanonicalEncoder, claim: &PhysicalPathClaim) {
+    match &claim.raw_relative_path {
+        PlatformPathBytes::Unix(bytes) => {
+            encoder.u8(1);
+            encoder.u32(u32::try_from(bytes.len()).expect("raw Unix path exceeds u32 length"));
+            encoder.raw(bytes);
+        }
+        PlatformPathBytes::Windows(units) => {
+            encoder.u8(2);
+            encoder.u32(u32::try_from(units.len()).expect("raw Windows path exceeds u32 length"));
+            for unit in units {
+                encoder.u16(*unit);
+            }
+        }
+    }
+    encoder.raw(&claim.file_hash.0);
 }
 
 fn encode_bundle_sources(encoder: &mut CanonicalEncoder, sources: &[ReadableBundleSource]) {
@@ -848,10 +974,33 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
     };
 
     match detail {
-        VersionPoisonV1::DuplicateAssetUuid { sources, .. }
-        | VersionPoisonV1::DuplicateBundleUuid { sources, .. }
-        | VersionPoisonV1::CrossFileLogicalPathCollision { sources, .. } => {
+        VersionPoisonV1::DuplicateAssetUuid { claimants, .. } => {
+            validate_strict_two(claimants)?;
+            for claimant in claimants {
+                match claimant {
+                    AssetClaimant::Authored {
+                        source, local_id, ..
+                    } => {
+                        validate_source(source)?;
+                        validate_identifier(local_id)?;
+                    }
+                    AssetClaimant::Derived { output_key, .. } => {
+                        validate_identifier(output_key)?;
+                    }
+                }
+            }
+        }
+        VersionPoisonV1::DuplicateBundleUuid { sources, .. } => {
             validate_collision_sources(sources)?;
+        }
+        VersionPoisonV1::SameRootNormalizedPathCollision {
+            root_name,
+            normalized_path,
+            claims,
+        } => {
+            validate_root_and_path(root_name, normalized_path)?;
+            validate_strict_two(claims)?;
+            claims.iter().try_for_each(validate_physical_path_claim)?;
         }
         VersionPoisonV1::IncompleteSkeleton { source, .. } => validate_source(source)?,
         VersionPoisonV1::UnreadableGlobalBundlePath {
@@ -862,13 +1011,54 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
             validate_root_and_path(root_name, normalized_path)?;
         }
     }
-    if let VersionPoisonV1::CrossFileLogicalPathCollision {
-        normalized_path, ..
-    } = detail
-    {
-        validate_normalized_path(normalized_path)?;
+    Ok(())
+}
+
+fn validate_strict_two<T: Ord>(values: &[T]) -> Result<(), VersionPoisonError> {
+    if values.len() < 2 {
+        return Err(VersionPoisonError::InsufficientSources);
+    }
+    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(VersionPoisonError::NonCanonicalSources);
     }
     Ok(())
+}
+
+fn validate_identifier(value: &str) -> Result<(), VersionPoisonError> {
+    use unicode_normalization::UnicodeNormalization;
+    if value.is_empty()
+        || value.nfc().collect::<String>() != value
+        || value.contains(['/', '\\', '\0'])
+    {
+        return Err(VersionPoisonError::InvalidClaimant);
+    }
+    Ok(())
+}
+
+fn validate_physical_path_claim(claim: &PhysicalPathClaim) -> Result<(), VersionPoisonError> {
+    let valid = match &claim.raw_relative_path {
+        PlatformPathBytes::Unix(bytes) => {
+            !bytes.is_empty()
+                && !bytes.contains(&0)
+                && !bytes.starts_with(b"/")
+                && !bytes
+                    .split(|byte| *byte == b'/')
+                    .any(|part| part.is_empty() || part == b"." || part == b"..")
+        }
+        PlatformPathBytes::Windows(units) => {
+            !units.is_empty()
+                && !units.contains(&0)
+                && !matches!(units.first(), Some(47 | 92))
+                && !units
+                    .split(|unit| matches!(*unit, 47 | 92))
+                    .any(|part| part.is_empty() || part == [46_u16] || part == [46_u16, 46_u16])
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(VersionPoisonError::InvalidRawPath)
+    }
 }
 
 fn validate_root_and_path(
