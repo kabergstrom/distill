@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -179,7 +179,7 @@ CREATE TABLE configuration_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     active_generation  INTEGER NOT NULL,
     input_version      INTEGER NOT NULL,
-    poison_code        INTEGER CHECK (poison_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)),
+    poison_code        INTEGER CHECK (poison_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)),
     poison_reason_hash BLOB CHECK (poison_reason_hash IS NULL OR length(poison_reason_hash) = 32),
     poison_message     TEXT,
     CHECK ((poison_code IS NULL AND poison_reason_hash IS NULL AND poison_message IS NULL)

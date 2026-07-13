@@ -215,6 +215,7 @@ pub enum ConfigurationPoisonCode {
     MissingLineageManifest = 10,
     DuplicateLineageManifest = 11,
     UnsupportedTargetIdentity = 12,
+    DuplicateTargetName = 13,
 }
 
 impl TryFrom<u16> for ConfigurationPoisonCode {
@@ -234,6 +235,7 @@ impl TryFrom<u16> for ConfigurationPoisonCode {
             10 => Ok(Self::MissingLineageManifest),
             11 => Ok(Self::DuplicateLineageManifest),
             12 => Ok(Self::UnsupportedTargetIdentity),
+            13 => Ok(Self::DuplicateTargetName),
             unknown => Err(UnknownConfigurationPoisonCode(unknown)),
         }
     }
@@ -332,6 +334,9 @@ pub enum DscpV1 {
         expected: CompilationIdentity,
         observed: CompilationIdentity,
     },
+    DuplicateTargetName {
+        normalized_name: String,
+    },
 }
 
 impl DscpV1 {
@@ -355,6 +360,7 @@ impl DscpV1 {
             Self::UnsupportedTargetIdentity { .. } => {
                 ConfigurationPoisonCode::UnsupportedTargetIdentity
             }
+            Self::DuplicateTargetName { .. } => ConfigurationPoisonCode::DuplicateTargetName,
         }
     }
 
@@ -403,6 +409,7 @@ impl DscpV1 {
                     encode_compilation_identity(encoder, expected);
                     encode_compilation_identity(encoder, observed);
                 }
+                Self::DuplicateTargetName { normalized_name } => encoder.str(normalized_name),
             }
         })
     }

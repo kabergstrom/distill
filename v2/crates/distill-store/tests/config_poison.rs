@@ -49,6 +49,7 @@ fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
         ConfigurationPoisonCode::UnsupportedTargetIdentity as u16,
         12
     );
+    assert_eq!(ConfigurationPoisonCode::DuplicateTargetName as u16, 13);
     assert_eq!(ConfigurationPathKey::AssetRoot as u8, 1);
     assert_eq!(ConfigurationPathKey::StatePath as u8, 2);
     assert_eq!(ConfigurationPathKey::SchemaArtifact as u8, 3);
@@ -162,6 +163,12 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
                 observed: compilation,
             },
             ConfigurationPoisonCode::UnsupportedTargetIdentity,
+        ),
+        (
+            DscpV1::DuplicateTargetName {
+                normalized_name: "ship".to_owned(),
+            },
+            ConfigurationPoisonCode::DuplicateTargetName,
         ),
     ];
     for (reason, expected) in cases {
