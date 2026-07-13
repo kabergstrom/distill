@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::sync::Notify;
 use unicode_normalization::UnicodeNormalization;
 
+use distill_core::attestation::RegistryExtraFact;
+
 use crate::attestation::validate_attestation_shape;
 use crate::*;
 
@@ -120,6 +122,7 @@ struct ConnectionState {
     target: String,
     target_generation: u64,
     policy_generation: u64,
+    attestation_generation: u64,
     epoch: GameModuleEpoch,
     load_policy: Arc<LoadPolicyAttestation>,
     subscribed_assets: BTreeSet<AssetUuid>,
@@ -144,8 +147,8 @@ impl Server {
         let mut target_map = BTreeMap::new();
         for target in targets {
             validate_attestation_shape(
-                &target.layout_registry,
-                target.layout_aggregate,
+                &target.compiled_registry,
+                target.dsca,
                 &target.load_policy,
                 target.policy_digest,
             )?;
@@ -325,8 +328,8 @@ impl Server {
     ) -> Result<SnapshotStamp, AdminError> {
         let mut state = self.lock();
         validate_attestation_shape(
-            &replacement.layout_registry,
-            replacement.layout_aggregate,
+            &replacement.compiled_registry,
+            replacement.dsca,
             &replacement.load_policy,
             replacement.policy_digest,
         )
@@ -339,8 +342,10 @@ impl Server {
                 target: name.clone(),
             })?;
         let target_changed = runtime.definition.definition_hash != replacement.definition_hash
-            || runtime.definition.layout_registry != replacement.layout_registry
-            || runtime.definition.layout_aggregate != replacement.layout_aggregate;
+            || !compiled_equal_ignoring_load_policy(
+                &runtime.definition.compiled_registry,
+                &replacement.compiled_registry,
+            );
         let policy_changed = runtime.definition.load_policy != replacement.load_policy
             || runtime.definition.policy_digest != replacement.policy_digest;
         if !target_changed && !policy_changed {
@@ -410,6 +415,28 @@ impl Server {
     }
 }
 
+fn compiled_equal_ignoring_load_policy(
+    left: &[CompiledTypeRow],
+    right: &[CompiledTypeRow],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.type_uuid == right.type_uuid
+                && left.logical_hash == right.logical_hash
+                && left.native_layout_digest == right.native_layout_digest
+                && left
+                    .registry_extras
+                    .rows
+                    .iter()
+                    .filter(|row| !matches!(row.fact, RegistryExtraFact::BuildOnly(_)))
+                    .eq(right
+                        .registry_extras
+                        .rows
+                        .iter()
+                        .filter(|row| !matches!(row.fact, RegistryExtraFact::BuildOnly(_))))
+        })
+}
+
 impl Root {
     pub fn connect(&self, request: ConnectRequest) -> ConnectOutcome {
         let mut state = self.server.lock();
@@ -430,8 +457,8 @@ impl Root {
         let policy = match validate_complete_attestation(
             &runtime.definition,
             request.target_definition_hash,
-            &request.layout_registry,
-            request.layout_aggregate,
+            &request.compiled_registry,
+            request.dsca,
             &request.load_policy,
             request.policy_digest,
         ) {
@@ -458,6 +485,7 @@ impl Root {
             target: request.target,
             target_generation,
             policy_generation,
+            attestation_generation: 0,
             epoch: request.epoch,
             load_policy: policy,
             subscribed_assets: BTreeSet::new(),
@@ -473,6 +501,9 @@ impl Root {
                 connection,
             },
             instance: state.instance,
+            policy_generation,
+            target_generation,
+            attestation_generation: 0,
         })
     }
 }
@@ -638,7 +669,7 @@ impl Hub {
         RpcResult::Success(())
     }
 
-    pub fn reattest(&self, request: ReattestRequest) -> RpcResult<()> {
+    pub fn reattest(&self, request: ReattestRequest) -> RpcResult<u64> {
         let state = self.server.lock();
         let mut connection = lock_connection(&self.connection);
         if let Some(reason) = generation_fence(&state, &connection) {
@@ -650,6 +681,27 @@ impl Hub {
             .expect("current view must exist");
         if let ConfigurationStatus::Poisoned(poison) = &current_view.configuration {
             return RpcResult::ConfigurationPoisoned(poison.clone());
+        }
+        let expected_successor = match request.base_attestation_generation.checked_add(1) {
+            Some(successor) => successor,
+            None => {
+                return RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
+                    base: request.base_attestation_generation,
+                    successor: request.successor_attestation_generation,
+                })
+            }
+        };
+        if request.successor_attestation_generation != expected_successor {
+            return RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
+                base: request.base_attestation_generation,
+                successor: request.successor_attestation_generation,
+            });
+        }
+        if request.base_attestation_generation != connection.attestation_generation {
+            return RpcResult::Failure(RpcFailure::StaleAttestationBase {
+                expected: connection.attestation_generation,
+                got: request.base_attestation_generation,
+            });
         }
         if request.epoch <= connection.epoch {
             return RpcResult::Failure(RpcFailure::EpochNotSuccessor {
@@ -664,8 +716,8 @@ impl Hub {
         let policy = match validate_complete_attestation(
             &runtime.definition,
             request.target_definition_hash,
-            &request.layout_registry,
-            request.layout_aggregate,
+            &request.compiled_registry,
+            request.dsca,
             &request.load_policy,
             request.policy_digest,
         ) {
@@ -674,7 +726,8 @@ impl Hub {
         };
         connection.epoch = request.epoch;
         connection.load_policy = policy;
-        RpcResult::Success(())
+        connection.attestation_generation = request.successor_attestation_generation;
+        RpcResult::Success(request.successor_attestation_generation)
     }
 }
 
@@ -834,12 +887,12 @@ impl DeltaStream {
 fn validate_complete_attestation(
     target: &TargetDefinition,
     target_hash: TargetDefinitionHash,
-    layout_rows: &[LayoutEntry],
-    layout_aggregate: [u8; 32],
+    compiled_rows: &[CompiledTypeRow],
+    dsca: CompiledAttestationDigest,
     policy_rows: &[LoadPolicyEntry],
     policy_digest: [u8; 32],
 ) -> Result<Arc<LoadPolicyAttestation>, ConnectError> {
-    validate_attestation_shape(layout_rows, layout_aggregate, policy_rows, policy_digest)
+    validate_attestation_shape(compiled_rows, dsca, policy_rows, policy_digest)
         .map_err(ConnectError::AttestationShape)?;
     if target.definition_hash != target_hash {
         return Err(ConnectError::TargetDefinitionMismatch {
@@ -848,24 +901,22 @@ fn validate_complete_attestation(
         });
     }
 
-    if layout_aggregate != target.layout_aggregate {
-        for client in layout_rows {
+    if dsca != target.dsca {
+        for client in compiled_rows {
             let server = target
-                .layout_registry
+                .compiled_registry
                 .binary_search_by_key(&client.type_uuid, |row| row.type_uuid)
                 .ok()
-                .map(|index| target.layout_registry[index]);
+                .map(|index| &target.compiled_registry[index]);
             match server {
                 None => {
-                    return Err(ConnectError::MissingLayout {
+                    return Err(ConnectError::MissingCompiledType {
                         type_uuid: client.type_uuid,
                     })
                 }
-                Some(server) if server.layout_digest != client.layout_digest => {
-                    return Err(ConnectError::LayoutMismatch {
+                Some(server) if server != client => {
+                    return Err(ConnectError::CompiledTypeMismatch {
                         type_uuid: client.type_uuid,
-                        expected: server.layout_digest,
-                        got: client.layout_digest,
                     })
                 }
                 Some(_) => {}
@@ -944,6 +995,7 @@ fn basis_for(connection: &ConnectionState, snapshot: SnapshotStamp) -> RpcBasis 
         load_policy: connection.load_policy.clone(),
         policy_generation: connection.policy_generation,
         target_generation: connection.target_generation,
+        attestation_generation: connection.attestation_generation,
     }
 }
 

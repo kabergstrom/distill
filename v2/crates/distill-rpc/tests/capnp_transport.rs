@@ -1,18 +1,38 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use distill_core::attestation::{
+    CompiledTypeRow, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, SchemaNodeId,
+};
 use distill_rpc::capnp_transport::{schema, CapnpClient, RemoteConnectOutcome, StagedListener};
 use distill_rpc::*;
 use tokio::task::LocalSet;
+
+fn compiled(definition: u8) -> CompiledTypeRow {
+    CompiledTypeRow::new(
+        TypeUuid([1; 16]),
+        LogicalHash([3; 32]),
+        [2; 32],
+        false,
+        RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+            node: SchemaNodeId(0),
+            path: vec![],
+            fact: RegistryExtraFact::ControlRole(if definition == 7 {
+                distill_core::attestation::ControlRole::Unrestricted
+            } else {
+                distill_core::attestation::ControlRole::AuthoringOnlyRequired
+            }),
+        }])
+        .unwrap(),
+    )
+    .unwrap()
+}
 
 fn target() -> TargetDefinition {
     TargetDefinition::canonical(
         "dev",
         TargetDefinitionHash([7; 32]),
-        vec![LayoutEntry {
-            type_uuid: TypeUuid([1; 16]),
-            layout_digest: [2; 32],
-        }],
+        vec![compiled(7)],
         vec![LoadPolicyEntry {
             type_uuid: TypeUuid([1; 16]),
             build_only: false,
@@ -26,7 +46,7 @@ fn request() -> ConnectRequest {
         GameModuleEpoch(1),
         "dev",
         TargetDefinitionHash([7; 32]),
-        target().layout_registry,
+        target().compiled_registry,
         target().load_policy,
     )
     .unwrap()
@@ -34,6 +54,83 @@ fn request() -> ConnectRequest {
 
 fn server() -> Server {
     Server::new(StoreInstanceId([9; 16]), vec![target()]).unwrap()
+}
+
+fn write_reattest(
+    mut params: schema::hub::reattest_params::Builder<'_>,
+    epoch: u64,
+    base: u64,
+    successor: u64,
+) {
+    let next = request();
+    params.set_epoch(epoch);
+    params.set_base_attestation_generation(base);
+    params.set_successor_attestation_generation(successor);
+    params.set_target_def_hash(&next.target_definition_hash.0);
+    let mut rows = params
+        .reborrow()
+        .init_compiled_registry(next.compiled_registry.len() as u32);
+    for (index, row) in next.compiled_registry.iter().enumerate() {
+        let mut wire = rows.reborrow().get(index as u32);
+        wire.set_type_uuid(&row.type_uuid.0);
+        wire.set_logical_hash(&row.logical_hash.0);
+        wire.set_native_layout_digest(&row.native_layout_digest);
+        wire.set_build_only(row.build_only);
+        wire.set_registry_extras_digest(&row.registry_extras_digest.0);
+        wire.set_registry_extras(&row.registry_extras.encode().unwrap());
+    }
+    params.set_dsca_aggregate(&next.dsca.0);
+    let mut policies = params
+        .reborrow()
+        .init_load_policy(next.load_policy.len() as u32);
+    for (index, row) in next.load_policy.iter().enumerate() {
+        let mut wire = policies.reborrow().get(index as u32);
+        wire.set_type_uuid(&row.type_uuid.0);
+        wire.set_build_only(row.build_only);
+    }
+    params.set_policy_digest(&next.policy_digest);
+}
+
+#[test]
+fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
+    let source = include_str!("../schema/distill_rpc.capnp");
+    assert!(!source.contains("CallStatus"));
+    assert!(!source.contains("AnyPointer"));
+    assert!(!source.contains("-> (status"));
+    for name in [
+        "SnapshotCall",
+        "SubscribeCall",
+        "VoidCall",
+        "UInt64Call",
+        "UuidCall",
+        "ProgressCall",
+        "DataCall",
+        "UuidListCall",
+        "EntryMetaCall",
+        "ResolveCall",
+        "PathResolveCall",
+        "ChunkStreamCall",
+    ] {
+        let marker = format!("struct {name} {{");
+        let body = source
+            .split_once(marker.as_str())
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+            .split_once("\n  }\n}")
+            .unwrap_or_else(|| panic!("unterminated {name}"))
+            .0;
+        assert!(body.contains("success @0"), "{name} success ordinal");
+        assert!(
+            body.contains("reconnectRequired @1"),
+            "{name} reconnect ordinal"
+        );
+        assert!(
+            body.contains("configurationPoisoned @2"),
+            "{name} poison ordinal"
+        );
+        assert!(body.contains("leaseFailure @3"), "{name} lease ordinal");
+        assert!(body.contains("error @4"), "{name} error ordinal");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -102,17 +199,42 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 tokio::task::spawn_local(async move { server_listener.serve_one().await });
             let client = CapnpClient::connect_local(address).await.unwrap();
             let hub = match client.connect(&request()).await.unwrap() {
-                RemoteConnectOutcome::Connected { hub, instance } => {
+                RemoteConnectOutcome::Connected {
+                    hub,
+                    instance,
+                    policy_generation,
+                    target_generation,
+                    attestation_generation,
+                } => {
                     assert_eq!(instance, StoreInstanceId([9; 16]));
+                    assert_eq!(policy_generation, 0);
+                    assert_eq!(target_generation, 0);
+                    assert_eq!(attestation_generation, 0);
                     hub
                 }
                 other => panic!("expected connected, got {other:?}"),
             };
 
+            // Reattestation carries and revalidates the same full typed rows,
+            // not a layout-only projection.
+            let mut reattest = hub.reattest_request();
+            write_reattest(reattest.get(), 2, 0, 1);
+            let reattested = reattest.send().promise.await.unwrap();
+            assert!(matches!(
+                reattested
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                schema::u_int64_call::Which::Success(1)
+            ));
+
             let snapshot_response = hub.snapshot_request().send().promise.await.unwrap();
             let snapshot_result = snapshot_response.get().unwrap().get_result().unwrap();
             let snapshot = match snapshot_result.which().unwrap() {
-                schema::snapshot_result::Which::Snapshot(snapshot) => snapshot.unwrap(),
+                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
                 _ => panic!("expected snapshot capability"),
             };
 
@@ -121,7 +243,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let resolve_response = resolve.send().promise.await.unwrap();
             let resolve_result = resolve_response.get().unwrap().get_result().unwrap();
             let terminal = match resolve_result.which().unwrap() {
-                schema::resolve_call_result::Which::Terminal(terminal) => terminal.unwrap(),
+                schema::resolve_call::Which::Success(terminal) => terminal.unwrap(),
                 _ => panic!("expected terminal resolve"),
             };
             assert_eq!(terminal.get_basis().unwrap().get_version(), 1);
@@ -137,7 +259,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let fetch_response = fetch.send().promise.await.unwrap();
             let fetch_result = fetch_response.get().unwrap().get_result().unwrap();
             let terminal = match fetch_result.which().unwrap() {
-                schema::fetch_call_result::Which::Terminal(terminal) => terminal.unwrap(),
+                schema::chunk_stream_call::Which::Success(terminal) => terminal.unwrap(),
                 _ => panic!("expected terminal fetch"),
             };
             assert_eq!(terminal.get_basis().unwrap().get_version(), 1);
@@ -158,7 +280,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let subscribe_response = subscribe.send().promise.await.unwrap();
             let subscribe_result = subscribe_response.get().unwrap().get_result().unwrap();
             let installed = match subscribe_result.which().unwrap() {
-                schema::subscribe_result::Which::Installed(installed) => installed.unwrap(),
+                schema::subscribe_call::Which::Success(installed) => installed.unwrap(),
                 _ => panic!("expected subscription"),
             };
             assert_eq!(installed.get_installed(), 1);
@@ -218,7 +340,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
             let refresh_result = refresh_response.get().unwrap().get_result().unwrap();
             let poisoned_snapshot = match refresh_result.which().unwrap() {
-                schema::snapshot_result::Which::Snapshot(snapshot) => snapshot.unwrap(),
+                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
                 _ => panic!("refresh must remain valid under configuration poison"),
             };
             let mut poisoned_resolve = poisoned_snapshot.resolve_request();
@@ -226,7 +348,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let poisoned_response = poisoned_resolve.send().promise.await.unwrap();
             let poisoned_result = poisoned_response.get().unwrap().get_result().unwrap();
             match poisoned_result.which().unwrap() {
-                schema::resolve_call_result::Which::ConfigurationPoisoned(value) => {
+                schema::resolve_call::Which::ConfigurationPoisoned(value) => {
                     let value = value.unwrap();
                     assert_eq!(value.get_code(), poison.code.0);
                     assert_eq!(value.get_reason_hash().unwrap(), &poison.reason_hash);
@@ -241,10 +363,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                     TargetDefinition::canonical(
                         "dev",
                         TargetDefinitionHash([8; 32]),
-                        vec![LayoutEntry {
-                            type_uuid: TypeUuid([1; 16]),
-                            layout_digest: [2; 32],
-                        }],
+                        vec![compiled(8)],
                         vec![LoadPolicyEntry {
                             type_uuid: TypeUuid([1; 16]),
                             build_only: false,
@@ -258,7 +377,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let fenced_response = fenced_resolve.send().promise.await.unwrap();
             let fenced_result = fenced_response.get().unwrap().get_result().unwrap();
             match fenced_result.which().unwrap() {
-                schema::resolve_call_result::Which::ReconnectRequired(reconnect) => {
+                schema::resolve_call::Which::ReconnectRequired(reconnect) => {
                     assert_eq!(
                         reconnect.unwrap().get_reason().unwrap(),
                         schema::ReconnectReason::TargetDefinitionChanged
@@ -292,13 +411,35 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
                 tokio::task::spawn_local(async move { server_listener.serve_one().await });
             let client = CapnpClient::connect_local(address).await.unwrap();
 
+            let mut wrong_protocol = request();
+            wrong_protocol.protocol = PROTOCOL_VERSION + 1;
+            assert!(matches!(
+                client.connect(&wrong_protocol).await.unwrap(),
+                RemoteConnectOutcome::ProtocolFailure {
+                    expected: PROTOCOL_VERSION,
+                    observed,
+                    ..
+                } if observed == PROTOCOL_VERSION + 1
+            ));
+
+            let mut wrong_attestation = request();
+            wrong_attestation.target_definition_hash = TargetDefinitionHash([8; 32]);
+            assert!(matches!(
+                client.connect(&wrong_attestation).await.unwrap(),
+                RemoteConnectOutcome::AttestationFailure {
+                    code: 2000,
+                    type_uuid: None,
+                    ..
+                }
+            ));
+
             let mut malformed = client.root().connect_request();
             {
                 let mut params = malformed.get();
                 params.set_target("dev");
                 params.set_target_def_hash(&[7; 31]);
-                params.reborrow().init_layout_registry(0);
-                params.set_layout_aggregate(&[0; 32]);
+                params.reborrow().init_compiled_registry(0);
+                params.set_dsca_aggregate(&[0; 32]);
                 params.reborrow().init_load_policy(0);
                 params.set_policy_digest(&[0; 32]);
                 params.set_protocol(PROTOCOL_VERSION);
@@ -307,7 +448,7 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let malformed_response = malformed.send().promise.await.unwrap();
             let malformed_result = malformed_response.get().unwrap().get_result().unwrap();
             match malformed_result.which().unwrap() {
-                schema::connect_result::Which::Rejected(failure) => {
+                schema::connect_call::Which::Error(failure) => {
                     let failure = failure.unwrap();
                     assert_eq!(failure.get_code(), 1002);
                     assert!(failure
@@ -320,6 +461,39 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
                 _ => panic!("wrong hash width must be rejected"),
             }
 
+            let mut forged_extras = client.root().connect_request();
+            {
+                let valid = request();
+                let row = &valid.compiled_registry[0];
+                let mut params = forged_extras.get();
+                params.set_target("dev");
+                params.set_target_def_hash(&valid.target_definition_hash.0);
+                let mut rows = params.reborrow().init_compiled_registry(1);
+                let mut wire = rows.reborrow().get(0);
+                wire.set_type_uuid(&row.type_uuid.0);
+                wire.set_logical_hash(&row.logical_hash.0);
+                wire.set_native_layout_digest(&row.native_layout_digest);
+                wire.set_build_only(row.build_only);
+                wire.set_registry_extras_digest(&row.registry_extras_digest.0);
+                wire.set_registry_extras(&[2, 0, 0, 0, 0]);
+                params.set_dsca_aggregate(&valid.dsca.0);
+                let mut policies = params.reborrow().init_load_policy(1);
+                let mut policy = policies.reborrow().get(0);
+                policy.set_type_uuid(&valid.load_policy[0].type_uuid.0);
+                policy.set_build_only(false);
+                params.set_policy_digest(&valid.policy_digest);
+                params.set_protocol(PROTOCOL_VERSION);
+                params.set_game_module_epoch(1);
+            }
+            let forged_response = forged_extras.send().promise.await.unwrap();
+            let forged_result = forged_response.get().unwrap().get_result().unwrap();
+            match forged_result.which().unwrap() {
+                schema::connect_call::Which::Error(failure) => {
+                    assert_eq!(failure.unwrap().get_code(), 1005);
+                }
+                _ => panic!("unknown DSRE version must be a typed wire rejection"),
+            }
+
             let hub = match client.connect(&request()).await.unwrap() {
                 RemoteConnectOutcome::Connected { hub, .. } => hub,
                 other => panic!("expected connected, got {other:?}"),
@@ -327,7 +501,7 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let snapshot_response = hub.snapshot_request().send().promise.await.unwrap();
             let snapshot_result = snapshot_response.get().unwrap().get_result().unwrap();
             let snapshot = match snapshot_result.which().unwrap() {
-                schema::snapshot_result::Which::Snapshot(snapshot) => snapshot.unwrap(),
+                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
                 _ => panic!("expected snapshot"),
             };
             let mut resolve = snapshot.resolve_request();
@@ -335,7 +509,7 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let response = resolve.send().promise.await.unwrap();
             let result = response.get().unwrap().get_result().unwrap();
             match result.which().unwrap() {
-                schema::resolve_call_result::Which::Failure(failure) => {
+                schema::resolve_call::Which::Error(failure) => {
                     assert_eq!(failure.unwrap().get_code(), 1001)
                 }
                 _ => panic!("wrong UUID width must be a typed failure"),
@@ -346,11 +520,97 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             let response = fetch.send().promise.await.unwrap();
             let result = response.get().unwrap().get_result().unwrap();
             match result.which().unwrap() {
-                schema::fetch_call_result::Which::Failure(failure) => {
+                schema::chunk_stream_call::Which::Error(failure) => {
                     assert_eq!(failure.unwrap().get_code(), 1002)
                 }
                 _ => panic!("wrong hash width must be a typed failure"),
             }
+
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_wire_reattests_cas_the_generation_without_late_overwrite() {
+    LocalSet::new()
+        .run_until(async {
+            let listener = Rc::new(
+                StagedListener::bind(server().root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let server_listener = listener.clone();
+            let server_task =
+                tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = match client.connect(&request()).await.unwrap() {
+                RemoteConnectOutcome::Connected {
+                    hub,
+                    attestation_generation,
+                    ..
+                } => {
+                    assert_eq!(attestation_generation, 0);
+                    hub
+                }
+                other => panic!("expected connected, got {other:?}"),
+            };
+
+            let mut first = hub.reattest_request();
+            write_reattest(first.get(), 2, 0, 1);
+            let mut second = hub.reattest_request();
+            write_reattest(second.get(), 3, 0, 1);
+            let (first, second) = futures::join!(first.send().promise, second.send().promise);
+            let first = first.unwrap();
+            let second = second.unwrap();
+            let outcomes = [
+                first.get().unwrap().get_result().unwrap().which().unwrap(),
+                second.get().unwrap().get_result().unwrap().which().unwrap(),
+            ];
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, schema::u_int64_call::Which::Success(1)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| match outcome {
+                        schema::u_int64_call::Which::Error(error) =>
+                            error.as_ref().is_ok_and(|error| {
+                                error.get_message().is_ok_and(|message| {
+                                    message.to_str().is_ok_and(|message| {
+                                        message.contains("StaleAttestationBase")
+                                    })
+                                })
+                            }),
+                        _ => false,
+                    })
+                    .count(),
+                1
+            );
+
+            let mut successor = hub.reattest_request();
+            write_reattest(successor.get(), 4, 1, 2);
+            let successor = successor.send().promise.await.unwrap();
+            assert!(matches!(
+                successor
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                schema::u_int64_call::Which::Success(2)
+            ));
 
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)

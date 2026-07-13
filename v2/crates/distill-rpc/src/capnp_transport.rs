@@ -18,11 +18,12 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
-    AssetDeltaState, AssetEvent, AssetUuid, ChunkStream, ConfigurationPoison, ConfigurationStatus,
-    ConnectOutcome, ConnectRequest, ContentHash, Delta, DeltaStream, DriftedInput, GameModuleEpoch,
-    Hub, InputVersion, LayoutEntry, LoadPolicyEntry, PathResolveFailure, PathResolveResult,
-    ReattestRequest, ReconnectReason, ResolveResult, Root, RpcResult, Snapshot, SnapshotStamp,
-    StoreInstanceId, TargetDefinitionHash, TypeUuid,
+    AssetDeltaState, AssetEvent, AssetUuid, ChunkStream, CompiledAttestationDigest,
+    CompiledTypeRow, ConfigurationPoison, ConfigurationStatus, ConnectOutcome, ConnectRequest,
+    ContentHash, Delta, DeltaStream, DriftedInput, GameModuleEpoch, Hub, InputVersion,
+    LoadPolicyEntry, PathResolveFailure, PathResolveResult, ReattestRequest, ReconnectReason,
+    RegistryExtrasDigest, RegistryExtrasV1, ResolveResult, Root, RpcFailure, RpcResult, Snapshot,
+    SnapshotStamp, StoreInstanceId, TargetDefinitionHash, TypeUuid,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -31,6 +32,7 @@ const WIRE_INVALID_UUID: u16 = 1001;
 const WIRE_INVALID_HASH: u16 = 1002;
 const WIRE_INVALID_INSTANCE: u16 = 1003;
 const WIRE_INVALID_UTF8: u16 = 1004;
+const WIRE_INVALID_ATTESTATION: u16 = 1005;
 const CONNECT_REJECTED: u16 = 2000;
 const RPC_FAILURE: u16 = 3000;
 const UNSUPPORTED_METHOD: u16 = 4000;
@@ -184,9 +186,22 @@ pub enum RemoteConnectOutcome {
     Connected {
         hub: schema::hub::Client,
         instance: StoreInstanceId,
+        policy_generation: u64,
+        target_generation: u64,
+        attestation_generation: u64,
     },
     ConfigurationPoisoned(ConfigurationPoison),
-    Rejected {
+    AttestationFailure {
+        code: u16,
+        type_uuid: Option<TypeUuid>,
+        message: String,
+    },
+    ProtocolFailure {
+        expected: u32,
+        observed: u32,
+        message: String,
+    },
+    Error {
         code: u16,
         message: String,
     },
@@ -195,16 +210,45 @@ pub enum RemoteConnectOutcome {
 impl fmt::Debug for RemoteConnectOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connected { instance, .. } => f
+            Self::Connected {
+                instance,
+                policy_generation,
+                target_generation,
+                attestation_generation,
+                ..
+            } => f
                 .debug_struct("Connected")
                 .field("instance", instance)
+                .field("policy_generation", policy_generation)
+                .field("target_generation", target_generation)
+                .field("attestation_generation", attestation_generation)
                 .finish_non_exhaustive(),
             Self::ConfigurationPoisoned(poison) => f
                 .debug_tuple("ConfigurationPoisoned")
                 .field(poison)
                 .finish(),
-            Self::Rejected { code, message } => f
-                .debug_struct("Rejected")
+            Self::AttestationFailure {
+                code,
+                type_uuid,
+                message,
+            } => f
+                .debug_struct("AttestationFailure")
+                .field("code", code)
+                .field("type_uuid", type_uuid)
+                .field("message", message)
+                .finish(),
+            Self::ProtocolFailure {
+                expected,
+                observed,
+                message,
+            } => f
+                .debug_struct("ProtocolFailure")
+                .field("expected", expected)
+                .field("observed", observed)
+                .field("message", message)
+                .finish(),
+            Self::Error { code, message } => f
+                .debug_struct("Error")
                 .field("code", code)
                 .field("message", message)
                 .finish(),
@@ -246,28 +290,27 @@ impl schema::root::Server for RootService {
             let request = match decoded {
                 Ok(request) => request,
                 Err(DecodeError::Wire(error)) => {
-                    write_wire_failure(result.init_rejected(), &error);
+                    write_wire_error(result.init_error(), &error);
                     return Ok(());
                 }
                 Err(DecodeError::Capnp(error)) => return Err(error),
             };
             match self.root.connect(request) {
                 ConnectOutcome::Connected(connected) => {
-                    let mut output = result.init_connected();
+                    let mut output = result.init_success();
                     let hub: schema::hub::Client =
                         capnp_rpc::new_client(HubService { hub: connected.hub });
                     output.set_hub(hub);
                     output.set_instance(&connected.instance.0);
+                    output.set_policy_generation(connected.policy_generation);
+                    output.set_target_generation(connected.target_generation);
+                    output.set_attestation_generation(connected.attestation_generation);
                 }
                 ConnectOutcome::ConfigurationPoisoned(poison) => {
                     write_poison(result.init_configuration_poisoned(), &poison);
                 }
                 ConnectOutcome::Rejected(error) => {
-                    write_failure(
-                        result.init_rejected(),
-                        CONNECT_REJECTED,
-                        &format!("{error:?}"),
-                    );
+                    write_connect_error(result, &error);
                 }
             }
             Ok(())
@@ -302,14 +345,14 @@ impl schema::hub::Server for HubService {
             let assets = match decode_uuid_list(reader.get_assets()?, "assets") {
                 Ok(assets) => assets,
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
             let paths = match decode_text_list(reader.get_paths()?, "paths") {
                 Ok(paths) => paths,
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
@@ -327,7 +370,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::WriteResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Hub.write");
+            write_unsupported(results.get().init_result().init_error(), "Hub.write");
             Ok(())
         }
     }
@@ -338,7 +381,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::ImportResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Hub.import");
+            write_unsupported(results.get().init_result().init_error(), "Hub.import");
             Ok(())
         }
     }
@@ -349,7 +392,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::ReimportResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Hub.reimport");
+            write_unsupported(results.get().init_result().init_error(), "Hub.reimport");
             Ok(())
         }
     }
@@ -360,7 +403,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::OperationResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Hub.operation");
+            write_unsupported(results.get().init_result().init_error(), "Hub.operation");
             Ok(())
         }
     }
@@ -374,7 +417,7 @@ impl schema::hub::Server for HubService {
             let hash = match decode_hash(params.get()?.get_hash()?, "hash") {
                 Ok(hash) => ContentHash(hash),
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
@@ -389,7 +432,7 @@ impl schema::hub::Server for HubService {
         mut results: schema::hub::WireTreeResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Hub.wireTree");
+            write_unsupported(results.get().init_result().init_error(), "Hub.wireTree");
             Ok(())
         }
     }
@@ -404,12 +447,12 @@ impl schema::hub::Server for HubService {
             let request = match decode_reattest_request(reader) {
                 Ok(request) => request,
                 Err(DecodeError::Wire(error)) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
                 Err(DecodeError::Capnp(error)) => return Err(error),
             };
-            write_call_result(results.get().init_result(), self.hub.reattest(request));
+            write_uint64_result(results.get().init_result(), self.hub.reattest(request));
             Ok(())
         }
     }
@@ -424,18 +467,18 @@ impl schema::hub::Server for HubService {
             let assets = match decode_uuid_list(reader.get_assets()?, "assets") {
                 Ok(assets) => assets,
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
             let paths = match decode_text_list(reader.get_paths()?, "paths") {
                 Ok(paths) => paths,
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
-            write_call_result(
+            write_void_result(
                 results.get().init_result(),
                 self.hub.unsubscribe(assets, paths),
             );
@@ -456,7 +499,10 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::VersionResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_stamp(results.get().init_stamp(), self.snapshot.stamp());
+            write_uint64_result(
+                results.get().init_result(),
+                RpcResult::Success(self.snapshot.version().0),
+            );
             Ok(())
         }
     }
@@ -467,7 +513,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::QueryResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.query");
+            write_unsupported(results.get().init_result().init_error(), "Snapshot.query");
             Ok(())
         }
     }
@@ -478,7 +524,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::EntryResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.entry");
+            write_unsupported(results.get().init_result().init_error(), "Snapshot.entry");
             Ok(())
         }
     }
@@ -492,7 +538,7 @@ impl schema::snapshot::Server for SnapshotService {
             let uuid = match decode_uuid(params.get()?.get_uuid()?, "uuid") {
                 Ok(uuid) => AssetUuid(uuid),
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
@@ -518,7 +564,10 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::Reserved5Results,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.reserved5");
+            write_unsupported(
+                results.get().init_result().init_error(),
+                "Snapshot.reserved5",
+            );
             Ok(())
         }
     }
@@ -529,7 +578,10 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::Reserved6Results,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.reserved6");
+            write_unsupported(
+                results.get().init_result().init_error(),
+                "Snapshot.reserved6",
+            );
             Ok(())
         }
     }
@@ -540,7 +592,10 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::Reserved7Results,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.reserved7");
+            write_unsupported(
+                results.get().init_result().init_error(),
+                "Snapshot.reserved7",
+            );
             Ok(())
         }
     }
@@ -551,7 +606,10 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::Reserved8Results,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.reserved8");
+            write_unsupported(
+                results.get().init_result().init_error(),
+                "Snapshot.reserved8",
+            );
             Ok(())
         }
     }
@@ -562,7 +620,10 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::Reserved9Results,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_unsupported(results.get().init_status(), "Snapshot.reserved9");
+            write_unsupported(
+                results.get().init_result().init_error(),
+                "Snapshot.reserved9",
+            );
             Ok(())
         }
     }
@@ -576,7 +637,7 @@ impl schema::snapshot::Server for SnapshotService {
             let path = match decode_text(params.get()?.get_path()?, "path") {
                 Ok(path) => path,
                 Err(error) => {
-                    write_wire_failure(results.get().init_result().init_failure(), &error);
+                    write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
@@ -594,7 +655,7 @@ impl schema::snapshot::Server for SnapshotService {
         mut results: schema::snapshot::ConfigurationResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            write_configuration(results.get().init_state(), &self.snapshot.configuration());
+            write_configuration_result(results.get().init_result(), &self.snapshot.configuration());
             Ok(())
         }
     }
@@ -686,9 +747,10 @@ fn decode_connect_request(
     let target_definition_hash = TargetDefinitionHash(
         decode_hash(reader.get_target_def_hash()?, "targetDefHash").map_err(DecodeError::Wire)?,
     );
-    let layout_registry = decode_layouts(reader.get_layout_registry()?)?;
-    let layout_aggregate = decode_hash(reader.get_layout_aggregate()?, "layoutAggregate")
-        .map_err(DecodeError::Wire)?;
+    let compiled_registry = decode_compiled(reader.get_compiled_registry()?)?;
+    let dsca = CompiledAttestationDigest(
+        decode_hash(reader.get_dsca_aggregate()?, "dscaAggregate").map_err(DecodeError::Wire)?,
+    );
     let load_policy = decode_policies(reader.get_load_policy()?)?;
     let policy_digest =
         decode_hash(reader.get_policy_digest()?, "policyDigest").map_err(DecodeError::Wire)?;
@@ -696,8 +758,8 @@ fn decode_connect_request(
         epoch: GameModuleEpoch(reader.get_game_module_epoch()),
         target,
         target_definition_hash,
-        layout_registry,
-        layout_aggregate,
+        compiled_registry,
+        dsca,
         load_policy,
         policy_digest,
         protocol: reader.get_protocol(),
@@ -709,32 +771,66 @@ fn decode_reattest_request(
 ) -> Result<ReattestRequest, DecodeError> {
     Ok(ReattestRequest {
         epoch: GameModuleEpoch(reader.get_epoch()),
+        base_attestation_generation: reader.get_base_attestation_generation(),
+        successor_attestation_generation: reader.get_successor_attestation_generation(),
         target_definition_hash: TargetDefinitionHash(
             decode_hash(reader.get_target_def_hash()?, "targetDefHash")
                 .map_err(DecodeError::Wire)?,
         ),
-        layout_registry: decode_layouts(reader.get_layout_registry()?)?,
-        layout_aggregate: decode_hash(reader.get_layout_aggregate()?, "layoutAggregate")
-            .map_err(DecodeError::Wire)?,
+        compiled_registry: decode_compiled(reader.get_compiled_registry()?)?,
+        dsca: CompiledAttestationDigest(
+            decode_hash(reader.get_dsca_aggregate()?, "dscaAggregate")
+                .map_err(DecodeError::Wire)?,
+        ),
         load_policy: decode_policies(reader.get_load_policy()?)?,
         policy_digest: decode_hash(reader.get_policy_digest()?, "policyDigest")
             .map_err(DecodeError::Wire)?,
     })
 }
 
-fn decode_layouts(
-    rows: capnp::struct_list::Reader<'_, schema::layout_entry::Owned>,
-) -> Result<Vec<LayoutEntry>, DecodeError> {
+fn decode_compiled(
+    rows: capnp::struct_list::Reader<'_, schema::compiled_type_entry::Owned>,
+) -> Result<Vec<CompiledTypeRow>, DecodeError> {
     rows.iter()
         .map(|row| {
-            Ok(LayoutEntry {
+            let registry_extras =
+                RegistryExtrasV1::decode(row.get_registry_extras()?).map_err(|error| {
+                    DecodeError::Wire(WireFailure {
+                        code: WIRE_INVALID_ATTESTATION,
+                        message: format!("compiledRegistry.registryExtras is invalid: {error}"),
+                    })
+                })?;
+            let value = CompiledTypeRow {
                 type_uuid: TypeUuid(
-                    decode_uuid(row.get_type_uuid()?, "layoutRegistry.typeUuid")
+                    decode_uuid(row.get_type_uuid()?, "compiledRegistry.typeUuid")
                         .map_err(DecodeError::Wire)?,
                 ),
-                layout_digest: decode_hash(row.get_layout_digest()?, "layoutRegistry.layoutDigest")
+                logical_hash: crate::LogicalHash(
+                    decode_hash(row.get_logical_hash()?, "compiledRegistry.logicalHash")
+                        .map_err(DecodeError::Wire)?,
+                ),
+                native_layout_digest: decode_hash(
+                    row.get_native_layout_digest()?,
+                    "compiledRegistry.nativeLayoutDigest",
+                )
+                .map_err(DecodeError::Wire)?,
+                build_only: row.get_build_only(),
+                registry_extras_digest: RegistryExtrasDigest(
+                    decode_hash(
+                        row.get_registry_extras_digest()?,
+                        "compiledRegistry.registryExtrasDigest",
+                    )
                     .map_err(DecodeError::Wire)?,
-            })
+                ),
+                registry_extras,
+            };
+            value.validate().map_err(|error| {
+                DecodeError::Wire(WireFailure {
+                    code: WIRE_INVALID_ATTESTATION,
+                    message: format!("compiledRegistry row is invalid: {error}"),
+                })
+            })?;
+            Ok(value)
         })
         .collect()
 }
@@ -826,14 +922,22 @@ fn write_connect_request(
     {
         let mut rows = output
             .reborrow()
-            .init_layout_registry(request.layout_registry.len() as u32);
-        for (index, row) in request.layout_registry.iter().enumerate() {
+            .init_compiled_registry(request.compiled_registry.len() as u32);
+        for (index, row) in request.compiled_registry.iter().enumerate() {
             let mut item = rows.reborrow().get(index as u32);
             item.set_type_uuid(&row.type_uuid.0);
-            item.set_layout_digest(&row.layout_digest);
+            item.set_logical_hash(&row.logical_hash.0);
+            item.set_native_layout_digest(&row.native_layout_digest);
+            item.set_build_only(row.build_only);
+            item.set_registry_extras_digest(&row.registry_extras_digest.0);
+            item.set_registry_extras(
+                &row.registry_extras
+                    .encode()
+                    .expect("validated ConnectRequest carries canonical DSRE"),
+            );
         }
     }
-    output.set_layout_aggregate(&request.layout_aggregate);
+    output.set_dsca_aggregate(&request.dsca.0);
     {
         let mut rows = output
             .reborrow()
@@ -850,30 +954,53 @@ fn write_connect_request(
 }
 
 fn decode_connect_response(
-    response: schema::connect_result::Reader<'_>,
+    response: schema::connect_call::Reader<'_>,
 ) -> Result<RemoteConnectOutcome, capnp::Error> {
-    use schema::connect_result::Which;
+    use schema::connect_call::Which;
     match response
         .which()
         .map_err(|error| capnp::Error::failed(error.to_string()))?
     {
-        Which::Connected(connected) => {
+        Which::Success(connected) => {
             let connected = connected?;
             let instance = decode_instance(connected.get_instance()?, "instance")
                 .map_err(|error| capnp::Error::failed(error.message))?;
             Ok(RemoteConnectOutcome::Connected {
                 hub: connected.get_hub()?,
                 instance: StoreInstanceId(instance),
+                policy_generation: connected.get_policy_generation(),
+                target_generation: connected.get_target_generation(),
+                attestation_generation: connected.get_attestation_generation(),
             })
         }
         Which::ConfigurationPoisoned(poison) => Ok(RemoteConnectOutcome::ConfigurationPoisoned(
             read_poison(poison?)?,
         )),
-        Which::Rejected(failure) => {
+        Which::AttestationFailure(failure) => {
             let failure = failure?;
-            Ok(RemoteConnectOutcome::Rejected {
+            let type_uuid = decode_uuid(failure.get_type_uuid()?, "attestationFailure.typeUuid")
+                .map_err(|error| capnp::Error::failed(error.message))?;
+            Ok(RemoteConnectOutcome::AttestationFailure {
                 code: failure.get_code(),
-                message: decode_text(failure.get_message()?, "rejected.message")
+                type_uuid: (type_uuid != [0; 16]).then_some(TypeUuid(type_uuid)),
+                message: decode_text(failure.get_message()?, "attestationFailure.message")
+                    .map_err(|error| capnp::Error::failed(error.message))?,
+            })
+        }
+        Which::ProtocolFailure(failure) => {
+            let failure = failure?;
+            Ok(RemoteConnectOutcome::ProtocolFailure {
+                expected: failure.get_expected(),
+                observed: failure.get_observed(),
+                message: decode_text(failure.get_message()?, "protocolFailure.message")
+                    .map_err(|error| capnp::Error::failed(error.message))?,
+            })
+        }
+        Which::Error(failure) => {
+            let failure = failure?;
+            Ok(RemoteConnectOutcome::Error {
+                code: failure.get_code(),
+                message: decode_text(failure.get_message()?, "error.message")
                     .map_err(|error| capnp::Error::failed(error.message))?,
             })
         }
@@ -892,16 +1019,13 @@ fn read_poison(
     })
 }
 
-fn write_snapshot_result(
-    result: schema::snapshot_result::Builder<'_>,
-    outcome: RpcResult<Snapshot>,
-) {
+fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: RpcResult<Snapshot>) {
     match outcome {
         RpcResult::Success(snapshot) => {
             let client: schema::snapshot::Client =
                 capnp_rpc::new_client(SnapshotService { snapshot });
             let mut result = result;
-            result.set_snapshot(client);
+            result.set_success(client);
         }
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
@@ -909,19 +1033,17 @@ fn write_snapshot_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::Failure(error) => {
-            write_failure(result.init_failure(), RPC_FAILURE, &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_rpc_result_error_snapshot(result, error),
     }
 }
 
 fn write_subscribe_result(
-    result: schema::subscribe_result::Builder<'_>,
+    result: schema::subscribe_call::Builder<'_>,
     outcome: RpcResult<crate::SubscriptionInstall>,
 ) {
     match outcome {
         RpcResult::Success(subscription) => {
-            let mut installed = result.init_installed();
+            let mut installed = result.init_success();
             let client: schema::delta_stream::Client = capnp_rpc::new_client(DeltaStreamService {
                 stream: subscription.deltas,
             });
@@ -934,34 +1056,53 @@ fn write_subscribe_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::Failure(error) => {
-            write_failure(result.init_failure(), RPC_FAILURE, &format!("{error:?}"))
-        }
+        RpcResult::Failure(error) => write_rpc_result_error_subscribe(result, error),
     }
 }
 
-fn write_call_result(mut result: schema::call_status::Builder<'_>, outcome: RpcResult<()>) {
+fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcResult<()>) {
     match outcome {
-        RpcResult::Success(()) => result.set_ok(()),
+        RpcResult::Success(()) => result.set_success(()),
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        }
         RpcResult::Failure(error) => {
-            write_failure(result.init_failure(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: RpcResult<u64>) {
+    match outcome {
+        RpcResult::Success(value) => result.set_success(value),
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationPoisoned(poison) => {
+            write_poison(result.init_configuration_poisoned(), &poison)
+        }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        }
+        RpcResult::Failure(error) => {
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
     }
 }
 
 fn write_resolve_result(
-    result: schema::resolve_call_result::Builder<'_>,
+    result: schema::resolve_call::Builder<'_>,
     outcome: RpcResult<crate::TerminalEvent<ResolveResult>>,
 ) {
     match outcome {
         RpcResult::Success(terminal) => {
-            let mut output = result.init_terminal();
+            let mut output = result.init_success();
             write_stamp(output.reborrow().init_basis(), terminal.basis.snapshot);
             let mut value = output.init_result();
             match terminal.value {
@@ -980,19 +1121,22 @@ fn write_resolve_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        }
         RpcResult::Failure(error) => {
-            write_failure(result.init_failure(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
     }
 }
 
 fn write_path_result(
-    result: schema::path_call_result::Builder<'_>,
+    result: schema::path_resolve_call::Builder<'_>,
     outcome: RpcResult<crate::TerminalEvent<PathResolveResult>>,
 ) {
     match outcome {
         RpcResult::Success(terminal) => {
-            let mut output = result.init_terminal();
+            let mut output = result.init_success();
             write_stamp(output.reborrow().init_basis(), terminal.basis.snapshot);
             let mut value = output.init_result();
             match terminal.value {
@@ -1012,19 +1156,22 @@ fn write_path_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        }
         RpcResult::Failure(error) => {
-            write_failure(result.init_failure(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
     }
 }
 
 fn write_fetch_result(
-    result: schema::fetch_call_result::Builder<'_>,
+    result: schema::chunk_stream_call::Builder<'_>,
     outcome: RpcResult<crate::TerminalEvent<ChunkStream>>,
 ) {
     match outcome {
         RpcResult::Success(terminal) => {
-            let mut output = result.init_terminal();
+            let mut output = result.init_success();
             write_stamp(output.reborrow().init_basis(), terminal.basis.snapshot);
             let client: schema::chunk_stream::Client = capnp_rpc::new_client(ChunkStreamService {
                 stream: Mutex::new(terminal.value),
@@ -1037,8 +1184,11 @@ fn write_fetch_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        }
         RpcResult::Failure(error) => {
-            write_failure(result.init_failure(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
     }
 }
@@ -1101,13 +1251,15 @@ fn write_delta(mut output: schema::delta::Builder<'_>, delta: &Delta) {
     }
 }
 
-fn write_configuration(
-    mut output: schema::configuration_status::Builder<'_>,
+fn write_configuration_result(
+    mut output: schema::void_call::Builder<'_>,
     state: &ConfigurationStatus,
 ) {
     match state {
-        ConfigurationStatus::Ready => output.set_ready(()),
-        ConfigurationStatus::Poisoned(poison) => write_poison(output.init_poisoned(), poison),
+        ConfigurationStatus::Ready => output.set_success(()),
+        ConfigurationStatus::Poisoned(poison) => {
+            write_poison(output.init_configuration_poisoned(), poison)
+        }
     }
 }
 
@@ -1125,21 +1277,83 @@ fn write_poison(
     output.set_message(poison.message.as_str());
 }
 
-fn write_failure(mut output: schema::rpc_failure::Builder<'_>, code: u16, message: &str) {
+fn write_error(mut output: schema::rpc_error::Builder<'_>, code: u16, message: &str) {
     output.set_code(code);
     output.set_message(message);
 }
 
-fn write_wire_failure(output: schema::rpc_failure::Builder<'_>, failure: &WireFailure) {
-    write_failure(output, failure.code, failure.message.as_str());
+fn write_wire_error(output: schema::rpc_error::Builder<'_>, failure: &WireFailure) {
+    write_error(output, failure.code, failure.message.as_str());
 }
 
-fn write_unsupported(mut output: schema::call_status::Builder<'_>, method: &str) {
-    write_failure(
-        output.reborrow().init_failure(),
+fn write_unsupported(output: schema::rpc_error::Builder<'_>, method: &str) {
+    write_error(
+        output,
         UNSUPPORTED_METHOD,
         &format!("{method} is outside the loader RPC state model"),
     );
+}
+
+fn write_lease_failure(mut output: schema::lease_failure::Builder<'_>, message: &str) {
+    output.set_code(1);
+    output.set_message(message);
+}
+
+fn write_connect_error(mut result: schema::connect_call::Builder<'_>, error: &crate::ConnectError) {
+    if let crate::ConnectError::ProtocolMismatch { expected, got } = error {
+        let mut failure = result.reborrow().init_protocol_failure();
+        failure.set_expected(*expected);
+        failure.set_observed(*got);
+        failure.set_message(format!("{error:?}").as_str());
+        return;
+    }
+    let mut failure = result.init_attestation_failure();
+    failure.set_code(CONNECT_REJECTED);
+    let type_uuid = match error {
+        crate::ConnectError::MissingCompiledType { type_uuid }
+        | crate::ConnectError::CompiledTypeMismatch { type_uuid }
+        | crate::ConnectError::MissingLoadPolicy { type_uuid }
+        | crate::ConnectError::LoadPolicyMismatch { type_uuid, .. } => type_uuid.0,
+        _ => [0; 16],
+    };
+    failure.set_type_uuid(&type_uuid);
+    failure.set_message(format!("{error:?}").as_str());
+}
+
+fn write_rpc_result_error_snapshot(
+    mut result: schema::snapshot_call::Builder<'_>,
+    error: RpcFailure,
+) {
+    if error == RpcFailure::LeaseExpired {
+        write_lease_failure(
+            result.reborrow().init_lease_failure(),
+            "snapshot lease expired",
+        );
+    } else {
+        write_error(
+            result.init_error(),
+            RPC_FAILURE,
+            format!("{error:?}").as_str(),
+        );
+    }
+}
+
+fn write_rpc_result_error_subscribe(
+    mut result: schema::subscribe_call::Builder<'_>,
+    error: RpcFailure,
+) {
+    if error == RpcFailure::LeaseExpired {
+        write_lease_failure(
+            result.reborrow().init_lease_failure(),
+            "snapshot lease expired",
+        );
+    } else {
+        write_error(
+            result.init_error(),
+            RPC_FAILURE,
+            format!("{error:?}").as_str(),
+        );
+    }
 }
 
 fn write_reconnect(mut output: schema::reconnect_required::Builder<'_>, reason: ReconnectReason) {

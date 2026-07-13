@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use distill_core::attestation::{
+    AttestationError, ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
+    RegistryPathStep, SchemaNodeId,
+};
 use distill_rpc::*;
 
 fn type_id(byte: u8) -> TypeUuid {
@@ -19,11 +23,30 @@ fn target_hash(byte: u8) -> TargetDefinitionHash {
     TargetDefinitionHash([byte; 32])
 }
 
-fn layout(byte: u8) -> LayoutEntry {
-    LayoutEntry {
-        type_uuid: type_id(byte),
-        layout_digest: [byte + 20; 32],
-    }
+fn compiled(byte: u8, build_only: bool) -> CompiledTypeRow {
+    CompiledTypeRow::new(
+        type_id(byte),
+        LogicalHash([byte + 10; 32]),
+        [byte + 20; 32],
+        build_only,
+        RegistryExtrasV1::canonical(vec![
+            RegistryExtraRow {
+                node: SchemaNodeId(0),
+                path: vec![],
+                fact: RegistryExtraFact::BuildOnly(build_only),
+            },
+            RegistryExtraRow {
+                node: SchemaNodeId(0),
+                path: vec![RegistryPathStep::Field("ref".into())],
+                fact: RegistryExtraFact::Reference {
+                    strength: ReferenceStrength::Strong,
+                    target: type_id(byte + 30),
+                },
+            },
+        ])
+        .unwrap(),
+    )
+    .unwrap()
 }
 
 fn policy(byte: u8, build_only: bool) -> LoadPolicyEntry {
@@ -37,7 +60,10 @@ fn target_with(definition_hash: u8, policies: &[(u8, bool)]) -> TargetDefinition
     TargetDefinition::canonical(
         "dev",
         target_hash(definition_hash),
-        policies.iter().map(|(byte, _)| layout(*byte)).collect(),
+        policies
+            .iter()
+            .map(|(byte, build_only)| compiled(*byte, *build_only))
+            .collect(),
         policies
             .iter()
             .map(|(byte, build_only)| policy(*byte, *build_only))
@@ -51,7 +77,10 @@ fn request_for(definition_hash: u8, epoch: u64, policies: &[(u8, bool)]) -> Conn
         GameModuleEpoch(epoch),
         "dev",
         target_hash(definition_hash),
-        policies.iter().map(|(byte, _)| layout(*byte)).collect(),
+        policies
+            .iter()
+            .map(|(byte, build_only)| compiled(*byte, *build_only))
+            .collect(),
         policies
             .iter()
             .map(|(byte, build_only)| policy(*byte, *build_only))
@@ -135,18 +164,10 @@ fn staging_accepts_only_numeric_loopback_addresses() {
 }
 
 #[test]
-fn dsla_and_dslp_match_the_pinned_byte_grammar() {
-    let layouts = vec![layout(1), layout(2)];
+fn dsca_and_dslp_match_the_shared_typed_grammars() {
+    let compiled = vec![compiled(1, false), compiled(2, true)];
     let policies = vec![policy(1, false), policy(2, true)];
 
-    let mut dsla = blake3::Hasher::new();
-    dsla.update(b"DSLA");
-    dsla.update(&[1]);
-    dsla.update(&2_u32.to_le_bytes());
-    for row in &layouts {
-        dsla.update(&row.type_uuid.0);
-        dsla.update(&row.layout_digest);
-    }
     let mut dslp = blake3::Hasher::new();
     dslp.update(b"DSLP");
     dslp.update(&[1]);
@@ -157,8 +178,10 @@ fn dsla_and_dslp_match_the_pinned_byte_grammar() {
     }
 
     assert_eq!(
-        compute_layout_aggregate(&layouts).unwrap(),
-        *dsla.finalize().as_bytes()
+        CompiledTypeTable::canonical(compiled.clone())
+            .unwrap()
+            .digest,
+        distill_core::attestation::compute_compiled_attestation_digest(&compiled).unwrap()
     );
     assert_eq!(
         compute_policy_digest(&policies).unwrap(),
@@ -173,17 +196,19 @@ fn canonical_attestations_reject_duplicates_and_different_registered_sets() {
             GameModuleEpoch(1),
             "dev",
             target_hash(7),
-            vec![layout(1), layout(1)],
+            vec![compiled(1, false), compiled(1, false)],
             vec![policy(1, false), policy(1, false)],
         ),
-        Err(AttestationShapeError::LayoutRowsNotStrictlySorted { .. })
+        Err(AttestationShapeError::Compiled(
+            AttestationError::DuplicateType(_)
+        ))
     ));
     assert!(matches!(
         ConnectRequest::canonical(
             GameModuleEpoch(1),
             "dev",
             target_hash(7),
-            vec![layout(1)],
+            vec![compiled(1, false)],
             vec![policy(2, false)],
         ),
         Err(AttestationShapeError::RegisteredTypeSetMismatch { .. })
@@ -230,40 +255,47 @@ fn connect_rejects_protocol_target_and_definition_mismatches() {
 }
 
 #[test]
-fn connect_rejects_unsorted_forged_and_mismatched_layout_attestations() {
+fn connect_rejects_unsorted_forged_and_mismatched_compiled_attestations() {
     let server = server_with(&[(1, false), (2, true)]);
     let mut unsorted = request_for(7, 1, &[(1, false), (2, true)]);
-    unsorted.layout_registry.reverse();
+    unsorted.compiled_registry.reverse();
     assert!(matches!(
         server.root().connect(unsorted),
         ConnectOutcome::Rejected(ConnectError::AttestationShape(
-            AttestationShapeError::LayoutRowsNotStrictlySorted { .. }
+            AttestationShapeError::Compiled(AttestationError::TypeRowsNotStrictlySorted)
         ))
     ));
 
     let mut forged = request_for(7, 1, &[(1, false)]);
-    forged.layout_aggregate = [55; 32];
+    forged.dsca.0 = [55; 32];
     assert!(matches!(
         server.root().connect(forged),
         ConnectOutcome::Rejected(ConnectError::AttestationShape(
-            AttestationShapeError::LayoutAggregateMismatch { .. }
+            AttestationShapeError::Compiled(AttestationError::CompiledDigestMismatch)
         ))
     ));
 
     let mut mismatch = request_for(7, 1, &[(1, false)]);
-    mismatch.layout_registry[0].layout_digest = [99; 32];
-    mismatch.layout_aggregate = compute_layout_aggregate(&mismatch.layout_registry).unwrap();
+    mismatch.compiled_registry[0] = CompiledTypeRow::new(
+        type_id(1),
+        LogicalHash([11; 32]),
+        [99; 32],
+        false,
+        mismatch.compiled_registry[0].registry_extras.clone(),
+    )
+    .unwrap();
+    mismatch.dsca = CompiledTypeTable::canonical(mismatch.compiled_registry.clone())
+        .unwrap()
+        .digest;
     assert!(matches!(
         server.root().connect(mismatch),
-        ConnectOutcome::Rejected(ConnectError::LayoutMismatch {
-            type_uuid,
-            ..
-        }) if type_uuid == type_id(1)
+        ConnectOutcome::Rejected(ConnectError::CompiledTypeMismatch { type_uuid })
+            if type_uuid == type_id(1)
     ));
 
     assert!(matches!(
         server.root().connect(request_for(7, 1, &[(3, false)])),
-        ConnectOutcome::Rejected(ConnectError::MissingLayout { type_uuid })
+        ConnectOutcome::Rejected(ConnectError::MissingCompiledType { type_uuid })
             if type_uuid == type_id(3)
     ));
 }
@@ -282,12 +314,75 @@ fn connect_rejects_forged_and_mismatched_load_policy_attestations() {
 
     assert!(matches!(
         server.root().connect(request_for(7, 1, &[(1, true)])),
-        ConnectOutcome::Rejected(ConnectError::LoadPolicyMismatch {
-            type_uuid,
-            expected: false,
-            got: true,
-        }) if type_uuid == type_id(1)
+        ConnectOutcome::Rejected(ConnectError::CompiledTypeMismatch { type_uuid })
+            if type_uuid == type_id(1)
     ));
+}
+
+#[test]
+fn equal_dsnl_cannot_hide_logical_reference_or_extras_drift() {
+    let server = server_with(&[(1, false)]);
+    let base = compiled(1, false);
+    let variants = [
+        CompiledTypeRow::new(
+            base.type_uuid,
+            LogicalHash([99; 32]),
+            base.native_layout_digest,
+            base.build_only,
+            base.registry_extras.clone(),
+        )
+        .unwrap(),
+        CompiledTypeRow::new(
+            base.type_uuid,
+            base.logical_hash,
+            base.native_layout_digest,
+            base.build_only,
+            RegistryExtrasV1::canonical(vec![
+                RegistryExtraRow {
+                    node: SchemaNodeId(0),
+                    path: vec![],
+                    fact: RegistryExtraFact::BuildOnly(false),
+                },
+                RegistryExtraRow {
+                    node: SchemaNodeId(0),
+                    path: vec![RegistryPathStep::Field("ref".into())],
+                    fact: RegistryExtraFact::Reference {
+                        strength: ReferenceStrength::Weak,
+                        target: type_id(42),
+                    },
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap(),
+        CompiledTypeRow::new(
+            base.type_uuid,
+            base.logical_hash,
+            base.native_layout_digest,
+            base.build_only,
+            RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+                node: SchemaNodeId(0),
+                path: vec![],
+                fact: RegistryExtraFact::BuildOnly(false),
+            }])
+            .unwrap(),
+        )
+        .unwrap(),
+    ];
+
+    for changed in variants {
+        assert_eq!(changed.native_layout_digest, base.native_layout_digest);
+        let mut request = request_for(7, 1, &[(1, false)]);
+        request.compiled_registry = vec![changed];
+        request.dsca = CompiledTypeTable::canonical(request.compiled_registry.clone())
+            .unwrap()
+            .digest;
+        assert!(matches!(
+            server.root().connect(request),
+            ConnectOutcome::Rejected(ConnectError::CompiledTypeMismatch { type_uuid })
+                if type_uuid == type_id(1)
+        ));
+    }
 }
 
 #[test]
@@ -312,7 +407,7 @@ fn reattest_rechecks_the_entire_identity_and_requires_a_successor_epoch() {
 
     assert_eq!(
         hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        RpcResult::Success(())
+        RpcResult::Success(1)
     );
     assert!(matches!(
         old_snapshot.resolve(asset_id(1)),
@@ -322,6 +417,95 @@ fn reattest_rechecks_the_entire_identity_and_requires_a_successor_epoch() {
         })
     ));
     assert!(matches!(old_snapshot.refresh(), RpcResult::Success(_)));
+}
+
+#[test]
+fn connect_returns_all_basis_generations_and_reattest_is_generation_cas() {
+    let server = server_with(&[(1, false)]);
+    let connected = match server.root().connect(request_for(7, 1, &[(1, false)])) {
+        ConnectOutcome::Connected(connected) => connected,
+        other => panic!("expected connection, got {other:?}"),
+    };
+    assert_eq!(connected.instance, StoreInstanceId([9; 16]));
+    assert_eq!(connected.policy_generation, 0);
+    assert_eq!(connected.target_generation, 0);
+    assert_eq!(connected.attestation_generation, 0);
+    assert_eq!(
+        snapshot(&connected.hub).basis().attestation_generation,
+        connected.attestation_generation
+    );
+
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let run = |epoch| {
+        let hub = connected.hub.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let mut request = ReattestRequest::from(request_for(7, epoch, &[(1, false)]));
+            request.base_attestation_generation = 0;
+            request.successor_attestation_generation = 1;
+            barrier.wait();
+            hub.reattest(request)
+        })
+    };
+    let first = run(2);
+    let second = run(3);
+    barrier.wait();
+    let outcomes = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, RpcResult::Success(1)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                RpcResult::Failure(RpcFailure::StaleAttestationBase {
+                    expected: 1,
+                    got: 0
+                })
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(snapshot(&connected.hub).basis().attestation_generation, 1);
+
+    let mut successor = ReattestRequest::from(request_for(7, 4, &[(1, false)]));
+    successor.base_attestation_generation = 1;
+    successor.successor_attestation_generation = 2;
+    assert_eq!(connected.hub.reattest(successor), RpcResult::Success(2));
+    assert_eq!(snapshot(&connected.hub).basis().attestation_generation, 2);
+}
+
+#[test]
+fn reattest_rejects_nonconsecutive_and_overflowing_generations_without_mutation() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let mut skipped = ReattestRequest::from(request_for(7, 2, &[(1, false)]));
+    skipped.successor_attestation_generation = 2;
+    assert_eq!(
+        hub.reattest(skipped),
+        RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
+            base: 0,
+            successor: 2,
+        })
+    );
+    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
+
+    let mut overflow = ReattestRequest::from(request_for(7, 2, &[(1, false)]));
+    overflow.base_attestation_generation = u64::MAX;
+    overflow.successor_attestation_generation = 0;
+    assert!(matches!(
+        hub.reattest(overflow),
+        RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
+            base: u64::MAX,
+            successor: 0
+        })
+    ));
+    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
 }
 
 #[test]
@@ -1022,11 +1206,11 @@ fn forged_target_replacements_are_rejected_before_generation_or_version_changes(
     let snap = snapshot(&hub);
     let before = server.current_stamp();
     let mut forged = target_with(8, &[(1, false)]);
-    forged.layout_aggregate = [77; 32];
+    forged.dsca.0 = [77; 32];
     assert!(matches!(
         server.replace_target(forged),
         Err(AdminError::InvalidTargetAttestation(
-            AttestationShapeError::LayoutAggregateMismatch { .. }
+            AttestationShapeError::Compiled(AttestationError::CompiledDigestMismatch)
         ))
     ));
     assert_eq!(server.current_stamp(), before);

@@ -1,36 +1,38 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::{LayoutEntry, LoadPolicyEntry, TargetDefinitionHash, TypeUuid};
+use distill_core::attestation::{
+    AttestationError, CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable,
+};
 
-const DSLA: [u8; 4] = *b"DSLA";
+use crate::{LoadPolicyEntry, TargetDefinitionHash, TypeUuid};
+
 const DSLP: [u8; 4] = *b"DSLP";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttestationShapeError {
-    LayoutRowsNotStrictlySorted {
-        previous: TypeUuid,
-        current: TypeUuid,
-    },
+    Compiled(AttestationError),
     PolicyRowsNotStrictlySorted {
         previous: TypeUuid,
         current: TypeUuid,
-    },
-    LayoutAggregateMismatch {
-        expected: [u8; 32],
-        got: [u8; 32],
     },
     PolicyDigestMismatch {
         expected: [u8; 32],
         got: [u8; 32],
     },
     RegisteredTypeSetMismatch {
-        only_layout: Vec<TypeUuid>,
+        only_compiled: Vec<TypeUuid>,
         only_policy: Vec<TypeUuid>,
     },
     DuplicateTarget {
         target: String,
     },
+}
+
+impl From<AttestationError> for AttestationShapeError {
+    fn from(value: AttestationError) -> Self {
+        Self::Compiled(value)
+    }
 }
 
 impl fmt::Display for AttestationShapeError {
@@ -40,18 +42,6 @@ impl fmt::Display for AttestationShapeError {
 }
 
 impl std::error::Error for AttestationShapeError {}
-
-fn ensure_layout_order(rows: &[LayoutEntry]) -> Result<(), AttestationShapeError> {
-    for pair in rows.windows(2) {
-        if pair[0].type_uuid >= pair[1].type_uuid {
-            return Err(AttestationShapeError::LayoutRowsNotStrictlySorted {
-                previous: pair[0].type_uuid,
-                current: pair[1].type_uuid,
-            });
-        }
-    }
-    Ok(())
-}
 
 fn ensure_policy_order(rows: &[LoadPolicyEntry]) -> Result<(), AttestationShapeError> {
     for pair in rows.windows(2) {
@@ -66,35 +56,22 @@ fn ensure_policy_order(rows: &[LoadPolicyEntry]) -> Result<(), AttestationShapeE
 }
 
 fn ensure_same_type_set(
-    layout_rows: &[LayoutEntry],
+    compiled_rows: &[CompiledTypeRow],
     policy_rows: &[LoadPolicyEntry],
 ) -> Result<(), AttestationShapeError> {
-    let layouts: BTreeSet<_> = layout_rows.iter().map(|row| row.type_uuid).collect();
+    let compiled: BTreeSet<_> = compiled_rows.iter().map(|row| row.type_uuid).collect();
     let policies: BTreeSet<_> = policy_rows.iter().map(|row| row.type_uuid).collect();
-    if layouts == policies {
+    if compiled == policies {
         return Ok(());
     }
     Err(AttestationShapeError::RegisteredTypeSetMismatch {
-        only_layout: layouts.difference(&policies).copied().collect(),
-        only_policy: policies.difference(&layouts).copied().collect(),
+        only_compiled: compiled.difference(&policies).copied().collect(),
+        only_policy: policies.difference(&compiled).copied().collect(),
     })
 }
 
-/// `blake3("DSLA" || version:u8 || count:u32 LE || rows)`.
-pub fn compute_layout_aggregate(rows: &[LayoutEntry]) -> Result<[u8; 32], AttestationShapeError> {
-    ensure_layout_order(rows)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&DSLA);
-    hasher.update(&[1]);
-    hasher.update(&(rows.len() as u32).to_le_bytes());
-    for row in rows {
-        hasher.update(&row.type_uuid.0);
-        hasher.update(&row.layout_digest);
-    }
-    Ok(*hasher.finalize().as_bytes())
-}
-
-/// `blake3("DSLP" || version:u8 || count:u32 LE || rows)`.
+/// `blake3("DSLP" || version:u8 || count:u32 LE || rows)` remains an
+/// independently basis-bound policy digest even though DSCA repeats the bit.
 pub fn compute_policy_digest(rows: &[LoadPolicyEntry]) -> Result<[u8; 32], AttestationShapeError> {
     ensure_policy_order(rows)?;
     let mut hasher = blake3::Hasher::new();
@@ -109,25 +86,27 @@ pub fn compute_policy_digest(rows: &[LoadPolicyEntry]) -> Result<[u8; 32], Attes
 }
 
 pub(crate) fn validate_attestation_shape(
-    layout_rows: &[LayoutEntry],
-    layout_aggregate: [u8; 32],
+    compiled_rows: &[CompiledTypeRow],
+    dsca: CompiledAttestationDigest,
     policy_rows: &[LoadPolicyEntry],
     policy_digest: [u8; 32],
 ) -> Result<(), AttestationShapeError> {
-    ensure_same_type_set(layout_rows, policy_rows)?;
-    let expected_layout = compute_layout_aggregate(layout_rows)?;
-    if expected_layout != layout_aggregate {
-        return Err(AttestationShapeError::LayoutAggregateMismatch {
-            expected: expected_layout,
-            got: layout_aggregate,
-        });
-    }
+    ensure_same_type_set(compiled_rows, policy_rows)?;
+    CompiledTypeTable::from_canonical(compiled_rows.to_vec(), dsca)?;
     let expected_policy = compute_policy_digest(policy_rows)?;
     if expected_policy != policy_digest {
         return Err(AttestationShapeError::PolicyDigestMismatch {
             expected: expected_policy,
             got: policy_digest,
         });
+    }
+    for (compiled, policy) in compiled_rows.iter().zip(policy_rows) {
+        if compiled.type_uuid != policy.type_uuid || compiled.build_only != policy.build_only {
+            return Err(AttestationShapeError::RegisteredTypeSetMismatch {
+                only_compiled: vec![compiled.type_uuid],
+                only_policy: vec![policy.type_uuid],
+            });
+        }
     }
     Ok(())
 }
@@ -136,8 +115,8 @@ pub(crate) fn validate_attestation_shape(
 pub struct TargetDefinition {
     pub name: String,
     pub definition_hash: TargetDefinitionHash,
-    pub layout_registry: Vec<LayoutEntry>,
-    pub layout_aggregate: [u8; 32],
+    pub compiled_registry: Vec<CompiledTypeRow>,
+    pub dsca: CompiledAttestationDigest,
     pub load_policy: Vec<LoadPolicyEntry>,
     pub policy_digest: [u8; 32],
 }
@@ -146,19 +125,19 @@ impl TargetDefinition {
     pub fn canonical(
         name: impl Into<String>,
         definition_hash: TargetDefinitionHash,
-        mut layout_registry: Vec<LayoutEntry>,
+        compiled_registry: Vec<CompiledTypeRow>,
         mut load_policy: Vec<LoadPolicyEntry>,
     ) -> Result<Self, AttestationShapeError> {
-        layout_registry.sort_by_key(|row| row.type_uuid);
+        let compiled = CompiledTypeTable::canonical(compiled_registry)?;
         load_policy.sort_by_key(|row| row.type_uuid);
-        ensure_same_type_set(&layout_registry, &load_policy)?;
-        let layout_aggregate = compute_layout_aggregate(&layout_registry)?;
+        ensure_same_type_set(&compiled.rows, &load_policy)?;
         let policy_digest = compute_policy_digest(&load_policy)?;
+        validate_attestation_shape(&compiled.rows, compiled.digest, &load_policy, policy_digest)?;
         Ok(Self {
             name: name.into(),
             definition_hash,
-            layout_registry,
-            layout_aggregate,
+            compiled_registry: compiled.rows,
+            dsca: compiled.digest,
             load_policy,
             policy_digest,
         })

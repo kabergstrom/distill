@@ -14,9 +14,7 @@ pub mod capnp_transport;
 mod protocol;
 mod server;
 
-pub use attestation::{
-    compute_layout_aggregate, compute_policy_digest, AttestationShapeError, TargetDefinition,
-};
+pub use attestation::{compute_policy_digest, AttestationShapeError, TargetDefinition};
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
 pub use server::{DeltaStream, Hub, Root, Server, Snapshot};

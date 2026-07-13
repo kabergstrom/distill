@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+pub use distill_core::attestation::{
+    CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable, RegistryExtrasDigest,
+    RegistryExtrasV1,
+};
 pub use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 pub use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
@@ -12,12 +16,6 @@ pub struct GameModuleEpoch(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LayoutEntry {
-    pub type_uuid: TypeUuid,
-    pub layout_digest: [u8; 32],
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LoadPolicyEntry {
@@ -36,8 +34,8 @@ pub struct ConnectRequest {
     pub epoch: GameModuleEpoch,
     pub target: String,
     pub target_definition_hash: TargetDefinitionHash,
-    pub layout_registry: Vec<LayoutEntry>,
-    pub layout_aggregate: [u8; 32],
+    pub compiled_registry: Vec<CompiledTypeRow>,
+    pub dsca: CompiledAttestationDigest,
     pub load_policy: Vec<LoadPolicyEntry>,
     pub policy_digest: [u8; 32],
     pub protocol: u32,
@@ -48,16 +46,15 @@ impl ConnectRequest {
         epoch: GameModuleEpoch,
         target: impl Into<String>,
         target_definition_hash: TargetDefinitionHash,
-        mut layout_registry: Vec<LayoutEntry>,
+        compiled_registry: Vec<CompiledTypeRow>,
         mut load_policy: Vec<LoadPolicyEntry>,
     ) -> Result<Self, crate::AttestationShapeError> {
-        layout_registry.sort_by_key(|row| row.type_uuid);
         load_policy.sort_by_key(|row| row.type_uuid);
-        let layout_aggregate = crate::compute_layout_aggregate(&layout_registry)?;
+        let compiled = CompiledTypeTable::canonical(compiled_registry)?;
         let policy_digest = crate::compute_policy_digest(&load_policy)?;
         crate::attestation::validate_attestation_shape(
-            &layout_registry,
-            layout_aggregate,
+            &compiled.rows,
+            compiled.digest,
             &load_policy,
             policy_digest,
         )?;
@@ -65,8 +62,8 @@ impl ConnectRequest {
             epoch,
             target: target.into(),
             target_definition_hash,
-            layout_registry,
-            layout_aggregate,
+            compiled_registry: compiled.rows,
+            dsca: compiled.digest,
             load_policy,
             policy_digest,
             protocol: PROTOCOL_VERSION,
@@ -77,9 +74,11 @@ impl ConnectRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReattestRequest {
     pub epoch: GameModuleEpoch,
+    pub base_attestation_generation: u64,
+    pub successor_attestation_generation: u64,
     pub target_definition_hash: TargetDefinitionHash,
-    pub layout_registry: Vec<LayoutEntry>,
-    pub layout_aggregate: [u8; 32],
+    pub compiled_registry: Vec<CompiledTypeRow>,
+    pub dsca: CompiledAttestationDigest,
     pub load_policy: Vec<LoadPolicyEntry>,
     pub policy_digest: [u8; 32],
 }
@@ -88,9 +87,11 @@ impl From<ConnectRequest> for ReattestRequest {
     fn from(request: ConnectRequest) -> Self {
         Self {
             epoch: request.epoch,
+            base_attestation_generation: 0,
+            successor_attestation_generation: 1,
             target_definition_hash: request.target_definition_hash,
-            layout_registry: request.layout_registry,
-            layout_aggregate: request.layout_aggregate,
+            compiled_registry: request.compiled_registry,
+            dsca: request.dsca,
             load_policy: request.load_policy,
             policy_digest: request.policy_digest,
         }
@@ -111,13 +112,11 @@ pub enum ConnectError {
         got: TargetDefinitionHash,
     },
     AttestationShape(crate::AttestationShapeError),
-    MissingLayout {
+    MissingCompiledType {
         type_uuid: TypeUuid,
     },
-    LayoutMismatch {
+    CompiledTypeMismatch {
         type_uuid: TypeUuid,
-        expected: [u8; 32],
-        got: [u8; 32],
     },
     MissingLoadPolicy {
         type_uuid: TypeUuid,
@@ -148,11 +147,18 @@ pub enum ConnectOutcome {
 pub struct Connected {
     pub hub: crate::Hub,
     pub instance: StoreInstanceId,
+    pub policy_generation: u64,
+    pub target_generation: u64,
+    pub attestation_generation: u64,
 }
 
 impl PartialEq for Connected {
     fn eq(&self, other: &Self) -> bool {
-        self.instance == other.instance && self.hub.connection_id() == other.hub.connection_id()
+        self.instance == other.instance
+            && self.policy_generation == other.policy_generation
+            && self.target_generation == other.target_generation
+            && self.attestation_generation == other.attestation_generation
+            && self.hub.connection_id() == other.hub.connection_id()
     }
 }
 
@@ -242,6 +248,14 @@ pub enum RpcFailure {
         previous: GameModuleEpoch,
         proposed: GameModuleEpoch,
     },
+    StaleAttestationBase {
+        expected: u64,
+        got: u64,
+    },
+    InvalidAttestationSuccessor {
+        base: u64,
+        successor: u64,
+    },
     Attestation(ConnectError),
 }
 
@@ -268,6 +282,7 @@ pub struct RpcBasis {
     pub load_policy: Arc<LoadPolicyAttestation>,
     pub policy_generation: u64,
     pub target_generation: u64,
+    pub attestation_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
