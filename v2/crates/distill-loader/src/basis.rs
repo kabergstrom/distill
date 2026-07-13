@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use distill_asset::AssetRuntimeDescriptor;
+use distill_core::attestation::is_bootstrap_control_type;
 use distill_core::id::TypeUuid;
 use distill_store::state::SnapshotStamp;
 
@@ -91,6 +92,12 @@ impl LoadPolicyAttestation {
         descriptors: &[&AssetRuntimeDescriptor],
     ) -> Result<(), LoadPolicyError> {
         for row in &self.rows {
+            // These five rows authenticate the format boundary through the
+            // independent bootstrap gate; they are deliberately not runtime
+            // registry descriptors or policy-eligible closure members.
+            if is_bootstrap_control_type(row.type_uuid) {
+                continue;
+            }
             let descriptor = descriptors
                 .iter()
                 .find(|descriptor| descriptor.type_uuid == row.type_uuid)

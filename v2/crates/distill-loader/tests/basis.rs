@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS;
 use distill_core::id::TypeUuid;
 use distill_loader::basis::digest_rows;
 use distill_loader::{
@@ -56,4 +57,24 @@ fn every_basis_carries_the_verified_projection() {
     };
     assert_eq!(basis.load_policy().digest(), policy.digest());
     assert_eq!(basis.rpc_snapshot(), None);
+}
+
+#[test]
+fn bootstrap_policy_rows_are_boundary_attestation_not_runtime_descriptors() {
+    let policy = LoadPolicyAttestation::from_rows(
+        BOOTSTRAP_CONTROL_TYPE_UUIDS
+            .map(|type_uuid| LoadPolicyRow {
+                type_uuid,
+                build_only: true,
+            })
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(policy.verify_descriptors(&[]), Ok(()));
+    for type_uuid in BOOTSTRAP_CONTROL_TYPE_UUIDS {
+        assert_eq!(
+            policy.require_runtime(type_uuid),
+            Err(LoadPolicyError::BuildOnly(type_uuid))
+        );
+    }
 }
