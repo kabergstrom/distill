@@ -11,4 +11,5 @@ distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }
 distill-build = { path = "../distill-build" }
 distill-loader = { path = "../distill-loader" }
+distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }

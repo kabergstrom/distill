@@ -13,6 +13,7 @@ use distill_pack::manifest::{
     PackManifest, PackTarget, PathRow, WireTreeRow,
 };
 use distill_pack::{MountError, PackfileIO, RuntimeAttestation};
+use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_wire::artifact::{
     content_hash, parse_artifact, write_artifact, ArtifactHeader, ARTIFACT_MAGIC,
 };
@@ -78,27 +79,37 @@ fn fixture(
         apis: vec![3],
         options: BTreeMap::new(),
     };
+    let runtime_row = CompiledTypeRow::new(
+        type_uuid,
+        logical_hash,
+        [5; 32],
+        false,
+        RegistryExtrasV1::canonical(vec![RegistryExtraRow {
+            node: SchemaNodeId(0),
+            path: vec![],
+            fact: RegistryExtraFact::BuildOnly(false),
+        }])
+        .unwrap(),
+    )
+    .unwrap();
+    let bootstrap_authority = consumer_bootstrap_authority_v1().unwrap();
+    let bootstrap_rows = bootstrap_authority.rows().to_vec();
+    let mut compiled_rows = bootstrap_rows;
+    compiled_rows.push(runtime_row);
+    let compiled_types = CompiledTypeTable::canonical(compiled_rows).unwrap();
+    let load_policy = compiled_types
+        .rows
+        .iter()
+        .map(|row| LoadPolicyRow {
+            type_uuid: row.type_uuid,
+            build_only: row.build_only,
+        })
+        .collect();
     let manifest = PackManifest {
         target: target.clone(),
         target_def_hash: [4; 32],
-        compiled_types: CompiledTypeTable::canonical(vec![CompiledTypeRow::new(
-            type_uuid,
-            logical_hash,
-            [5; 32],
-            false,
-            RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-                node: SchemaNodeId(0),
-                path: vec![],
-                fact: RegistryExtraFact::BuildOnly(false),
-            }])
-            .unwrap(),
-        )
-        .unwrap()])
-        .unwrap(),
-        load_policy: vec![LoadPolicyRow {
-            type_uuid,
-            build_only: false,
-        }],
+        compiled_types: compiled_types.clone(),
+        load_policy,
         archives: vec![ArchiveRef {
             generation: 7,
             file_hash: archive.bytes[archive.bytes.len() - 32..]
@@ -140,7 +151,8 @@ fn fixture(
     let runtime = RuntimeAttestation {
         target,
         target_def_hash: [4; 32],
-        compiled_types: manifest.compiled_types.clone(),
+        compiled_types,
+        bootstrap_authority,
     };
     (
         encode_manifest(&manifest).unwrap(),
@@ -206,6 +218,36 @@ fn mount_refuses_wrong_runtime_or_archive_identity() {
     assert!(matches!(
         PackfileIO::mount(&manifest, vec![bad_archive], &good_runtime),
         Err(MountError::Archive(_))
+    ));
+}
+
+#[test]
+fn equal_pack_and_runtime_bootstrap_forgery_fails_independent_local_authority() {
+    let (manifest_bytes, archive, mut runtime, _, _) = fixture(true);
+    let mut manifest = distill_pack::manifest::decode_manifest(&manifest_bytes).unwrap();
+    let bootstrap_uuid = runtime.bootstrap_authority.rows()[0].type_uuid;
+    let index = manifest
+        .compiled_types
+        .rows
+        .iter()
+        .position(|row| row.type_uuid == bootstrap_uuid)
+        .unwrap();
+    let original = manifest.compiled_types.rows[index].clone();
+    manifest.compiled_types.rows[index] = CompiledTypeRow::new(
+        original.type_uuid,
+        original.logical_hash,
+        [0xee; 32],
+        original.build_only,
+        original.registry_extras,
+    )
+    .unwrap();
+    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
+    runtime.compiled_types = manifest.compiled_types.clone();
+
+    let forged_manifest = encode_manifest(&manifest).unwrap();
+    assert!(matches!(
+        PackfileIO::mount(&forged_manifest, vec![archive], &runtime),
+        Err(MountError::BootstrapAuthority(_))
     ));
 }
 

@@ -3,8 +3,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_core::attestation::{
-    CompiledTypeRow, CompiledTypeTable, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
-    SchemaNodeId,
+    BootstrapControlSpecV1, CompiledTypeRow, CompiledTypeTable, RegistryExtraFact,
+    RegistryExtraRow, RegistryExtrasV1, SchemaNodeId, BOOTSTRAP_CONTROL_COUNT,
 };
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_pack::activation::{manifest_filename, publish_manifest, PointerError};
@@ -31,6 +31,16 @@ fn sample() -> PackManifest {
         .unwrap(),
     )
     .unwrap();
+    let mut compiled_rows = bootstrap_rows();
+    compiled_rows.push(compiled);
+    let mut load_policy = compiled_rows
+        .iter()
+        .map(|row| LoadPolicyRow {
+            type_uuid: row.type_uuid,
+            build_only: row.build_only,
+        })
+        .collect::<Vec<_>>();
+    load_policy.sort_by_key(|row| row.type_uuid);
     PackManifest {
         target: PackTarget {
             os: 1,
@@ -39,11 +49,8 @@ fn sample() -> PackManifest {
             options: BTreeMap::from([("quality".into(), "high".into())]),
         },
         target_def_hash: [5; 32],
-        compiled_types: CompiledTypeTable::canonical(vec![compiled]).unwrap(),
-        load_policy: vec![LoadPolicyRow {
-            type_uuid,
-            build_only: false,
-        }],
+        compiled_types: CompiledTypeTable::canonical(compiled_rows).unwrap(),
+        load_policy,
         archives: vec![ArchiveRef {
             generation: 9,
             file_hash: [8; 32],
@@ -80,6 +87,24 @@ fn sample() -> PackManifest {
     }
 }
 
+fn bootstrap_rows() -> Vec<CompiledTypeRow> {
+    BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .iter()
+        .map(|row| {
+            CompiledTypeRow::new(
+                row.type_uuid,
+                row.logical_hash,
+                [row.symbol as u8; 32],
+                true,
+                row.registry_extras.clone(),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
 #[test]
 fn manifest_roundtrips_byte_identically_with_all_five_tables() {
     let manifest = sample();
@@ -100,16 +125,18 @@ fn manifest_header_places_direct_compiled_rows_before_load_policy() {
 
     assert_eq!(
         u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()),
-        1
+        (BOOTSTRAP_CONTROL_COUNT + 1) as u32
     );
     cursor += 4;
-    let compiled_row = manifest.compiled_types.rows[0].encode().unwrap();
-    assert_eq!(
-        &bytes[cursor..cursor + compiled_row.len()],
-        compiled_row.as_slice(),
-        "compiled row must begin directly with TypeUuid, without an outer row length"
-    );
-    cursor += compiled_row.len();
+    for row in &manifest.compiled_types.rows {
+        let compiled_row = row.encode().unwrap();
+        assert_eq!(
+            &bytes[cursor..cursor + compiled_row.len()],
+            compiled_row.as_slice(),
+            "compiled row must begin directly with TypeUuid, without an outer row length"
+        );
+        cursor += compiled_row.len();
+    }
     assert_eq!(
         &bytes[cursor..cursor + 32],
         &manifest.compiled_types.digest.0
@@ -117,7 +144,7 @@ fn manifest_header_places_direct_compiled_rows_before_load_policy() {
     cursor += 32;
     assert_eq!(
         u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()),
-        1,
+        (BOOTSTRAP_CONTROL_COUNT + 1) as u32,
         "load-policy count must follow DSCA"
     );
     cursor += 4;
@@ -208,8 +235,16 @@ fn attestation_requires_pack_projection_coverage_but_allows_runtime_superset() {
         RegistryExtrasV1::default(),
     )
     .unwrap();
-    let runtime =
-        CompiledTypeTable::canonical(vec![manifest.compiled_types.rows[0].clone(), extra]).unwrap();
+    let runtime = CompiledTypeTable::canonical(
+        manifest
+            .compiled_types
+            .rows
+            .iter()
+            .cloned()
+            .chain([extra])
+            .collect(),
+    )
+    .unwrap();
     assert!(verify_attestation(&manifest, &runtime, [5; 32]).is_ok());
     assert!(verify_attestation(
         &manifest,
@@ -223,7 +258,15 @@ fn attestation_requires_pack_projection_coverage_but_allows_runtime_superset() {
 #[test]
 fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
     let mut forged = sample();
-    forged.compiled_types.rows[0].registry_extras_digest.0[0] ^= 1;
+    let runtime_index = forged
+        .compiled_types
+        .rows
+        .iter()
+        .position(|row| row.type_uuid == forged.assets[0].terminal_type)
+        .unwrap();
+    forged.compiled_types.rows[runtime_index]
+        .registry_extras_digest
+        .0[0] ^= 1;
     assert!(matches!(
         encode_manifest(&forged),
         Err(ManifestError::CompiledAttestation(
@@ -232,10 +275,8 @@ fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
     ));
 
     let mut duplicate = sample();
-    duplicate
-        .compiled_types
-        .rows
-        .push(duplicate.compiled_types.rows[0].clone());
+    let repeated = duplicate.compiled_types.rows[0].clone();
+    duplicate.compiled_types.rows.insert(1, repeated);
     assert!(matches!(
         encode_manifest(&duplicate),
         Err(ManifestError::CompiledAttestation(
@@ -251,7 +292,12 @@ fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
     );
 
     let manifest = canonicalize(sample()).unwrap();
-    let pack_row = &manifest.compiled_types.rows[0];
+    let pack_row = manifest
+        .compiled_types
+        .rows
+        .iter()
+        .find(|row| row.type_uuid == manifest.assets[0].terminal_type)
+        .unwrap();
     let stale = CompiledTypeRow::new(
         pack_row.type_uuid,
         LogicalHash([99; 32]),
@@ -260,7 +306,17 @@ fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
         pack_row.registry_extras.clone(),
     )
     .unwrap();
-    let stale_runtime = CompiledTypeTable::canonical(vec![stale]).unwrap();
+    let stale_runtime = CompiledTypeTable::canonical(
+        manifest
+            .compiled_types
+            .rows
+            .iter()
+            .filter(|row| row.type_uuid != pack_row.type_uuid)
+            .cloned()
+            .chain([stale])
+            .collect(),
+    )
+    .unwrap();
     assert_eq!(
         verify_attestation(&manifest, &stale_runtime, manifest.target_def_hash),
         Err(ManifestError::CompiledMismatch(pack_row.type_uuid))
@@ -268,26 +324,64 @@ fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
 }
 
 #[test]
-fn manifest_rejects_compiled_rows_outside_the_asset_type_closure() {
+fn manifest_requires_exact_asset_closure_union_five_bootstrap_rows() {
+    let mut manifest = sample();
+    let missing_bootstrap = manifest
+        .compiled_types
+        .rows
+        .iter()
+        .find(|row| row.build_only)
+        .unwrap()
+        .type_uuid;
+    manifest
+        .compiled_types
+        .rows
+        .retain(|row| row.type_uuid != missing_bootstrap);
+    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
+    manifest
+        .load_policy
+        .retain(|row| row.type_uuid != missing_bootstrap);
+    assert!(matches!(
+        encode_manifest(&manifest),
+        Err(ManifestError::BootstrapAuthority(
+            distill_core::attestation::BootstrapAuthorityMismatch::Missing(_)
+        ))
+    ));
+
     let mut manifest = sample();
     let type_uuid = TypeUuid([99; 16]);
-    manifest.compiled_types = CompiledTypeTable::canonical(vec![
-        manifest.compiled_types.rows[0].clone(),
-        CompiledTypeRow::new(
-            type_uuid,
-            LogicalHash([99; 32]),
-            [99; 32],
-            false,
-            RegistryExtrasV1::default(),
-        )
-        .unwrap(),
-    ])
+    let extra = CompiledTypeRow::new(
+        type_uuid,
+        LogicalHash([99; 32]),
+        [99; 32],
+        false,
+        RegistryExtrasV1::default(),
+    )
     .unwrap();
+    manifest.compiled_types.rows.push(extra);
+    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
     manifest.load_policy.push(LoadPolicyRow {
         type_uuid,
         build_only: false,
     });
 
+    assert_eq!(
+        encode_manifest(&manifest),
+        Err(ManifestError::CompiledCoverage)
+    );
+}
+
+#[test]
+fn bootstrap_rows_are_boundary_only_and_cannot_enter_the_asset_closure() {
+    let mut manifest = sample();
+    let bootstrap = manifest
+        .compiled_types
+        .rows
+        .iter()
+        .find(|row| row.build_only)
+        .unwrap()
+        .clone();
+    manifest.assets[0].authored_type = bootstrap.type_uuid;
     assert_eq!(
         encode_manifest(&manifest),
         Err(ManifestError::CompiledCoverage)

@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::attestation::{
-    AttestationError, CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable,
+    is_bootstrap_control_type, validate_bootstrap_logical_authority, AttestationError,
+    BootstrapAuthorityMismatch, BundleFormatVersion, CompiledAttestationDigest, CompiledTypeRow,
+    CompiledTypeTable, BOOTSTRAP_CONTROL_TYPE_UUIDS,
 };
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 
@@ -100,6 +102,7 @@ pub enum ManifestError {
     MissingRuntimeType(TypeUuid),
     MissingDependency(AssetUuid),
     CompiledAttestation(AttestationError),
+    BootstrapAuthority(BootstrapAuthorityMismatch),
     CompiledCoverage,
     CompiledMismatch(TypeUuid),
 }
@@ -627,17 +630,30 @@ pub fn verify_attestation(
 
 fn verify_compiled_closure(manifest: &PackManifest) -> Result<(), ManifestError> {
     manifest.compiled_types.validate()?;
+    validate_bootstrap_logical_authority(&manifest.compiled_types.rows, BundleFormatVersion::V1)
+        .map_err(ManifestError::BootstrapAuthority)?;
     let used_types = manifest
         .assets
         .iter()
         .flat_map(|asset| [asset.authored_type, asset.terminal_type])
         .collect::<BTreeSet<_>>();
-    if used_types.len() != manifest.compiled_types.rows.len()
+    if used_types
+        .iter()
+        .any(|type_uuid| is_bootstrap_control_type(*type_uuid))
+    {
+        return Err(ManifestError::CompiledCoverage);
+    }
+    let boundary_types = used_types
+        .iter()
+        .copied()
+        .chain(BOOTSTRAP_CONTROL_TYPE_UUIDS)
+        .collect::<BTreeSet<_>>();
+    if boundary_types.len() != manifest.compiled_types.rows.len()
         || manifest
             .compiled_types
             .rows
             .iter()
-            .any(|row| !used_types.contains(&row.type_uuid))
+            .any(|row| !boundary_types.contains(&row.type_uuid))
         || manifest.load_policy.len() != manifest.compiled_types.rows.len()
     {
         return Err(ManifestError::CompiledCoverage);
@@ -650,6 +666,9 @@ fn verify_compiled_closure(manifest: &PackManifest) -> Result<(), ManifestError>
             .map(|index| manifest.load_policy[index]);
         if !matches!(policy, Some(value) if value.build_only == row.build_only) {
             return Err(ManifestError::CompiledMismatch(row.type_uuid));
+        }
+        if used_types.contains(&row.type_uuid) && row.build_only {
+            return Err(ManifestError::CompiledCoverage);
         }
     }
     let asset_uuids = manifest

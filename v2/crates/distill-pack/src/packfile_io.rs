@@ -3,12 +3,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use distill_core::attestation::CompiledTypeTable;
+use distill_core::attestation::{
+    BootstrapAuthorityMismatch, BundleFormatVersion, CompiledTypeTable,
+};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_loader::{
     FetchedArtifact, IoBasis, IoEvent, LoadPolicyAttestation, LoadPolicyRow, LoaderIO,
     ManifestHash, PathResolveResult, ReqId, ResolveResult,
 };
+use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::Blob;
@@ -24,6 +27,9 @@ pub struct RuntimeAttestation {
     pub target: PackTarget,
     pub target_def_hash: [u8; 32],
     pub compiled_types: CompiledTypeTable,
+    /// Sealed DSCI-keyed local format authority. It cannot be constructed from
+    /// either the pack projection or `compiled_types`.
+    pub bootstrap_authority: &'static ConsumerBootstrapAuthorityV1,
 }
 
 #[derive(Debug)]
@@ -31,6 +37,7 @@ pub enum MountError {
     Manifest(ManifestError),
     Archive(ArchiveError),
     TargetMismatch,
+    BootstrapAuthority(BootstrapAuthorityMismatch),
     MissingArchive(u32),
     DuplicateArchive(u32),
     ArchiveFileHash(u32),
@@ -148,6 +155,14 @@ impl PackfileIO {
         if manifest.target != runtime.target {
             return Err(MountError::TargetMismatch);
         }
+        runtime
+            .bootstrap_authority
+            .validate_boundary_rows(&runtime.compiled_types.rows, BundleFormatVersion::V1)
+            .map_err(MountError::BootstrapAuthority)?;
+        runtime
+            .bootstrap_authority
+            .validate_boundary_rows(&manifest.compiled_types.rows, BundleFormatVersion::V1)
+            .map_err(MountError::BootstrapAuthority)?;
         verify_attestation(manifest, &runtime.compiled_types, runtime.target_def_hash)?;
         Ok(())
     }
