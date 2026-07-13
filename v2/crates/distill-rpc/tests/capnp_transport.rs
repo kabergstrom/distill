@@ -29,10 +29,14 @@ fn compiled(definition: u8) -> CompiledTypeRow {
 }
 
 fn target() -> TargetDefinition {
+    target_with_definition(7)
+}
+
+fn target_with_definition(definition: u8) -> TargetDefinition {
     TargetDefinition::canonical(
         "dev",
-        TargetDefinitionHash([7; 32]),
-        vec![compiled(7)],
+        TargetDefinitionHash([definition; 32]),
+        vec![compiled(definition)],
         vec![LoadPolicyEntry {
             type_uuid: TypeUuid([1; 16]),
             build_only: false,
@@ -131,6 +135,26 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         assert!(body.contains("leaseFailure @3"), "{name} lease ordinal");
         assert!(body.contains("error @4"), "{name} error ordinal");
     }
+    let reattest = source
+        .split_once("struct ReattestResult {")
+        .expect("dedicated ReattestResult")
+        .1
+        .split_once("\n  }\n}")
+        .expect("terminated ReattestResult")
+        .0;
+    for arm in [
+        "success @0 :ReattestSuccess",
+        "attestationFailure @1 :AttestationFailure",
+        "staleAttestationBase @2 :StaleAttestationBase",
+        "attestationGenerationOverflow @3 :AttestationGenerationOverflow",
+        "reconnectRequired @4 :ReconnectRequired",
+        "configurationPoisoned @5 :ConfigurationPoison",
+        "leaseFailure @6 :LeaseFailure",
+        "error @7 :RpcError",
+    ] {
+        assert!(reattest.contains(arm), "missing reattest arm {arm}");
+    }
+    assert!(source.contains("-> (result :ReattestResult);"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -220,16 +244,19 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
             let mut reattest = hub.reattest_request();
             write_reattest(reattest.get(), 2, 0, 1);
             let reattested = reattest.send().promise.await.unwrap();
-            assert!(matches!(
-                reattested
-                    .get()
-                    .unwrap()
-                    .get_result()
-                    .unwrap()
-                    .which()
-                    .unwrap(),
-                schema::u_int64_call::Which::Success(1)
-            ));
+            match reattested
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::reattest_result::Which::Success(success) => {
+                    assert_eq!(success.unwrap().get_installed_attestation_generation(), 1)
+                }
+                _ => panic!("expected typed reattestation success"),
+            }
 
             let snapshot_response = hub.snapshot_request().send().promise.await.unwrap();
             let snapshot_result = snapshot_response.get().unwrap().get_result().unwrap();
@@ -426,11 +453,34 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
             wrong_attestation.target_definition_hash = TargetDefinitionHash([8; 32]);
             assert!(matches!(
                 client.connect(&wrong_attestation).await.unwrap(),
-                RemoteConnectOutcome::AttestationFailure {
-                    code: 2000,
-                    type_uuid: None,
-                    ..
-                }
+                RemoteConnectOutcome::AttestationFailure(failure)
+                    if failure.code == AttestationFailureCode::TARGET_DEFINITION_MISMATCH
+                        && failure.subject
+                            == AttestationSubject::TargetDefinition(
+                                TargetDefinitionFailureSubject::DigestMismatch {
+                                    expected: TargetDefinitionHash([7; 32]),
+                                    observed: TargetDefinitionHash([8; 32]),
+                                }
+                            )
+            ));
+
+            let wrong_type = ConnectRequest::canonical(
+                GameModuleEpoch(1),
+                "dev",
+                TargetDefinitionHash([7; 32]),
+                vec![compiled(8)],
+                vec![LoadPolicyEntry {
+                    type_uuid: TypeUuid([1; 16]),
+                    build_only: false,
+                }],
+            )
+            .unwrap();
+            assert!(matches!(
+                client.connect(&wrong_type).await.unwrap(),
+                RemoteConnectOutcome::AttestationFailure(failure)
+                    if failure.code == AttestationFailureCode::COMPILED_TYPE_MISMATCH
+                        && failure.subject
+                            == AttestationSubject::SpecificType(TypeUuid([1; 16]))
             ));
 
             let mut malformed = client.root().connect_request();
@@ -576,7 +626,13 @@ async fn concurrent_wire_reattests_cas_the_generation_without_late_overwrite() {
             assert_eq!(
                 outcomes
                     .iter()
-                    .filter(|outcome| matches!(outcome, schema::u_int64_call::Which::Success(1)))
+                    .filter(|outcome| match outcome {
+                        schema::reattest_result::Which::Success(success) =>
+                            success.as_ref().is_ok_and(|success| {
+                                success.get_installed_attestation_generation() == 1
+                            }),
+                        _ => false,
+                    })
                     .count(),
                 1
             );
@@ -584,13 +640,11 @@ async fn concurrent_wire_reattests_cas_the_generation_without_late_overwrite() {
                 outcomes
                     .iter()
                     .filter(|outcome| match outcome {
-                        schema::u_int64_call::Which::Error(error) =>
-                            error.as_ref().is_ok_and(|error| {
-                                error.get_message().is_ok_and(|message| {
-                                    message.to_str().is_ok_and(|message| {
-                                        message.contains("StaleAttestationBase")
-                                    })
-                                })
+                        schema::reattest_result::Which::StaleAttestationBase(stale) =>
+                            stale.as_ref().is_ok_and(|stale| {
+                                stale.get_code() == STALE_ATTESTATION_BASE_CODE
+                                    && stale.get_expected() == 1
+                                    && stale.get_observed() == 0
                             }),
                         _ => false,
                     })
@@ -601,16 +655,131 @@ async fn concurrent_wire_reattests_cas_the_generation_without_late_overwrite() {
             let mut successor = hub.reattest_request();
             write_reattest(successor.get(), 4, 1, 2);
             let successor = successor.send().promise.await.unwrap();
-            assert!(matches!(
-                successor
-                    .get()
-                    .unwrap()
-                    .get_result()
-                    .unwrap()
-                    .which()
+            match successor
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::reattest_result::Which::Success(success) => {
+                    assert_eq!(success.unwrap().get_installed_attestation_generation(), 2)
+                }
+                _ => panic!("expected second typed reattestation success"),
+            }
+
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wire_reattest_has_typed_failure_subjects_generations_and_reconnect() {
+    LocalSet::new()
+        .run_until(async {
+            let server = server();
+            let listener = Rc::new(
+                StagedListener::bind(server.root(), "127.0.0.1:0")
+                    .await
                     .unwrap(),
-                schema::u_int64_call::Which::Success(2)
-            ));
+            );
+            let address = listener.local_addr().unwrap();
+            let server_listener = listener.clone();
+            let server_task =
+                tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = match client.connect(&request()).await.unwrap() {
+                RemoteConnectOutcome::Connected { hub, .. } => hub,
+                other => panic!("expected connected, got {other:?}"),
+            };
+
+            let mut bad_target = hub.reattest_request();
+            {
+                let mut params = bad_target.get();
+                write_reattest(params.reborrow(), 2, 0, 1);
+                params.set_target_def_hash(&[8; 32]);
+            }
+            let response = bad_target.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            let failure = match result.which().unwrap() {
+                schema::reattest_result::Which::AttestationFailure(failure) => failure.unwrap(),
+                _ => panic!("target mismatch must use the attestation arm"),
+            };
+            assert_eq!(
+                failure.get_code(),
+                AttestationFailureCode::TARGET_DEFINITION_MISMATCH.0
+            );
+            let subject = failure.get_subject().unwrap();
+            let target = match subject.which().unwrap() {
+                schema::attestation_subject::Which::TargetDefinition(target) => target.unwrap(),
+                _ => panic!("target mismatch must use the target-definition subject"),
+            };
+            let mismatch = match target.which().unwrap() {
+                schema::target_definition_subject::Which::DigestMismatch(mismatch) => {
+                    mismatch.unwrap()
+                }
+                _ => panic!("target subject must carry both digests"),
+            };
+            assert_eq!(mismatch.get_expected().unwrap(), &[7; 32]);
+            assert_eq!(mismatch.get_observed().unwrap(), &[8; 32]);
+
+            let mut overflow = hub.reattest_request();
+            write_reattest(overflow.get(), 2, u64::MAX, 0);
+            let response = overflow.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            match result.which().unwrap() {
+                schema::reattest_result::Which::AttestationGenerationOverflow(overflow) => {
+                    let overflow = overflow.unwrap();
+                    assert_eq!(overflow.get_code(), ATTESTATION_GENERATION_OVERFLOW_CODE);
+                    assert_eq!(overflow.get_base(), u64::MAX);
+                }
+                _ => panic!("generation overflow must have its dedicated arm"),
+            }
+
+            // Overflow did not mutate: base zero remains installable.
+            let mut valid = hub.reattest_request();
+            write_reattest(valid.get(), 2, 0, 1);
+            let response = valid.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            match result.which().unwrap() {
+                schema::reattest_result::Which::Success(success) => {
+                    assert_eq!(success.unwrap().get_installed_attestation_generation(), 1)
+                }
+                _ => panic!("expected successor installation"),
+            }
+
+            let mut stale = hub.reattest_request();
+            write_reattest(stale.get(), 3, 0, 1);
+            let response = stale.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            match result.which().unwrap() {
+                schema::reattest_result::Which::StaleAttestationBase(stale) => {
+                    let stale = stale.unwrap();
+                    assert_eq!(stale.get_code(), STALE_ATTESTATION_BASE_CODE);
+                    assert_eq!(stale.get_expected(), 1);
+                    assert_eq!(stale.get_observed(), 0);
+                }
+                _ => panic!("stale base must have its dedicated arm"),
+            }
+
+            server.replace_target(target_with_definition(8)).unwrap();
+            let mut fenced = hub.reattest_request();
+            write_reattest(fenced.get(), 3, 1, 2);
+            let response = fenced.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            match result.which().unwrap() {
+                schema::reattest_result::Which::ReconnectRequired(reconnect) => assert_eq!(
+                    reconnect.unwrap().get_reason().unwrap(),
+                    schema::ReconnectReason::TargetDefinitionChanged
+                ),
+                _ => panic!("target drift must reconnect without installing"),
+            }
 
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)

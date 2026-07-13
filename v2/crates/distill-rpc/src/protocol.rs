@@ -128,6 +128,59 @@ pub enum ConnectError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttestationFailureCode(pub u16);
+
+impl AttestationFailureCode {
+    pub const UNKNOWN_TARGET: Self = Self(0x0200);
+    pub const TARGET_DEFINITION_MISMATCH: Self = Self(0x0201);
+    pub const COMPILED_REGISTRY_INVALID: Self = Self(0x0202);
+    pub const DSCA_AGGREGATE_MISMATCH: Self = Self(0x0203);
+    pub const MISSING_COMPILED_TYPE: Self = Self(0x0204);
+    pub const COMPILED_TYPE_MISMATCH: Self = Self(0x0205);
+    pub const POLICY_PROJECTION_INVALID: Self = Self(0x0206);
+    pub const MISSING_LOAD_POLICY: Self = Self(0x0207);
+    pub const LOAD_POLICY_MISMATCH: Self = Self(0x0208);
+}
+
+/// Typed carrier for what part of the complete attestation failed. No UUID
+/// sentinel is used for aggregate/table failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationSubject {
+    SpecificType(TypeUuid),
+    TargetDefinition(TargetDefinitionFailureSubject),
+    CompiledRegistry,
+    DscaAggregate,
+    PolicyProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetDefinitionFailureSubject {
+    UnknownTarget(String),
+    DigestMismatch {
+        expected: TargetDefinitionHash,
+        observed: TargetDefinitionHash,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationFailure {
+    pub code: AttestationFailureCode,
+    pub subject: AttestationSubject,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReattestSuccess {
+    /// The only legal source for the successor RPC basis generation.
+    pub installed_attestation_generation: u64,
+}
+
+pub const STALE_ATTESTATION_BASE_CODE: u16 = 0x0100;
+pub const ATTESTATION_GENERATION_OVERFLOW_CODE: u16 = 0x0101;
+pub const INVALID_ATTESTATION_SUCCESSOR_CODE: u16 = 0x0102;
+pub const EPOCH_NOT_SUCCESSOR_CODE: u16 = 0x0103;
+
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
@@ -135,6 +188,76 @@ impl fmt::Display for ConnectError {
 }
 
 impl std::error::Error for ConnectError {}
+
+impl ConnectError {
+    /// Stable connect/reattest wire classification shared by both result
+    /// unions. Presentation text is deliberately not the type carrier.
+    pub fn attestation_failure(&self) -> AttestationFailure {
+        use distill_core::attestation::AttestationError;
+
+        let (code, subject) = match self {
+            Self::ProtocolMismatch { .. } => {
+                unreachable!("protocol mismatch has its own ConnectResult arm")
+            }
+            Self::UnknownTarget { target } => (
+                AttestationFailureCode::UNKNOWN_TARGET,
+                AttestationSubject::TargetDefinition(
+                    TargetDefinitionFailureSubject::UnknownTarget(target.clone()),
+                ),
+            ),
+            Self::TargetDefinitionMismatch { expected, got } => (
+                AttestationFailureCode::TARGET_DEFINITION_MISMATCH,
+                AttestationSubject::TargetDefinition(
+                    TargetDefinitionFailureSubject::DigestMismatch {
+                        expected: *expected,
+                        observed: *got,
+                    },
+                ),
+            ),
+            Self::AttestationShape(crate::AttestationShapeError::Compiled(
+                AttestationError::CompiledDigestMismatch,
+            )) => (
+                AttestationFailureCode::DSCA_AGGREGATE_MISMATCH,
+                AttestationSubject::DscaAggregate,
+            ),
+            Self::AttestationShape(crate::AttestationShapeError::Compiled(_)) => (
+                AttestationFailureCode::COMPILED_REGISTRY_INVALID,
+                AttestationSubject::CompiledRegistry,
+            ),
+            Self::AttestationShape(crate::AttestationShapeError::DuplicateTarget { target }) => (
+                AttestationFailureCode::UNKNOWN_TARGET,
+                AttestationSubject::TargetDefinition(
+                    TargetDefinitionFailureSubject::UnknownTarget(target.clone()),
+                ),
+            ),
+            Self::AttestationShape(_) => (
+                AttestationFailureCode::POLICY_PROJECTION_INVALID,
+                AttestationSubject::PolicyProjection,
+            ),
+            Self::MissingCompiledType { type_uuid } => (
+                AttestationFailureCode::MISSING_COMPILED_TYPE,
+                AttestationSubject::SpecificType(*type_uuid),
+            ),
+            Self::CompiledTypeMismatch { type_uuid } => (
+                AttestationFailureCode::COMPILED_TYPE_MISMATCH,
+                AttestationSubject::SpecificType(*type_uuid),
+            ),
+            Self::MissingLoadPolicy { type_uuid } => (
+                AttestationFailureCode::MISSING_LOAD_POLICY,
+                AttestationSubject::SpecificType(*type_uuid),
+            ),
+            Self::LoadPolicyMismatch { type_uuid, .. } => (
+                AttestationFailureCode::LOAD_POLICY_MISMATCH,
+                AttestationSubject::SpecificType(*type_uuid),
+            ),
+        };
+        AttestationFailure {
+            code,
+            subject,
+            message: format!("{self:?}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectOutcome {
@@ -255,6 +378,9 @@ pub enum RpcFailure {
     InvalidAttestationSuccessor {
         base: u64,
         successor: u64,
+    },
+    AttestationGenerationOverflow {
+        base: u64,
     },
     Attestation(ConnectError),
 }

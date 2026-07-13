@@ -49,10 +49,60 @@ struct RpcError {
   message @1 :Text;
 }
 
+struct DigestMismatch {
+  expected @0 :Data;
+  observed @1 :Data;
+}
+
+struct TargetDefinitionSubject {
+  union {
+    unknownTarget @0 :Text;
+    digestMismatch @1 :DigestMismatch;
+  }
+}
+
+struct AttestationSubject {
+  union {
+    specificType @0 :Data;
+    targetDefinition @1 :TargetDefinitionSubject;
+    compiledRegistry @2 :Void;
+    dscaAggregate @3 :Void;
+    policyProjection @4 :Void;
+  }
+}
+
 struct AttestationFailure {
   code @0 :UInt16;
-  typeUuid @1 :Data;
+  subject @1 :AttestationSubject;
   message @2 :Text;
+}
+
+struct ReattestSuccess {
+  installedAttestationGeneration @0 :UInt64;
+}
+
+struct StaleAttestationBase {
+  code @0 :UInt16;
+  expected @1 :UInt64;
+  observed @2 :UInt64;
+}
+
+struct AttestationGenerationOverflow {
+  code @0 :UInt16;
+  base @1 :UInt64;
+}
+
+struct ReattestResult {
+  union {
+    success @0 :ReattestSuccess;
+    attestationFailure @1 :AttestationFailure;
+    staleAttestationBase @2 :StaleAttestationBase;
+    attestationGenerationOverflow @3 :AttestationGenerationOverflow;
+    reconnectRequired @4 :ReconnectRequired;
+    configurationPoisoned @5 :ConfigurationPoison;
+    leaseFailure @6 :LeaseFailure;
+    error @7 :RpcError;
+  }
 }
 
 struct ProtocolFailure {
@@ -273,7 +323,7 @@ interface Hub {
                targetDefHash :Data,
                compiledRegistry :List(CompiledTypeEntry), dscaAggregate :Data,
                loadPolicy :List(LoadPolicyEntry), policyDigest :Data)
-           -> (result :UInt64Call);
+           -> (result :ReattestResult);
   unsubscribe @9 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
 }

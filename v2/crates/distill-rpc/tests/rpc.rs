@@ -407,7 +407,9 @@ fn reattest_rechecks_the_entire_identity_and_requires_a_successor_epoch() {
 
     assert_eq!(
         hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        RpcResult::Success(1)
+        RpcResult::Success(ReattestSuccess {
+            installed_attestation_generation: 1,
+        })
     );
     assert!(matches!(
         old_snapshot.resolve(asset_id(1)),
@@ -417,6 +419,85 @@ fn reattest_rechecks_the_entire_identity_and_requires_a_successor_epoch() {
         })
     ));
     assert!(matches!(old_snapshot.refresh(), RpcResult::Success(_)));
+}
+
+#[test]
+fn connect_and_reattest_share_stable_typed_attestation_failure_subjects() {
+    let type_uuid = type_id(1);
+    let cases = [
+        (
+            ConnectError::UnknownTarget {
+                target: "missing".into(),
+            },
+            AttestationFailureCode::UNKNOWN_TARGET,
+            AttestationSubject::TargetDefinition(TargetDefinitionFailureSubject::UnknownTarget(
+                "missing".into(),
+            )),
+        ),
+        (
+            ConnectError::MissingCompiledType { type_uuid },
+            AttestationFailureCode::MISSING_COMPILED_TYPE,
+            AttestationSubject::SpecificType(type_uuid),
+        ),
+        (
+            ConnectError::CompiledTypeMismatch { type_uuid },
+            AttestationFailureCode::COMPILED_TYPE_MISMATCH,
+            AttestationSubject::SpecificType(type_uuid),
+        ),
+        (
+            ConnectError::MissingLoadPolicy { type_uuid },
+            AttestationFailureCode::MISSING_LOAD_POLICY,
+            AttestationSubject::SpecificType(type_uuid),
+        ),
+        (
+            ConnectError::LoadPolicyMismatch {
+                type_uuid,
+                expected: false,
+                got: true,
+            },
+            AttestationFailureCode::LOAD_POLICY_MISMATCH,
+            AttestationSubject::SpecificType(type_uuid),
+        ),
+        (
+            ConnectError::TargetDefinitionMismatch {
+                expected: target_hash(7),
+                got: target_hash(8),
+            },
+            AttestationFailureCode::TARGET_DEFINITION_MISMATCH,
+            AttestationSubject::TargetDefinition(TargetDefinitionFailureSubject::DigestMismatch {
+                expected: target_hash(7),
+                observed: target_hash(8),
+            }),
+        ),
+        (
+            ConnectError::AttestationShape(AttestationShapeError::Compiled(
+                AttestationError::TrailingBytes,
+            )),
+            AttestationFailureCode::COMPILED_REGISTRY_INVALID,
+            AttestationSubject::CompiledRegistry,
+        ),
+        (
+            ConnectError::AttestationShape(AttestationShapeError::Compiled(
+                AttestationError::CompiledDigestMismatch,
+            )),
+            AttestationFailureCode::DSCA_AGGREGATE_MISMATCH,
+            AttestationSubject::DscaAggregate,
+        ),
+        (
+            ConnectError::AttestationShape(AttestationShapeError::PolicyDigestMismatch {
+                expected: [1; 32],
+                got: [2; 32],
+            }),
+            AttestationFailureCode::POLICY_PROJECTION_INVALID,
+            AttestationSubject::PolicyProjection,
+        ),
+    ];
+    for (error, code, subject) in cases {
+        let failure = error.attestation_failure();
+        assert_eq!(failure.code, code);
+        assert_eq!(failure.subject, subject);
+        assert!(!failure.message.is_empty());
+    }
 }
 
 #[test]
@@ -454,7 +535,12 @@ fn connect_returns_all_basis_generations_and_reattest_is_generation_cas() {
     assert_eq!(
         outcomes
             .iter()
-            .filter(|outcome| matches!(outcome, RpcResult::Success(1)))
+            .filter(|outcome| matches!(
+                outcome,
+                RpcResult::Success(ReattestSuccess {
+                    installed_attestation_generation: 1
+                })
+            ))
             .count(),
         1
     );
@@ -476,8 +562,58 @@ fn connect_returns_all_basis_generations_and_reattest_is_generation_cas() {
     let mut successor = ReattestRequest::from(request_for(7, 4, &[(1, false)]));
     successor.base_attestation_generation = 1;
     successor.successor_attestation_generation = 2;
-    assert_eq!(connected.hub.reattest(successor), RpcResult::Success(2));
+    assert_eq!(
+        connected.hub.reattest(successor),
+        RpcResult::Success(ReattestSuccess {
+            installed_attestation_generation: 2,
+        })
+    );
     assert_eq!(snapshot(&connected.hub).basis().attestation_generation, 2);
+}
+
+#[test]
+fn reattest_echo_rotates_the_basis_and_discards_old_generation_events() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let old_snapshot = snapshot(&hub);
+    let install = hub
+        .subscribe(InputVersion(0), vec![asset_id(1)], vec![])
+        .success()
+        .unwrap();
+    install.deltas.next().expect("initial install event");
+    server
+        .commit(Commit {
+            assets: vec![AssetMutation::Remove {
+                uuid: asset_id(1),
+                delta: AssetDeltaState::Changed,
+            }],
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let success = hub
+        .reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)])))
+        .success()
+        .unwrap();
+    assert_eq!(success.installed_attestation_generation, 1);
+    assert_eq!(
+        snapshot(&hub).basis().attestation_generation,
+        success.installed_attestation_generation
+    );
+    assert!(matches!(
+        old_snapshot.resolve(asset_id(1)),
+        RpcResult::Failure(RpcFailure::ClientEpochChanged { .. })
+    ));
+    let replacement = install
+        .deltas
+        .next()
+        .expect("old queued delta is replaced by a successor-basis resync");
+    assert!(matches!(replacement, StreamEvent::ResyncRequired { .. }));
+    assert_eq!(
+        replacement.basis().attestation_generation,
+        success.installed_attestation_generation
+    );
+    assert!(install.deltas.next().is_none());
 }
 
 #[test]
@@ -500,10 +636,7 @@ fn reattest_rejects_nonconsecutive_and_overflowing_generations_without_mutation(
     overflow.successor_attestation_generation = 0;
     assert!(matches!(
         hub.reattest(overflow),
-        RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
-            base: u64::MAX,
-            successor: 0
-        })
+        RpcResult::Failure(RpcFailure::AttestationGenerationOverflow { base: u64::MAX })
     ));
     assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
 }
@@ -1059,10 +1192,35 @@ fn target_definition_change_fences_every_target_bound_method_and_prompts_stream(
         hub.reattest(ReattestRequest::from(request_for(8, 2, &[(1, false)]))),
         reason,
     );
+    assert_eq!(hub.attestation_generation(), 0);
 
     // Pure snapshot metadata remains inspectable; it is not target-bound data.
     assert_eq!(snap.version(), InputVersion(0));
     assert_eq!(snap.configuration(), ConfigurationStatus::Ready);
+}
+
+#[test]
+fn store_and_protocol_components_of_the_reattest_fence_never_mutate_generation() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+
+    server.replace_store_instance(StoreInstanceId([10; 16]));
+    assert_reconnect(
+        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
+        ReconnectReason::StoreInstanceChanged,
+    );
+    assert_eq!(hub.attestation_generation(), 0);
+    server.replace_store_instance(StoreInstanceId([9; 16]));
+    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
+
+    server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
+    assert_reconnect(
+        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
+        ReconnectReason::ProtocolEpochChanged,
+    );
+    assert_eq!(hub.attestation_generation(), 0);
+    server.replace_protocol_epoch(PROTOCOL_VERSION);
+    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
 }
 
 #[test]
@@ -1075,6 +1233,11 @@ fn load_policy_change_has_its_own_fence_reason_and_target_reason_wins_if_both_ch
         snap.resolve(asset_id(1)),
         ReconnectReason::LoadPolicyChanged,
     );
+    assert_reconnect(
+        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, true)]))),
+        ReconnectReason::LoadPolicyChanged,
+    );
+    assert_eq!(hub.attestation_generation(), 0);
 
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);

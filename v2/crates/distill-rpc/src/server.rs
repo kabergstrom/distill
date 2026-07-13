@@ -83,6 +83,7 @@ impl fmt::Debug for DeltaStream {
 
 struct ServerState {
     instance: StoreInstanceId,
+    protocol_epoch: u32,
     current: InputVersion,
     views: BTreeMap<InputVersion, Arc<VersionView>>,
     history: VecDeque<HistoryDelta>,
@@ -123,6 +124,8 @@ struct ConnectionState {
     target_generation: u64,
     policy_generation: u64,
     attestation_generation: u64,
+    store_instance: StoreInstanceId,
+    protocol_epoch: u32,
     epoch: GameModuleEpoch,
     load_policy: Arc<LoadPolicyAttestation>,
     subscribed_assets: BTreeSet<AssetUuid>,
@@ -130,6 +133,29 @@ struct ConnectionState {
     queue: VecDeque<StreamEvent>,
     stream_installed: bool,
     notify: Arc<Notify>,
+}
+
+/// Complete connection fence captured with the attestation validation
+/// snapshot and compared again immediately before installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReattestationFence {
+    attestation_generation: u64,
+    target_generation: u64,
+    policy_generation: u64,
+    store_instance: StoreInstanceId,
+    protocol_epoch: u32,
+}
+
+impl ReattestationFence {
+    fn capture(connection: &ConnectionState) -> Self {
+        Self {
+            attestation_generation: connection.attestation_generation,
+            target_generation: connection.target_generation,
+            policy_generation: connection.policy_generation,
+            store_instance: connection.store_instance,
+            protocol_epoch: connection.protocol_epoch,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -182,6 +208,7 @@ impl Server {
         Ok(Self {
             inner: Arc::new(Mutex::new(ServerState {
                 instance,
+                protocol_epoch: PROTOCOL_VERSION,
                 current: InputVersion(0),
                 views,
                 history: VecDeque::new(),
@@ -208,6 +235,33 @@ impl Server {
 
     pub fn current_stamp(&self) -> SnapshotStamp {
         let state = self.lock();
+        stamp(&state)
+    }
+
+    /// Publish a replacement store instance and fence every extant
+    /// capability. Production uses this when disposable daemon state is
+    /// recreated; retaining it here makes the store component of the fence
+    /// tuple explicit and testable.
+    pub fn replace_store_instance(&self, instance: StoreInstanceId) -> SnapshotStamp {
+        let mut state = self.lock();
+        if state.instance == instance {
+            return stamp(&state);
+        }
+        state.instance = instance;
+        advance_empty_version(&mut state);
+        notify_all_reconnect(&mut state, ReconnectReason::StoreInstanceChanged);
+        stamp(&state)
+    }
+
+    /// Advance the protocol epoch and fence every existing connection.
+    pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> SnapshotStamp {
+        let mut state = self.lock();
+        if state.protocol_epoch == protocol_epoch {
+            return stamp(&state);
+        }
+        state.protocol_epoch = protocol_epoch;
+        advance_empty_version(&mut state);
+        notify_all_reconnect(&mut state, ReconnectReason::ProtocolEpochChanged);
         stamp(&state)
     }
 
@@ -440,9 +494,9 @@ fn compiled_equal_ignoring_load_policy(
 impl Root {
     pub fn connect(&self, request: ConnectRequest) -> ConnectOutcome {
         let mut state = self.server.lock();
-        if request.protocol != PROTOCOL_VERSION {
+        if request.protocol != state.protocol_epoch {
             return ConnectOutcome::Rejected(ConnectError::ProtocolMismatch {
-                expected: PROTOCOL_VERSION,
+                expected: state.protocol_epoch,
                 got: request.protocol,
             });
         }
@@ -486,6 +540,8 @@ impl Root {
             target_generation,
             policy_generation,
             attestation_generation: 0,
+            store_instance: state.instance,
+            protocol_epoch: state.protocol_epoch,
             epoch: request.epoch,
             load_policy: policy,
             subscribed_assets: BTreeSet::new(),
@@ -511,6 +567,12 @@ impl Root {
 impl Hub {
     pub fn connection_id(&self) -> u64 {
         lock_connection(&self.connection).id
+    }
+
+    /// The installed generation, exposed for loader basis rotation and
+    /// diagnostics. Mutation is possible only through successful reattest.
+    pub fn attestation_generation(&self) -> u64 {
+        lock_connection(&self.connection).attestation_generation
     }
 
     pub fn snapshot(&self) -> RpcResult<Snapshot> {
@@ -669,12 +731,13 @@ impl Hub {
         RpcResult::Success(())
     }
 
-    pub fn reattest(&self, request: ReattestRequest) -> RpcResult<u64> {
+    pub fn reattest(&self, request: ReattestRequest) -> RpcResult<ReattestSuccess> {
         let state = self.server.lock();
         let mut connection = lock_connection(&self.connection);
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
+        let validation_fence = ReattestationFence::capture(&connection);
         let current_view = state
             .views
             .get(&state.current)
@@ -685,9 +748,8 @@ impl Hub {
         let expected_successor = match request.base_attestation_generation.checked_add(1) {
             Some(successor) => successor,
             None => {
-                return RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
+                return RpcResult::Failure(RpcFailure::AttestationGenerationOverflow {
                     base: request.base_attestation_generation,
-                    successor: request.successor_attestation_generation,
                 })
             }
         };
@@ -724,10 +786,58 @@ impl Hub {
             Ok(policy) => policy,
             Err(error) => return RpcResult::Failure(RpcFailure::Attestation(error)),
         };
+
+        // Validation and installation currently share the server lock, but
+        // the complete tuple is still compared explicitly. This preserves
+        // the CAS contract if validation later moves off-lock.
+        if let Some(reason) = generation_fence(&state, &connection) {
+            return RpcResult::ReconnectRequired { reason };
+        }
+        let install_fence = ReattestationFence::capture(&connection);
+        if install_fence.store_instance != validation_fence.store_instance {
+            return RpcResult::ReconnectRequired {
+                reason: ReconnectReason::StoreInstanceChanged,
+            };
+        }
+        if install_fence.protocol_epoch != validation_fence.protocol_epoch {
+            return RpcResult::ReconnectRequired {
+                reason: ReconnectReason::ProtocolEpochChanged,
+            };
+        }
+        if install_fence.target_generation != validation_fence.target_generation {
+            return RpcResult::ReconnectRequired {
+                reason: ReconnectReason::TargetDefinitionChanged,
+            };
+        }
+        if install_fence.policy_generation != validation_fence.policy_generation {
+            return RpcResult::ReconnectRequired {
+                reason: ReconnectReason::LoadPolicyChanged,
+            };
+        }
+        if install_fence.attestation_generation != validation_fence.attestation_generation {
+            return RpcResult::Failure(RpcFailure::StaleAttestationBase {
+                expected: install_fence.attestation_generation,
+                got: request.base_attestation_generation,
+            });
+        }
+
         connection.epoch = request.epoch;
         connection.load_policy = policy;
         connection.attestation_generation = request.successor_attestation_generation;
-        RpcResult::Success(request.successor_attestation_generation)
+        if connection.stream_installed {
+            connection.queue.clear();
+            let basis = basis_for(&connection, stamp(&state));
+            enqueue_event(
+                &mut connection,
+                StreamEvent::ResyncRequired {
+                    basis,
+                    oldest_available: state.current,
+                },
+            );
+        }
+        RpcResult::Success(ReattestSuccess {
+            installed_attestation_generation: request.successor_attestation_generation,
+        })
     }
 }
 
@@ -976,6 +1086,12 @@ fn snapshot_from(
 }
 
 fn generation_fence(state: &ServerState, connection: &ConnectionState) -> Option<ReconnectReason> {
+    if state.instance != connection.store_instance {
+        return Some(ReconnectReason::StoreInstanceChanged);
+    }
+    if state.protocol_epoch != connection.protocol_epoch {
+        return Some(ReconnectReason::ProtocolEpochChanged);
+    }
     let target = state
         .targets
         .get(&connection.target)
@@ -1073,6 +1189,21 @@ fn notify_reconnect(state: &mut ServerState, target: &str, reason: ReconnectReas
         if connection.target != target {
             continue;
         }
+        let basis = basis_for(&connection, current);
+        enqueue_event(
+            &mut connection,
+            StreamEvent::Asset {
+                basis,
+                event: AssetEvent::ReconnectRequired { reason },
+            },
+        );
+    }
+}
+
+fn notify_all_reconnect(state: &mut ServerState, reason: ReconnectReason) {
+    let current = stamp(state);
+    for connection in live_connections(state) {
+        let mut connection = lock_connection(&connection);
         let basis = basis_for(&connection, current);
         enqueue_event(
             &mut connection,

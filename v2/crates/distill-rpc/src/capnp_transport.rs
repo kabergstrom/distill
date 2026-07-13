@@ -23,7 +23,7 @@ use crate::{
     ContentHash, Delta, DeltaStream, DriftedInput, GameModuleEpoch, Hub, InputVersion,
     LoadPolicyEntry, PathResolveFailure, PathResolveResult, ReattestRequest, ReconnectReason,
     RegistryExtrasDigest, RegistryExtrasV1, ResolveResult, Root, RpcFailure, RpcResult, Snapshot,
-    SnapshotStamp, StoreInstanceId, TargetDefinitionHash, TypeUuid,
+    SnapshotStamp, StoreInstanceId, TargetDefinitionFailureSubject, TargetDefinitionHash, TypeUuid,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -33,7 +33,6 @@ const WIRE_INVALID_HASH: u16 = 1002;
 const WIRE_INVALID_INSTANCE: u16 = 1003;
 const WIRE_INVALID_UTF8: u16 = 1004;
 const WIRE_INVALID_ATTESTATION: u16 = 1005;
-const CONNECT_REJECTED: u16 = 2000;
 const RPC_FAILURE: u16 = 3000;
 const UNSUPPORTED_METHOD: u16 = 4000;
 
@@ -191,11 +190,7 @@ pub enum RemoteConnectOutcome {
         attestation_generation: u64,
     },
     ConfigurationPoisoned(ConfigurationPoison),
-    AttestationFailure {
-        code: u16,
-        type_uuid: Option<TypeUuid>,
-        message: String,
-    },
+    AttestationFailure(crate::AttestationFailure),
     ProtocolFailure {
         expected: u32,
         observed: u32,
@@ -227,16 +222,9 @@ impl fmt::Debug for RemoteConnectOutcome {
                 .debug_tuple("ConfigurationPoisoned")
                 .field(poison)
                 .finish(),
-            Self::AttestationFailure {
-                code,
-                type_uuid,
-                message,
-            } => f
-                .debug_struct("AttestationFailure")
-                .field("code", code)
-                .field("type_uuid", type_uuid)
-                .field("message", message)
-                .finish(),
+            Self::AttestationFailure(failure) => {
+                f.debug_tuple("AttestationFailure").field(failure).finish()
+            }
             Self::ProtocolFailure {
                 expected,
                 observed,
@@ -452,7 +440,7 @@ impl schema::hub::Server for HubService {
                 }
                 Err(DecodeError::Capnp(error)) => return Err(error),
             };
-            write_uint64_result(results.get().init_result(), self.hub.reattest(request));
+            write_reattest_result(results.get().init_result(), self.hub.reattest(request));
             Ok(())
         }
     }
@@ -976,17 +964,9 @@ fn decode_connect_response(
         Which::ConfigurationPoisoned(poison) => Ok(RemoteConnectOutcome::ConfigurationPoisoned(
             read_poison(poison?)?,
         )),
-        Which::AttestationFailure(failure) => {
-            let failure = failure?;
-            let type_uuid = decode_uuid(failure.get_type_uuid()?, "attestationFailure.typeUuid")
-                .map_err(|error| capnp::Error::failed(error.message))?;
-            Ok(RemoteConnectOutcome::AttestationFailure {
-                code: failure.get_code(),
-                type_uuid: (type_uuid != [0; 16]).then_some(TypeUuid(type_uuid)),
-                message: decode_text(failure.get_message()?, "attestationFailure.message")
-                    .map_err(|error| capnp::Error::failed(error.message))?,
-            })
-        }
+        Which::AttestationFailure(failure) => Ok(RemoteConnectOutcome::AttestationFailure(
+            read_attestation_failure(failure?)?,
+        )),
         Which::ProtocolFailure(failure) => {
             let failure = failure?;
             Ok(RemoteConnectOutcome::ProtocolFailure {
@@ -1005,6 +985,64 @@ fn decode_connect_response(
             })
         }
     }
+}
+
+fn read_attestation_failure(
+    failure: schema::attestation_failure::Reader<'_>,
+) -> Result<crate::AttestationFailure, capnp::Error> {
+    use schema::attestation_subject::Which;
+    let subject = failure.get_subject()?;
+    let subject = match subject
+        .which()
+        .map_err(|error| capnp::Error::failed(error.to_string()))?
+    {
+        Which::SpecificType(type_uuid) => crate::AttestationSubject::SpecificType(TypeUuid(
+            decode_uuid(type_uuid?, "attestationFailure.subject.specificType")
+                .map_err(|error| capnp::Error::failed(error.message))?,
+        )),
+        Which::TargetDefinition(target) => {
+            let target = target?;
+            use schema::target_definition_subject::Which as TargetWhich;
+            let target = match target
+                .which()
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+            {
+                TargetWhich::UnknownTarget(name) => TargetDefinitionFailureSubject::UnknownTarget(
+                    decode_text(name?, "attestationFailure.subject.target.unknownTarget")
+                        .map_err(|error| capnp::Error::failed(error.message))?,
+                ),
+                TargetWhich::DigestMismatch(mismatch) => {
+                    let mismatch = mismatch?;
+                    TargetDefinitionFailureSubject::DigestMismatch {
+                        expected: TargetDefinitionHash(
+                            decode_hash(
+                                mismatch.get_expected()?,
+                                "attestationFailure.subject.target.expected",
+                            )
+                            .map_err(|error| capnp::Error::failed(error.message))?,
+                        ),
+                        observed: TargetDefinitionHash(
+                            decode_hash(
+                                mismatch.get_observed()?,
+                                "attestationFailure.subject.target.observed",
+                            )
+                            .map_err(|error| capnp::Error::failed(error.message))?,
+                        ),
+                    }
+                }
+            };
+            crate::AttestationSubject::TargetDefinition(target)
+        }
+        Which::CompiledRegistry(()) => crate::AttestationSubject::CompiledRegistry,
+        Which::DscaAggregate(()) => crate::AttestationSubject::DscaAggregate,
+        Which::PolicyProjection(()) => crate::AttestationSubject::PolicyProjection,
+    };
+    Ok(crate::AttestationFailure {
+        code: crate::AttestationFailureCode(failure.get_code()),
+        subject,
+        message: decode_text(failure.get_message()?, "attestationFailure.message")
+            .map_err(|error| capnp::Error::failed(error.message))?,
+    })
 }
 
 fn read_poison(
@@ -1092,6 +1130,51 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
         }
         RpcResult::Failure(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_reattest_result(
+    result: schema::reattest_result::Builder<'_>,
+    outcome: RpcResult<crate::ReattestSuccess>,
+) {
+    match outcome {
+        RpcResult::Success(success) => result
+            .init_success()
+            .set_installed_attestation_generation(success.installed_attestation_generation),
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationPoisoned(poison) => {
+            write_poison(result.init_configuration_poisoned(), &poison)
+        }
+        RpcResult::Failure(RpcFailure::Attestation(error)) => write_attestation_failure(
+            result.init_attestation_failure(),
+            &error.attestation_failure(),
+        ),
+        RpcResult::Failure(RpcFailure::StaleAttestationBase { expected, got }) => {
+            let mut stale = result.init_stale_attestation_base();
+            stale.set_code(crate::STALE_ATTESTATION_BASE_CODE);
+            stale.set_expected(expected);
+            stale.set_observed(got);
+        }
+        RpcResult::Failure(RpcFailure::AttestationGenerationOverflow { base }) => {
+            let mut overflow = result.init_attestation_generation_overflow();
+            overflow.set_code(crate::ATTESTATION_GENERATION_OVERFLOW_CODE);
+            overflow.set_base(base);
+        }
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        }
+        RpcResult::Failure(error) => {
+            let code = match error {
+                RpcFailure::InvalidAttestationSuccessor { .. } => {
+                    crate::INVALID_ATTESTATION_SUCCESSOR_CODE
+                }
+                RpcFailure::EpochNotSuccessor { .. } => crate::EPOCH_NOT_SUCCESSOR_CODE,
+                _ => RPC_FAILURE,
+            };
+            write_error(result.init_error(), code, &format!("{error:?}"));
         }
     }
 }
@@ -1307,17 +1390,40 @@ fn write_connect_error(mut result: schema::connect_call::Builder<'_>, error: &cr
         failure.set_message(format!("{error:?}").as_str());
         return;
     }
-    let mut failure = result.init_attestation_failure();
-    failure.set_code(CONNECT_REJECTED);
-    let type_uuid = match error {
-        crate::ConnectError::MissingCompiledType { type_uuid }
-        | crate::ConnectError::CompiledTypeMismatch { type_uuid }
-        | crate::ConnectError::MissingLoadPolicy { type_uuid }
-        | crate::ConnectError::LoadPolicyMismatch { type_uuid, .. } => type_uuid.0,
-        _ => [0; 16],
-    };
-    failure.set_type_uuid(&type_uuid);
-    failure.set_message(format!("{error:?}").as_str());
+    write_attestation_failure(
+        result.init_attestation_failure(),
+        &error.attestation_failure(),
+    );
+}
+
+fn write_attestation_failure(
+    mut output: schema::attestation_failure::Builder<'_>,
+    failure: &crate::AttestationFailure,
+) {
+    output.set_code(failure.code.0);
+    output.set_message(failure.message.as_str());
+    let mut subject = output.init_subject();
+    match &failure.subject {
+        crate::AttestationSubject::SpecificType(type_uuid) => {
+            subject.set_specific_type(&type_uuid.0)
+        }
+        crate::AttestationSubject::TargetDefinition(target) => {
+            let mut output = subject.init_target_definition();
+            match target {
+                TargetDefinitionFailureSubject::UnknownTarget(target) => {
+                    output.set_unknown_target(target.as_str())
+                }
+                TargetDefinitionFailureSubject::DigestMismatch { expected, observed } => {
+                    let mut mismatch = output.init_digest_mismatch();
+                    mismatch.set_expected(&expected.0);
+                    mismatch.set_observed(&observed.0);
+                }
+            }
+        }
+        crate::AttestationSubject::CompiledRegistry => subject.set_compiled_registry(()),
+        crate::AttestationSubject::DscaAggregate => subject.set_dsca_aggregate(()),
+        crate::AttestationSubject::PolicyProjection => subject.set_policy_projection(()),
+    }
 }
 
 fn write_rpc_result_error_snapshot(
