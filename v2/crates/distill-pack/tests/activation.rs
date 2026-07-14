@@ -61,6 +61,8 @@ fn archive_names_are_hash_addressed_and_publication_is_no_replace() {
     )
     .unwrap();
     let hash = publish_archive(&dir, &archive.bytes).unwrap();
+    assert_eq!(hash, *blake3::hash(&archive.bytes).as_bytes());
+    assert_ne!(hash.as_slice(), &archive.bytes[archive.bytes.len() - 32..]);
     let expected = archive_filename(hash);
     assert!(expected.starts_with("archive-"));
     assert_eq!(expected.len(), "archive-".len() + 64 + ".dpk".len());

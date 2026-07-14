@@ -92,13 +92,11 @@ impl PackfileIO {
         for bytes in archive_files {
             let decoded = decode_archive(&bytes)?;
             let generation = decoded.generation;
-            let trailer: [u8; 32] = bytes[bytes.len() - 32..]
-                .try_into()
-                .expect("a decoded archive has a trailer");
+            let file_hash = *blake3::hash(&bytes).as_bytes();
             if archives.insert(generation, decoded).is_some() {
                 return Err(MountError::DuplicateArchive(generation));
             }
-            raw_hashes.insert(generation, trailer);
+            raw_hashes.insert(generation, file_hash);
         }
         for archive_ref in &manifest.archives {
             if raw_hashes.get(&archive_ref.generation) != Some(&archive_ref.file_hash) {

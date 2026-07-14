@@ -112,9 +112,7 @@ fn fixture(
         load_policy,
         archives: vec![ArchiveRef {
             generation: 7,
-            file_hash: archive.bytes[archive.bytes.len() - 32..]
-                .try_into()
-                .unwrap(),
+            file_hash: *blake3::hash(&archive.bytes).as_bytes(),
         }],
         assets: vec![ManifestAssetRow {
             asset_uuid,
@@ -238,6 +236,19 @@ fn mount_refuses_wrong_runtime_or_archive_identity() {
     assert!(matches!(
         PackfileIO::mount(&manifest, vec![bad_archive], &good_runtime),
         Err(MountError::Archive(_))
+    ));
+}
+
+#[test]
+fn mount_refuses_the_internal_trailer_as_the_archive_file_hash() {
+    let (manifest_bytes, archive, runtime, _, _) = fixture(true);
+    let mut manifest = distill_pack::manifest::decode_manifest(&manifest_bytes).unwrap();
+    manifest.archives[0].file_hash = archive[archive.len() - 32..].try_into().unwrap();
+    let manifest = encode_manifest(&manifest).unwrap();
+
+    assert!(matches!(
+        PackfileIO::mount(&manifest, vec![archive], &runtime),
+        Err(MountError::ArchiveFileHash(7))
     ));
 }
 
