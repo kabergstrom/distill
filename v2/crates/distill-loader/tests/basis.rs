@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS;
+use distill_core::attestation::{CompiledAttestationDigest, BOOTSTRAP_CONTROL_TYPE_UUIDS};
 use distill_core::id::TypeUuid;
 use distill_loader::basis::digest_rows;
 use distill_loader::{
     IoBasis, LoadPolicyAttestation, LoadPolicyError, LoadPolicyRow, ManifestHash,
 };
+use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 fn row(id: u8, build_only: bool) -> LoadPolicyRow {
     LoadPolicyRow {
@@ -57,6 +58,25 @@ fn every_basis_carries_the_verified_projection() {
     };
     assert_eq!(basis.load_policy().digest(), policy.digest());
     assert_eq!(basis.rpc_snapshot(), None);
+}
+
+#[test]
+fn rpc_basis_identity_includes_every_connection_fence_generation() {
+    let load_policy = Arc::new(LoadPolicyAttestation::from_rows(vec![row(1, false)]).unwrap());
+    let basis = |target_generation| IoBasis::Rpc {
+        snapshot: SnapshotStamp {
+            instance: StoreInstanceId([3; 16]),
+            version: InputVersion(4),
+        },
+        load_policy: load_policy.clone(),
+        daemon_compiled_projection: CompiledAttestationDigest([5; 32]),
+        policy_generation: 6,
+        target_generation,
+        attestation_generation: 8,
+    };
+
+    assert_ne!(basis(7), basis(9));
+    assert_eq!(basis(7).rpc_snapshot().unwrap().version, InputVersion(4));
 }
 
 #[test]

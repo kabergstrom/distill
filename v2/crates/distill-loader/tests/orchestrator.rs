@@ -839,6 +839,38 @@ fn placeholder_resolution_failure_poisons_without_partial_swap() {
 }
 
 #[test]
+fn role_ineligible_is_a_typed_failure_not_a_missing_asset() {
+    let token = ModuleEpochToken::new(26);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 26, &token);
+    let asset = uuid(30);
+    let _handle = loader.add_ref::<A>(asset).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (req, request_basis) = loader.io().resolve_for(asset);
+    loader.io_mut().push(IoEvent::Resolved {
+        req,
+        uuid: asset,
+        result: ResolveResult::RoleIneligible {
+            uuid: asset,
+            role: distill_build::trace::EntryRole::AuthoringOnly,
+        },
+        basis: request_basis,
+    });
+
+    loader.process(&mut storage).unwrap();
+
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::RoleIneligible {
+            uuid,
+            role: distill_build::trace::EntryRole::AuthoringOnly,
+        } if *uuid == asset
+    )));
+    assert!(storage.updates.is_empty());
+}
+
+#[test]
 fn placeholder_visitor_failure_is_observed_and_destroys_the_injected_value() {
     let token = ModuleEpochToken::new(24);
     let mut loader = Loader::new(mock_io());

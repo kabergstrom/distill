@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use distill_build::query::AssetQuery;
+use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_store::state::SnapshotStamp;
 use distill_wire::exec::Blob;
@@ -32,6 +33,10 @@ pub enum ResolveResult {
     },
     Failed {
         error: String,
+    },
+    RoleIneligible {
+        uuid: AssetUuid,
+        role: EntryRole,
     },
     Missing,
     Deleted {
@@ -67,6 +72,7 @@ pub enum AssetDeltaState {
 pub enum ReconnectReason {
     TargetDefinitionChanged,
     LoadPolicyChanged,
+    CompiledAttestationChanged,
     StoreInstanceChanged,
     ProtocolEpochChanged,
 }

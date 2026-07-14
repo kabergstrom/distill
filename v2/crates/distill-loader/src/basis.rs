@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use distill_asset::AssetRuntimeDescriptor;
-use distill_core::attestation::is_bootstrap_control_type;
+use distill_core::attestation::{is_bootstrap_control_type, CompiledAttestationDigest};
 use distill_core::id::TypeUuid;
 use distill_store::state::SnapshotStamp;
 
@@ -137,7 +137,10 @@ pub enum IoBasis {
     Rpc {
         snapshot: SnapshotStamp,
         load_policy: Arc<LoadPolicyAttestation>,
+        daemon_compiled_projection: CompiledAttestationDigest,
         policy_generation: u64,
+        target_generation: u64,
+        attestation_generation: u64,
     },
     Pack {
         manifest: ManifestHash,

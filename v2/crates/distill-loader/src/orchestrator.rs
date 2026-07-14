@@ -94,6 +94,10 @@ pub enum LoaderDiagnostic {
         uuid: AssetUuid,
         error: String,
     },
+    RoleIneligible {
+        uuid: AssetUuid,
+        role: distill_build::trace::EntryRole,
+    },
     ComponentPoisoned {
         members: Vec<AssetUuid>,
         failures: Vec<(AssetUuid, MemberFailure)>,
@@ -1123,6 +1127,17 @@ impl<I: LoaderIO> Loader<I> {
                 candidate.terminal = CandidateTerminal::Failed(error.clone());
                 self.diagnostics
                     .push(LoaderDiagnostic::ResolveFailed { uuid, error });
+            }
+            ResolveResult::RoleIneligible {
+                uuid: observed,
+                role,
+            } => {
+                let error = format!("asset {observed} has non-runtime role {role:?}");
+                candidate.terminal = CandidateTerminal::Failed(error);
+                self.diagnostics.push(LoaderDiagnostic::RoleIneligible {
+                    uuid: observed,
+                    role,
+                });
             }
             ResolveResult::Missing => {
                 candidate.terminal = if was_live {
