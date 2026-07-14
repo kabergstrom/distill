@@ -69,6 +69,12 @@ pub fn host_interface_closure_manifest() -> &'static [(&'static str, &'static [u
     host_interface_closure::HOST_INTERFACE_CLOSURE
 }
 
+/// Exact `rustc -vV` of the compiler that built this resident host image.
+/// This is intentionally independent of the watched project's DSCI.
+pub fn host_rustc_identity() -> &'static str {
+    host_interface_closure::HOST_RUSTC_IDENTITY
+}
+
 /// The daemon-side ABI identity embedded into the expected candidate. A
 /// pipeline module built against this exact interface crate calls the same
 /// helper when exporting its C-prefix identity bytes.
@@ -144,7 +150,7 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
     });
     ModuleIdentity {
         module_abi: ModuleAbiIdentity {
-            rustc: compilation.rustc.clone(),
+            rustc: host_rustc_identity().to_owned(),
             interface_fingerprint,
             measured_interface,
             panic_strategy: if cfg!(panic = "unwind") {

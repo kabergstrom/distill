@@ -2,6 +2,7 @@ use distill_daemon::epoch::{MeasuredLayout, ModuleAbiIdentity, ModuleIdentity};
 use distill_daemon::module_loader::{
     decode_measured_layouts, decode_module_identity, encode_measured_layouts,
     encode_module_identity, host_interface_closure_manifest, host_module_identity,
+    host_rustc_identity,
 };
 use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
 
@@ -35,6 +36,13 @@ fn module_abi_identity_covers_the_resolved_interface_closure() {
     let host = host_module_identity(consumer_compilation_identity_v1().clone());
     assert_ne!(host.module_abi.interface_fingerprint, [0; 32]);
     assert_ne!(host.module_abi.measured_interface, [0; 32]);
+    assert_eq!(host.module_abi.rustc, host_rustc_identity());
+    assert!(!host_rustc_identity().is_empty());
+
+    let mut other_project = consumer_compilation_identity_v1().clone();
+    other_project.rustc = "newly rebuilt project rustc".to_owned();
+    let other_host = host_module_identity(other_project);
+    assert_eq!(other_host.module_abi.rustc, host_rustc_identity());
 }
 
 #[test]

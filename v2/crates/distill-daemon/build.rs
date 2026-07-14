@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -71,6 +72,20 @@ fn main() {
         println!("cargo:rerun-if-env-changed={key}");
     }
     generated.push_str("];\n");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let rustc_identity = Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.trim().to_owned())
+        .filter(|output| !output.is_empty())
+        .expect("the rustc selected by Cargo must report `rustc -vV`");
+    generated.push_str(&format!(
+        "pub const HOST_RUSTC_IDENTITY: &str = {rustc_identity:?};\n"
+    ));
+    println!("cargo:rerun-if-env-changed=RUSTC");
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("host_interface_closure.rs"),
         generated,
