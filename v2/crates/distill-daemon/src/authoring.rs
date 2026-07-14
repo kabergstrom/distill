@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
 use distill_core::attestation::is_bootstrap_control_type;
@@ -27,6 +27,7 @@ use distill_store::journal::{
 use distill_store::Store;
 
 use crate::coordinator::{publish_current_scan, LineageDestination};
+use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
     unique_sibling, write_same_dir_temp, LineageRepairBackend, LineageRepairBackendInitError,
 };
@@ -34,12 +35,13 @@ use crate::quarantine::{QuarantineDriver, QuarantineError, QuarantineRoot};
 use crate::scanner::{AssetRoot, RootedScanner, ScanError};
 
 pub struct AuthoringService {
-    store: Arc<Mutex<Store>>,
-    roots: Vec<AssetRoot>,
-    scanner: RootedScanner,
+    pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) roots: Vec<AssetRoot>,
+    pub(crate) scanner: RootedScanner,
     quarantine: QuarantineDriver,
-    lineage_destination: LineageDestination,
+    pub(crate) lineage_destination: LineageDestination,
     lineage: LineageRepairBackend,
+    pub(crate) importers: RwLock<RegisteredImporters>,
 }
 
 impl AuthoringService {
@@ -62,7 +64,27 @@ impl AuthoringService {
             quarantine,
             lineage_destination,
             lineage,
+            importers: RwLock::new(BTreeMap::new()),
         })
+    }
+
+    pub fn register_importer(
+        &self,
+        importer: Arc<dyn crate::importer::AuthoringImporter>,
+    ) -> Result<(), RpcFailure> {
+        let registered = RegisteredImporter::validate(importer)?;
+        let mut importers = self
+            .importers
+            .write()
+            .map_err(|_| invalid("importer registry lock is poisoned"))?;
+        if importers.contains_key(&registered.id) {
+            return Err(invalid(format!(
+                "importer {:?} is already registered",
+                registered.id
+            )));
+        }
+        importers.insert(registered.id.clone(), registered);
+        Ok(())
     }
 
     fn prepare_direct_write(
@@ -70,27 +92,47 @@ impl AuthoringService {
         base: InputVersion,
         operations: &[AuthoringOp],
     ) -> Result<Commit, RpcFailure> {
-        let mut store = self.lock_store()?;
+        let store = self.lock_store()?;
         require_base(&store, base)?;
         let planned = self.plan_bundle_mutation(&store, operations)?;
+        drop(store);
+        self.publish_file(
+            base,
+            PublicationGroupKind::AuthoringWrite,
+            &encode_write_basis(base, operations),
+            planned.target,
+            planned.preimage,
+            planned.proposed,
+        )
+    }
 
-        let temp = planned
-            .proposed
+    pub(crate) fn publish_file(
+        &self,
+        base: InputVersion,
+        kind: PublicationGroupKind,
+        basis: &[u8],
+        target: PathBuf,
+        preimage: Option<ContentHash>,
+        proposed: Option<Vec<u8>>,
+    ) -> Result<Commit, RpcFailure> {
+        let mut store = self.lock_store()?;
+        require_base(&store, base)?;
+        let temp = proposed
             .as_ref()
-            .map(|bytes| write_same_dir_temp(&planned.target, bytes).map_err(invalid))
+            .map(|bytes| write_same_dir_temp(&target, bytes).map_err(invalid))
             .transpose()?;
-        let proposed_hash = planned.proposed.as_ref().map_or_else(empty_hash, |bytes| {
+        let proposed_hash = proposed.as_ref().map_or_else(empty_hash, |bytes| {
             ContentHash(*blake3::hash(bytes).as_bytes())
         });
         let plan = JournalIntentPlan {
-            target_path: path_text(&planned.target)?,
+            target_path: path_text(&target)?,
             temp_path: temp
                 .as_deref()
                 .map(path_text)
                 .transpose()?
                 .unwrap_or_default(),
-            conflict_path: path_text(&unique_sibling(&planned.target, "conflict"))?,
-            pre_image_hash: planned.preimage,
+            conflict_path: path_text(&unique_sibling(&target, "conflict"))?,
+            pre_image_hash: preimage,
             proposed_hash,
         };
 
@@ -101,11 +143,7 @@ impl AuthoringService {
                 return Err(invalid(error));
             }
         };
-        let group = match publication.record_group(
-            PublicationGroupKind::AuthoringWrite,
-            &encode_write_basis(base, operations),
-            &[plan],
-        ) {
+        let group = match publication.record_group(kind, basis, &[plan]) {
             Ok(group) => group,
             Err(error) => {
                 remove_unjournaled_temp(temp.as_deref());
@@ -113,12 +151,12 @@ impl AuthoringService {
             }
         };
         let intent = group.child_intents[0];
-        let installed = match (planned.preimage, planned.proposed.as_ref()) {
+        let installed = match (preimage, proposed.as_ref()) {
             (Some(_), Some(_)) => publication
-                .resume_group_replace(intent, &planned.target)
+                .resume_group_replace(intent, &target)
                 .map(|outcome| outcome == RenameAsideOutcome::Installed),
             (Some(_), None) => publication
-                .resume_group_delete(intent, &planned.target)
+                .resume_group_delete(intent, &target)
                 .map(|outcome| outcome == DeletionRecoveryOutcome::Deleted),
             (None, Some(_)) => publication
                 .resume_group_create(intent)
@@ -387,22 +425,18 @@ impl AuthoringBackend for AuthoringService {
 
     fn prepare_import(
         &self,
-        _base: InputVersion,
-        _request: &ImportRequest,
+        base: InputVersion,
+        request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
-        Err(RpcFailure::AuthoringBackendUnavailable {
-            operation: "import".into(),
-        })
+        self.prepare_import_request(base, request)
     }
 
     fn prepare_reimport(
         &self,
-        _base: InputVersion,
-        _bundle: BundleUuid,
+        base: InputVersion,
+        bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
-        Err(RpcFailure::AuthoringBackendUnavailable {
-            operation: "reimport".into(),
-        })
+        self.prepare_reimport_bundle(base, bundle)
     }
 
     fn prepare_operation(
@@ -440,7 +474,7 @@ struct PlannedBundleMutation {
     proposed: Option<Vec<u8>>,
 }
 
-fn require_base(store: &Store, base: InputVersion) -> Result<(), RpcFailure> {
+pub(crate) fn require_base(store: &Store, base: InputVersion) -> Result<(), RpcFailure> {
     let expected = store.input_version();
     if expected != base {
         return Err(RpcFailure::StaleInputVersion {
@@ -517,7 +551,7 @@ fn empty_hash() -> ContentHash {
     ContentHash(*blake3::hash(b"").as_bytes())
 }
 
-fn invalid(error: impl std::fmt::Display) -> RpcFailure {
+pub(crate) fn invalid(error: impl std::fmt::Display) -> RpcFailure {
     RpcFailure::InvalidAuthoringRequest {
         detail: error.to_string(),
     }
