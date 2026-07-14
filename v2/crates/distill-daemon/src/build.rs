@@ -1861,7 +1861,25 @@ fn encode_or_hydrate(
             PersistedOutcome::Success { outputs, aux }
                 if outputs.len() == 1 && outputs[0].output_key.is_empty() && aux.is_empty() =>
             {
-                Ok((outputs.into_iter().next().unwrap().bytes, Vec::new(), None))
+                let output = outputs.into_iter().next().unwrap();
+                validate_cached_output_type_set(
+                    &output.type_uuids,
+                    loaded.entry.type_uuid,
+                    loaded.entry.type_uuid,
+                    terminal_type,
+                )?;
+                let encoded = EncodedNodeOutput {
+                    output_key: String::new(),
+                    asset: loaded.entry.uuid,
+                    authored_type: loaded.entry.type_uuid,
+                    encoded_type: loaded.entry.type_uuid,
+                    terminal_type,
+                    project: project.clone(),
+                    bytes: output.bytes,
+                    references: Vec::new(),
+                };
+                verify_encoded_output(&encoded)?;
+                Ok((encoded.bytes, Vec::new(), None))
             }
             PersistedOutcome::Success { .. } => Err(BuildError::Failed(
                 "cached build-import result has an invalid output shape".to_owned(),
@@ -1962,9 +1980,11 @@ fn encode_or_hydrate(
     let EncodedArtifact {
         bytes, references, ..
     } = encoded;
-    let mut types = vec![loaded.entry.type_uuid];
-    types.sort();
-    types.dedup();
+    let types = canonical_output_type_set(
+        loaded.entry.type_uuid,
+        loaded.entry.type_uuid,
+        terminal_type,
+    );
     context
         .store
         .commit_build(BuildCommit {
@@ -3355,11 +3375,8 @@ mod tests {
                 },
             )]),
         };
-        std::fs::write(
-            assets.join("byte.bundle"),
-            distill_bundle::write_bundle(&bundle).unwrap(),
-        )
-        .unwrap();
+        let bundle_bytes = distill_bundle::write_bundle(&bundle).unwrap();
+        std::fs::write(assets.join("byte.bundle"), &bundle_bytes).unwrap();
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 StoreConfig::new(temp.path().join("state")),
@@ -3425,6 +3442,31 @@ mod tests {
 
         let first = build(&coordinator, &request).unwrap();
         let first_memo = coordinator.store().lock().unwrap().memo_seq();
+        let import_key = build_import_digest(&BuildImportInputs {
+            asset: ASSET,
+            bundle: BUNDLE,
+            local_id: "entry".to_owned(),
+            authored_type: TYPE,
+            terminal_type: TERMINAL,
+            canonical_bundle_bytes: bundle_bytes,
+            logical: project.logical_hash,
+            layout: project.layout_hash,
+            migrations: Vec::new(),
+            validator_dylib_hash: None,
+            artifact_format_version: ARTIFACT_FORMAT_VERSION,
+        });
+        let import_candidates = coordinator
+            .store()
+            .lock()
+            .unwrap()
+            .lookup_candidates(KeyKind::BuildImport, &import_key)
+            .unwrap();
+        let distill_store::cas::record::ResultOutcome::Success { outputs, .. } =
+            &import_candidates[0].payload.outcome
+        else {
+            panic!("build import succeeded");
+        };
+        assert_eq!(outputs[0].type_uuids, vec![TYPE, TERMINAL]);
         assert_eq!(first.artifacts.len(), 2);
         assert_eq!(first.wire_trees.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
