@@ -44,6 +44,7 @@ use crate::callbacks::{
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
 };
+use crate::tool_resolver::resolve_tool_epoch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleAbiIdentity {
@@ -437,6 +438,21 @@ impl CandidateRegistrationArena {
         self.install(registration, capsule)
     }
 
+    fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
+        let mut descriptors = Vec::new();
+        let mut cursor = self.head;
+        while let Some(node) = cursor {
+            // SAFETY: an unpublished arena exclusively owns every linked node.
+            let node = unsafe { node.as_ref() };
+            if let CallbackHandle::Tool(descriptor) = &node.callback {
+                descriptors.push(descriptor.clone());
+            }
+            cursor = node.next;
+        }
+        descriptors.reverse();
+        descriptors
+    }
+
     /// Transfer one module-owned object into the unpublished arena. Metadata
     /// validation is intentionally performed only after `register` returns so
     /// even a later duplicate is already owned and can be rolled back safely.
@@ -816,11 +832,19 @@ struct EpochInner {
     targets: Vec<TargetDefinition>,
     target_set_hash: TargetSetHash,
     registration: RegistrationSet,
+    tools: BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1>,
     accepting: AtomicBool,
     active_jobs: AtomicUsize,
     lifecycle: Mutex<EpochLifecycle>,
     registration_arena: Mutex<Option<CandidateRegistrationArena>>,
     module: Mutex<Option<Box<dyn LoadedPipelineModule>>>,
+}
+
+struct PreparedEpochRegistration {
+    target_set: CanonicalTargetSet,
+    registration: RegistrationSet,
+    tools: BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1>,
+    arena: CandidateRegistrationArena,
 }
 
 #[derive(Default)]
@@ -835,11 +859,15 @@ impl PipelineEpoch {
         id: u64,
         staged: StagedModule,
         token: ModuleEpochToken,
-        target_set: CanonicalTargetSet,
-        registration: RegistrationSet,
-        registration_arena: CandidateRegistrationArena,
+        prepared: PreparedEpochRegistration,
         module: Box<dyn LoadedPipelineModule>,
     ) -> Self {
+        let PreparedEpochRegistration {
+            target_set,
+            registration,
+            tools,
+            arena,
+        } = prepared;
         Self(Arc::new(EpochInner {
             id,
             staged,
@@ -854,10 +882,11 @@ impl PipelineEpoch {
                 .collect(),
             target_set_hash: target_set.digest,
             registration,
+            tools,
             accepting: AtomicBool::new(true),
             active_jobs: AtomicUsize::new(0),
             lifecycle: Mutex::new(EpochLifecycle::default()),
-            registration_arena: Mutex::new(Some(registration_arena)),
+            registration_arena: Mutex::new(Some(arena)),
             module: Mutex::new(Some(module)),
         }))
     }
@@ -975,10 +1004,7 @@ impl PipelineEpoch {
     pub fn tool_epoch(
         &self,
     ) -> BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1> {
-        self.tool_descriptors()
-            .into_iter()
-            .map(|descriptor| (descriptor.id, descriptor.registration))
-            .collect()
+        self.0.tools.clone()
     }
 
     pub fn invoke_importer(
@@ -1529,13 +1555,28 @@ impl ModuleHost {
             ));
         }
 
+        let tools = match resolve_tool_epoch(registration_arena.tool_descriptors()) {
+            Ok(tools) => tools,
+            Err(error) => {
+                let cleanup = discard_candidate(module, registration_arena);
+                return Err(candidate_poison_with_cleanup(
+                    PipelinePoisonCode::CandidateRegistration,
+                    format!("tool registration resolution failed: {error}"),
+                    cleanup,
+                ));
+            }
+        };
+
         let epoch = PipelineEpoch::new(
             id,
             staged,
             token,
-            target_set,
-            registration,
-            registration_arena,
+            PreparedEpochRegistration {
+                target_set,
+                registration,
+                tools,
+                arena: registration_arena,
+            },
             module,
         );
         Ok(epoch)
@@ -2453,9 +2494,12 @@ pub(crate) fn processor_test_epoch_with<
             content_hash: [9; 32],
         },
         token,
-        target_set,
-        registration,
-        arena,
+        PreparedEpochRegistration {
+            target_set,
+            registration,
+            tools: BTreeMap::new(),
+            arena,
+        },
         Box::new(TestNoopModule),
     )
 }
@@ -2466,6 +2510,7 @@ mod callback_tests {
     use crate::callbacks::{
         DiagnosticSeverity, MigrationFunctionError, PipelineDefaults, PipelineImporter,
         PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorProducts,
+        ToolRegistration,
     };
     use crate::importer::{AuthoringImportContext, AuthoringImporterError};
     use distill_build::import::{ImportError, ImportOutput};
@@ -2473,10 +2518,9 @@ mod callback_tests {
     use distill_build::pipeline::TargetSelector;
     use distill_build::query::{FileQuery, RootedPath};
     use distill_build::tool::{ToolOutput, ToolRunError};
-    use distill_core::tool::{ToolCwdPolicy, ToolLaunchMetadataV1, ToolPlatformBinding};
+    use distill_core::tool::{ToolCwdPolicy, ToolPlatformBinding};
     use distill_migrate::FieldPath;
     use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
-    use distill_store::pipeline::ToolCapsuleRegistrationV1;
 
     struct NoopModule;
 
@@ -2670,13 +2714,10 @@ mod callback_tests {
         arena
             .register_tool(ToolDescriptor {
                 id: "compiler".into(),
-                registration: ToolCapsuleRegistrationV1 {
-                    files: vec![],
-                    resolved_interpreter: None,
-                    launch: ToolLaunchMetadataV1 {
-                        argv0: "bin/compiler".into(),
-                        interpreter_args: vec![],
-                    },
+                registration: ToolRegistration {
+                    launcher: PathBuf::from("compiler"),
+                    declared_resources: vec![],
+                    plugins: vec![],
                     environment: vec![],
                     cwd_policy: ToolCwdPolicy::EmptyScratch,
                     platform: ToolPlatformBinding::Pinned {
@@ -2701,9 +2742,12 @@ mod callback_tests {
                 content_hash: [9; 32],
             },
             token,
-            target_set,
-            registration,
-            arena,
+            PreparedEpochRegistration {
+                target_set,
+                registration,
+                tools: BTreeMap::new(),
+                arena,
+            },
             Box::new(NoopModule),
         );
 

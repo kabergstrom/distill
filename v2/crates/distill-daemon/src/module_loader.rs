@@ -14,14 +14,13 @@ use distill_core::attestation::CompiledTypeTable;
 use distill_core::canonical::{domain_digest, DSMA};
 use distill_json::AuthoredValue;
 use distill_schema::ngp_schema::CompilationIdentity;
-use distill_store::pipeline::ToolCapsuleRegistrationV1;
 use unicode_normalization::is_nfc;
 
 use crate::callbacks::{
     CallbackInvokeError, DefaultsDescriptor, Diagnostic, Diagnostics, ImporterDescriptor,
     MigrationFunctionError, PipelineProcessContext, ProcessArtifact, ProcessContextError,
     ProcessOutputs, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
-    ValidatorDescriptor,
+    ToolRegistration, ToolResourceDeclaration, ValidatorDescriptor,
 };
 use crate::epoch::{
     CandidateRegistrationArena, ErasedRegistrationCapsule, HostCallbackBoundary,
@@ -125,7 +124,8 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
         encode_measurement::<ValidatorDescriptor>(encoder);
         encode_measurement::<DefaultsDescriptor>(encoder);
         encode_measurement::<ToolDescriptor>(encoder);
-        encode_measurement::<ToolCapsuleRegistrationV1>(encoder);
+        encode_measurement::<ToolRegistration>(encoder);
+        encode_measurement::<ToolResourceDeclaration>(encoder);
         encode_measurement::<ProcessorProducts>(encoder);
         encode_measurement::<ProcessArtifact>(encoder);
         encode_measurement::<ProcessOutputs>(encoder);

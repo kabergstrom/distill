@@ -19,4 +19,5 @@ pub mod process;
 pub mod quarantine;
 pub mod scanner;
 pub mod scheduler;
+mod tool_resolver;
 pub mod watcher;

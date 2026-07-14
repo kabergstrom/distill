@@ -128,7 +128,7 @@ where
     Ok(())
 }
 
-fn is_system_runtime_library(library: &str) -> bool {
+pub(crate) fn is_system_runtime_library(library: &str) -> bool {
     if library.is_empty() {
         return false;
     }

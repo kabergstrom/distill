@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use distill_asset::CallbackPanic;
@@ -18,10 +19,10 @@ use distill_build::query::{AssetQuery, IntakeError};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolOutput, ToolRunError};
 use distill_build::trace::StableFailureFingerprint;
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::tool::{ToolCwdPolicy, ToolPlatformBinding};
 use distill_json::AuthoredValue;
 use distill_migrate::FieldPath;
 use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
-use distill_store::pipeline::ToolCapsuleRegistrationV1;
 
 use crate::epoch::ModuleCallError;
 use crate::epoch::PipelineEpoch;
@@ -61,7 +62,25 @@ pub struct DefaultsDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDescriptor {
     pub id: String,
-    pub registration: ToolCapsuleRegistrationV1,
+    pub registration: ToolRegistration,
+}
+
+/// Declarative module-facing tool registration. The daemon, rather than the
+/// registering module, resolves and seals every byte in the execution closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRegistration {
+    pub launcher: PathBuf,
+    pub declared_resources: Vec<ToolResourceDeclaration>,
+    pub plugins: Vec<ToolResourceDeclaration>,
+    pub environment: Vec<(String, String)>,
+    pub cwd_policy: ToolCwdPolicy,
+    pub platform: ToolPlatformBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResourceDeclaration {
+    pub source: PathBuf,
+    pub capsule_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
