@@ -85,6 +85,28 @@ fn live_resize_reclamps_reservation_and_drains_excess_active_slots() {
 }
 
 #[test]
+fn operational_store_values_apply_without_copying_restart_state() {
+    let (_dir, mut store) = open();
+    let original_state_path = store.operational_config().state_path;
+    let mut candidate = StoreConfig::new("/a/restart-only/path");
+    candidate.displaced_retention_days = 31;
+    candidate.segment_size = 4096;
+    candidate.cache_limit = 8192;
+    candidate.parallelism = 3;
+    candidate.batch_reserved_workers = 2;
+
+    store.apply_operational_config(&candidate).unwrap();
+    let applied = store.operational_config();
+    assert_eq!(applied.state_path, original_state_path);
+    assert_eq!(applied.displaced_retention_days, 31);
+    assert_eq!(applied.segment_size, 4096);
+    assert_eq!(applied.cache_limit, 8192);
+    assert_eq!(applied.parallelism, 3);
+    assert_eq!(applied.batch_reserved_workers, 2);
+    assert_eq!(store.input_version().0, 0);
+}
+
+#[test]
 fn restart_only_changes_stage_without_advancing_or_replacing_active_values() {
     let (_dir, mut store) = open();
     let before = store.input_version();

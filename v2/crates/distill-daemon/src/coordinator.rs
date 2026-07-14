@@ -6,7 +6,7 @@
 //! projection for the same successor version.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::attestation::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
@@ -15,11 +15,12 @@ use distill_core::lineage::AcceptedSchemaEpoch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
-    AuthoringValue, Commit, ConfigurationStatus, CoordinatedCommitError, DriftedInput,
-    LineageManifestClaimant, LineageRepairState, PathMutation, PipelineDiagnostic, Server,
-    SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison, VersionPoisonV1,
+    AuthoringValue, Commit, ConfigurationPoison, ConfigurationStatus, CoordinatedCommitError,
+    DriftedInput, LineageManifestClaimant, LineageRepairState, PathMutation, PipelineDiagnostic,
+    Server, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison, VersionPoisonV1,
 };
 use distill_store::bundles::{AssetRecord, BundleMeta};
+use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileKind, FileState};
 use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, VerifiedSchemaLineageManifest,
@@ -32,7 +33,7 @@ use distill_store::state::{
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
-use crate::authoring::{AuthoringService, AuthoringServiceInitError};
+use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
 use crate::epoch::{
     stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
     UnloadOutcome,
@@ -42,6 +43,7 @@ use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
+use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::watcher::{GenerationReplay, WatcherQueue, WatcherQueueError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +56,15 @@ pub struct DaemonCoordinator {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
     server: Server,
-    lineage_destination: LineageDestination,
+    lineage_destination: RwLock<LineageDestination>,
     authoring: Arc<AuthoringService>,
     pipeline: Mutex<CoordinatedPipelineRuntime>,
+    configuration_poison: Mutex<Option<ConfigurationPoison>>,
+    operational: Mutex<OperationalRuntime>,
+}
+
+struct OperationalRuntime {
+    scheduler: Scheduler,
 }
 
 struct CoordinatedPipelineRuntime {
@@ -83,9 +91,10 @@ impl DaemonCoordinator {
         roots: Vec<AssetRoot>,
         lineage_destination: LineageDestination,
         targets: Vec<TargetDefinition>,
+        max_dependency_depth: usize,
     ) -> Result<Self, CoordinatorInitError> {
         let module_state_path = store_config.state_path.join("pipeline-host");
-        let store = Arc::new(Mutex::new(Store::open(store_config)?));
+        let store = Arc::new(Mutex::new(Store::open(store_config.clone())?));
         let scanner = RootedScanner::new(roots.clone())?;
         let backend = Arc::new(AuthoringService::new(
             Arc::clone(&store),
@@ -110,13 +119,23 @@ impl DaemonCoordinator {
             loader: DynamicPipelineModuleLoader,
             pending: None,
         };
+        let operational = OperationalRuntime {
+            scheduler: Scheduler::new(SchedulerConfig {
+                parallelism: store_config.parallelism,
+                batch_reserved_workers: store_config.batch_reserved_workers,
+                max_dependency_depth,
+            })
+            .map_err(|error| CoordinatorInitError::Operational(error.to_string()))?,
+        };
         Ok(Self {
             store,
             scanner,
             server,
-            lineage_destination,
+            lineage_destination: RwLock::new(lineage_destination),
             authoring: backend,
             pipeline: Mutex::new(pipeline),
+            configuration_poison: Mutex::new(None),
+            operational: Mutex::new(operational),
         })
     }
 
@@ -138,6 +157,146 @@ impl DaemonCoordinator {
 
     pub fn pipeline_snapshot(&self) -> PipelineSnapshot {
         lock_pipeline(&self.pipeline).host.snapshot()
+    }
+
+    pub fn operational_configuration(&self) -> SchedulerConfig {
+        self.operational
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scheduler
+            .config()
+    }
+
+    pub fn apply_operational_configuration(
+        &self,
+        store_config: &StoreConfig,
+        max_dependency_depth: usize,
+    ) -> Result<(), CoordinatorError> {
+        let scheduler = Scheduler::new(SchedulerConfig {
+            parallelism: store_config.parallelism,
+            batch_reserved_workers: store_config.batch_reserved_workers,
+            max_dependency_depth,
+        })
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        lock_store(&self.store)
+            .apply_operational_config(store_config)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        self.operational
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scheduler = scheduler;
+        Ok(())
+    }
+
+    pub fn stage_restart_configuration(
+        &self,
+        changes: &[RestartOnlyChange],
+    ) -> Result<PendingRestart, CoordinatorError> {
+        let pending = lock_store(&self.store)
+            .stage_pending_restart(changes)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        self.server.restart_required(pending.keys.clone());
+        Ok(pending)
+    }
+
+    fn configuration_poison(&self) -> Option<ConfigurationPoison> {
+        self.configuration_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn lineage_destination(&self) -> LineageDestination {
+        self.lineage_destination
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Publish a rejected configuration source as an ordinary input version.
+    /// The overlay participates in every concurrent scan classification, so a
+    /// scan failure cannot erase the candidate's typed configuration reason.
+    pub fn publish_configuration_rejection(
+        &self,
+        reason: DscpV1,
+        message: impl Into<String>,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let poison = ConfigurationPoison::from_reason(&reason, message);
+        let previous = {
+            let mut current = self
+                .configuration_poison
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            current.replace(poison)
+        };
+        match self.reconcile_full_scan() {
+            Ok(stamp) => Ok(stamp),
+            Err(error) => {
+                *self
+                    .configuration_poison
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn heal_configuration_rejection(&self) -> Result<SnapshotStamp, CoordinatorError> {
+        let previous = self
+            .configuration_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match self.reconcile_full_scan() {
+            Ok(stamp) => Ok(stamp),
+            Err(error) => {
+                *self
+                    .configuration_poison
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn publish_filesystem_configuration(
+        &self,
+        roots: Vec<AssetRoot>,
+        lineage_destination: LineageDestination,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let prepared = self
+            .authoring
+            .prepare_filesystem_candidate(roots, lineage_destination)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let scan = prepared.scanner().scan()?;
+        let destination = prepared.lineage_destination().clone();
+        let candidate = ScanCandidate::build(prepared.scanner(), &destination, scan, None)?;
+        let prepared = Arc::new(Mutex::new(Some(prepared)));
+        let captured = Arc::clone(&prepared);
+        let base = self.server.current_stamp().version;
+        let store = Arc::clone(&self.store);
+        let authoring = Arc::clone(&self.authoring);
+        self.server
+            .coordinated_commit(base, || {
+                let commit = publish_scan(&store, base, candidate, true)
+                    .map_err(|error| error.to_string())?;
+                let prepared: AuthoringFilesystemCandidate = captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("configuration candidate installs once");
+                authoring.install_filesystem_candidate(prepared);
+                *self
+                    .lineage_destination
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = destination;
+                self.configuration_poison
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                Ok(commit)
+            })
+            .map_err(CoordinatorError::Coordinated)
     }
 
     /// Stage, attest, durably publish, and only then expose one pipeline
@@ -313,12 +472,17 @@ impl DaemonCoordinator {
     }
 
     fn publish_scan(&self, scan: ScanSnapshot) -> Result<SnapshotStamp, CoordinatorError> {
-        let candidate = ScanCandidate::build(&self.scanner, &self.lineage_destination, scan)?;
+        let candidate = ScanCandidate::build(
+            &self.scanner,
+            &self.lineage_destination(),
+            scan,
+            self.configuration_poison(),
+        )?;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         self.server
             .coordinated_commit(base, || {
-                publish_scan(&store, base, candidate).map_err(|error| error.to_string())
+                publish_scan(&store, base, candidate, false).map_err(|error| error.to_string())
             })
             .map_err(CoordinatorError::Coordinated)
     }
@@ -338,22 +502,37 @@ impl DaemonCoordinator {
                 }
                 let commit = match &rejection {
                     ScanRejection::Version(poison) => {
+                        let configuration = self.configuration_poison();
                         store
                             .input_transaction(|transaction| {
-                                transaction.set_version_poisons([poison.clone()])
+                                transaction.set_version_poisons([poison.clone()])?;
+                                if let Some(configuration) = &configuration {
+                                    transaction.publish_configuration_poison(
+                                        &configuration.detail,
+                                        &configuration.message,
+                                    )?;
+                                }
+                                Ok(())
                             })
                             .map_err(|error| error.to_string())?;
                         Commit {
+                            configuration: configuration.map(ConfigurationStatus::Poisoned),
                             version_poison: Some(Some(poison.clone())),
                             ..Commit::default()
                         }
                     }
                     ScanRejection::Configuration { reason, message } => {
-                        let poison = distill_rpc::ConfigurationPoison::from_reason(reason, message);
+                        let observed = ConfigurationPoison::from_reason(reason, message);
+                        let poison = ConfigurationPoison::select_canonical(
+                            self.configuration_poison().into_iter().chain([observed]),
+                        )
+                        .map_err(|error| error.to_string())?
+                        .expect("one scan configuration poison");
                         store
                             .input_transaction(|transaction| {
                                 transaction.set_version_poisons([])?;
-                                transaction.publish_configuration_poison(reason, message)
+                                transaction
+                                    .publish_configuration_poison(&poison.detail, &poison.message)
                             })
                             .map_err(|error| error.to_string())?;
                         Commit {
@@ -566,6 +745,7 @@ pub enum CoordinatorInitError {
     Rpc(distill_rpc::AttestationShapeError),
     Module(String),
     ModuleIo(std::io::Error),
+    Operational(String),
 }
 
 impl std::fmt::Display for CoordinatorInitError {
@@ -643,6 +823,7 @@ impl ScanCandidate {
         scanner: &RootedScanner,
         destination: &LineageDestination,
         scan: ScanSnapshot,
+        external_poison: Option<ConfigurationPoison>,
     ) -> Result<Self, CoordinatorError> {
         let mut poisons = Vec::new();
         for bundle in &scan.bundles {
@@ -712,48 +893,66 @@ impl ScanCandidate {
         let mut claimants = lineage_claimants(&parsed);
         claimants.sort();
         claimants.dedup();
-        let (configuration, lineage_repair, lineage_manifest) = match claimants.as_slice() {
-            [] => {
-                let reason = DscpV1::MissingLineageManifest;
-                let poison = distill_rpc::ConfigurationPoison::from_reason(
-                    &reason,
-                    "the unique SchemaLineageManifest is missing",
-                );
-                let repair = LineageRepairState::Missing {
-                    configured_root: destination.root.clone(),
-                    configured_path: destination.path.clone(),
-                    destination: scanner
-                        .inspect_destination(&destination.root, &destination.path)?,
-                };
-                (ConfigurationStatus::Poisoned(poison), Some(repair), None)
+        let (lineage_configuration, mut lineage_repair, lineage_manifest) =
+            match claimants.as_slice() {
+                [] => {
+                    let reason = DscpV1::MissingLineageManifest;
+                    let poison = distill_rpc::ConfigurationPoison::from_reason(
+                        &reason,
+                        "the unique SchemaLineageManifest is missing",
+                    );
+                    let repair = LineageRepairState::Missing {
+                        configured_root: destination.root.clone(),
+                        configured_path: destination.path.clone(),
+                        destination: scanner
+                            .inspect_destination(&destination.root, &destination.path)?,
+                    };
+                    (ConfigurationStatus::Poisoned(poison), Some(repair), None)
+                }
+                [claimant] => {
+                    let (source, bundle) = parsed
+                        .iter()
+                        .find(|(source, bundle)| {
+                            source.root_name == claimant.root_name
+                                && source.normalized_path == claimant.normalized_path
+                                && bundle.uuid == claimant.bundle
+                        })
+                        .expect("claimant came from parsed scan");
+                    let entry = &bundle.assets[&claimant.local_id];
+                    let manifest =
+                        decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
+                    (ConfigurationStatus::Ready, None, Some(manifest))
+                }
+                _ => {
+                    let reason = DscpV1::DuplicateLineageManifest {
+                        entries: claimants.clone(),
+                    };
+                    let poison = distill_rpc::ConfigurationPoison::from_reason(
+                        &reason,
+                        "multiple SchemaLineageManifest entries claim authority",
+                    );
+                    (
+                        ConfigurationStatus::Poisoned(poison),
+                        Some(LineageRepairState::Duplicate { claimants }),
+                        None,
+                    )
+                }
+            };
+
+        let configuration = match lineage_configuration {
+            ConfigurationStatus::Ready => {
+                external_poison.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Poisoned)
             }
-            [claimant] => {
-                let (source, bundle) = parsed
-                    .iter()
-                    .find(|(source, bundle)| {
-                        source.root_name == claimant.root_name
-                            && source.normalized_path == claimant.normalized_path
-                            && bundle.uuid == claimant.bundle
-                    })
-                    .expect("claimant came from parsed scan");
-                let entry = &bundle.assets[&claimant.local_id];
-                let manifest =
-                    decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
-                (ConfigurationStatus::Ready, None, Some(manifest))
-            }
-            _ => {
-                let reason = DscpV1::DuplicateLineageManifest {
-                    entries: claimants.clone(),
-                };
-                let poison = distill_rpc::ConfigurationPoison::from_reason(
-                    &reason,
-                    "multiple SchemaLineageManifest entries claim authority",
-                );
-                (
-                    ConfigurationStatus::Poisoned(poison),
-                    Some(LineageRepairState::Duplicate { claimants }),
-                    None,
+            ConfigurationStatus::Poisoned(lineage_poison) => {
+                let selected = ConfigurationPoison::select_canonical(
+                    external_poison.into_iter().chain([lineage_poison.clone()]),
                 )
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
+                .expect("lineage supplied one configuration poison");
+                if selected.reason_hash != lineage_poison.reason_hash {
+                    lineage_repair = None;
+                }
+                ConfigurationStatus::Poisoned(selected)
             }
         };
 
@@ -771,6 +970,7 @@ fn publish_scan(
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
     candidate: ScanCandidate,
+    advance_configuration: bool,
 ) -> Result<Commit, StoreError> {
     let mut store = lock_store(store);
     if store.input_version() != base {
@@ -785,12 +985,19 @@ fn publish_scan(
     let old_bundles = store.all_bundles()?;
     let old_assets = store.all_asset_ids()?;
     let old_paths = store.all_path_entries()?;
-    let generation = match store.configuration_state()? {
+    let mut generation = match store.configuration_state()? {
         ConfigurationState::Ready(epoch) => epoch.generation,
         ConfigurationState::Poisoned { last_good, .. } => {
             last_good.map_or(0, |epoch| epoch.generation)
         }
     };
+    if advance_configuration {
+        generation = generation
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidConfiguration {
+                error: "configuration generation exhausted".to_owned(),
+            })?;
+    }
 
     let mut commit = rpc_commit(&candidate, &old_assets, &old_paths)?;
     store.input_transaction(|transaction| {
@@ -911,9 +1118,9 @@ pub(crate) fn publish_current_scan(
     base: InputVersion,
 ) -> Result<Commit, String> {
     let scan = scanner.scan().map_err(|error| error.to_string())?;
-    let candidate = ScanCandidate::build(scanner, lineage_destination, scan)
+    let candidate = ScanCandidate::build(scanner, lineage_destination, scan, None)
         .map_err(|error| error.to_string())?;
-    publish_scan(store, base, candidate).map_err(|error| error.to_string())
+    publish_scan(store, base, candidate, false).map_err(|error| error.to_string())
 }
 
 fn rpc_commit(

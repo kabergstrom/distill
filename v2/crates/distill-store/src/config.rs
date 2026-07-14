@@ -199,6 +199,25 @@ pub struct PendingRestart {
 }
 
 impl Store {
+    /// Apply the operational-live subset of a validated candidate. Paths and
+    /// other epoch/restart values are deliberately not copied here.
+    pub fn apply_operational_config(
+        &mut self,
+        candidate: &StoreConfig,
+    ) -> Result<(), ConfigValidationError> {
+        candidate.validate_scheduler()?;
+        self.config.displaced_retention_days = candidate.displaced_retention_days;
+        self.config.segment_size = candidate.segment_size;
+        self.config.cache_limit = candidate.cache_limit;
+        self.config.parallelism = candidate.parallelism;
+        self.config.batch_reserved_workers = candidate.batch_reserved_workers;
+        Ok(())
+    }
+
+    pub fn operational_config(&self) -> StoreConfig {
+        self.config.clone()
+    }
+
     /// Stage and validate restart-only changes without advancing the input
     /// version or replacing the active configuration generation.
     pub fn stage_pending_restart(

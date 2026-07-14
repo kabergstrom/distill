@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
@@ -138,6 +139,7 @@ struct CanonicalRoot {
 #[derive(Debug, Clone)]
 pub struct RootedScanner {
     roots: Arc<RwLock<BTreeMap<String, CanonicalRoot>>>,
+    revision: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +237,7 @@ impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
         Ok(Self {
             roots: Arc::new(RwLock::new(canonicalize_roots(roots)?)),
+            revision: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -246,12 +249,21 @@ impl RootedScanner {
         &self,
         roots: impl IntoIterator<Item = AssetRoot>,
     ) -> Result<(), ScanError> {
-        let replacement = canonicalize_roots(roots)?;
+        let replacement = Self::new(roots)?;
+        self.replace_from(&replacement);
+        Ok(())
+    }
+
+    pub(crate) fn replace_from(&self, replacement: &Self) {
         *self
             .roots
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement.root_snapshot();
+        self.revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     pub fn physical_path(&self, root: &str, path: &str) -> Result<PathBuf, ScanError> {

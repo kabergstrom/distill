@@ -171,6 +171,7 @@ impl From<&ScannedFile> for ObservedPath {
 /// Native watcher adapters may feed the same [`WatcherQueue`].
 pub struct PollingWatchSource {
     scanner: RootedScanner,
+    scanner_revision: u64,
     observed: BTreeMap<(String, String), ObservedPath>,
     last_failure: Option<String>,
 }
@@ -182,6 +183,7 @@ impl PollingWatchSource {
     pub fn arm(scanner: RootedScanner) -> Result<Self, ScanError> {
         let observed = observe(&scanner)?;
         Ok(Self {
+            scanner_revision: scanner.revision(),
             scanner,
             observed,
             last_failure: None,
@@ -189,6 +191,13 @@ impl PollingWatchSource {
     }
 
     pub fn poll_once(&mut self, queue: &Mutex<WatcherQueue>) -> Result<usize, ScanError> {
+        let revision = self.scanner.revision();
+        if revision != self.scanner_revision {
+            self.observed = observe(&self.scanner)?;
+            self.scanner_revision = revision;
+            self.last_failure = None;
+            return Ok(0);
+        }
         let current = match observe(&self.scanner) {
             Ok(current) => current,
             Err(error) => {

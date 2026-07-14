@@ -9,6 +9,7 @@ use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
 use distill_core::attestation::CompiledTypeTable;
 use distill_rpc::{LoadPolicyEntry, TargetDefinition, TargetDefinitionHash};
 use distill_store::config::{parse_byte_size, ConfigValidationError};
+use distill_store::state::{ConfigurationPathKey, DscpV1, OwnedPathKind, OwnedPathSide};
 use distill_store::StoreConfig;
 use serde::Deserialize;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
@@ -18,7 +19,7 @@ use crate::epoch::{CandidateRequirements, MeasuredLayout, TargetDefinition as Pi
 use crate::module_loader::host_module_identity;
 use crate::scanner::AssetRoot;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub source_path: PathBuf,
     pub daemon: DaemonSection,
@@ -30,26 +31,26 @@ pub struct DaemonConfig {
     pub cas: CasSection,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSection {
     pub address: SocketAddr,
     pub state_path: PathBuf,
     pub displaced_retention_days: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetsSection {
     pub roots: BTreeMap<String, PathBuf>,
     pub schema_path: PathBuf,
     pub lineage_manifest: LineageDestination,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModulesSection {
     pub pipeline_dylib: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSection {
     pub os: TargetOs,
     pub arch: TargetArch,
@@ -58,20 +59,20 @@ pub struct TargetSection {
     pub debug_info: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodegenSection {
     pub rs_mod_path: PathBuf,
     pub auto_codegen: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineSection {
     pub parallelism: usize,
     pub max_dependency_depth: usize,
     pub batch_reserved_workers: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasSection {
     pub segment_size: u64,
     pub cache_limit: u64,
@@ -411,6 +412,102 @@ impl DaemonConfig {
             targets,
             native_dependencies: Vec::new(),
         })
+    }
+}
+
+/// Convert a rejected source candidate into the stable DSCP fact carried by
+/// the poisoned version. Errors whose grammar has no more specific DSCP row
+/// bind to the exact source bytes through `MalformedConfiguration`.
+pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> DscpV1 {
+    let malformed = || DscpV1::MalformedConfiguration {
+        file_hash: *blake3::hash(source).as_bytes(),
+    };
+    let path_text = |path: &Path| path.to_str().filter(|text| is_nfc(text)).map(str::to_owned);
+    match error {
+        DaemonConfigError::NonLoopbackAddress(address) => DscpV1::NonLoopbackAddress {
+            address: address.to_string(),
+        },
+        DaemonConfigError::DuplicateNormalizedName { kind, name } if *kind == "asset root" => {
+            DscpV1::DuplicateRootName {
+                normalized_name: name.clone(),
+            }
+        }
+        DaemonConfigError::DuplicateNormalizedName { kind, name } if *kind == "target" => {
+            DscpV1::DuplicateTargetName {
+                normalized_name: name.clone(),
+            }
+        }
+        DaemonConfigError::RootUnavailable(path) => {
+            path_text(path).map_or_else(malformed, |path| DscpV1::InvalidPath {
+                key: ConfigurationPathKey::AssetRoot,
+                normalized_or_raw_path: path,
+            })
+        }
+        DaemonConfigError::InvalidLineagePath(path) => {
+            let normalized = path.nfc().collect::<String>();
+            DscpV1::InvalidPath {
+                key: ConfigurationPathKey::ImportDestination,
+                normalized_or_raw_path: normalized,
+            }
+        }
+        DaemonConfigError::UnknownLineageRoot(root) => DscpV1::InvalidPath {
+            key: ConfigurationPathKey::ImportDestination,
+            normalized_or_raw_path: root.clone(),
+        },
+        DaemonConfigError::EmptyTargetApis(target) => DscpV1::EmptyTargetApis {
+            target: target.clone(),
+        },
+        DaemonConfigError::Scheduler(ConfigValidationError::ParallelismZero) => {
+            DscpV1::InvalidParallelism { value: 0 }
+        }
+        DaemonConfigError::Scheduler(ConfigValidationError::BatchReservationOutOfBounds {
+            got,
+            ..
+        }) => match (u32::try_from(*got), scheduler_values(source)) {
+            (Ok(reservation), Some((parallelism, _))) => DscpV1::InvalidBatchReservation {
+                parallelism,
+                reservation,
+            },
+            _ => malformed(),
+        },
+        DaemonConfigError::PathOverlap {
+            asset_root,
+            controlled_path,
+            role,
+        } => match (path_text(asset_root), path_text(controlled_path)) {
+            (Some(asset_root), Some(controlled_path)) => DscpV1::OwnedPathOverlap {
+                first: OwnedPathSide {
+                    kind: OwnedPathKind::AssetRoot,
+                    path: asset_root,
+                },
+                second: OwnedPathSide {
+                    kind: owned_path_kind(role),
+                    path: controlled_path,
+                },
+            },
+            _ => malformed(),
+        },
+        _ => malformed(),
+    }
+}
+
+fn scheduler_values(source: &[u8]) -> Option<(u32, u32)> {
+    let source = std::str::from_utf8(source).ok()?;
+    let value: toml::Value = toml::from_str(source).ok()?;
+    let pipeline = value.get("pipeline")?;
+    Some((
+        u32::try_from(pipeline.get("parallelism")?.as_integer()?).ok()?,
+        u32::try_from(pipeline.get("batch_reserved_workers")?.as_integer()?).ok()?,
+    ))
+}
+
+fn owned_path_kind(role: &str) -> OwnedPathKind {
+    match role {
+        "daemon.state_path" => OwnedPathKind::DaemonState,
+        "assets.schema_path" => OwnedPathKind::SchemaArtifact,
+        "modules.pipeline_dylib" => OwnedPathKind::PipelineModule,
+        "codegen.rs_mod_path" => OwnedPathKind::CodegenOutput,
+        _ => OwnedPathKind::ImportDestination,
     }
 }
 

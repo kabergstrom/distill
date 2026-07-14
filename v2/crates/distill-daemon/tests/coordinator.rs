@@ -86,6 +86,7 @@ fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {
             path: "schema/schema-lineage.bundle".to_owned(),
         },
         vec![target()],
+        256,
     )
     .unwrap()
 }

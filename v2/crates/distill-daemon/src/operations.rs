@@ -43,8 +43,8 @@ impl AuthoringService {
         let runtime = OperationRuntime {
             store: Arc::clone(&self.store),
             scanner: self.scanner.clone(),
-            quarantine: self.quarantine.clone(),
-            lineage_destination: self.lineage_destination.clone(),
+            quarantine: self.quarantine_snapshot(),
+            lineage_destination: self.lineage_destination_snapshot(),
         };
         let planned = match operation {
             LongRunningOp::RenameWithFixups(payload) => {

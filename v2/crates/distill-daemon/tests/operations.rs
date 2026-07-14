@@ -132,6 +132,7 @@ fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
             path: "schema/schema-lineage.bundle".into(),
         },
         vec![target()],
+        256,
     )
     .unwrap();
     coordinator.reconcile_full_scan().unwrap();
@@ -213,6 +214,7 @@ fn disk_migration_applies_a_verified_forward_automatic_plan() {
             path: "schema/schema-lineage.bundle".into(),
         },
         vec![target()],
+        256,
     )
     .unwrap();
     coordinator.reconcile_full_scan().unwrap();

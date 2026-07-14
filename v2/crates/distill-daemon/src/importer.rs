@@ -908,7 +908,7 @@ impl AuthoringService {
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("bundle root identity is missing"))?
         } else if requested_root.is_empty() {
-            match self.roots.as_slice() {
+            match self.roots_snapshot().as_slice() {
                 [root] => root.name.clone(),
                 _ => {
                     return Err(invalid(
@@ -918,7 +918,11 @@ impl AuthoringService {
             }
         } else {
             let root = normalize_identifier(requested_root).map_err(invalid)?;
-            if !self.roots.iter().any(|candidate| candidate.name == root) {
+            if !self
+                .roots_snapshot()
+                .iter()
+                .any(|candidate| candidate.name == root)
+            {
                 return Err(invalid(format!("unknown import destination root {root:?}")));
             }
             root
@@ -940,7 +944,11 @@ impl AuthoringService {
     ) -> Result<ImportDestination, RpcFailure> {
         let root = normalize_identifier(root).map_err(invalid)?;
         let path = normalize_path(path).map_err(invalid)?;
-        if !self.roots.iter().any(|candidate| candidate.name == root) {
+        if !self
+            .roots_snapshot()
+            .iter()
+            .any(|candidate| candidate.name == root)
+        {
             return Err(invalid(format!(
                 "unknown directory import destination root {root:?}"
             )));

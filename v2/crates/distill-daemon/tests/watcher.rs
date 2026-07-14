@@ -116,3 +116,39 @@ fn portable_watch_source_detects_create_update_and_delete_from_the_rooted_scanne
         }]
     );
 }
+
+#[test]
+fn published_root_replacement_resets_watcher_basis_without_duplicate_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(first.join("old.txt"), b"old").unwrap();
+    std::fs::write(second.join("new.txt"), b"new").unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new(
+        "main",
+        &first,
+        first.join(".distill-displaced"),
+    )])
+    .unwrap();
+    let mut source = PollingWatchSource::arm(scanner.clone()).unwrap();
+    let queue = Mutex::new(WatcherQueue::new(16));
+
+    scanner
+        .replace_roots([AssetRoot::new(
+            "main",
+            &second,
+            second.join(".distill-displaced"),
+        )])
+        .unwrap();
+    assert_eq!(source.poll_once(&queue).unwrap(), 0);
+    assert!(queue.lock().unwrap().take_live_batch().is_empty());
+
+    std::fs::write(second.join("later.txt"), b"later").unwrap();
+    assert_eq!(source.poll_once(&queue).unwrap(), 1);
+    assert_eq!(
+        queue.lock().unwrap().take_live_batch(),
+        vec![event("later.txt")]
+    );
+}

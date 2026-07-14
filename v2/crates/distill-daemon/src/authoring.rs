@@ -36,12 +36,30 @@ use crate::scanner::{AssetRoot, RootedScanner, ScanError};
 
 pub struct AuthoringService {
     pub(crate) store: Arc<Mutex<Store>>,
-    pub(crate) roots: Vec<AssetRoot>,
     pub(crate) scanner: RootedScanner,
-    pub(crate) quarantine: QuarantineDriver,
-    pub(crate) lineage_destination: LineageDestination,
-    lineage: LineageRepairBackend,
+    roots: RwLock<Vec<AssetRoot>>,
+    quarantine: RwLock<QuarantineDriver>,
+    lineage_destination: RwLock<LineageDestination>,
+    lineage: RwLock<LineageRepairBackend>,
     pub(crate) importers: RwLock<RegisteredImporters>,
+}
+
+pub(crate) struct AuthoringFilesystemCandidate {
+    roots: Vec<AssetRoot>,
+    scanner: RootedScanner,
+    quarantine: QuarantineDriver,
+    lineage_destination: LineageDestination,
+    lineage: LineageRepairBackend,
+}
+
+impl AuthoringFilesystemCandidate {
+    pub(crate) fn scanner(&self) -> &RootedScanner {
+        &self.scanner
+    }
+
+    pub(crate) fn lineage_destination(&self) -> &LineageDestination {
+        &self.lineage_destination
+    }
 }
 
 impl AuthoringService {
@@ -59,13 +77,75 @@ impl AuthoringService {
         let lineage = LineageRepairBackend::new(Arc::clone(&store), roots.clone())?;
         Ok(Self {
             store,
+            scanner,
+            roots: RwLock::new(roots),
+            quarantine: RwLock::new(quarantine),
+            lineage_destination: RwLock::new(lineage_destination),
+            lineage: RwLock::new(lineage),
+            importers: RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    pub(crate) fn prepare_filesystem_candidate(
+        &self,
+        roots: Vec<AssetRoot>,
+        lineage_destination: LineageDestination,
+    ) -> Result<AuthoringFilesystemCandidate, AuthoringServiceInitError> {
+        let scanner = RootedScanner::new(roots.clone())?;
+        let quarantine = QuarantineDriver::new(
+            roots
+                .iter()
+                .map(|root| QuarantineRoot::new(&root.path, &root.quarantine_dir)),
+        )?;
+        let lineage = LineageRepairBackend::new(Arc::clone(&self.store), roots.clone())?;
+        Ok(AuthoringFilesystemCandidate {
             roots,
             scanner,
             quarantine,
             lineage_destination,
             lineage,
-            importers: RwLock::new(BTreeMap::new()),
         })
+    }
+
+    pub(crate) fn install_filesystem_candidate(&self, candidate: AuthoringFilesystemCandidate) {
+        self.scanner.replace_from(&candidate.scanner);
+        *self
+            .roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.roots;
+        *self
+            .quarantine
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.quarantine;
+        *self
+            .lineage_destination
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.lineage_destination;
+        *self
+            .lineage
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.lineage;
+    }
+
+    pub(crate) fn roots_snapshot(&self) -> Vec<AssetRoot> {
+        self.roots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn quarantine_snapshot(&self) -> QuarantineDriver {
+        self.quarantine
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn lineage_destination_snapshot(&self) -> LineageDestination {
+        self.lineage_destination
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn register_importer(
@@ -136,7 +216,8 @@ impl AuthoringService {
             proposed_hash,
         };
 
-        let mut publication = match self.quarantine.admit_publication(&mut store) {
+        let quarantine = self.quarantine_snapshot();
+        let mut publication = match quarantine.admit_publication(&mut store) {
             Ok(publication) => publication,
             Err(error) => {
                 remove_unjournaled_temp(temp.as_deref());
@@ -173,8 +254,13 @@ impl AuthoringService {
         drop(publication);
         drop(store);
 
-        publish_current_scan(&self.scanner, &self.lineage_destination, &self.store, base)
-            .map_err(invalid)
+        publish_current_scan(
+            &self.scanner,
+            &self.lineage_destination_snapshot(),
+            &self.store,
+            base,
+        )
+        .map_err(invalid)
     }
 
     fn plan_bundle_mutation(
@@ -269,7 +355,8 @@ impl AuthoringService {
                 return Err(invalid("new bundle entries must name one destination path"));
             }
             let path = *paths.first().expect("one destination path");
-            let [root] = self.roots.as_slice() else {
+            let roots = self.roots_snapshot();
+            let [root] = roots.as_slice() else {
                 return Err(invalid(
                     "direct bundle creation requires exactly one configured asset root; import supplies an explicit root",
                 ));
@@ -453,6 +540,8 @@ impl AuthoringBackend for AuthoringService {
         canonical_manifest_bundle: &[u8],
     ) -> Result<Commit, LineageRepairBackendError> {
         self.lineage
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prepare_create_missing_lineage(basis, canonical_manifest_bundle)
     }
 
@@ -462,6 +551,8 @@ impl AuthoringBackend for AuthoringService {
         survivor: &LineageManifestClaimant,
     ) -> Result<Commit, LineageRepairBackendError> {
         self.lineage
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prepare_resolve_duplicate_lineage(basis, survivor)
     }
 }
