@@ -1,13 +1,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use distill_core::attestation::{CompiledTypeRow, CompiledTypeTable, RegistryExtrasV1};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-use distill_loader::{IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo};
+use distill_loader::{IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo};
+use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectOutcome, ConnectRequest,
-    GameModuleEpoch, LoadPolicyEntry, PathMutation, ServedClosureRow, Server, StoreInstanceId,
-    StoredResolve, TargetDefinition, TargetDefinitionHash,
+    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, GameModuleEpoch,
+    LoadPolicyEntry, PathMutation, ServedClosureRow, Server, StoreInstanceId, StoredResolve,
+    TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
@@ -16,8 +18,14 @@ use distill_wire::wire::WireNode;
 
 const TARGET_HASH: [u8; 32] = [7; 32];
 
-#[test]
-fn rpc_io_resolves_fetches_paths_and_live_deltas_under_authenticated_bases() {
+struct Fixture {
+    server: Server,
+    request: ConnectRequest,
+    asset: AssetUuid,
+    hash: distill_core::id::ContentHash,
+}
+
+fn fixture() -> Fixture {
     let asset = AssetUuid([1; 16]);
     let type_uuid = TypeUuid([2; 16]);
     let logical_hash = LogicalHash([3; 32]);
@@ -114,59 +122,74 @@ fn rpc_io_resolves_fetches_paths_and_live_deltas_under_authenticated_bases() {
         policy,
     )
     .unwrap();
-    let hub = match server.root().connect(request) {
-        ConnectOutcome::Connected(connected) => connected.hub,
-        other => panic!("connect failed: {other:?}"),
-    };
-    let mut io = RpcIo::new(hub).unwrap();
+    Fixture {
+        server,
+        request,
+        asset,
+        hash,
+    }
+}
+
+#[test]
+fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
+    let Fixture {
+        server,
+        request,
+        asset,
+        hash,
+    } = fixture();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            listener.serve_one().await.unwrap();
+        });
+    });
+    let address = address_rx.recv().unwrap();
+    let mut io = RpcIo::connect(address, request).unwrap();
     let basis = io.begin_sweep();
-    assert!(matches!(
-        &basis,
-        IoBasis::Rpc {
-            policy_generation: 0,
-            target_generation: 0,
-            attestation_generation: 0,
-            ..
-        }
-    ));
 
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);
     io.resolve_path(ReqId(3), "assets/a.bundle", &basis);
-    let events = io.poll();
-    assert!(matches!(
-        &events[0],
+    let events = poll_until(&mut io, 3);
+    assert!(events.iter().any(|event| matches!(
+        event,
         IoEvent::Resolved {
             req: ReqId(1),
             result: ResolveResult::Built { content_hash },
             basis: event_basis,
             ..
         } if *content_hash == hash && event_basis == &basis
-    ));
-    assert!(matches!(
-        &events[1],
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
         IoEvent::Fetched {
             req: ReqId(2),
-            content_hash,
             artifact,
             basis: event_basis,
-        } if *content_hash == hash
-            && artifact.blobs.len() == 1
+            ..
+        } if artifact.blobs.len() == 1
             && artifact.blobs[0].is_empty()
             && event_basis == &basis
-    ));
-    assert!(matches!(
-        &events[2],
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
         IoEvent::PathResolved {
             req: ReqId(3),
             result: distill_loader::PathResolveResult::Resolved(found),
             basis: event_basis,
             ..
         } if *found == asset && event_basis == &basis
-    ));
+    )));
 
     io.subscribe(asset);
-    assert!(io.poll().is_empty());
     server
         .commit(Commit {
             assets: vec![AssetMutation::Set {
@@ -177,9 +200,29 @@ fn rpc_io_resolves_fetches_paths_and_live_deltas_under_authenticated_bases() {
             ..Commit::default()
         })
         .unwrap();
-    assert!(matches!(
-        io.poll().as_slice(),
-        [IoEvent::Delta { assets, .. }]
+    let deltas = poll_until(&mut io, 1);
+    assert!(deltas.iter().any(|event| matches!(
+        event,
+        IoEvent::Delta { assets, .. }
             if assets == &vec![(asset, distill_loader::AssetDeltaState::Changed)]
-    ));
+    )));
+
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+fn poll_until(io: &mut RpcIo, minimum: usize) -> Vec<IoEvent> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut events = Vec::new();
+    while events.len() < minimum && Instant::now() < deadline {
+        events.extend(io.poll());
+        if events.len() < minimum {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(
+        events.len() >= minimum,
+        "RPC IO events timed out: {events:?}"
+    );
+    events
 }

@@ -7,15 +7,17 @@
 
 pub mod admission;
 pub mod basis;
+pub mod capnp_io;
 pub mod component;
 pub mod io;
 pub mod orchestrator;
-pub mod rpc_io;
+mod rpc_decode;
 pub mod runtime;
 pub mod storage;
 
 pub use admission::{Admission, FetchAdmission};
 pub use basis::{IoBasis, LoadPolicyAttestation, LoadPolicyError, LoadPolicyRow, ManifestHash};
+pub use capnp_io::{RpcIo, RpcIoInitError};
 pub use component::{
     AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, MemberFailure,
 };
@@ -27,7 +29,6 @@ pub use orchestrator::{
     FetchedInput, Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, PreparedValue,
     ReattestationState, RegistrationError,
 };
-pub use rpc_io::{RpcIo, RpcIoInitError};
 pub use runtime::{
     AdoptionId, CompletionDisposition, ConnectionEpoch, HandleId, ManifestEntry, ManifestState,
     OutstandingPurpose, RequestOwner, RequestTracker,

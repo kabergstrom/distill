@@ -12,6 +12,7 @@ distill-core = { path = "../distill-core" }
 distill-rpc = { path = "../distill-rpc" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 distill-schema = { path = "../distill-schema" }
