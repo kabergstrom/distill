@@ -35,11 +35,11 @@ pub use distill_store::state::{
 use distill_store::{Store, StoreError};
 
 use crate::callbacks::{
-    erase_callback, CallbackHandle, CallbackInvokeError, DefaultsDescriptor, Diagnostics,
-    ImporterDescriptor, InfallibleCallbackError, MigrationFunctionError, PipelineDefaults,
-    PipelineImporter, PipelineMigration, PipelineProcessContext, PipelineProcessor,
-    PipelineValidator, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
-    ValidatorDescriptor,
+    erase_callback, CallbackHandle, CallbackInvokeError, CodegenDescriptor, DefaultsDescriptor,
+    Diagnostics, ImporterDescriptor, InfallibleCallbackError, MigrationFunctionError,
+    PipelineCodegen, PipelineCodegenContext, PipelineDefaults, PipelineImporter, PipelineMigration,
+    PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorDescriptor,
+    ProcessorError, ProcessorProducts, ToolDescriptor, ValidatorDescriptor,
 };
 use crate::tool_resolver::resolve_tool_epoch;
 
@@ -121,6 +121,7 @@ pub struct TargetDefinition {
 pub enum RegistrationKind {
     Importer,
     Processor,
+    Codegen,
     Validator,
     Migration,
     Defaults,
@@ -366,6 +367,24 @@ impl CandidateRegistrationArena {
         self.install(registration, capsule)
     }
 
+    pub fn register_codegen<T: PipelineCodegen>(
+        &mut self,
+        descriptor: CodegenDescriptor,
+        callback: T,
+    ) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Codegen,
+            id: descriptor.id.clone(),
+            version: descriptor.version,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            callback,
+            self.owner.clone(),
+            CallbackHandle::codegen::<T>(descriptor),
+        );
+        self.install(registration, capsule)
+    }
+
     pub fn register_validator<T: PipelineValidator>(
         &mut self,
         descriptor: ValidatorDescriptor,
@@ -545,6 +564,9 @@ impl CandidateRegistrationArena {
                 descriptor.id == registration.id && descriptor.version == registration.version
             }
             (RegistrationKind::Processor, CallbackHandle::Processor { descriptor, .. }) => {
+                descriptor.id == registration.id && descriptor.version == registration.version
+            }
+            (RegistrationKind::Codegen, CallbackHandle::Codegen { descriptor, .. }) => {
                 descriptor.id == registration.id && descriptor.version == registration.version
             }
             (RegistrationKind::Validator, CallbackHandle::Validator { descriptor, .. }) => {
@@ -945,6 +967,16 @@ impl PipelineEpoch {
             .collect()
     }
 
+    pub fn codegen_descriptors(&self) -> Vec<CodegenDescriptor> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Codegen { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn validator_descriptors(&self) -> Vec<ValidatorDescriptor> {
         self.callback_rows()
             .into_iter()
@@ -1080,6 +1112,36 @@ impl PipelineEpoch {
                 Err(CallbackInvokeError::Panicked)
             }
         }
+    }
+
+    pub fn invoke_codegens(
+        &self,
+        context: &mut dyn PipelineCodegenContext,
+    ) -> Result<
+        Vec<distill_build::codegen::GeneratedFile>,
+        CallbackInvokeError<distill_build::codegen::CodegenFailure>,
+    > {
+        let _job = self.callback_job()?;
+        let callbacks = self
+            .callback_rows()
+            .into_iter()
+            .filter(|(_, callback)| matches!(callback, CallbackHandle::Codegen { .. }))
+            .collect::<Vec<_>>();
+        let mut files = Vec::new();
+        for (pointer, callback) in callbacks {
+            let CallbackHandle::Codegen { call, .. } = callback else {
+                unreachable!("codegen predicate returned another kind")
+            };
+            match unsafe { call(pointer, context) } {
+                Ok(Ok(mut generated)) => files.append(&mut generated),
+                Ok(Err(error)) => return Err(CallbackInvokeError::Rejected(error)),
+                Err(_) => {
+                    self.callback_panicked("codegen");
+                    return Err(CallbackInvokeError::Panicked);
+                }
+            }
+        }
+        Ok(files)
     }
 
     pub fn invoke_validators(
@@ -1960,7 +2022,8 @@ pub(crate) fn stored_pipeline_epoch(
             let kind = match registration.kind {
                 RegistrationKind::Importer => StoredRegistrationKind::Importer,
                 RegistrationKind::Processor => StoredRegistrationKind::Processor,
-                RegistrationKind::Validator
+                RegistrationKind::Codegen
+                | RegistrationKind::Validator
                 | RegistrationKind::Migration
                 | RegistrationKind::Defaults
                 | RegistrationKind::Tool => return None,
@@ -2484,16 +2547,19 @@ pub(crate) fn processor_test_epoch_with<
 mod callback_tests {
     use super::*;
     use crate::callbacks::{
-        DiagnosticSeverity, MigrationFunctionError, PipelineDefaults, PipelineImporter,
-        PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorProducts,
-        ToolRegistration, ToolSource,
+        CodegenAsset, CodegenContextError, CodegenDescriptor, DiagnosticSeverity,
+        MigrationFunctionError, PipelineCodegen, PipelineCodegenContext, PipelineDefaults,
+        PipelineImporter, PipelineProcessContext, PipelineProcessor, PipelineValidator,
+        ProcessorProducts, ToolRegistration, ToolSource,
     };
     use crate::importer::{AuthoringImportContext, AuthoringImporterError};
+    use distill_build::codegen::{CodegenFailure, GeneratedFile};
     use distill_build::import::{ImportError, ImportOutput};
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::TargetSelector;
-    use distill_build::query::{FileQuery, RootedPath};
+    use distill_build::query::{AssetQuery, FileQuery, RootedPath};
     use distill_build::tool::{ToolOutput, ToolRunError};
+    use distill_core::id::AssetUuid;
     use distill_core::tool::ToolCwdPolicy;
     use distill_migrate::FieldPath;
     use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
@@ -2609,6 +2675,40 @@ mod callback_tests {
         }
     }
 
+    struct Codegen;
+
+    impl PipelineCodegen for Codegen {
+        fn generate(
+            &self,
+            context: &mut dyn PipelineCodegenContext,
+        ) -> Result<Vec<GeneratedFile>, CodegenFailure> {
+            let asset = context
+                .read(AssetUuid([7; 16]))
+                .map_err(|error| CodegenFailure::Generation(error.to_string()))?
+                .ok_or_else(|| CodegenFailure::Generation("source disappeared".into()))?;
+            Ok(vec![GeneratedFile::new(
+                asset.asset,
+                format!("pub const VALUE: u64 = {:?};\n", asset.value).into_bytes(),
+            )])
+        }
+    }
+
+    struct CodegenContext;
+
+    impl PipelineCodegenContext for CodegenContext {
+        fn query(&mut self, _query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
+            Ok(vec![AssetUuid([7; 16])])
+        }
+
+        fn read(&mut self, asset: AssetUuid) -> Result<Option<CodegenAsset>, CodegenContextError> {
+            Ok(Some(CodegenAsset {
+                asset,
+                type_uuid: TypeUuid([2; 16]),
+                value: distill_json::AuthoredValue::UInt(17),
+            }))
+        }
+    }
+
     struct Defaults;
 
     impl PipelineDefaults for Defaults {
@@ -2702,6 +2802,16 @@ mod callback_tests {
             })
             .into_result()
             .unwrap();
+        arena
+            .register_codegen(
+                CodegenDescriptor {
+                    id: "rust_bindings".into(),
+                    version: 1,
+                },
+                Codegen,
+            )
+            .into_result()
+            .unwrap();
 
         let registration = arena.registration_set(BTreeSet::from(["desktop".into()]));
         let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
@@ -2765,6 +2875,9 @@ mod callback_tests {
             Some(distill_json::AuthoredValue::UInt(7))
         );
         assert_eq!(epoch.tool_descriptors()[0].id, "compiler");
+        let generated = epoch.invoke_codegens(&mut CodegenContext).unwrap();
+        assert_eq!(generated.len(), 1);
+        assert_eq!(generated[0].asset(), AssetUuid([7; 16]));
 
         epoch.begin_drain();
         assert!(unload_epoch(&epoch).is_ok());

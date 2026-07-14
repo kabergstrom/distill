@@ -16,10 +16,11 @@ use distill_schema::ngp_schema::CompilationIdentity;
 use unicode_normalization::is_nfc;
 
 use crate::callbacks::{
-    CallbackInvokeError, DefaultsDescriptor, Diagnostic, Diagnostics, ImporterDescriptor,
-    MigrationFunctionError, PipelineProcessContext, ProcessArtifact, ProcessContextError,
-    ProcessOutputs, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
-    ToolRegistration, ToolSource, ValidatorDescriptor,
+    CallbackInvokeError, CodegenAsset, CodegenContextError, CodegenDescriptor, DefaultsDescriptor,
+    Diagnostic, Diagnostics, ImporterDescriptor, MigrationFunctionError, PipelineCodegenContext,
+    PipelineProcessContext, ProcessArtifact, ProcessContextError, ProcessOutputs,
+    ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor, ToolRegistration,
+    ToolSource, ValidatorDescriptor,
 };
 use crate::epoch::{
     CandidateRegistrationArena, ErasedRegistrationCapsule, HostCallbackBoundary,
@@ -122,9 +123,13 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
         encode_measurement::<*mut dyn EncodeSink>(encoder);
         encode_measurement::<*mut dyn AuthoringImportContext>(encoder);
         encode_measurement::<*mut dyn PipelineProcessContext>(encoder);
+        encode_measurement::<*mut dyn PipelineCodegenContext>(encoder);
         encode_measurement::<AuthoredValue>(encoder);
         encode_measurement::<ImporterDescriptor>(encoder);
         encode_measurement::<ProcessorDescriptor>(encoder);
+        encode_measurement::<CodegenDescriptor>(encoder);
+        encode_measurement::<CodegenAsset>(encoder);
+        encode_measurement::<CodegenContextError>(encoder);
         encode_measurement::<ValidatorDescriptor>(encoder);
         encode_measurement::<DefaultsDescriptor>(encoder);
         encode_measurement::<ToolDescriptor>(encoder);

@@ -69,6 +69,14 @@ pub enum CodegenFailure {
     },
 }
 
+impl std::fmt::Display for CodegenFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for CodegenFailure {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttemptOutcome {
     Files(Vec<GeneratedFile>),

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use distill_asset::CallbackPanic;
+use distill_build::codegen::{CodegenFailure, GeneratedFile};
 use distill_build::outputs::OutputDecls;
 use distill_build::pipeline::{Target, TargetSelector};
 use distill_build::query::{AssetQuery, IntakeError};
@@ -57,6 +58,12 @@ pub struct ValidatorDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultsDescriptor {
     pub type_uuid: TypeUuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodegenDescriptor {
+    pub id: String,
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +201,30 @@ pub struct ProcessArtifact {
     pub blobs: Vec<Arc<[u8]>>,
 }
 
+/// One exact authored source entry exposed to an authoring-side generator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodegenAsset {
+    pub asset: AssetUuid,
+    pub type_uuid: TypeUuid,
+    pub value: AuthoredValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodegenContextError {
+    Unavailable(&'static str),
+    AttemptStopped,
+    InvalidQuery(IntakeError),
+    Failed(String),
+}
+
+impl std::fmt::Display for CodegenContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for CodegenContextError {}
+
 /// Job-bound output namespace. A processor can only mint child identities
 /// from the parent and declaration set installed for its own stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +335,17 @@ pub trait PipelineProcessContext {
     ) -> Result<ToolOutput, ToolRunError>;
 }
 
+/// Snapshot-pinned authored reads available only to codegen callbacks.
+pub trait PipelineCodegenContext {
+    fn query(&mut self, _query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
+        Err(CodegenContextError::Unavailable("query"))
+    }
+
+    fn read(&mut self, _asset: AssetUuid) -> Result<Option<CodegenAsset>, CodegenContextError> {
+        Err(CodegenContextError::Unavailable("read"))
+    }
+}
+
 impl<S: ToolEpochSnapshot + ?Sized> PipelineProcessContext for ProcessContext<'_, S> {
     fn run_tool(
         &mut self,
@@ -322,6 +364,13 @@ pub trait PipelineProcessor: Send + Sync + 'static {
         input: AuthoredValue,
         context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, ProcessorError>;
+}
+
+pub trait PipelineCodegen: Send + Sync + 'static {
+    fn generate(
+        &self,
+        context: &mut dyn PipelineCodegenContext,
+    ) -> Result<Vec<GeneratedFile>, CodegenFailure>;
 }
 
 pub trait PipelineValidator: Send + Sync + 'static {
@@ -501,6 +550,10 @@ type ProcessorCall = unsafe fn(
     AuthoredValue,
     &mut dyn PipelineProcessContext,
 ) -> Result<Result<ProcessorProducts, ProcessorError>, CallbackPanic>;
+type CodegenCall = unsafe fn(
+    *const u8,
+    &mut dyn PipelineCodegenContext,
+) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic>;
 type ValidatorCall = unsafe fn(
     *const u8,
     &AuthoredValue,
@@ -525,6 +578,10 @@ pub(crate) enum CallbackHandle {
         descriptor: ProcessorDescriptor,
         call: ProcessorCall,
     },
+    Codegen {
+        descriptor: CodegenDescriptor,
+        call: CodegenCall,
+    },
     Validator {
         descriptor: ValidatorDescriptor,
         call: ValidatorCall,
@@ -547,6 +604,7 @@ impl std::fmt::Debug for CallbackHandle {
             Self::None => "CallbackHandle::None",
             Self::Importer { .. } => "CallbackHandle::Importer",
             Self::Processor { .. } => "CallbackHandle::Processor",
+            Self::Codegen { .. } => "CallbackHandle::Codegen",
             Self::Validator { .. } => "CallbackHandle::Validator",
             Self::Migration { .. } => "CallbackHandle::Migration",
             Self::Defaults { .. } => "CallbackHandle::Defaults",
@@ -567,6 +625,13 @@ impl CallbackHandle {
         Self::Processor {
             descriptor,
             call: call_processor::<T>,
+        }
+    }
+
+    pub(crate) fn codegen<T: PipelineCodegen>(descriptor: CodegenDescriptor) -> Self {
+        Self::Codegen {
+            descriptor,
+            call: call_codegen::<T>,
         }
     }
 
@@ -627,6 +692,16 @@ unsafe fn call_processor<T: PipelineProcessor>(
 ) -> Result<Result<ProcessorProducts, ProcessorError>, CallbackPanic> {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         (&*pointer.cast::<T>()).process(input, context)
+    }))
+    .map_err(|_| CallbackPanic)
+}
+
+unsafe fn call_codegen<T: PipelineCodegen>(
+    pointer: *const u8,
+    context: &mut dyn PipelineCodegenContext,
+) -> Result<Result<Vec<GeneratedFile>, CodegenFailure>, CallbackPanic> {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        (&*pointer.cast::<T>()).generate(context)
     }))
     .map_err(|_| CallbackPanic)
 }
