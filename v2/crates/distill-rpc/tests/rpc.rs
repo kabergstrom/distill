@@ -462,6 +462,15 @@ fn authoring_snapshot(hub: &Hub) -> AuthoringSnapshot {
 }
 
 #[test]
+fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
+    let entry = authoring_entry(9, AuthoringEntryRole::AuthoringOnly);
+    assert_eq!(
+        decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).unwrap(),
+        AuthoredValue::Blob(vec![11])
+    );
+}
+
+#[test]
 fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     let server = server_with(&[(1, false)]);
     let valid = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);

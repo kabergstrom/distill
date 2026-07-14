@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
@@ -7,10 +8,13 @@ use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination, Watcher
 use distill_daemon::scanner::AssetRoot;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringInspectResult, LoadPolicyEntry, MetadataCall, MetadataNamespaceCall, TargetDefinition,
-    TargetDefinitionHash,
+    AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
+    AuthoringValue as RpcAuthoringValue, LoadPolicyEntry, MetadataCall, MetadataNamespaceCall,
+    TargetDefinition, TargetDefinitionHash,
 };
-use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_schema::ngp_schema::{
+    node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
+};
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
 use distill_store::StoreConfig;
 
@@ -154,6 +158,71 @@ fn watcher_union_reconciles_an_offline_delete_in_exactly_one_version() {
     assert!(store.bundle(bundle).unwrap().is_none());
     assert!(store.entry(asset).unwrap().is_none());
     assert_eq!(store.input_version(), InputVersion(2));
+}
+
+#[test]
+fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
+    let coordinator = coordinator(&temp);
+    let bundle_path = temp.path().join("assets/ordinary.bundle");
+    std::fs::write(&bundle_path, bytes).unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+
+    let parsed = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    let original = &parsed.assets["entry"];
+    let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
+    let operation = AuthoringOp::Set(AuthoringEntry {
+        uuid: asset_uuid,
+        bundle: bundle_uuid,
+        local_id: "entry".into(),
+        normalized_path: "ordinary.bundle".into(),
+        type_uuid: original.type_uuid,
+        terminal_type: original.type_uuid,
+        schema_hash: original.schema_hash,
+        logical_schema: Arc::from(logical_schema.into_bytes()),
+        role: AuthoringEntryRole::Runtime,
+        tags: BTreeMap::new(),
+        value: RpcAuthoringValue {
+            canonical_value: Arc::from(&b"9"[..]),
+            blobs: Vec::new(),
+        },
+    });
+    let backend = Arc::clone(coordinator.authoring_service());
+    let stamp = coordinator
+        .server()
+        .coordinated_commit(InputVersion(1), || {
+            backend
+                .prepare_write(InputVersion(1), &[operation])
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or_else(|| "production authoring returned no commit".to_owned())
+        })
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(2));
+    let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
+    assert_eq!(
+        coordinator.store().lock().unwrap().input_version(),
+        InputVersion(2)
+    );
+
+    let backend = Arc::clone(coordinator.authoring_service());
+    let stamp = coordinator
+        .server()
+        .coordinated_commit(InputVersion(2), || {
+            backend
+                .prepare_write(InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }])
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or_else(|| "production authoring returned no commit".to_owned())
+        })
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(3));
+    assert!(!bundle_path.exists());
+    let store = coordinator.store();
+    let store = store.lock().unwrap();
+    assert_eq!(store.input_version(), InputVersion(3));
+    assert!(store.bundle(bundle_uuid).unwrap().is_none());
+    assert!(store.entry(asset_uuid).unwrap().is_none());
 }
 
 #[cfg(unix)]

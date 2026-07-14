@@ -4098,21 +4098,25 @@ fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> Result<(), A
 }
 
 fn validate_authoring_entry(entry: &AuthoringEntry) -> Result<(), AuthoringValueError> {
-    validate_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value)
+    decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value).map(drop)
 }
 
-pub(crate) fn validate_authoring_payload(
+/// Authenticate and decode an RPC authored-value carrier into the exact
+/// schema-shaped value stored in a bundle. Blob tokens are interpreted only
+/// while walking a `SchemaNode::Blob`, so an ordinary field named
+/// `$distill_blob` can never collide with the transport escape.
+pub fn decode_authoring_payload(
     schema_hash: LogicalHash,
     logical_schema: &[u8],
     authored_value: &AuthoringValue,
-) -> Result<(), AuthoringValueError> {
+) -> Result<AuthoredValue, AuthoringValueError> {
     let schema_text =
         std::str::from_utf8(logical_schema).map_err(|_| AuthoringValueError::LogicalSchemaUtf8)?;
     let schema = verify_snapshot(schema_text, schema_hash)
         .map_err(|error| AuthoringValueError::LogicalSchemaInvalid(error.to_string()))?;
     let value_text = std::str::from_utf8(&authored_value.canonical_value)
         .map_err(|_| AuthoringValueError::ValueInvalid("value is not UTF-8".to_owned()))?;
-    let value = distill_json::parse(value_text)
+    let mut value = distill_json::parse(value_text)
         .map_err(|error| AuthoringValueError::ValueInvalid(error.to_string()))?;
     let rewritten = distill_json::write(&value)
         .map_err(|error| AuthoringValueError::ValueInvalid(error.to_string()))?;
@@ -4131,7 +4135,118 @@ pub(crate) fn validate_authoring_payload(
             return Err(AuthoringValueError::UnusedBlobIndex { index });
         }
     }
-    Ok(())
+    materialize_blob_tokens(
+        &schema.root,
+        &mut value,
+        &mut Vec::new(),
+        &authored_value.blobs,
+    );
+    Ok(value)
+}
+
+fn materialize_blob_tokens(
+    schema: &SchemaNode,
+    value: &mut AuthoredValue,
+    frames: &mut Vec<SchemaNode>,
+    blobs: &[Arc<[u8]>],
+) {
+    match schema {
+        SchemaNode::Blob => {
+            let AuthoredValue::Object(object) = value else {
+                unreachable!("validated Blob shape")
+            };
+            let Some(AuthoredValue::UInt(index)) = object.get("$distill_blob") else {
+                unreachable!("validated Blob token")
+            };
+            *value = AuthoredValue::Blob(blobs[*index as usize].to_vec());
+        }
+        SchemaNode::Struct { fields, .. } => {
+            let AuthoredValue::Object(object) = value else {
+                unreachable!("validated struct shape")
+            };
+            frames.push(schema.clone());
+            for (name, _, field_schema) in fields {
+                materialize_blob_tokens(
+                    field_schema,
+                    object.get_mut(name).expect("validated struct field"),
+                    frames,
+                    blobs,
+                );
+            }
+            frames.pop();
+        }
+        SchemaNode::Enum { variants, .. } => {
+            let AuthoredValue::Object(object) = value else {
+                unreachable!("validated enum shape")
+            };
+            let name = object
+                .first_key_value()
+                .expect("validated enum variant")
+                .0
+                .clone();
+            let variant_schema = &variants
+                .iter()
+                .find(|(candidate, _, _)| candidate == &name)
+                .expect("validated enum schema")
+                .2;
+            frames.push(schema.clone());
+            materialize_blob_tokens(
+                variant_schema,
+                object.get_mut(&name).expect("validated enum value"),
+                frames,
+                blobs,
+            );
+            frames.pop();
+        }
+        SchemaNode::Vec(element) | SchemaNode::Set(element) => {
+            let AuthoredValue::Array(values) = value else {
+                unreachable!("validated sequence shape")
+            };
+            for value in values {
+                materialize_blob_tokens(element, value, frames, blobs);
+            }
+        }
+        SchemaNode::Array { elem, .. } => {
+            let AuthoredValue::Array(values) = value else {
+                unreachable!("validated array shape")
+            };
+            for value in values {
+                materialize_blob_tokens(elem, value, frames, blobs);
+            }
+        }
+        SchemaNode::Option(element) => {
+            if !matches!(value, AuthoredValue::Null) {
+                materialize_blob_tokens(element, value, frames, blobs);
+            }
+        }
+        SchemaNode::Map { key, value: item } => match value {
+            AuthoredValue::Array(entries) => {
+                for entry in entries {
+                    let AuthoredValue::Array(pair) = entry else {
+                        unreachable!("validated map pair")
+                    };
+                    let (key_value, item_value) = pair.split_at_mut(1);
+                    materialize_blob_tokens(key, &mut key_value[0], frames, blobs);
+                    materialize_blob_tokens(item, &mut item_value[0], frames, blobs);
+                }
+            }
+            AuthoredValue::Object(entries) => {
+                for item_value in entries.values_mut() {
+                    materialize_blob_tokens(item, item_value, frames, blobs);
+                }
+            }
+            _ => unreachable!("validated map shape"),
+        },
+        SchemaNode::BackRef(distance) => {
+            let target = frames[frames.len() - (*distance as usize + 1)].clone();
+            materialize_blob_tokens(&target, value, frames, blobs);
+        }
+        SchemaNode::Primitive(_)
+        | SchemaNode::AssetRef(_)
+        | SchemaNode::WeakRef(_)
+        | SchemaNode::String
+        | SchemaNode::Unit => {}
+    }
 }
 
 fn walk_schema_value(

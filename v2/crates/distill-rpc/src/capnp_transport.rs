@@ -2531,7 +2531,8 @@ pub fn decode_authoring_inspection(
             .collect::<Result<Vec<_>, _>>()?,
     };
     let logical_schema: std::sync::Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
-    crate::server::validate_authoring_payload(schema_hash, &logical_schema, &authored_value)
+    crate::server::decode_authoring_payload(schema_hash, &logical_schema, &authored_value)
+        .map(drop)
         .map_err(|error| {
             capnp::Error::failed(format!("invalid authoring inspection: {error:?}"))
         })?;

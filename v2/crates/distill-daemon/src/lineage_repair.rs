@@ -673,7 +673,7 @@ fn group_claimants(
     Ok(grouped)
 }
 
-fn write_same_dir_temp(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+pub(crate) fn write_same_dir_temp(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let parent = target
         .parent()
         .ok_or_else(|| "publication target has no parent directory".to_owned())?;
@@ -716,7 +716,7 @@ impl FileDirSync {
     }
 }
 
-fn unique_sibling(target: &Path, role: &str) -> PathBuf {
+pub(crate) fn unique_sibling(target: &Path, role: &str) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let name = target
         .file_name()

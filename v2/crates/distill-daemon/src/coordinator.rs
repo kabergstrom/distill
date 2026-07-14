@@ -30,7 +30,8 @@ use distill_store::state::{
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
-use crate::lineage_repair::{LineageRepairBackend, LineageRepairBackendInitError};
+use crate::authoring::{AuthoringService, AuthoringServiceInitError};
+use crate::lineage_repair::LineageRepairBackendInitError;
 use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
@@ -47,6 +48,7 @@ pub struct DaemonCoordinator {
     scanner: RootedScanner,
     server: Server,
     lineage_destination: LineageDestination,
+    authoring: Arc<AuthoringService>,
 }
 
 impl DaemonCoordinator {
@@ -58,18 +60,27 @@ impl DaemonCoordinator {
     ) -> Result<Self, CoordinatorInitError> {
         let store = Arc::new(Mutex::new(Store::open(store_config)?));
         let scanner = RootedScanner::new(roots.clone())?;
-        let backend = Arc::new(LineageRepairBackend::new(Arc::clone(&store), roots)?);
+        let backend = Arc::new(AuthoringService::new(
+            Arc::clone(&store),
+            roots,
+            lineage_destination.clone(),
+        )?);
         let (instance, version) = {
             let store = lock_store(&store);
             (store.instance_id(), store.input_version())
         };
-        let server =
-            Server::new_at_version_with_authoring_backend(instance, version, targets, backend)?;
+        let server = Server::new_at_version_with_authoring_backend(
+            instance,
+            version,
+            targets,
+            backend.clone(),
+        )?;
         Ok(Self {
             store,
             scanner,
             server,
             lineage_destination,
+            authoring: backend,
         })
     }
 
@@ -83,6 +94,10 @@ impl DaemonCoordinator {
 
     pub fn scanner(&self) -> RootedScanner {
         self.scanner.clone()
+    }
+
+    pub fn authoring_service(&self) -> &Arc<AuthoringService> {
+        &self.authoring
     }
 
     /// Reconcile one complete scan. A watcher generation is armed before the
@@ -299,6 +314,7 @@ pub enum CoordinatorInitError {
     Store(StoreError),
     Scan(ScanError),
     Repair(LineageRepairBackendInitError),
+    Authoring(AuthoringServiceInitError),
     Rpc(distill_rpc::AttestationShapeError),
 }
 
@@ -323,6 +339,11 @@ impl From<ScanError> for CoordinatorInitError {
 impl From<LineageRepairBackendInitError> for CoordinatorInitError {
     fn from(error: LineageRepairBackendInitError) -> Self {
         Self::Repair(error)
+    }
+}
+impl From<AuthoringServiceInitError> for CoordinatorInitError {
+    fn from(error: AuthoringServiceInitError) -> Self {
+        Self::Authoring(error)
     }
 }
 impl From<distill_rpc::AttestationShapeError> for CoordinatorInitError {
@@ -611,6 +632,20 @@ fn publish_scan(
         Ok(())
     })?;
     Ok(commit)
+}
+
+/// Rescan the complete namespace and advance the durable projection from an
+/// authoring backend while the RPC server holds its publication lock.
+pub(crate) fn publish_current_scan(
+    scanner: &RootedScanner,
+    lineage_destination: &LineageDestination,
+    store: &Arc<Mutex<Store>>,
+    base: InputVersion,
+) -> Result<Commit, String> {
+    let scan = scanner.scan().map_err(|error| error.to_string())?;
+    let candidate = ScanCandidate::build(scanner, lineage_destination, scan)
+        .map_err(|error| error.to_string())?;
+    publish_scan(store, base, candidate).map_err(|error| error.to_string())
 }
 
 fn rpc_commit(

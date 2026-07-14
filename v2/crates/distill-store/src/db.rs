@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -265,7 +265,7 @@ CREATE TABLE displaced (
 );
 CREATE TABLE publication_groups (
     group_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    kind        INTEGER NOT NULL CHECK (kind IN (1, 2, 3, 4, 5, 6)),
     basis       BLOB NOT NULL,
     retired     INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
 );

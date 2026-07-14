@@ -18,7 +18,7 @@ pub use attestation::{compute_policy_digest, AttestationShapeError, TargetDefini
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
 pub use server::{
-    decode_asset_reference_query, AuthoringSnapshot, CoordinatedCommitError, DeltaStream, Hub,
-    LineageRepair, MetadataAuthoringSnapshot, MetadataHub, MetadataSnapshot, Root, Server,
-    Snapshot,
+    decode_asset_reference_query, decode_authoring_payload, AuthoringSnapshot,
+    CoordinatedCommitError, DeltaStream, Hub, LineageRepair, MetadataAuthoringSnapshot,
+    MetadataHub, MetadataSnapshot, Root, Server, Snapshot,
 };

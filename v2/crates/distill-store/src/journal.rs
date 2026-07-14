@@ -115,6 +115,10 @@ pub struct RecoveredEdit {
 pub enum PublicationGroupKind {
     LineageCreate = 1,
     LineageDuplicate = 2,
+    AuthoringWrite = 3,
+    Import = 4,
+    DiskMigration = 5,
+    Codegen = 6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +243,10 @@ impl Store {
             let kind = match raw_kind {
                 1 => PublicationGroupKind::LineageCreate,
                 2 => PublicationGroupKind::LineageDuplicate,
+                3 => PublicationGroupKind::AuthoringWrite,
+                4 => PublicationGroupKind::Import,
+                5 => PublicationGroupKind::DiskMigration,
+                6 => PublicationGroupKind::Codegen,
                 _ => {
                     return Err(StoreError::BadIntent {
                         intent_id: group_id,
