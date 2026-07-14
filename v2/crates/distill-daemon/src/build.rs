@@ -7,10 +7,10 @@ use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec, E
 use distill_build::dslf::LocalFailureClass;
 use distill_build::keys::{build_import_digest, BuildImportInputs};
 use distill_build::persist::{lookup_persisted_candidate, PersistedOutcome};
-use distill_build::query::AssetQuery;
+use distill_build::query::{asset_query_result_hash, AssetQuery};
 use distill_build::trace::{
     trace_payload_bytes, CapabilityKey, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
-    Observed, StableFailureFingerprint, TraceSource,
+    Observed, StableFailureFingerprint, TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
@@ -319,12 +319,13 @@ fn encode_or_hydrate(
         migrations: Vec::new(),
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
     });
+    let trace_source = StoreTraceSource::capture(context.store)?;
     if let Some(hit) = lookup_persisted_candidate(
         context.store,
         KeyKind::BuildImport,
         &key,
         loaded.entry.uuid,
-        &NoTraceSource,
+        &trace_source,
     )
     .map_err(BuildError::infrastructure)?
     {
@@ -344,12 +345,19 @@ fn encode_or_hydrate(
     }
 
     let source_bundle = loaded.meta.bundle;
-    let store = &*context.store;
+    let mut trace = Vec::new();
     let mut resolver = |query: &distill_json::AuthoredValue,
                         expected: TypeUuid,
                         strong: bool,
                         _path: &[distill_bundle::PathComponent]| {
-        resolve_reference(store, source_bundle, query, expected, strong)
+        resolve_reference(
+            &trace_source,
+            source_bundle,
+            query,
+            expected,
+            strong,
+            &mut trace,
+        )
     };
     let encoded = encode_artifact_value(
         ArtifactValueSpec {
@@ -379,7 +387,7 @@ fn encode_or_hydrate(
             static_input_key: key,
             asset_uuid: loaded.entry.uuid,
             static_inputs_canonical: Vec::new(),
-            trace: trace_payload_bytes(&[]),
+            trace: trace_payload_bytes(&trace),
             outcome: CommitOutcome::Success {
                 payload_kind: PayloadKind::ImportEncoding,
                 outputs: vec![OutputSpec {
@@ -439,69 +447,90 @@ fn load_edges(
 }
 
 fn resolve_reference(
-    store: &Store,
+    source: &StoreTraceSource,
     source_bundle: BundleUuid,
     value: &distill_json::AuthoredValue,
     expected: TypeUuid,
     _strong: bool,
+    trace: &mut Vec<TraceOp>,
 ) -> Result<AssetUuid, String> {
     let query = decode_asset_reference_query(value).map_err(|error| format!("{error:?}"))?;
     let asset = match query {
         AssetReferenceQuery::Uuid(asset) => Some(asset),
-        AssetReferenceQuery::SameBundleLocalId(local_id) => {
-            entry_in_bundle(store, source_bundle, &local_id)?
-        }
+        AssetReferenceQuery::SameBundleLocalId(local_id) => resolve_query(
+            source,
+            AssetQuery {
+                local_id: Some(local_id),
+                bundle_uuid: Some(source_bundle),
+                ..AssetQuery::default()
+            },
+            trace,
+        )?,
         AssetReferenceQuery::Path {
             normalized_path,
             local_id: None,
-        } => store
-            .resolve_path(&normalized_path)
-            .map_err(|error| error.to_string())?,
+        } => {
+            let observed = source.resolve(&normalized_path);
+            trace.push(TraceOp::Resolve {
+                path: normalized_path,
+                observed: observed.clone(),
+            });
+            match observed {
+                Observed::Ok(asset) => asset,
+                Observed::Err(error) => return Err(format!("{error:?}")),
+            }
+        }
         AssetReferenceQuery::Path {
             normalized_path,
             local_id: Some(local_id),
-        } => {
-            let bundles = store
-                .all_bundles()
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|bundle| bundle.path == normalized_path)
-                .collect::<Vec<_>>();
-            if bundles.len() > 1 {
-                return Err(format!("ambiguous bundle path {normalized_path}"));
-            }
-            bundles
-                .first()
-                .map(|bundle| entry_in_bundle(store, bundle.bundle, &local_id))
-                .transpose()?
-                .flatten()
-        }
+        } => resolve_query(
+            source,
+            AssetQuery {
+                bundle_path: Some(normalized_path),
+                local_id: Some(local_id),
+                ..AssetQuery::default()
+            },
+            trace,
+        )?,
     }
     .ok_or_else(|| "asset reference did not resolve".to_owned())?;
-    let target = store
-        .runtime_entry(asset)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("referenced asset {asset} is missing"))?;
-    if target.type_uuid != expected {
+    let role = source.role_check(asset);
+    trace.push(TraceOp::RoleCheck {
+        asset,
+        observed: role.clone(),
+    });
+    if role != Observed::Ok(Some(EntryRole::Runtime)) {
+        return Err(format!("referenced asset {asset} is not runtime eligible"));
+    }
+    let terminal = source.ref_check(asset, expected);
+    trace.push(TraceOp::RefCheck {
+        asset,
+        expected_terminal: expected,
+        observed: terminal.clone(),
+    });
+    if terminal != Observed::Ok(Some(expected)) {
         return Err(format!(
-            "referenced asset {asset} has terminal type {}, expected {expected}",
-            target.type_uuid
+            "referenced asset {asset} does not have expected terminal type {expected}"
         ));
     }
     Ok(asset)
 }
 
-fn entry_in_bundle(
-    store: &Store,
-    bundle: BundleUuid,
-    local_id: &str,
+fn resolve_query(
+    source: &StoreTraceSource,
+    query: AssetQuery,
+    trace: &mut Vec<TraceOp>,
 ) -> Result<Option<AssetUuid>, String> {
-    Ok(store
-        .entries_in_bundle(bundle)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|entry| entry.local_id == local_id)
-        .map(|entry| entry.asset))
+    let results = source.query_results(&query);
+    trace.push(TraceOp::Query {
+        query: Box::new(query),
+        observed: Observed::Ok(asset_query_result_hash(&results)),
+    });
+    match results.as_slice() {
+        [] => Ok(None),
+        [asset] => Ok(Some(*asset)),
+        _ => Err(format!("asset reference query is ambiguous: {results:?}")),
+    }
 }
 
 fn load_asset(
@@ -634,7 +663,126 @@ fn merge_wire_trees(
     Ok(())
 }
 
-struct NoTraceSource;
+#[derive(Clone)]
+struct TraceEntry {
+    asset: AssetUuid,
+    bundle: BundleUuid,
+    bundle_path: String,
+    local_id: String,
+    authored_type: TypeUuid,
+    role: EntryRole,
+    tags: Vec<String>,
+}
+
+#[derive(Clone)]
+struct StoreTraceSource {
+    entries: BTreeMap<AssetUuid, TraceEntry>,
+    paths: BTreeMap<String, Vec<AssetUuid>>,
+}
+
+impl StoreTraceSource {
+    fn capture(store: &Store) -> Result<Self, BuildError> {
+        let bundles = store
+            .all_bundles()
+            .map_err(BuildError::infrastructure)?
+            .into_iter()
+            .map(|bundle| (bundle.bundle, bundle.path))
+            .collect::<BTreeMap<_, _>>();
+        let mut entries = BTreeMap::new();
+        for asset in store.all_asset_ids().map_err(BuildError::infrastructure)? {
+            let Some(entry) = store.entry(asset).map_err(BuildError::failed)? else {
+                continue;
+            };
+            let bundle_path = bundles.get(&entry.bundle).cloned().ok_or_else(|| {
+                BuildError::Infrastructure("trace entry owner bundle is missing".to_owned())
+            })?;
+            entries.insert(
+                asset,
+                TraceEntry {
+                    asset,
+                    bundle: entry.bundle,
+                    bundle_path,
+                    local_id: entry.local_id,
+                    authored_type: entry.type_uuid,
+                    role: if entry.authoring_only {
+                        EntryRole::AuthoringOnly
+                    } else {
+                        EntryRole::Runtime
+                    },
+                    tags: entry.tags,
+                },
+            );
+        }
+        let mut paths = BTreeMap::<String, Vec<AssetUuid>>::new();
+        for (path, _, asset) in store
+            .all_path_entries()
+            .map_err(BuildError::infrastructure)?
+        {
+            paths.entry(path).or_default().push(asset);
+        }
+        for assets in paths.values_mut() {
+            assets.sort();
+            assets.dedup();
+        }
+        Ok(Self { entries, paths })
+    }
+
+    fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
+        let glob = query
+            .path_glob
+            .as_ref()
+            .and_then(|pattern| globset::Glob::new(pattern).ok())
+            .map(|glob| glob.compile_matcher());
+        self.entries
+            .values()
+            .filter(|entry| entry.role == EntryRole::Runtime)
+            .filter(|entry| query.uuid.is_none_or(|uuid| uuid == entry.asset))
+            .filter(|entry| {
+                query
+                    .bundle_path
+                    .as_ref()
+                    .is_none_or(|path| path == &entry.bundle_path)
+            })
+            .filter(|entry| {
+                query
+                    .local_id
+                    .as_ref()
+                    .is_none_or(|local_id| local_id == &entry.local_id)
+            })
+            .filter(|entry| {
+                query
+                    .bundle_uuid
+                    .is_none_or(|bundle| bundle == entry.bundle)
+            })
+            .filter(|entry| {
+                query
+                    .authored_type
+                    .is_none_or(|authored| authored == entry.authored_type)
+            })
+            .filter(|entry| {
+                query
+                    .terminal_type
+                    .is_none_or(|terminal| terminal == entry.authored_type)
+            })
+            .filter(|entry| {
+                query.tag.as_ref().is_none_or(|tag| {
+                    tag.value.is_none() && entry.tags.iter().any(|actual| actual == &tag.tag)
+                })
+            })
+            .filter(|entry| {
+                query
+                    .path_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| entry.bundle_path.starts_with(prefix))
+            })
+            .filter(|entry| {
+                glob.as_ref()
+                    .is_none_or(|glob| glob.is_match(&entry.bundle_path))
+            })
+            .map(|entry| entry.asset)
+            .collect()
+    }
+}
 
 fn no_trace<T>() -> Observed<T> {
     Observed::Err(StableFailureFingerprint::Local {
@@ -643,17 +791,23 @@ fn no_trace<T>() -> Observed<T> {
     })
 }
 
-impl TraceSource for NoTraceSource {
+impl TraceSource for StoreTraceSource {
     fn read(&self, _asset: AssetUuid) -> Observed<ContentHash> {
         no_trace()
     }
 
-    fn resolve(&self, _path: &str) -> Observed<Option<AssetUuid>> {
-        no_trace()
+    fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>> {
+        match self.paths.get(path).map(Vec::as_slice).unwrap_or_default() {
+            [] => Observed::Ok(None),
+            [asset] => Observed::Ok(Some(*asset)),
+            conflicting => Observed::Err(StableFailureFingerprint::Ambiguous {
+                conflicting: conflicting.to_vec(),
+            }),
+        }
     }
 
-    fn query(&self, _query: &AssetQuery) -> Observed<[u8; 32]> {
-        no_trace()
+    fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]> {
+        Observed::Ok(asset_query_result_hash(&self.query_results(query)))
     }
 
     fn tool(&self, _id: &str) -> Observed<[u8; 32]> {
@@ -664,12 +818,12 @@ impl TraceSource for NoTraceSource {
         no_trace()
     }
 
-    fn ref_check(&self, _asset: AssetUuid, _expected: TypeUuid) -> Observed<Option<TypeUuid>> {
-        no_trace()
+    fn ref_check(&self, asset: AssetUuid, _expected: TypeUuid) -> Observed<Option<TypeUuid>> {
+        Observed::Ok(self.entries.get(&asset).map(|entry| entry.authored_type))
     }
 
-    fn role_check(&self, _asset: AssetUuid) -> Observed<Option<EntryRole>> {
-        no_trace()
+    fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>> {
+        Observed::Ok(self.entries.get(&asset).map(|entry| entry.role))
     }
 
     fn control(&self, _query: &ControlQuery) -> Observed<[u8; 32]> {
@@ -900,5 +1054,53 @@ mod tests {
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
         assert_eq!(coordinator.store().lock().unwrap().memo_seq(), first_memo);
+    }
+
+    #[test]
+    fn reference_trace_invalidates_on_resolution_role_or_terminal_type_drift() {
+        let source = StoreTraceSource {
+            entries: BTreeMap::from([(
+                ASSET,
+                TraceEntry {
+                    asset: ASSET,
+                    bundle: BUNDLE,
+                    bundle_path: "target.bundle".to_owned(),
+                    local_id: "entry".to_owned(),
+                    authored_type: TYPE,
+                    role: EntryRole::Runtime,
+                    tags: Vec::new(),
+                },
+            )]),
+            paths: BTreeMap::from([("target.bundle".to_owned(), vec![ASSET])]),
+        };
+        let mut trace = Vec::new();
+        assert_eq!(
+            resolve_reference(
+                &source,
+                BUNDLE,
+                &AuthoredValue::Str("target.bundle".to_owned()),
+                TYPE,
+                true,
+                &mut trace,
+            )
+            .unwrap(),
+            ASSET
+        );
+        assert_eq!(trace.len(), 3);
+        assert!(distill_build::trace::revalidate(&trace, &source));
+
+        let mut moved = source.clone();
+        moved
+            .paths
+            .insert("target.bundle".to_owned(), vec![AssetUuid([99; 16])]);
+        assert!(!distill_build::trace::revalidate(&trace, &moved));
+
+        let mut role_changed = source.clone();
+        role_changed.entries.get_mut(&ASSET).unwrap().role = EntryRole::AuthoringOnly;
+        assert!(!distill_build::trace::revalidate(&trace, &role_changed));
+
+        let mut retyped = source;
+        retyped.entries.get_mut(&ASSET).unwrap().authored_type = TypeUuid([88; 16]);
+        assert!(!distill_build::trace::revalidate(&trace, &retyped));
     }
 }
