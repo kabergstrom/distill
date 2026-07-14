@@ -125,6 +125,10 @@ impl QuarantineDriver {
             })
     }
 
+    pub(crate) fn with_root(&self, root: QuarantineRoot) -> Result<Self, QuarantineError> {
+        Self::new(self.roots.iter().cloned().chain(std::iter::once(root)))
+    }
+
     /// Record a deletion intent, rename the inode to its intent-ID-derived
     /// quarantine name, verify the displaced bytes, then retire the intent.
     /// The store restores mismatched bytes and returns a typed conflict.

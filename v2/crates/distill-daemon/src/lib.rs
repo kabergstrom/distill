@@ -12,6 +12,7 @@ static DISTILL_SYSTEM_ALLOCATOR: std::alloc::System = std::alloc::System;
 pub mod authoring;
 mod build;
 pub mod callbacks;
+pub mod codegen;
 pub mod config;
 pub mod coordinator;
 pub mod epoch;
