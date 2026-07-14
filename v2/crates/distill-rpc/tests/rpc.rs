@@ -173,7 +173,10 @@ fn production_bootstrap_starts_at_the_durable_store_version() {
     .unwrap();
 
     assert_eq!(server.current_stamp().version, InputVersion(41));
-    assert_eq!(snapshot(&connect(&server, &[(1, false)])).stamp().version, InputVersion(41));
+    assert_eq!(
+        snapshot(&connect(&server, &[(1, false)])).stamp().version,
+        InputVersion(41)
+    );
 }
 
 #[derive(Default)]
@@ -316,11 +319,61 @@ fn durable_write_backend_owns_the_committed_projection() {
     let hub = connect(&server, &[(1, false)]);
 
     assert_eq!(
-        hub.write(InputVersion(8), vec![AuthoringOp::Remove { uuid: asset_id(7) }]),
+        hub.write(
+            InputVersion(8),
+            vec![AuthoringOp::Remove { uuid: asset_id(7) }]
+        ),
         RpcResult::Success(InputVersion(9))
     );
     assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
     assert_eq!(server.current_stamp().version, InputVersion(9));
+}
+
+#[test]
+fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
+    let server = server_with(&[(1, false)]);
+    let mut called = false;
+    assert_eq!(
+        server.coordinated_commit(InputVersion(9), || {
+            called = true;
+            Ok(Commit::default())
+        }),
+        Err(CoordinatedCommitError::Stale {
+            expected: InputVersion(9),
+            observed: InputVersion(0),
+        })
+    );
+    assert!(!called);
+    assert_eq!(
+        server
+            .coordinated_commit(InputVersion(0), || Ok(Commit::default()))
+            .unwrap()
+            .version,
+        InputVersion(1)
+    );
+}
+
+#[test]
+fn coordinator_can_project_daemon_controls_but_hub_cannot_write_them_directly() {
+    let server = server_with(&[(1, false)]);
+    let mut control = authoring_entry(44, AuthoringEntryRole::AuthoringOnly);
+    control.local_id = "$record".to_owned();
+    server
+        .commit(Commit {
+            authoring: vec![AuthoringMutation::Set(control.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+    assert!(matches!(
+        authoring_snapshot(&hub).inspect(control.uuid),
+        RpcResult::Success(AuthoringInspectResult::Inspection(_))
+    ));
+    assert!(matches!(
+        hub.write(InputVersion(1), vec![AuthoringOp::Set(control)]),
+        RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { .. })
+    ));
+    assert_eq!(server.current_stamp().version, InputVersion(1));
 }
 
 fn connect(server: &Server, policies: &[(u8, bool)]) -> Hub {

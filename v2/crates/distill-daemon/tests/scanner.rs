@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
-use distill_daemon::scanner::{AssetRoot, RootedScanner, ScanError};
+use distill_daemon::scanner::{AssetRoot, RootedScanner, ScanError, ScannedFileKind};
 use distill_json::AuthoredValue;
 use distill_rpc::{LineageRepairDestination, OccupiedLineageDestinationKind};
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
@@ -49,6 +49,39 @@ fn scanner(temp: &tempfile::TempDir) -> RootedScanner {
         root.join(".distill-displaced"),
     )])
     .unwrap()
+}
+
+#[test]
+fn full_scan_reports_raw_files_and_keeps_malformed_bundle_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::write(root.join("nested/good.bundle"), ordinary_bundle()).unwrap();
+    std::fs::write(root.join("bad.bundle"), b"not a bundle").unwrap();
+    std::fs::write(root.join("source.png"), b"raw source").unwrap();
+    let scanner = scanner(&temp);
+
+    let scan = scanner.scan().unwrap();
+    assert_eq!(
+        scan.files
+            .iter()
+            .map(|file| (file.normalized_path.as_str(), file.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("bad.bundle", ScannedFileKind::File),
+            ("nested", ScannedFileKind::Directory),
+            ("nested/good.bundle", ScannedFileKind::File),
+            ("source.png", ScannedFileKind::File),
+        ]
+    );
+    assert_eq!(scan.bundles.len(), 2);
+    assert!(scan.bundles[0].parsed.is_err());
+    assert!(scan.bundles[1].parsed.is_ok());
+    assert!(scan
+        .files
+        .iter()
+        .filter(|file| file.kind == ScannedFileKind::File)
+        .all(|file| file.content_hash.is_some()));
 }
 
 #[test]

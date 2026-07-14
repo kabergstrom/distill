@@ -475,6 +475,93 @@ impl Store {
             .optional()?)
     }
 
+    /// Complete deterministic bundle projection used to synthesize deletes
+    /// during startup reconciliation and to hydrate the RPC metadata index.
+    pub fn all_bundles(&self) -> Result<Vec<BundleMeta>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT bundle_uuid, root_id, path, format_version, content_hash,
+                    origin_rules_bundle, origin_rule, origin_group_root, origin_group_path
+             FROM bundles ORDER BY bundle_uuid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let origin = match (
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ) {
+                (Some(rules), Some(rule), Some(group_root), Some(group_path)) => {
+                    Some(DirectoryOrigin {
+                        rules_bundle: BundleUuid(blob16(rules)),
+                        rule: DirectoryRuleId(blob16(rule)),
+                        group_root,
+                        group_path,
+                    })
+                }
+                _ => None,
+            };
+            Ok(BundleMeta {
+                bundle: BundleUuid(blob16(row.get(0)?)),
+                root: RootId(row.get(1)?),
+                path: row.get(2)?,
+                format_version: row.get(3)?,
+                content_hash: ContentHash(blob32(row.get(4)?)),
+                origin,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Complete deterministic entry projection for one bundle. Poisoned
+    /// skeleton rows intentionally fail through [`Store::entry`] rather than
+    /// being mistaken for ordinary authored metadata.
+    pub fn entries_in_bundle(&self, bundle: BundleUuid) -> Result<Vec<EntryMeta>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1 ORDER BY asset_uuid")?;
+        let assets = statement
+            .query_map([bundle.0.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut entries = Vec::with_capacity(assets.len());
+        for asset in assets {
+            if let Some(entry) = self.entry(AssetUuid(blob16(asset)))? {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Complete path-index projection grouped by normalized logical path.
+    /// Multiple roots remain multiple candidates; no root is selected here.
+    pub fn all_path_entries(&self) -> Result<Vec<(String, RootId, AssetUuid)>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path, root_id, asset_uuid FROM path_index ORDER BY path, root_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                RootId(row.get(1)?),
+                AssetUuid(blob16(row.get(2)?)),
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Raw deterministic asset identity set, including poisoned skeleton rows.
+    /// Startup reconciliation uses it only to remove identities absent from a
+    /// healed full scan; it does not expose skeleton metadata.
+    pub fn all_asset_ids(&self) -> Result<Vec<AssetUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT asset_uuid FROM assets ORDER BY asset_uuid")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Every generated bundle a rules bundle owns (§2, §8): the
     /// scan-derived ownership index orphan tracking re-derives after
     /// daemon-state loss — never precious.

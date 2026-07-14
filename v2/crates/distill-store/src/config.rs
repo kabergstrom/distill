@@ -359,6 +359,28 @@ impl Store {
 }
 
 impl InputTxn<'_> {
+    /// Publish a validated configuration candidate, healing any prior poison
+    /// while retaining the active generation selected by the configuration
+    /// coordinator.
+    pub fn publish_configuration_ready(&mut self, generation: u64) -> Result<(), StoreError> {
+        self.txn.execute(
+            "INSERT INTO configuration_state(
+                 id, active_generation, input_version,
+                 poison_code, poison_detail_version, poison_detail,
+                 poison_reason_hash, poison_message
+             ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET active_generation = excluded.active_generation,
+               input_version = excluded.input_version,
+               poison_code = NULL,
+               poison_detail_version = NULL,
+               poison_detail = NULL,
+               poison_reason_hash = NULL,
+               poison_message = NULL",
+            rusqlite::params![generation as i64, self.version().0 as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn publish_configuration_poison(
         &mut self,
         reason: &DscpV1,

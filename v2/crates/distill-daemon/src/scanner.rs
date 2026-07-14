@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
-use distill_core::id::BundleFileHash;
+use distill_core::id::{BundleFileHash, ContentHash};
 use distill_rpc::{
     LineageManifestClaimant, LineageRepairDestination, OccupiedLineageDestinationKind,
 };
@@ -136,12 +136,42 @@ pub struct RootedScanner {
     roots: BTreeMap<String, CanonicalRoot>,
 }
 
-#[derive(Debug)]
-struct ScannedBundle {
-    root_name: String,
-    normalized_path: String,
-    file_hash: BundleFileHash,
-    parsed: distill_bundle::Bundle,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannedFileKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+/// One identity-checked raw-tree row. `content_hash` is present for every
+/// regular-file observation, including a symlink whose admitted target is a
+/// regular file; directories carry no byte identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedFile {
+    pub root_name: String,
+    pub normalized_path: String,
+    pub kind: ScannedFileKind,
+    pub modified_nanos: i64,
+    pub size: u64,
+    pub content_hash: Option<ContentHash>,
+}
+
+/// A `.bundle` candidate remains in the report even when its envelope is
+/// malformed. The coordinator, not traversal, decides whether the current
+/// bytes yield a complete namespace skeleton or version-global poison.
+#[derive(Debug, Clone)]
+pub struct ScannedBundle {
+    pub root_name: String,
+    pub normalized_path: String,
+    pub file_hash: BundleFileHash,
+    pub bytes: Vec<u8>,
+    pub parsed: Result<distill_bundle::Bundle, distill_bundle::BundleError>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanSnapshot {
+    pub files: Vec<ScannedFile>,
+    pub bundles: Vec<ScannedBundle>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,31 +297,33 @@ impl RootedScanner {
     }
 
     pub fn lineage_claimants(&self) -> Result<Vec<LineageManifestClaimant>, ScanError> {
-        let mut claimants = self
-            .scan_bundles()?
-            .into_iter()
-            .flat_map(|bundle| {
-                bundle
-                    .parsed
-                    .assets
-                    .into_iter()
-                    .filter(|(_, entry)| entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID)
-                    .map(move |(local_id, entry)| LineageManifestClaimant {
+        let mut claimants = Vec::new();
+        for bundle in self.scan()?.bundles {
+            let Ok(parsed) = bundle.parsed else {
+                continue;
+            };
+            for (local_id, entry) in parsed.assets {
+                if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
+                    claimants.push(LineageManifestClaimant {
                         root_name: bundle.root_name.clone(),
                         normalized_path: bundle.normalized_path.clone(),
-                        bundle: bundle.parsed.uuid,
+                        bundle: parsed.uuid,
                         local_id,
                         asset: entry.uuid,
                         file_hash: bundle.file_hash,
-                    })
-            })
-            .collect::<Vec<_>>();
+                    });
+                }
+            }
+        }
         claimants.sort();
         claimants.dedup();
         Ok(claimants)
     }
 
-    fn scan_bundles(&self) -> Result<Vec<ScannedBundle>, ScanError> {
+    /// Enumerate the complete raw namespace in deterministic `(root, path)`
+    /// order. Watchers arm outside this call; their generation-tagged event
+    /// union is applied by the coordinator after this candidate commits.
+    pub fn scan(&self) -> Result<ScanSnapshot, ScanError> {
         let mut stack = self
             .roots
             .values()
@@ -304,7 +336,7 @@ impl RootedScanner {
             })
             .collect::<Vec<_>>();
         let mut identities = BTreeMap::<FileIdentity, (String, PathBuf)>::new();
-        let mut bundles = Vec::new();
+        let mut snapshot = ScanSnapshot::default();
 
         while let Some(pending) = stack.pop() {
             let root = &self.roots[&pending.root_name];
@@ -332,6 +364,16 @@ impl RootedScanner {
             if pending.ancestry.contains(&identity) {
                 return Err(ScanError::DirectoryCycle {
                     path: pending.physical_path,
+                });
+            }
+            if !pending.relative_components.is_empty() {
+                snapshot.files.push(ScannedFile {
+                    root_name: pending.root_name.clone(),
+                    normalized_path: pending.relative_components.join("/"),
+                    kind: ScannedFileKind::Directory,
+                    modified_nanos: modified_nanos(&metadata),
+                    size: metadata.len(),
+                    content_hash: None,
                 });
             }
             if let Some((first_root, first)) = identities.insert(
@@ -372,10 +414,33 @@ impl RootedScanner {
                 let mut relative = pending.relative_components.clone();
                 relative.push(component);
                 let physical = entry.path();
+                let link_metadata =
+                    fs::symlink_metadata(&physical).map_err(|source| ScanError::Io {
+                        path: physical.clone(),
+                        source,
+                    })?;
                 let metadata = fs::metadata(&physical).map_err(|source| ScanError::Io {
                     path: physical.clone(),
                     source,
                 })?;
+                let is_symlink = link_metadata.file_type().is_symlink();
+                if is_symlink {
+                    let canonical =
+                        fs::canonicalize(&physical).map_err(|source| ScanError::Io {
+                            path: physical.clone(),
+                            source,
+                        })?;
+                    if !self
+                        .roots
+                        .values()
+                        .any(|candidate| canonical.starts_with(&candidate.canonical_path))
+                    {
+                        return Err(ScanError::SymlinkEscape {
+                            path: physical,
+                            target: canonical,
+                        });
+                    }
+                }
                 if metadata.is_dir() {
                     let canonical =
                         fs::canonicalize(&physical).map_err(|source| ScanError::Io {
@@ -400,25 +465,48 @@ impl RootedScanner {
                         relative_components: relative,
                         ancestry,
                     });
-                } else if metadata.is_file()
-                    && physical
+                } else if metadata.is_file() {
+                    let bytes = self.read_identity_checked(&physical)?;
+                    let normalized_path = relative.join("/");
+                    snapshot.files.push(ScannedFile {
+                        root_name: pending.root_name.clone(),
+                        normalized_path: normalized_path.clone(),
+                        kind: if is_symlink {
+                            ScannedFileKind::Symlink
+                        } else {
+                            ScannedFileKind::File
+                        },
+                        modified_nanos: modified_nanos(&metadata),
+                        size: metadata.len(),
+                        content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+                    });
+                    if physical
                         .extension()
                         .and_then(|extension| extension.to_str())
                         == Some("bundle")
-                {
-                    let bytes = self.read_identity_checked(&physical)?;
-                    if let Ok(parsed) = distill_bundle::parse_bundle(&bytes) {
-                        bundles.push(ScannedBundle {
+                    {
+                        snapshot.bundles.push(ScannedBundle {
                             root_name: pending.root_name.clone(),
-                            normalized_path: relative.join("/"),
+                            normalized_path,
                             file_hash: BundleFileHash::of_observed_bytes(&bytes),
-                            parsed,
+                            parsed: distill_bundle::parse_bundle(&bytes),
+                            bytes,
                         });
                     }
+                } else {
+                    return Err(ScanError::NonRegularFile { path: physical });
                 }
             }
         }
-        Ok(bundles)
+        snapshot.files.sort_by(|left, right| {
+            (&left.root_name, &left.normalized_path)
+                .cmp(&(&right.root_name, &right.normalized_path))
+        });
+        snapshot.bundles.sort_by(|left, right| {
+            (&left.root_name, &left.normalized_path)
+                .cmp(&(&right.root_name, &right.normalized_path))
+        });
+        Ok(snapshot)
     }
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
@@ -453,6 +541,16 @@ impl RootedScanner {
         }
         Ok(bytes)
     }
+}
+
+fn modified_nanos(metadata: &Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+        })
 }
 
 fn validate_root_name(name: &str) -> Result<(), ScanError> {

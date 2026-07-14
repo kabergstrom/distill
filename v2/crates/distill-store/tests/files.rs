@@ -70,6 +70,18 @@ fn file_rows_roundtrip_and_are_keyed_per_root() {
     assert_eq!(a.kind, FileKind::File);
     assert_eq!(a.content_hash, Some(ContentHash([3u8; 32])));
     assert!(store.file(main, "absent").unwrap().is_none());
+    assert_eq!(
+        store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|(root, path, state)| (root, path, state.mtime))
+            .collect::<Vec<_>>(),
+        [
+            (main, "tex/rock.bundle".to_owned(), 100),
+            (engine, "tex/rock.bundle".to_owned(), 200),
+        ]
+    );
 }
 
 #[test]

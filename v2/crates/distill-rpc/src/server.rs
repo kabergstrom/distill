@@ -164,6 +164,16 @@ pub struct DeltaStream {
     connection: Arc<Mutex<ConnectionState>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatedCommitError {
+    Stale {
+        expected: InputVersion,
+        observed: InputVersion,
+    },
+    Publication(String),
+    Invalid(AdminError),
+}
+
 struct MetadataBinding {
     id: u64,
     store_instance: StoreInstanceId,
@@ -435,10 +445,7 @@ impl Server {
                 return Err(AttestationShapeError::DuplicateTarget { target: name });
             }
         }
-        let stamp = SnapshotStamp {
-            instance,
-            version,
-        };
+        let stamp = SnapshotStamp { instance, version };
         let view = Arc::new(VersionView {
             stamp,
             configuration: ConfigurationStatus::Ready,
@@ -636,6 +643,27 @@ impl Server {
     pub fn commit(&self, commit: Commit) -> Result<SnapshotStamp, AdminError> {
         let mut state = self.lock();
         commit_locked(&mut state, commit)
+    }
+
+    /// Serialize one durable coordinator publication with the matching RPC
+    /// projection. The closure runs while the server publication lock is held;
+    /// watcher/configuration coordinators use the same lock order as RPC
+    /// authoring backends, so a store version can never advance without its
+    /// exact in-memory successor being installed before another publication.
+    pub fn coordinated_commit(
+        &self,
+        base: InputVersion,
+        publish: impl FnOnce() -> Result<Commit, String>,
+    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
+        let mut state = self.lock();
+        if state.current != base {
+            return Err(CoordinatedCommitError::Stale {
+                expected: base,
+                observed: state.current,
+            });
+        }
+        let commit = publish().map_err(CoordinatedCommitError::Publication)?;
+        commit_locked(&mut state, commit).map_err(CoordinatedCommitError::Invalid)
     }
 
     /// Discard cursor history strictly before `oldest_available`.
@@ -1706,6 +1734,14 @@ impl Hub {
         if ops.is_empty() {
             return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
                 detail: "authoring operation batch must not be empty".to_owned(),
+            });
+        }
+        if ops.iter().any(|operation| {
+            matches!(operation, AuthoringOp::Set(entry) if entry.local_id.starts_with('$'))
+        }) {
+            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+                detail: "daemon-owned '$settings' and '$record' entries cannot be written directly"
+                    .to_owned(),
             });
         }
         drop(connection);
@@ -3881,7 +3917,7 @@ fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
     for mutation in &commit.authoring {
         let uuid = match mutation {
             AuthoringMutation::Set(entry) => {
-                if !valid_reference_local_id(&entry.local_id) {
+                if !valid_bundle_local_id(&entry.local_id) {
                     return Err(AdminError::InvalidAuthoringIdentity {
                         uuid: entry.uuid,
                         detail: "local ID is noncanonical or uses the reserved '$' namespace"
@@ -4353,6 +4389,10 @@ fn valid_identifier(value: &str) -> bool {
 
 fn valid_reference_local_id(value: &str) -> bool {
     valid_identifier(value) && !value.starts_with('$')
+}
+
+fn valid_bundle_local_id(value: &str) -> bool {
+    valid_reference_local_id(value) || matches!(value, "$settings" | "$record")
 }
 
 fn valid_logical_path(path: &str) -> bool {

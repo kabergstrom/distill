@@ -94,6 +94,11 @@ fn bundle_and_asset_rows_roundtrip() {
 
     assert!(store.entry(AssetUuid([99u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([99u8; 16])).unwrap().is_none());
+    assert_eq!(store.all_bundles().unwrap(), [bundle]);
+    assert_eq!(
+        store.entries_in_bundle(BundleUuid([1; 16])).unwrap(),
+        [entry]
+    );
 }
 
 // ---- directory-import ownership (§2, §8, §13) ----
