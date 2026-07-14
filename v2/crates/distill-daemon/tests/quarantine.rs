@@ -1,6 +1,11 @@
+use std::collections::BTreeMap;
+
 use distill_core::id::ContentHash;
 use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot, RecoveryOutcome};
-use distill_store::journal::{CreationRecoveryOutcome, RenameAsideOutcome};
+use distill_store::codegen::CodegenPublicationBasis;
+use distill_store::journal::{
+    CreationRecoveryOutcome, JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome,
+};
 use distill_store::{Store, StoreConfig, StoreError};
 
 #[test]
@@ -130,4 +135,48 @@ fn admitted_replacement_uses_the_portable_no_replace_state_machine() {
         RenameAsideOutcome::Installed
     );
     assert_eq!(std::fs::read(target).unwrap(), b"new");
+}
+
+#[test]
+fn codegen_group_recovery_commits_preimages_before_retirement() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let output = temp.path().join("generated");
+    std::fs::create_dir(&output).unwrap();
+    let quarantine = output.join(".distill-displaced");
+    let target = output.join("mod.rs");
+    let proposed = output.join(".mod.proposed");
+    std::fs::write(&proposed, b"pub mod shader;\n").unwrap();
+    let proposed_hash = ContentHash(*blake3::hash(b"pub mod shader;\n").as_bytes());
+    let mut store = Store::open(StoreConfig::new(&state)).unwrap();
+    let mut outputs = BTreeMap::new();
+    outputs.insert("mod.rs".to_owned(), proposed_hash);
+    let basis =
+        CodegenPublicationBasis::new(store.input_version(), BTreeMap::new(), outputs.clone());
+    store
+        .record_publication_group(
+            PublicationGroupKind::Codegen,
+            &basis.encode(),
+            &[JournalIntentPlan {
+                target_path: target.to_string_lossy().into_owned(),
+                temp_path: proposed.to_string_lossy().into_owned(),
+                conflict_path: output.join("mod.conflict").to_string_lossy().into_owned(),
+                pre_image_hash: None,
+                proposed_hash,
+            }],
+        )
+        .unwrap();
+    let driver = QuarantineDriver::new([QuarantineRoot::new(&output, &quarantine)]).unwrap();
+
+    let publication = driver.admit_publication(&mut store).unwrap();
+    assert_eq!(
+        publication.recovered().len(),
+        1,
+        "the unfinished child was recovered before admission"
+    );
+    drop(publication);
+
+    assert_eq!(std::fs::read(target).unwrap(), b"pub mod shader;\n");
+    assert_eq!(store.codegen_outputs().unwrap(), outputs);
+    assert!(store.unfinished_publication_groups().unwrap().is_empty());
 }

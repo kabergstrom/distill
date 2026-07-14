@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use distill_core::id::ContentHash;
+use distill_store::codegen::CodegenPublicationBasis;
 use distill_store::journal::{
     JournalIntentPlan, PublicationGroup, PublicationGroupKind, RecoveredEdit,
 };
@@ -238,6 +239,15 @@ impl QuarantineDriver {
             })));
         }
         for group in store.unfinished_publication_groups()? {
+            if group.kind == PublicationGroupKind::Codegen {
+                let basis = CodegenPublicationBasis::decode(&group.basis).map_err(|detail| {
+                    QuarantineError::Store(Box::new(StoreError::BadIntent {
+                        intent_id: group.group_id,
+                        detail,
+                    }))
+                })?;
+                store.apply_codegen_publication_basis(&basis)?;
+            }
             store.retire_publication_group(group.group_id)?;
         }
         Ok(outcomes)
@@ -294,6 +304,25 @@ impl PublicationDriver<'_> {
         self.store
             .retire_publication_group(group_id)
             .map_err(Into::into)
+    }
+
+    /// Install the durable preimage map after every Codegen child mutation is
+    /// terminal, then retire the parent. Startup recovery performs the same
+    /// idempotent sequence for a crash between these two steps.
+    pub fn complete_codegen_group(
+        &mut self,
+        group: &PublicationGroup,
+        basis: &CodegenPublicationBasis,
+    ) -> Result<(), QuarantineError> {
+        if group.kind != PublicationGroupKind::Codegen || group.basis != basis.encode() {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail: "codegen completion basis does not match its publication group".into(),
+            })));
+        }
+        self.store.apply_codegen_publication_basis(basis)?;
+        self.store.retire_publication_group(group.group_id)?;
+        Ok(())
     }
 
     pub fn resume_group_replace(
