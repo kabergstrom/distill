@@ -5131,6 +5131,13 @@ fn path_glob_matches(pattern: &str, path: &str) -> bool {
 
 fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
     let mut chunks = VecDeque::new();
+    let total_bytes = payload
+        .blobs
+        .iter()
+        .try_fold(payload.structural.len() as u64, |total, blob| {
+            total.checked_add(blob.len() as u64)
+        })
+        .expect("one process cannot hold more artifact bytes than u64");
     push_chunks(
         &mut chunks,
         ArtifactChunkKind::Structural,
@@ -5147,7 +5154,10 @@ fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
             chunk_size,
         );
     }
-    ChunkStream { chunks }
+    ChunkStream {
+        chunks,
+        total_bytes,
+    }
 }
 
 fn push_chunks(

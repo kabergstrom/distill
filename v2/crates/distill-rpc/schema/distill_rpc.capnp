@@ -918,6 +918,7 @@ struct PathResolveResult {
 struct TerminalFetch {
   basis @0 :RpcBasisValue;
   chunks @1 :ChunkStream;
+  totalBytes @2 :UInt64;
 }
 
 struct ChunkStreamCall {

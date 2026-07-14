@@ -1797,6 +1797,13 @@ pub struct ArtifactChunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkStream {
     pub(crate) chunks: std::collections::VecDeque<ArtifactChunk>,
+    pub(crate) total_bytes: u64,
+}
+
+impl ChunkStream {
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
 }
 
 pub(crate) trait ProgressCompletion: Send + Sync {

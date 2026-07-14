@@ -193,6 +193,7 @@ async fn remote_loader_client_preserves_typed_calls_and_rotates_reattestation() 
                 RemoteCall::Success(terminal) => terminal,
                 other => panic!("fetch failed: {other:?}"),
             };
+            let fetched_total = fetched.value.total_bytes();
             let mut structural = Vec::new();
             while let Some(chunk) = fetched.value.next_chunk().await.unwrap() {
                 assert_eq!(chunk.kind, ArtifactChunkKind::Structural);
@@ -202,6 +203,7 @@ async fn remote_loader_client_preserves_typed_calls_and_rotates_reattestation() 
                 distill_wire::artifact::content_hash(&structural),
                 content_hash
             );
+            assert_eq!(fetched_total, structural.len() as u64);
             assert_eq!(
                 match hub.wire_tree(layout_hash).await.unwrap() {
                     RemoteCall::Success(bytes) => bytes,
@@ -1209,6 +1211,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                     .get_version(),
                 1
             );
+            assert_eq!(terminal.get_total_bytes(), expected_structural.len() as u64);
             let chunks = terminal.get_chunks().unwrap();
             let chunk_response = chunks.next_request().send().promise.await.unwrap();
             let chunk = chunk_response.get().unwrap();

@@ -133,6 +133,7 @@ impl RemoteHub {
                     basis,
                     value: RemoteChunkStream {
                         client: value.get_chunks()?,
+                        total_bytes: value.get_total_bytes(),
                     },
                 }))
             }
@@ -521,6 +522,7 @@ impl RemoteSnapshot {
 
 pub struct RemoteChunkStream {
     client: schema::chunk_stream::Client,
+    total_bytes: u64,
 }
 
 impl std::fmt::Debug for RemoteChunkStream {
@@ -532,6 +534,10 @@ impl std::fmt::Debug for RemoteChunkStream {
 }
 
 impl RemoteChunkStream {
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
     pub async fn next_chunk(&mut self) -> Result<Option<ArtifactChunk>, capnp::Error> {
         let response = self.client.next_request().send().promise.await?;
         let value = response.get()?;

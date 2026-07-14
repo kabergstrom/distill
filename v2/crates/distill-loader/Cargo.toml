@@ -13,4 +13,6 @@ distill-rpc = { path = "../distill-rpc" }
 distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
+memmap2 = "0.7"
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "sync"] }

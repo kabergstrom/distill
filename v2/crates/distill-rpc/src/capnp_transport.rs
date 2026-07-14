@@ -4282,6 +4282,7 @@ fn write_fetch_result(
         RpcResult::Success(terminal) => {
             let mut output = result.init_success();
             write_rpc_basis(output.reborrow().init_basis(), &terminal.basis);
+            output.set_total_bytes(terminal.value.total_bytes());
             let client: schema::chunk_stream::Client = capnp_rpc::new_client(ChunkStreamService {
                 stream: Mutex::new(terminal.value),
             });

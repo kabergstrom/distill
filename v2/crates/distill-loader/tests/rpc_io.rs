@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use distill_core::attestation::{CompiledTypeRow, CompiledTypeTable, RegistryExtrasV1};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-use distill_loader::{IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo, RuntimeAttestation};
+use distill_loader::{
+    IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo, RpcIoConfig, RuntimeAttestation,
+};
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, GameModuleEpoch,
@@ -62,6 +64,7 @@ fn fixture() -> Fixture {
     server
         .install_wire_tree(layout_hash, Arc::from(dswl_bytes(&wire).unwrap()))
         .unwrap();
+    let blob = vec![0x5a; 64];
     let complete = write_artifact(
         &ArtifactHeader {
             asset_uuid: asset,
@@ -74,7 +77,7 @@ fn fixture() -> Fixture {
         &[],
         &[],
         &[],
-        &[(Vec::new(), &[][..])],
+        &[(Vec::new(), blob.as_slice())],
     )
     .unwrap();
     let parsed = parse_artifact(&complete).unwrap();
@@ -85,7 +88,7 @@ fn fixture() -> Fixture {
             hash,
             ArtifactPayload {
                 structural: Arc::from(complete[..structural_len].to_vec()),
-                blobs: vec![Arc::from(&b""[..])],
+                blobs: vec![Arc::from(blob)],
                 encoded_type: type_uuid,
                 terminal_type: type_uuid,
                 closure_rows: vec![ServedClosureRow {
@@ -161,7 +164,17 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         )
         .unwrap(),
     };
-    let mut io = RpcIo::connect(address, request).unwrap();
+    let spool = tempfile::tempdir().unwrap();
+    let mut io = RpcIo::connect_with_config(
+        address,
+        request,
+        RpcIoConfig {
+            fetch_memory_budget: 8,
+            spool_threshold: 1,
+            spool_directory: Some(spool.path().to_owned()),
+        },
+    )
+    .unwrap();
     io.reattest(initial_attestation.clone());
     assert!(matches!(
         poll_until(&mut io, 1).as_slice(),
@@ -216,9 +229,10 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
             basis: event_basis,
             ..
         } if artifact.blobs.len() == 1
-            && artifact.blobs[0].is_empty()
+            && artifact.blobs[0].as_bytes() == [0x5a; 64]
             && event_basis == &basis
     )));
+    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 1);
     assert!(events.iter().any(|event| matches!(
         event,
         IoEvent::PathResolved {
@@ -247,6 +261,8 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
             if assets == &vec![(asset, distill_loader::AssetDeltaState::Changed)]
     )));
 
+    drop(events);
+    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
     drop(io);
     server_thread.join().unwrap();
 }
