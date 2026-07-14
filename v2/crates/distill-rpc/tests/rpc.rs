@@ -173,11 +173,16 @@ impl BuildBackend for RecordingBuildBackend {
         let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
         let wire_bytes: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
         let layout_hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
+        let authored_type = if request.output_key.is_empty() {
+            request.entry.type_uuid
+        } else {
+            request.requested_terminal_type
+        };
         let (content_hash, payload) = canonical_artifact(
-            request.entry.uuid,
-            request.entry.type_uuid,
-            request.entry.terminal_type,
-            request.entry.terminal_type,
+            request.requested_asset,
+            authored_type,
+            request.requested_terminal_type,
+            request.requested_terminal_type,
             layout_hash,
             Vec::new(),
             Vec::new(),
@@ -247,6 +252,52 @@ fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outpu
     assert_eq!(requests[1].basis, second_stamp);
     assert_eq!(requests[1].target, "dev");
     assert_eq!(requests[1].target_definition, target_hash(7));
+    assert_eq!(requests[1].requested_asset, entry.uuid);
+    assert!(requests[1].output_key.is_empty());
+}
+
+#[test]
+fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() {
+    let server = server_with(&[(1, false), (2, false)]);
+    let backend = Arc::new(RecordingBuildBackend::default());
+    server.install_build_backend(backend.clone());
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let output_key = "reflection".to_owned();
+    let child = AssetUuid::v5(entry.uuid, &output_key);
+    server
+        .commit(Commit {
+            assets: vec![set_asset(
+                entry.uuid,
+                StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                AssetDeltaState::Changed,
+            )],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            derived_outputs: Some(BTreeMap::from([(
+                child,
+                DerivedOutputEntry {
+                    parent: entry.uuid,
+                    output_key: output_key.clone(),
+                    terminal_type: type_id(2),
+                },
+            )])),
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let snapshot = snapshot(&connect(&server, &[(1, false), (2, false)]));
+    let hash = match snapshot.resolve(child).success().unwrap().value {
+        ResolveResult::Built { content_hash } => content_hash,
+        other => panic!("expected built derived output, got {other:?}"),
+    };
+    assert!(matches!(snapshot.fetch(hash), RpcResult::Success(_)));
+    let requests = backend.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].entry.uuid, entry.uuid);
+    assert_eq!(requests[0].requested_asset, child);
+    assert_eq!(requests[0].output_key, output_key);
+    assert_eq!(requests[0].requested_terminal_type, type_id(2));
 }
 
 #[test]

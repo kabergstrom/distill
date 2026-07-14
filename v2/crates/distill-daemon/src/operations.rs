@@ -31,6 +31,7 @@ use distill_store::Store;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::coordinator::{publish_current_scan, LineageDestination};
 use crate::lineage_repair::{unique_sibling, write_same_dir_temp};
+use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::QuarantineDriver;
 use crate::scanner::RootedScanner;
 
@@ -45,6 +46,7 @@ impl AuthoringService {
             scanner: self.scanner.clone(),
             quarantine: self.quarantine_snapshot(),
             lineage_destination: self.lineage_destination_snapshot(),
+            pipeline_projection: self.pipeline_projection(),
         };
         let planned = match operation {
             LongRunningOp::RenameWithFixups(payload) => {
@@ -318,6 +320,7 @@ struct OperationRuntime {
     scanner: RootedScanner,
     quarantine: QuarantineDriver,
     lineage_destination: LineageDestination,
+    pipeline_projection: PipelineProjection,
 }
 
 enum PlannedOperation {
@@ -421,8 +424,13 @@ impl OperationRuntime {
             .map_err(|error| error.to_string())?;
         drop(publication);
         drop(store);
-        let commit =
-            publish_current_scan(&self.scanner, &self.lineage_destination, &self.store, base)?;
+        let commit = publish_current_scan(
+            &self.scanner,
+            &self.lineage_destination,
+            &self.store,
+            base,
+            &self.pipeline_projection,
+        )?;
         Ok(DeferredOperationResult {
             commit,
             terminal_error: (!conflicts.is_empty()).then(|| conflicts.join("; ")),

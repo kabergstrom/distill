@@ -12,6 +12,7 @@ pub mod lineage_repair;
 pub mod logical_node;
 pub mod module_loader;
 mod operations;
+mod pipeline_map;
 pub mod policy;
 pub mod process;
 pub mod quarantine;

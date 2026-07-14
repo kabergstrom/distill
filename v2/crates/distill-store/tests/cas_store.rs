@@ -410,6 +410,25 @@ fn derived_output_namespace_resolves_children() {
 }
 
 #[test]
+fn derived_output_namespace_replacement_is_atomic_and_complete() {
+    let (_d, mut store) = store();
+    let old = declare_child(&mut store, PARENT, "normals");
+    let next_parent = AssetUuid([8; 16]);
+    let next = AssetUuid::v5(next_parent, "meshlets");
+    store
+        .input_transaction(|txn| {
+            txn.clear_derived_outputs()?;
+            txn.set_derived_output(next, next_parent, "meshlets")
+        })
+        .unwrap();
+    assert!(store.resolve_child(old).unwrap().is_none());
+    assert_eq!(
+        store.resolve_child(next).unwrap(),
+        Some((next_parent, "meshlets".to_owned()))
+    );
+}
+
+#[test]
 fn commit_assertions_verify_against_the_namespace() {
     // §9: commit rows are memo data verified against the input-versioned
     // namespace index, never a namespace claim of their own.

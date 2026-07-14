@@ -144,6 +144,13 @@ fn verify_request_entry(
     authority: &ProjectSchemaAuthority,
 ) -> Result<(), BuildError> {
     let requested = &request.entry;
+    if request.output_key.is_empty() {
+        if request.requested_asset != requested.uuid {
+            return Err(BuildError::Drifted(request.drifted_input.clone()));
+        }
+    } else if request.requested_asset != AssetUuid::v5(requested.uuid, &request.output_key) {
+        return Err(BuildError::Drifted(request.drifted_input.clone()));
+    }
     if requested.bundle != loaded.meta.bundle
         || requested.local_id != loaded.meta.local_id
         || requested.normalized_path != loaded.bundle_meta.path
@@ -1008,6 +1015,9 @@ mod tests {
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
             target_definition: TargetDefinitionHash([4; 32]),
+            requested_asset: ASSET,
+            output_key: String::new(),
+            requested_terminal_type: TYPE,
             entry: AuthoringEntry {
                 uuid: ASSET,
                 bundle: BUNDLE,

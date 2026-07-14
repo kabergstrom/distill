@@ -1648,6 +1648,12 @@ pub struct BuildRequest {
     pub basis: SnapshotStamp,
     pub target: String,
     pub target_definition: TargetDefinitionHash,
+    /// UUID named by the resolver. For a primary this equals `entry.uuid`;
+    /// for a derived output it is UUIDv5(parent, output_key).
+    pub requested_asset: AssetUuid,
+    /// Empty for the primary, otherwise the statically declared extra key.
+    pub output_key: String,
+    pub requested_terminal_type: TypeUuid,
     pub entry: AuthoringEntry,
     pub drifted_input: DriftedInput,
 }
@@ -1989,11 +1995,24 @@ pub enum PathMutation {
     },
 }
 
+/// Snapshot-published derived child authority.  These rows come from the
+/// authored asset set crossed with the pinned pipeline map; cached build
+/// records never create namespace authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedOutputEntry {
+    pub parent: AssetUuid,
+    pub output_key: String,
+    pub terminal_type: TypeUuid,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Commit {
     pub assets: Vec<AssetMutation>,
     pub authoring: Vec<AuthoringMutation>,
     pub paths: Vec<PathMutation>,
+    /// `Some` replaces the complete derived-output namespace for the new
+    /// immutable version. `None` preserves it for metadata-only commits.
+    pub derived_outputs: Option<BTreeMap<AssetUuid, DerivedOutputEntry>>,
     pub configuration: Option<ConfigurationStatus>,
     pub pipeline: Option<PipelineDiagnostic>,
     /// `Some(None)` heals version poison; `Some(Some(_))` publishes it.

@@ -743,6 +743,13 @@ pub(crate) fn now_millis() -> i64 {
 // ---- derived-output namespace (input-versioned, §9/§13) ----
 
 impl crate::db::InputTxn<'_> {
+    /// Replace-style publications clear the previous version's projection
+    /// before installing the successor rows in the same input transaction.
+    pub fn clear_derived_outputs(&mut self) -> Result<(), StoreError> {
+        self.txn.execute("DELETE FROM derived_outputs", [])?;
+        Ok(())
+    }
+
     /// Publish one derived-output namespace row: `child uuid → (parent
     /// uuid, output key)` — derived per published version from its
     /// assets × pinned pipeline map (§9), the only authority for child

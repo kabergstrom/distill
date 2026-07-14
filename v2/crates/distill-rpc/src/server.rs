@@ -358,6 +358,7 @@ struct VersionView {
     assets: BTreeMap<AssetUuid, VersionResolve>,
     authoring: BTreeMap<AssetUuid, AuthoringEntry>,
     paths: BTreeMap<String, BTreeSet<AssetUuid>>,
+    derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
     lineage_repair: Option<LineageRepairState>,
 }
 
@@ -528,6 +529,7 @@ impl Server {
             assets: BTreeMap::new(),
             authoring: BTreeMap::new(),
             paths: BTreeMap::new(),
+            derived_outputs: BTreeMap::new(),
             lineage_repair: None,
         });
         let mut views = BTreeMap::new();
@@ -2673,10 +2675,12 @@ impl Snapshot {
             if let ConfigurationStatus::Poisoned(poison) = &self.view.configuration {
                 return RpcResult::ConfigurationPoisoned(poison.clone());
             }
+            let derived = self.view.derived_outputs.get(&uuid).cloned();
+            let authoring_uuid = derived.as_ref().map_or(uuid, |output| output.parent);
             if self
                 .view
                 .authoring
-                .get(&uuid)
+                .get(&authoring_uuid)
                 .is_some_and(|entry| entry.role == AuthoringEntryRole::AuthoringOnly)
             {
                 return RpcResult::Success(TerminalEvent {
@@ -2689,16 +2693,26 @@ impl Snapshot {
             let runtime_entry = self
                 .view
                 .authoring
-                .get(&uuid)
+                .get(&authoring_uuid)
                 .filter(|entry| entry.role == AuthoringEntryRole::Runtime)
                 .cloned();
+            let output_key = derived
+                .as_ref()
+                .map_or_else(String::new, |output| output.output_key.clone());
             let key = BuildKey {
                 basis: self.basis.snapshot,
                 target: connection.target.clone(),
                 asset: uuid,
             };
             let build_resolution = state.build_results.get(&key).cloned();
-            let version_resolution = self.view.assets.get(&uuid).cloned();
+            let version_resolution = derived.as_ref().map_or_else(
+                || self.view.assets.get(&uuid).cloned(),
+                |output| {
+                    Some(VersionResolve::Drifted {
+                        input: DriftedInput::Asset(output.parent),
+                    })
+                },
+            );
 
             if build_resolution.is_none() {
                 if let (Some(VersionResolve::Drifted { input }), Some(entry)) =
@@ -2724,6 +2738,11 @@ impl Snapshot {
                         basis: self.basis.snapshot,
                         target: connection.target.clone(),
                         target_definition,
+                        requested_asset: uuid,
+                        output_key: output_key.clone(),
+                        requested_terminal_type: derived
+                            .as_ref()
+                            .map_or(entry.terminal_type, |output| output.terminal_type),
                         entry,
                         drifted_input: input.clone(),
                     };
@@ -2773,7 +2792,25 @@ impl Snapshot {
             {
                 match verified_artifact_closure(&state, *content_hash) {
                     Ok((mut required, rows)) => {
-                        if let Some(entry) = &runtime_entry {
+                        if let Some(output) = &derived {
+                            let Some(root) = rows.iter().find(|row| row.asset == uuid) else {
+                                return RpcResult::Failure(RpcFailure::InvalidQuery {
+                                    detail:
+                                        "built artifact closure omits the requested derived output"
+                                            .to_owned(),
+                                });
+                            };
+                            if root.authored_type != output.terminal_type
+                                || root.encoded_type != output.terminal_type
+                                || root.terminal_type != output.terminal_type
+                            {
+                                return RpcResult::Failure(RpcFailure::InvalidQuery {
+                                    detail: "derived-output declaration does not match the authenticated artifact closure"
+                                        .to_owned(),
+                                });
+                            }
+                            required.insert(output.terminal_type);
+                        } else if let Some(entry) = &runtime_entry {
                             let Some(root) = rows.iter().find(|row| row.asset == entry.uuid) else {
                                 return RpcResult::Failure(RpcFailure::InvalidQuery {
                                     detail:
@@ -2795,6 +2832,8 @@ impl Snapshot {
                     }
                     Err(error) => return RpcResult::Failure(error),
                 }
+            } else if let Some(output) = &derived {
+                (BTreeSet::from([output.terminal_type]), Vec::new())
             } else if let Some(entry) = &runtime_entry {
                 match served_rows_for_entry(&state, &self.view, entry) {
                     Ok(verified) => verified,
@@ -4232,6 +4271,9 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
             }
         }
     }
+    if let Some(derived_outputs) = commit.derived_outputs {
+        view.derived_outputs = derived_outputs;
+    }
     if let Some(configuration) = commit.configuration {
         view.configuration = configuration;
     }
@@ -4276,6 +4318,20 @@ fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
     }
     if let Some(Some(repair)) = &commit.lineage_repair {
         validate_lineage_repair_state(repair)?;
+    }
+    if let Some(derived_outputs) = &commit.derived_outputs {
+        for (child, entry) in derived_outputs {
+            if *child != AssetUuid::v5(entry.parent, &entry.output_key)
+                || entry.output_key.is_empty()
+                || !valid_identifier(&entry.output_key)
+            {
+                return Err(AdminError::InvalidAuthoringIdentity {
+                    uuid: *child,
+                    detail: "derived output does not match its canonical parent/key identity"
+                        .to_owned(),
+                });
+            }
+        }
     }
     let mut assets = BTreeSet::new();
     for mutation in &commit.assets {

@@ -31,6 +31,7 @@ use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
     unique_sibling, write_same_dir_temp, LineageRepairBackend, LineageRepairBackendInitError,
 };
+use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::{QuarantineDriver, QuarantineError, QuarantineRoot};
 use crate::scanner::{AssetRoot, RootedScanner, ScanError};
 
@@ -43,6 +44,7 @@ pub struct AuthoringService {
     lineage: RwLock<LineageRepairBackend>,
     pub(crate) builtin_importers: RwLock<RegisteredImporters>,
     pub(crate) pipeline_importers: RwLock<RegisteredImporters>,
+    pipeline_projection: RwLock<PipelineProjection>,
 }
 
 pub(crate) struct AuthoringFilesystemCandidate {
@@ -85,7 +87,22 @@ impl AuthoringService {
             lineage: RwLock::new(lineage),
             builtin_importers: RwLock::new(BTreeMap::new()),
             pipeline_importers: RwLock::new(BTreeMap::new()),
+            pipeline_projection: RwLock::new(PipelineProjection::default()),
         })
+    }
+
+    pub(crate) fn pipeline_projection(&self) -> PipelineProjection {
+        self.pipeline_projection
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn install_pipeline_projection(&self, projection: PipelineProjection) {
+        *self
+            .pipeline_projection
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = projection;
     }
 
     pub(crate) fn prepare_filesystem_candidate(
@@ -305,6 +322,7 @@ impl AuthoringService {
             &self.lineage_destination_snapshot(),
             &self.store,
             base,
+            &self.pipeline_projection(),
         )
         .map_err(invalid)
     }

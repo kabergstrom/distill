@@ -17,8 +17,9 @@ use distill_json::AuthoredValue;
 use distill_rpc::{
     AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
     AuthoringValue, Commit, ConfigurationPoison, ConfigurationStatus, CoordinatedCommitError,
-    DriftedInput, LineageManifestClaimant, LineageRepairState, PathMutation, PipelineDiagnostic,
-    Server, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison, VersionPoisonV1,
+    DerivedOutputEntry, DriftedInput, LineageManifestClaimant, LineageRepairState, PathMutation,
+    PipelineDiagnostic, Server, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison,
+    VersionPoisonV1,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{AssetRecord, BundleMeta};
@@ -44,6 +45,7 @@ use crate::epoch::{
 };
 use crate::lineage_repair::LineageRepairBackendInitError;
 use crate::module_loader::DynamicPipelineModuleLoader;
+use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
@@ -327,31 +329,68 @@ impl DaemonCoordinator {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
             host.prepare_candidate(pipeline_source, &mut requirements, loader)
         };
-        let (pipeline, mut prepared_epoch) = match prepared_epoch {
+        let authored_types = requirements
+            .compiled_types
+            .rows
+            .iter()
+            .map(|row| row.type_uuid)
+            .collect::<Vec<_>>();
+        let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
             Ok(prepared) => {
-                let stored = match stored_pipeline_epoch(&prepared, &requirements) {
-                    Ok(stored) => stored,
-                    Err(error) => {
-                        let _ = runtime.host.discard_unpublished(prepared);
-                        return Err(CoordinatorError::InvalidManifest(error.to_string()));
-                    }
-                };
-                if let Err(error) = self.authoring.prepare_pipeline_importers(
-                    EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
+                match PipelineProjection::build(
+                    prepared.processor_descriptors(),
+                    prepared.dylib_hash(),
+                    &build_targets,
+                    authored_types,
                 ) {
-                    let _ = runtime.host.discard_unpublished(prepared);
-                    return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+                    Err(error) => {
+                        let cleanup = runtime.host.discard_unpublished(prepared);
+                        let poison = cleanup.unwrap_or_else(|| {
+                            PipelinePoison::new(
+                                PipelinePoisonCode::CandidateRegistration,
+                                PipelinePoisonOrigin::CandidateOpen,
+                                CleanupDisposition::CleanedAndClosed,
+                                format!("invalid target-resolved pipeline map: {error:?}"),
+                            )
+                            .expect("candidate-registration cleanup tuple is valid")
+                        });
+                        (
+                            ConfigurationPipelinePublication::Poison(poison),
+                            None,
+                            PipelineProjection::default(),
+                        )
+                    }
+                    Ok(projection) => {
+                        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+                            Ok(stored) => stored,
+                            Err(error) => {
+                                let _ = runtime.host.discard_unpublished(prepared);
+                                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+                            }
+                        };
+                        if let Err(error) = self.authoring.prepare_pipeline_importers(
+                            EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
+                        ) {
+                            let _ = runtime.host.discard_unpublished(prepared);
+                            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+                        }
+                        let tools = prepared.tool_epoch();
+                        (
+                            ConfigurationPipelinePublication::Epoch {
+                                epoch: stored,
+                                tools,
+                            },
+                            Some(prepared),
+                            projection,
+                        )
+                    }
                 }
-                let tools = prepared.tool_epoch();
-                (
-                    ConfigurationPipelinePublication::Epoch {
-                        epoch: stored,
-                        tools,
-                    },
-                    Some(prepared),
-                )
             }
-            Err(poison) => (ConfigurationPipelinePublication::Poison(poison), None),
+            Err(poison) => (
+                ConfigurationPipelinePublication::Poison(poison),
+                None,
+                PipelineProjection::default(),
+            ),
         };
         let filesystem = Arc::new(Mutex::new(Some(filesystem)));
         let captured = Arc::clone(&filesystem);
@@ -360,8 +399,9 @@ impl DaemonCoordinator {
         let authoring = Arc::clone(&self.authoring);
         self.server
             .coordinated_replace_target_set(base, targets, || {
-                let commit = publish_scan(&store, base, candidate, true, Some(&pipeline))
-                    .map_err(|error| error.to_string())?;
+                let commit =
+                    publish_scan(&store, base, candidate, true, Some(&pipeline), &projection)
+                        .map_err(|error| error.to_string())?;
                 let stored_pipeline = lock_store(&store)
                     .pipeline_state()
                     .map_err(|error| error.to_string())?
@@ -386,6 +426,7 @@ impl DaemonCoordinator {
                     .build_targets
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = build_targets.clone();
+                authoring.install_pipeline_projection(projection.clone());
                 self.configuration_poison
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -663,9 +704,10 @@ impl DaemonCoordinator {
         )?;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
+        let projection = self.authoring.pipeline_projection();
         self.server
             .coordinated_commit(base, || {
-                publish_scan(&store, base, candidate, false, None)
+                publish_scan(&store, base, candidate, false, None, &projection)
                     .map_err(|error| error.to_string())
             })
             .map_err(CoordinatorError::Coordinated)
@@ -1150,13 +1192,91 @@ impl ScanCandidate {
     }
 }
 
+fn projected_derived_outputs(
+    candidate: &ScanCandidate,
+    projection: &PipelineProjection,
+) -> Result<
+    (
+        BTreeMap<AssetUuid, DerivedOutputEntry>,
+        Option<VersionPoison>,
+    ),
+    StoreError,
+> {
+    let mut claims = BTreeMap::<AssetUuid, Vec<AssetClaimant>>::new();
+    let mut outputs = BTreeMap::<AssetUuid, DerivedOutputEntry>::new();
+    for source in &candidate.scan.bundles {
+        let Ok(bundle) = &source.parsed else {
+            continue;
+        };
+        for (local_id, entry) in &bundle.assets {
+            claims
+                .entry(entry.uuid)
+                .or_default()
+                .push(AssetClaimant::Authored {
+                    source: readable_source(source),
+                    bundle: bundle.uuid,
+                    local_id: local_id.clone(),
+                });
+            for (child, output) in projection.derived_outputs([(entry.uuid, entry.type_uuid)]) {
+                let claimant = AssetClaimant::Derived {
+                    parent: entry.uuid,
+                    output_key: output.output_key.clone(),
+                };
+                claims.entry(child).or_default().push(claimant);
+                if let Some(existing) = outputs.insert(child, output.clone()) {
+                    if existing != output {
+                        // The claimant table below publishes the closed typed
+                        // collision; keeping either row here is harmless
+                        // because poisoned versions expose no namespace.
+                    }
+                }
+            }
+        }
+    }
+
+    let mut poisons = Vec::new();
+    for (asset, mut claimants) in claims {
+        claimants.sort();
+        claimants.dedup();
+        if claimants.len() > 1 {
+            poisons.push(
+                VersionPoison::new(
+                    VersionPoisonV1::DuplicateAssetUuid { asset, claimants },
+                    format!("authored/derived asset UUID collision at {asset}"),
+                )
+                .map_err(|error| StoreError::InvalidConfiguration {
+                    error: format!("invalid derived-output collision: {error}"),
+                })?,
+            );
+        }
+    }
+    let poison = VersionPoison::select_canonical(poisons).map_err(|error| {
+        StoreError::InvalidConfiguration {
+            error: format!("invalid derived-output collision set: {error}"),
+        }
+    })?;
+    Ok((outputs, poison))
+}
+
 fn publish_scan(
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
-    candidate: ScanCandidate,
+    mut candidate: ScanCandidate,
     advance_configuration: bool,
     pipeline: Option<&ConfigurationPipelinePublication>,
+    projection: &PipelineProjection,
 ) -> Result<Commit, StoreError> {
+    let (derived_outputs, derived_poison) = projected_derived_outputs(&candidate, projection)?;
+    candidate.version_poison = VersionPoison::select_canonical(
+        candidate
+            .version_poison
+            .take()
+            .into_iter()
+            .chain(derived_poison),
+    )
+    .map_err(|error| StoreError::InvalidConfiguration {
+        error: format!("invalid derived-output collision poison: {error}"),
+    })?;
     let mut store = lock_store(store);
     if store.input_version() != base {
         return Err(StoreError::InvalidConfiguration {
@@ -1184,7 +1304,13 @@ fn publish_scan(
             })?;
     }
 
-    let mut commit = rpc_commit(&candidate, &old_assets, &old_paths)?;
+    let mut commit = rpc_commit(
+        &candidate,
+        &old_assets,
+        &old_paths,
+        projection,
+        derived_outputs.clone(),
+    )?;
     store.input_transaction(|transaction| {
         let mut root_ids = BTreeMap::new();
         let mut scanned_keys = BTreeSet::new();
@@ -1212,6 +1338,12 @@ fn publish_scan(
         }
         transaction.set_clean_watermark(newest_mtime)?;
         transaction.set_version_poisons(candidate.version_poison.clone())?;
+        transaction.clear_derived_outputs()?;
+        if candidate.version_poison.is_none() {
+            for (child, output) in &derived_outputs {
+                transaction.set_derived_output(*child, output.parent, &output.output_key)?;
+            }
+        }
 
         match &candidate.configuration {
             ConfigurationStatus::Ready => transaction.publish_configuration_ready(generation)?,
@@ -1312,23 +1444,27 @@ pub(crate) fn publish_current_scan(
     lineage_destination: &LineageDestination,
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
+    projection: &PipelineProjection,
 ) -> Result<Commit, String> {
     let scan = scanner.scan().map_err(|error| error.to_string())?;
     let candidate = ScanCandidate::build(scanner, lineage_destination, scan, None)
         .map_err(|error| error.to_string())?;
-    publish_scan(store, base, candidate, false, None).map_err(|error| error.to_string())
+    publish_scan(store, base, candidate, false, None, projection).map_err(|error| error.to_string())
 }
 
 fn rpc_commit(
     candidate: &ScanCandidate,
     old_assets: &[AssetUuid],
     old_paths: &[(String, distill_store::files::RootId, AssetUuid)],
+    projection: &PipelineProjection,
+    derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
 ) -> Result<Commit, StoreError> {
     let mut commit = Commit {
         configuration: Some(candidate.configuration.clone()),
         pipeline: Some(PipelineDiagnostic::Ready),
         version_poison: Some(candidate.version_poison.clone()),
         lineage_repair: Some(candidate.lineage_repair.clone()),
+        derived_outputs: Some(derived_outputs),
         ..Commit::default()
     };
     if candidate.version_poison.is_some() {
@@ -1355,6 +1491,7 @@ fn rpc_commit(
                 bundle,
                 local_id,
                 entry,
+                projection.interface(entry.type_uuid).terminal,
             )?));
         }
         if let Some(primary) = &bundle.primary {
@@ -1404,6 +1541,7 @@ fn rpc_entry(
     bundle: &Bundle,
     local_id: &str,
     entry: &AssetEntry,
+    terminal_type: TypeUuid,
 ) -> Result<AuthoringEntry, StoreError> {
     let schema = &bundle.schemas[&entry.schema_hash];
     let logical_schema = distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
@@ -1418,7 +1556,7 @@ fn rpc_entry(
         local_id: local_id.to_owned(),
         normalized_path,
         type_uuid: entry.type_uuid,
-        terminal_type: entry.type_uuid,
+        terminal_type,
         schema_hash: entry.schema_hash,
         logical_schema: Arc::from(logical_schema.into_bytes()),
         role: if entry.authoring_only {

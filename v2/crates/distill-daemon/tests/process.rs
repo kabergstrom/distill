@@ -238,11 +238,13 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
         || process.coordinator().build_target("dev").is_some(),
         "initial build target was not retained",
     );
-    assert!(!process
-        .coordinator()
-        .build_target("dev")
-        .expect("initial target is retained for build execution")
-        .optimize);
+    assert!(
+        !process
+            .coordinator()
+            .build_target("dev")
+            .expect("initial target is retained for build execution")
+            .optimize
+    );
     let before = process.coordinator().server().current_stamp().version;
     let edited = config_source(&temp).replace("optimize = false", "optimize = true");
     std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
@@ -258,11 +260,13 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
         process.coordinator().server().current_stamp().version,
         after
     );
-    assert!(process
-        .coordinator()
-        .build_target("dev")
-        .expect("published target is retained for build execution")
-        .optimize);
+    assert!(
+        process
+            .coordinator()
+            .build_target("dev")
+            .expect("published target is retained for build execution")
+            .optimize
+    );
     assert!(process.last_background_error().is_none());
 }
 
