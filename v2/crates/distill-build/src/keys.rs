@@ -34,6 +34,14 @@ pub fn static_inputs_digest(inputs: &StaticInputs) -> [u8; 32] {
     domain_digest(DSSI, 1, |e| encode_static(e, inputs))
 }
 
+/// Canonical DSSI body retained in result records for audit/recovery.  The
+/// CAS index still keys only on [`static_inputs_digest`].
+pub fn static_inputs_canonical_bytes(inputs: &StaticInputs) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new();
+    encode_static(&mut encoder, inputs);
+    encoder.into_bytes()
+}
+
 fn encode_static(e: &mut CanonicalEncoder, inputs: &StaticInputs) {
     e.raw(&inputs.asset.0);
     e.u16(inputs.stage);
@@ -70,6 +78,9 @@ pub struct BuildImportInputs {
     pub logical: LogicalHash,
     pub layout: LayoutHash,
     pub migrations: Vec<AppliedMigration>,
+    /// Validator code participates only when this authored type has at least
+    /// one registered validator in the pinned epoch.
+    pub validator_dylib_hash: Option<[u8; 32]>,
     pub artifact_format_version: u32,
 }
 
@@ -89,6 +100,7 @@ pub fn build_import_digest(inputs: &BuildImportInputs) -> [u8; 32] {
             e.u32(migration.planner_version);
             e.option(migration.dylib_hash, |e, hash| e.raw(hash));
         });
+        e.option(inputs.validator_dylib_hash, |e, hash| e.raw(hash));
         e.u32(inputs.artifact_format_version);
     })
 }

@@ -2336,6 +2336,71 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
+struct TestNoopModule;
+
+#[cfg(test)]
+impl LoadedPipelineModule for TestNoopModule {
+    fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError> {
+        Err(ModuleCallError::new("unused test module identity"))
+    }
+
+    fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError> {
+        Err(ModuleCallError::new("unused test module layouts"))
+    }
+
+    fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError> {
+        Err(ModuleCallError::new("unused test module types"))
+    }
+
+    fn register(
+        &mut self,
+        _targets: &[TargetDefinition],
+        _arena: &mut CandidateRegistrationArena,
+    ) -> Result<BTreeSet<String>, ModuleCallError> {
+        Err(ModuleCallError::new("unused test module registration"))
+    }
+
+    fn unload(&mut self) -> Result<(), ModuleCallError> {
+        Ok(())
+    }
+
+    fn dlclose(&mut self) {}
+}
+
+#[cfg(test)]
+pub(crate) fn processor_test_epoch<P: crate::callbacks::PipelineProcessor>(
+    target: &str,
+    target_definition_hash: [u8; 32],
+    descriptor: crate::callbacks::ProcessorDescriptor,
+    processor: P,
+) -> PipelineEpoch {
+    let token = ModuleEpochToken::new(9002);
+    let mut arena = CandidateRegistrationArena::new(token.clone());
+    arena
+        .register_processor(descriptor, processor)
+        .into_result()
+        .expect("test processor registration is valid");
+    let registration = arena.registration_set(BTreeSet::from([target.to_owned()]));
+    let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
+        name: target.to_owned(),
+        target_definition_hash,
+    }])
+    .expect("test target set is canonical");
+    PipelineEpoch::new(
+        9002,
+        StagedModule {
+            path: PathBuf::from("pipeline-test"),
+            content_hash: [9; 32],
+        },
+        token,
+        target_set,
+        registration,
+        arena,
+        Box::new(TestNoopModule),
+    )
+}
+
+#[cfg(test)]
 mod callback_tests {
     use super::*;
     use crate::callbacks::{

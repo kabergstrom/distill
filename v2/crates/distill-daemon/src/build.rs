@@ -4,10 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec, EncodedArtifact};
-use distill_build::dslf::LocalFailureClass;
-use distill_build::keys::{build_import_digest, BuildImportInputs};
+use distill_build::dslf::{DslfV1, LocalFailureClass};
+use distill_build::keys::{
+    build_import_digest, static_inputs_canonical_bytes, static_inputs_digest, BuildImportInputs,
+    OutputHash, StaticInputs,
+};
 use distill_build::persist::{lookup_persisted_candidate, PersistedOutcome};
+use distill_build::pipeline::{
+    PipelineChain, PipelineRegistry, PipelineStage, ProcessorRegistration, Target,
+};
 use distill_build::query::{asset_query_result_hash, AssetQuery};
+use distill_build::tool::{ProcessContext, StoreToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
     trace_payload_bytes, CapabilityKey, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
     Observed, StableFailureFingerprint, TraceOp, TraceSource,
@@ -21,12 +28,17 @@ use distill_rpc::{
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
 use distill_store::bundles::{BundleMeta, EntryMeta};
-use distill_store::cas::record::KeyKind;
-use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+use distill_store::cas::record::{
+    FailureCause as StoreFailureCause, FailureFingerprint as StoreFailureFingerprint, KeyKind,
+    LocalFailureClass as StoreLocalFailureClass,
+};
+use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::Store;
 use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
 
+use crate::callbacks::{CallbackInvokeError, DiagnosticSeverity};
 use crate::coordinator::DaemonCoordinator;
+use crate::epoch::PipelineSnapshot;
 use crate::scanner::RootedScanner;
 
 pub(crate) struct CoordinatorBuildBackend {
@@ -89,7 +101,8 @@ struct LoadedAsset {
 
 #[derive(Clone)]
 struct NodePublication {
-    row: ServedClosureRow,
+    primary: ServedClosureRow,
+    outputs: BTreeMap<String, ServedClosureRow>,
     artifacts: BTreeMap<ContentHash, BuildArtifactPublication>,
     wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
@@ -98,6 +111,12 @@ struct BuildContext<'a> {
     store: &'a mut Store,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
+    pipeline: PipelineSnapshot,
+    registry: PipelineRegistry,
+    target: Target,
+    target_definition: [u8; 32],
+    dylib_hash: [u8; 32],
+    basis: distill_store::state::InputVersion,
     max_depth: usize,
     visiting: BTreeSet<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodePublication>,
@@ -107,6 +126,61 @@ fn build(
     coordinator: &DaemonCoordinator,
     request: &BuildRequest,
 ) -> Result<BuildPublication, BuildError> {
+    let authority = coordinator.schema_authority().ok_or_else(|| {
+        BuildError::Failed("project schema authority is not published".to_owned())
+    })?;
+    let target = coordinator.build_target(&request.target).ok_or_else(|| {
+        BuildError::Failed(format!(
+            "build target {:?} is not published",
+            request.target
+        ))
+    })?;
+    let observed_target = distill_rpc::TargetDefinitionHash(
+        distill_build::keys::target_definition_hash(&target, &[]),
+    );
+    if observed_target != request.target_definition {
+        return Err(BuildError::Drifted(request.drifted_input.clone()));
+    }
+    let pipeline = coordinator.pipeline_snapshot();
+    let epoch = pipeline
+        .epoch()
+        .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+    let dylib_hash = epoch.dylib_hash();
+    let registry = PipelineRegistry::new(
+        epoch
+            .processor_descriptors()
+            .into_iter()
+            .map(|descriptor| {
+                ProcessorRegistration::new(
+                    &descriptor.id,
+                    descriptor.version,
+                    descriptor.input,
+                    descriptor.selector,
+                    descriptor.outputs,
+                    dylib_hash,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BuildError::failed)?,
+    )
+    .map_err(BuildError::failed)?;
+    let requested_chain = registry
+        .chain(request.entry.type_uuid, &target)
+        .map_err(BuildError::failed)?;
+    let expected_requested_type = if request.output_key.is_empty() {
+        requested_chain.terminal
+    } else {
+        requested_chain
+            .extras
+            .get(&request.output_key)
+            .copied()
+            .ok_or_else(|| BuildError::Drifted(DriftedInput::Asset(request.requested_asset)))?
+    };
+    if request.entry.terminal_type != requested_chain.terminal
+        || request.requested_terminal_type != expected_requested_type
+    {
+        return Err(BuildError::Drifted(request.drifted_input.clone()));
+    }
     let store_handle = coordinator.store();
     let mut store = store_handle
         .lock()
@@ -116,9 +190,6 @@ fn build(
     {
         return Err(BuildError::Drifted(request.drifted_input.clone()));
     }
-    let authority = coordinator.schema_authority().ok_or_else(|| {
-        BuildError::Failed("project schema authority is not published".to_owned())
-    })?;
     let root = load_asset(&store, &coordinator.scanner(), request.entry.uuid)?;
     verify_request_entry(request, &root, &authority)?;
 
@@ -126,13 +197,23 @@ fn build(
         store: &mut store,
         scanner: coordinator.scanner(),
         authority,
+        pipeline,
+        registry,
+        target,
+        target_definition: request.target_definition.0,
+        dylib_hash,
+        basis: request.basis.version,
         max_depth: coordinator.operational_configuration().max_dependency_depth,
         visiting: BTreeSet::new(),
         memo: BTreeMap::new(),
     };
     let root = build_asset(&mut context, request.entry.uuid, 0)?;
+    let selected = root
+        .outputs
+        .get(&request.output_key)
+        .ok_or_else(|| BuildError::Drifted(DriftedInput::Asset(request.requested_asset)))?;
     Ok(BuildPublication {
-        root_content_hash: root.row.content_hash,
+        root_content_hash: selected.content_hash,
         artifacts: root.artifacts.into_values().collect(),
         wire_trees: root.wire_trees.into_values().collect(),
     })
@@ -156,7 +237,6 @@ fn verify_request_entry(
         || requested.normalized_path != loaded.bundle_meta.path
         || requested.type_uuid != loaded.meta.type_uuid
         || requested.schema_hash != loaded.meta.logical_hash
-        || requested.type_uuid != requested.terminal_type
     {
         return Err(BuildError::Drifted(request.drifted_input.clone()));
     }
@@ -236,97 +316,774 @@ fn build_asset_inner(
             "asset {asset} requires schema migration before build"
         )));
     }
-    context
-        .store
-        .put_wire_tree(&project.dswl_bytes)
-        .map_err(BuildError::infrastructure)?;
-
-    let (bytes, references) = encode_or_hydrate(context, &loaded, &project)?;
-    let view = parse_artifact(&bytes).map_err(BuildError::failed)?;
-    verify_artifact_identity(&view, &loaded, &project)?;
-    let structural_len = bytes
-        .len()
-        .checked_sub(view.blob_section.len())
-        .ok_or_else(|| BuildError::Failed("artifact structural length underflow".to_owned()))?;
-    let blobs = (0..view.blob_table.len())
-        .map(|index| {
-            view.blob(index as u32)
-                .map(|blob| Arc::<[u8]>::from(blob.to_vec()))
-                .ok_or_else(|| BuildError::Failed("artifact blob table is invalid".to_owned()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let load_edges = load_edges(context.store, &loaded, &view.load_deps, &references)?;
-    let mut closure = BTreeMap::new();
-    let mut artifacts = BTreeMap::new();
-    let mut wire_trees = BTreeMap::from([(
-        project.layout_hash,
-        BuildWireTree {
-            layout_hash: project.layout_hash,
-            bytes: Arc::from(project.dswl_bytes.clone()),
-        },
-    )]);
-    for edge in &load_edges {
-        let child = build_asset(context, edge.asset, depth + 1)?;
-        merge_closure_row(&mut closure, child.row.clone())?;
-        for row in &child.artifacts[&child.row.content_hash]
-            .payload
-            .closure_rows
-        {
-            merge_closure_row(&mut closure, row.clone())?;
-        }
-        merge_artifacts(&mut artifacts, child.artifacts)?;
-        merge_wire_trees(&mut wire_trees, child.wire_trees)?;
-    }
-    let content_hash = ContentHash(*blake3::hash(&bytes).as_bytes());
-    let row = ServedClosureRow {
+    let validators_registered = context
+        .pipeline
+        .epoch()
+        .map_err(|poison| BuildError::Failed(poison.to_string()))?
+        .validator_descriptors()
+        .iter()
+        .any(|descriptor| descriptor.asset_type == loaded.entry.type_uuid);
+    let chain = context
+        .registry
+        .chain(loaded.entry.type_uuid, &context.target)
+        .map_err(BuildError::failed)?;
+    let (bytes, references) = encode_or_hydrate(
+        context,
+        &loaded,
+        &project,
+        chain.terminal,
+        validators_registered.then_some(context.dylib_hash),
+    )?;
+    let imported = EncodedNodeOutput {
+        output_key: String::new(),
         asset,
-        content_hash,
         authored_type: loaded.entry.type_uuid,
         encoded_type: loaded.entry.type_uuid,
-        terminal_type: loaded.entry.type_uuid,
-        load_edges,
+        terminal_type: chain.terminal,
+        project,
+        bytes,
+        references,
     };
-    merge_closure_row(&mut closure, row.clone())?;
-    let closure_rows = closure.into_values().collect::<Vec<_>>();
-    artifacts.insert(
-        content_hash,
-        BuildArtifactPublication {
-            content_hash,
-            payload: ArtifactPayload {
-                structural: Arc::from(bytes[..structural_len].to_vec()),
-                blobs,
-                encoded_type: loaded.entry.type_uuid,
-                terminal_type: loaded.entry.type_uuid,
-                closure_rows,
+    let outputs = if chain.stages.is_empty() {
+        vec![imported]
+    } else {
+        process_chain(context, &loaded, &chain, imported)?
+    };
+    assemble_outputs(context, outputs, depth)
+}
+
+#[derive(Clone)]
+struct EncodedNodeOutput {
+    output_key: String,
+    asset: AssetUuid,
+    authored_type: TypeUuid,
+    encoded_type: TypeUuid,
+    terminal_type: TypeUuid,
+    project: ProjectTypeAuthority,
+    bytes: Vec<u8>,
+    references: Vec<distill_wire::encode::EncodedReference>,
+}
+
+fn process_chain(
+    context: &mut BuildContext<'_>,
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    imported: EncodedNodeOutput,
+) -> Result<Vec<EncodedNodeOutput>, BuildError> {
+    if let Some(outputs) = hydrate_complete_chain(context, loaded, chain, &imported)? {
+        return Ok(outputs);
+    }
+
+    let mut current_value = loaded.entry.data.clone();
+    let mut current_hash = ContentHash(*blake3::hash(&imported.bytes).as_bytes());
+    let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
+    let mut final_primary = None;
+    for stage in &chain.stages {
+        let static_inputs = processor_static_inputs(context, loaded, stage, current_hash)?;
+        let cached = hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?;
+        let execution_root = context.store.state_path().join("tool-runs");
+        std::fs::create_dir_all(&execution_root).map_err(BuildError::infrastructure)?;
+        let platform_id = context.target.compilation_identity.target_triple.clone();
+        let system_runtime_id = context.target.compilation_identity.rustc.clone();
+        let tool_snapshot = StoreToolEpochSnapshot::new(context.store, context.basis);
+        let mut process_context = ProcessContext::new(
+            &tool_snapshot,
+            ToolRuntimeBinding {
+                platform_id: &platform_id,
+                system_runtime_id: &system_runtime_id,
+                execution_root: &execution_root,
             },
-        },
+        );
+        let outcome = context
+            .pipeline
+            .epoch()
+            .map_err(|poison| BuildError::Failed(poison.to_string()))?
+            .invoke_processor(&stage.registration.id, current_value, &mut process_context);
+        let mut trace = process_context
+            .into_trace()
+            .map_err(|_| BuildError::Infrastructure("processor trace was discarded".to_owned()))?;
+        let products = match outcome {
+            Ok(products) => products,
+            Err(CallbackInvokeError::Rejected(error)) => {
+                commit_processor_failure(
+                    context,
+                    loaded,
+                    stage,
+                    &static_inputs,
+                    &trace,
+                    error.code,
+                )?;
+                return Err(BuildError::Failed(format!(
+                    "processor {:?} rejected asset {} with code {}: {}",
+                    stage.registration.id, loaded.entry.uuid, error.code, error.message
+                )));
+            }
+            Err(error) => return Err(BuildError::failed(error)),
+        };
+        let next_value = products.primary.clone().ok_or_else(|| {
+            BuildError::Failed(format!(
+                "processor {:?} omitted its primary output",
+                stage.registration.id
+            ))
+        })?;
+        let encoded =
+            encode_processor_products(context, loaded, chain, stage, &products, &mut trace)?;
+        if let Some((cached_outputs, cached_debug)) = cached {
+            ensure_cached_stage_matches(&cached_outputs, &cached_debug, &encoded, &products.debug)?;
+        } else {
+            commit_processor_stage(
+                context,
+                loaded,
+                &static_inputs,
+                &trace,
+                &encoded,
+                &products.debug,
+            )?;
+        }
+        let primary = encoded
+            .iter()
+            .find(|output| output.output_key.is_empty())
+            .cloned()
+            .expect("closed processor output always has a primary");
+        current_hash = ContentHash(*blake3::hash(&primary.bytes).as_bytes());
+        current_value = next_value;
+        for output in encoded {
+            if output.output_key.is_empty() {
+                final_primary = Some(output);
+            } else if extras.insert(output.output_key.clone(), output).is_some() {
+                return Err(BuildError::Failed(
+                    "processor chain produced a duplicate extra key".to_owned(),
+                ));
+            }
+        }
+    }
+    let mut outputs = vec![final_primary.expect("nonempty chain has a final primary")];
+    outputs.extend(extras.into_values());
+    Ok(outputs)
+}
+
+fn hydrate_complete_chain(
+    context: &mut BuildContext<'_>,
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    imported: &EncodedNodeOutput,
+) -> Result<Option<Vec<EncodedNodeOutput>>, BuildError> {
+    let mut input_hash = ContentHash(*blake3::hash(&imported.bytes).as_bytes());
+    let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
+    let mut final_primary = None;
+    for stage in &chain.stages {
+        let static_inputs = processor_static_inputs(context, loaded, stage, input_hash)?;
+        let Some((outputs, _debug)) =
+            hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?
+        else {
+            return Ok(None);
+        };
+        let primary = outputs
+            .iter()
+            .find(|output| output.output_key.is_empty())
+            .cloned()
+            .expect("hydrated stage was shape checked");
+        input_hash = ContentHash(*blake3::hash(&primary.bytes).as_bytes());
+        for output in outputs {
+            if output.output_key.is_empty() {
+                final_primary = Some(output);
+            } else {
+                extras.insert(output.output_key.clone(), output);
+            }
+        }
+    }
+    let mut outputs = vec![final_primary.expect("nonempty chain has a cached final primary")];
+    outputs.extend(extras.into_values());
+    Ok(Some(outputs))
+}
+
+fn processor_static_inputs(
+    context: &BuildContext<'_>,
+    loaded: &LoadedAsset,
+    stage: &PipelineStage,
+    input_hash: ContentHash,
+) -> Result<StaticInputs, BuildError> {
+    let mut output_hashes = Vec::with_capacity(stage.registration.outputs.extras.len() + 1);
+    for (key, type_uuid) in std::iter::once((String::new(), stage.registration.outputs.primary))
+        .chain(
+            stage
+                .registration
+                .outputs
+                .extras
+                .iter()
+                .map(|(key, ty)| (key.clone(), *ty)),
+        )
+    {
+        let authority = context.authority.project_type(type_uuid).ok_or_else(|| {
+            BuildError::Failed(format!(
+                "processor output type {type_uuid} has no schema authority"
+            ))
+        })?;
+        output_hashes.push(OutputHash {
+            key,
+            logical: authority.logical_hash,
+            layout: authority.layout_hash,
+        });
+    }
+    Ok(StaticInputs {
+        asset: loaded.entry.uuid,
+        stage: stage.index,
+        input_hash,
+        target_def_hash: context.target_definition,
+        processor_id: stage.registration.id.clone(),
+        processor_version: stage.registration.version,
+        dylib_hash: context.dylib_hash,
+        output_hashes,
+        artifact_format_version: ARTIFACT_FORMAT_VERSION,
+    })
+}
+
+fn hydrate_processor_stage(
+    context: &mut BuildContext<'_>,
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    stage: &PipelineStage,
+    static_inputs: &StaticInputs,
+) -> Result<Option<(Vec<EncodedNodeOutput>, BTreeMap<String, Vec<u8>>)>, BuildError> {
+    let key = static_inputs_digest(static_inputs);
+    let trace_source = StoreTraceSource::capture(
+        context.store,
+        &context.registry,
+        &context.target,
+        context.basis,
+    )?;
+    let Some(hit) = lookup_persisted_candidate(
+        context.store,
+        KeyKind::Processor,
+        &key,
+        loaded.entry.uuid,
+        &trace_source,
+    )
+    .map_err(BuildError::infrastructure)?
+    else {
+        return Ok(None);
+    };
+    match hit.outcome {
+        PersistedOutcome::Failure { cause } => Err(BuildError::Failed(format!(
+            "cached processor failure: {cause:?}"
+        ))),
+        PersistedOutcome::Success { outputs, aux } => {
+            let expected_keys = std::iter::once(String::new())
+                .chain(stage.registration.outputs.extras.keys().cloned())
+                .collect::<BTreeSet<_>>();
+            let observed_keys = outputs
+                .iter()
+                .map(|output| output.output_key.clone())
+                .collect::<BTreeSet<_>>();
+            if outputs.len() != expected_keys.len() || observed_keys != expected_keys {
+                return Err(BuildError::Failed(
+                    "cached processor result has an invalid closed output table".to_owned(),
+                ));
+            }
+            let mut hydrated = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                let (asset, authored_type, encoded_type, terminal_type) =
+                    expected_output_identity(loaded, chain, stage, &output.output_key)?;
+                let project = context
+                    .authority
+                    .project_type(encoded_type)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BuildError::Failed(format!(
+                            "cached processor output type {encoded_type} has no schema authority"
+                        ))
+                    })?;
+                let encoded = EncodedNodeOutput {
+                    output_key: output.output_key,
+                    asset,
+                    authored_type,
+                    encoded_type,
+                    terminal_type,
+                    project,
+                    bytes: output.bytes,
+                    references: Vec::new(),
+                };
+                verify_encoded_output(&encoded)?;
+                hydrated.push(encoded);
+            }
+            let debug = aux
+                .into_iter()
+                .map(|row| (row.debug_key, row.bytes))
+                .collect();
+            Ok(Some((hydrated, debug)))
+        }
+    }
+}
+
+fn expected_output_identity(
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    stage: &PipelineStage,
+    output_key: &str,
+) -> Result<(AssetUuid, TypeUuid, TypeUuid, TypeUuid), BuildError> {
+    if output_key.is_empty() {
+        Ok((
+            loaded.entry.uuid,
+            loaded.entry.type_uuid,
+            stage.registration.outputs.primary,
+            chain.terminal,
+        ))
+    } else {
+        let type_uuid = stage
+            .registration
+            .outputs
+            .extras
+            .get(output_key)
+            .copied()
+            .ok_or_else(|| BuildError::Failed("cached undeclared processor extra".to_owned()))?;
+        Ok((
+            AssetUuid::v5(loaded.entry.uuid, output_key),
+            type_uuid,
+            type_uuid,
+            type_uuid,
+        ))
+    }
+}
+
+fn encode_processor_products(
+    context: &BuildContext<'_>,
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    stage: &PipelineStage,
+    products: &crate::callbacks::ProcessorProducts,
+    trace: &mut Vec<TraceOp>,
+) -> Result<Vec<EncodedNodeOutput>, BuildError> {
+    let trace_source = StoreTraceSource::capture(
+        context.store,
+        &context.registry,
+        &context.target,
+        context.basis,
+    )?;
+    let mut values = Vec::with_capacity(products.extras.len() + 1);
+    values.push((
+        String::new(),
+        products
+            .primary
+            .as_ref()
+            .expect("epoch validates processor primary"),
+    ));
+    values.extend(
+        products
+            .extras
+            .iter()
+            .map(|(key, value)| (key.clone(), value)),
     );
+    let mut outputs = Vec::with_capacity(values.len());
+    for (output_key, value) in values {
+        let (asset, authored_type, encoded_type, terminal_type) =
+            expected_output_identity(loaded, chain, stage, &output_key)?;
+        let project = context
+            .authority
+            .project_type(encoded_type)
+            .cloned()
+            .ok_or_else(|| {
+                BuildError::Failed(format!(
+                    "processor output type {encoded_type} has no schema authority"
+                ))
+            })?;
+        let source_bundle = loaded.meta.bundle;
+        let mut resolver = |query: &distill_json::AuthoredValue,
+                            expected: TypeUuid,
+                            strong: bool,
+                            _path: &[distill_bundle::PathComponent]| {
+            resolve_reference(&trace_source, source_bundle, query, expected, strong, trace)
+        };
+        let encoded = encode_artifact_value(
+            ArtifactValueSpec {
+                asset_uuid: asset,
+                authored_type,
+                terminal_type,
+                encoded_type,
+                logical_hash: project.logical_hash,
+                layout_hash: project.layout_hash,
+                schema: &project.logical_schema.root,
+                wire: &project.wire,
+                value,
+            },
+            &mut resolver,
+        )
+        .map_err(BuildError::failed)?;
+        outputs.push(EncodedNodeOutput {
+            output_key,
+            asset,
+            authored_type,
+            encoded_type,
+            terminal_type,
+            project,
+            bytes: encoded.bytes,
+            references: encoded.references,
+        });
+    }
+    Ok(outputs)
+}
+
+fn ensure_cached_stage_matches(
+    cached: &[EncodedNodeOutput],
+    cached_debug: &BTreeMap<String, Vec<u8>>,
+    fresh: &[EncodedNodeOutput],
+    fresh_debug: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), BuildError> {
+    let cached = cached
+        .iter()
+        .map(|output| (&output.output_key, &output.bytes))
+        .collect::<BTreeMap<_, _>>();
+    let fresh = fresh
+        .iter()
+        .map(|output| (&output.output_key, &output.bytes))
+        .collect::<BTreeMap<_, _>>();
+    if cached != fresh || cached_debug != fresh_debug {
+        return Err(BuildError::Failed(
+            "processor output disagrees with its revalidated cached result".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn commit_processor_stage(
+    context: &mut BuildContext<'_>,
+    loaded: &LoadedAsset,
+    static_inputs: &StaticInputs,
+    trace: &[TraceOp],
+    outputs: &[EncodedNodeOutput],
+    debug: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), BuildError> {
+    context
+        .store
+        .commit_build(BuildCommit {
+            key_kind: KeyKind::Processor,
+            static_input_key: static_inputs_digest(static_inputs),
+            asset_uuid: loaded.entry.uuid,
+            static_inputs_canonical: static_inputs_canonical_bytes(static_inputs),
+            trace: trace_payload_bytes(trace),
+            outcome: CommitOutcome::Success {
+                payload_kind: PayloadKind::ProcessorOutput,
+                outputs: outputs
+                    .iter()
+                    .map(|output| OutputSpec {
+                        output_key: output.output_key.clone(),
+                        type_uuids: output_type_set(output),
+                        bytes: output.bytes.clone(),
+                    })
+                    .collect(),
+                aux: debug
+                    .iter()
+                    .map(|(debug_key, bytes)| AuxSpec {
+                        debug_key: debug_key.clone(),
+                        bytes: bytes.clone(),
+                    })
+                    .collect(),
+            },
+        })
+        .map_err(BuildError::infrastructure)?;
+    Ok(())
+}
+
+fn commit_processor_failure(
+    context: &mut BuildContext<'_>,
+    loaded: &LoadedAsset,
+    stage: &PipelineStage,
+    static_inputs: &StaticInputs,
+    trace: &[TraceOp],
+    build_error_code: u32,
+) -> Result<(), BuildError> {
+    let cause = if trace.last().is_some_and(TraceOp::failed) {
+        StoreFailureCause::Op
+    } else {
+        let detail = DslfV1::Processor {
+            asset: loaded.entry.uuid,
+            processor_id: stage.registration.id.clone(),
+            processor_version: stage.registration.version,
+            stage: stage.index,
+            build_error_code,
+        }
+        .digest()
+        .map_err(BuildError::failed)?;
+        StoreFailureCause::Local(StoreFailureFingerprint::Local {
+            class: StoreLocalFailureClass::Processor,
+            detail,
+        })
+    };
+    context
+        .store
+        .commit_build(BuildCommit {
+            key_kind: KeyKind::Processor,
+            static_input_key: static_inputs_digest(static_inputs),
+            asset_uuid: loaded.entry.uuid,
+            static_inputs_canonical: static_inputs_canonical_bytes(static_inputs),
+            trace: trace_payload_bytes(trace),
+            outcome: CommitOutcome::Failure { cause },
+        })
+        .map_err(BuildError::infrastructure)?;
+    Ok(())
+}
+
+fn output_type_set(output: &EncodedNodeOutput) -> Vec<TypeUuid> {
+    let mut types = vec![
+        output.authored_type,
+        output.encoded_type,
+        output.terminal_type,
+    ];
+    types.sort();
+    types.dedup();
+    types
+}
+
+fn assemble_outputs(
+    context: &mut BuildContext<'_>,
+    outputs: Vec<EncodedNodeOutput>,
+    depth: usize,
+) -> Result<NodePublication, BuildError> {
+    struct PendingArtifact {
+        content_hash: ContentHash,
+        structural: Arc<[u8]>,
+        blobs: Vec<Arc<[u8]>>,
+        encoded_type: TypeUuid,
+        terminal_type: TypeUuid,
+    }
+
+    let local_assets = outputs
+        .iter()
+        .map(|output| output.asset)
+        .collect::<BTreeSet<_>>();
+    let mut rows = BTreeMap::<String, ServedClosureRow>::new();
+    let mut pending = Vec::with_capacity(outputs.len());
+    let mut wire_trees = BTreeMap::new();
+    for output in &outputs {
+        verify_encoded_output(output)?;
+        context
+            .store
+            .put_wire_tree(&output.project.dswl_bytes)
+            .map_err(BuildError::infrastructure)?;
+        wire_trees.insert(
+            output.project.layout_hash,
+            BuildWireTree {
+                layout_hash: output.project.layout_hash,
+                bytes: Arc::from(output.project.dswl_bytes.clone()),
+            },
+        );
+        let view = parse_artifact(&output.bytes).map_err(BuildError::failed)?;
+        let structural_len = output
+            .bytes
+            .len()
+            .checked_sub(view.blob_section.len())
+            .ok_or_else(|| BuildError::Failed("artifact structural length underflow".to_owned()))?;
+        let blobs = (0..view.blob_table.len())
+            .map(|index| {
+                view.blob(index as u32)
+                    .map(|blob| Arc::<[u8]>::from(blob.to_vec()))
+                    .ok_or_else(|| BuildError::Failed("artifact blob table is invalid".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let load_edges =
+            load_edges_for_output(context, output.asset, &view.load_deps, &output.references)?;
+        let content_hash = ContentHash(*blake3::hash(&output.bytes).as_bytes());
+        rows.insert(
+            output.output_key.clone(),
+            ServedClosureRow {
+                asset: output.asset,
+                content_hash,
+                authored_type: output.authored_type,
+                encoded_type: output.encoded_type,
+                terminal_type: output.terminal_type,
+                load_edges,
+            },
+        );
+        pending.push(PendingArtifact {
+            content_hash,
+            structural: Arc::from(output.bytes[..structural_len].to_vec()),
+            blobs,
+            encoded_type: output.encoded_type,
+            terminal_type: output.terminal_type,
+        });
+    }
+
+    let mut closure = BTreeMap::new();
+    for row in rows.values() {
+        merge_closure_row(&mut closure, row.clone())?;
+    }
+    let mut artifacts = BTreeMap::new();
+    for row in rows.values() {
+        for edge in &row.load_edges {
+            if local_assets.contains(&edge.asset) {
+                continue;
+            }
+            let (dependency, selected) = build_dependency(context, edge.asset, depth + 1)?;
+            merge_closure_row(&mut closure, selected.clone())?;
+            let selected_artifact = dependency
+                .artifacts
+                .get(&selected.content_hash)
+                .expect("selected dependency row has an artifact");
+            for nested in &selected_artifact.payload.closure_rows {
+                merge_closure_row(&mut closure, nested.clone())?;
+            }
+            merge_artifacts(&mut artifacts, dependency.artifacts)?;
+            merge_wire_trees(&mut wire_trees, dependency.wire_trees)?;
+        }
+    }
+    let closure_rows = closure.into_values().collect::<Vec<_>>();
+    for artifact in pending {
+        artifacts.insert(
+            artifact.content_hash,
+            BuildArtifactPublication {
+                content_hash: artifact.content_hash,
+                payload: ArtifactPayload {
+                    structural: artifact.structural,
+                    blobs: artifact.blobs,
+                    encoded_type: artifact.encoded_type,
+                    terminal_type: artifact.terminal_type,
+                    closure_rows: closure_rows.clone(),
+                },
+            },
+        );
+    }
+    let primary = rows
+        .get("")
+        .cloned()
+        .ok_or_else(|| BuildError::Failed("built chain has no primary output".to_owned()))?;
     Ok(NodePublication {
-        row,
+        primary,
+        outputs: rows,
         artifacts,
         wire_trees,
     })
+}
+
+fn build_dependency(
+    context: &mut BuildContext<'_>,
+    asset: AssetUuid,
+    depth: usize,
+) -> Result<(NodePublication, ServedClosureRow), BuildError> {
+    let derived = context
+        .store
+        .resolve_child(asset)
+        .map_err(BuildError::failed)?;
+    if let Some((parent, output_key)) = derived {
+        let publication = build_asset(context, parent, depth)?;
+        let selected = publication
+            .outputs
+            .get(&output_key)
+            .cloned()
+            .ok_or_else(|| {
+                BuildError::Failed(format!(
+                    "derived child {asset} is absent from parent {parent}'s chain result"
+                ))
+            })?;
+        Ok((publication, selected))
+    } else {
+        let publication = build_asset(context, asset, depth)?;
+        let selected = publication.primary.clone();
+        Ok((publication, selected))
+    }
+}
+
+fn verify_encoded_output(output: &EncodedNodeOutput) -> Result<(), BuildError> {
+    let view = parse_artifact(&output.bytes).map_err(BuildError::failed)?;
+    if view.asset_uuid != output.asset
+        || view.authored_type != output.authored_type
+        || view.encoded_type != output.encoded_type
+        || view.terminal_type != output.terminal_type
+        || view.logical_hash != output.project.logical_hash
+        || view.layout_hash != output.project.layout_hash
+    {
+        return Err(BuildError::Failed(
+            "cached artifact identity does not match its build inputs".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_edges_for_output(
+    context: &BuildContext<'_>,
+    source_asset: AssetUuid,
+    load_deps: &[AssetUuid],
+    references: &[distill_wire::encode::EncodedReference],
+) -> Result<Vec<ServedLoadEdge>, BuildError> {
+    let fresh = references
+        .iter()
+        .filter(|reference| reference.strong)
+        .map(|reference| (reference.asset, reference.expected_terminal))
+        .collect::<BTreeMap<_, _>>();
+    let mut edges = Vec::with_capacity(load_deps.len());
+    for asset in load_deps {
+        let observed = resolved_terminal_type(context, *asset)?;
+        let expected = fresh.get(asset).copied().unwrap_or(observed);
+        if observed != expected {
+            return Err(BuildError::Failed(format!(
+                "reference from {source_asset} expects terminal type {expected}, but {asset} has {observed}"
+            )));
+        }
+        edges.push(ServedLoadEdge {
+            asset: *asset,
+            expected_terminal: expected,
+        });
+    }
+    edges.sort();
+    edges.dedup();
+    Ok(edges)
+}
+
+fn resolved_terminal_type(
+    context: &BuildContext<'_>,
+    asset: AssetUuid,
+) -> Result<TypeUuid, BuildError> {
+    if let Some(entry) = context.store.entry(asset).map_err(BuildError::failed)? {
+        return context
+            .registry
+            .chain(entry.type_uuid, &context.target)
+            .map(|chain| chain.terminal)
+            .map_err(BuildError::failed);
+    }
+    let (parent, output_key) = context
+        .store
+        .resolve_child(asset)
+        .map_err(BuildError::failed)?
+        .ok_or_else(|| BuildError::Failed(format!("missing strong reference {asset}")))?;
+    let parent = context
+        .store
+        .entry(parent)
+        .map_err(BuildError::failed)?
+        .ok_or_else(|| BuildError::Failed("derived parent is missing".to_owned()))?;
+    context
+        .registry
+        .chain(parent.type_uuid, &context.target)
+        .map_err(BuildError::failed)?
+        .extras
+        .get(&output_key)
+        .copied()
+        .ok_or_else(|| BuildError::Failed("derived output is absent from pipeline map".to_owned()))
 }
 
 fn encode_or_hydrate(
     context: &mut BuildContext<'_>,
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
+    terminal_type: TypeUuid,
+    validator_dylib_hash: Option<[u8; 32]>,
 ) -> Result<(Vec<u8>, Vec<distill_wire::encode::EncodedReference>), BuildError> {
     let key = build_import_digest(&BuildImportInputs {
         asset: loaded.entry.uuid,
         bundle: loaded.meta.bundle,
         local_id: loaded.meta.local_id.clone(),
         authored_type: loaded.entry.type_uuid,
-        terminal_type: loaded.entry.type_uuid,
+        terminal_type,
         canonical_bundle_bytes: loaded.bundle_bytes.clone(),
         logical: project.logical_hash,
         layout: project.layout_hash,
         migrations: Vec::new(),
+        validator_dylib_hash,
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
     });
-    let trace_source = StoreTraceSource::capture(context.store)?;
+    let trace_source = StoreTraceSource::capture(
+        context.store,
+        &context.registry,
+        &context.target,
+        context.basis,
+    )?;
     if let Some(hit) = lookup_persisted_candidate(
         context.store,
         KeyKind::BuildImport,
@@ -351,6 +1108,48 @@ fn encode_or_hydrate(
         };
     }
 
+    if validator_dylib_hash.is_some() {
+        let diagnostics = context
+            .pipeline
+            .epoch()
+            .map_err(|poison| BuildError::Failed(poison.to_string()))?
+            .invoke_validators(loaded.entry.type_uuid, &loaded.entry.data)
+            .map_err(BuildError::failed)?;
+        let error_paths = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .map(|diagnostic| diagnostic.path.clone())
+            .collect::<Vec<_>>();
+        if !error_paths.is_empty() {
+            let facts = DslfV1::Validator {
+                asset: loaded.entry.uuid,
+                type_uuid: loaded.entry.type_uuid,
+                error_paths,
+            };
+            let detail = facts.digest().map_err(BuildError::failed)?;
+            context
+                .store
+                .commit_build(BuildCommit {
+                    key_kind: KeyKind::BuildImport,
+                    static_input_key: key,
+                    asset_uuid: loaded.entry.uuid,
+                    static_inputs_canonical: Vec::new(),
+                    trace: trace_payload_bytes(&[]),
+                    outcome: CommitOutcome::Failure {
+                        cause: StoreFailureCause::Local(StoreFailureFingerprint::Local {
+                            class: StoreLocalFailureClass::Validator,
+                            detail,
+                        }),
+                    },
+                })
+                .map_err(BuildError::infrastructure)?;
+            return Err(BuildError::Failed(format!(
+                "asset {} failed validation: {diagnostics:?}",
+                loaded.entry.uuid
+            )));
+        }
+    }
+
     let source_bundle = loaded.meta.bundle;
     let mut trace = Vec::new();
     let mut resolver = |query: &distill_json::AuthoredValue,
@@ -370,7 +1169,7 @@ fn encode_or_hydrate(
         ArtifactValueSpec {
             asset_uuid: loaded.entry.uuid,
             authored_type: loaded.entry.type_uuid,
-            terminal_type: loaded.entry.type_uuid,
+            terminal_type,
             encoded_type: loaded.entry.type_uuid,
             logical_hash: project.logical_hash,
             layout_hash: project.layout_hash,
@@ -407,50 +1206,6 @@ fn encode_or_hydrate(
         })
         .map_err(BuildError::infrastructure)?;
     Ok((bytes, references))
-}
-
-fn load_edges(
-    store: &Store,
-    loaded: &LoadedAsset,
-    load_deps: &[AssetUuid],
-    references: &[distill_wire::encode::EncodedReference],
-) -> Result<Vec<ServedLoadEdge>, BuildError> {
-    let fresh = references
-        .iter()
-        .filter(|reference| reference.strong)
-        .map(|reference| {
-            (
-                reference.asset,
-                ServedLoadEdge {
-                    asset: reference.asset,
-                    expected_terminal: reference.expected_terminal,
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut edges = Vec::with_capacity(load_deps.len());
-    for asset in load_deps {
-        let target = store
-            .runtime_entry(*asset)
-            .map_err(BuildError::failed)?
-            .ok_or_else(|| BuildError::Failed(format!("missing strong reference {asset}")))?;
-        let expected = fresh
-            .get(asset)
-            .map_or(target.type_uuid, |edge| edge.expected_terminal);
-        if target.type_uuid != expected {
-            return Err(BuildError::Failed(format!(
-                "reference from {} expects terminal type {}, but {} has {}",
-                loaded.entry.uuid, expected, asset, target.type_uuid
-            )));
-        }
-        edges.push(ServedLoadEdge {
-            asset: *asset,
-            expected_terminal: expected,
-        });
-    }
-    edges.sort();
-    edges.dedup();
-    Ok(edges)
 }
 
 fn resolve_reference(
@@ -598,25 +1353,6 @@ fn find_bundle_asset(bundle: &Bundle, asset: AssetUuid) -> Option<(&str, &AssetE
         .find_map(|(local_id, entry)| (entry.uuid == asset).then_some((local_id.as_str(), entry)))
 }
 
-fn verify_artifact_identity(
-    view: &distill_wire::artifact::ArtifactView<'_>,
-    loaded: &LoadedAsset,
-    project: &ProjectTypeAuthority,
-) -> Result<(), BuildError> {
-    if view.asset_uuid != loaded.entry.uuid
-        || view.authored_type != loaded.entry.type_uuid
-        || view.encoded_type != loaded.entry.type_uuid
-        || view.terminal_type != loaded.entry.type_uuid
-        || view.logical_hash != project.logical_hash
-        || view.layout_hash != project.layout_hash
-    {
-        return Err(BuildError::Failed(
-            "cached build-import artifact identity does not match its DSBI inputs".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn merge_closure_row(
     closure: &mut BTreeMap<AssetUuid, ServedClosureRow>,
     row: ServedClosureRow,
@@ -677,6 +1413,7 @@ struct TraceEntry {
     bundle_path: String,
     local_id: String,
     authored_type: TypeUuid,
+    terminal_type: TypeUuid,
     role: EntryRole,
     tags: Vec<String>,
 }
@@ -684,11 +1421,19 @@ struct TraceEntry {
 #[derive(Clone)]
 struct StoreTraceSource {
     entries: BTreeMap<AssetUuid, TraceEntry>,
+    terminal_types: BTreeMap<AssetUuid, TypeUuid>,
+    roles: BTreeMap<AssetUuid, EntryRole>,
     paths: BTreeMap<String, Vec<AssetUuid>>,
+    tools: BTreeMap<String, [u8; 32]>,
 }
 
 impl StoreTraceSource {
-    fn capture(store: &Store) -> Result<Self, BuildError> {
+    fn capture(
+        store: &Store,
+        registry: &PipelineRegistry,
+        target: &Target,
+        basis: distill_store::state::InputVersion,
+    ) -> Result<Self, BuildError> {
         let bundles = store
             .all_bundles()
             .map_err(BuildError::infrastructure)?
@@ -711,6 +1456,10 @@ impl StoreTraceSource {
                     bundle_path,
                     local_id: entry.local_id,
                     authored_type: entry.type_uuid,
+                    terminal_type: registry
+                        .chain(entry.type_uuid, target)
+                        .map_err(BuildError::failed)?
+                        .terminal,
                     role: if entry.authoring_only {
                         EntryRole::AuthoringOnly
                     } else {
@@ -731,7 +1480,45 @@ impl StoreTraceSource {
             assets.sort();
             assets.dedup();
         }
-        Ok(Self { entries, paths })
+        let mut terminal_types = entries
+            .iter()
+            .map(|(asset, entry)| (*asset, entry.terminal_type))
+            .collect::<BTreeMap<_, _>>();
+        let mut roles = entries
+            .iter()
+            .map(|(asset, entry)| (*asset, entry.role))
+            .collect::<BTreeMap<_, _>>();
+        for (child, parent, output_key) in store
+            .all_derived_outputs()
+            .map_err(BuildError::infrastructure)?
+        {
+            let parent_type = entries.get(&parent).ok_or_else(|| {
+                BuildError::Infrastructure("derived parent is absent from trace index".to_owned())
+            })?;
+            let terminal = registry
+                .chain(parent_type.authored_type, target)
+                .map_err(BuildError::failed)?
+                .extras
+                .get(&output_key)
+                .copied()
+                .ok_or_else(|| {
+                    BuildError::Infrastructure(
+                        "derived output is absent from the pinned pipeline map".to_owned(),
+                    )
+                })?;
+            terminal_types.insert(child, terminal);
+            roles.insert(child, EntryRole::Runtime);
+        }
+        let tools = store
+            .tool_hashes_at(basis)
+            .map_err(BuildError::infrastructure)?;
+        Ok(Self {
+            entries,
+            terminal_types,
+            roles,
+            paths,
+            tools,
+        })
     }
 
     fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
@@ -769,7 +1556,7 @@ impl StoreTraceSource {
             .filter(|entry| {
                 query
                     .terminal_type
-                    .is_none_or(|terminal| terminal == entry.authored_type)
+                    .is_none_or(|terminal| terminal == entry.terminal_type)
             })
             .filter(|entry| {
                 query.tag.as_ref().is_none_or(|tag| {
@@ -817,8 +1604,15 @@ impl TraceSource for StoreTraceSource {
         Observed::Ok(asset_query_result_hash(&self.query_results(query)))
     }
 
-    fn tool(&self, _id: &str) -> Observed<[u8; 32]> {
-        no_trace()
+    fn tool(&self, id: &str) -> Observed<[u8; 32]> {
+        self.tools.get(id).copied().map_or_else(
+            || {
+                Observed::Err(StableFailureFingerprint::MissingCapability {
+                    key: CapabilityKey::Tool(id.to_owned()),
+                })
+            },
+            Observed::Ok,
+        )
     }
 
     fn capability(&self, _key: &CapabilityKey) -> Observed<[u8; 32]> {
@@ -826,11 +1620,11 @@ impl TraceSource for StoreTraceSource {
     }
 
     fn ref_check(&self, asset: AssetUuid, _expected: TypeUuid) -> Observed<Option<TypeUuid>> {
-        Observed::Ok(self.entries.get(&asset).map(|entry| entry.authored_type))
+        Observed::Ok(self.terminal_types.get(&asset).copied())
     }
 
     fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>> {
-        Observed::Ok(self.entries.get(&asset).map(|entry| entry.role))
+        Observed::Ok(self.roles.get(&asset).copied())
     }
 
     fn control(&self, _query: &ControlQuery) -> Observed<[u8; 32]> {
@@ -846,7 +1640,13 @@ impl TraceSource for StoreTraceSource {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::callbacks::{
+        PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProducts,
+    };
+    use distill_build::outputs::OutputDecls;
+    use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_bundle::{EntryLineageV1, LineageStamp};
     use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
     use distill_json::AuthoredValue;
@@ -864,6 +1664,8 @@ mod tests {
     use crate::scanner::AssetRoot;
 
     const TYPE: TypeUuid = TypeUuid([71; 16]);
+    const TERMINAL: TypeUuid = TypeUuid([74; 16]);
+    const EXTRA: TypeUuid = TypeUuid([75; 16]);
     const ASSET: AssetUuid = AssetUuid([72; 16]);
     const BUNDLE: BundleUuid = BundleUuid([73; 16]);
 
@@ -907,6 +1709,36 @@ mod tests {
                         generic_argument_ids: Vec::new(),
                         has_default: true,
                     },
+                    TypeDef {
+                        id: SchemaTypeId(2),
+                        kind: PrimitiveType::Struct,
+                        path: path("game", "CookedByteAsset"),
+                        uuid: Some(TERMINAL),
+                        attrs: TypeAttrs::default(),
+                        fields: vec![Field {
+                            id: FieldIdentifier::Name("value".to_owned()),
+                            type_id: SchemaTypeId(1),
+                            attrs: FieldAttrs::default(),
+                        }],
+                        generic_parameters: Vec::new(),
+                        generic_argument_ids: Vec::new(),
+                        has_default: false,
+                    },
+                    TypeDef {
+                        id: SchemaTypeId(3),
+                        kind: PrimitiveType::Struct,
+                        path: path("game", "ByteMetadata"),
+                        uuid: Some(EXTRA),
+                        attrs: TypeAttrs::default(),
+                        fields: vec![Field {
+                            id: FieldIdentifier::Name("value".to_owned()),
+                            type_id: SchemaTypeId(1),
+                            attrs: FieldAttrs::default(),
+                        }],
+                        generic_parameters: Vec::new(),
+                        generic_argument_ids: Vec::new(),
+                        has_default: false,
+                    },
                 ],
                 layouts: vec![SchemaLayouts {
                     identity: distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1()
@@ -929,6 +1761,26 @@ mod tests {
                             tag_encoding: None,
                             fields: Vec::new(),
                         },
+                        TypeLayout {
+                            size: Some(1),
+                            align: Some(1),
+                            layout_complete: true,
+                            tag_encoding: None,
+                            fields: vec![FieldLayout {
+                                offset: Some(0),
+                                field_size: Some(1),
+                            }],
+                        },
+                        TypeLayout {
+                            size: Some(1),
+                            align: Some(1),
+                            layout_complete: true,
+                            tag_encoding: None,
+                            fields: vec![FieldLayout {
+                                offset: Some(0),
+                                field_size: Some(1),
+                            }],
+                        },
                     ],
                 }],
             },
@@ -937,7 +1789,7 @@ mod tests {
         .unwrap()
     }
 
-    fn target() -> TargetDefinition {
+    fn rpc_target(hash: TargetDefinitionHash) -> TargetDefinition {
         let rows = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
             .unwrap()
             .rows()
@@ -949,16 +1801,46 @@ mod tests {
                 build_only: row.build_only,
             })
             .collect();
-        TargetDefinition::canonical("dev", TargetDefinitionHash([4; 32]), rows, policy).unwrap()
+        TargetDefinition::canonical("dev", hash, rows, policy).unwrap()
+    }
+
+    struct CountingProcessor(Arc<AtomicUsize>);
+
+    impl PipelineProcessor for CountingProcessor {
+        fn process(
+            &self,
+            input: AuthoredValue,
+            _context: &mut dyn PipelineProcessContext,
+        ) -> Result<ProcessorProducts, ProcessorError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ProcessorProducts {
+                primary: Some(input.clone()),
+                extras: BTreeMap::from([("metadata".to_owned(), input)]),
+                debug: BTreeMap::from([("processor-log".to_owned(), b"ok".to_vec())]),
+            })
+        }
     }
 
     #[test]
-    fn production_backend_persists_and_hydrates_the_exact_build_import() {
+    fn production_backend_persists_and_hydrates_the_complete_processor_chain() {
         let temp = tempfile::tempdir().unwrap();
         let assets = temp.path().join("assets");
         std::fs::create_dir_all(&assets).unwrap();
         let authority = Arc::new(authority());
         let project = authority.project_type(TYPE).unwrap();
+        let build_target = Target::new(
+            TargetOs::Linux,
+            TargetArch::X86_64,
+            BTreeSet::from([GraphicsApi::new("vulkan").unwrap()]),
+            false,
+            true,
+            authority.identity().clone(),
+        )
+        .unwrap();
+        let target_hash = TargetDefinitionHash(distill_build::keys::target_definition_hash(
+            &build_target,
+            &[],
+        ));
         let epochs = vec![AcceptedSchemaEpoch {
             digest: project.logical_hash,
             forward_parent: None,
@@ -1004,27 +1886,41 @@ mod tests {
                     root: "main".to_owned(),
                     path: "schema/lineage.bundle".to_owned(),
                 },
-                vec![target()],
+                vec![rpc_target(target_hash)],
                 64,
             )
             .unwrap(),
         );
         coordinator.reconcile_full_scan().unwrap();
         coordinator.install_schema_authority_for_test(authority.clone());
+        coordinator.install_build_target_for_test("dev", build_target);
+        let calls = Arc::new(AtomicUsize::new(0));
+        coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch(
+            "dev",
+            target_hash.0,
+            crate::callbacks::ProcessorDescriptor {
+                id: "cook".to_owned(),
+                version: 4,
+                input: TYPE,
+                selector: TargetSelector::new(None, None).unwrap(),
+                outputs: OutputDecls::new(TERMINAL, vec![("metadata".to_owned(), EXTRA)]).unwrap(),
+            },
+            CountingProcessor(Arc::clone(&calls)),
+        ));
         let request = BuildRequest {
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
-            target_definition: TargetDefinitionHash([4; 32]),
+            target_definition: target_hash,
             requested_asset: ASSET,
             output_key: String::new(),
-            requested_terminal_type: TYPE,
+            requested_terminal_type: TERMINAL,
             entry: AuthoringEntry {
                 uuid: ASSET,
                 bundle: BUNDLE,
                 local_id: "entry".to_owned(),
                 normalized_path: "byte.bundle".to_owned(),
                 type_uuid: TYPE,
-                terminal_type: TYPE,
+                terminal_type: TERMINAL,
                 schema_hash: project.logical_hash,
                 logical_schema: Arc::from(
                     snapshot_to_json(&project.logical_schema)
@@ -1043,8 +1939,9 @@ mod tests {
 
         let first = build(&coordinator, &request).unwrap();
         let first_memo = coordinator.store().lock().unwrap().memo_seq();
-        assert_eq!(first.artifacts.len(), 1);
+        assert_eq!(first.artifacts.len(), 2);
         assert_eq!(first.wire_trees.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         let root = first
             .artifacts
             .iter()
@@ -1059,11 +1956,34 @@ mod tests {
         let parsed =
             distill_wire::artifact::parse_artifact_parts(&root.payload.structural, &blobs).unwrap();
         assert_eq!(parsed.asset_uuid, ASSET);
+        assert_eq!(parsed.authored_type, TYPE);
+        assert_eq!(parsed.encoded_type, TERMINAL);
+        assert_eq!(parsed.terminal_type, TERMINAL);
         assert_eq!(parsed.fixed, [7]);
+        let child = AssetUuid::v5(ASSET, "metadata");
+        let extra = first
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                let blobs = artifact
+                    .payload
+                    .blobs
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<_>>();
+                distill_wire::artifact::parse_artifact_parts(&artifact.payload.structural, &blobs)
+                    .unwrap()
+                    .asset_uuid
+                    == child
+            })
+            .expect("declared extra artifact is published");
+        assert_eq!(extra.payload.encoded_type, EXTRA);
+        assert_eq!(extra.payload.terminal_type, EXTRA);
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
         assert_eq!(coordinator.store().lock().unwrap().memo_seq(), first_memo);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1077,11 +1997,15 @@ mod tests {
                     bundle_path: "target.bundle".to_owned(),
                     local_id: "entry".to_owned(),
                     authored_type: TYPE,
+                    terminal_type: TYPE,
                     role: EntryRole::Runtime,
                     tags: Vec::new(),
                 },
             )]),
+            terminal_types: BTreeMap::from([(ASSET, TYPE)]),
+            roles: BTreeMap::from([(ASSET, EntryRole::Runtime)]),
             paths: BTreeMap::from([("target.bundle".to_owned(), vec![ASSET])]),
+            tools: BTreeMap::new(),
         };
         let mut trace = Vec::new();
         assert_eq!(
@@ -1106,11 +2030,11 @@ mod tests {
         assert!(!distill_build::trace::revalidate(&trace, &moved));
 
         let mut role_changed = source.clone();
-        role_changed.entries.get_mut(&ASSET).unwrap().role = EntryRole::AuthoringOnly;
+        role_changed.roles.insert(ASSET, EntryRole::AuthoringOnly);
         assert!(!distill_build::trace::revalidate(&trace, &role_changed));
 
         let mut retyped = source;
-        retyped.entries.get_mut(&ASSET).unwrap().authored_type = TypeUuid([88; 16]);
+        retyped.terminal_types.insert(ASSET, TypeUuid([88; 16]));
         assert!(!distill_build::trace::revalidate(&trace, &retyped));
     }
 }

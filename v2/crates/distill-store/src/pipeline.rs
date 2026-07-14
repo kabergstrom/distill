@@ -2297,6 +2297,34 @@ impl Store {
         }))
     }
 
+    pub fn tool_hashes_at(
+        &self,
+        basis: InputVersion,
+    ) -> Result<BTreeMap<String, [u8; 32]>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT candidate.tool_key, candidate.capsule_hash
+               FROM tools AS candidate
+              WHERE candidate.input_version = (
+                    SELECT MAX(prior.input_version)
+                      FROM tools AS prior
+                     WHERE prior.tool_key = candidate.tool_key
+                       AND prior.input_version <= ?1)
+                AND candidate.present = 1
+              ORDER BY candidate.tool_key",
+        )?;
+        let rows = statement.query_map([i64::try_from(basis.0).unwrap_or(i64::MAX)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (key, hash) = row?;
+            let hash = hash.try_into().map_err(|_| {
+                StoreError::InvalidToolCapsule(distill_core::tool::ToolCapsuleError::Truncated)
+            })?;
+            Ok((key, hash))
+        })
+        .collect()
+    }
+
     /// Resolve a tool key through the ToolEpoch table (§13).
     pub fn tool(&self, key: &str) -> Result<Option<StagedTool>, StoreError> {
         self.tool_at(key, self.input_version())

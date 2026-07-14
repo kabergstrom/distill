@@ -781,6 +781,28 @@ impl crate::db::InputTxn<'_> {
 }
 
 impl Store {
+    pub fn all_derived_outputs(&self) -> Result<Vec<(AssetUuid, AssetUuid, String)>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT child_uuid, parent_uuid, output_key FROM derived_outputs ORDER BY child_uuid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (child, parent, key) = row?;
+            Ok((
+                AssetUuid(crate::bundles::blob16(child)),
+                AssetUuid(crate::bundles::blob16(parent)),
+                key,
+            ))
+        })
+        .collect()
+    }
+
     /// Resolve a derived child through the namespace index — the only
     /// authority (§9): historical result records never resurrect a
     /// retired child. Namespace-facing: fails under version poison.

@@ -207,6 +207,19 @@ impl DaemonCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(authority);
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_build_target_for_test(&self, name: &str, target: Target) {
+        self.build_targets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), target);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_pipeline_epoch_for_test(&self, epoch: PipelineEpoch) {
+        lock_pipeline(&self.pipeline).host.install_ready(epoch);
+    }
+
     pub fn operational_configuration(&self) -> SchedulerConfig {
         self.operational
             .lock()

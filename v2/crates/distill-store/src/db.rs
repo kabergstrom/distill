@@ -317,6 +317,10 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
+    pub fn state_path(&self) -> &Path {
+        &self.config.state_path
+    }
+
     /// Open (creating if absent) the daemon state under
     /// `config.state_path`.
     pub fn open(config: StoreConfig) -> Result<Store, StoreError> {

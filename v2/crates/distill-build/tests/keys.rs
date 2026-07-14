@@ -49,6 +49,7 @@ fn build_import_key_names_the_sibling_entry_and_bundle_bytes() {
         logical: LogicalHash([5; 32]),
         layout: LayoutHash([6; 32]),
         migrations: vec![],
+        validator_dylib_hash: Some([7; 32]),
         artifact_format_version: 1,
     };
     let mut sibling = base.clone();
@@ -57,6 +58,9 @@ fn build_import_key_names_the_sibling_entry_and_bundle_bytes() {
     let mut edited = base.clone();
     edited.canonical_bundle_bytes.push(0);
     assert_ne!(build_import_digest(&base), build_import_digest(&edited));
+    let mut validator = base.clone();
+    validator.validator_dylib_hash = Some([8; 32]);
+    assert_ne!(build_import_digest(&base), build_import_digest(&validator));
 }
 
 #[test]
