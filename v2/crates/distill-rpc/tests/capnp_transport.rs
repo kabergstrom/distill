@@ -194,15 +194,15 @@ struct BlockingBuildBackend {
 }
 
 impl BuildBackend for BlockingBuildBackend {
-    fn build(&self, _request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
         self.started.store(true, Ordering::Release);
         let (released, wake) = &*self.release;
         let mut released = released.lock().unwrap();
         while !*released {
             released = wake.wait(released).unwrap();
         }
-        Ok(BuildBackendOutcome::Failed {
-            error: "released test build".to_owned(),
+        Ok(BuildBackendOutcome::Drifted {
+            input: request.drifted_input.clone(),
         })
     }
 }
@@ -1254,7 +1254,7 @@ async fn a_slow_snapshot_build_does_not_stall_the_rpc_io_thread() {
         release: Arc::clone(&release),
     }));
     let entry = authoring_entry(41, AuthoringEntryRole::Runtime);
-    server
+    let drift_stamp = server
         .commit(Commit {
             assets: vec![AssetMutation::Set {
                 uuid: entry.uuid,
@@ -1324,7 +1324,30 @@ async fn a_slow_snapshot_build_does_not_stall_the_rpc_io_thread() {
                 *released.lock().unwrap() = true;
                 wake.notify_all();
             }
-            resolve_task.await.unwrap().unwrap();
+            let resolve_response = resolve_task.await.unwrap().unwrap();
+            let resolve_terminal = match resolve_response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::resolve_call::Which::Success(terminal) => terminal.unwrap(),
+                _ => panic!("expected typed drifted resolve"),
+            };
+            let drifted = match resolve_terminal.get_result().unwrap().which().unwrap() {
+                schema::resolve_result::Which::Drifted(drifted) => drifted.unwrap(),
+                _ => panic!("expected drifted result"),
+            };
+            let drifted_asset = match drifted.get_input().unwrap().which().unwrap() {
+                schema::drifted_input_value::Which::Asset(asset) => asset.unwrap(),
+                _ => panic!("expected asset drift input"),
+            };
+            assert_eq!(drifted_asset, &entry.uuid.0);
+            let current = drifted.get_current().unwrap();
+            assert_eq!(current.get_instance().unwrap(), &drift_stamp.instance.0);
+            assert_eq!(current.get_version(), drift_stamp.version.0);
             assert!(matches!(
                 metadata,
                 Ok(Ok(RemoteMetadataOutcome::Connected { .. }))

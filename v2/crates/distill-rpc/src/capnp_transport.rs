@@ -4171,9 +4171,18 @@ fn write_resolve_result(
             let mut value = output.init_result();
             match terminal.value {
                 ResolveResult::Built { content_hash } => value.set_built(&content_hash.0),
-                ResolveResult::Drifted { input, current } => value.set_drifted(
-                    format!("{} at {}", describe_drift(&input), current.version.0).as_str(),
-                ),
+                ResolveResult::Drifted { input, current } => {
+                    let mut drifted = value.init_drifted();
+                    let mut wire_input = drifted.reborrow().init_input();
+                    match input {
+                        DriftedInput::File(path) => wire_input.set_file(path.as_str()),
+                        DriftedInput::Asset(asset) => wire_input.set_asset(&asset.0),
+                        DriftedInput::Query(query) => wire_input.set_query(query.as_str()),
+                        DriftedInput::Dylib => wire_input.set_dylib(()),
+                        DriftedInput::Tool(tool) => wire_input.set_tool(tool.as_str()),
+                    }
+                    write_stamp(drifted.init_current(), current);
+                }
                 ResolveResult::Failed { error } => value.set_failed(error.as_str()),
                 ResolveResult::Missing => value.set_missing(()),
                 ResolveResult::Deleted { at } => write_stamp(value.init_deleted(), at),
@@ -5272,15 +5281,5 @@ fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
         }
         ReconnectReason::StoreInstanceChanged => schema::ReconnectReason::StoreInstanceChanged,
         ReconnectReason::ProtocolEpochChanged => schema::ReconnectReason::ProtocolEpochChanged,
-    }
-}
-
-fn describe_drift(input: &DriftedInput) -> String {
-    match input {
-        DriftedInput::File(path) => format!("file:{path}"),
-        DriftedInput::Asset(uuid) => format!("asset:{uuid}"),
-        DriftedInput::Query(query) => format!("query:{query}"),
-        DriftedInput::Dylib => "dylib".to_owned(),
-        DriftedInput::Tool(tool) => format!("tool:{tool}"),
     }
 }

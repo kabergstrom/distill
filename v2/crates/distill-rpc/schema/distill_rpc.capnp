@@ -853,6 +853,21 @@ struct TerminalResolve {
   result @1 :ResolveResult;
 }
 
+struct DriftedInputValue {
+  union {
+    file @0 :Text;
+    asset @1 :Data;
+    query @2 :Text;
+    dylib @3 :Void;
+    tool @4 :Text;
+  }
+}
+
+struct DriftedResolve {
+  input @0 :DriftedInputValue;
+  current @1 :SnapshotStamp;
+}
+
 struct ResolveCall {
   union {
     success @0 :TerminalResolve;
@@ -868,7 +883,7 @@ struct ResolveCall {
 struct ResolveResult {
   union {
     built @0 :Data;
-    drifted @1 :Text;
+    drifted @1 :DriftedResolve;
     failed @2 :Text;
     missing @3 :Void;
     deleted @4 :SnapshotStamp;
