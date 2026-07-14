@@ -2,6 +2,7 @@
 //! scheduling, code-loading policy, and displaced-inode quarantine.
 
 pub mod epoch;
+pub mod lineage_repair;
 pub mod policy;
 pub mod quarantine;
 pub mod scanner;

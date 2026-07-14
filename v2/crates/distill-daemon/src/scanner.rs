@@ -319,7 +319,14 @@ impl RootedScanner {
                 });
             }
             let identity = file_identity(&metadata);
-            if root.quarantine_identity == Some(identity) {
+            let live_quarantine_identity = fs::metadata(&root.configured.quarantine_dir)
+                .ok()
+                .filter(|metadata| metadata.is_dir())
+                .map(|metadata| file_identity(&metadata));
+            if pending.physical_path == root.configured.quarantine_dir
+                || root.quarantine_identity == Some(identity)
+                || live_quarantine_identity == Some(identity)
+            {
                 continue;
             }
             if pending.ancestry.contains(&identity) {
