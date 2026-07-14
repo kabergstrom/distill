@@ -184,6 +184,38 @@ impl DaemonCoordinator {
         lock_pipeline(&self.pipeline).host.snapshot()
     }
 
+    /// Persist the first runtime poison latched by a published callback
+    /// without minting a new input version. The in-memory epoch token fences
+    /// work immediately; this closes the crash/restart durability side of the
+    /// same monotonic transition.
+    pub(crate) fn sync_runtime_pipeline_poison(
+        &self,
+    ) -> Result<Option<PipelinePoison>, CoordinatorError> {
+        let observed = {
+            let runtime = lock_pipeline(&self.pipeline);
+            let Some(epoch) = runtime.host.published_ready_epoch() else {
+                return Ok(None);
+            };
+            match runtime.host.snapshot().epoch() {
+                Ok(_) => return Ok(None),
+                Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => {
+                    (epoch.dylib_hash(), poison)
+                }
+                Err(_) => return Ok(None),
+            }
+        };
+        let mut store = lock_store(&self.store);
+        match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
+            Ok(()) => Ok(Some(observed.1)),
+            Err(StoreError::StalePublishedPipeline {
+                actual: Some(actual),
+                already_unavailable: true,
+                ..
+            }) if actual == observed.0 => Ok(Some(observed.1)),
+            Err(error) => Err(CoordinatorError::RuntimePipeline(error.to_string())),
+        }
+    }
+
     pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
         self.schema_authority
             .read()
@@ -1027,6 +1059,7 @@ pub enum CoordinatorError {
     Watcher(WatcherQueueError),
     InvalidManifest(String),
     Coordinated(CoordinatedCommitError),
+    RuntimePipeline(String),
 }
 
 impl std::fmt::Display for CoordinatorError {

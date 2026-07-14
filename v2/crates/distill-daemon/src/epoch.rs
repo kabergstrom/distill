@@ -1435,6 +1435,13 @@ impl ModuleHost {
         }
     }
 
+    pub(crate) fn published_ready_epoch(&self) -> Option<PipelineEpoch> {
+        match &self.published {
+            Some(PublishedState::Ready(epoch)) => Some(epoch.clone()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn prepare_candidate(
         &mut self,
         source: &Path,

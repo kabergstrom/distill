@@ -71,7 +71,21 @@ impl BuildBackend for CoordinatorBuildBackend {
                 .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
                     operation: "build coordinator stopped".to_owned(),
                 })?;
-        match build(&coordinator, request) {
+        let result = build(&coordinator, request);
+        match coordinator.sync_runtime_pipeline_poison() {
+            Ok(Some(poison)) => {
+                return Ok(BuildBackendOutcome::Failed {
+                    error: poison.to_string(),
+                })
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(RpcFailure::AuthoringBackendUnavailable {
+                    operation: format!("persist runtime pipeline poison: {error}"),
+                })
+            }
+        }
+        match result {
             Ok(publication) => Ok(BuildBackendOutcome::Built(publication)),
             Err(BuildError::Drifted(input)) => Ok(BuildBackendOutcome::Drifted { input }),
             Err(BuildError::Failed(error)) => Ok(BuildBackendOutcome::Failed { error }),
