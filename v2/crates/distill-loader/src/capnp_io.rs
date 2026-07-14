@@ -11,12 +11,14 @@ use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
-use distill_rpc::{AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, StreamEvent};
+use distill_rpc::{
+    AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, ReattestRequest, StreamEvent,
+};
 use tokio::sync::mpsc;
 
 use crate::io::{
     AssetDeltaState, DriftedInput, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ReqId,
-    ResolveResult,
+    ResolveResult, RuntimeAttestation,
 };
 use crate::rpc_decode::{
     artifact_layout_hash, collect_artifact_chunks, fetched_artifact, io_basis,
@@ -96,6 +98,10 @@ impl Drop for RpcIo {
 }
 
 impl LoaderIO for RpcIo {
+    fn reattest(&mut self, attestation: RuntimeAttestation) {
+        self.send(Command::Reattest(attestation));
+    }
+
     fn begin_sweep(&mut self) -> IoBasis {
         let (reply, receive) = sync_mpsc::sync_channel(1);
         if self.commands.send(Command::BeginSweep { reply }).is_err() {
@@ -166,6 +172,7 @@ impl LoaderIO for RpcIo {
 }
 
 enum Command {
+    Reattest(RuntimeAttestation),
     BeginSweep {
         reply: sync_mpsc::SyncSender<Option<IoBasis>>,
     },
@@ -257,10 +264,22 @@ fn run_thread(
         if init.send(Ok(basis)).is_err() {
             return;
         }
+        let accepted = RuntimeAttestation {
+            epoch: crate::GameModuleEpoch(request.epoch.0),
+            target_definition_hash: request.target_definition_hash.0,
+            compiled_types: distill_core::attestation::CompiledTypeTable::from_canonical(
+                request.compiled_registry.clone(),
+                request.dsca,
+            )
+            .expect("CapnpClient accepted a validated ConnectRequest"),
+        };
         Driver {
-            _client: client,
+            address,
+            target: request.target,
+            client,
             hub,
             snapshot,
+            accepted,
             commands,
             events,
             subscriptions: Rc::new(RefCell::new(Subscriptions::default())),
@@ -272,9 +291,12 @@ fn run_thread(
 }
 
 struct Driver {
-    _client: CapnpClient,
+    address: SocketAddr,
+    target: String,
+    client: CapnpClient,
     hub: RemoteHub,
     snapshot: RemoteSnapshot,
+    accepted: RuntimeAttestation,
     commands: mpsc::UnboundedReceiver<Command>,
     events: sync_mpsc::Sender<IoEvent>,
     subscriptions: Rc<RefCell<Subscriptions>>,
@@ -301,6 +323,7 @@ impl Driver {
 
     async fn handle(&mut self, command: Command) -> bool {
         match command {
+            Command::Reattest(attestation) => self.reattest(attestation).await,
             Command::BeginSweep { reply } => {
                 let basis = match self.snapshot.refresh().await {
                     Ok(RemoteCall::Success(snapshot)) => {
@@ -401,6 +424,150 @@ impl Driver {
             Command::Shutdown => return false,
         }
         true
+    }
+
+    async fn reattest(&mut self, attestation: RuntimeAttestation) {
+        if attestation == self.accepted {
+            self.refresh_snapshot_and_publish().await;
+            return;
+        }
+        let request = match reattest_request(&self.hub, &attestation) {
+            Ok(request) => request,
+            Err(message) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed { message });
+                return;
+            }
+        };
+        match self.hub.reattest(&request).await {
+            Ok(RemoteCall::Success(_)) => {
+                self.accepted = attestation;
+                self.refresh_snapshot_and_publish().await;
+            }
+            Ok(RemoteCall::ReconnectRequired(_)) => self.reconnect(attestation).await,
+            Ok(call) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: remote_message(call),
+                });
+            }
+            Err(error) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+
+    async fn reconnect(&mut self, attestation: RuntimeAttestation) {
+        let request = match connect_request(&self.target, &attestation) {
+            Ok(request) => request,
+            Err(message) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed { message });
+                return;
+            }
+        };
+        let client = match CapnpClient::connect_local(self.address).await {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: error.to_string(),
+                });
+                return;
+            }
+        };
+        let outcome = match client.connect(&request).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: error.to_string(),
+                });
+                return;
+            }
+        };
+        let hub = match RemoteHub::connected(outcome) {
+            Ok(hub) => hub,
+            Err(outcome) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: format!("RPC reconnection rejected: {outcome:?}"),
+                });
+                return;
+            }
+        };
+        let snapshot = match hub.snapshot().await {
+            Ok(RemoteCall::Success(snapshot)) => snapshot,
+            Ok(call) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: remote_message(call),
+                });
+                return;
+            }
+            Err(error) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: error.to_string(),
+                });
+                return;
+            }
+        };
+        if let Some(task) = self.delta_task.take() {
+            task.abort();
+        }
+        self.client = client;
+        self.hub = hub;
+        self.snapshot = snapshot;
+        self.accepted = attestation;
+        self.restart_subscription().await;
+        self.publish_reattested();
+    }
+
+    async fn refresh_snapshot_and_publish(&mut self) {
+        match self.hub.snapshot().await {
+            Ok(RemoteCall::Success(snapshot)) => {
+                self.snapshot = snapshot;
+                self.restart_subscription().await;
+                self.publish_reattested();
+            }
+            Ok(call) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: remote_message(call),
+                });
+            }
+            Err(error) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+
+    fn publish_reattested(&self) {
+        match io_basis(self.snapshot.basis()) {
+            Ok(basis) => {
+                let _ = self.events.send(IoEvent::Reattested {
+                    attestation: self.accepted.clone(),
+                    basis,
+                });
+            }
+            Err(error) => {
+                let _ = self.events.send(IoEvent::ReattestationFailed {
+                    message: format!("invalid reattested load policy: {error:?}"),
+                });
+            }
+        }
+    }
+
+    async fn restart_subscription(&mut self) {
+        if let Some(task) = self.delta_task.take() {
+            task.abort();
+        }
+        let (assets, paths) = {
+            let subscriptions = self.subscriptions.borrow();
+            (
+                subscriptions.assets.iter().copied().collect::<Vec<_>>(),
+                subscriptions.paths.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if !assets.is_empty() || !paths.is_empty() {
+            self.subscribe(assets, paths).await;
+        }
     }
 
     fn basis_matches(&self, basis: &IoBasis) -> bool {
@@ -648,6 +815,36 @@ fn init_remote_failure<T: std::fmt::Debug>(call: RemoteCall<T>) -> RpcIoInitErro
         }
         other => RpcIoInitError::Unavailable(remote_message(other)),
     }
+}
+
+fn connect_request(
+    target: &str,
+    attestation: &RuntimeAttestation,
+) -> Result<ConnectRequest, String> {
+    attestation
+        .connect_request(target)
+        .map_err(|error| error.to_string())
+}
+
+fn reattest_request(
+    hub: &RemoteHub,
+    attestation: &RuntimeAttestation,
+) -> Result<ReattestRequest, String> {
+    let request = connect_request("reattest", attestation)?;
+    let successor = hub
+        .attestation_generation()
+        .checked_add(1)
+        .ok_or_else(|| "attestation generation overflow".to_owned())?;
+    Ok(ReattestRequest {
+        epoch: request.epoch,
+        base_attestation_generation: hub.attestation_generation(),
+        successor_attestation_generation: successor,
+        target_definition_hash: request.target_definition_hash,
+        compiled_registry: request.compiled_registry,
+        dsca: request.dsca,
+        load_policy: request.load_policy,
+        policy_digest: request.policy_digest,
+    })
 }
 
 fn stream_events(

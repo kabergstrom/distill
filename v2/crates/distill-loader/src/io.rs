@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use distill_build::trace::EntryRole;
+use distill_core::attestation::CompiledTypeTable;
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_store::state::SnapshotStamp;
 use distill_wire::exec::Blob;
@@ -11,6 +12,75 @@ use crate::basis::IoBasis;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ReqId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAttestation {
+    pub epoch: crate::GameModuleEpoch,
+    pub target_definition_hash: [u8; 32],
+    pub compiled_types: CompiledTypeTable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAttestationError {
+    Bootstrap(String),
+    Compiled(distill_core::attestation::AttestationError),
+    Rpc(distill_rpc::AttestationShapeError),
+}
+
+impl std::fmt::Display for RuntimeAttestationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "runtime attestation: {self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeAttestationError {}
+
+impl RuntimeAttestation {
+    pub fn from_descriptors(
+        epoch: crate::GameModuleEpoch,
+        target_definition_hash: [u8; 32],
+        descriptors: &[&'static distill_asset::AssetRuntimeDescriptor],
+    ) -> Result<Self, RuntimeAttestationError> {
+        let bootstrap = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
+            .map_err(|error| RuntimeAttestationError::Bootstrap(error.to_string()))?;
+        let mut rows = bootstrap.rows().to_vec();
+        rows.extend(
+            descriptors
+                .iter()
+                .map(|descriptor| (*descriptor.compiled_type).clone()),
+        );
+        let compiled_types =
+            CompiledTypeTable::canonical(rows).map_err(RuntimeAttestationError::Compiled)?;
+        Ok(Self {
+            epoch,
+            target_definition_hash,
+            compiled_types,
+        })
+    }
+
+    pub fn connect_request(
+        &self,
+        target: &str,
+    ) -> Result<distill_rpc::ConnectRequest, RuntimeAttestationError> {
+        let policy = self
+            .compiled_types
+            .rows
+            .iter()
+            .map(|row| distill_rpc::LoadPolicyEntry {
+                type_uuid: row.type_uuid,
+                build_only: row.build_only,
+            })
+            .collect();
+        distill_rpc::ConnectRequest::canonical(
+            distill_rpc::GameModuleEpoch(self.epoch.0),
+            target,
+            distill_rpc::TargetDefinitionHash(self.target_definition_hash),
+            self.compiled_types.rows.clone(),
+            policy,
+        )
+        .map_err(RuntimeAttestationError::Rpc)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriftedInput {
@@ -112,9 +182,17 @@ pub enum IoEvent {
     ReconnectRequired {
         reason: ReconnectReason,
     },
+    Reattested {
+        attestation: RuntimeAttestation,
+        basis: IoBasis,
+    },
+    ReattestationFailed {
+        message: String,
+    },
 }
 
 pub trait LoaderIO {
+    fn reattest(&mut self, attestation: RuntimeAttestation);
     fn begin_sweep(&mut self) -> IoBasis;
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis);
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis);

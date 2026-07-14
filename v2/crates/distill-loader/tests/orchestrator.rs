@@ -9,7 +9,7 @@ use distill_loader::{
     AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
     LoadPolicyAttestation, LoadPolicyRow, LoadStatus, Loader, LoaderDiagnostic, LoaderError,
     LoaderIO, ManifestHash, PathResolveResult, PendingState, PendingToken, PreparedValue,
-    ReattestationState, ReqId, ResolveResult, StorageError, UpdateResult,
+    ReattestationState, ReqId, ResolveResult, RuntimeAttestation, StorageError, UpdateResult,
 };
 use distill_store::state::{InputVersion, StoreInstanceId};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
@@ -85,6 +85,7 @@ impl AssetType for RefPlaceholder {
 
 #[derive(Debug, Clone)]
 enum Command {
+    Reattest,
     Resolve(ReqId, AssetUuid, IoBasis),
     Fetch(ReqId, ContentHash, IoBasis),
     ResolvePath(ReqId, String, IoBasis),
@@ -147,6 +148,14 @@ impl MockIo {
 }
 
 impl LoaderIO for MockIo {
+    fn reattest(&mut self, attestation: RuntimeAttestation) {
+        self.commands.push(Command::Reattest);
+        self.events.push_back(IoEvent::Reattested {
+            attestation,
+            basis: self.basis.clone(),
+        });
+    }
+
     fn begin_sweep(&mut self) -> IoBasis {
         self.sweeps += 1;
         self.basis.clone()
@@ -351,6 +360,7 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
         .register_types(
             GameModuleEpoch(epoch),
             token.clone(),
+            [7; 32],
             &[
                 A::descriptor(),
                 B::descriptor(),
@@ -359,7 +369,6 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
         )
         .unwrap();
     assert_eq!(loader.reattestation_state(), ReattestationState::Required);
-    loader.confirm_reattested();
 }
 
 fn resolve(loader: &mut Loader<MockIo>, asset_uuid: AssetUuid, hash: ContentHash) {
@@ -570,6 +579,38 @@ fn pending_member_defers_the_whole_dependency_component() {
 }
 
 #[test]
+fn stale_reattestation_completion_cannot_unblock_the_registered_epoch() {
+    let token = ModuleEpochToken::new(31);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 31, &token);
+    let IoEvent::Reattested { attestation, basis } = loader.io_mut().events.pop_front().unwrap()
+    else {
+        panic!("registration must request typed reattestation");
+    };
+    let mut stale = attestation.clone();
+    stale.epoch = GameModuleEpoch(30);
+    loader.io_mut().push(IoEvent::Reattested {
+        attestation: stale,
+        basis: basis.clone(),
+    });
+    let mut storage = Storage::default();
+
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.reattestation_state(), ReattestationState::Required);
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::Io(message) if message.contains("ignored stale runtime reattestation")
+    )));
+
+    loader
+        .io_mut()
+        .push(IoEvent::Reattested { attestation, basis });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.reattestation_state(), ReattestationState::Attested);
+}
+
+#[test]
 fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion() {
     let token = ModuleEpochToken::new(3);
     let mut loader = Loader::new(mock_io());
@@ -592,7 +633,6 @@ fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion()
     assert_eq!(loader.reattestation_state(), ReattestationState::Required);
     assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
 
-    loader.confirm_reattested();
     loader.process(&mut storage).unwrap();
     let (new_req, new_basis) = loader.io().path_for("textures/main");
     assert_ne!(new_req, old_req);
@@ -637,7 +677,6 @@ fn protocol_epoch_reconnect_fences_old_resolve_and_requires_reattestation() {
         diagnostic,
         LoaderDiagnostic::ReconnectRequired(distill_loader::ReconnectReason::ProtocolEpochChanged)
     )));
-    loader.confirm_reattested();
     loader.process(&mut storage).unwrap();
     assert_ne!(loader.io().resolve_for(asset_uuid).0, old_req);
 }

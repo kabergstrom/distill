@@ -28,6 +28,7 @@ use crate::component::{
 };
 use crate::io::{
     FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ResolveResult,
+    RuntimeAttestation,
 };
 use crate::runtime::{
     AdoptionId, CompletionDisposition, HandleId, ManifestEntry, ManifestState, OutstandingPurpose,
@@ -60,6 +61,7 @@ pub enum RegistrationError {
     DuplicateType(TypeUuid),
     DuplicatePlaceholder(TypeUuid),
     PlaceholderTypeMismatch,
+    Attestation(crate::RuntimeAttestationError),
     Epoch(RuntimeEpochError),
 }
 
@@ -308,6 +310,7 @@ pub struct Loader<I: LoaderIO> {
     next_handle: u64,
     next_adoption: u64,
     attestation: ReattestationState,
+    registered_attestation: Option<RuntimeAttestation>,
     draining: BTreeSet<GameModuleEpoch>,
 }
 
@@ -333,6 +336,7 @@ impl<I: LoaderIO> Loader<I> {
             next_handle: 1,
             next_adoption: 1,
             attestation: ReattestationState::Required,
+            registered_attestation: None,
             draining: BTreeSet::new(),
         }
     }
@@ -353,6 +357,7 @@ impl<I: LoaderIO> Loader<I> {
         &mut self,
         epoch: GameModuleEpoch,
         token: ModuleEpochToken,
+        target_definition_hash: [u8; 32],
         descriptors: &[&'static AssetRuntimeDescriptor],
     ) -> Result<(), RegistrationError> {
         let mut seen = BTreeSet::new();
@@ -361,6 +366,9 @@ impl<I: LoaderIO> Loader<I> {
                 return Err(RegistrationError::DuplicateType(descriptor.type_uuid));
             }
         }
+        let attestation =
+            RuntimeAttestation::from_descriptors(epoch, target_definition_hash, descriptors)
+                .map_err(RegistrationError::Attestation)?;
         self.epochs
             .register(epoch, token.clone(), descriptors.len())
             .map_err(RegistrationError::Epoch)?;
@@ -374,6 +382,7 @@ impl<I: LoaderIO> Loader<I> {
                 },
             );
         }
+        self.registered_attestation = Some(attestation);
         self.block_for_reattest();
         Ok(())
     }
@@ -404,13 +413,6 @@ impl<I: LoaderIO> Loader<I> {
             },
         );
         Ok(())
-    }
-
-    /// The embedding RpcIO/PackfileIO has completed its full external
-    /// reattestation. The next `process` obtains a fresh basis and verifies its
-    /// policy projection against the registered descriptors before issuing IO.
-    pub fn confirm_reattested(&mut self) {
-        self.attestation = ReattestationState::Attested;
     }
 
     pub fn add_ref<T: AssetType>(&mut self, uuid: AssetUuid) -> Result<Handle<T>, LoaderError> {
@@ -755,6 +757,9 @@ impl<I: LoaderIO> Loader<I> {
         self.attestation = ReattestationState::Required;
         let _ = self.requests.reconnect();
         self.abandon_sweep();
+        if let Some(attestation) = self.registered_attestation.clone() {
+            self.io.reattest(attestation);
+        }
     }
 
     fn abandon_sweep(&mut self) {
@@ -929,6 +934,31 @@ impl<I: LoaderIO> Loader<I> {
                         }
                     }));
                 self.block_for_reattest();
+            }
+            IoEvent::Reattested { attestation, basis } => {
+                if self.registered_attestation.as_ref() != Some(&attestation) {
+                    self.diagnostics.push(LoaderDiagnostic::Io(format!(
+                        "ignored stale runtime reattestation for epoch {:?}",
+                        attestation.epoch
+                    )));
+                    return Ok(());
+                }
+                let descriptors = self
+                    .descriptors
+                    .values()
+                    .map(|record| record.descriptor)
+                    .collect::<Vec<_>>();
+                match basis.load_policy().verify_descriptors(&descriptors) {
+                    Ok(()) => self.attestation = ReattestationState::Attested,
+                    Err(error) => self.diagnostics.push(LoaderDiagnostic::Io(format!(
+                        "reattested load-policy projection: {error:?}"
+                    ))),
+                }
+            }
+            IoEvent::ReattestationFailed { message } => {
+                self.diagnostics.push(LoaderDiagnostic::Io(format!(
+                    "runtime reattestation failed: {message}"
+                )));
             }
             IoEvent::Delta { assets, paths, .. } => {
                 self.abandon_sweep();

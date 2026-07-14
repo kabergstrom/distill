@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use distill_core::attestation::{CompiledTypeRow, CompiledTypeTable, RegistryExtrasV1};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-use distill_loader::{IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo};
+use distill_loader::{IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo, RuntimeAttestation};
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, GameModuleEpoch,
@@ -152,8 +152,48 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         });
     });
     let address = address_rx.recv().unwrap();
+    let initial_attestation = RuntimeAttestation {
+        epoch: distill_loader::GameModuleEpoch(request.epoch.0),
+        target_definition_hash: request.target_definition_hash.0,
+        compiled_types: CompiledTypeTable::from_canonical(
+            request.compiled_registry.clone(),
+            request.dsca,
+        )
+        .unwrap(),
+    };
     let mut io = RpcIo::connect(address, request).unwrap();
+    io.reattest(initial_attestation.clone());
+    assert!(matches!(
+        poll_until(&mut io, 1).as_slice(),
+        [IoEvent::Reattested {
+            basis: IoBasis::Rpc {
+                attestation_generation: 0,
+                ..
+            },
+            ..
+        }]
+    ));
+    let mut successor = initial_attestation;
+    successor.epoch = distill_loader::GameModuleEpoch(2);
+    io.reattest(successor);
+    assert!(matches!(
+        poll_until(&mut io, 1).as_slice(),
+        [IoEvent::Reattested {
+            basis: IoBasis::Rpc {
+                attestation_generation: 1,
+                ..
+            },
+            ..
+        }]
+    ));
     let basis = io.begin_sweep();
+    assert!(matches!(
+        &basis,
+        IoBasis::Rpc {
+            attestation_generation: 1,
+            ..
+        }
+    ));
 
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);

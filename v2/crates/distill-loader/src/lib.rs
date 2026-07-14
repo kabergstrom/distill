@@ -23,7 +23,7 @@ pub use component::{
 };
 pub use io::{
     AssetDeltaState, DriftedInput, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult,
-    ReconnectReason, ReqId, ResolveResult,
+    ReconnectReason, ReqId, ResolveResult, RuntimeAttestation, RuntimeAttestationError,
 };
 pub use orchestrator::{
     FetchedInput, Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, PreparedValue,

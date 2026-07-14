@@ -10,6 +10,7 @@ use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_loader::{
     FetchedArtifact, IoBasis, IoEvent, LoadPolicyAttestation, LoadPolicyRow, LoaderIO,
     ManifestHash, PathResolveResult, ReqId, ResolveResult,
+    RuntimeAttestation as LoaderRuntimeAttestation,
 };
 use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
@@ -76,6 +77,8 @@ pub struct PackfileIO {
     archives: BTreeMap<u32, DecodedArchive>,
     basis: IoBasis,
     events: VecDeque<IoEvent>,
+    runtime_target: PackTarget,
+    bootstrap_authority: &'static ConsumerBootstrapAuthorityV1,
 }
 
 impl PackfileIO {
@@ -142,6 +145,8 @@ impl PackfileIO {
             archives,
             basis,
             events: VecDeque::new(),
+            runtime_target: runtime.target.clone(),
+            bootstrap_authority: runtime.bootstrap_authority,
         })
     }
 
@@ -300,6 +305,24 @@ fn decode_fetched(
 }
 
 impl LoaderIO for PackfileIO {
+    fn reattest(&mut self, attestation: LoaderRuntimeAttestation) {
+        let runtime = RuntimeAttestation {
+            target: self.runtime_target.clone(),
+            target_def_hash: attestation.target_definition_hash,
+            compiled_types: attestation.compiled_types.clone(),
+            bootstrap_authority: self.bootstrap_authority,
+        };
+        match Self::verify_runtime(&self.manifest, &runtime) {
+            Ok(()) => self.events.push_back(IoEvent::Reattested {
+                attestation,
+                basis: self.basis.clone(),
+            }),
+            Err(error) => self.events.push_back(IoEvent::ReattestationFailed {
+                message: format!("pack runtime attestation: {error:?}"),
+            }),
+        }
+    }
+
     fn begin_sweep(&mut self) -> IoBasis {
         self.basis.clone()
     }

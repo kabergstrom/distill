@@ -6,7 +6,10 @@ use distill_core::attestation::{
     SchemaNodeId,
 };
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-use distill_loader::{IoEvent, LoaderIO, PathResolveResult, ReqId, ResolveResult};
+use distill_loader::{
+    GameModuleEpoch, IoEvent, LoaderIO, PathResolveResult, ReqId, ResolveResult,
+    RuntimeAttestation as LoaderRuntimeAttestation,
+};
 use distill_pack::archive::{encode_archive, ArtifactPayload};
 use distill_pack::manifest::{
     encode_manifest, ArchiveRef, EncodingRow, IndexRow, LoadPolicyRow, ManifestAssetRow,
@@ -184,6 +187,42 @@ fn packfile_io_resolves_fetches_and_resolves_paths_under_one_basis() {
         req: ReqId(3), result: PathResolveResult::Resolved(got), basis: event_basis, ..
     } if *got == asset_uuid && event_basis == &basis));
     assert!(io.poll().is_empty());
+}
+
+#[test]
+fn packfile_io_reattests_the_registered_runtime_before_progress() {
+    let (manifest, archive, runtime, _, _) = fixture(true);
+    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let attestation = LoaderRuntimeAttestation {
+        epoch: GameModuleEpoch(1),
+        target_definition_hash: runtime.target_def_hash,
+        compiled_types: runtime.compiled_types.clone(),
+    };
+
+    LoaderIO::reattest(&mut io, attestation);
+
+    assert!(matches!(
+        io.poll().as_slice(),
+        [IoEvent::Reattested { basis, .. }] if basis == &io.begin_sweep()
+    ));
+}
+
+#[test]
+fn packfile_io_rejects_a_changed_runtime_attestation() {
+    let (manifest, archive, runtime, _, _) = fixture(true);
+    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let attestation = LoaderRuntimeAttestation {
+        epoch: GameModuleEpoch(1),
+        target_definition_hash: [0; 32],
+        compiled_types: runtime.compiled_types.clone(),
+    };
+
+    LoaderIO::reattest(&mut io, attestation);
+
+    assert!(matches!(
+        io.poll().as_slice(),
+        [IoEvent::ReattestationFailed { .. }]
+    ));
 }
 
 #[test]
