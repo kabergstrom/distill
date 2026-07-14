@@ -87,6 +87,41 @@ pub struct AssetEntry {
     pub data: AuthoredValue,
 }
 
+/// Revalidate an entry against the unique accepted lineage-manifest
+/// authority after ordinary bundle parsing has established its local shape.
+/// Bootstrap controls deliberately receive `None`; every other type requires
+/// the exact accepted epoch vector and its embedded stamp must be a prefix.
+pub fn validate_entry_lineage_authority(
+    local_id: &str,
+    format_version: u32,
+    entry: &AssetEntry,
+    schema: &LogicalSchema,
+    accepted_epochs: Option<&[AcceptedSchemaEpoch]>,
+) -> Result<(), BundleError> {
+    envelope::validate_entry_lineage(local_id, format_version, entry, schema)?;
+    match (&entry.lineage, accepted_epochs) {
+        (EntryLineageV1::Bootstrap { .. }, None) => Ok(()),
+        (EntryLineageV1::Bootstrap { .. }, Some(_)) => Err(BundleError::EntryLineage {
+            local_id: local_id.to_owned(),
+            detail: "bootstrap type must be absent from lineage-manifest authority",
+        }),
+        (EntryLineageV1::Manifest(_), None) => Err(BundleError::EntryLineage {
+            local_id: local_id.to_owned(),
+            detail: "manifest lineage authority is unavailable",
+        }),
+        (EntryLineageV1::Manifest(stamp), Some(accepted))
+            if stamp.epochs.len() <= accepted.len()
+                && stamp.epochs == accepted[..stamp.epochs.len()] =>
+        {
+            Ok(())
+        }
+        (EntryLineageV1::Manifest(_), Some(_)) => Err(BundleError::EntryLineage {
+            local_id: local_id.to_owned(),
+            detail: "entry lineage is not an exact accepted manifest prefix",
+        }),
+    }
+}
+
 /// Stack reserved for the recursive phases (schema walk, JSON
 /// encode/decode, snapshot codec). `MAX_WALK_DEPTH` frames cost several KB
 /// each in unoptimized builds; reserving explicitly makes the depth caps
