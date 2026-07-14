@@ -1,7 +1,7 @@
 use distill_daemon::epoch::{MeasuredLayout, ModuleAbiIdentity, ModuleIdentity};
 use distill_daemon::module_loader::{
     decode_measured_layouts, decode_module_identity, encode_measured_layouts,
-    encode_module_identity,
+    encode_module_identity, host_interface_closure_manifest, host_module_identity,
 };
 use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
 
@@ -16,6 +16,25 @@ fn identity() -> ModuleIdentity {
             allocator: "system".to_owned(),
         },
     }
+}
+
+#[test]
+fn module_abi_identity_covers_the_resolved_interface_closure() {
+    let manifest = host_interface_closure_manifest();
+    assert!(manifest
+        .iter()
+        .any(|(path, _)| *path == "distill-daemon/src/callbacks.rs"));
+    assert!(manifest
+        .iter()
+        .any(|(path, _)| *path == "distill-asset/src/types.rs"));
+    assert!(manifest
+        .iter()
+        .any(|(path, _)| *path == "ngp-schema/src/identity.rs"));
+    assert!(manifest.iter().any(|(path, _)| *path == "v2/Cargo.lock"));
+
+    let host = host_module_identity(consumer_compilation_identity_v1().clone());
+    assert_ne!(host.module_abi.interface_fingerprint, [0; 32]);
+    assert_ne!(host.module_abi.measured_interface, [0; 32]);
 }
 
 #[test]

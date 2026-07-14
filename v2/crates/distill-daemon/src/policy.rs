@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use object::Object;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Linkage {
     Static,
@@ -43,6 +45,7 @@ pub enum CodeLoadPermit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
     RuntimeDynamicDependency { name: String },
+    InvalidNativeImage { detail: String },
     PipelineDlopenBanned,
     UnstagedCode,
     MissingContentHash,
@@ -53,6 +56,9 @@ impl std::fmt::Display for PolicyError {
         match self {
             Self::RuntimeDynamicDependency { name } => {
                 write!(f, "pipeline dependency `{name}` must be statically linked")
+            }
+            Self::InvalidNativeImage { detail } => {
+                write!(f, "pipeline image dependency table is invalid: {detail}")
             }
             Self::PipelineDlopenBanned => {
                 f.write_str("runtime dlopen from pipeline/module code is banned")
@@ -77,6 +83,106 @@ pub fn validate_candidate_linkage(dependencies: &[NativeDependency]) -> Result<(
         });
     }
     Ok(())
+}
+
+/// Inspect the dependency table encoded in the authenticated native image.
+/// This is deliberately performed before platform loader code runs: a module
+/// may depend only on the target's acknowledged system runtime.
+pub fn validate_pipeline_image_linkage(bytes: &[u8]) -> Result<(), PolicyError> {
+    let image = object::File::parse(bytes).map_err(|error| PolicyError::InvalidNativeImage {
+        detail: error.to_string(),
+    })?;
+    let imports = image
+        .imports()
+        .map_err(|error| PolicyError::InvalidNativeImage {
+            detail: error.to_string(),
+        })?;
+    let mut libraries = imports
+        .iter()
+        .map(|import| {
+            std::str::from_utf8(import.library())
+                .map(str::to_owned)
+                .map_err(|_| PolicyError::InvalidNativeImage {
+                    detail: "dependency name is not UTF-8".to_owned(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    libraries.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    libraries.dedup();
+    validate_native_library_names(libraries)
+}
+
+pub fn validate_native_library_names<I, S>(libraries: I) -> Result<(), PolicyError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for library in libraries {
+        let library = library.as_ref();
+        if !is_system_runtime_library(library) {
+            return Err(PolicyError::RuntimeDynamicDependency {
+                name: library.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_system_runtime_library(library: &str) -> bool {
+    if library.is_empty() {
+        return false;
+    }
+    if library.starts_with("/usr/lib/")
+        || library.starts_with("/System/Library/Frameworks/")
+        || library.starts_with("/System/Library/PrivateFrameworks/")
+    {
+        return true;
+    }
+
+    let name = library
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(library)
+        .to_ascii_lowercase();
+    let unix_system_stems = [
+        "ld-linux",
+        "ld-musl",
+        "libc.so",
+        "libdl.so",
+        "libgcc_s.so",
+        "libm.so",
+        "libpthread.so",
+        "libresolv.so",
+        "librt.so",
+        "libunwind.so",
+        "libutil.so",
+        "linux-vdso.so",
+    ];
+    if unix_system_stems
+        .iter()
+        .any(|stem| name == *stem || name.starts_with(&format!("{stem}.")))
+    {
+        return true;
+    }
+
+    let windows_system = [
+        "advapi32.dll",
+        "bcrypt.dll",
+        "kernel32.dll",
+        "msvcrt.dll",
+        "ntdll.dll",
+        "ole32.dll",
+        "shell32.dll",
+        "ucrtbase.dll",
+        "user32.dll",
+        "userenv.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "ws2_32.dll",
+    ];
+    windows_system.contains(&name.as_str())
+        || name.starts_with("api-ms-win-")
+        || name.starts_with("ext-ms-win-")
 }
 
 pub struct CodeLoadingPolicy;

@@ -3,15 +3,37 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use distill_asset::{
+    AssetRuntimeDescriptor, CallbackPanic, EncodeContainer, EncodeSink, EpochToken, ErasedValue,
+    ModuleEpochToken, PlaceholderThunk,
+};
+use distill_build::import::ImportOutput;
+use distill_build::outputs::{OutputDecls, OutputError};
+use distill_build::tool::{ToolOutput, ToolRunError};
 use distill_core::attestation::CompiledTypeTable;
 use distill_core::canonical::{domain_digest, DSMA};
+use distill_json::AuthoredValue;
 use distill_schema::ngp_schema::CompilationIdentity;
+use distill_store::pipeline::ToolCapsuleRegistrationV1;
 use unicode_normalization::is_nfc;
 
-use crate::epoch::{
-    CandidateRegistrationArena, LoadedPipelineModule, MeasuredLayout, ModuleAbiIdentity,
-    ModuleCallError, ModuleIdentity, PipelineModuleLoader, StagedModule, TargetDefinition,
+use crate::callbacks::{
+    CallbackInvokeError, DefaultsDescriptor, Diagnostic, Diagnostics, ImporterDescriptor,
+    MigrationFunctionError, PipelineProcessContext, ProcessorDescriptor, ProcessorError,
+    ProcessorProducts, ToolDescriptor, ValidatorDescriptor,
 };
+use crate::epoch::{
+    CandidateRegistrationArena, ErasedRegistrationCapsule, HostCallbackBoundary,
+    LoadedPipelineModule, MeasuredLayout, ModuleAbiIdentity, ModuleCallError, ModuleIdentity,
+    PipelineModuleLoader, Registration, RegistrationSet, RegistrationStatus, StagedModule,
+    TargetDefinition,
+};
+use crate::importer::{AuthoringImportContext, AuthoringImporterError};
+use crate::policy::validate_pipeline_image_linkage;
+
+mod host_interface_closure {
+    include!(concat!(env!("OUT_DIR"), "/host_interface_closure.rs"));
+}
 
 pub const PIPELINE_MODULE_ABI_VERSION_V1: u32 = 1;
 pub const PIPELINE_MODULE_SYMBOL_V1: &[u8] = b"distill_pipeline_module_v1\0";
@@ -43,6 +65,10 @@ pub struct PipelineModuleTableV1 {
 
 pub type PipelineModuleEntryV1 = unsafe extern "C" fn() -> *const PipelineModuleTableV1;
 
+pub fn host_interface_closure_manifest() -> &'static [(&'static str, &'static [u8])] {
+    host_interface_closure::HOST_INTERFACE_CLOSURE
+}
+
 /// The daemon-side ABI identity embedded into the expected candidate. A
 /// pipeline module built against this exact interface crate calls the same
 /// helper when exporting its C-prefix identity bytes.
@@ -50,16 +76,67 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
     let compilation_digest = distill_schema::ngp_schema::identity_digest(&compilation);
     let interface_fingerprint = domain_digest(DSMA, 1, |encoder| {
         encoder.raw(&compilation_digest);
-        encoder.raw(include_bytes!("epoch.rs"));
-        encoder.raw(include_bytes!("module_loader.rs"));
-        encoder.raw(include_bytes!("../../distill-asset/src/types.rs"));
-        encoder.raw(include_bytes!("../../distill-build/src/pipeline.rs"));
+        encoder.seq(
+            host_interface_closure::HOST_INTERFACE_CLOSURE,
+            |encoder, row| {
+                encoder.str(row.0);
+                encoder.u64(row.1.len() as u64);
+                encoder.raw(row.1);
+            },
+        );
+        encoder.seq(
+            host_interface_closure::HOST_BUILD_CONFIGURATION,
+            |encoder, row| {
+                encoder.str(row.0);
+                encoder.str(row.1);
+            },
+        );
     });
     let measured_interface = domain_digest(DSMA, 2, |encoder| {
         encode_measurement::<PipelineModuleTableV1>(encoder);
+        encode_measurement::<PipelineProbeFnV1>(encoder);
+        encode_measurement::<PipelineRegisterFnV1>(encoder);
+        encode_measurement::<PipelineUnloadFnV1>(encoder);
         encode_measurement::<TargetDefinition>(encoder);
         encode_measurement::<CandidateRegistrationArena>(encoder);
+        encode_measurement::<ErasedRegistrationCapsule>(encoder);
+        encode_measurement::<Registration>(encoder);
+        encode_measurement::<RegistrationSet>(encoder);
+        encode_measurement::<RegistrationStatus>(encoder);
+        encode_measurement::<HostCallbackBoundary>(encoder);
         encode_measurement::<ModuleCallError>(encoder);
+        encode_measurement::<ModuleIdentity>(encoder);
+        encode_measurement::<ModuleAbiIdentity>(encoder);
+        encode_measurement::<MeasuredLayout>(encoder);
+        encode_measurement::<ModuleEpochToken>(encoder);
+        encode_measurement::<EpochToken>(encoder);
+        encode_measurement::<ErasedValue>(encoder);
+        encode_measurement::<AssetRuntimeDescriptor>(encoder);
+        encode_measurement::<EncodeContainer>(encoder);
+        encode_measurement::<PlaceholderThunk>(encoder);
+        encode_measurement::<CallbackPanic>(encoder);
+        encode_measurement::<*mut dyn EncodeSink>(encoder);
+        encode_measurement::<*mut dyn AuthoringImportContext>(encoder);
+        encode_measurement::<*mut dyn PipelineProcessContext>(encoder);
+        encode_measurement::<AuthoredValue>(encoder);
+        encode_measurement::<ImporterDescriptor>(encoder);
+        encode_measurement::<ProcessorDescriptor>(encoder);
+        encode_measurement::<ValidatorDescriptor>(encoder);
+        encode_measurement::<DefaultsDescriptor>(encoder);
+        encode_measurement::<ToolDescriptor>(encoder);
+        encode_measurement::<ToolCapsuleRegistrationV1>(encoder);
+        encode_measurement::<ProcessorProducts>(encoder);
+        encode_measurement::<ProcessorError>(encoder);
+        encode_measurement::<MigrationFunctionError>(encoder);
+        encode_measurement::<Diagnostic>(encoder);
+        encode_measurement::<Diagnostics>(encoder);
+        encode_measurement::<CallbackInvokeError<ProcessorError>>(encoder);
+        encode_measurement::<AuthoringImporterError>(encoder);
+        encode_measurement::<ImportOutput>(encoder);
+        encode_measurement::<OutputDecls>(encoder);
+        encode_measurement::<OutputError>(encoder);
+        encode_measurement::<ToolOutput>(encoder);
+        encode_measurement::<ToolRunError>(encoder);
     });
     ModuleIdentity {
         module_abi: ModuleAbiIdentity {
@@ -78,6 +155,7 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
 }
 
 fn encode_measurement<T>(encoder: &mut distill_core::canonical::CanonicalEncoder) {
+    encoder.str(std::any::type_name::<T>());
     encoder.u64(std::mem::size_of::<T>() as u64);
     encoder.u64(std::mem::align_of::<T>() as u64);
 }
@@ -94,9 +172,10 @@ impl PipelineModuleLoader for DynamicPipelineModuleLoader {
         // boundary. The shared host verifies the staged bytes immediately
         // before opening exactly this host-owned path.
         let image = unsafe {
-            ngp_module_host::HostedLibrary::open_verified(
+            ngp_module_host::HostedLibrary::open_verified_with(
                 PathBuf::from(&staged.path),
                 staged.content_hash,
+                |bytes| validate_pipeline_image_linkage(bytes).map_err(|error| error.to_string()),
             )
         }
         .map_err(|error| ModuleCallError::new(error.to_string()))?;
