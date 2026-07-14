@@ -16,8 +16,7 @@ use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 pub use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
 use distill_core::tool::{
-    ToolCapsuleFile, ToolCapsuleFileRole, ToolCwdPolicy, ToolExecutionCapsuleV1,
-    ToolLaunchMetadataV1, ToolPlatformBinding,
+    ToolCwdPolicy, ToolExecutionIdentityV2, ToolPackageFile, ToolSourceIdentityV2,
 };
 use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use rusqlite::OptionalExtension;
@@ -31,98 +30,115 @@ use crate::state::{
     SchemaRegistryMismatch,
 };
 
-/// One already-resolved member supplied at the registration boundary.
+/// One package member supplied at the registration boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedToolCapsuleFile {
+pub struct ResolvedToolPackageFile {
     pub path: String,
-    pub role: ToolCapsuleFileRole,
     pub executable: bool,
     pub bytes: Vec<u8>,
 }
 
-/// Complete registration input after interpreter/DSO/plugin/resource
-/// resolution. The store derives every byte hash and refuses partial or
-/// noncanonical closure metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCapsuleRegistrationV1 {
-    pub files: Vec<ResolvedToolCapsuleFile>,
-    pub resolved_interpreter: Option<String>,
-    pub launch: ToolLaunchMetadataV1,
-    pub environment: Vec<(String, String)>,
-    pub cwd_policy: ToolCwdPolicy,
-    pub platform: ToolPlatformBinding,
+pub enum ResolvedToolSourceV2 {
+    Package {
+        launcher: String,
+        files: Vec<ResolvedToolPackageFile>,
+    },
+    Ambient {
+        launcher: String,
+        toolchain_id: String,
+        trusted_fingerprint: Option<[u8; 32]>,
+    },
 }
 
-/// One published ToolEpoch mapping. Jobs launch only inside `root` using the
-/// verified capsule object and trace the aggregate DSCT `capsule_hash`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedTool {
+pub struct ToolRegistrationV2 {
+    pub source: ResolvedToolSourceV2,
+    pub environment: Vec<(String, String)>,
+    pub cwd_policy: ToolCwdPolicy,
+}
+
+/// One published ToolEpoch mapping. Package roots are immutable staged trees;
+/// ambient registrations retain only their explicit executable path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredTool {
     pub key: String,
-    pub root: PathBuf,
-    pub capsule: ToolExecutionCapsuleV1,
-    pub capsule_hash: [u8; 32],
+    pub root: Option<PathBuf>,
+    pub identity: ToolExecutionIdentityV2,
+    pub tool_hash: [u8; 32],
     pub input_version: InputVersion,
 }
 
-impl StagedTool {
-    /// Reopen the full staged closure immediately before process creation.
-    /// Failure is transient launch state and must not enter a memoized trace.
-    pub fn revalidate(&self) -> Result<(), StoreError> {
-        verify_capsule_root(&self.key, &self.root, &self.capsule)
+impl RegisteredTool {
+    pub fn is_cacheable(&self) -> bool {
+        self.identity.is_cacheable()
     }
 
-    /// Recheck the configured launch platform against the sealed binding.
-    /// Explicit residual bindings still pin the platform while deliberately
-    /// naming the accepted ambient runtime class in the DSCT object.
-    pub fn validate_launch_platform(
-        &self,
-        platform_id: &str,
-        system_runtime_id: &str,
-    ) -> Result<(), StoreError> {
-        let matches = match &self.capsule.platform {
-            ToolPlatformBinding::Pinned {
-                platform_id: expected_platform,
-                system_runtime_id: expected_runtime,
-            } => expected_platform == platform_id && expected_runtime == system_runtime_id,
-            ToolPlatformBinding::ExplicitResidual {
-                platform_id: expected_platform,
-                ..
-            } => expected_platform == platform_id,
-        };
-        if !matches {
-            return Err(StoreError::ToolCapsuleUnavailable {
+    /// Reopen the staged package or ambient executable immediately before
+    /// process creation. Failure is transient and never memoized.
+    pub fn revalidate(&self) -> Result<(), StoreError> {
+        match (&self.identity.source, &self.root) {
+            (ToolSourceIdentityV2::Package { files, .. }, Some(root)) => {
+                verify_package_root(&self.key, root, files)
+            }
+            (ToolSourceIdentityV2::Ambient { launcher, .. }, None) => {
+                verify_ambient_launcher(&self.key, std::path::Path::new(launcher))
+            }
+            _ => Err(StoreError::ToolUnavailable {
                 key: self.key.clone(),
-                path: self.root.clone(),
-                detail: "configured platform/runtime differs from the sealed binding",
-            });
+                path: self
+                    .root
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("<ambient>")),
+                detail: "persisted tool source and staged root disagree",
+            }),
         }
-        Ok(())
     }
 }
 
-impl ToolCapsuleRegistrationV1 {
-    fn seal(self) -> Result<(ToolExecutionCapsuleV1, Vec<ResolvedToolCapsuleFile>), StoreError> {
-        let files = self
-            .files
-            .iter()
-            .map(|file| ToolCapsuleFile {
-                path: file.path.clone(),
-                role: file.role,
-                executable: file.executable,
-                len: file.bytes.len() as u64,
-                bytes_hash: *blake3::hash(&file.bytes).as_bytes(),
-            })
-            .collect();
-        let capsule = ToolExecutionCapsuleV1 {
-            files,
-            resolved_interpreter: self.resolved_interpreter,
-            launch: self.launch,
+impl ToolRegistrationV2 {
+    fn seal(self) -> Result<(ToolExecutionIdentityV2, Vec<ResolvedToolPackageFile>), StoreError> {
+        let (source, files) = match self.source {
+            ResolvedToolSourceV2::Package { launcher, files } => {
+                let rows = files
+                    .iter()
+                    .map(|file| ToolPackageFile {
+                        path: file.path.clone(),
+                        executable: file.executable,
+                        len: file.bytes.len() as u64,
+                        bytes_hash: *blake3::hash(&file.bytes).as_bytes(),
+                    })
+                    .collect();
+                (
+                    ToolSourceIdentityV2::Package {
+                        launcher,
+                        files: rows,
+                    },
+                    files,
+                )
+            }
+            ResolvedToolSourceV2::Ambient {
+                launcher,
+                toolchain_id,
+                trusted_fingerprint,
+            } => (
+                ToolSourceIdentityV2::Ambient {
+                    launcher,
+                    toolchain_id,
+                    trusted_fingerprint,
+                },
+                Vec::new(),
+            ),
+        };
+        let identity = ToolExecutionIdentityV2 {
+            source,
             environment: self.environment,
             cwd_policy: self.cwd_policy,
-            platform: self.platform,
         };
-        capsule.validate().map_err(StoreError::InvalidToolCapsule)?;
-        Ok((capsule, self.files))
+        identity
+            .validate()
+            .map_err(StoreError::InvalidToolIdentity)?;
+        Ok((identity, files))
     }
 }
 
@@ -141,16 +157,14 @@ fn stage_immutable_file(
     key: &str,
     path: &std::path::Path,
     bytes: &[u8],
-    metadata: &ToolCapsuleFile,
+    metadata: &ToolPackageFile,
 ) -> Result<(), StoreError> {
     if !path.exists() {
-        let parent = path
-            .parent()
-            .ok_or_else(|| StoreError::ToolCapsuleUnavailable {
-                key: key.to_owned(),
-                path: path.to_path_buf(),
-                detail: "staged object has no parent directory",
-            })?;
+        let parent = path.parent().ok_or_else(|| StoreError::ToolUnavailable {
+            key: key.to_owned(),
+            path: path.to_path_buf(),
+            detail: "staged object has no parent directory",
+        })?;
         let mut nonce = [0u8; 8];
         getrandom::getrandom(&mut nonce).map_err(|source| StoreError::Io {
             path: path.to_path_buf(),
@@ -188,7 +202,7 @@ fn stage_immutable_file(
         std::fs::remove_file(&tmp).map_err(|source| StoreError::Io { path: tmp, source })?;
         crate::cas::manifest::fsync_dir(parent)?;
     }
-    verify_capsule_file(key, path, metadata)
+    verify_package_file(key, path, metadata)
 }
 
 #[cfg(unix)]
@@ -227,142 +241,140 @@ fn set_staged_permissions(
         })
 }
 
-fn verify_capsule_root(
+fn verify_package_root(
     key: &str,
     root: &std::path::Path,
-    capsule: &ToolExecutionCapsuleV1,
+    expected_files: &[ToolPackageFile],
 ) -> Result<(), StoreError> {
     let root_metadata =
-        std::fs::symlink_metadata(root).map_err(|_| StoreError::ToolCapsuleUnavailable {
+        std::fs::symlink_metadata(root).map_err(|_| StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: root.to_path_buf(),
-            detail: "staged capsule root is unavailable",
+            detail: "staged package root is unavailable",
         })?;
     if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return Err(StoreError::ToolCapsuleUnavailable {
+        return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: root.to_path_buf(),
-            detail: "staged capsule root is not a real directory",
+            detail: "staged package root is not a real directory",
         });
     }
-    let expected = capsule
-        .files
+    let expected = expected_files
         .iter()
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
-    collect_capsule_files(key, root, root, &mut actual)?;
+    collect_package_files(key, root, root, &mut actual)?;
     if actual != expected {
-        return Err(StoreError::ToolCapsuleUnavailable {
+        return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: root.to_path_buf(),
-            detail: "staged capsule file set differs from the sealed object",
+            detail: "staged package file set differs from its identity",
         });
     }
-    for file in &capsule.files {
-        verify_capsule_file(key, &root.join(&file.path), file)?;
+    for file in expected_files {
+        verify_package_file(key, &root.join(&file.path), file)?;
     }
     Ok(())
 }
 
-fn collect_capsule_files(
+fn collect_package_files(
     key: &str,
     root: &std::path::Path,
     directory: &std::path::Path,
     files: &mut BTreeSet<String>,
 ) -> Result<(), StoreError> {
-    let entries = std::fs::read_dir(directory).map_err(|_| StoreError::ToolCapsuleUnavailable {
+    let entries = std::fs::read_dir(directory).map_err(|_| StoreError::ToolUnavailable {
         key: key.to_owned(),
         path: directory.to_path_buf(),
-        detail: "staged capsule directory is unreadable",
+        detail: "staged package directory is unreadable",
     })?;
     for entry in entries {
-        let entry = entry.map_err(|_| StoreError::ToolCapsuleUnavailable {
+        let entry = entry.map_err(|_| StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: directory.to_path_buf(),
-            detail: "staged capsule directory entry is unreadable",
+            detail: "staged package directory entry is unreadable",
         })?;
         let path = entry.path();
         let metadata =
-            std::fs::symlink_metadata(&path).map_err(|_| StoreError::ToolCapsuleUnavailable {
+            std::fs::symlink_metadata(&path).map_err(|_| StoreError::ToolUnavailable {
                 key: key.to_owned(),
                 path: path.clone(),
-                detail: "staged capsule member metadata is unavailable",
+                detail: "staged package member metadata is unavailable",
             })?;
         if metadata.file_type().is_symlink() {
-            return Err(StoreError::ToolCapsuleUnavailable {
+            return Err(StoreError::ToolUnavailable {
                 key: key.to_owned(),
                 path,
-                detail: "staged capsule contains a symlink",
+                detail: "staged package contains a symlink",
             });
         }
         if metadata.is_dir() {
-            collect_capsule_files(key, root, &path, files)?;
+            collect_package_files(key, root, &path, files)?;
         } else if metadata.is_file() {
-            let relative =
-                path.strip_prefix(root)
-                    .map_err(|_| StoreError::ToolCapsuleUnavailable {
-                        key: key.to_owned(),
-                        path: path.clone(),
-                        detail: "staged capsule member escaped its root",
-                    })?;
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| StoreError::ToolUnavailable {
+                    key: key.to_owned(),
+                    path: path.clone(),
+                    detail: "staged package member escaped its root",
+                })?;
             let relative = relative
                 .components()
                 .map(|component| component.as_os_str().to_str())
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| StoreError::ToolCapsuleUnavailable {
+                .ok_or_else(|| StoreError::ToolUnavailable {
                     key: key.to_owned(),
                     path: path.clone(),
-                    detail: "staged capsule member path is not UTF-8",
+                    detail: "staged package member path is not UTF-8",
                 })?
                 .join("/");
             files.insert(relative);
         } else {
-            return Err(StoreError::ToolCapsuleUnavailable {
+            return Err(StoreError::ToolUnavailable {
                 key: key.to_owned(),
                 path,
-                detail: "staged capsule contains a non-file member",
+                detail: "staged package contains a non-file member",
             });
         }
     }
     Ok(())
 }
 
-fn verify_capsule_file(
+fn verify_package_file(
     key: &str,
     path: &std::path::Path,
-    expected: &ToolCapsuleFile,
+    expected: &ToolPackageFile,
 ) -> Result<(), StoreError> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| StoreError::ToolCapsuleUnavailable {
-            key: key.to_owned(),
-            path: path.to_path_buf(),
-            detail: "staged capsule member is unavailable",
-        })?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| StoreError::ToolUnavailable {
+        key: key.to_owned(),
+        path: path.to_path_buf(),
+        detail: "staged package member is unavailable",
+    })?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(StoreError::ToolCapsuleUnavailable {
+        return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: path.to_path_buf(),
-            detail: "staged capsule member is not a regular file",
+            detail: "staged package member is not a regular file",
         });
     }
     if metadata.len() != expected.len {
-        return Err(StoreError::ToolCapsuleUnavailable {
+        return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: path.to_path_buf(),
-            detail: "staged capsule member length changed",
+            detail: "staged package member length changed",
         });
     }
-    let bytes = std::fs::read(path).map_err(|_| StoreError::ToolCapsuleUnavailable {
+    let bytes = std::fs::read(path).map_err(|_| StoreError::ToolUnavailable {
         key: key.to_owned(),
         path: path.to_path_buf(),
-        detail: "staged capsule member is unreadable",
+        detail: "staged package member is unreadable",
     })?;
     if blake3::hash(&bytes).as_bytes() != &expected.bytes_hash {
-        return Err(StoreError::ToolCapsuleUnavailable {
+        return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: path.to_path_buf(),
-            detail: "staged capsule member hash changed",
+            detail: "staged package member hash changed",
         });
     }
     verify_executable_mode(key, path, &metadata, expected.executable)
@@ -377,10 +389,10 @@ fn verify_executable_mode(
 ) -> Result<(), StoreError> {
     use std::os::unix::fs::PermissionsExt;
     if (metadata.permissions().mode() & 0o111 != 0) != expected {
-        return Err(StoreError::ToolCapsuleUnavailable {
+        return Err(StoreError::ToolUnavailable {
             key: key.to_owned(),
             path: path.to_path_buf(),
-            detail: "staged capsule executable mode changed",
+            detail: "staged package executable mode changed",
         });
     }
     Ok(())
@@ -394,6 +406,22 @@ fn verify_executable_mode(
     _expected: bool,
 ) -> Result<(), StoreError> {
     Ok(())
+}
+
+fn verify_ambient_launcher(key: &str, path: &std::path::Path) -> Result<(), StoreError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| StoreError::ToolUnavailable {
+        key: key.to_owned(),
+        path: path.to_path_buf(),
+        detail: "ambient executable is unavailable",
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(StoreError::ToolUnavailable {
+            key: key.to_owned(),
+            path: path.to_path_buf(),
+            detail: "ambient executable is not a regular file",
+        });
+    }
+    verify_executable_mode(key, path, &metadata, true)
 }
 
 /// Sealed publication input tying the store summary to the independently
@@ -808,80 +836,89 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Stage and publish a complete hermetic tool capsule. Every member is
-    /// reopened and verified before the ToolEpoch row becomes visible.
-    pub fn stage_tool(
+    /// Publish a package snapshot or explicit ambient toolchain identity.
+    pub fn register_tool(
         &mut self,
         key: &str,
-        registration: ToolCapsuleRegistrationV1,
-    ) -> Result<StagedTool, StoreError> {
+        registration: ToolRegistrationV2,
+    ) -> Result<RegisteredTool, StoreError> {
         if key.is_empty() || !is_nfc(key) || key.contains('\0') {
             return Err(StoreError::InvalidToolKey);
         }
-        let (capsule, sources) = registration.seal()?;
-        let capsule_hash = capsule.digest().map_err(StoreError::InvalidToolCapsule)?;
-        let capsule_object = capsule
+        let (identity, sources) = registration.seal()?;
+        let tool_hash = identity.digest().map_err(StoreError::InvalidToolIdentity)?;
+        let identity_object = identity
             .encode_record()
-            .map_err(StoreError::InvalidToolCapsule)?;
-        let tools_dir = self.state_path.join("tools");
-        let objects_dir = tools_dir.join("objects");
-        let root = tools_dir.join("capsules").join(hex_hash(&capsule_hash));
-        create_dir_all(&objects_dir)?;
-        create_dir_all(&root)?;
-        for (metadata, source) in capsule.files.iter().zip(&sources) {
-            let mode = if metadata.executable { "x" } else { "n" };
-            let object = objects_dir.join(format!("{}-{mode}", hex_hash(&metadata.bytes_hash)));
-            stage_immutable_file(key, &object, &source.bytes, metadata)?;
-            let member = root.join(&metadata.path);
-            if let Some(parent) = member.parent() {
-                create_dir_all(parent)?;
-            }
-            match std::fs::hard_link(&object, &member) {
-                Ok(()) => {
+            .map_err(StoreError::InvalidToolIdentity)?;
+        let root = match &identity.source {
+            ToolSourceIdentityV2::Package { files, .. } => {
+                let tools_dir = self.state_path.join("tools");
+                let objects_dir = tools_dir.join("objects");
+                let root = tools_dir.join("packages").join(hex_hash(&tool_hash));
+                create_dir_all(&objects_dir)?;
+                create_dir_all(&root)?;
+                for (metadata, source) in files.iter().zip(&sources) {
+                    let mode = if metadata.executable { "x" } else { "n" };
+                    let object =
+                        objects_dir.join(format!("{}-{mode}", hex_hash(&metadata.bytes_hash)));
+                    stage_immutable_file(key, &object, &source.bytes, metadata)?;
+                    let member = root.join(&metadata.path);
                     if let Some(parent) = member.parent() {
-                        crate::cas::manifest::fsync_dir(parent)?;
+                        create_dir_all(parent)?;
+                    }
+                    match std::fs::hard_link(&object, &member) {
+                        Ok(()) => {
+                            if let Some(parent) = member.parent() {
+                                crate::cas::manifest::fsync_dir(parent)?;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(source) => {
+                            return Err(StoreError::Io {
+                                path: member,
+                                source,
+                            })
+                        }
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => {
-                    return Err(StoreError::Io {
-                        path: member,
-                        source,
-                    })
-                }
+                verify_package_root(key, &root, files)?;
+                Some(root)
             }
-        }
-        verify_capsule_root(key, &root, &capsule)?;
+            ToolSourceIdentityV2::Ambient { launcher, .. } => {
+                verify_ambient_launcher(key, std::path::Path::new(launcher))?;
+                None
+            }
+        };
         self.txn.execute(
-            "INSERT INTO tools(tool_key, present, capsule_object, capsule_hash, input_version)
+            "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
              VALUES (?1, 1, ?2, ?3, ?4)
              ON CONFLICT(tool_key, input_version) DO UPDATE SET
                present = 1,
-               capsule_object = excluded.capsule_object,
-               capsule_hash = excluded.capsule_hash",
+               identity_object = excluded.identity_object,
+               tool_hash = excluded.tool_hash",
             rusqlite::params![
                 key,
-                capsule_object,
-                capsule_hash.as_slice(),
+                identity_object,
+                tool_hash.as_slice(),
                 self.version().0 as i64,
             ],
         )?;
-        Ok(StagedTool {
+        Ok(RegisteredTool {
             key: key.to_owned(),
             root,
-            capsule,
-            capsule_hash,
+            identity,
+            tool_hash,
             input_version: self.version(),
         })
     }
 
     /// Publish one complete ToolEpoch projection. Keys absent from `tools`
     /// receive input-versioned tombstones so a removed registration cannot
-    /// fall through to an older live capsule at a newer snapshot.
+    /// fall through to an older live registration at a newer snapshot.
     pub fn publish_tool_epoch(
         &mut self,
-        tools: &BTreeMap<String, ToolCapsuleRegistrationV1>,
-    ) -> Result<Vec<StagedTool>, StoreError> {
+        tools: &BTreeMap<String, ToolRegistrationV2>,
+    ) -> Result<Vec<RegisteredTool>, StoreError> {
         let mut previous = BTreeSet::new();
         {
             let mut statement = self.txn.prepare(
@@ -905,17 +942,17 @@ impl InputTxn<'_> {
 
         let mut staged = Vec::with_capacity(tools.len());
         for (key, registration) in tools {
-            staged.push(self.stage_tool(key, registration.clone())?);
+            staged.push(self.register_tool(key, registration.clone())?);
         }
         let current = tools.keys().cloned().collect::<BTreeSet<_>>();
         for removed in previous.difference(&current) {
             self.txn.execute(
-                "INSERT INTO tools(tool_key, present, capsule_object, capsule_hash, input_version)
+                "INSERT INTO tools(tool_key, present, identity_object, tool_hash, input_version)
                  VALUES (?1, 0, X'', ?2, ?3)
                  ON CONFLICT(tool_key, input_version) DO UPDATE SET
                    present = 0,
-                   capsule_object = X'',
-                   capsule_hash = excluded.capsule_hash",
+                   identity_object = X'',
+                   tool_hash = excluded.tool_hash",
                 rusqlite::params![removed, [0_u8; 32].as_slice(), self.version().0 as i64,],
             )?;
         }
@@ -2326,7 +2363,7 @@ impl Store {
         basis: InputVersion,
     ) -> Result<BTreeMap<String, [u8; 32]>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT candidate.tool_key, candidate.capsule_hash
+            "SELECT candidate.tool_key, candidate.tool_hash
                FROM tools AS candidate
               WHERE candidate.input_version = (
                     SELECT MAX(prior.input_version)
@@ -2342,7 +2379,7 @@ impl Store {
         rows.map(|row| {
             let (key, hash) = row?;
             let hash = hash.try_into().map_err(|_| {
-                StoreError::InvalidToolCapsule(distill_core::tool::ToolCapsuleError::Truncated)
+                StoreError::InvalidToolIdentity(distill_core::tool::ToolIdentityError::Truncated)
             })?;
             Ok((key, hash))
         })
@@ -2350,22 +2387,22 @@ impl Store {
     }
 
     /// Resolve a tool key through the ToolEpoch table (§13).
-    pub fn tool(&self, key: &str) -> Result<Option<StagedTool>, StoreError> {
+    pub fn tool(&self, key: &str) -> Result<Option<RegisteredTool>, StoreError> {
         self.tool_at(key, self.input_version())
     }
 
     /// Resolve the last ToolEpoch mapping visible at an exact pinned input
-    /// version. Historical rows remain addressable while their immutable
-    /// capsule roots coexist, so an older job never launches a replacement.
+    /// version. Historical package roots coexist, so an older job never
+    /// launches a replacement registration.
     pub fn tool_at(
         &self,
         key: &str,
         basis: InputVersion,
-    ) -> Result<Option<StagedTool>, StoreError> {
+    ) -> Result<Option<RegisteredTool>, StoreError> {
         let row = self
             .conn
             .query_row(
-                "SELECT present, capsule_object, capsule_hash, input_version
+                "SELECT present, identity_object, tool_hash, input_version
                    FROM tools
                   WHERE tool_key = ?1 AND input_version <= ?2
                   ORDER BY input_version DESC
@@ -2387,34 +2424,37 @@ impl Store {
         if !present {
             return Ok(None);
         }
-        let capsule = ToolExecutionCapsuleV1::decode_record(&record)
-            .map_err(StoreError::InvalidToolCapsule)?;
-        let capsule_hash: [u8; 32] = hash.try_into().map_err(|_| {
-            StoreError::InvalidToolCapsule(distill_core::tool::ToolCapsuleError::Truncated)
+        let identity = ToolExecutionIdentityV2::decode_record(&record)
+            .map_err(StoreError::InvalidToolIdentity)?;
+        let tool_hash: [u8; 32] = hash.try_into().map_err(|_| {
+            StoreError::InvalidToolIdentity(distill_core::tool::ToolIdentityError::Truncated)
         })?;
-        if capsule.digest().map_err(StoreError::InvalidToolCapsule)? != capsule_hash {
-            return Err(StoreError::ToolCapsuleUnavailable {
+        if identity.digest().map_err(StoreError::InvalidToolIdentity)? != tool_hash {
+            return Err(StoreError::ToolUnavailable {
                 key: key.to_owned(),
                 path: self.config.state_path.join("tools"),
-                detail: "persisted capsule hash does not match its object",
+                detail: "persisted tool hash does not match its identity object",
             });
         }
-        let root = self
-            .config
-            .state_path
-            .join("tools/capsules")
-            .join(hex_hash(&capsule_hash));
+        let root = matches!(&identity.source, ToolSourceIdentityV2::Package { .. }).then(|| {
+            self.config
+                .state_path
+                .join("tools/packages")
+                .join(hex_hash(&tool_hash))
+        });
         let input_version =
-            u64::try_from(input_version).map_err(|_| StoreError::ToolCapsuleUnavailable {
+            u64::try_from(input_version).map_err(|_| StoreError::ToolUnavailable {
                 key: key.to_owned(),
-                path: root.clone(),
+                path: root
+                    .clone()
+                    .unwrap_or_else(|| self.config.state_path.join("tools")),
                 detail: "persisted ToolEpoch input version is negative",
             })?;
-        Ok(Some(StagedTool {
+        Ok(Some(RegisteredTool {
             key: key.to_owned(),
             root,
-            capsule,
-            capsule_hash,
+            identity,
+            tool_hash,
             input_version: InputVersion(input_version),
         }))
     }

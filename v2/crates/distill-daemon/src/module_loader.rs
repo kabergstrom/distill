@@ -1,7 +1,6 @@
 //! Concrete pipeline cdylib loader over the shared New Game Plus host layer.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use distill_asset::{
     AssetRuntimeDescriptor, CallbackPanic, EncodeContainer, EncodeSink, EpochToken, ErasedValue,
@@ -20,7 +19,7 @@ use crate::callbacks::{
     CallbackInvokeError, DefaultsDescriptor, Diagnostic, Diagnostics, ImporterDescriptor,
     MigrationFunctionError, PipelineProcessContext, ProcessArtifact, ProcessContextError,
     ProcessOutputs, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
-    ToolRegistration, ToolResourceDeclaration, ValidatorDescriptor,
+    ToolRegistration, ToolSource, ValidatorDescriptor,
 };
 use crate::epoch::{
     CandidateRegistrationArena, ErasedRegistrationCapsule, HostCallbackBoundary,
@@ -29,7 +28,6 @@ use crate::epoch::{
     TargetDefinition,
 };
 use crate::importer::{AuthoringImportContext, AuthoringImporterError};
-use crate::policy::validate_pipeline_image_linkage;
 
 mod host_interface_closure {
     include!(concat!(env!("OUT_DIR"), "/host_interface_closure.rs"));
@@ -131,7 +129,7 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
         encode_measurement::<DefaultsDescriptor>(encoder);
         encode_measurement::<ToolDescriptor>(encoder);
         encode_measurement::<ToolRegistration>(encoder);
-        encode_measurement::<ToolResourceDeclaration>(encoder);
+        encode_measurement::<ToolSource>(encoder);
         encode_measurement::<ProcessorProducts>(encoder);
         encode_measurement::<ProcessArtifact>(encoder);
         encode_measurement::<ProcessOutputs>(encoder);
@@ -182,11 +180,7 @@ impl PipelineModuleLoader for DynamicPipelineModuleLoader {
         // boundary. The shared host verifies the staged bytes immediately
         // before opening exactly this host-owned path.
         let image = unsafe {
-            ngp_module_host::HostedLibrary::open_verified_with(
-                PathBuf::from(&staged.path),
-                staged.content_hash,
-                |bytes| validate_pipeline_image_linkage(bytes).map_err(|error| error.to_string()),
-            )
+            ngp_module_host::HostedLibrary::open_verified(&staged.path, staged.content_hash)
         }
         .map_err(|error| ModuleCallError::new(error.to_string()))?;
         let table = {

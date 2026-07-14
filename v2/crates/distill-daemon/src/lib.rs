@@ -22,7 +22,6 @@ mod migration_control;
 pub mod module_loader;
 mod operations;
 mod pipeline_map;
-pub mod policy;
 pub mod process;
 pub mod quarantine;
 pub mod scanner;

@@ -29,16 +29,16 @@ pub enum Observed<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolLaunchDiagnostic {
     pub id: String,
-    pub capsule_hash: [u8; 32],
+    pub tool_hash: [u8; 32],
     pub class: ToolLaunchFailureClass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolLaunchFailureClass {
     NotExecutable,
-    MissingInterpreter,
     SpawnDenied,
-    CapsuleClosureUnavailable,
+    PackageUnavailable,
+    AmbientUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

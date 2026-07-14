@@ -130,13 +130,13 @@ pub enum StoreError {
     /// Target-set rows/digest were forged or non-canonical. The store
     /// recomputes DSTS at every publication and schema command.
     InvalidTargetSet(distill_core::target_set::TargetSetError),
-    /// A proposed ToolEpoch capsule was incomplete or noncanonical.
-    InvalidToolCapsule(distill_core::tool::ToolCapsuleError),
+    /// A proposed ToolEpoch identity was incomplete or noncanonical.
+    InvalidToolIdentity(distill_core::tool::ToolIdentityError),
     /// Tool keys are nonempty NFC text and cannot carry NUL.
     InvalidToolKey,
-    /// A published capsule object can no longer be revalidated against its
-    /// staged closure. This is a transient launch refusal, never memoized.
-    ToolCapsuleUnavailable {
+    /// A published package or ambient executable is unavailable at launch.
+    /// This is a transient refusal, never memoized.
+    ToolUnavailable {
         key: String,
         path: PathBuf,
         detail: &'static str,
@@ -369,15 +369,15 @@ impl fmt::Display for StoreError {
             StoreError::InvalidTargetSet(error) => {
                 write!(f, "candidate target set fails DSTS verification: {error}")
             }
-            StoreError::InvalidToolCapsule(error) => {
-                write!(f, "tool execution capsule is invalid: {error}")
+            StoreError::InvalidToolIdentity(error) => {
+                write!(f, "tool execution identity is invalid: {error}")
             }
             StoreError::InvalidToolKey => {
                 write!(f, "tool key must be nonempty NFC text without NUL")
             }
-            StoreError::ToolCapsuleUnavailable { key, path, detail } => write!(
+            StoreError::ToolUnavailable { key, path, detail } => write!(
                 f,
-                "tool capsule {key:?} is unavailable at {}: {detail}",
+                "tool {key:?} is unavailable at {}: {detail}",
                 path.display()
             ),
             StoreError::LineageMutationRequiresCandidate => write!(
@@ -479,7 +479,7 @@ impl std::error::Error for StoreError {
             StoreError::Sqlite(e) => Some(e),
             StoreError::Io { source, .. } => Some(source),
             StoreError::InvalidTargetSet(error) => Some(error),
-            StoreError::InvalidToolCapsule(error) => Some(error),
+            StoreError::InvalidToolIdentity(error) => Some(error),
             StoreError::InvalidPipelinePoison(error) => Some(error),
             StoreError::InvalidVersionPoison(error) => Some(error),
             _ => None,

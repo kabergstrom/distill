@@ -118,7 +118,7 @@ struct CoordinatedPipelineRuntime {
 enum ConfigurationPipelinePublication {
     Epoch {
         epoch: ValidatedPipelineEpoch,
-        tools: BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1>,
+        tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     },
     Poison(PipelinePoison),
 }

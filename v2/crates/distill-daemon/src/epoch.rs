@@ -41,9 +41,6 @@ use crate::callbacks::{
     PipelineValidator, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
     ValidatorDescriptor,
 };
-use crate::policy::{
-    validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
-};
 use crate::tool_resolver::resolve_tool_epoch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,7 +724,6 @@ pub struct CandidateRequirements {
     pub measured_layouts: Vec<MeasuredLayout>,
     pub compiled_types: CompiledTypeTable,
     pub targets: Vec<TargetDefinition>,
-    pub native_dependencies: Vec<NativeDependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -832,7 +828,7 @@ struct EpochInner {
     targets: Vec<TargetDefinition>,
     target_set_hash: TargetSetHash,
     registration: RegistrationSet,
-    tools: BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1>,
+    tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     accepting: AtomicBool,
     active_jobs: AtomicUsize,
     lifecycle: Mutex<EpochLifecycle>,
@@ -843,7 +839,7 @@ struct EpochInner {
 struct PreparedEpochRegistration {
     target_set: CanonicalTargetSet,
     registration: RegistrationSet,
-    tools: BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1>,
+    tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     arena: CandidateRegistrationArena,
 }
 
@@ -1001,9 +997,7 @@ impl PipelineEpoch {
             .collect()
     }
 
-    pub fn tool_epoch(
-        &self,
-    ) -> BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1> {
+    pub fn tool_epoch(&self) -> BTreeMap<String, distill_store::pipeline::ToolRegistrationV2> {
         self.0.tools.clone()
     }
 
@@ -1502,16 +1496,6 @@ impl ModuleHost {
                 ))
             }
         };
-        if let Err(error) = CodeLoadingPolicy::authorize(CodeLoadRequest::HostPipelineModule {
-            staged_copy: true,
-            content_hash: Some(staged.content_hash),
-        }) {
-            return Err(candidate_poison_record(
-                PipelinePoisonCode::CandidateOpen,
-                error.to_string(),
-                CandidateCleanupDisposition::None,
-            ));
-        }
         let mut module = match boundary_call("open", || loader.open_staged(&staged)) {
             Ok(module) => module,
             Err(error) => {
@@ -2015,8 +1999,6 @@ fn validate_requirements(
     requirements: &mut CandidateRequirements,
     bootstrap_authority: &HostBootstrapAuthorityV1,
 ) -> Result<CanonicalTargetSet, String> {
-    validate_candidate_linkage(&requirements.native_dependencies)
-        .map_err(|error| error.to_string())?;
     if requirements.identity.module_abi.panic_strategy != "unwind" {
         return Err("pipeline and daemon must both use panic = unwind".to_owned());
     }
@@ -2504,7 +2486,7 @@ mod callback_tests {
     use crate::callbacks::{
         DiagnosticSeverity, MigrationFunctionError, PipelineDefaults, PipelineImporter,
         PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorProducts,
-        ToolRegistration,
+        ToolRegistration, ToolSource,
     };
     use crate::importer::{AuthoringImportContext, AuthoringImporterError};
     use distill_build::import::{ImportError, ImportOutput};
@@ -2512,7 +2494,7 @@ mod callback_tests {
     use distill_build::pipeline::TargetSelector;
     use distill_build::query::{FileQuery, RootedPath};
     use distill_build::tool::{ToolOutput, ToolRunError};
-    use distill_core::tool::{ToolCwdPolicy, ToolPlatformBinding};
+    use distill_core::tool::ToolCwdPolicy;
     use distill_migrate::FieldPath;
     use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
 
@@ -2709,15 +2691,13 @@ mod callback_tests {
             .register_tool(ToolDescriptor {
                 id: "compiler".into(),
                 registration: ToolRegistration {
-                    launcher: PathBuf::from("compiler"),
-                    declared_resources: vec![],
-                    plugins: vec![],
+                    source: ToolSource::Ambient {
+                        launcher: PathBuf::from("compiler"),
+                        toolchain_id: "test-compiler".into(),
+                        trusted_fingerprint: None,
+                    },
                     environment: vec![],
                     cwd_policy: ToolCwdPolicy::EmptyScratch,
-                    platform: ToolPlatformBinding::Pinned {
-                        platform_id: "test".into(),
-                        system_runtime_id: "test".into(),
-                    },
                 },
             })
             .into_result()

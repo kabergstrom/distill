@@ -19,7 +19,7 @@ use distill_build::query::{AssetQuery, IntakeError};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolOutput, ToolRunError};
 use distill_build::trace::StableFailureFingerprint;
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
-use distill_core::tool::{ToolCwdPolicy, ToolPlatformBinding};
+use distill_core::tool::ToolCwdPolicy;
 use distill_json::AuthoredValue;
 use distill_migrate::FieldPath;
 use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
@@ -65,22 +65,25 @@ pub struct ToolDescriptor {
     pub registration: ToolRegistration,
 }
 
-/// Declarative module-facing tool registration. The daemon, rather than the
-/// registering module, resolves and seals every byte in the execution closure.
+/// Declarative module-facing tool registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRegistration {
-    pub launcher: PathBuf,
-    pub declared_resources: Vec<ToolResourceDeclaration>,
-    pub plugins: Vec<ToolResourceDeclaration>,
+    pub source: ToolSource,
     pub environment: Vec<(String, String)>,
     pub cwd_policy: ToolCwdPolicy,
-    pub platform: ToolPlatformBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResourceDeclaration {
-    pub source: PathBuf,
-    pub capsule_path: String,
+pub enum ToolSource {
+    Package {
+        root: PathBuf,
+        launcher: String,
+    },
+    Ambient {
+        launcher: PathBuf,
+        toolchain_id: String,
+        trusted_fingerprint: Option<[u8; 32]>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

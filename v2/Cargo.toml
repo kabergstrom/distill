@@ -27,7 +27,6 @@ blake3 = "1"
 ryu = "1"
 unicode-normalization = "0.1"
 globset = "0.4"
-object = { version = "0.37", default-features = false, features = ["read", "std"] }
 sha1_smol = "1"
 proc-macro2 = "1"
 quote = "1"

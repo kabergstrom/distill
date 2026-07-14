@@ -45,7 +45,7 @@ use distill_store::cas::record::{
     LocalFailureClass as StoreLocalFailureClass,
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
-use distill_store::pipeline::StagedTool;
+use distill_store::pipeline::RegisteredTool;
 use distill_store::{Store, StoreError};
 use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
 
@@ -210,7 +210,7 @@ struct BuildContext {
 
 #[derive(Clone)]
 struct PinnedToolEpoch {
-    tools: BTreeMap<String, StagedTool>,
+    tools: BTreeMap<String, RegisteredTool>,
 }
 
 impl PinnedToolEpoch {
@@ -231,7 +231,7 @@ impl PinnedToolEpoch {
                         "published tool {key:?} disappeared while pinning its epoch"
                     ))
                 })?;
-            if tool.capsule_hash != expected_hash {
+            if tool.tool_hash != expected_hash {
                 return Err(BuildError::Infrastructure(format!(
                     "published tool {key:?} changed while pinning its epoch"
                 )));
@@ -243,7 +243,7 @@ impl PinnedToolEpoch {
 }
 
 impl ToolEpochSnapshot for PinnedToolEpoch {
-    fn tool(&self, id: &str) -> Result<Option<StagedTool>, StoreError> {
+    fn tool(&self, id: &str) -> Result<Option<RegisteredTool>, StoreError> {
         Ok(self.tools.get(id).cloned())
     }
 }
@@ -271,6 +271,7 @@ struct BuildProcessContext<'a> {
     trace: Vec<TraceOp>,
     stopped: bool,
     discarded: bool,
+    cacheable: bool,
     fatal: Option<BuildError>,
 }
 
@@ -288,6 +289,7 @@ impl<'a> BuildProcessContext<'a> {
             trace: Vec::new(),
             stopped: false,
             discarded: false,
+            cacheable: true,
             fatal: None,
         }
     }
@@ -322,7 +324,7 @@ impl<'a> BuildProcessContext<'a> {
         self.abort(error, ProcessContextError::Failed(detail))
     }
 
-    fn finish(self) -> Result<Vec<TraceOp>, BuildError> {
+    fn finish(self) -> Result<(Vec<TraceOp>, bool), BuildError> {
         if let Some(error) = self.fatal {
             return Err(error);
         }
@@ -331,7 +333,7 @@ impl<'a> BuildProcessContext<'a> {
                 "processor attempted basis was discarded".to_owned(),
             ));
         }
-        Ok(self.trace)
+        Ok((self.trace, self.cacheable))
     }
 }
 
@@ -496,25 +498,19 @@ impl PipelineProcessContext for BuildProcessContext<'_> {
         if self.ensure_active().is_err() {
             return Err(distill_build::tool::ToolRunError::AttemptStopped);
         }
-        let platform_id = self
-            .context
-            .target
-            .compilation_identity
-            .target_triple
-            .clone();
-        let system_runtime_id = self.context.target.compilation_identity.rustc.clone();
         let mut tool = ProcessContext::new(
             &self.context.tools,
             ToolRuntimeBinding {
-                platform_id: &platform_id,
-                system_runtime_id: &system_runtime_id,
                 execution_root: &self.context.execution_root,
             },
         );
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         let result = tool.run_tool(id, &args, stdin);
         match tool.into_trace() {
-            Ok(trace) => self.trace.extend(trace),
+            Ok((trace, cacheable)) => {
+                self.trace.extend(trace);
+                self.cacheable &= cacheable;
+            }
             Err(_) => {
                 self.discarded = true;
                 self.fatal = Some(BuildError::Infrastructure(
@@ -1195,18 +1191,20 @@ fn process_chain(
         );
         let outcome =
             epoch.invoke_processor(&stage.registration.id, current_value, &mut process_context);
-        let mut trace = process_context.finish()?;
+        let (mut trace, cacheable) = process_context.finish()?;
         let products = match outcome {
             Ok(products) => products,
             Err(CallbackInvokeError::Rejected(error)) => {
-                commit_processor_failure(
-                    context,
-                    loaded,
-                    stage,
-                    &static_inputs,
-                    &trace,
-                    error.code,
-                )?;
+                if cacheable {
+                    commit_processor_failure(
+                        context,
+                        loaded,
+                        stage,
+                        &static_inputs,
+                        &trace,
+                        error.code,
+                    )?;
+                }
                 return Err(BuildError::Failed(format!(
                     "processor {:?} rejected asset {} with code {}: {}",
                     stage.registration.id, loaded.entry.uuid, error.code, error.message
@@ -1222,17 +1220,24 @@ fn process_chain(
         })?;
         let encoded =
             encode_processor_products(context, loaded, chain, stage, &products, &mut trace)?;
-        if let Some((cached_outputs, cached_debug)) = cached {
-            ensure_cached_stage_matches(&cached_outputs, &cached_debug, &encoded, &products.debug)?;
-        } else {
-            commit_processor_stage(
-                context,
-                loaded,
-                &static_inputs,
-                &trace,
-                &encoded,
-                &products.debug,
-            )?;
+        if cacheable {
+            if let Some((cached_outputs, cached_debug)) = cached {
+                ensure_cached_stage_matches(
+                    &cached_outputs,
+                    &cached_debug,
+                    &encoded,
+                    &products.debug,
+                )?;
+            } else {
+                commit_processor_stage(
+                    context,
+                    loaded,
+                    &static_inputs,
+                    &trace,
+                    &encoded,
+                    &products.debug,
+                )?;
+            }
         }
         let primary = encoded
             .iter()

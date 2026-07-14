@@ -5,8 +5,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use distill_core::tool::{ToolCapsuleFile, ToolCwdPolicy};
-use distill_store::pipeline::StagedTool;
+use distill_core::tool::{ToolCwdPolicy, ToolPackageFile, ToolSourceIdentityV2};
+use distill_store::pipeline::RegisteredTool;
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreError};
 
@@ -19,7 +19,7 @@ use crate::trace::{
 /// A snapshot-pinned ToolEpoch projection. Implementations must return the
 /// mapping visible at that snapshot, not a live registration path.
 pub trait ToolEpochSnapshot {
-    fn tool(&self, id: &str) -> Result<Option<StagedTool>, StoreError>;
+    fn tool(&self, id: &str) -> Result<Option<RegisteredTool>, StoreError>;
 }
 
 /// Store-backed projection of the ToolEpoch visible at one exact input
@@ -41,15 +41,13 @@ impl<'a> StoreToolEpochSnapshot<'a> {
 }
 
 impl ToolEpochSnapshot for StoreToolEpochSnapshot<'_> {
-    fn tool(&self, id: &str) -> Result<Option<StagedTool>, StoreError> {
+    fn tool(&self, id: &str) -> Result<Option<RegisteredTool>, StoreError> {
         self.store.tool_at(id, self.basis)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ToolRuntimeBinding<'a> {
-    pub platform_id: &'a str,
-    pub system_runtime_id: &'a str,
     /// Daemon-owned directory in which private execution trees are created.
     pub execution_root: &'a Path,
 }
@@ -90,6 +88,7 @@ pub struct ProcessContext<'a, S: ToolEpochSnapshot + ?Sized> {
     trace: Vec<TraceOp>,
     stopped: bool,
     discarded: bool,
+    cacheable: bool,
 }
 
 impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
@@ -100,6 +99,7 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
             trace: Vec::new(),
             stopped: false,
             discarded: false,
+            cacheable: true,
         }
     }
 
@@ -116,11 +116,11 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
         (!self.discarded).then_some(self.trace.as_slice())
     }
 
-    pub fn into_trace(self) -> Result<Vec<TraceOp>, TraceDiscarded> {
+    pub fn into_trace(self) -> Result<(Vec<TraceOp>, bool), TraceDiscarded> {
         if self.discarded {
             Err(TraceDiscarded)
         } else {
-            Ok(self.trace)
+            Ok((self.trace, self.cacheable))
         }
     }
 
@@ -140,8 +140,8 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
                 return Err(ToolRunError::InvalidId(error));
             }
         };
-        let staged = match self.snapshot.tool(&id) {
-            Ok(Some(staged)) => staged,
+        let registered = match self.snapshot.tool(&id) {
+            Ok(Some(registered)) => registered,
             Ok(None) => {
                 let failure = StableFailureFingerprint::MissingCapability {
                     key: CapabilityKey::Tool(id.clone()),
@@ -164,41 +164,43 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
 
         self.trace.push(TraceOp::Tool {
             id: id.clone(),
-            observed: Observed::Ok(staged.capsule_hash),
+            observed: Observed::Ok(registered.tool_hash),
         });
-        if staged.revalidate().is_err()
-            || staged
-                .validate_launch_platform(self.runtime.platform_id, self.runtime.system_runtime_id)
-                .is_err()
-        {
-            return Err(self.transient(
-                id,
-                staged.capsule_hash,
-                ToolLaunchFailureClass::CapsuleClosureUnavailable,
-            ));
+        self.cacheable &= registered.is_cacheable();
+        if registered.revalidate().is_err() {
+            let class = match &registered.identity.source {
+                ToolSourceIdentityV2::Package { .. } => ToolLaunchFailureClass::PackageUnavailable,
+                ToolSourceIdentityV2::Ambient { .. } => ToolLaunchFailureClass::AmbientUnavailable,
+            };
+            return Err(self.transient(id, registered.tool_hash, class));
         }
 
-        let execution = match ExecutionTree::new(&staged, self.runtime.execution_root) {
+        let execution = match ExecutionTree::new(&registered, self.runtime.execution_root) {
             Ok(execution) => execution,
-            Err(class) => return Err(self.transient(id, staged.capsule_hash, class)),
+            Err(class) => return Err(self.transient(id, registered.tool_hash, class)),
         };
-        let result = launch(&staged, &execution, args, stdin);
+        let result = launch(&registered, &execution, args, stdin);
         let output = match result {
             Ok(output) => output,
             Err(LaunchError::Closed(class)) => {
-                return Err(self.transient(id, staged.capsule_hash, class));
+                return Err(self.transient(id, registered.tool_hash, class));
             }
             Err(LaunchError::Infrastructure(detail)) => {
                 self.discard();
                 return Err(ToolRunError::Infrastructure { id, detail });
             }
         };
-        if verify_execution_root(&execution.capsule_root, &staged.capsule.files).is_err() {
-            return Err(self.transient(
-                id,
-                staged.capsule_hash,
-                ToolLaunchFailureClass::CapsuleClosureUnavailable,
-            ));
+        if let (Some(package_root), Some(files)) = (
+            execution.package_root.as_deref(),
+            registered.identity.package_files(),
+        ) {
+            if verify_execution_root(package_root, files).is_err() {
+                return Err(self.transient(
+                    id,
+                    registered.tool_hash,
+                    ToolLaunchFailureClass::PackageUnavailable,
+                ));
+            }
         }
         Ok(output)
     }
@@ -206,13 +208,13 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
     fn transient(
         &mut self,
         id: String,
-        capsule_hash: [u8; 32],
+        tool_hash: [u8; 32],
         class: ToolLaunchFailureClass,
     ) -> ToolRunError {
         self.discard();
         ToolRunError::Transient(ToolLaunchDiagnostic {
             id,
-            capsule_hash,
+            tool_hash,
             class,
         })
     }
@@ -226,51 +228,64 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
 
 struct ExecutionTree {
     directory: tempfile::TempDir,
-    capsule_root: PathBuf,
+    package_root: Option<PathBuf>,
     scratch_root: PathBuf,
 }
 
 impl ExecutionTree {
-    fn new(staged: &StagedTool, execution_root: &Path) -> Result<Self, ToolLaunchFailureClass> {
+    fn new(tool: &RegisteredTool, execution_root: &Path) -> Result<Self, ToolLaunchFailureClass> {
         let directory = tempfile::Builder::new()
             .prefix(".distill-tool-")
             .tempdir_in(execution_root)
             .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-        let capsule_root = directory.path().join("capsule");
         let scratch_root = directory.path().join("scratch");
-        std::fs::create_dir(&capsule_root)
-            .and_then(|()| std::fs::create_dir(&scratch_root))
-            .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-        for file in &staged.capsule.files {
-            let source = staged.root.join(&file.path);
-            let destination = capsule_root.join(&file.path);
-            let bytes = std::fs::read(&source)
-                .map_err(|_| ToolLaunchFailureClass::CapsuleClosureUnavailable)?;
-            if bytes.len() as u64 != file.len || blake3::hash(&bytes).as_bytes() != &file.bytes_hash
-            {
-                return Err(ToolLaunchFailureClass::CapsuleClosureUnavailable);
+        std::fs::create_dir(&scratch_root).map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
+
+        let package_root = if let ToolSourceIdentityV2::Package { files, .. } =
+            &tool.identity.source
+        {
+            let source_root = tool
+                .root
+                .as_deref()
+                .ok_or(ToolLaunchFailureClass::PackageUnavailable)?;
+            let package_root = directory.path().join("package");
+            std::fs::create_dir(&package_root).map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
+            for file in files {
+                let source = source_root.join(&file.path);
+                let destination = package_root.join(&file.path);
+                let bytes = std::fs::read(&source)
+                    .map_err(|_| ToolLaunchFailureClass::PackageUnavailable)?;
+                if bytes.len() as u64 != file.len
+                    || blake3::hash(&bytes).as_bytes() != &file.bytes_hash
+                {
+                    return Err(ToolLaunchFailureClass::PackageUnavailable);
+                }
+                let parent = destination
+                    .parent()
+                    .ok_or(ToolLaunchFailureClass::PackageUnavailable)?;
+                std::fs::create_dir_all(parent).map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)
+                    .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
+                output
+                    .write_all(&bytes)
+                    .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
+                set_file_permissions(&output, file.executable)
+                    .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
             }
-            let parent = destination
-                .parent()
-                .ok_or(ToolLaunchFailureClass::CapsuleClosureUnavailable)?;
-            std::fs::create_dir_all(parent).map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&destination)
-                .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-            output
-                .write_all(&bytes)
-                .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-            set_file_permissions(&output, file.executable)
-                .map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-        }
-        seal_directories(&capsule_root).map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
-        verify_execution_root(&capsule_root, &staged.capsule.files)
-            .map_err(|_| ToolLaunchFailureClass::CapsuleClosureUnavailable)?;
+            seal_directories(&package_root).map_err(|_| ToolLaunchFailureClass::SpawnDenied)?;
+            verify_execution_root(&package_root, files)
+                .map_err(|_| ToolLaunchFailureClass::PackageUnavailable)?;
+            Some(package_root)
+        } else {
+            None
+        };
+
         Ok(Self {
             directory,
-            capsule_root,
+            package_root,
             scratch_root,
         })
     }
@@ -288,47 +303,46 @@ enum LaunchError {
 }
 
 fn launch(
-    staged: &StagedTool,
+    tool: &RegisteredTool,
     execution: &ExecutionTree,
     args: &[&str],
     stdin: &[u8],
 ) -> Result<ToolOutput, LaunchError> {
-    let interpreter = staged.capsule.resolved_interpreter.as_ref();
-    let program_relative = interpreter.unwrap_or(&staged.capsule.launch.argv0);
-    let program_row = staged
-        .capsule
-        .files
-        .iter()
-        .find(|file| file.path == *program_relative)
-        .ok_or(LaunchError::Closed(
-            ToolLaunchFailureClass::CapsuleClosureUnavailable,
-        ))?;
-    if !program_row.executable {
-        return Err(LaunchError::Closed(if interpreter.is_some() {
-            ToolLaunchFailureClass::MissingInterpreter
-        } else {
-            ToolLaunchFailureClass::NotExecutable
-        }));
-    }
+    let (program, source_is_ambient) = match &tool.identity.source {
+        ToolSourceIdentityV2::Package { launcher, .. } => (
+            execution
+                .package_root
+                .as_deref()
+                .ok_or(LaunchError::Closed(
+                    ToolLaunchFailureClass::PackageUnavailable,
+                ))?
+                .join(launcher),
+            false,
+        ),
+        ToolSourceIdentityV2::Ambient { launcher, .. } => (PathBuf::from(launcher), true),
+    };
 
-    let mut command = Command::new(execution.capsule_root.join(program_relative));
-    if interpreter.is_some() {
-        command.args(&staged.capsule.launch.interpreter_args);
-        command.arg(execution.capsule_root.join(&staged.capsule.launch.argv0));
-    }
+    let mut command = Command::new(program);
     command.args(args);
     command.env_clear();
     command.envs(
-        staged
-            .capsule
+        tool.identity
             .environment
             .iter()
             .map(|(key, value)| (key, value)),
     );
-    let cwd = match &staged.capsule.cwd_policy {
+    let cwd = match &tool.identity.cwd_policy {
         ToolCwdPolicy::EmptyScratch => execution.scratch_root.clone(),
-        ToolCwdPolicy::ReadOnlyCapsuleRoot => execution.capsule_root.clone(),
-        ToolCwdPolicy::ReadOnlyDeclaredSubdir(path) => execution.capsule_root.join(path),
+        ToolCwdPolicy::ReadOnlyPackageRoot => execution.package_root.clone().ok_or(
+            LaunchError::Closed(ToolLaunchFailureClass::PackageUnavailable),
+        )?,
+        ToolCwdPolicy::ReadOnlyPackageSubdir(path) => execution
+            .package_root
+            .as_deref()
+            .ok_or(LaunchError::Closed(
+                ToolLaunchFailureClass::PackageUnavailable,
+            ))?
+            .join(path),
     };
     command.current_dir(cwd);
     command
@@ -337,8 +351,8 @@ fn launch(
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
         let class = match error.kind() {
-            std::io::ErrorKind::NotFound if interpreter.is_some() => {
-                ToolLaunchFailureClass::MissingInterpreter
+            std::io::ErrorKind::NotFound if source_is_ambient => {
+                ToolLaunchFailureClass::AmbientUnavailable
             }
             std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
                 ToolLaunchFailureClass::NotExecutable
@@ -369,7 +383,7 @@ fn launch(
     })
 }
 
-fn verify_execution_root(root: &Path, expected: &[ToolCapsuleFile]) -> Result<(), ()> {
+fn verify_execution_root(root: &Path, expected: &[ToolPackageFile]) -> Result<(), ()> {
     let expected_paths = expected
         .iter()
         .map(|file| file.path.clone())

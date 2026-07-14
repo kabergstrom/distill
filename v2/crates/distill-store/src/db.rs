@@ -215,8 +215,8 @@ CREATE TABLE pending_restart (
 CREATE TABLE tools (
     tool_key       TEXT NOT NULL,
     present        INTEGER NOT NULL CHECK (present IN (0, 1)),
-    capsule_object BLOB NOT NULL,
-    capsule_hash   BLOB NOT NULL CHECK (length(capsule_hash) = 32),
+    identity_object BLOB NOT NULL,
+    tool_hash      BLOB NOT NULL CHECK (length(tool_hash) = 32),
     input_version  INTEGER NOT NULL,
     PRIMARY KEY (tool_key, input_version)
 );

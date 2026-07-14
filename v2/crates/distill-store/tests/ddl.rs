@@ -198,7 +198,7 @@ fn assets_row_shape() {
 
 #[test]
 fn tools_table_is_the_tool_epoch() {
-    // §13: tool key → (verified capsule object, aggregate DSCT hash) — input-versioned.
+    // §13: tool key → (verified identity object, aggregate DSCT hash) — input-versioned.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
@@ -206,8 +206,8 @@ fn tools_table_is_the_tool_epoch() {
         [
             "tool_key",
             "present",
-            "capsule_object",
-            "capsule_hash",
+            "identity_object",
+            "tool_hash",
             "input_version"
         ]
     );

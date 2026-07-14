@@ -288,7 +288,6 @@ fn requirements(tag: u8) -> CandidateRequirements {
             name: "desktop".into(),
             fingerprint: [tag; 32],
         }],
-        native_dependencies: vec![],
     }
 }
 

@@ -12,16 +12,14 @@ use distill_core::attestation::{
 };
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
-use distill_core::tool::{
-    ToolCapsuleFileRole, ToolCwdPolicy, ToolLaunchMetadataV1, ToolPlatformBinding,
-};
+use distill_core::tool::ToolCwdPolicy;
 use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_store::bundles::AssetRecord;
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, HardStopReason, LineageClass, LineageStamp,
-    ResolvedToolCapsuleFile, ReverseMigrationEdge, SchemaLineageManifest,
-    SchemaReactivationRequest, SchemaRollbackRequest, ToolCapsuleRegistrationV1,
-    TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
+    ResolvedToolPackageFile, ResolvedToolSourceV2, ReverseMigrationEdge, SchemaLineageManifest,
+    SchemaReactivationRequest, SchemaRollbackRequest, ToolRegistrationV2, TypeAuthorityState,
+    ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
     load_policy_digest, CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
@@ -35,33 +33,25 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
-fn tool_capsule(launcher: &[u8], resource: &[u8]) -> ToolCapsuleRegistrationV1 {
-    ToolCapsuleRegistrationV1 {
-        files: vec![
-            ResolvedToolCapsuleFile {
-                path: "bin/tool".into(),
-                role: ToolCapsuleFileRole::Launcher,
-                executable: true,
-                bytes: launcher.to_vec(),
-            },
-            ResolvedToolCapsuleFile {
-                path: "share/config".into(),
-                role: ToolCapsuleFileRole::DeclaredResource,
-                executable: false,
-                bytes: resource.to_vec(),
-            },
-        ],
-        resolved_interpreter: None,
-        launch: ToolLaunchMetadataV1 {
-            argv0: "bin/tool".into(),
-            interpreter_args: vec![],
+fn tool_package(launcher: &[u8], resource: &[u8]) -> ToolRegistrationV2 {
+    ToolRegistrationV2 {
+        source: ResolvedToolSourceV2::Package {
+            launcher: "bin/tool".into(),
+            files: vec![
+                ResolvedToolPackageFile {
+                    path: "bin/tool".into(),
+                    executable: true,
+                    bytes: launcher.to_vec(),
+                },
+                ResolvedToolPackageFile {
+                    path: "share/config".into(),
+                    executable: false,
+                    bytes: resource.to_vec(),
+                },
+            ],
         },
         environment: vec![("LANG".into(), "C.UTF-8".into())],
         cwd_policy: ToolCwdPolicy::EmptyScratch,
-        platform: ToolPlatformBinding::ExplicitResidual {
-            platform_id: "test-platform".into(),
-            system_runtime_class: "test-kernel-abi".into(),
-        },
     }
 }
 
@@ -1129,55 +1119,53 @@ fn forged_dsts_is_rejected_at_publish_and_again_at_schema_commit() {
 // ---- tools: the ToolEpoch table ----
 
 #[test]
-fn staging_a_tool_is_content_addressed_and_input_versioned() {
-    // §13: tool key → (complete staged capsule, DSCT) at an input version.
+fn registering_a_package_tool_is_content_addressed_and_input_versioned() {
+    // §13: tool key → (complete staged package, DSCT) at an input version.
     let (_d, mut store) = store();
     let binary = b"#!/bin/sh\necho v1\n";
 
-    let (staged, v) = store
-        .input_transaction(|txn| txn.stage_tool("shaderc", tool_capsule(binary, b"cfg v1")))
+    let (registered, v) = store
+        .input_transaction(|txn| txn.register_tool("shaderc", tool_package(binary, b"cfg v1")))
         .unwrap();
-    assert_eq!(staged.input_version, v);
-    assert!(staged.root.join("bin/tool").is_file());
-    assert_eq!(std::fs::read(staged.root.join("bin/tool")).unwrap(), binary);
-    assert_eq!(
-        std::fs::read(staged.root.join("share/config")).unwrap(),
-        b"cfg v1"
-    );
-    assert_ne!(staged.capsule_hash, *blake3::hash(binary).as_bytes());
+    assert_eq!(registered.input_version, v);
+    let root = registered.root.as_ref().expect("package root");
+    assert!(root.join("bin/tool").is_file());
+    assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), binary);
+    assert_eq!(std::fs::read(root.join("share/config")).unwrap(), b"cfg v1");
+    assert_ne!(registered.tool_hash, *blake3::hash(binary).as_bytes());
 
     let resolved = store.tool("shaderc").unwrap().expect("registered");
-    assert_eq!(resolved.capsule_hash, staged.capsule_hash);
-    assert_eq!(resolved.capsule, staged.capsule);
-    assert_eq!(resolved.root, staged.root);
+    assert_eq!(resolved.tool_hash, registered.tool_hash);
+    assert_eq!(resolved.identity, registered.identity);
+    assert_eq!(resolved.root, registered.root);
     assert!(store.tool("unknown-tool").unwrap().is_none());
 }
 
 #[test]
-fn replacing_a_tool_republishes_and_staged_copies_coexist() {
+fn replacing_a_tool_republishes_and_package_copies_coexist() {
     // §9: staged versions coexist — a swap mid-epoch invalidates traces
-    // into rebuilds that run the new capsule at the new version.
+    // into rebuilds that run the new package at the new version.
     let (_d, mut store) = store();
     let (v1, ver1) = store
         .input_transaction(|txn| {
-            txn.stage_tool("shaderc", tool_capsule(b"same launcher", b"resource v1"))
+            txn.register_tool("shaderc", tool_package(b"same launcher", b"resource v1"))
         })
         .unwrap();
     let (v2, ver2) = store
         .input_transaction(|txn| {
-            txn.stage_tool("shaderc", tool_capsule(b"same launcher", b"resource v2"))
+            txn.register_tool("shaderc", tool_package(b"same launcher", b"resource v2"))
         })
         .unwrap();
-    assert_ne!(v1.capsule_hash, v2.capsule_hash);
+    assert_ne!(v1.tool_hash, v2.tool_hash);
     assert_ne!(v1.root, v2.root);
-    assert!(v1.root.join("share/config").is_file());
-    assert!(v2.root.join("share/config").is_file());
+    assert!(v1.root.as_ref().unwrap().join("share/config").is_file());
+    assert!(v2.root.as_ref().unwrap().join("share/config").is_file());
 
     let current = store.tool("shaderc").unwrap().unwrap();
-    assert_eq!(current.capsule_hash, v2.capsule_hash);
+    assert_eq!(current.tool_hash, v2.tool_hash);
     assert_eq!(current.input_version, ver2);
     let pinned = store.tool_at("shaderc", ver1).unwrap().unwrap();
-    assert_eq!(pinned.capsule_hash, v1.capsule_hash);
+    assert_eq!(pinned.tool_hash, v1.tool_hash);
     assert_eq!(pinned.input_version, ver1);
     assert!(store
         .tool_at("shaderc", distill_store::state::InputVersion(0))
@@ -1191,11 +1179,11 @@ fn complete_tool_epoch_tombstones_removed_keys_without_hiding_old_snapshots() {
     let first = BTreeMap::from([
         (
             "compiler".to_owned(),
-            tool_capsule(b"compiler", b"compiler config"),
+            tool_package(b"compiler", b"compiler config"),
         ),
         (
             "linker".to_owned(),
-            tool_capsule(b"linker", b"linker config"),
+            tool_package(b"linker", b"linker config"),
         ),
     ]);
     let (_, version_one) = store
@@ -1204,7 +1192,7 @@ fn complete_tool_epoch_tombstones_removed_keys_without_hiding_old_snapshots() {
 
     let second = BTreeMap::from([(
         "compiler".to_owned(),
-        tool_capsule(b"compiler v2", b"compiler config v2"),
+        tool_package(b"compiler v2", b"compiler config v2"),
     )]);
     let (_, version_two) = store
         .input_transaction(|txn| txn.publish_tool_epoch(&second))
@@ -1224,7 +1212,7 @@ fn a_failed_transaction_publishes_no_tool_mapping() {
     let (_d, mut store) = store();
     let err = store
         .input_transaction::<(), _>(|txn| {
-            txn.stage_tool("shaderc", tool_capsule(b"tool v1", b"resource"))?;
+            txn.register_tool("shaderc", tool_package(b"tool v1", b"resource"))?;
             Err(StoreError::Poisoned {
                 error: "abort".into(),
             })
@@ -1237,47 +1225,78 @@ fn a_failed_transaction_publishes_no_tool_mapping() {
 }
 
 #[test]
-fn invalid_capsule_registration_publishes_nothing() {
+fn invalid_package_registration_publishes_nothing() {
     let (_d, mut store) = store();
-    let mut capsule = tool_capsule(b"tool", b"resource");
-    capsule.files[0].path = "../tool".into();
+    let mut package = tool_package(b"tool", b"resource");
+    let ResolvedToolSourceV2::Package { files, .. } = &mut package.source else {
+        unreachable!();
+    };
+    files[0].path = "../tool".into();
     let before = store.input_version();
     assert!(matches!(
-        store.input_transaction(|txn| txn.stage_tool("tool", capsule)),
-        Err(StoreError::InvalidToolCapsule(_))
+        store.input_transaction(|txn| txn.register_tool("tool", package)),
+        Err(StoreError::InvalidToolIdentity(_))
     ));
     assert_eq!(store.input_version(), before);
     assert!(store.tool("tool").unwrap().is_none());
 }
 
 #[test]
-fn staged_capsule_is_revalidated_immediately_before_launch() {
+fn staged_package_is_revalidated_immediately_before_launch() {
     let (_d, mut store) = store();
-    let (staged, _) = store
-        .input_transaction(|txn| txn.stage_tool("tool", tool_capsule(b"launcher", b"resource")))
+    let (registered, _) = store
+        .input_transaction(|txn| txn.register_tool("tool", tool_package(b"launcher", b"resource")))
         .unwrap();
-    staged
-        .validate_launch_platform("test-platform", "ignored-for-residual")
-        .unwrap();
+    std::fs::remove_file(registered.root.as_ref().unwrap().join("share/config")).unwrap();
     assert!(matches!(
-        staged.validate_launch_platform("other-platform", "ignored"),
-        Err(StoreError::ToolCapsuleUnavailable { .. })
+        registered.revalidate(),
+        Err(StoreError::ToolUnavailable { .. })
     ));
-
-    std::fs::remove_file(staged.root.join("share/config")).unwrap();
-    assert!(matches!(
-        staged.revalidate(),
-        Err(StoreError::ToolCapsuleUnavailable { .. })
-    ));
-    // Lookup still returns the snapshot's sealed identity. Closure drift is
+    // Lookup still returns the snapshot's sealed identity. Package drift is
     // classified only by the immediate pre-launch revalidation so the caller
     // can discard the successful Tool trace observation as transient.
     let resolved = store.tool("tool").unwrap().expect("published mapping");
-    assert_eq!(resolved.capsule_hash, staged.capsule_hash);
+    assert_eq!(resolved.tool_hash, registered.tool_hash);
     assert!(matches!(
         resolved.revalidate(),
-        Err(StoreError::ToolCapsuleUnavailable { .. })
+        Err(StoreError::ToolUnavailable { .. })
     ));
+}
+
+#[test]
+fn ambient_registration_is_not_staged_and_trust_controls_cacheability() {
+    let (_d, mut store) = store();
+    let launcher = std::env::current_exe().unwrap();
+    let untrusted = ToolRegistrationV2 {
+        source: ResolvedToolSourceV2::Ambient {
+            launcher: launcher.to_string_lossy().into_owned(),
+            toolchain_id: "developer-tools".into(),
+            trusted_fingerprint: None,
+        },
+        environment: vec![],
+        cwd_policy: ToolCwdPolicy::EmptyScratch,
+    };
+    let (registered, _) = store
+        .input_transaction(|txn| txn.register_tool("ambient", untrusted))
+        .unwrap();
+    assert!(registered.root.is_none());
+    assert!(!registered.is_cacheable());
+    registered.revalidate().unwrap();
+
+    let trusted = ToolRegistrationV2 {
+        source: ResolvedToolSourceV2::Ambient {
+            launcher: launcher.to_string_lossy().into_owned(),
+            toolchain_id: "developer-tools".into(),
+            trusted_fingerprint: Some([7; 32]),
+        },
+        environment: vec![],
+        cwd_policy: ToolCwdPolicy::EmptyScratch,
+    };
+    let (registered, _) = store
+        .input_transaction(|txn| txn.register_tool("ambient", trusted))
+        .unwrap();
+    assert!(registered.root.is_none());
+    assert!(registered.is_cacheable());
 }
 
 // ---- schema lineage (§6, §11, §13) ----

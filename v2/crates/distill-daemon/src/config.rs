@@ -430,7 +430,6 @@ impl DaemonConfig {
             measured_layouts,
             compiled_types: compiled.clone(),
             targets,
-            native_dependencies: Vec::new(),
         })
     }
 }
