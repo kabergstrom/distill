@@ -1,10 +1,13 @@
 use distill_build::cache::*;
 use distill_build::query::AssetQuery;
 use distill_build::trace::*;
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, TypeUuid};
 
 struct Source(ContentHash);
 impl TraceSource for Source {
+    fn authoring_read(&self, _: AssetUuid) -> Observed<Option<BundleFileHash>> {
+        Observed::Ok(None)
+    }
     fn read(&self, _: AssetUuid) -> Observed<ContentHash> {
         Observed::Ok(self.0)
     }

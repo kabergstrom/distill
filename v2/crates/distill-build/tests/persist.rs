@@ -6,7 +6,7 @@ use distill_build::trace::{
     trace_payload_bytes, CapabilityKey, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
     Observed, TraceOp, TraceSource,
 };
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, TypeUuid};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::{Store, StoreConfig};
@@ -17,6 +17,9 @@ struct Snapshot {
 }
 
 impl TraceSource for Snapshot {
+    fn authoring_read(&self, _: AssetUuid) -> Observed<Option<BundleFileHash>> {
+        Observed::Ok(None)
+    }
     fn read(&self, _: AssetUuid) -> Observed<ContentHash> {
         Observed::Ok(ContentHash([0; 32]))
     }

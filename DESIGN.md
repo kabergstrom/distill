@@ -3602,6 +3602,11 @@ pub enum FailureCause {
 }
 
 pub enum TraceOp {                         // the labeled, outcome-bearing trace
+    /// Authoring-service source read. The whole owning bundle is the atomic
+    /// authored file; Ok(None) is a first-class miss. Pipeline build code
+    /// cannot construct this operation.
+    AuthoringRead { asset: AssetUuid,
+                    observed: Observed<Option<BundleFileHash>> },
     Read    { asset: AssetUuid, observed: Observed<ContentHash> },
     Resolve { path: String, observed: Observed<Option<AssetUuid>> },
                                            // Ok(None) is a first-class miss,
@@ -3652,6 +3657,11 @@ payload is encoded in the
 field order declared above by the §5 canonical record codec. `Observed` uses
 `Ok=1` and `Err=2`, followed by its declared payload. Repeated operations are
 retained because multiplicity and order are part of the witnessed attempt.
+`AuthoringRead=11` follows the same record rules and encodes its optional
+`BundleFileHash` with the canonical `Option` tag. It is available only to
+daemon authoring services such as codegen: ordinary processor `Read` remains
+the ContentHash-bearing artifact operation and the two meanings never share a
+tag.
 
 `CapabilityKey` has its own fixed `u8` tags:
 `MigrationFn=1`, `DefaultTable=2`, `Importer=3`, `Processor=4`, and `Tool=5`,
@@ -8632,6 +8642,11 @@ maintained under a recorded query over all `ShaderPipeline` assets. A
 body-only edit diffs to a no-op — no `.rs` mtime bump, no cargo rebuild
 cascade. A new pipeline gets its `.rs` as soon as its import lands, with no
 game demand — the bootstrap path for referencing a new shader from code.
+Every source-entry hit or miss is recorded as DSTR v1
+`TraceOp::AuthoringRead`, committing the owning bundle's exact raw byte
+identity; query membership remains an ordinary `TraceOp::Query`. This keeps
+codegen on the shared outcome-bearing trace/revalidation path without treating
+authored bundle bytes as artifact ContentHashes.
 
 Each codegen attempt returns a single `CodegenAttempt { basis, trace,
 outcome }`: the pinned input/configuration basis, the complete outcome-bearing

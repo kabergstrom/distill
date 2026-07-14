@@ -211,6 +211,12 @@ impl Reader<'_> {
                 id: self.string()?,
                 observed: self.observed(Self::array32)?,
             },
+            11 => TraceOp::AuthoringRead {
+                asset: AssetUuid(self.array16()?),
+                observed: self.observed(|reader| {
+                    reader.option(|reader| Ok(BundleFileHash(reader.array32()?)))
+                })?,
+            },
             tag => return Err(TraceDecodeError::UnknownOperation(tag)),
         })
     }

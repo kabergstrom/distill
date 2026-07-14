@@ -25,7 +25,9 @@ use distill_build::trace::{
 };
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::attestation::MIGRATION_TYPE_UUID;
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
+use distill_core::id::{
+    AssetUuid, BundleFileHash, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
+};
 use distill_core::lineage::lineage_chain_digest;
 use distill_json::AuthoredValue;
 use distill_migrate::{
@@ -3049,6 +3051,7 @@ struct TraceEntry {
 
 #[derive(Clone)]
 struct StoreTraceSource {
+    authoring_hashes: BTreeMap<AssetUuid, BundleFileHash>,
     entries: BTreeMap<AssetUuid, TraceEntry>,
     terminal_types: BTreeMap<AssetUuid, TypeUuid>,
     roles: BTreeMap<AssetUuid, EntryRole>,
@@ -3195,19 +3198,26 @@ fn validate_endpoint_stamp(
 
 impl StoreTraceSource {
     fn capture(store: &Store, basis: TraceCaptureBasis<'_>) -> Result<Self, BuildError> {
-        let bundles = store
-            .all_bundles()
-            .map_err(BuildError::infrastructure)?
+        let bundle_rows = store.all_bundles().map_err(BuildError::infrastructure)?;
+        let bundles = bundle_rows
+            .iter()
+            .map(|bundle| (bundle.bundle, bundle.path.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let bundle_hashes = bundle_rows
             .into_iter()
-            .map(|bundle| (bundle.bundle, bundle.path))
+            .map(|bundle| (bundle.bundle, BundleFileHash(bundle.content_hash.0)))
             .collect::<BTreeMap<_, _>>();
         let mut entries = BTreeMap::new();
+        let mut authoring_hashes = BTreeMap::new();
         let mut tag_poisons = BTreeMap::new();
         for asset in store.all_asset_ids().map_err(BuildError::infrastructure)? {
             let Some(entry) = store.entry(asset).map_err(BuildError::failed)? else {
                 continue;
             };
             let bundle = entry.bundle;
+            let bundle_hash = bundle_hashes.get(&bundle).copied().ok_or_else(|| {
+                BuildError::Infrastructure("trace entry owner bundle hash is missing".to_owned())
+            })?;
             let bundle_path = bundles.get(&bundle).cloned().ok_or_else(|| {
                 BuildError::Infrastructure("trace entry owner bundle is missing".to_owned())
             })?;
@@ -3232,6 +3242,7 @@ impl StoreTraceSource {
                     tags: entry.tags,
                 },
             );
+            authoring_hashes.insert(asset, bundle_hash);
             if store
                 .tag_index_state(asset)
                 .map_err(BuildError::infrastructure)?
@@ -3313,6 +3324,7 @@ impl StoreTraceSource {
             }
         }
         Ok(Self {
+            authoring_hashes,
             entries,
             terminal_types,
             roles,
@@ -3404,6 +3416,10 @@ fn no_trace<T>() -> Observed<T> {
 }
 
 impl TraceSource for StoreTraceSource {
+    fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>> {
+        Observed::Ok(self.authoring_hashes.get(&asset).copied())
+    }
+
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash> {
         self.content_hashes.get(&asset).copied().map_or_else(
             || {
@@ -4514,6 +4530,7 @@ mod tests {
     #[test]
     fn reference_trace_invalidates_on_resolution_role_or_terminal_type_drift() {
         let source = StoreTraceSource {
+            authoring_hashes: BTreeMap::new(),
             entries: BTreeMap::from([(
                 ASSET,
                 TraceEntry {
@@ -4571,6 +4588,7 @@ mod tests {
     fn absent_weak_uuid_reference_is_legal_and_trace_invalidates_when_it_appears() {
         let missing = AssetUuid([99; 16]);
         let mut source = StoreTraceSource {
+            authoring_hashes: BTreeMap::new(),
             entries: BTreeMap::new(),
             terminal_types: BTreeMap::new(),
             roles: BTreeMap::new(),

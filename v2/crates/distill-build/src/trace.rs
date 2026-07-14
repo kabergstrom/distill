@@ -1,7 +1,7 @@
 //! Outcome-bearing build/import traces and verifying-trace lookup (§§8–10).
 
 use distill_core::canonical::{CanonicalEncoder, DSTR};
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_migrate::MigrationOp;
 use distill_schema::ngp_schema::LogicalSchema;
@@ -395,6 +395,13 @@ pub fn local_failure_fingerprint(facts: &DslfV1) -> Result<StableFailureFingerpr
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TraceOp {
+    /// Authoring-service read of one source entry. The whole owning bundle's
+    /// byte identity is observed because one bundle is the atomic authored
+    /// file; `Ok(None)` is a first-class missing read.
+    AuthoringRead {
+        asset: AssetUuid,
+        observed: Observed<Option<BundleFileHash>>,
+    },
     Read {
         asset: AssetUuid,
         observed: Observed<ContentHash>,
@@ -509,6 +516,7 @@ impl LoadInputs {
 impl TraceOp {
     pub fn failed(&self) -> bool {
         match self {
+            Self::AuthoringRead { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::Read { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::Resolve { observed, .. } => matches!(observed, Observed::Err(_)),
             Self::Query { observed, .. } => matches!(observed, Observed::Err(_)),
@@ -633,6 +641,7 @@ impl AttemptedControlBasis {
 }
 
 pub trait TraceSource {
+    fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>>;
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash>;
     fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>>;
     fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]>;
@@ -646,6 +655,7 @@ pub trait TraceSource {
 
 pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
     trace.iter().all(|op| match op {
+        TraceOp::AuthoringRead { asset, observed } => &source.authoring_read(*asset) == observed,
         TraceOp::Read { asset, observed } => &source.read(*asset) == observed,
         TraceOp::Resolve { path, observed } => &source.resolve(path) == observed,
         TraceOp::Query { query, observed } => &source.query(query) == observed,
@@ -734,6 +744,11 @@ fn observed<T>(
 
 fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
     match op {
+        TraceOp::AuthoringRead { asset, observed: o } => {
+            e.enum_variant(11);
+            e.raw(&asset.0);
+            observed(e, o, |e, hash| e.option(*hash, |e, hash| e.raw(&hash.0)));
+        }
         TraceOp::Read { asset, observed: o } => {
             e.enum_variant(1);
             e.raw(&asset.0);

@@ -3,13 +3,14 @@ use std::collections::BTreeMap;
 use distill_build::dslf::{DslfError, DslfV1};
 use distill_build::query::AssetQuery;
 use distill_build::trace::*;
-use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, LogicalHash, TypeUuid};
 use distill_migrate::FieldPath;
 use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
 use distill_store::pipeline::{AcceptedSchemaEpoch, LineageStamp};
 
 #[derive(Default)]
 struct Snapshot {
+    authoring_reads: BTreeMap<AssetUuid, Observed<Option<BundleFileHash>>>,
     reads: BTreeMap<AssetUuid, Observed<ContentHash>>,
     resolves: BTreeMap<String, Observed<Option<AssetUuid>>>,
     roles: BTreeMap<AssetUuid, Observed<Option<EntryRole>>>,
@@ -18,6 +19,12 @@ struct Snapshot {
 }
 
 impl TraceSource for Snapshot {
+    fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>> {
+        self.authoring_reads
+            .get(&asset)
+            .cloned()
+            .unwrap_or(Observed::Ok(None))
+    }
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash> {
         self.reads[&asset].clone()
     }
@@ -48,6 +55,29 @@ impl TraceSource for Snapshot {
     fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
         self.control_reads[subject].clone()
     }
+}
+
+#[test]
+fn dstr_authoring_read_pins_tag_eleven_and_optional_bundle_identity() {
+    let asset = AssetUuid([0x33; 16]);
+    let hash = BundleFileHash([0x44; 32]);
+    let op = TraceOp::AuthoringRead {
+        asset,
+        observed: Observed::Ok(Some(hash)),
+    };
+    let actual = trace_canonical_bytes(std::slice::from_ref(&op));
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"DSTR");
+    expected.push(1);
+    expected.extend_from_slice(&1_u32.to_le_bytes());
+    expected.push(11); // TraceOp::AuthoringRead
+    expected.extend_from_slice(&asset.0);
+    expected.push(1); // Observed::Ok
+    expected.push(1); // Some
+    expected.extend_from_slice(&hash.0);
+    assert_eq!(actual, expected);
+    assert_eq!(decode_trace_canonical_bytes(&actual).unwrap(), vec![op]);
 }
 
 #[test]
@@ -125,7 +155,10 @@ fn dstr_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
     let implicit_bytes = trace_payload_bytes(std::slice::from_ref(&implicit));
     let explicit_bytes = trace_payload_bytes(std::slice::from_ref(&explicit));
     assert_ne!(implicit_bytes, explicit_bytes);
-    assert_eq!(decode_trace_payload_bytes(&explicit_bytes), Ok(vec![explicit]));
+    assert_eq!(
+        decode_trace_payload_bytes(&explicit_bytes),
+        Ok(vec![explicit])
+    );
 
     let forbidden = TraceOp::Query {
         query: Box::new(AssetQuery {
