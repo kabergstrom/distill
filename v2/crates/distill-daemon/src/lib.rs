@@ -10,6 +10,7 @@ pub mod epoch;
 pub mod importer;
 pub mod lineage_repair;
 pub mod logical_node;
+mod migration_control;
 pub mod module_loader;
 mod operations;
 mod pipeline_map;

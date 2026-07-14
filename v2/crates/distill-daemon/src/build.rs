@@ -16,11 +16,15 @@ use distill_build::pipeline::{
 use distill_build::query::{asset_query_result_hash, AssetQuery};
 use distill_build::tool::{ProcessContext, StoreToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
-    trace_payload_bytes, CapabilityKey, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
-    Observed, StableFailureFingerprint, TraceOp, TraceSource,
+    control_failure_fingerprint, trace_payload_bytes, CapabilityKey, ControlFailureCode,
+    ControlFailureSubject, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
+    MigrationControlKind, MigrationControlValue, Observed, StableFailureFingerprint, TraceOp,
+    TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_core::attestation::MIGRATION_TYPE_UUID;
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
+use distill_core::lineage::lineage_chain_digest;
 use distill_json::AuthoredValue;
 use distill_migrate::{
     conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, EdgeKind, FieldPath,
@@ -44,6 +48,7 @@ use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
 use crate::callbacks::{CallbackInvokeError, DiagnosticSeverity};
 use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
+use crate::migration_control::{self, MigrationDecodeError, MigrationHeader};
 use crate::scanner::RootedScanner;
 
 pub(crate) struct CoordinatorBuildBackend {
@@ -1058,6 +1063,7 @@ fn capture_trace_source(context: &BuildContext<'_>) -> Result<StoreTraceSource, 
         .map_err(|poison| BuildError::Failed(poison.to_string()))?;
     StoreTraceSource::capture(
         context.store,
+        &context.scanner,
         &context.registry,
         &context.target,
         context.basis,
@@ -1190,37 +1196,76 @@ fn load_current_value(
     if loaded.entry.schema_hash == project.logical_hash {
         return Ok(loaded.entry.data.clone());
     }
-    let stamp = match &loaded.entry.lineage {
-        EntryLineageV1::Manifest(stamp) => Some(stamp.clone()),
-        EntryLineageV1::Bootstrap { .. } => None,
-    };
-    let placement = context
-        .store
-        .classify_lineage(
-            loaded.entry.type_uuid,
-            loaded.entry.schema_hash,
-            stamp,
-            project.logical_hash,
-        )
-        .map_err(BuildError::infrastructure)?;
-    if !placement.permits_automatic_diff() {
-        return Err(BuildError::Failed(format!(
-            "asset {} cannot migrate from {} to {}: {placement:?}",
-            loaded.entry.uuid, loaded.entry.schema_hash, project.logical_hash
-        )));
-    }
     let bundle = distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
     let old = bundle
         .schemas
         .get(&loaded.entry.schema_hash)
         .ok_or_else(|| {
             BuildError::Failed("bundle omitted the entry's old schema snapshot".to_owned())
-        })?;
-    let plan = plan_automatic(&old.root, &project.logical_schema.root)
+        })?
+        .clone();
+    let selected = select_migration_chain(
+        trace_source,
+        loaded.entry.type_uuid,
+        loaded.entry.schema_hash,
+        project.logical_hash,
+        trace,
+    )?;
+    let mut value = loaded.entry.data.clone();
+    let mut schema = old;
+    let mut node = loaded.entry.schema_hash;
+    let mut tail_stamp = match &loaded.entry.lineage {
+        EntryLineageV1::Manifest(stamp) => Some(stamp.clone()),
+        EntryLineageV1::Bootstrap { .. } => None,
+    };
+    for edge in selected.edges {
+        if edge.target_type_uuid != loaded.entry.type_uuid
+            || edge.from_hash != node
+            || edge.from_schema != schema
+        {
+            return Err(BuildError::Failed(format!(
+                "Migration control {} does not continue the selected schema chain",
+                edge.asset
+            )));
+        }
+        value = execute_custom_migration(context, trace_source, trace, &edge, value)?;
+        schema = edge.to_schema.clone();
+        node = edge.to_hash;
+        tail_stamp = Some(edge.to_lineage.clone());
+    }
+    if node == project.logical_hash {
+        if schema != project.logical_schema {
+            return Err(BuildError::Failed(
+                "Migration chain reached the current hash with a different schema".to_owned(),
+            ));
+        }
+        return Ok(value);
+    }
+    if !selected.needs_automatic_tail {
+        return Err(BuildError::Failed(
+            "Migration chain stopped before the current schema".to_owned(),
+        ));
+    }
+    let placement = context
+        .store
+        .classify_lineage(
+            loaded.entry.type_uuid,
+            node,
+            tail_stamp,
+            project.logical_hash,
+        )
+        .map_err(BuildError::infrastructure)?;
+    if !placement.permits_automatic_diff() {
+        return Err(BuildError::Failed(format!(
+            "asset {} cannot automatically migrate the custom-chain tail from {} to {}: {placement:?}",
+            loaded.entry.uuid, node, project.logical_hash
+        )));
+    }
+    let plan = plan_automatic(&schema.root, &project.logical_schema.root)
         .map_err(|error| BuildError::Failed(error.to_string()))?;
     validate_plan(
         &plan,
-        &old.root,
+        &schema.root,
         &project.logical_schema.root,
         EdgeKind::Automatic,
     )
@@ -1249,8 +1294,8 @@ fn load_current_value(
     let defaults = EpochDefaults::new(epoch, loaded.entry.type_uuid);
     let migrated = execute_ops(
         &plan,
-        &loaded.entry.data,
-        &old.root,
+        &value,
+        &schema.root,
         &project.logical_schema.root,
         &defaults,
     )
@@ -1266,6 +1311,159 @@ fn load_current_value(
         BuildError::Failed(format!("migrated value is non-conforming: {error}"))
     })?;
     Ok(migrated)
+}
+
+struct SelectedMigrationChain {
+    edges: Vec<MigrationControlValue>,
+    needs_automatic_tail: bool,
+}
+
+fn select_migration_chain(
+    source: &StoreTraceSource,
+    type_uuid: TypeUuid,
+    start: LogicalHash,
+    target: LogicalHash,
+    trace: &mut Vec<TraceOp>,
+) -> Result<SelectedMigrationChain, BuildError> {
+    let mut selected = SelectedMigrationChain {
+        edges: Vec::new(),
+        needs_automatic_tail: false,
+    };
+    let mut visited = BTreeSet::from([start]);
+    let mut node = start;
+    loop {
+        if node == target {
+            return Ok(selected);
+        }
+        let query = ControlQuery::MigrationEdges {
+            type_uuid,
+            from_hash: node,
+        };
+        let observed = source.control(&query);
+        trace.push(TraceOp::Control {
+            query,
+            observed: observed.clone(),
+        });
+        if let Observed::Err(error) = observed {
+            return Err(BuildError::Failed(format!(
+                "Migration control query failed: {error:?}"
+            )));
+        }
+        let assets = source.migration_assets(type_uuid, node);
+        let mut outgoing = Vec::with_capacity(assets.len());
+        for asset in assets {
+            let subject = ControlSubject::Migration(asset);
+            let observed = source.control_read(&subject);
+            trace.push(TraceOp::ControlRead {
+                subject,
+                observed: observed.clone(),
+            });
+            if let Observed::Err(error) = observed {
+                return Err(BuildError::Failed(format!(
+                    "Migration control {asset} failed validation: {error:?}"
+                )));
+            }
+            outgoing.push(
+                source
+                    .migration_controls
+                    .get(&asset)
+                    .and_then(|record| record.value.clone())
+                    .ok_or_else(|| {
+                        BuildError::Infrastructure(
+                            "successful Migration control read has no decoded value".to_owned(),
+                        )
+                    })?,
+            );
+        }
+        match outgoing.len() {
+            0 => {
+                selected.needs_automatic_tail = true;
+                return Ok(selected);
+            }
+            1 => {
+                let edge = outgoing.pop().expect("one outgoing edge");
+                if !visited.insert(edge.to_hash) {
+                    return Err(BuildError::Failed(format!(
+                        "Migration graph cycle revisits {}",
+                        edge.to_hash
+                    )));
+                }
+                node = edge.to_hash;
+                selected.edges.push(edge);
+            }
+            _ => {
+                return Err(BuildError::Failed(format!(
+                    "ambiguous Migration graph at {node}: {:?}",
+                    outgoing.iter().map(|edge| edge.asset).collect::<Vec<_>>()
+                )));
+            }
+        }
+    }
+}
+
+fn execute_custom_migration(
+    context: &BuildContext<'_>,
+    source: &StoreTraceSource,
+    trace: &mut Vec<TraceOp>,
+    edge: &MigrationControlValue,
+    input: AuthoredValue,
+) -> Result<AuthoredValue, BuildError> {
+    let output = match &edge.kind {
+        MigrationControlKind::Ops(ops) => {
+            validate_plan(
+                ops,
+                &edge.from_schema.root,
+                &edge.to_schema.root,
+                EdgeKind::Custom,
+            )
+            .map_err(|errors| {
+                BuildError::Failed(format!(
+                    "Migration control {} has an invalid custom plan: {errors:?}",
+                    edge.asset
+                ))
+            })?;
+            let epoch = context
+                .pipeline
+                .epoch()
+                .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+            let defaults = EpochDefaults::new(epoch, edge.target_type_uuid);
+            execute_ops(
+                ops,
+                &input,
+                &edge.from_schema.root,
+                &edge.to_schema.root,
+                &defaults,
+            )
+            .map_err(|error| BuildError::Failed(error.to_string()))?
+            .value
+        }
+        MigrationControlKind::Function { key } => {
+            let capability = CapabilityKey::MigrationFn(key.clone());
+            let observed = source.capability(&capability);
+            trace.push(TraceOp::Capability {
+                key: capability,
+                observed: observed.clone(),
+            });
+            if let Observed::Err(error) = observed {
+                return Err(BuildError::Failed(format!(
+                    "Migration function capability {key:?} is unavailable: {error:?}"
+                )));
+            }
+            context
+                .pipeline
+                .epoch()
+                .map_err(|poison| BuildError::Failed(poison.to_string()))?
+                .invoke_migration(key, input)
+                .map_err(BuildError::failed)?
+        }
+    };
+    conforms(&output, &edge.to_schema.root).map_err(|error| {
+        BuildError::Failed(format!(
+            "Migration control {} produced a non-conforming value: {error}",
+            edge.asset
+        ))
+    })?;
+    Ok(output)
 }
 
 fn encode_or_hydrate(
@@ -1657,11 +1855,136 @@ struct StoreTraceSource {
     paths: BTreeMap<String, Vec<AssetUuid>>,
     tools: BTreeMap<String, [u8; 32]>,
     capabilities: Vec<(CapabilityKey, [u8; 32])>,
+    migration_controls: BTreeMap<AssetUuid, MigrationControlRecord>,
+}
+
+#[derive(Clone)]
+struct MigrationControlRecord {
+    header: MigrationHeader,
+    observed: Observed<ControlValueHash>,
+    value: Option<MigrationControlValue>,
+}
+
+fn capture_migration_controls(
+    store: &Store,
+    scanner: &RootedScanner,
+) -> Result<BTreeMap<AssetUuid, MigrationControlRecord>, BuildError> {
+    let mut records = BTreeMap::new();
+    for asset in store.all_asset_ids().map_err(BuildError::infrastructure)? {
+        let Some(meta) = store.entry(asset).map_err(BuildError::failed)? else {
+            continue;
+        };
+        if meta.type_uuid != MIGRATION_TYPE_UUID {
+            continue;
+        }
+        let loaded = load_asset(store, scanner, asset)?;
+        let bundle =
+            distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
+        let header = migration_control::decode_header(&loaded.entry.data)
+            .map_err(|error| BuildError::Failed(error.to_string()))?;
+        let decoded = if !loaded.entry.authoring_only {
+            Err((
+                ControlFailureCode::WrongRole,
+                "Migration control is not authoring-only".to_owned(),
+            ))
+        } else {
+            migration_control::decode(asset, &bundle, &loaded.entry, header)
+                .map_err(|error| match error {
+                    MigrationDecodeError::Malformed(detail) => {
+                        (ControlFailureCode::Malformed, detail)
+                    }
+                    MigrationDecodeError::SchemaClosure(detail) => {
+                        (ControlFailureCode::SchemaClosure, detail)
+                    }
+                })
+                .and_then(|value| {
+                    validate_migration_control_lineage(store, &value)
+                        .map(|()| value)
+                        .map_err(|detail| (ControlFailureCode::Malformed, detail))
+                })
+        };
+        let (observed, value) = match decoded {
+            Ok(value) => (
+                Observed::Ok(ControlValueHash(
+                    *blake3::hash(&loaded.bundle_bytes).as_bytes(),
+                )),
+                Some(value),
+            ),
+            Err((code, _detail)) => (
+                Observed::Err(
+                    control_failure_fingerprint(
+                        ControlFailureSubject::Read(ControlSubject::Migration(asset)),
+                        code,
+                        Vec::<AssetUuid>::new(),
+                    )
+                    .expect("migration control decode failures have valid cardinality"),
+                ),
+                None,
+            ),
+        };
+        records.insert(
+            asset,
+            MigrationControlRecord {
+                header,
+                observed,
+                value,
+            },
+        );
+    }
+    Ok(records)
+}
+
+fn validate_migration_control_lineage(
+    store: &Store,
+    value: &MigrationControlValue,
+) -> Result<(), String> {
+    if value.from_hash == value.to_hash {
+        return Err("Migration edge endpoints must differ".to_owned());
+    }
+    let accepted = store
+        .current_lineage_stamp(value.target_type_uuid)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Migration target type has no accepted lineage authority".to_owned())?;
+    validate_endpoint_stamp(
+        value.target_type_uuid,
+        value.from_hash,
+        &value.from_lineage,
+        &accepted,
+        "from",
+    )?;
+    validate_endpoint_stamp(
+        value.target_type_uuid,
+        value.to_hash,
+        &value.to_lineage,
+        &accepted,
+        "to",
+    )
+}
+
+fn validate_endpoint_stamp(
+    type_uuid: TypeUuid,
+    hash: LogicalHash,
+    stamp: &distill_bundle::LineageStamp,
+    accepted: &distill_bundle::LineageStamp,
+    endpoint: &str,
+) -> Result<(), String> {
+    if stamp.epochs.is_empty()
+        || stamp.epochs.len() > accepted.epochs.len()
+        || stamp.epochs != accepted.epochs[..stamp.epochs.len()]
+        || stamp.selected_digest() != Some(hash)
+        || stamp.chain != lineage_chain_digest(type_uuid, &stamp.epochs, stamp.cursor)
+    {
+        return Err(format!(
+            "Migration {endpoint} lineage is not a verified accepted prefix"
+        ));
+    }
+    Ok(())
 }
 
 impl StoreTraceSource {
     fn capture(
         store: &Store,
+        scanner: &RootedScanner,
         registry: &PipelineRegistry,
         target: &Target,
         basis: distill_store::state::InputVersion,
@@ -1758,6 +2081,7 @@ impl StoreTraceSource {
             )
             .map(|key| (key, dylib_hash))
             .collect();
+        let migration_controls = capture_migration_controls(store, scanner)?;
         Ok(Self {
             entries,
             terminal_types,
@@ -1765,7 +2089,18 @@ impl StoreTraceSource {
             paths,
             tools,
             capabilities,
+            migration_controls,
         })
+    }
+
+    fn migration_assets(&self, type_uuid: TypeUuid, from_hash: LogicalHash) -> Vec<AssetUuid> {
+        self.migration_controls
+            .iter()
+            .filter(|(_, record)| {
+                record.header.target_type_uuid == type_uuid && record.header.from_hash == from_hash
+            })
+            .map(|(asset, _)| *asset)
+            .collect()
     }
 
     fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
@@ -1880,12 +2215,36 @@ impl TraceSource for StoreTraceSource {
         Observed::Ok(self.roles.get(&asset).copied())
     }
 
-    fn control(&self, _query: &ControlQuery) -> Observed<[u8; 32]> {
-        no_trace()
+    fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]> {
+        match query {
+            ControlQuery::MigrationEdges {
+                type_uuid,
+                from_hash,
+            } => Observed::Ok(asset_query_result_hash(
+                &self.migration_assets(*type_uuid, *from_hash),
+            )),
+            ControlQuery::DirectoryImportRuleSet => no_trace(),
+        }
     }
 
-    fn control_read(&self, _subject: &ControlSubject) -> Observed<ControlValueHash> {
-        no_trace()
+    fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
+        match subject {
+            ControlSubject::Migration(asset) => self
+                .migration_controls
+                .get(asset)
+                .map(|record| record.observed.clone())
+                .unwrap_or_else(|| {
+                    Observed::Err(
+                        control_failure_fingerprint(
+                            ControlFailureSubject::Read(subject.clone()),
+                            ControlFailureCode::Missing,
+                            Vec::<AssetUuid>::new(),
+                        )
+                        .expect("missing control read has valid cardinality"),
+                    )
+                }),
+            _ => no_trace(),
+        }
     }
 }
 
@@ -1898,14 +2257,19 @@ mod tests {
     use crate::callbacks::{
         PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProducts,
     };
+    use distill_asset::{AssetReflect, AssetType};
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_bundle::{EntryLineageV1, LineageStamp};
-    use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
+    use distill_core::lineage::AcceptedSchemaEpoch;
     use distill_json::AuthoredValue;
     use distill_rpc::{
         AuthoringEntry, AuthoringEntryRole, AuthoringValue, Commit, InputVersion, LoadPolicyEntry,
         TargetDefinition, TargetDefinitionHash,
+    };
+    use distill_schema::bootstrap_builtins_v1::{
+        AcceptedSchemaEpochV1, AuthoredValueV1, FieldPathV1, LineageStampV1, MigrationKindV1,
+        MigrationOpV1, MigrationV1,
     };
     use distill_schema::ngp_schema::{
         node_hash, snapshot_to_json, Field, FieldAttrs, FieldIdentifier, FieldLayout,
@@ -1926,6 +2290,8 @@ mod tests {
     const EXTRA: TypeUuid = TypeUuid([75; 16]);
     const ASSET: AssetUuid = AssetUuid([72; 16]);
     const BUNDLE: BundleUuid = BundleUuid([73; 16]);
+    const MIGRATION_ASSET: AssetUuid = AssetUuid([76; 16]);
+    const MIGRATION_BUNDLE: BundleUuid = BundleUuid([77; 16]);
 
     fn path(krate: &str, name: &str) -> TypePath {
         TypePath {
@@ -2148,6 +2514,95 @@ mod tests {
         TargetDefinition::canonical("dev", hash, rows, policy).unwrap()
     }
 
+    fn custom_write_migration_bundle(
+        old_hash: LogicalHash,
+        old_schema: &LogicalSchema,
+        current_hash: LogicalHash,
+        current_schema: &LogicalSchema,
+    ) -> Bundle {
+        let old_epochs = vec![AcceptedSchemaEpoch {
+            digest: old_hash,
+            forward_parent: None,
+        }];
+        let current_epochs = vec![
+            AcceptedSchemaEpoch {
+                digest: old_hash,
+                forward_parent: None,
+            },
+            AcceptedSchemaEpoch {
+                digest: current_hash,
+                forward_parent: Some(0),
+            },
+        ];
+        let migration = MigrationV1 {
+            target_type_uuid: TYPE.0,
+            from_hash: old_hash.0,
+            to_hash: current_hash.0,
+            from_lineage: LineageStampV1 {
+                epochs: vec![AcceptedSchemaEpochV1 {
+                    digest: old_hash.0,
+                    forward_parent: None,
+                }],
+                cursor: 0,
+                chain: lineage_chain_digest(TYPE, &old_epochs, 0),
+            },
+            to_lineage: LineageStampV1 {
+                epochs: current_epochs
+                    .iter()
+                    .map(|epoch| AcceptedSchemaEpochV1 {
+                        digest: epoch.digest.0,
+                        forward_parent: epoch.forward_parent,
+                    })
+                    .collect(),
+                cursor: 1,
+                chain: lineage_chain_digest(TYPE, &current_epochs, 1),
+            },
+            kind: MigrationKindV1::Ops {
+                ops: vec![
+                    MigrationOpV1::DropField {
+                        at: FieldPathV1 {
+                            segments: vec!["value".to_owned()],
+                        },
+                    },
+                    MigrationOpV1::WriteValue {
+                        to: FieldPathV1 {
+                            segments: vec!["value".to_owned()],
+                        },
+                        value: AuthoredValueV1::UInt { value: 42 },
+                    },
+                ],
+            },
+        };
+        let migration_schema = crate::logical_node::decode_logical_schema_bytes(
+            &distill_asset::build::logical_schema_bytes::<MigrationV1>(),
+        )
+        .unwrap();
+        let migration_hash = MigrationV1::descriptor().logical_hash;
+        Bundle {
+            format_version: 1,
+            uuid: MIGRATION_BUNDLE,
+            primary: None,
+            schemas: BTreeMap::from([
+                (old_hash, old_schema.clone()),
+                (current_hash, current_schema.clone()),
+                (migration_hash, migration_schema),
+            ]),
+            assets: BTreeMap::from([(
+                "migration".to_owned(),
+                AssetEntry {
+                    uuid: MIGRATION_ASSET,
+                    type_uuid: MigrationV1::TYPE_UUID,
+                    schema_hash: migration_hash,
+                    lineage: EntryLineageV1::Bootstrap {
+                        bundle_format_version: 1,
+                    },
+                    authoring_only: true,
+                    data: migration.to_authored(),
+                },
+            )]),
+        }
+    }
+
     struct CountingProcessor(Arc<AtomicUsize>);
 
     impl PipelineProcessor for CountingProcessor {
@@ -2183,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn production_backend_migrates_forward_lineage_before_processing_and_caches_it() {
+    fn production_backend_replans_when_a_custom_migration_shadows_the_automatic_tail() {
         let temp = tempfile::tempdir().unwrap();
         let assets = temp.path().join("assets");
         std::fs::create_dir_all(&assets).unwrap();
@@ -2317,7 +2772,7 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
-        let request = BuildRequest {
+        let mut request = BuildRequest {
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
             target_definition: target_hash,
@@ -2363,6 +2818,37 @@ mod tests {
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let migration = custom_write_migration_bundle(
+            old_hash,
+            &old_schema,
+            project.logical_hash,
+            &project.logical_schema,
+        );
+        std::fs::write(
+            assets.join("migration.bundle"),
+            distill_bundle::write_bundle(&migration).unwrap(),
+        )
+        .unwrap();
+        coordinator.reconcile_full_scan().unwrap();
+        request.basis = coordinator.server().current_stamp();
+
+        let custom = build(&coordinator, &request).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let root = custom
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.content_hash == custom.root_content_hash)
+            .unwrap();
+        let blobs = root
+            .payload
+            .blobs
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&[u8]>>();
+        let parsed =
+            distill_wire::artifact::parse_artifact_parts(&root.payload.structural, &blobs).unwrap();
+        assert_eq!(parsed.fixed, [42, 0]);
     }
 
     #[test]
@@ -2551,6 +3037,7 @@ mod tests {
             paths: BTreeMap::from([("target.bundle".to_owned(), vec![ASSET])]),
             tools: BTreeMap::new(),
             capabilities: Vec::new(),
+            migration_controls: BTreeMap::new(),
         };
         let mut trace = Vec::new();
         assert_eq!(
