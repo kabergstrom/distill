@@ -32,6 +32,7 @@ use distill_store::{Store, StoreConfig, StoreError};
 
 use crate::lineage_repair::{LineageRepairBackend, LineageRepairBackendInitError};
 use crate::scanner::{AssetRoot, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind};
+use crate::watcher::{GenerationReplay, WatcherQueue, WatcherQueueError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageDestination {
@@ -83,6 +84,33 @@ impl DaemonCoordinator {
     /// [`Self::apply_watcher_batch`] after this transaction.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         let scan = self.scanner.scan()?;
+        self.publish_scan(scan)
+    }
+
+    /// Arm a watcher generation before traversal, publish the startup scan,
+    /// then replay the exact event union. Overflow repeats a fully armed scan;
+    /// it can never degrade into a partial event set.
+    pub fn reconcile_startup(
+        &self,
+        watcher: &Mutex<WatcherQueue>,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let mut stamp;
+        loop {
+            let generation = lock_watcher(watcher).arm_scan()?;
+            stamp = self.reconcile_full_scan()?;
+            match lock_watcher(watcher).finish_scan(generation)? {
+                GenerationReplay::Events(events) => {
+                    if !events.is_empty() {
+                        stamp = self.apply_watcher_batch(events)?;
+                    }
+                    return Ok(stamp);
+                }
+                GenerationReplay::FullRescan => continue,
+            }
+        }
+    }
+
+    fn publish_scan(&self, scan: ScanSnapshot) -> Result<SnapshotStamp, CoordinatorError> {
         let candidate = ScanCandidate::build(&self.scanner, &self.lineage_destination, scan)?;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
@@ -93,9 +121,10 @@ impl DaemonCoordinator {
             .map_err(CoordinatorError::Coordinated)
     }
 
-    /// Queue a watcher batch as one durable input event. Downstream workers
-    /// consume these rows transactionally; duplicates are intentional union
-    /// semantics and collapse only when the consumer observes current state.
+    /// Reconcile a watcher batch as one durable input event. Event paths are a
+    /// trigger/union, never trusted as a complete namespace; the identity-
+    /// checked scan supplies current bytes and the single coordinated commit
+    /// consumes the change without an empty queue-only version in front of it.
     pub fn apply_watcher_batch(
         &self,
         events: impl IntoIterator<Item = WatcherPathEvent>,
@@ -106,29 +135,8 @@ impl DaemonCoordinator {
         if events.is_empty() {
             return Ok(self.server.current_stamp());
         }
-        let base = self.server.current_stamp().version;
-        let store = Arc::clone(&self.store);
-        self.server
-            .coordinated_commit(base, || {
-                let mut store = lock_store(&store);
-                if store.input_version() != base {
-                    return Err(format!(
-                        "durable watcher basis is {:?}, expected {base:?}",
-                        store.input_version()
-                    ));
-                }
-                store
-                    .input_transaction(|transaction| {
-                        for event in &events {
-                            let root = transaction.intern_root(&event.root)?;
-                            transaction.push_dirty(root, &event.path, event.exists)?;
-                        }
-                        Ok(())
-                    })
-                    .map_err(|error| error.to_string())?;
-                Ok(Commit::default())
-            })
-            .map_err(CoordinatorError::Coordinated)
+        let scan = self.scanner.scan()?;
+        self.publish_scan(scan)
     }
 }
 
@@ -179,6 +187,7 @@ impl From<distill_rpc::AttestationShapeError> for CoordinatorInitError {
 #[derive(Debug)]
 pub enum CoordinatorError {
     Scan(ScanError),
+    Watcher(WatcherQueueError),
     InvalidManifest(String),
     Coordinated(CoordinatedCommitError),
 }
@@ -194,6 +203,12 @@ impl std::error::Error for CoordinatorError {}
 impl From<ScanError> for CoordinatorError {
     fn from(error: ScanError) -> Self {
         Self::Scan(error)
+    }
+}
+
+impl From<WatcherQueueError> for CoordinatorError {
+    fn from(error: WatcherQueueError) -> Self {
+        Self::Watcher(error)
     }
 }
 
@@ -797,4 +812,10 @@ fn invalid_manifest<T>(detail: &str) -> Result<T, CoordinatorError> {
 
 fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn lock_watcher(watcher: &Mutex<WatcherQueue>) -> MutexGuard<'_, WatcherQueue> {
+    watcher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

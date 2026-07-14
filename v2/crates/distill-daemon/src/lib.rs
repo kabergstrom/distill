@@ -8,3 +8,4 @@ pub mod policy;
 pub mod quarantine;
 pub mod scanner;
 pub mod scheduler;
+pub mod watcher;
