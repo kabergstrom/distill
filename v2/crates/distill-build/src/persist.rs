@@ -169,6 +169,45 @@ pub fn lookup_persisted_candidate(
     Ok(None)
 }
 
+/// Decode and authenticate the traces in one static-input bucket without
+/// selecting or hydrating a hit. Hosts use this preflight to materialize
+/// content dependencies named by `TraceOp::Read` before revalidation; the
+/// ordinary lookup remains the single hit-selection path.
+pub fn persisted_candidate_traces(
+    store: &mut Store,
+    key_kind: KeyKind,
+    static_key: &[u8; 32],
+    expected_asset: AssetUuid,
+) -> Result<Vec<Vec<TraceOp>>, PersistedCacheError> {
+    store
+        .lookup_candidates(key_kind, static_key)?
+        .into_iter()
+        .map(|candidate| {
+            if candidate.payload.key_kind != key_kind {
+                return Err(PersistedCacheError::KeyKindMismatch {
+                    expected: key_kind,
+                    observed: candidate.payload.key_kind,
+                });
+            }
+            if candidate.asset_uuid != expected_asset {
+                return Err(PersistedCacheError::AssetMismatch {
+                    expected: expected_asset,
+                    observed: candidate.asset_uuid,
+                });
+            }
+            let trace = decode_trace_payload_bytes(&candidate.payload.trace)?;
+            let observed_digest = trace_digest(&trace);
+            if observed_digest != candidate.trace_digest {
+                return Err(PersistedCacheError::TraceDigestMismatch {
+                    indexed: candidate.trace_digest,
+                    observed: observed_digest,
+                });
+            }
+            Ok(trace)
+        })
+        .collect()
+}
+
 fn validate_failure(trace: &[TraceOp], cause: &FailureCause) -> Result<(), PersistedCacheError> {
     match cause {
         FailureCause::Op if trace.last().is_some_and(TraceOp::failed) => Ok(()),

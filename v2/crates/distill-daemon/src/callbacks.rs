@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 use distill_asset::CallbackPanic;
 use distill_build::outputs::OutputDecls;
-use distill_build::pipeline::TargetSelector;
+use distill_build::pipeline::{Target, TargetSelector};
+use distill_build::query::{AssetQuery, IntakeError};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolOutput, ToolRunError};
-use distill_core::id::TypeUuid;
+use distill_build::trace::StableFailureFingerprint;
+use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_migrate::FieldPath;
 use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
@@ -73,6 +75,17 @@ impl ProcessorError {
         Self {
             code,
             message: message.into(),
+        }
+    }
+}
+
+impl From<ProcessContextError> for ProcessorError {
+    fn from(error: ProcessContextError) -> Self {
+        Self {
+            // Zero is reserved by the host boundary for infrastructure/context
+            // rejection and is never committed as a deterministic DSLF row.
+            code: 0,
+            message: error.to_string(),
         }
     }
 }
@@ -146,6 +159,74 @@ pub struct ProcessorProducts {
     pub debug: BTreeMap<String, Vec<u8>>,
 }
 
+/// One snapshot-pinned terminal artifact returned by a processor dependency
+/// read. Generated typed adapters fix up `structural`/`blobs` into `T`; the
+/// neutral boundary retains the complete authenticated payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessArtifact {
+    pub asset: AssetUuid,
+    pub content_hash: ContentHash,
+    pub encoded_type: TypeUuid,
+    pub terminal_type: TypeUuid,
+    pub structural: Arc<[u8]>,
+    pub blobs: Vec<Arc<[u8]>>,
+}
+
+/// Job-bound output namespace. A processor can only mint child identities
+/// from the parent and declaration set installed for its own stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutputs {
+    parent: AssetUuid,
+    declarations: OutputDecls,
+}
+
+impl ProcessOutputs {
+    pub(crate) fn new(parent: AssetUuid, declarations: OutputDecls) -> Self {
+        Self {
+            parent,
+            declarations,
+        }
+    }
+
+    pub fn parent(&self) -> AssetUuid {
+        self.parent
+    }
+
+    pub fn declarations(&self) -> &OutputDecls {
+        &self.declarations
+    }
+
+    pub fn child(&self, key: &str) -> Result<AssetUuid, ProcessContextError> {
+        if !self.declarations.extras.contains_key(key) {
+            return Err(ProcessContextError::UndeclaredOutput(key.to_owned()));
+        }
+        Ok(AssetUuid::v5(self.parent, key))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessContextError {
+    Unavailable(&'static str),
+    AttemptStopped,
+    InvalidQuery(IntakeError),
+    Observed(StableFailureFingerprint),
+    WrongTerminal {
+        asset: AssetUuid,
+        expected: TypeUuid,
+        observed: TypeUuid,
+    },
+    UndeclaredOutput(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for ProcessContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ProcessContextError {}
+
 pub trait PipelineImporter: Send + Sync + 'static {
     fn import(
         &self,
@@ -165,6 +246,34 @@ impl<T: AuthoringImporter + 'static> PipelineImporter for T {
 }
 
 pub trait PipelineProcessContext {
+    fn read(
+        &mut self,
+        _asset: AssetUuid,
+        _expected_terminal: TypeUuid,
+    ) -> Result<ProcessArtifact, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("read"))
+    }
+
+    fn read_path(
+        &mut self,
+        _path: &str,
+        _expected_terminal: TypeUuid,
+    ) -> Result<ProcessArtifact, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("read_path"))
+    }
+
+    fn query(&mut self, _query: &AssetQuery) -> Result<Vec<AssetUuid>, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("query"))
+    }
+
+    fn target(&self) -> Result<&Target, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("target"))
+    }
+
+    fn outputs(&self) -> Result<ProcessOutputs, ProcessContextError> {
+        Err(ProcessContextError::Unavailable("outputs"))
+    }
+
     fn run_tool(
         &mut self,
         id: &str,

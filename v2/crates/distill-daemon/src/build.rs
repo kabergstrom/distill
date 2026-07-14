@@ -9,11 +9,13 @@ use distill_build::keys::{
     build_import_digest, static_inputs_canonical_bytes, static_inputs_digest, AppliedMigration,
     AutomaticMigration, BuildImportInputs, OutputHash, StaticInputs,
 };
-use distill_build::persist::{lookup_persisted_candidate, PersistedOutcome};
+use distill_build::persist::{
+    lookup_persisted_candidate, persisted_candidate_traces, PersistedOutcome,
+};
 use distill_build::pipeline::{
     PipelineChain, PipelineRegistry, PipelineStage, ProcessorRegistration, Target,
 };
-use distill_build::query::{asset_query_result_hash, AssetQuery};
+use distill_build::query::{asset_query_result_hash, normalize_path, AssetQuery};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
     control_failure_fingerprint, trace_payload_bytes, CapabilityKey, ControlFailureCode,
@@ -47,7 +49,10 @@ use distill_store::pipeline::StagedTool;
 use distill_store::{Store, StoreError};
 use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
 
-use crate::callbacks::{CallbackInvokeError, DiagnosticSeverity};
+use crate::callbacks::{
+    CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
+    ProcessContextError, ProcessOutputs,
+};
 use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::migration_control::{self, MigrationDecodeError, MigrationHeader};
@@ -171,6 +176,7 @@ struct BuildContext {
     execution_root: std::path::PathBuf,
     max_depth: usize,
     visiting: BTreeSet<AssetUuid>,
+    callback_chain: Vec<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodePublication>,
 }
 
@@ -228,6 +234,311 @@ fn lock_build_store(context: &BuildContext) -> Result<MutexGuard<'_, Store>, Bui
 fn ensure_build_basis(context: &BuildContext) -> Result<(), BuildError> {
     drop(lock_build_store(context)?);
     Ok(())
+}
+
+struct BuildProcessContext<'a> {
+    context: &'a mut BuildContext,
+    origin_bundle: BundleUuid,
+    outputs: ProcessOutputs,
+    trace: Vec<TraceOp>,
+    stopped: bool,
+    discarded: bool,
+    fatal: Option<BuildError>,
+}
+
+impl<'a> BuildProcessContext<'a> {
+    fn new(
+        context: &'a mut BuildContext,
+        origin_bundle: BundleUuid,
+        parent: AssetUuid,
+        declarations: distill_build::outputs::OutputDecls,
+    ) -> Self {
+        Self {
+            context,
+            origin_bundle,
+            outputs: ProcessOutputs::new(parent, declarations),
+            trace: Vec::new(),
+            stopped: false,
+            discarded: false,
+            fatal: None,
+        }
+    }
+
+    fn ensure_active(&self) -> Result<(), ProcessContextError> {
+        if self.stopped || self.discarded {
+            Err(ProcessContextError::AttemptStopped)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn abort(
+        &mut self,
+        error: BuildError,
+        callback_error: ProcessContextError,
+    ) -> ProcessContextError {
+        self.stopped = true;
+        self.fatal = Some(error);
+        callback_error
+    }
+
+    fn abort_observed(&mut self, failure: StableFailureFingerprint) -> ProcessContextError {
+        self.abort(
+            BuildError::Failed(format!("processor dependency failed: {failure:?}")),
+            ProcessContextError::Observed(failure),
+        )
+    }
+
+    fn abort_build(&mut self, error: BuildError) -> ProcessContextError {
+        let detail = format!("{error:?}");
+        self.abort(error, ProcessContextError::Failed(detail))
+    }
+
+    fn finish(self) -> Result<Vec<TraceOp>, BuildError> {
+        if let Some(error) = self.fatal {
+            return Err(error);
+        }
+        if self.discarded {
+            return Err(BuildError::Infrastructure(
+                "processor attempted basis was discarded".to_owned(),
+            ));
+        }
+        Ok(self.trace)
+    }
+}
+
+impl PipelineProcessContext for BuildProcessContext<'_> {
+    fn read(
+        &mut self,
+        asset: AssetUuid,
+        expected_terminal: TypeUuid,
+    ) -> Result<ProcessArtifact, ProcessContextError> {
+        self.ensure_active()?;
+        let source = capture_trace_source(self.context).map_err(|error| self.abort_build(error))?;
+
+        let role = source.role_check(asset);
+        self.trace.push(TraceOp::RoleCheck {
+            asset,
+            observed: role.clone(),
+        });
+        match role {
+            Observed::Ok(Some(EntryRole::Runtime)) => {}
+            Observed::Ok(Some(observed_role)) => {
+                let failure = StableFailureFingerprint::RoleIneligible {
+                    asset,
+                    observed_role,
+                };
+                self.trace.push(TraceOp::Read {
+                    asset,
+                    observed: Observed::Err(failure.clone()),
+                });
+                return Err(self.abort_observed(failure));
+            }
+            Observed::Ok(None) => {
+                let failure = StableFailureFingerprint::MissingRef {
+                    query: Box::new(AssetQuery {
+                        uuid: Some(asset),
+                        ..AssetQuery::default()
+                    }),
+                    expected_terminal,
+                };
+                self.trace.push(TraceOp::Read {
+                    asset,
+                    observed: Observed::Err(failure.clone()),
+                });
+                return Err(self.abort_observed(failure));
+            }
+            Observed::Err(failure) => return Err(self.abort_observed(failure)),
+        }
+
+        let terminal = source.ref_check(asset, expected_terminal);
+        self.trace.push(TraceOp::RefCheck {
+            asset,
+            expected_terminal,
+            observed: terminal.clone(),
+        });
+        match terminal {
+            Observed::Ok(Some(observed)) if observed == expected_terminal => {}
+            Observed::Ok(Some(observed)) => {
+                let error = ProcessContextError::WrongTerminal {
+                    asset,
+                    expected: expected_terminal,
+                    observed,
+                };
+                return Err(self.abort(BuildError::Failed(error.to_string()), error));
+            }
+            Observed::Ok(None) => {
+                let failure = StableFailureFingerprint::MissingRef {
+                    query: Box::new(AssetQuery {
+                        uuid: Some(asset),
+                        ..AssetQuery::default()
+                    }),
+                    expected_terminal,
+                };
+                self.trace.push(TraceOp::Read {
+                    asset,
+                    observed: Observed::Err(failure.clone()),
+                });
+                return Err(self.abort_observed(failure));
+            }
+            Observed::Err(failure) => return Err(self.abort_observed(failure)),
+        }
+
+        let artifact =
+            build_process_artifact(self.context, asset).map_err(|error| self.abort_build(error))?;
+        self.trace.push(TraceOp::Read {
+            asset,
+            observed: Observed::Ok(artifact.content_hash),
+        });
+        Ok(artifact)
+    }
+
+    fn read_path(
+        &mut self,
+        path: &str,
+        expected_terminal: TypeUuid,
+    ) -> Result<ProcessArtifact, ProcessContextError> {
+        self.ensure_active()?;
+        let path = match normalize_path(path) {
+            Ok(path) => path,
+            Err(detail) => {
+                let callback_error = ProcessContextError::InvalidQuery(detail.clone());
+                return Err(self.abort(BuildError::Failed(detail.to_string()), callback_error));
+            }
+        };
+        let source = capture_trace_source(self.context).map_err(|error| self.abort_build(error))?;
+        let observed = source.resolve(&path);
+        self.trace.push(TraceOp::Resolve {
+            path: path.clone(),
+            observed: observed.clone(),
+        });
+        match observed {
+            Observed::Ok(Some(asset)) => self.read(asset, expected_terminal),
+            Observed::Ok(None) => {
+                let failure = StableFailureFingerprint::MissingRef {
+                    query: Box::new(AssetQuery {
+                        bundle_path: Some(path),
+                        ..AssetQuery::default()
+                    }),
+                    expected_terminal,
+                };
+                Err(self.abort_observed(failure))
+            }
+            Observed::Err(failure) => Err(self.abort_observed(failure)),
+        }
+    }
+
+    fn query(&mut self, query: &AssetQuery) -> Result<Vec<AssetUuid>, ProcessContextError> {
+        self.ensure_active()?;
+        let query = match query.clone().close(Some(self.origin_bundle)) {
+            Ok(query) => query,
+            Err(detail) => {
+                let callback_error = ProcessContextError::InvalidQuery(detail.clone());
+                return Err(self.abort(BuildError::Failed(detail.to_string()), callback_error));
+            }
+        };
+        let source = capture_trace_source(self.context).map_err(|error| self.abort_build(error))?;
+        let observed = source.query(&query);
+        self.trace.push(TraceOp::Query {
+            query: Box::new(query.clone()),
+            observed: observed.clone(),
+        });
+        match observed {
+            Observed::Ok(_) => Ok(source.query_results(&query)),
+            Observed::Err(failure) => Err(self.abort_observed(failure)),
+        }
+    }
+
+    fn target(&self) -> Result<&Target, ProcessContextError> {
+        self.ensure_active()?;
+        Ok(&self.context.target)
+    }
+
+    fn outputs(&self) -> Result<ProcessOutputs, ProcessContextError> {
+        self.ensure_active()?;
+        Ok(self.outputs.clone())
+    }
+
+    fn run_tool(
+        &mut self,
+        id: &str,
+        args: &[String],
+        stdin: &[u8],
+    ) -> Result<distill_build::tool::ToolOutput, distill_build::tool::ToolRunError> {
+        if self.ensure_active().is_err() {
+            return Err(distill_build::tool::ToolRunError::AttemptStopped);
+        }
+        let platform_id = self
+            .context
+            .target
+            .compilation_identity
+            .target_triple
+            .clone();
+        let system_runtime_id = self.context.target.compilation_identity.rustc.clone();
+        let mut tool = ProcessContext::new(
+            &self.context.tools,
+            ToolRuntimeBinding {
+                platform_id: &platform_id,
+                system_runtime_id: &system_runtime_id,
+                execution_root: &self.context.execution_root,
+            },
+        );
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = tool.run_tool(id, &args, stdin);
+        match tool.into_trace() {
+            Ok(trace) => self.trace.extend(trace),
+            Err(_) => {
+                self.discarded = true;
+                self.fatal = Some(BuildError::Infrastructure(
+                    "tool launch discarded the processor attempted basis".to_owned(),
+                ));
+            }
+        }
+        if let Err(error) = &result {
+            self.stopped = true;
+            if self.fatal.is_none() {
+                self.fatal = Some(match error {
+                    distill_build::tool::ToolRunError::Stable(failure) => {
+                        BuildError::Failed(format!("tool dependency failed: {failure:?}"))
+                    }
+                    _ => BuildError::Infrastructure(format!("tool launch failed: {error:?}")),
+                });
+            }
+        }
+        result
+    }
+}
+
+fn build_process_artifact(
+    context: &mut BuildContext,
+    asset: AssetUuid,
+) -> Result<ProcessArtifact, BuildError> {
+    let derived = lock_build_store(context)?
+        .resolve_child(asset)
+        .map_err(BuildError::failed)?;
+    let (publication, output_key) = match derived {
+        Some((parent, output_key)) => (build_asset(context, parent)?, output_key),
+        None => (build_asset(context, asset)?, String::new()),
+    };
+    let selected = publication.outputs.get(&output_key).ok_or_else(|| {
+        BuildError::Failed(format!(
+            "built dependency {asset} omitted output {output_key:?}"
+        ))
+    })?;
+    let artifact = publication
+        .artifacts
+        .get(&selected.content_hash)
+        .ok_or_else(|| {
+            BuildError::Infrastructure("built dependency payload is absent".to_owned())
+        })?;
+    Ok(ProcessArtifact {
+        asset,
+        content_hash: selected.content_hash,
+        encoded_type: artifact.payload.encoded_type,
+        terminal_type: artifact.payload.terminal_type,
+        structural: Arc::clone(&artifact.payload.structural),
+        blobs: artifact.payload.blobs.clone(),
+    })
 }
 
 fn build(
@@ -325,6 +636,7 @@ fn build(
         execution_root,
         max_depth: coordinator.operational_configuration().max_dependency_depth,
         visiting: BTreeSet::new(),
+        callback_chain: Vec::new(),
         memo: BTreeMap::new(),
     };
     let root = build_asset(&mut context, request.entry.uuid)?;
@@ -393,10 +705,11 @@ fn build_asset(
         Assemble(PendingNodePublication),
     }
 
-    let mut stack = vec![Frame::Enter {
-        asset,
-        chain: vec![asset],
-    }];
+    let mut chain = context.callback_chain.clone();
+    if chain.last().copied() != Some(asset) {
+        chain.push(asset);
+    }
+    let mut stack = vec![Frame::Enter { asset, chain }];
     while let Some(frame) = stack.pop() {
         match frame {
             Frame::Enter { asset, chain } => {
@@ -414,13 +727,16 @@ fn build_asset(
                         "strong-reference cycle reaches assets {chain:?}"
                     )));
                 }
+                let previous_chain = std::mem::replace(&mut context.callback_chain, chain.clone());
                 let pending = match build_asset_inner(context, asset) {
                     Ok(pending) => pending,
                     Err(error) => {
+                        context.callback_chain = previous_chain;
                         context.visiting.remove(&asset);
                         return Err(error);
                     }
                 };
+                context.callback_chain = previous_chain;
                 let dependencies = pending_dependency_parents(context, &pending)?;
                 stack.push(Frame::Assemble(pending));
                 for dependency in dependencies.into_iter().rev() {
@@ -572,24 +888,20 @@ fn process_chain(
         let static_inputs = processor_static_inputs(context, loaded, stage, current_hash)?;
         let cached = hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?;
         std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
-        let platform_id = context.target.compilation_identity.target_triple.clone();
-        let system_runtime_id = context.target.compilation_identity.rustc.clone();
-        let mut process_context = ProcessContext::new(
-            &context.tools,
-            ToolRuntimeBinding {
-                platform_id: &platform_id,
-                system_runtime_id: &system_runtime_id,
-                execution_root: &context.execution_root,
-            },
-        );
-        let outcome = context
+        let epoch = context
             .pipeline
             .epoch()
             .map_err(|poison| BuildError::Failed(poison.to_string()))?
-            .invoke_processor(&stage.registration.id, current_value, &mut process_context);
-        let mut trace = process_context
-            .into_trace()
-            .map_err(|_| BuildError::Infrastructure("processor trace was discarded".to_owned()))?;
+            .clone();
+        let mut process_context = BuildProcessContext::new(
+            context,
+            loaded.meta.bundle,
+            loaded.entry.uuid,
+            stage.registration.outputs.clone(),
+        );
+        let outcome =
+            epoch.invoke_processor(&stage.registration.id, current_value, &mut process_context);
+        let mut trace = process_context.finish()?;
         let products = match outcome {
             Ok(products) => products,
             Err(CallbackInvokeError::Rejected(error)) => {
@@ -734,6 +1046,7 @@ fn hydrate_processor_stage(
     static_inputs: &StaticInputs,
 ) -> Result<Option<HydratedProcessorStage>, BuildError> {
     let key = static_inputs_digest(static_inputs);
+    preload_persisted_reads(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
     let trace_source = capture_trace_source(context)?;
     let hit = {
         let mut store = lock_build_store(context)?;
@@ -806,6 +1119,34 @@ fn hydrate_processor_stage(
             Ok(Some((hydrated, debug)))
         }
     }
+}
+
+fn preload_persisted_reads(
+    context: &mut BuildContext,
+    key_kind: KeyKind,
+    static_key: &[u8; 32],
+    asset: AssetUuid,
+) -> Result<(), BuildError> {
+    let traces = {
+        let mut store = lock_build_store(context)?;
+        persisted_candidate_traces(&mut store, key_kind, static_key, asset)
+            .map_err(BuildError::infrastructure)?
+    };
+    let dependencies = traces
+        .iter()
+        .flat_map(|trace| trace.iter())
+        .filter_map(|operation| match operation {
+            TraceOp::Read {
+                asset,
+                observed: Observed::Ok(_),
+            } => Some(*asset),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for dependency in dependencies {
+        let _ = build_process_artifact(context, dependency)?;
+    }
+    Ok(())
 }
 
 fn expected_output_identity(
@@ -1313,12 +1654,15 @@ fn capture_trace_source(context: &BuildContext) -> Result<StoreTraceSource, Buil
     let store = lock_build_store(context)?;
     StoreTraceSource::capture(
         &store,
-        &context.scanner,
-        &context.registry,
-        &context.target,
-        context.basis,
-        epoch,
-        context.dylib_hash,
+        TraceCaptureBasis {
+            scanner: &context.scanner,
+            registry: &context.registry,
+            target: &context.target,
+            input_version: context.basis,
+            epoch,
+            dylib_hash: context.dylib_hash,
+            memo: &context.memo,
+        },
     )
 }
 
@@ -2413,6 +2757,17 @@ struct StoreTraceSource {
     tools: BTreeMap<String, [u8; 32]>,
     capabilities: Vec<(CapabilityKey, [u8; 32])>,
     migration_controls: BTreeMap<AssetUuid, MigrationControlRecord>,
+    content_hashes: BTreeMap<AssetUuid, ContentHash>,
+}
+
+struct TraceCaptureBasis<'a> {
+    scanner: &'a RootedScanner,
+    registry: &'a PipelineRegistry,
+    target: &'a Target,
+    input_version: distill_store::state::InputVersion,
+    epoch: &'a PipelineEpoch,
+    dylib_hash: [u8; 32],
+    memo: &'a BTreeMap<AssetUuid, NodePublication>,
 }
 
 #[derive(Clone)]
@@ -2539,15 +2894,7 @@ fn validate_endpoint_stamp(
 }
 
 impl StoreTraceSource {
-    fn capture(
-        store: &Store,
-        scanner: &RootedScanner,
-        registry: &PipelineRegistry,
-        target: &Target,
-        basis: distill_store::state::InputVersion,
-        epoch: &PipelineEpoch,
-        dylib_hash: [u8; 32],
-    ) -> Result<Self, BuildError> {
+    fn capture(store: &Store, basis: TraceCaptureBasis<'_>) -> Result<Self, BuildError> {
         let bundles = store
             .all_bundles()
             .map_err(BuildError::infrastructure)?
@@ -2570,8 +2917,9 @@ impl StoreTraceSource {
                     bundle_path,
                     local_id: entry.local_id,
                     authored_type: entry.type_uuid,
-                    terminal_type: registry
-                        .chain(entry.type_uuid, target)
+                    terminal_type: basis
+                        .registry
+                        .chain(entry.type_uuid, basis.target)
                         .map_err(BuildError::failed)?
                         .terminal,
                     role: if entry.authoring_only {
@@ -2609,8 +2957,9 @@ impl StoreTraceSource {
             let parent_type = entries.get(&parent).ok_or_else(|| {
                 BuildError::Infrastructure("derived parent is absent from trace index".to_owned())
             })?;
-            let terminal = registry
-                .chain(parent_type.authored_type, target)
+            let terminal = basis
+                .registry
+                .chain(parent_type.authored_type, basis.target)
                 .map_err(BuildError::failed)?
                 .extras
                 .get(&output_key)
@@ -2624,21 +2973,36 @@ impl StoreTraceSource {
             roles.insert(child, EntryRole::Runtime);
         }
         let tools = store
-            .tool_hashes_at(basis)
+            .tool_hashes_at(basis.input_version)
             .map_err(BuildError::infrastructure)?;
-        let capabilities = epoch
+        let capabilities = basis
+            .epoch
             .default_table_types()
             .into_iter()
             .map(CapabilityKey::DefaultTable)
             .chain(
-                epoch
+                basis
+                    .epoch
                     .migration_function_keys()
                     .into_iter()
                     .map(CapabilityKey::MigrationFn),
             )
-            .map(|key| (key, dylib_hash))
+            .map(|key| (key, basis.dylib_hash))
             .collect();
-        let migration_controls = capture_migration_controls(store, scanner)?;
+        let migration_controls = capture_migration_controls(store, basis.scanner)?;
+        let mut content_hashes = BTreeMap::new();
+        for publication in basis.memo.values() {
+            for output in publication.outputs.values() {
+                if content_hashes
+                    .insert(output.asset, output.content_hash)
+                    .is_some_and(|existing| existing != output.content_hash)
+                {
+                    return Err(BuildError::Infrastructure(
+                        "one build context observed two contents for an asset".to_owned(),
+                    ));
+                }
+            }
+        }
         Ok(Self {
             entries,
             terminal_types,
@@ -2647,6 +3011,7 @@ impl StoreTraceSource {
             tools,
             capabilities,
             migration_controls,
+            content_hashes,
         })
     }
 
@@ -2725,8 +3090,23 @@ fn no_trace<T>() -> Observed<T> {
 }
 
 impl TraceSource for StoreTraceSource {
-    fn read(&self, _asset: AssetUuid) -> Observed<ContentHash> {
-        no_trace()
+    fn read(&self, asset: AssetUuid) -> Observed<ContentHash> {
+        self.content_hashes.get(&asset).copied().map_or_else(
+            || {
+                Observed::Err(StableFailureFingerprint::MissingRef {
+                    query: Box::new(AssetQuery {
+                        uuid: Some(asset),
+                        ..AssetQuery::default()
+                    }),
+                    expected_terminal: self
+                        .terminal_types
+                        .get(&asset)
+                        .copied()
+                        .unwrap_or(TypeUuid([0; 16])),
+                })
+            },
+            Observed::Ok,
+        )
     }
 
     fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>> {
@@ -2847,6 +3227,8 @@ mod tests {
     const EXTRA: TypeUuid = TypeUuid([75; 16]);
     const ASSET: AssetUuid = AssetUuid([72; 16]);
     const BUNDLE: BundleUuid = BundleUuid([73; 16]);
+    const DEPENDENCY_ASSET: AssetUuid = AssetUuid([78; 16]);
+    const DEPENDENCY_BUNDLE: BundleUuid = BundleUuid([79; 16]);
     const MIGRATION_ASSET: AssetUuid = AssetUuid([76; 16]);
     const MIGRATION_BUNDLE: BundleUuid = BundleUuid([77; 16]);
 
@@ -3203,11 +3585,36 @@ mod tests {
         fn process(
             &self,
             input: AuthoredValue,
-            _context: &mut dyn PipelineProcessContext,
+            context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.observed_unlocked
                 .store(self.store.try_lock().is_ok(), Ordering::SeqCst);
+            let AuthoredValue::Object(fields) = &input else {
+                panic!("processor input is a struct");
+            };
+            if fields.get("value") == Some(&AuthoredValue::UInt(7)) {
+                assert_eq!(context.target().unwrap().os, TargetOs::Linux);
+                let outputs = context.outputs().unwrap();
+                assert_eq!(outputs.parent(), ASSET);
+                assert_eq!(
+                    outputs.child("metadata").unwrap(),
+                    AssetUuid::v5(ASSET, "metadata")
+                );
+                let query = AssetQuery {
+                    authored_type: Some(TYPE),
+                    ..AssetQuery::default()
+                };
+                assert_eq!(
+                    context.query(&query).unwrap(),
+                    vec![ASSET, DEPENDENCY_ASSET]
+                );
+                let read = context.read(DEPENDENCY_ASSET, TERMINAL).unwrap();
+                assert_eq!(read.asset, DEPENDENCY_ASSET);
+                assert_eq!(read.terminal_type, TERMINAL);
+                let resolved = context.read_path("dependency.bundle", TERMINAL).unwrap();
+                assert_eq!(resolved.content_hash, read.content_hash);
+            }
             Ok(ProcessorProducts {
                 primary: Some(input.clone()),
                 extras: BTreeMap::from([("metadata".to_owned(), input)]),
@@ -3269,7 +3676,7 @@ mod tests {
                     schema_hash: old_hash,
                     lineage: EntryLineageV1::Manifest(LineageStamp {
                         chain: lineage_chain_digest(TYPE, &epochs, 0),
-                        epochs,
+                        epochs: epochs.clone(),
                         cursor: 0,
                     }),
                     authoring_only: false,
@@ -3557,7 +3964,7 @@ mod tests {
                     schema_hash: project.logical_hash,
                     lineage: EntryLineageV1::Manifest(LineageStamp {
                         chain: lineage_chain_digest(TYPE, &epochs, 0),
-                        epochs,
+                        epochs: epochs.clone(),
                         cursor: 0,
                     }),
                     authoring_only: false,
@@ -3570,6 +3977,35 @@ mod tests {
         };
         let bundle_bytes = distill_bundle::write_bundle(&bundle).unwrap();
         std::fs::write(assets.join("byte.bundle"), &bundle_bytes).unwrap();
+        let dependency_bundle = Bundle {
+            format_version: 1,
+            uuid: DEPENDENCY_BUNDLE,
+            primary: Some("dependency".to_owned()),
+            schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            assets: BTreeMap::from([(
+                "dependency".to_owned(),
+                AssetEntry {
+                    uuid: DEPENDENCY_ASSET,
+                    type_uuid: TYPE,
+                    schema_hash: project.logical_hash,
+                    lineage: EntryLineageV1::Manifest(LineageStamp {
+                        chain: lineage_chain_digest(TYPE, &epochs, 0),
+                        epochs: epochs.clone(),
+                        cursor: 0,
+                    }),
+                    authoring_only: false,
+                    data: AuthoredValue::Object(BTreeMap::from([(
+                        "value".to_owned(),
+                        AuthoredValue::UInt(8),
+                    )])),
+                },
+            )]),
+        };
+        std::fs::write(
+            assets.join("dependency.bundle"),
+            distill_bundle::write_bundle(&dependency_bundle).unwrap(),
+        )
+        .unwrap();
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 StoreConfig::new(temp.path().join("state")),
@@ -3668,7 +4104,7 @@ mod tests {
         assert_eq!(outputs[0].type_uuids, vec![TYPE, TERMINAL]);
         assert_eq!(first.artifacts.len(), 2);
         assert_eq!(first.wire_trees.len(), 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(observed_unlocked.load(Ordering::SeqCst));
         let root = first
             .artifacts
@@ -3711,7 +4147,7 @@ mod tests {
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
         assert_eq!(coordinator.store().lock().unwrap().memo_seq(), first_memo);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -3736,6 +4172,7 @@ mod tests {
             tools: BTreeMap::new(),
             capabilities: Vec::new(),
             migration_controls: BTreeMap::new(),
+            content_hashes: BTreeMap::new(),
         };
         let mut trace = Vec::new();
         assert_eq!(
@@ -3779,6 +4216,7 @@ mod tests {
             tools: BTreeMap::new(),
             capabilities: Vec::new(),
             migration_controls: BTreeMap::new(),
+            content_hashes: BTreeMap::new(),
         };
         let value = AuthoredValue::Str(missing.to_string());
         let mut trace = Vec::new();

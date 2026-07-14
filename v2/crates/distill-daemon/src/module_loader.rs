@@ -19,8 +19,9 @@ use unicode_normalization::is_nfc;
 
 use crate::callbacks::{
     CallbackInvokeError, DefaultsDescriptor, Diagnostic, Diagnostics, ImporterDescriptor,
-    MigrationFunctionError, PipelineProcessContext, ProcessorDescriptor, ProcessorError,
-    ProcessorProducts, ToolDescriptor, ValidatorDescriptor,
+    MigrationFunctionError, PipelineProcessContext, ProcessArtifact, ProcessContextError,
+    ProcessOutputs, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
+    ValidatorDescriptor,
 };
 use crate::epoch::{
     CandidateRegistrationArena, ErasedRegistrationCapsule, HostCallbackBoundary,
@@ -126,6 +127,9 @@ pub fn host_module_identity(compilation: CompilationIdentity) -> ModuleIdentity 
         encode_measurement::<ToolDescriptor>(encoder);
         encode_measurement::<ToolCapsuleRegistrationV1>(encoder);
         encode_measurement::<ProcessorProducts>(encoder);
+        encode_measurement::<ProcessArtifact>(encoder);
+        encode_measurement::<ProcessOutputs>(encoder);
+        encode_measurement::<ProcessContextError>(encoder);
         encode_measurement::<ProcessorError>(encoder);
         encode_measurement::<MigrationFunctionError>(encoder);
         encode_measurement::<Diagnostic>(encoder);
