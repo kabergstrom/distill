@@ -5,7 +5,7 @@
 //! sweep (§18's `displaced_retention_days`).
 
 use distill_core::id::ContentHash;
-use distill_store::journal::RenameAsideState;
+use distill_store::journal::{CreationRecoveryOutcome, RenameAsideOutcome, RenameAsideState};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
@@ -302,4 +302,70 @@ fn deletion_mismatch_restores_user_bytes_and_reports_conflict() {
     assert_eq!(std::fs::read(&target).unwrap(), b"new external save");
     assert_eq!(store.quarantined_entries().unwrap().len(), 0);
     assert!(store.displacement_history().unwrap()[0].restored);
+}
+
+#[test]
+fn native_journaled_replacement_installs_no_replace_and_retains_the_preimage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("asset-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("manifest.bundle");
+    let temp = root.join(".manifest.proposed");
+    let conflict = root.join("manifest.conflict");
+    std::fs::write(&target, b"old manifest").unwrap();
+    std::fs::write(&temp, b"new manifest").unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let intent = store
+        .record_intent(
+            target.to_str().unwrap(),
+            temp.to_str().unwrap(),
+            conflict.to_str().unwrap(),
+            Some(hash(b"old manifest")),
+            hash(b"new manifest"),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .publish_journaled_replacement(intent, &quarantine_dir(&dir))
+            .unwrap(),
+        RenameAsideOutcome::Installed
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"new manifest");
+    assert!(!temp.exists());
+    assert_eq!(
+        std::fs::read(quarantine_dir(&dir).join(format!("intent-{intent}"))).unwrap(),
+        b"old manifest"
+    );
+    assert!(store.unretired_intents().unwrap().is_empty());
+}
+
+#[test]
+fn native_creation_recovery_is_no_replace_and_restart_resumable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("asset-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("manifest.bundle");
+    let temp = root.join(".manifest.proposed");
+    std::fs::write(&temp, b"first manifest").unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let intent = store
+        .record_intent(
+            target.to_str().unwrap(),
+            temp.to_str().unwrap(),
+            root.join("manifest.conflict").to_str().unwrap(),
+            None,
+            hash(b"first manifest"),
+        )
+        .unwrap();
+    drop(store);
+
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    assert_eq!(
+        store.reconcile_journaled_creation(intent).unwrap(),
+        CreationRecoveryOutcome::Installed
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"first manifest");
+    assert!(!temp.exists());
+    assert!(store.unretired_intents().unwrap().is_empty());
 }

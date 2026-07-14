@@ -110,7 +110,6 @@ pub struct RecoveredEdit {
     pub quarantine_path: PathBuf,
 }
 
-#[cfg(any(windows, test))]
 #[derive(Debug)]
 struct RenameAsideIntent {
     target: PathBuf,
@@ -121,7 +120,6 @@ struct RenameAsideIntent {
     state: RenameAsideState,
 }
 
-#[cfg(any(windows, test))]
 enum NoReplaceError {
     DestinationExists,
     Other(StoreError),
@@ -129,8 +127,7 @@ enum NoReplaceError {
 
 /// Deliberately has no replace operation. Keeping the state machine generic
 /// over this capability both prevents an overwrite implementation and lets
-/// non-Windows CI inject races at exact move boundaries.
-#[cfg(any(windows, test))]
+/// tests inject races at exact move boundaries on every supported host.
 trait RenameAsideFs {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError>;
     fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError>;
@@ -304,6 +301,46 @@ impl Store {
         Ok(qpath)
     }
 
+    /// Execute or resume the portable no-replace replacement state machine.
+    /// Every move preserves a destination that appeared after the basis CAS;
+    /// the exact pre-image and any raced target remain journal-addressable.
+    pub fn publish_journaled_replacement(
+        &mut self,
+        intent_id: i64,
+        quarantine_dir: &Path,
+    ) -> Result<RenameAsideOutcome, StoreError> {
+        #[cfg(windows)]
+        let mut filesystem = WindowsRenameAsideFs;
+        #[cfg(not(windows))]
+        let mut filesystem = NativeRenameAsideFs;
+        self.publish_rename_aside_with(intent_id, quarantine_dir, &mut filesystem)
+    }
+
+    /// Resume a journaled deletion on every supported host.
+    pub fn reconcile_journaled_deletion(
+        &mut self,
+        intent_id: i64,
+        quarantine_dir: &Path,
+    ) -> Result<DeletionRecoveryOutcome, StoreError> {
+        #[cfg(windows)]
+        let mut filesystem = WindowsRenameAsideFs;
+        #[cfg(not(windows))]
+        let mut filesystem = NativeRenameAsideFs;
+        self.reconcile_deletion_with(intent_id, quarantine_dir, &mut filesystem)
+    }
+
+    /// Resume a journaled no-replace creation on every supported host.
+    pub fn reconcile_journaled_creation(
+        &mut self,
+        intent_id: i64,
+    ) -> Result<CreationRecoveryOutcome, StoreError> {
+        #[cfg(windows)]
+        let mut filesystem = WindowsRenameAsideFs;
+        #[cfg(not(windows))]
+        let mut filesystem = NativeRenameAsideFs;
+        self.reconcile_creation_with(intent_id, &mut filesystem)
+    }
+
     /// Execute or resume §14's Windows rename-aside fallback.
     ///
     /// `MoveFileExW` is used without `MOVEFILE_REPLACE_EXISTING` for all
@@ -317,7 +354,7 @@ impl Store {
         intent_id: i64,
         quarantine_dir: &Path,
     ) -> Result<RenameAsideOutcome, StoreError> {
-        self.publish_rename_aside_with(intent_id, quarantine_dir, &mut WindowsRenameAsideFs)
+        self.publish_journaled_replacement(intent_id, quarantine_dir)
     }
 
     #[cfg(windows)]
@@ -326,7 +363,7 @@ impl Store {
         intent_id: i64,
         quarantine_dir: &Path,
     ) -> Result<DeletionRecoveryOutcome, StoreError> {
-        self.reconcile_deletion_with(intent_id, quarantine_dir, &mut WindowsRenameAsideFs)
+        self.reconcile_journaled_deletion(intent_id, quarantine_dir)
     }
 
     #[cfg(windows)]
@@ -334,10 +371,9 @@ impl Store {
         &mut self,
         intent_id: i64,
     ) -> Result<CreationRecoveryOutcome, StoreError> {
-        self.reconcile_creation_with(intent_id, &mut WindowsRenameAsideFs)
+        self.reconcile_journaled_creation(intent_id)
     }
 
-    #[cfg(any(windows, test))]
     fn reconcile_deletion_with<F: RenameAsideFs>(
         &mut self,
         intent_id: i64,
@@ -471,7 +507,6 @@ impl Store {
         })
     }
 
-    #[cfg(any(windows, test))]
     fn reconcile_creation_with<F: RenameAsideFs>(
         &mut self,
         intent_id: i64,
@@ -516,7 +551,6 @@ impl Store {
         }
     }
 
-    #[cfg(any(windows, test))]
     fn publish_rename_aside_with<F: RenameAsideFs>(
         &mut self,
         intent_id: i64,
@@ -853,7 +887,6 @@ impl Store {
         })
     }
 
-    #[cfg(any(windows, test))]
     fn load_rename_aside_intent(&self, intent_id: i64) -> Result<RenameAsideIntent, StoreError> {
         let raw = self
             .conn
@@ -894,7 +927,6 @@ impl Store {
         })
     }
 
-    #[cfg(any(windows, test))]
     fn journal_rename_aside_displacement(
         &mut self,
         intent_id: i64,
@@ -942,7 +974,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
     fn begin_reappeared_target<F: RenameAsideFs>(
         &mut self,
         fs: &mut F,
@@ -964,7 +995,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
     fn available_conflict_path<F: RenameAsideFs>(
         &self,
         fs: &mut F,
@@ -997,7 +1027,6 @@ impl Store {
         })
     }
 
-    #[cfg(any(windows, test))]
     fn preserve_displacement_path_collision(
         &mut self,
         intent_id: i64,
@@ -1051,7 +1080,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
     fn finish_journaled_move(
         &mut self,
         intent_id: i64,
@@ -1080,7 +1108,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
     fn set_rename_aside_state(
         &mut self,
         intent_id: i64,
@@ -1100,7 +1127,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
     fn finish_rename_aside_terminal(
         &mut self,
         intent_id: i64,
@@ -1131,7 +1157,6 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
     fn displacement_hash(&self, intent_id: i64, ordinal: u32) -> Result<ContentHash, StoreError> {
         let bytes = self
             .conn
@@ -1148,7 +1173,6 @@ impl Store {
         Ok(ContentHash(blob32(bytes)))
     }
 
-    #[cfg(any(windows, test))]
     fn displacement_path(&self, intent_id: i64, ordinal: u32) -> Result<PathBuf, StoreError> {
         self.displacement_path_optional(intent_id, ordinal)?
             .ok_or_else(|| StoreError::BadIntent {
@@ -1157,7 +1181,6 @@ impl Store {
             })
     }
 
-    #[cfg(any(windows, test))]
     fn displacement_path_optional(
         &self,
         intent_id: i64,
@@ -1174,7 +1197,6 @@ impl Store {
             .map(PathBuf::from))
     }
 
-    #[cfg(any(windows, test))]
     fn load_intent_paths(
         &self,
         intent_id: i64,
@@ -1200,7 +1222,6 @@ impl Store {
             })
     }
 
-    #[cfg(any(windows, test))]
     fn intent_proposed_hash(&self, intent_id: i64) -> Result<ContentHash, StoreError> {
         self.conn
             .query_row(
@@ -1381,14 +1402,12 @@ impl Store {
     }
 }
 
-#[cfg(any(windows, test))]
 fn read_hash<F: RenameAsideFs>(fs: &mut F, path: &Path) -> Result<Option<ContentHash>, StoreError> {
     Ok(fs
         .read(path)?
         .map(|bytes| ContentHash(*blake3::hash(&bytes).as_bytes())))
 }
 
-#[cfg(any(windows, test))]
 fn existing_hash<F: RenameAsideFs>(
     fs: &mut F,
     intent_id: i64,
@@ -1401,7 +1420,6 @@ fn existing_hash<F: RenameAsideFs>(
     })
 }
 
-#[cfg(any(windows, test))]
 fn require_hash<F: RenameAsideFs>(
     fs: &mut F,
     intent_id: i64,
@@ -1423,12 +1441,10 @@ fn require_hash<F: RenameAsideFs>(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
 fn hash_hex(hash: ContentHash) -> String {
     hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(any(windows, test))]
 fn sync_move_dirs<F: RenameAsideFs>(
     fs: &mut F,
     source: &Path,
@@ -1441,6 +1457,73 @@ fn sync_move_dirs<F: RenameAsideFs>(
         fs.sync_dir(destination_parent)?;
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+struct NativeRenameAsideFs;
+
+#[cfg(not(windows))]
+impl RenameAsideFs for NativeRenameAsideFs {
+    fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError> {
+        std::fs::create_dir_all(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn sync_file(&mut self, path: &Path) -> Result<(), StoreError> {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+
+    fn sync_dir(&mut self, path: &Path) -> Result<(), StoreError> {
+        crate::cas::manifest::fsync_dir(path)
+    }
+
+    fn ensure_same_filesystem(
+        &mut self,
+        source: &Path,
+        destination_dir: &Path,
+    ) -> Result<(), StoreError> {
+        ensure_same_filesystem(source, destination_dir)
+    }
+
+    fn move_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), NoReplaceError> {
+        match std::fs::hard_link(source, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(NoReplaceError::DestinationExists)
+            }
+            Err(source) => {
+                return Err(NoReplaceError::Other(StoreError::Io {
+                    path: destination.to_path_buf(),
+                    source,
+                }))
+            }
+        }
+        let source_path = source.to_path_buf();
+        std::fs::remove_file(source).map_err(|source| {
+            NoReplaceError::Other(StoreError::Io {
+                path: source_path,
+                source,
+            })
+        })
+    }
 }
 
 #[cfg(windows)]
