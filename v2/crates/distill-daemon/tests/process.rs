@@ -116,6 +116,10 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
         Some(PipelineState::Poisoned { .. })
     ));
     assert!(process.last_background_error().is_none());
+    assert!(
+        !temp.path().join("generated").exists(),
+        "disabled codegen must not create its output directory"
+    );
     drop(process);
 }
 
@@ -227,6 +231,32 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         before
+    );
+    assert!(
+        !temp.path().join("generated").exists(),
+        "a staged restart-only edit must not activate codegen in this process"
+    );
+}
+
+#[test]
+fn startup_auto_codegen_activates_the_service_and_surfaces_pipeline_unavailability() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let path = temp.path().join("distill.toml");
+    std::fs::write(
+        &path,
+        config_source(&temp).replace("auto_codegen = false", "auto_codegen = true"),
+    )
+    .unwrap();
+    write_schema(&temp, "initial");
+
+    let process = DaemonProcess::start(DaemonConfig::load(path).unwrap()).unwrap();
+
+    assert!(temp.path().join("generated").is_dir());
+    assert!(
+        process.last_background_error().is_some(),
+        "the enabled service must report that the intentionally missing pipeline cannot run"
     );
 }
 

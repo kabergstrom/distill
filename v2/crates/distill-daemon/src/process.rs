@@ -13,6 +13,7 @@ use distill_store::state::{
     CleanupDisposition, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
 };
 
+use crate::codegen::CodegenService;
 use crate::config::{config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
 use crate::watcher::{WatcherQueue, WatcherThread};
@@ -66,6 +67,12 @@ impl DaemonProcess {
         // startup instance.
         let mut config_watch = ConfigWatch::new(config.clone());
         config_watch.reconcile(&coordinator)?;
+        let mut codegen = CodegenService::new(
+            &coordinator,
+            &config.codegen.rs_mod_path,
+            config.codegen.auto_codegen,
+        )
+        .map_err(DaemonProcessError::Codegen)?;
         let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new(WATCH_CAPACITY)));
         let watcher =
             WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue), DEBOUNCE)?;
@@ -74,12 +81,16 @@ impl DaemonProcess {
 
         let stop = Arc::new(AtomicBool::new(false));
         let last_background_error = Arc::new(Mutex::new(None));
+        if let Err(error) = codegen.run(&coordinator) {
+            *lock(&last_background_error) = Some(error);
+        }
         let coordinator_thread = Some(spawn_coordinator_loop(
             Arc::clone(&coordinator),
             Arc::clone(&watcher_queue),
             Arc::clone(&stop),
             Arc::clone(&last_background_error),
             config_watch,
+            codegen,
         ));
 
         let (address_tx, address_rx) = mpsc::sync_channel(1);
@@ -159,6 +170,7 @@ pub enum DaemonProcessError {
         source: std::io::Error,
     },
     Schema(SchemaAuthorityError),
+    Codegen(String),
     Rpc(String),
 }
 
@@ -202,6 +214,7 @@ fn spawn_coordinator_loop(
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     mut config_watch: ConfigWatch,
+    mut codegen: CodegenService,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("distill-coordinator".to_owned())
@@ -230,9 +243,16 @@ fn spawn_coordinator_loop(
                 let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
                 let result = result.and(poison_result);
                 let _ = coordinator.reap_retired_pipeline_epochs();
-                if let Err(error) = result {
-                    *lock(&last_error) = Some(error.to_string());
-                    lock(&watcher).force_overflow();
+                match result {
+                    Err(error) => {
+                        *lock(&last_error) = Some(error.to_string());
+                        lock(&watcher).force_overflow();
+                    }
+                    Ok(()) => {
+                        if let Err(error) = codegen.run(&coordinator) {
+                            *lock(&last_error) = Some(error);
+                        }
+                    }
                 }
             }
         })
