@@ -6,6 +6,7 @@ use distill_schema::ngp_schema::{
     SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
 };
 use distill_schema::{ProjectSchemaAuthority, SchemaAuthorityError};
+use distill_wire::dswl::{decode_dswl, dswl_hash};
 
 const PROJECT_UUID: TypeUuid = TypeUuid([
     0x91, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
@@ -132,6 +133,18 @@ fn schema_projection_matches_the_independently_compiled_descriptor() {
         BOOTSTRAP_CONTROL_COUNT + 1
     );
     assert_eq!(authority.source_hash(), [7; 32]);
+
+    let project = authority.project_type(PROJECT_UUID).unwrap();
+    assert_eq!(project.schema_type, SchemaTypeId(0));
+    assert_eq!(project.logical_hash, observed.logical_hash);
+    assert_eq!(
+        project.logical_schema,
+        *authority.registry().current(PROJECT_UUID).unwrap().0
+    );
+    assert_eq!(dswl_hash(&project.wire).unwrap(), project.layout_hash);
+    let decoded = decode_dswl(&project.dswl_bytes).unwrap();
+    assert_eq!(dswl_hash(&decoded).unwrap(), project.layout_hash);
+    assert_eq!(authority.project_types().len(), 1);
 }
 
 #[test]

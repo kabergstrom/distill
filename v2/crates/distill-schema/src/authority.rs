@@ -12,9 +12,12 @@ use distill_core::attestation::{
     RegistryExtraRow, RegistryExtrasV1, RegistryPathStep, SchemaNodeId,
     BOOTSTRAP_CONTROL_TYPE_UUIDS,
 };
-use distill_core::id::TypeUuid;
+use distill_core::id::{LayoutHash, LogicalHash, TypeUuid};
+use distill_wire::derive::derive_wire;
 use distill_wire::dsnl::measured_dsnl_hash;
+use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::measured::{derive_measured_native, MeasuredLayoutError};
+use distill_wire::wire::WireNode;
 use ngp_schema::classify::{classify, Class};
 use ngp_schema::{
     CompilationIdentity, ExtractionError, Field, FieldIdentifier, LayoutView, Schema, SchemaTypeId,
@@ -31,7 +34,20 @@ pub struct ProjectSchemaAuthority {
     registry: SchemaRegistry,
     identity: CompilationIdentity,
     compiled: CompiledTypeTable,
+    project_types: BTreeMap<TypeUuid, ProjectTypeAuthority>,
     source_hash: [u8; 32],
+}
+
+/// All schema and target-layout material needed to encode one project asset
+/// type and publish its authenticated DSWL tree.
+#[derive(Debug, Clone)]
+pub struct ProjectTypeAuthority {
+    pub schema_type: SchemaTypeId,
+    pub logical_schema: ngp_schema::LogicalSchema,
+    pub logical_hash: LogicalHash,
+    pub wire: WireNode,
+    pub layout_hash: LayoutHash,
+    pub dswl_bytes: Vec<u8>,
 }
 
 impl ProjectSchemaAuthority {
@@ -54,6 +70,7 @@ impl ProjectSchemaAuthority {
         let identity = view.table.identity.clone();
         let registry = SchemaRegistry::from_schema(&schema)?;
         let mut rows = Vec::new();
+        let mut project_types = BTreeMap::new();
         let bootstrap = BOOTSTRAP_CONTROL_TYPE_UUIDS
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -78,7 +95,7 @@ impl ProjectSchemaAuthority {
                     type_path: ty.path.display_path(),
                 });
             }
-            let (_, logical_hash) = registry.current(type_uuid).ok_or_else(|| {
+            let (logical_schema, logical_hash) = registry.current(type_uuid).ok_or_else(|| {
                 SchemaAuthorityError::MissingProjection {
                     type_path: ty.path.display_path(),
                 }
@@ -94,6 +111,23 @@ impl ProjectSchemaAuthority {
                 ty.attrs.build_only,
                 registry_extras,
             )?);
+            let wire = derive_wire(view, ty.id)
+                .map_err(|error| SchemaAuthorityError::Wire(error.to_string()))?;
+            let layout_hash =
+                dswl_hash(&wire).map_err(|error| SchemaAuthorityError::Dswl(error.to_string()))?;
+            let dswl_bytes =
+                dswl_bytes(&wire).map_err(|error| SchemaAuthorityError::Dswl(error.to_string()))?;
+            project_types.insert(
+                type_uuid,
+                ProjectTypeAuthority {
+                    schema_type: ty.id,
+                    logical_schema: logical_schema.clone(),
+                    logical_hash,
+                    wire,
+                    layout_hash,
+                    dswl_bytes,
+                },
+            );
         }
         let bootstrap_authority = consumer_bootstrap_authority_v1()?;
         rows.extend(bootstrap_authority.rows().iter().cloned());
@@ -109,6 +143,7 @@ impl ProjectSchemaAuthority {
             registry,
             identity,
             compiled,
+            project_types,
             source_hash,
         })
     }
@@ -127,6 +162,14 @@ impl ProjectSchemaAuthority {
 
     pub fn compiled_table(&self) -> &CompiledTypeTable {
         &self.compiled
+    }
+
+    pub fn project_type(&self, type_uuid: TypeUuid) -> Option<&ProjectTypeAuthority> {
+        self.project_types.get(&type_uuid)
+    }
+
+    pub fn project_types(&self) -> &BTreeMap<TypeUuid, ProjectTypeAuthority> {
+        &self.project_types
     }
 
     pub fn source_hash(&self) -> [u8; 32] {
@@ -181,6 +224,8 @@ pub enum SchemaAuthorityError {
     Extraction(String),
     Measured(String),
     Dsnl(String),
+    Wire(String),
+    Dswl(String),
     Attestation(String),
     Bootstrap(String),
 }
