@@ -138,6 +138,40 @@ fn rooted_paths_reject_noncanonical_or_traversing_input() {
 }
 
 #[test]
+fn replacement_roots_are_shared_by_existing_scanner_clones() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(first.join("old.txt"), b"old").unwrap();
+    std::fs::write(second.join("new.txt"), b"new").unwrap();
+
+    let scanner = RootedScanner::new([AssetRoot::new(
+        "main",
+        &first,
+        first.join(".distill-displaced"),
+    )])
+    .unwrap();
+    let watcher_view = scanner.clone();
+    scanner
+        .replace_roots([AssetRoot::new(
+            "main",
+            &second,
+            second.join(".distill-displaced"),
+        )])
+        .unwrap();
+
+    let scan = watcher_view.scan().unwrap();
+    assert_eq!(scan.files.len(), 1);
+    assert_eq!(scan.files[0].normalized_path, "new.txt");
+    assert_eq!(
+        watcher_view.physical_path("main", "new.txt").unwrap(),
+        second.join("new.txt")
+    );
+}
+
+#[test]
 fn same_directory_identity_under_two_roots_is_never_tiebroken() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");

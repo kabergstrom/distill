@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
 use distill_core::id::{BundleFileHash, ContentHash};
@@ -136,7 +137,7 @@ struct CanonicalRoot {
 
 #[derive(Debug, Clone)]
 pub struct RootedScanner {
-    roots: BTreeMap<String, CanonicalRoot>,
+    roots: Arc<RwLock<BTreeMap<String, CanonicalRoot>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,68 +233,30 @@ impl From<FileIdentity> for ObservedFileIdentity {
 
 impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
-        let configured = roots.into_iter().collect::<Vec<_>>();
-        let canonical_paths = configured
-            .iter()
-            .map(|root| {
-                validate_root_name(&root.name)?;
-                let canonical_path =
-                    fs::canonicalize(&root.path).map_err(|_| ScanError::RootUnavailable {
-                        root: root.name.clone(),
-                        path: root.path.clone(),
-                    })?;
-                let metadata = fs::metadata(&canonical_path).map_err(|source| ScanError::Io {
-                    path: canonical_path.clone(),
-                    source,
-                })?;
-                if !metadata.is_dir() {
-                    return Err(ScanError::RootUnavailable {
-                        root: root.name.clone(),
-                        path: root.path.clone(),
-                    });
-                }
-                let quarantine_identity = match fs::metadata(&root.quarantine_dir) {
-                    Ok(metadata) if metadata.is_dir() => Some(file_identity(&metadata)),
-                    Ok(_) => {
-                        return Err(ScanError::NonRegularFile {
-                            path: root.quarantine_dir.clone(),
-                        })
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(source) => {
-                        return Err(ScanError::Io {
-                            path: root.quarantine_dir.clone(),
-                            source,
-                        })
-                    }
-                };
-                Ok((root.clone(), canonical_path, quarantine_identity))
-            })
-            .collect::<Result<Vec<_>, ScanError>>()?;
+        Ok(Self {
+            roots: Arc::new(RwLock::new(canonicalize_roots(roots)?)),
+        })
+    }
 
-        let mut roots = BTreeMap::new();
-        for (configured, canonical_path, quarantine_identity) in canonical_paths {
-            let name = configured.name.clone();
-            if roots
-                .insert(
-                    name.clone(),
-                    CanonicalRoot {
-                        configured,
-                        canonical_path,
-                        quarantine_identity,
-                    },
-                )
-                .is_some()
-            {
-                return Err(ScanError::DuplicateRootName(name));
-            }
-        }
-        Ok(Self { roots })
+    /// Validate a replacement root set completely before making it visible
+    /// to any scanner clone. Watchers, authoring, and the coordinator all hold
+    /// clones of this handle, so one swap changes their next pinned scan
+    /// together without interrupting a traversal already in flight.
+    pub fn replace_roots(
+        &self,
+        roots: impl IntoIterator<Item = AssetRoot>,
+    ) -> Result<(), ScanError> {
+        let replacement = canonicalize_roots(roots)?;
+        *self
+            .roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
+        Ok(())
     }
 
     pub fn physical_path(&self, root: &str, path: &str) -> Result<PathBuf, ScanError> {
-        let root = self
-            .roots
+        let roots = self.root_snapshot();
+        let root = roots
             .get(root)
             .ok_or_else(|| ScanError::UnknownRoot(root.to_owned()))?;
         let components = validate_logical_path(path)?;
@@ -304,10 +267,17 @@ impl RootedScanner {
         Ok(physical)
     }
 
+    fn root_snapshot(&self) -> BTreeMap<String, CanonicalRoot> {
+        self.roots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Locate an observed physical error beneath its configured root and
     /// preserve the platform's exact relative path units for DSVP.
     pub fn scan_subject(&self, path: &Path) -> Option<distill_store::state::ScanSubject> {
-        self.roots.values().find_map(|root| {
+        self.root_snapshot().values().find_map(|root| {
             let relative = path.strip_prefix(&root.configured.path).ok()?;
             if relative.as_os_str().is_empty() {
                 Some(distill_store::state::ScanSubject::Root {
@@ -323,7 +293,7 @@ impl RootedScanner {
     }
 
     pub fn first_root_subject(&self) -> Option<distill_store::state::ScanSubject> {
-        self.roots
+        self.root_snapshot()
             .keys()
             .next()
             .cloned()
@@ -332,7 +302,7 @@ impl RootedScanner {
 
     pub fn normalized_observed_path(&self, root: &str, path: &Path) -> String {
         let relative = self
-            .roots
+            .root_snapshot()
             .get(root)
             .and_then(|configured| path.strip_prefix(&configured.configured.path).ok())
             .map(|relative| relative.to_string_lossy().replace('\\', "/"))
@@ -399,8 +369,8 @@ impl RootedScanner {
     /// order. Watchers arm outside this call; their generation-tagged event
     /// union is applied by the coordinator after this candidate commits.
     pub fn scan(&self) -> Result<ScanSnapshot, ScanError> {
-        let mut stack = self
-            .roots
+        let roots = self.root_snapshot();
+        let mut stack = roots
             .values()
             .rev()
             .map(|root| PendingDirectory {
@@ -414,7 +384,7 @@ impl RootedScanner {
         let mut snapshot = ScanSnapshot::default();
 
         while let Some(pending) = stack.pop() {
-            let root = &self.roots[&pending.root_name];
+            let root = &roots[&pending.root_name];
             let metadata =
                 fs::metadata(&pending.physical_path).map_err(|source| ScanError::Io {
                     path: pending.physical_path.clone(),
@@ -508,8 +478,7 @@ impl RootedScanner {
                             path: physical.clone(),
                             source,
                         })?;
-                    if !self
-                        .roots
+                    if !roots
                         .values()
                         .any(|candidate| canonical.starts_with(&candidate.canonical_path))
                     {
@@ -525,8 +494,7 @@ impl RootedScanner {
                             path: physical.clone(),
                             source,
                         })?;
-                    if !self
-                        .roots
+                    if !roots
                         .values()
                         .any(|candidate| canonical.starts_with(&candidate.canonical_path))
                     {
@@ -619,6 +587,68 @@ impl RootedScanner {
         }
         Ok(bytes)
     }
+}
+
+fn canonicalize_roots(
+    roots: impl IntoIterator<Item = AssetRoot>,
+) -> Result<BTreeMap<String, CanonicalRoot>, ScanError> {
+    let configured = roots.into_iter().collect::<Vec<_>>();
+    let canonical_paths = configured
+        .iter()
+        .map(|root| {
+            validate_root_name(&root.name)?;
+            let canonical_path =
+                fs::canonicalize(&root.path).map_err(|_| ScanError::RootUnavailable {
+                    root: root.name.clone(),
+                    path: root.path.clone(),
+                })?;
+            let metadata = fs::metadata(&canonical_path).map_err(|source| ScanError::Io {
+                path: canonical_path.clone(),
+                source,
+            })?;
+            if !metadata.is_dir() {
+                return Err(ScanError::RootUnavailable {
+                    root: root.name.clone(),
+                    path: root.path.clone(),
+                });
+            }
+            let quarantine_identity = match fs::metadata(&root.quarantine_dir) {
+                Ok(metadata) if metadata.is_dir() => Some(file_identity(&metadata)),
+                Ok(_) => {
+                    return Err(ScanError::NonRegularFile {
+                        path: root.quarantine_dir.clone(),
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(ScanError::Io {
+                        path: root.quarantine_dir.clone(),
+                        source,
+                    })
+                }
+            };
+            Ok((root.clone(), canonical_path, quarantine_identity))
+        })
+        .collect::<Result<Vec<_>, ScanError>>()?;
+
+    let mut roots = BTreeMap::new();
+    for (configured, canonical_path, quarantine_identity) in canonical_paths {
+        let name = configured.name.clone();
+        if roots
+            .insert(
+                name.clone(),
+                CanonicalRoot {
+                    configured,
+                    canonical_path,
+                    quarantine_identity,
+                },
+            )
+            .is_some()
+        {
+            return Err(ScanError::DuplicateRootName(name));
+        }
+    }
+    Ok(roots)
 }
 
 #[cfg(unix)]
