@@ -829,10 +829,9 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO tools(tool_key, capsule_object, capsule_hash, input_version)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(tool_key) DO UPDATE SET
+             ON CONFLICT(tool_key, input_version) DO UPDATE SET
                capsule_object = excluded.capsule_object,
-               capsule_hash = excluded.capsule_hash,
-               input_version = excluded.input_version",
+               capsule_hash = excluded.capsule_hash",
             rusqlite::params![
                 key,
                 capsule_object,
@@ -2250,11 +2249,26 @@ impl Store {
 
     /// Resolve a tool key through the ToolEpoch table (§13).
     pub fn tool(&self, key: &str) -> Result<Option<StagedTool>, StoreError> {
+        self.tool_at(key, self.input_version())
+    }
+
+    /// Resolve the last ToolEpoch mapping visible at an exact pinned input
+    /// version. Historical rows remain addressable while their immutable
+    /// capsule roots coexist, so an older job never launches a replacement.
+    pub fn tool_at(
+        &self,
+        key: &str,
+        basis: InputVersion,
+    ) -> Result<Option<StagedTool>, StoreError> {
         let row = self
             .conn
             .query_row(
-                "SELECT capsule_object, capsule_hash, input_version FROM tools WHERE tool_key = ?1",
-                [key],
+                "SELECT capsule_object, capsule_hash, input_version
+                   FROM tools
+                  WHERE tool_key = ?1 AND input_version <= ?2
+                  ORDER BY input_version DESC
+                  LIMIT 1",
+                rusqlite::params![key, i64::try_from(basis.0).unwrap_or(i64::MAX)],
                 |r| {
                     Ok((
                         r.get::<_, Vec<u8>>(0)?,
@@ -2284,7 +2298,6 @@ impl Store {
             .state_path
             .join("tools/capsules")
             .join(hex_hash(&capsule_hash));
-        verify_capsule_root(key, &root, &capsule)?;
         let input_version =
             u64::try_from(input_version).map_err(|_| StoreError::ToolCapsuleUnavailable {
                 key: key.to_owned(),

@@ -12,4 +12,5 @@ pub mod outputs;
 pub mod pipeline;
 pub mod query;
 pub mod scheduler;
+pub mod tool;
 pub mod trace;

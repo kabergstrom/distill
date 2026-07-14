@@ -1158,7 +1158,7 @@ fn replacing_a_tool_republishes_and_staged_copies_coexist() {
     // §9: staged versions coexist — a swap mid-epoch invalidates traces
     // into rebuilds that run the new capsule at the new version.
     let (_d, mut store) = store();
-    let (v1, _) = store
+    let (v1, ver1) = store
         .input_transaction(|txn| {
             txn.stage_tool("shaderc", tool_capsule(b"same launcher", b"resource v1"))
         })
@@ -1176,6 +1176,13 @@ fn replacing_a_tool_republishes_and_staged_copies_coexist() {
     let current = store.tool("shaderc").unwrap().unwrap();
     assert_eq!(current.capsule_hash, v2.capsule_hash);
     assert_eq!(current.input_version, ver2);
+    let pinned = store.tool_at("shaderc", ver1).unwrap().unwrap();
+    assert_eq!(pinned.capsule_hash, v1.capsule_hash);
+    assert_eq!(pinned.input_version, ver1);
+    assert!(store
+        .tool_at("shaderc", distill_store::state::InputVersion(0))
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -1228,8 +1235,13 @@ fn staged_capsule_is_revalidated_immediately_before_launch() {
         staged.revalidate(),
         Err(StoreError::ToolCapsuleUnavailable { .. })
     ));
+    // Lookup still returns the snapshot's sealed identity. Closure drift is
+    // classified only by the immediate pre-launch revalidation so the caller
+    // can discard the successful Tool trace observation as transient.
+    let resolved = store.tool("tool").unwrap().expect("published mapping");
+    assert_eq!(resolved.capsule_hash, staged.capsule_hash);
     assert!(matches!(
-        store.tool("tool"),
+        resolved.revalidate(),
         Err(StoreError::ToolCapsuleUnavailable { .. })
     ));
 }

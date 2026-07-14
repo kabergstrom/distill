@@ -8,6 +8,7 @@ license.workspace = true
 blake3.workspace = true
 unicode-normalization.workspace = true
 globset.workspace = true
+tempfile = "3"
 distill-core = { path = "../distill-core" }
 distill-json = { path = "../distill-json" }
 distill-migrate = { path = "../distill-migrate" }

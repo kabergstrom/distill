@@ -173,7 +173,7 @@ fn tools_table_is_the_tool_epoch() {
             "input_version"
         ]
     );
-    assert_eq!(pk_columns(&conn, "tools"), ["tool_key"]);
+    assert_eq!(pk_columns(&conn, "tools"), ["tool_key", "input_version"]);
 }
 
 #[test]
