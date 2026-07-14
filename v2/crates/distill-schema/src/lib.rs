@@ -12,6 +12,8 @@ pub mod authority;
 pub mod bootstrap_builtins_v1;
 pub mod bootstrap_gen_v1;
 pub mod registry;
+pub mod tags;
 
 pub use authority::{ProjectSchemaAuthority, ProjectTypeAuthority, SchemaAuthorityError};
 pub use registry::SchemaRegistry;
+pub use tags::{extract_search_tags, TagExtractionError};

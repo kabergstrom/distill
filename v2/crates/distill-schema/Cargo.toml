@@ -8,6 +8,7 @@ license.workspace = true
 blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-core = { path = "../distill-core" }
+distill-json = { path = "../distill-json" }
 distill-wire = { path = "../distill-wire" }
 # The schema model itself is SHARED code (§5, §19): it lives in the engine
 # workspace so source-walk, the engine, and distill agree byte-for-byte.

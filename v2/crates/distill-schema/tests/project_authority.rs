@@ -1,12 +1,14 @@
 use distill_asset::AssetType;
 use distill_core::attestation::BOOTSTRAP_CONTROL_COUNT;
 use distill_core::id::TypeUuid;
+use distill_json::AuthoredValue;
 use distill_schema::ngp_schema::{
     Field, FieldAttrs, FieldIdentifier, FieldLayout, PrimitiveType, Schema, SchemaLayouts,
     SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
 };
-use distill_schema::{ProjectSchemaAuthority, SchemaAuthorityError};
+use distill_schema::{extract_search_tags, ProjectSchemaAuthority, SchemaAuthorityError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
+use std::collections::BTreeMap;
 
 const PROJECT_UUID: TypeUuid = TypeUuid([
     0x91, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
@@ -117,6 +119,65 @@ fn project_schema() -> Schema {
     }
 }
 
+fn tagged_schema() -> Schema {
+    Schema {
+        source_hashes: Default::default(),
+        types: vec![
+            TypeDef {
+                id: SchemaTypeId(0),
+                kind: PrimitiveType::Struct,
+                path: path("game", "TaggedRow"),
+                uuid: Some(TypeUuid([0x42; 16])),
+                attrs: TypeAttrs::default(),
+                fields: vec![Field {
+                    id: FieldIdentifier::Name("category".to_owned()),
+                    type_id: SchemaTypeId(1),
+                    attrs: FieldAttrs {
+                        tag: true,
+                        ..FieldAttrs::default()
+                    },
+                }],
+                generic_parameters: Vec::new(),
+                generic_argument_ids: Vec::new(),
+                has_default: false,
+            },
+            TypeDef {
+                id: SchemaTypeId(1),
+                kind: PrimitiveType::String,
+                path: path("alloc", "String"),
+                uuid: None,
+                attrs: TypeAttrs::default(),
+                fields: Vec::new(),
+                generic_parameters: Vec::new(),
+                generic_argument_ids: Vec::new(),
+                has_default: true,
+            },
+        ],
+        layouts: vec![SchemaLayouts {
+            identity: distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1().clone(),
+            layouts: vec![
+                TypeLayout {
+                    size: Some(std::mem::size_of::<String>() as u64),
+                    align: Some(std::mem::align_of::<String>() as u64),
+                    layout_complete: true,
+                    tag_encoding: None,
+                    fields: vec![FieldLayout {
+                        offset: Some(0),
+                        field_size: Some(std::mem::size_of::<String>() as u64),
+                    }],
+                },
+                TypeLayout {
+                    size: Some(std::mem::size_of::<String>() as u64),
+                    align: Some(std::mem::align_of::<String>() as u64),
+                    layout_complete: true,
+                    tag_encoding: None,
+                    fields: Vec::new(),
+                },
+            ],
+        }],
+    }
+}
+
 #[test]
 fn schema_projection_matches_the_independently_compiled_descriptor() {
     let authority = ProjectSchemaAuthority::from_schema(project_schema(), [7; 32]).unwrap();
@@ -145,6 +206,34 @@ fn schema_projection_matches_the_independently_compiled_descriptor() {
     let decoded = decode_dswl(&project.dswl_bytes).unwrap();
     assert_eq!(dswl_hash(&decoded).unwrap(), project.layout_hash);
     assert_eq!(authority.project_types().len(), 1);
+}
+
+#[test]
+fn current_schema_tag_extraction_reads_and_validates_annotated_string_values() {
+    let schema = tagged_schema();
+    let tags = extract_search_tags(
+        &schema,
+        SchemaTypeId(0),
+        &AuthoredValue::Object(BTreeMap::from([(
+            "category".to_owned(),
+            AuthoredValue::Str("enemy".to_owned()),
+        )])),
+    )
+    .unwrap();
+    assert_eq!(
+        tags,
+        BTreeMap::from([("category".to_owned(), "enemy".to_owned())])
+    );
+
+    let invalid = extract_search_tags(
+        &schema,
+        SchemaTypeId(0),
+        &AuthoredValue::Object(BTreeMap::from([(
+            "category".to_owned(),
+            AuthoredValue::Str("../enemy".to_owned()),
+        )])),
+    );
+    assert!(invalid.is_err());
 }
 
 #[test]
