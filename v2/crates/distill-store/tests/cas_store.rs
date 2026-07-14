@@ -14,6 +14,8 @@ use distill_store::state::{
     ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
+use distill_wire::dswl::{dswl_bytes, dswl_hash};
+use distill_wire::wire::WireNode;
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -79,22 +81,33 @@ fn declare_child(store: &mut Store, parent: AssetUuid, key: &str) -> AssetUuid {
 
 #[test]
 fn wire_trees_are_first_class_cas_records() {
-    // §13: the payload is the canonical DSWL serialization — its blake3
-    // IS the LayoutHash.
+    // §13: LayoutHash is the domain-separated digest of the canonical DSWL
+    // body, while typed reads return that body without the CAS preimage.
     let (_d, mut store) = store();
-    let tree = b"canonical DSWL bytes";
-    let hash = store.put_wire_tree(tree).unwrap();
-    assert_eq!(hash.0, *blake3::hash(tree).as_bytes());
-    assert_eq!(store.cas_read(&hash.0).unwrap(), tree);
+    let root = WireNode::Unit { offset: 0 };
+    let tree = dswl_bytes(&root).unwrap();
+    let hash = store.put_wire_tree(&tree).unwrap();
+    assert_eq!(hash, dswl_hash(&root).unwrap());
+    assert_eq!(store.wire_tree_read(hash).unwrap(), tree);
 }
 
 #[test]
 fn wire_tree_writes_are_idempotent() {
     let (_d, mut store) = store();
-    let a = store.put_wire_tree(b"same tree").unwrap();
-    let b = store.put_wire_tree(b"same tree").unwrap();
+    let tree = dswl_bytes(&WireNode::Unit { offset: 0 }).unwrap();
+    let a = store.put_wire_tree(&tree).unwrap();
+    let b = store.put_wire_tree(&tree).unwrap();
     assert_eq!(a, b);
-    assert_eq!(store.cas_read(&a.0).unwrap(), b"same tree");
+    assert_eq!(store.wire_tree_read(a).unwrap(), tree);
+}
+
+#[test]
+fn malformed_wire_tree_bodies_are_rejected_before_append() {
+    let (_d, mut store) = store();
+    assert!(matches!(
+        store.put_wire_tree(b"not DSWL"),
+        Err(StoreError::InvalidWireTree { .. })
+    ));
 }
 
 // ---- commit + read roundtrip ----

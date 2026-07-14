@@ -177,6 +177,9 @@ pub enum StoreError {
     },
     /// A read named a hash the extent index does not hold.
     NotFound { hash: [u8; 32] },
+    /// A wire-tree body or stored DSWL preimage was malformed, noncanonical,
+    /// or did not authenticate to the requested LayoutHash.
+    InvalidWireTree { detail: String },
     /// The bytes read back for a hash no longer verify against it —
     /// corruption caught at read time, never returned.
     CorruptExtent { segment: u64, offset: u64 },
@@ -405,6 +408,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::NotFound { hash } => {
                 write!(f, "no CAS extent for hash {}", hex(hash))
+            }
+            StoreError::InvalidWireTree { detail } => {
+                write!(f, "invalid DSWL wire tree: {detail}")
             }
             StoreError::CorruptExtent { segment, offset } => write!(
                 f,

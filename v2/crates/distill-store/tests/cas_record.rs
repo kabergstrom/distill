@@ -10,6 +10,8 @@ use distill_store::cas::record::{
     ResultPayload, RECORD_HEADER_LEN,
 };
 use distill_store::StoreError;
+use distill_wire::dswl::{dswl_bytes, dswl_hash, DSWL_VERSION};
+use distill_wire::wire::WireNode;
 
 fn sample(kind: RecordKind) -> Record {
     Record {
@@ -141,18 +143,23 @@ fn empty_keys_and_payload_roundtrip() {
 
 #[test]
 fn a_wire_tree_record_hash_is_its_layout_hash() {
-    // §13: a wire tree's blake3 IS the LayoutHash.
-    let tree_bytes = b"canonical DSWL serialization";
+    // The record payload is the exact DSWL digest preimage, so the generic
+    // raw CAS hash and semantic LayoutHash are the same key.
+    let root = WireNode::Unit { offset: 0 };
+    let tree_bytes = dswl_bytes(&root).unwrap();
+    let mut preimage = b"DSWL".to_vec();
+    preimage.push(DSWL_VERSION);
+    preimage.extend_from_slice(&tree_bytes);
     let rec = Record {
         kind: RecordKind::WireTree,
         asset_uuid: AssetUuid([0u8; 16]),
         static_input_key: Vec::new(),
         output_key: String::new(),
-        payload: tree_bytes.to_vec(),
+        payload: preimage,
     };
     let bytes = encode_record(&rec);
     let decoded = decode_record(&bytes, 0, 0).unwrap();
-    assert_eq!(decoded.content_hash, *blake3::hash(tree_bytes).as_bytes());
+    assert_eq!(decoded.content_hash, dswl_hash(&root).unwrap().0);
 }
 
 // ---- decode negatives ----

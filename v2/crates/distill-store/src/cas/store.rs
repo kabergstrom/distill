@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_wire::dswl::{decode_dswl, dswl_bytes, dswl_hash, DSWL_VERSION};
 
 use crate::cas::manifest::{self, GenerationManifest, ManifestSegment, SegmentKind};
 use crate::cas::record::{
@@ -282,16 +283,43 @@ impl Store {
     /// LayoutHash — call this before `commit_build`). Idempotent:
     /// duplicate content is byte-identical by definition.
     pub fn put_wire_tree(&mut self, tree_bytes: &[u8]) -> Result<LayoutHash, StoreError> {
-        let hash = *blake3::hash(tree_bytes).as_bytes();
-        if self.extent_of(&hash)?.is_some() {
-            return Ok(LayoutHash(hash));
+        let root = decode_dswl(tree_bytes).map_err(|error| StoreError::InvalidWireTree {
+            detail: format!("invalid canonical body: {error:?}"),
+        })?;
+        let canonical = dswl_bytes(&root).map_err(|error| StoreError::InvalidWireTree {
+            detail: format!("cannot re-encode body: {error}"),
+        })?;
+        if canonical != tree_bytes {
+            return Err(StoreError::InvalidWireTree {
+                detail: "decoded body does not reproduce byte-for-byte".to_owned(),
+            });
         }
+        let layout_hash = dswl_hash(&root).map_err(|error| StoreError::InvalidWireTree {
+            detail: format!("cannot authenticate body: {error}"),
+        })?;
+        if self.extent_of(&layout_hash.0)?.is_some() {
+            let existing = self.wire_tree_read(layout_hash)?;
+            if existing != tree_bytes {
+                return Err(StoreError::InvalidWireTree {
+                    detail: "LayoutHash extent contains a different canonical body".to_owned(),
+                });
+            }
+            return Ok(layout_hash);
+        }
+        // The generic CAS authenticates raw payload bytes. Persist the exact
+        // DSWL digest preimage so its raw blake3 is the semantic LayoutHash;
+        // typed reads strip the domain/version prefix before serving DSWL.
+        let mut preimage = Vec::with_capacity(5 + tree_bytes.len());
+        preimage.extend_from_slice(b"DSWL");
+        preimage.push(DSWL_VERSION);
+        preimage.extend_from_slice(tree_bytes);
+        debug_assert_eq!(*blake3::hash(&preimage).as_bytes(), layout_hash.0);
         let record = Record {
             kind: RecordKind::WireTree,
             asset_uuid: AssetUuid([0u8; 16]),
             static_input_key: Vec::new(),
             output_key: String::new(),
-            payload: tree_bytes.to_vec(),
+            payload: preimage.clone(),
         };
         let encoded = encode_record(&record);
         let payload_offset_in_record = (RECORD_HEADER_LEN) as u64;
@@ -306,17 +334,17 @@ impl Store {
         let txn = self.conn.transaction()?;
         upsert_extent(
             &txn,
-            &hash,
+            &layout_hash.0,
             segment,
             payload_offset,
-            tree_bytes.len() as u64,
+            preimage.len() as u64,
         )?;
         txn.execute(
             "UPDATE cas_segments SET indexed_len = ?2 WHERE segment_id = ?1",
             rusqlite::params![segment as i64, indexed_len as i64],
         )?;
         txn.commit()?;
-        Ok(LayoutHash(hash))
+        Ok(layout_hash)
     }
 
     /// Commit one build result (§13): payloads first, the result record
@@ -516,6 +544,39 @@ impl Store {
             return Err(StoreError::CorruptExtent { segment, offset });
         }
         Ok(bytes)
+    }
+
+    /// Read a first-class wire tree by its semantic LayoutHash, returning
+    /// the canonical DSWL body (without the stored digest preimage prefix).
+    pub fn wire_tree_read(&self, hash: LayoutHash) -> Result<Vec<u8>, StoreError> {
+        let preimage = self.cas_read(&hash.0)?;
+        let Some(body) = preimage.strip_prefix(b"DSWL") else {
+            return Err(StoreError::InvalidWireTree {
+                detail: "stored extent lacks the DSWL domain prefix".to_owned(),
+            });
+        };
+        let Some((&version, body)) = body.split_first() else {
+            return Err(StoreError::InvalidWireTree {
+                detail: "stored extent lacks the DSWL version".to_owned(),
+            });
+        };
+        if version != DSWL_VERSION {
+            return Err(StoreError::InvalidWireTree {
+                detail: format!("stored DSWL version {version} is unsupported"),
+            });
+        }
+        let root = decode_dswl(body).map_err(|error| StoreError::InvalidWireTree {
+            detail: format!("stored body is invalid: {error:?}"),
+        })?;
+        let observed = dswl_hash(&root).map_err(|error| StoreError::InvalidWireTree {
+            detail: format!("stored body cannot be authenticated: {error}"),
+        })?;
+        if observed != hash {
+            return Err(StoreError::InvalidWireTree {
+                detail: format!("requested {hash:?}, observed {observed:?}"),
+            });
+        }
+        Ok(body.to_vec())
     }
 
     /// Full doctor verification of every indexed CAS extent. Each record is

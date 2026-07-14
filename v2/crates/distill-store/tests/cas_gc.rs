@@ -9,6 +9,8 @@ use distill_store::artifacts::PinKind;
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::{Store, StoreConfig, StoreError};
+use distill_wire::dswl::dswl_bytes;
+use distill_wire::wire::WireNode;
 
 const PARENT: AssetUuid = AssetUuid([7u8; 16]);
 
@@ -208,7 +210,8 @@ fn compaction_reclaims_dead_bytes_and_flips_the_generation() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     let (survivor, _, _) = commit_with_aux(&mut store, 1, b"surviving artifact", b"dbg-s");
     let (_, _, dead_digest) = commit_with_aux(&mut store, 2, b"dead artifact", b"dbg-d");
-    let wire = store.put_wire_tree(b"wire tree bytes").unwrap();
+    let wire_bytes = dswl_bytes(&WireNode::Unit { offset: 0 }).unwrap();
+    let wire = store.put_wire_tree(&wire_bytes).unwrap();
     assert!(store
         .evict_result(KeyKind::Processor, &[2u8; 32], &dead_digest)
         .unwrap());
@@ -225,8 +228,8 @@ fn compaction_reclaims_dead_bytes_and_flips_the_generation() {
     // Everything live still reads; the bucket still resolves.
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
     assert_eq!(
-        store.cas_read(&wire.0).unwrap(),
-        b"wire tree bytes",
+        store.wire_tree_read(wire).unwrap(),
+        wire_bytes,
         "wire trees survive"
     );
     let candidates = store

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 distill-core = { path = "../distill-core" }
 distill-schema = { path = "../distill-schema" }
+distill-wire = { path = "../distill-wire" }
 ngp-schema = { path = "../../../../newgameplus/ngp-schema" }
 blake3 = { workspace = true }
 # Bundled SQLite: compiled from source, no system dependency (§13's
