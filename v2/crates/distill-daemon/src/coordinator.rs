@@ -207,29 +207,33 @@ impl DaemonCoordinator {
     pub(crate) fn sync_runtime_pipeline_poison(
         &self,
     ) -> Result<Option<PipelinePoison>, CoordinatorError> {
-        let observed = {
-            let runtime = lock_pipeline(&self.pipeline);
-            let Some(epoch) = runtime.host.published_ready_epoch() else {
-                return Ok(None);
-            };
-            match runtime.host.snapshot().epoch() {
-                Ok(_) => return Ok(None),
-                Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => {
-                    (epoch.dylib_hash(), poison)
-                }
-                Err(_) => return Ok(None),
-            }
+        let runtime = lock_pipeline(&self.pipeline);
+        let Some(epoch) = runtime.host.published_ready_epoch() else {
+            return Ok(None);
         };
-        let mut store = lock_store(&self.store);
-        match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
-            Ok(()) => Ok(Some(observed.1)),
-            Err(StoreError::StalePublishedPipeline {
-                actual: Some(actual),
-                already_unavailable: true,
-                ..
-            }) if actual == observed.0 => Ok(Some(observed.1)),
-            Err(error) => Err(CoordinatorError::RuntimePipeline(error.to_string())),
-        }
+        let observed = match runtime.host.snapshot().epoch() {
+            Ok(_) => return Ok(None),
+            Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => {
+                (epoch.dylib_hash(), poison)
+            }
+            Err(_) => return Ok(None),
+        };
+        let diagnostic = observed.1.clone();
+        self.server
+            .coordinated_runtime_pipeline_poison(diagnostic, || {
+                let mut store = lock_store(&self.store);
+                match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
+                    Ok(()) => Ok(()),
+                    Err(StoreError::StalePublishedPipeline {
+                        actual: Some(actual),
+                        already_unavailable: true,
+                        ..
+                    }) if actual == observed.0 => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+            .map_err(CoordinatorError::RuntimePipeline)?;
+        Ok(Some(observed.1))
     }
 
     pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {

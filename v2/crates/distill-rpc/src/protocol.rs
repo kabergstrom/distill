@@ -961,6 +961,7 @@ pub enum MetadataReconnectReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcFailure {
     LeaseExpired,
+    PipelineUnavailable(Box<PipelineUnavailableDiagnostic>),
     InvalidCursor {
         since: InputVersion,
         current: InputVersion,

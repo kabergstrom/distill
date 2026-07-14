@@ -33,7 +33,8 @@ use distill_migrate::{
 use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactPayload, AssetReferenceQuery,
     BuildArtifactPublication, BuildBackend, BuildBackendOutcome, BuildPublication, BuildRequest,
-    BuildWireTree, DriftedInput, RpcFailure, ServedClosureRow, ServedLoadEdge,
+    BuildWireTree, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow,
+    ServedLoadEdge,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
 use distill_store::bundles::{BundleMeta, EntryMeta};
@@ -76,9 +77,9 @@ impl BuildBackend for CoordinatorBuildBackend {
         let result = build(&coordinator, request);
         match coordinator.sync_runtime_pipeline_poison() {
             Ok(Some(poison)) => {
-                return Ok(BuildBackendOutcome::Failed {
-                    error: poison.to_string(),
-                })
+                return Err(RpcFailure::PipelineUnavailable(Box::new(
+                    PipelineUnavailableDiagnostic::PipelinePoison(poison),
+                )))
             }
             Ok(None) => {}
             Err(error) => {

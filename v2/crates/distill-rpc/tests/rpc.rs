@@ -2147,6 +2147,98 @@ fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
 }
 
 #[test]
+fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
+    let server = server_with(&[(1, false)]);
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let stamp = server
+        .commit(Commit {
+            assets: vec![set_asset(
+                entry.uuid,
+                StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                AssetDeltaState::Changed,
+            )],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+    let pinned = snapshot(&hub);
+    let poison = PipelinePoison::new(
+        PipelinePoisonCode::PublishedCallbackPanic,
+        PipelinePoisonOrigin::PublishedRuntime,
+        CleanupDisposition::PublishedEpochLeaked,
+        "processor callback panicked",
+    )
+    .unwrap();
+    let unavailable = RpcFailure::PipelineUnavailable(Box::new(
+        PipelineUnavailableDiagnostic::PipelinePoison(poison.clone()),
+    ));
+    let mut persisted = false;
+
+    server
+        .coordinated_runtime_pipeline_poison(poison.clone(), || {
+            persisted = true;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(persisted);
+    assert_eq!(server.current_stamp(), stamp);
+    assert_eq!(pinned.version(), RpcResult::Success(stamp.version));
+    assert!(matches!(
+        pinned.query(AssetQuery {
+            uuid: Some(entry.uuid),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Success(_)
+    ));
+    assert_eq!(
+        pinned.query(AssetQuery {
+            terminal_type: Some(entry.terminal_type),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Failure(unavailable.clone())
+    );
+    assert_eq!(
+        pinned.entry(entry.uuid),
+        RpcResult::Failure(unavailable.clone())
+    );
+    assert_eq!(
+        pinned.resolve(entry.uuid),
+        RpcResult::Failure(unavailable.clone())
+    );
+    assert_eq!(
+        hub.write(stamp.version, Vec::new()),
+        RpcResult::Failure(unavailable.clone())
+    );
+    assert_eq!(
+        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
+        RpcResult::Failure(unavailable)
+    );
+    assert_eq!(
+        server.root().connect(request_for(7, 3, &[(1, false)])),
+        ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelinePoison(
+            poison.clone()
+        ))
+    );
+    assert_eq!(
+        server
+            .root()
+            .metadata(PROTOCOL_VERSION)
+            .connected()
+            .unwrap()
+            .hub
+            .diagnostics()
+            .success()
+            .unwrap()
+            .pipeline,
+        PipelineDiagnostic::Poisoned(poison)
+    );
+}
+
+#[test]
 fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnostics() {
     let server = server_with(&[(1, false)]);
     let before = server.current_stamp();

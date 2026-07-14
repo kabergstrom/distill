@@ -353,7 +353,7 @@ impl BuildFlight {
 struct VersionView {
     stamp: SnapshotStamp,
     configuration: ConfigurationStatus,
-    pipeline: PipelineDiagnostic,
+    pipeline: Arc<RwLock<PipelineDiagnostic>>,
     version_poison: Option<VersionPoison>,
     assets: BTreeMap<AssetUuid, VersionResolve>,
     authoring: BTreeMap<AssetUuid, AuthoringEntry>,
@@ -524,7 +524,7 @@ impl Server {
         let view = Arc::new(VersionView {
             stamp,
             configuration: ConfigurationStatus::Ready,
-            pipeline: PipelineDiagnostic::Ready,
+            pipeline: Arc::new(RwLock::new(PipelineDiagnostic::Ready)),
             version_poison: None,
             assets: BTreeMap::new(),
             authoring: BTreeMap::new(),
@@ -581,6 +581,52 @@ impl Server {
     pub fn current_stamp(&self) -> SnapshotStamp {
         let state = self.lock();
         stamp(&state)
+    }
+
+    /// Persist and publish a runtime failure for the pipeline epoch currently
+    /// shared by every snapshot that pins it. The durable closure runs under
+    /// the server publication lock, preserving the coordinator's
+    /// pipeline -> RPC -> store lock order and preventing a successor epoch
+    /// from being poisoned by a stale observation.
+    pub fn coordinated_runtime_pipeline_poison(
+        &self,
+        poison: PipelinePoison,
+        persist: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        poison
+            .validate()
+            .map_err(|error| format!("invalid runtime pipeline poison: {error:?}"))?;
+        if poison.origin != PipelinePoisonOrigin::PublishedRuntime {
+            return Err("runtime poison publication requires PublishedRuntime origin".to_owned());
+        }
+
+        let state = self.lock();
+        let view = state
+            .views
+            .get(&state.current)
+            .expect("current view must exist");
+        {
+            let diagnostic = view
+                .pipeline
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*diagnostic {
+                PipelineDiagnostic::Ready => {}
+                PipelineDiagnostic::Poisoned(existing) if existing == &poison => return Ok(()),
+                other => {
+                    return Err(format!(
+                        "current RPC pipeline is not the observed ready epoch: {other:?}"
+                    ))
+                }
+            }
+        }
+        persist()?;
+        *view
+            .pipeline
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            PipelineDiagnostic::Poisoned(poison);
+        Ok(())
     }
 
     /// Publish a replacement store instance and fence every extant
@@ -1173,21 +1219,21 @@ impl Root {
         if let ConfigurationStatus::Poisoned(poison) = &current_view.configuration {
             return ConnectOutcome::ConfigurationPoisoned(poison.clone());
         }
-        match &current_view.pipeline {
+        match pipeline_diagnostic(current_view) {
             PipelineDiagnostic::Ready => {}
             PipelineDiagnostic::Poisoned(poison) => {
                 return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::PipelinePoison(poison.clone()),
+                    PipelineUnavailableDiagnostic::PipelinePoison(poison),
                 );
             }
             PipelineDiagnostic::SchemaAcceptanceRequired(required) => {
                 return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required.clone()),
+                    PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required),
                 );
             }
             PipelineDiagnostic::RetiredTypeReferenced(retired) => {
                 return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::RetiredTypeReferenced(retired.clone()),
+                    PipelineUnavailableDiagnostic::RetiredTypeReferenced(retired),
                 );
             }
         }
@@ -1663,7 +1709,7 @@ impl MetadataHub {
         MetadataCall::Success(MetadataDiagnostics {
             stamp: view.stamp,
             configuration: view.configuration.clone(),
-            pipeline: view.pipeline.clone(),
+            pipeline: pipeline_diagnostic(view),
             version_poison: view.version_poison.clone(),
         })
     }
@@ -1704,7 +1750,7 @@ impl MetadataSnapshot {
         MetadataCall::Success(MetadataDiagnostics {
             stamp: self.basis.snapshot,
             configuration: self.view.configuration.clone(),
-            pipeline: self.view.pipeline.clone(),
+            pipeline: pipeline_diagnostic(&self.view),
             version_poison: self.view.version_poison.clone(),
         })
     }
@@ -2377,6 +2423,9 @@ impl Hub {
         if let ConfigurationStatus::Poisoned(poison) = &current_view.configuration {
             return RpcResult::ConfigurationPoisoned(poison.clone());
         }
+        if let Some(error) = pipeline_failure(current_view) {
+            return RpcResult::Failure(error);
+        }
         let expected_successor = match request.base_attestation_generation.checked_add(1) {
             Some(successor) => successor,
             None => {
@@ -2615,6 +2664,11 @@ impl Snapshot {
         if let Some(poison) = &self.view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
         }
+        if query.terminal_type.is_some() {
+            if let Some(error) = pipeline_failure(&self.view) {
+                return RpcResult::Failure(error);
+            }
+        }
         if let Err(detail) = validate_asset_query(&query, false) {
             return RpcResult::Failure(RpcFailure::InvalidQuery { detail });
         }
@@ -2642,6 +2696,9 @@ impl Snapshot {
         }
         if let Some(poison) = &self.view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
+        }
+        if let Some(error) = pipeline_failure(&self.view) {
+            return RpcResult::Failure(error);
         }
         let Some(entry) = self.view.authoring.get(&uuid) else {
             return RpcResult::Failure(RpcFailure::AssetNotFound { uuid });
@@ -2675,6 +2732,9 @@ impl Snapshot {
             }
             if let Some(poison) = &self.view.version_poison {
                 return RpcResult::VersionPoisoned(poison.clone());
+            }
+            if let Some(error) = pipeline_failure(&self.view) {
+                return RpcResult::Failure(error);
             }
             if let ConfigurationStatus::Poisoned(poison) = &self.view.configuration {
                 return RpcResult::ConfigurationPoisoned(poison.clone());
@@ -2759,7 +2819,7 @@ impl Snapshot {
                         .read()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .clone();
-                    let outcome = backend.build(&request).and_then(|outcome| match outcome {
+                    let mut outcome = backend.build(&request).and_then(|outcome| match outcome {
                         BuildBackendOutcome::Built(publication) => self
                             .server
                             .install_build_publication(uuid, publication)
@@ -2771,6 +2831,9 @@ impl Snapshot {
                     });
                     let mut state = self.server.lock();
                     state.build_flights.remove(&key);
+                    if let Some(error) = pipeline_failure(&self.view) {
+                        outcome = Err(error);
+                    }
                     if let Ok(resolution) = &outcome {
                         state.build_results.insert(key, resolution.clone());
                     }
@@ -3399,6 +3462,32 @@ fn authoring_snapshot_from(
     }
 }
 
+fn pipeline_diagnostic(view: &VersionView) -> PipelineDiagnostic {
+    view.pipeline
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn pipeline_failure(view: &VersionView) -> Option<RpcFailure> {
+    match pipeline_diagnostic(view) {
+        PipelineDiagnostic::Ready => None,
+        PipelineDiagnostic::Poisoned(poison) => Some(RpcFailure::PipelineUnavailable(Box::new(
+            PipelineUnavailableDiagnostic::PipelinePoison(poison),
+        ))),
+        PipelineDiagnostic::SchemaAcceptanceRequired(required) => {
+            Some(RpcFailure::PipelineUnavailable(Box::new(
+                PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required),
+            )))
+        }
+        PipelineDiagnostic::RetiredTypeReferenced(retired) => {
+            Some(RpcFailure::PipelineUnavailable(Box::new(
+                PipelineUnavailableDiagnostic::RetiredTypeReferenced(retired),
+            )))
+        }
+    }
+}
+
 #[derive(Debug)]
 enum AuthoringGate {
     Reconnect(ReconnectReason),
@@ -3437,12 +3526,8 @@ fn authoring_gate(
     if let ConfigurationStatus::Poisoned(poison) = &view.configuration {
         return Some(AuthoringGate::ConfigurationPoisoned(poison.clone()));
     }
-    if view.pipeline != PipelineDiagnostic::Ready {
-        return Some(AuthoringGate::Failure(
-            RpcFailure::InvalidAuthoringRequest {
-                detail: "authoring requires a ready pipeline".to_owned(),
-            },
-        ));
+    if let Some(error) = pipeline_failure(view) {
+        return Some(AuthoringGate::Failure(error));
     }
     None
 }
@@ -4282,7 +4367,7 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
         view.configuration = configuration;
     }
     if let Some(pipeline) = commit.pipeline {
-        view.pipeline = pipeline;
+        view.pipeline = Arc::new(RwLock::new(pipeline));
     }
     if let Some(version_poison) = commit.version_poison {
         if let Some(poison) = &version_poison {

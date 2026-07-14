@@ -227,6 +227,8 @@ fn spawn_coordinator_loop(
                             .apply_watcher_batch(events)
                             .and_then(|_| reconcile_imports(&coordinator)),
                     });
+                let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
+                let result = result.and(poison_result);
                 let _ = coordinator.reap_retired_pipeline_epochs();
                 if let Err(error) = result {
                     *lock(&last_error) = Some(error.to_string());
@@ -543,9 +545,11 @@ fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
 }
 
 fn reconcile_imports(coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
-    coordinator.reconcile_directory_imports()?;
-    coordinator.reconcile_watched_imports()?;
-    Ok(())
+    let reconcile = coordinator
+        .reconcile_directory_imports()
+        .and_then(|_| coordinator.reconcile_watched_imports());
+    let poison = coordinator.sync_runtime_pipeline_poison().map(|_| ());
+    reconcile.and(poison)
 }
 
 enum WatchAction {
