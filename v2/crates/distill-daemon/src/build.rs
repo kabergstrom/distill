@@ -664,6 +664,7 @@ fn hydrate_processor_stage(
             }
             let mut hydrated = Vec::with_capacity(outputs.len());
             for output in outputs {
+                let persisted_type_uuids = output.type_uuids;
                 let (asset, authored_type, encoded_type, terminal_type) =
                     expected_output_identity(loaded, chain, stage, &output.output_key)?;
                 let project = context
@@ -686,6 +687,12 @@ fn hydrate_processor_stage(
                     references: Vec::new(),
                 };
                 verify_encoded_output(&encoded)?;
+                validate_cached_output_type_set(
+                    &persisted_type_uuids,
+                    authored_type,
+                    encoded_type,
+                    terminal_type,
+                )?;
                 hydrated.push(encoded);
             }
             let debug = aux
@@ -900,14 +907,37 @@ fn commit_processor_failure(
 }
 
 fn output_type_set(output: &EncodedNodeOutput) -> Vec<TypeUuid> {
-    let mut types = vec![
+    canonical_output_type_set(
         output.authored_type,
         output.encoded_type,
         output.terminal_type,
-    ];
+    )
+}
+
+fn canonical_output_type_set(
+    authored_type: TypeUuid,
+    encoded_type: TypeUuid,
+    terminal_type: TypeUuid,
+) -> Vec<TypeUuid> {
+    let mut types = vec![authored_type, encoded_type, terminal_type];
     types.sort();
     types.dedup();
     types
+}
+
+fn validate_cached_output_type_set(
+    observed: &[TypeUuid],
+    authored_type: TypeUuid,
+    encoded_type: TypeUuid,
+    terminal_type: TypeUuid,
+) -> Result<(), BuildError> {
+    let expected = canonical_output_type_set(authored_type, encoded_type, terminal_type);
+    if observed != expected {
+        return Err(BuildError::Failed(format!(
+            "cached processor output type set is invalid: expected {expected:?}, observed {observed:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn prepare_outputs(
@@ -2967,6 +2997,24 @@ mod tests {
                 debug: BTreeMap::new(),
             })
         }
+    }
+
+    #[test]
+    fn cached_processor_type_set_must_be_exact_and_canonical() {
+        let expected = canonical_output_type_set(TYPE, TERMINAL, TERMINAL);
+        assert_eq!(expected, vec![TYPE, TERMINAL]);
+        assert!(validate_cached_output_type_set(&expected, TYPE, TERMINAL, TERMINAL).is_ok());
+        assert!(validate_cached_output_type_set(&[TYPE], TYPE, TERMINAL, TERMINAL).is_err());
+        assert!(
+            validate_cached_output_type_set(&[TERMINAL, TYPE], TYPE, TERMINAL, TERMINAL).is_err()
+        );
+        assert!(validate_cached_output_type_set(
+            &[TYPE, TERMINAL, TERMINAL],
+            TYPE,
+            TERMINAL,
+            TERMINAL
+        )
+        .is_err());
     }
 
     #[test]
