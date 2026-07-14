@@ -9,7 +9,11 @@ blake3.workspace = true
 capnp = "0.26.2"
 capnp-rpc = "0.26.1"
 distill-core = { path = "../distill-core" }
+distill-bundle = { path = "../distill-bundle" }
+distill-json = { path = "../distill-json" }
+distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
+distill-wire = { path = "../distill-wire" }
 futures = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }

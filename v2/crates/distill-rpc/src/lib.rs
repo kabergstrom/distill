@@ -17,4 +17,7 @@ mod server;
 pub use attestation::{compute_policy_digest, AttestationShapeError, TargetDefinition};
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
-pub use server::{AuthoringSnapshot, DeltaStream, Hub, Root, Server, Snapshot};
+pub use server::{
+    decode_asset_reference_query, AuthoringSnapshot, DeltaStream, Hub, LineageRepair,
+    MetadataAuthoringSnapshot, MetadataHub, MetadataSnapshot, Root, Server, Snapshot,
+};

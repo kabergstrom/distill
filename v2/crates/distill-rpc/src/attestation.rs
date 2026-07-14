@@ -2,8 +2,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use distill_core::attestation::{
-    AttestationError, CompiledAttestationDigest, CompiledTypeRow, CompiledTypeTable,
+    AttestationError, BootstrapAuthorityMismatch, BundleFormatVersion, CompiledAttestationDigest,
+    CompiledTypeRow, CompiledTypeTable,
 };
+use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 
 use crate::{LoadPolicyEntry, TargetDefinitionHash, TypeUuid};
 
@@ -27,6 +29,8 @@ pub enum AttestationShapeError {
     DuplicateTarget {
         target: String,
     },
+    Bootstrap(BootstrapAuthorityMismatch),
+    BootstrapAuthorityUnavailable(String),
 }
 
 impl From<AttestationError> for AttestationShapeError {
@@ -113,12 +117,12 @@ pub(crate) fn validate_attestation_shape(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDefinition {
-    pub name: String,
-    pub definition_hash: TargetDefinitionHash,
-    pub compiled_registry: Vec<CompiledTypeRow>,
-    pub dsca: CompiledAttestationDigest,
-    pub load_policy: Vec<LoadPolicyEntry>,
-    pub policy_digest: [u8; 32],
+    name: String,
+    definition_hash: TargetDefinitionHash,
+    compiled_registry: Vec<CompiledTypeRow>,
+    dsca: CompiledAttestationDigest,
+    load_policy: Vec<LoadPolicyEntry>,
+    policy_digest: [u8; 32],
 }
 
 impl TargetDefinition {
@@ -129,6 +133,10 @@ impl TargetDefinition {
         mut load_policy: Vec<LoadPolicyEntry>,
     ) -> Result<Self, AttestationShapeError> {
         let compiled = CompiledTypeTable::canonical(compiled_registry)?;
+        consumer_bootstrap_authority_v1()
+            .map_err(|error| AttestationShapeError::BootstrapAuthorityUnavailable(error.0))?
+            .validate_boundary_rows(&compiled.rows, BundleFormatVersion::V1)
+            .map_err(AttestationShapeError::Bootstrap)?;
         load_policy.sort_by_key(|row| row.type_uuid);
         ensure_same_type_set(&compiled.rows, &load_policy)?;
         let policy_digest = compute_policy_digest(&load_policy)?;
@@ -141,5 +149,29 @@ impl TargetDefinition {
             load_policy,
             policy_digest,
         })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn definition_hash(&self) -> TargetDefinitionHash {
+        self.definition_hash
+    }
+
+    pub fn compiled_registry(&self) -> &[CompiledTypeRow] {
+        &self.compiled_registry
+    }
+
+    pub fn dsca(&self) -> CompiledAttestationDigest {
+        self.dsca
+    }
+
+    pub fn load_policy(&self) -> &[LoadPolicyEntry] {
+        &self.load_policy
+    }
+
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
     }
 }
