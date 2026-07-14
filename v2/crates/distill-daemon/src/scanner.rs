@@ -60,8 +60,11 @@ pub enum ScanError {
         path: PathBuf,
     },
     DirectoryAlias {
+        first_root: String,
         first: PathBuf,
+        second_root: String,
         second: PathBuf,
+        identity: ObservedFileIdentity,
     },
     FileIdentityChanged {
         path: PathBuf,
@@ -95,7 +98,7 @@ impl std::fmt::Display for ScanError {
             Self::DirectoryCycle { path } => {
                 write!(f, "directory identity cycle at {}", path.display())
             }
-            Self::DirectoryAlias { first, second } => write!(
+            Self::DirectoryAlias { first, second, .. } => write!(
                 f,
                 "one directory identity is reachable as both {} and {}",
                 first.display(),
@@ -195,6 +198,38 @@ enum FileIdentity {
     Portable { len: u64, modified_nanos: u128 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedFileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial: u64,
+        file_id: [u8; 16],
+    },
+    #[cfg(not(any(unix, windows)))]
+    Portable,
+}
+
+impl From<FileIdentity> for ObservedFileIdentity {
+    fn from(identity: FileIdentity) -> Self {
+        match identity {
+            #[cfg(unix)]
+            FileIdentity::Unix { device, inode } => Self::Unix { device, inode },
+            #[cfg(windows)]
+            FileIdentity::Windows {
+                volume_serial,
+                file_id,
+            } => Self::Windows {
+                volume_serial,
+                file_id,
+            },
+            #[cfg(not(any(unix, windows)))]
+            FileIdentity::Portable { .. } => Self::Portable,
+        }
+    }
+}
+
 impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
         let configured = roots.into_iter().collect::<Vec<_>>();
@@ -267,6 +302,46 @@ impl RootedScanner {
             physical.push(component);
         }
         Ok(physical)
+    }
+
+    /// Locate an observed physical error beneath its configured root and
+    /// preserve the platform's exact relative path units for DSVP.
+    pub fn scan_subject(&self, path: &Path) -> Option<distill_store::state::ScanSubject> {
+        self.roots.values().find_map(|root| {
+            let relative = path.strip_prefix(&root.configured.path).ok()?;
+            if relative.as_os_str().is_empty() {
+                Some(distill_store::state::ScanSubject::Root {
+                    root_name: root.configured.name.clone(),
+                })
+            } else {
+                Some(distill_store::state::ScanSubject::Subtree {
+                    root_name: root.configured.name.clone(),
+                    raw_relative_path: platform_path_bytes(relative),
+                })
+            }
+        })
+    }
+
+    pub fn first_root_subject(&self) -> Option<distill_store::state::ScanSubject> {
+        self.roots
+            .keys()
+            .next()
+            .cloned()
+            .map(|root_name| distill_store::state::ScanSubject::Root { root_name })
+    }
+
+    pub fn normalized_observed_path(&self, root: &str, path: &Path) -> String {
+        let relative = self
+            .roots
+            .get(root)
+            .and_then(|configured| path.strip_prefix(&configured.configured.path).ok())
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        if relative.is_empty() {
+            root.to_owned()
+        } else {
+            format!("{root}/{relative}")
+        }
     }
 
     pub fn inspect_destination(
@@ -382,8 +457,11 @@ impl RootedScanner {
             ) {
                 if first_root != pending.root_name || first != pending.physical_path {
                     return Err(ScanError::DirectoryAlias {
+                        first_root,
                         first,
+                        second_root: pending.root_name,
                         second: pending.physical_path,
+                        identity: identity.into(),
                     });
                 }
             }
@@ -541,6 +619,23 @@ impl RootedScanner {
         }
         Ok(bytes)
     }
+}
+
+#[cfg(unix)]
+fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
+    use std::os::unix::ffi::OsStrExt;
+    distill_store::state::PlatformPathBytes::Unix(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
+    use std::os::windows::ffi::OsStrExt;
+    distill_store::state::PlatformPathBytes::Windows(path.as_os_str().encode_wide().collect())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
+    distill_store::state::PlatformPathBytes::Unix(path.to_string_lossy().as_bytes().to_vec())
 }
 
 fn modified_nanos(metadata: &Metadata) -> i64 {

@@ -11,7 +11,7 @@ use distill_rpc::{
     TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
-use distill_store::state::{ConfigurationState, DscpV1, InputVersion};
+use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
 use distill_store::StoreConfig;
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
@@ -154,4 +154,63 @@ fn watcher_union_reconciles_an_offline_delete_in_exactly_one_version() {
     assert!(store.bundle(bundle).unwrap().is_none());
     assert!(store.entry(asset).unwrap().is_none());
     assert_eq!(store.input_version(), InputVersion(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    let link = temp.path().join("assets/escape");
+    symlink(&outside, &link).unwrap();
+
+    assert_eq!(
+        coordinator.reconcile_full_scan().unwrap().version,
+        InputVersion(1)
+    );
+    let store = coordinator.store();
+    assert!(matches!(
+        store
+            .lock()
+            .unwrap()
+            .version_poison()
+            .unwrap()
+            .unwrap()
+            .detail,
+        VersionPoisonV1::UnreadableScanSubtree { .. }
+    ));
+
+    std::fs::remove_file(link).unwrap();
+    assert_eq!(
+        coordinator.reconcile_full_scan().unwrap().version,
+        InputVersion(2)
+    );
+    assert!(store.lock().unwrap().version_poison().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_alias_publishes_configuration_poison_without_aborting_the_version() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("assets/real");
+    std::fs::create_dir_all(&directory).unwrap();
+    symlink(&directory, temp.path().join("assets/alias")).unwrap();
+    let coordinator = coordinator(&temp);
+
+    assert_eq!(
+        coordinator.reconcile_full_scan().unwrap().version,
+        InputVersion(1)
+    );
+    let store = coordinator.store();
+    assert!(matches!(
+        store.lock().unwrap().configuration_state().unwrap(),
+        ConfigurationState::Poisoned { reason, .. }
+            if matches!(reason.detail.as_ref(), DscpV1::DirectoryAlias { .. })
+    ));
 }

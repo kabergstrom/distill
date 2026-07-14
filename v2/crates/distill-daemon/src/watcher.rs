@@ -172,6 +172,7 @@ impl From<&ScannedFile> for ObservedPath {
 pub struct PollingWatchSource {
     scanner: RootedScanner,
     observed: BTreeMap<(String, String), ObservedPath>,
+    last_failure: Option<String>,
 }
 
 impl PollingWatchSource {
@@ -180,17 +181,26 @@ impl PollingWatchSource {
     /// without a watcher-activation gap.
     pub fn arm(scanner: RootedScanner) -> Result<Self, ScanError> {
         let observed = observe(&scanner)?;
-        Ok(Self { scanner, observed })
+        Ok(Self {
+            scanner,
+            observed,
+            last_failure: None,
+        })
     }
 
     pub fn poll_once(&mut self, queue: &Mutex<WatcherQueue>) -> Result<usize, ScanError> {
         let current = match observe(&self.scanner) {
             Ok(current) => current,
             Err(error) => {
-                lock_queue(queue).force_overflow();
+                let detail = error.to_string();
+                if self.last_failure.as_ref() != Some(&detail) {
+                    lock_queue(queue).force_overflow();
+                    self.last_failure = Some(detail);
+                }
                 return Err(error);
             }
         };
+        let healed = self.last_failure.take().is_some();
         let mut changed = Vec::new();
         for ((root, path), state) in &current {
             if self.observed.get(&(root.clone(), path.clone())) != Some(state) {
@@ -214,6 +224,9 @@ impl PollingWatchSource {
         let count = changed.len();
         {
             let mut queue = lock_queue(queue);
+            if healed {
+                queue.force_overflow();
+            }
             for event in changed {
                 // Queue insertion is infallible outside generation exhaustion;
                 // overflow is represented as state, never as dropped input.

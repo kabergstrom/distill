@@ -25,13 +25,15 @@ use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    AssetClaimant, ConfigurationState, DscpV1, InputVersion, ReadableBundleSource,
-    SkeletonFailureCode,
+    AssetClaimant, ConfigurationState, DirectoryAliasSide, DscpV1, InputVersion,
+    PlatformFileIdentity, ReadableBundleSource, ScanFailureCode, ScanSubject, SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
 use crate::lineage_repair::{LineageRepairBackend, LineageRepairBackendInitError};
-use crate::scanner::{AssetRoot, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind};
+use crate::scanner::{
+    AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
+};
 use crate::watcher::{GenerationReplay, WatcherQueue, WatcherQueueError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +89,10 @@ impl DaemonCoordinator {
     /// caller starts this method; queued events are unioned through
     /// [`Self::apply_watcher_batch`] after this transaction.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
-        let scan = self.scanner.scan()?;
-        self.publish_scan(scan)
+        match self.scanner.scan() {
+            Ok(scan) => self.publish_scan(scan),
+            Err(error) => self.publish_scan_rejection(&error),
+        }
     }
 
     /// Arm a watcher generation before traversal, publish the startup scan,
@@ -125,6 +129,51 @@ impl DaemonCoordinator {
             .map_err(CoordinatorError::Coordinated)
     }
 
+    fn publish_scan_rejection(&self, error: &ScanError) -> Result<SnapshotStamp, CoordinatorError> {
+        let rejection = classify_scan_rejection(&self.scanner, error)?;
+        let base = self.server.current_stamp().version;
+        let store = Arc::clone(&self.store);
+        self.server
+            .coordinated_commit(base, || {
+                let mut store = lock_store(&store);
+                if store.input_version() != base {
+                    return Err(format!(
+                        "durable rejected-scan basis is {:?}, expected {base:?}",
+                        store.input_version()
+                    ));
+                }
+                let commit = match &rejection {
+                    ScanRejection::Version(poison) => {
+                        store
+                            .input_transaction(|transaction| {
+                                transaction.set_version_poisons([poison.clone()])
+                            })
+                            .map_err(|error| error.to_string())?;
+                        Commit {
+                            version_poison: Some(Some(poison.clone())),
+                            ..Commit::default()
+                        }
+                    }
+                    ScanRejection::Configuration { reason, message } => {
+                        let poison = distill_rpc::ConfigurationPoison::from_reason(reason, message);
+                        store
+                            .input_transaction(|transaction| {
+                                transaction.set_version_poisons([])?;
+                                transaction.publish_configuration_poison(reason, message)
+                            })
+                            .map_err(|error| error.to_string())?;
+                        Commit {
+                            configuration: Some(ConfigurationStatus::Poisoned(poison)),
+                            version_poison: Some(None),
+                            ..Commit::default()
+                        }
+                    }
+                };
+                Ok(commit)
+            })
+            .map_err(CoordinatorError::Coordinated)
+    }
+
     /// Reconcile a watcher batch as one durable input event. Event paths are a
     /// trigger/union, never trusted as a complete namespace; the identity-
     /// checked scan supplies current bytes and the single coordinated commit
@@ -141,6 +190,100 @@ impl DaemonCoordinator {
         }
         let scan = self.scanner.scan()?;
         self.publish_scan(scan)
+    }
+}
+
+enum ScanRejection {
+    Version(VersionPoison),
+    Configuration {
+        reason: Box<DscpV1>,
+        message: String,
+    },
+}
+
+fn classify_scan_rejection(
+    scanner: &RootedScanner,
+    error: &ScanError,
+) -> Result<ScanRejection, CoordinatorError> {
+    if let ScanError::DirectoryAlias {
+        first_root,
+        first,
+        second_root,
+        second,
+        identity,
+    } = error
+    {
+        let identity = platform_identity(*identity);
+        return Ok(ScanRejection::Configuration {
+            reason: Box::new(DscpV1::DirectoryAlias {
+                first: DirectoryAliasSide {
+                    normalized_path: scanner.normalized_observed_path(first_root, first),
+                    identity,
+                },
+                second: DirectoryAliasSide {
+                    normalized_path: scanner.normalized_observed_path(second_root, second),
+                    identity,
+                },
+            }),
+            message: error.to_string(),
+        });
+    }
+    let (path, failure) = match error {
+        ScanError::Io { path, source } => (
+            Some(path.as_path()),
+            match source.kind() {
+                std::io::ErrorKind::PermissionDenied => ScanFailureCode::PermissionDenied,
+                std::io::ErrorKind::NotFound => ScanFailureCode::NotFound,
+                _ => ScanFailureCode::IoDataLoss,
+            },
+        ),
+        ScanError::RootUnavailable { .. } => (None, ScanFailureCode::NotFound),
+        ScanError::NonRegularFile { path } => {
+            (Some(path.as_path()), ScanFailureCode::InvalidFileType)
+        }
+        ScanError::FileIdentityChanged { path }
+        | ScanError::DirectoryCycle { path }
+        | ScanError::SymlinkEscape { path, .. } => (
+            Some(path.as_path()),
+            ScanFailureCode::SymlinkIdentityChanged,
+        ),
+        ScanError::InvalidLogicalPath(_) => (None, ScanFailureCode::InvalidFileType),
+        ScanError::InvalidRootName(_)
+        | ScanError::DuplicateRootName(_)
+        | ScanError::UnknownRoot(_)
+        | ScanError::DirectoryAlias { .. } => (None, ScanFailureCode::IoDataLoss),
+    };
+    let subject = path
+        .and_then(|path| scanner.scan_subject(path))
+        .or_else(|| scanner.first_root_subject())
+        .unwrap_or_else(|| ScanSubject::Root {
+            root_name: "unconfigured".to_owned(),
+        });
+    let detail = VersionPoisonV1::UnreadableScanSubtree { subject, failure };
+    let poison = VersionPoison::new(detail, error.to_string())
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+    Ok(ScanRejection::Version(poison))
+}
+
+fn platform_identity(identity: ObservedFileIdentity) -> PlatformFileIdentity {
+    match identity {
+        #[cfg(unix)]
+        ObservedFileIdentity::Unix { device, inode } => {
+            PlatformFileIdentity::Unix { device, inode }
+        }
+        #[cfg(windows)]
+        ObservedFileIdentity::Windows {
+            volume_serial,
+            file_id,
+        } => PlatformFileIdentity::Windows {
+            volume_serial,
+            file_id,
+        },
+        #[cfg(not(any(unix, windows)))]
+        ObservedFileIdentity::Portable => PlatformFileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        },
     }
 }
 
