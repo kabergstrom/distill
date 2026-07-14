@@ -18,7 +18,9 @@ pub enum TraceDecodeError {
     InvalidUtf8,
     NonCanonicalString,
     InvalidOptionTag(u8),
+    InvalidBool(u8),
     InvalidObservedTag(u8),
+    InvalidQuery,
     UnknownOperation(u8),
     ReservedToolLaunch,
     UnknownFailure(u8),
@@ -117,6 +119,14 @@ impl Reader<'_> {
         Ok(u32::from_le_bytes(
             self.take(4)?.try_into().expect("four bytes"),
         ))
+    }
+
+    fn bool(&mut self) -> Result<bool, TraceDecodeError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(TraceDecodeError::InvalidBool(value)),
+        }
     }
 
     fn array16(&mut self) -> Result<[u8; 16], TraceDecodeError> {
@@ -227,7 +237,7 @@ impl Reader<'_> {
     }
 
     fn asset_query(&mut self) -> Result<AssetQuery, TraceDecodeError> {
-        Ok(AssetQuery {
+        AssetQuery {
             uuid: self.option(|reader| Ok(AssetUuid(reader.array16()?)))?,
             bundle_path: self.option(Self::string)?,
             local_id: self.option(Self::string)?,
@@ -242,7 +252,10 @@ impl Reader<'_> {
             })?,
             path_prefix: self.option(Self::string)?,
             path_glob: self.option(Self::string)?,
-        })
+            authoring_only: self.option(Self::bool)?,
+        }
+        .close(None)
+        .map_err(|_| TraceDecodeError::InvalidQuery)
     }
 
     fn file_query(&mut self) -> Result<FileQuery, TraceDecodeError> {

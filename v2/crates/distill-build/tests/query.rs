@@ -40,6 +40,28 @@ fn empty_queries_and_invalid_globs_are_rejected() {
 }
 
 #[test]
+fn ordinary_and_pack_queries_cannot_select_authoring_only_entries() {
+    assert_eq!(
+        AssetQuery {
+            authoring_only: Some(true),
+            ..AssetQuery::default()
+        }
+        .close(None),
+        Err(IntakeError::AuthoringOnlyRestricted)
+    );
+    assert_eq!(
+        AssetQuery {
+            authoring_only: Some(false),
+            ..AssetQuery::default()
+        }
+        .close(None)
+        .unwrap()
+        .authoring_only,
+        Some(false)
+    );
+}
+
+#[test]
 fn query_hashes_are_sorted_deduplicated_and_domain_separated() {
     let a = AssetUuid([1; 16]);
     let b = AssetUuid([2; 16]);

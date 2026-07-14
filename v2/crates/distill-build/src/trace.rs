@@ -880,6 +880,7 @@ fn encode_query(e: &mut CanonicalEncoder, q: &AssetQuery) {
     });
     e.option(q.path_prefix.as_deref(), |e, v| e.str(v));
     e.option(q.path_glob.as_deref(), |e, v| e.str(v));
+    e.option(q.authoring_only, |e, v| e.bool(*v));
 }
 
 fn encode_failure(e: &mut CanonicalEncoder, failure: &StableFailureFingerprint, depth: usize) {

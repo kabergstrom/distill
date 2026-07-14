@@ -213,6 +213,7 @@ impl<'a, B: ImportBackend + ?Sized> ImportContext<'a, B> {
             IntakeError::EmptyQuery => 5,
             IntakeError::BundleRelativeWithoutOrigin => 6,
             IntakeError::InvalidGlob(_) => 7,
+            IntakeError::AuthoringOnlyRestricted => 8,
         };
         let facts = DslfV1::Importer {
             importer_id: self.importer_id.clone(),

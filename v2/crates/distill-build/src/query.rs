@@ -13,6 +13,7 @@ pub enum IntakeError {
     Nul,
     InvalidPath,
     EmptyQuery,
+    AuthoringOnlyRestricted,
     BundleRelativeWithoutOrigin,
     InvalidGlob(String),
 }
@@ -27,6 +28,9 @@ impl fmt::Display for IntakeError {
                 f.write_str("path is not a normalized, lexical root-relative path")
             }
             Self::EmptyQuery => f.write_str("a query must contain at least one selector"),
+            Self::AuthoringOnlyRestricted => {
+                f.write_str("authoring_only=true is restricted to tooling queries")
+            }
             Self::BundleRelativeWithoutOrigin => {
                 f.write_str("a bare local_id query requires an origin bundle")
             }
@@ -163,12 +167,16 @@ pub struct AssetQuery {
     pub tag: Option<TagSelector>,
     pub path_prefix: Option<String>,
     pub path_glob: Option<String>,
+    pub authoring_only: Option<bool>,
 }
 
 impl AssetQuery {
     pub fn close(mut self, origin: Option<BundleUuid>) -> Result<Self, IntakeError> {
         if self.selector_count() == 0 {
             return Err(IntakeError::EmptyQuery);
+        }
+        if self.authoring_only == Some(true) {
+            return Err(IntakeError::AuthoringOnlyRestricted);
         }
         self.bundle_path = self.bundle_path.map(|p| normalize_path(&p)).transpose()?;
         self.path_prefix = self.path_prefix.map(|p| normalize_path(&p)).transpose()?;
@@ -202,6 +210,7 @@ impl AssetQuery {
             self.tag.is_some(),
             self.path_prefix.is_some(),
             self.path_glob.is_some(),
+            self.authoring_only.is_some(),
         ]
         .into_iter()
         .filter(|v| *v)

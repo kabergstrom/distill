@@ -106,6 +106,42 @@ fn trace_digest_applies_the_dstr_domain_exactly_once() {
 }
 
 #[test]
+fn dstr_distinguishes_an_explicit_runtime_role_and_rejects_authoring_queries() {
+    let implicit = TraceOp::Query {
+        query: Box::new(AssetQuery {
+            uuid: Some(AssetUuid([9; 16])),
+            ..AssetQuery::default()
+        }),
+        observed: Observed::Ok([3; 32]),
+    };
+    let explicit = TraceOp::Query {
+        query: Box::new(AssetQuery {
+            uuid: Some(AssetUuid([9; 16])),
+            authoring_only: Some(false),
+            ..AssetQuery::default()
+        }),
+        observed: Observed::Ok([3; 32]),
+    };
+    let implicit_bytes = trace_payload_bytes(std::slice::from_ref(&implicit));
+    let explicit_bytes = trace_payload_bytes(std::slice::from_ref(&explicit));
+    assert_ne!(implicit_bytes, explicit_bytes);
+    assert_eq!(decode_trace_payload_bytes(&explicit_bytes), Ok(vec![explicit]));
+
+    let forbidden = TraceOp::Query {
+        query: Box::new(AssetQuery {
+            uuid: Some(AssetUuid([9; 16])),
+            authoring_only: Some(true),
+            ..AssetQuery::default()
+        }),
+        observed: Observed::Ok([3; 32]),
+    };
+    assert_eq!(
+        decode_trace_payload_bytes(&trace_payload_bytes(&[forbidden])),
+        Err(TraceDecodeError::InvalidQuery)
+    );
+}
+
+#[test]
 fn persisted_trace_decoder_rejects_reserved_noncanonical_and_trailing_forms() {
     assert_eq!(
         decode_trace_payload_bytes(&[1, 0, 0, 0, 4]),
