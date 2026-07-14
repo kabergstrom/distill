@@ -1018,7 +1018,17 @@ impl schema::snapshot::Server for SnapshotService {
                     return Ok(());
                 }
             };
-            write_resolve_result(results.get().init_result(), self.snapshot.resolve(uuid));
+            // Lazy resolution may synchronously execute a complete processor
+            // chain. Keep that work off the single-threaded capnp-rpc driver;
+            // the daemon build scheduler provides the actual admission bound
+            // while this future yields so unrelated connections keep moving.
+            let snapshot = self.snapshot.clone();
+            let outcome = tokio::task::spawn_blocking(move || snapshot.resolve(uuid))
+                .await
+                .map_err(|error| {
+                    capnp::Error::failed(format!("snapshot resolve worker failed: {error}"))
+                })?;
+            write_resolve_result(results.get().init_result(), outcome);
             Ok(())
         }
     }

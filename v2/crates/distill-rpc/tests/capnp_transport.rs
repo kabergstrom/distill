@@ -1,5 +1,6 @@
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use distill_core::attestation::{
     CompiledTypeRow, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, SchemaNodeId,
@@ -184,6 +185,25 @@ impl AuthoringBackend for RecordingAuthoringBackend {
                 },
             ],
         ))
+    }
+}
+
+struct BlockingBuildBackend {
+    started: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BuildBackend for BlockingBuildBackend {
+    fn build(&self, _request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        self.started.store(true, Ordering::Release);
+        let (released, wake) = &*self.release;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+        Ok(BuildBackendOutcome::Failed {
+            error: "released test build".to_owned(),
+        })
     }
 }
 
@@ -1222,6 +1242,97 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 .unwrap();
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_slow_snapshot_build_does_not_stall_the_rpc_io_thread() {
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let server = server();
+    server.install_build_backend(Arc::new(BlockingBuildBackend {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    }));
+    let entry = authoring_entry(41, AuthoringEntryRole::Runtime);
+    server
+        .commit(Commit {
+            assets: vec![AssetMutation::Set {
+                uuid: entry.uuid,
+                resolution: StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                delta: AssetDeltaState::Changed,
+            }],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            listener.serve_one().await.unwrap();
+        });
+    });
+    let address = address_rx.recv().unwrap();
+
+    LocalSet::new()
+        .run_until(async {
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = match client.connect(&request()).await.unwrap() {
+                RemoteConnectOutcome::Connected { hub, .. } => hub,
+                other => panic!("expected connected, got {other:?}"),
+            };
+            let response = hub.snapshot_request().send().promise.await.unwrap();
+            let snapshot = match response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                _ => panic!("expected snapshot capability"),
+            };
+
+            let mut resolve = snapshot.resolve_request();
+            resolve.get().set_uuid(&entry.uuid.0);
+            let resolve_task = tokio::task::spawn_local(resolve.send().promise);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !started.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("build callback started");
+
+            let metadata = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client.metadata(PROTOCOL_VERSION),
+            )
+            .await;
+            {
+                let (released, wake) = &*release;
+                *released.lock().unwrap() = true;
+                wake.notify_all();
+            }
+            resolve_task.await.unwrap().unwrap();
+            assert!(matches!(
+                metadata,
+                Ok(Ok(RemoteMetadataOutcome::Connected { .. }))
+            ));
+            drop(client);
+        })
+        .await;
+    server_thread.join().unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
