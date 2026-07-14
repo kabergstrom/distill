@@ -31,9 +31,9 @@ pub const BOOTSTRAP_TABLE_VERSION_V1: u8 = 1;
 // A literal, target-native fixture generated on the checked-in toolchain.
 // Per-target fixtures use different DSCI keys; no runtime fallback exists.
 pub const EMBEDDED_CONSUMER_BOOTSTRAP_RESOURCE_NAME_V1: &str =
-    "bootstrap/control-table-v1/89a9394dcdf15fe6f1af88a8e4337aa5cd9ba1b5002059a9149606093e1fc291.dsca";
+    "bootstrap/control-table-v1/8a1e7525705b5b5eb81e10afc0435b0a2a58c4995dd5a31637ec4878e196247c.dsca";
 const EMBEDDED_CONSUMER_BOOTSTRAP_RESOURCE_V1: &[u8] = include_bytes!(
-    "../bootstrap/control-table-v1/89a9394dcdf15fe6f1af88a8e4337aa5cd9ba1b5002059a9149606093e1fc291.dsca"
+    "../bootstrap/control-table-v1/8a1e7525705b5b5eb81e10afc0435b0a2a58c4995dd5a31637ec4878e196247c.dsca"
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,7 +205,7 @@ pub fn consumer_compilation_identity_v1() -> &'static CompilationIdentity {
             "target_vendor=\"apple\"".to_owned(),
         ]),
         manifest_lock_hash: decode_hex_32(
-            "f7a07d7118955b0d1c8aa190ccaeb923cf2823637c55b267c36da332d2fdd1ff",
+            "416a78a496d755554b9ee159ab0c8fd2af5e35f4e8a43a35bcfd90898d918456",
         ),
         algorithm_version: 1,
     })
