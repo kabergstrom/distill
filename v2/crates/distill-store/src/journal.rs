@@ -110,6 +110,32 @@ pub struct RecoveredEdit {
     pub quarantine_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum PublicationGroupKind {
+    LineageCreate = 1,
+    LineageDuplicate = 2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalIntentPlan {
+    pub target_path: String,
+    pub temp_path: String,
+    pub conflict_path: String,
+    pub pre_image_hash: Option<ContentHash>,
+    pub proposed_hash: ContentHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationGroup {
+    pub group_id: i64,
+    pub kind: PublicationGroupKind,
+    /// Canonical operation-specific basis, retained in full rather than only
+    /// by digest so startup diagnostics can name every promised pre-image.
+    pub basis: Vec<u8>,
+    pub child_intents: Vec<i64>,
+}
+
 #[derive(Debug)]
 struct RenameAsideIntent {
     target: PathBuf,
@@ -142,6 +168,139 @@ trait RenameAsideFs {
 }
 
 impl Store {
+    /// Atomically record a durable parent operation and every child mutation
+    /// before the first filesystem change. This closes the crash window where
+    /// a multi-path repair could otherwise expose an unparented partial plan.
+    pub fn record_publication_group(
+        &mut self,
+        kind: PublicationGroupKind,
+        basis: &[u8],
+        plans: &[JournalIntentPlan],
+    ) -> Result<PublicationGroup, StoreError> {
+        if plans.is_empty() {
+            return Err(StoreError::BadIntent {
+                intent_id: 0,
+                detail: "a publication group requires at least one child intent".into(),
+            });
+        }
+        let txn = self.conn.transaction()?;
+        txn.execute(
+            "INSERT INTO publication_groups(kind, basis, retired) VALUES (?1, ?2, 0)",
+            rusqlite::params![kind as i64, basis],
+        )?;
+        let group_id = txn.last_insert_rowid();
+        let mut child_intents = Vec::with_capacity(plans.len());
+        for (ordinal, plan) in plans.iter().enumerate() {
+            txn.execute(
+                "INSERT INTO write_intents(target_path, temp_path, conflict_path,
+                                           pre_image_hash, proposed_hash, retired)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                rusqlite::params![
+                    plan.target_path,
+                    plan.temp_path,
+                    plan.conflict_path,
+                    plan.pre_image_hash.as_ref().map(|hash| hash.0.as_slice()),
+                    plan.proposed_hash.0.as_slice(),
+                ],
+            )?;
+            let intent_id = txn.last_insert_rowid();
+            txn.execute(
+                "INSERT INTO publication_group_children(group_id, ordinal, intent_id)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![group_id, ordinal as i64, intent_id],
+            )?;
+            child_intents.push(intent_id);
+        }
+        txn.commit()?;
+        Ok(PublicationGroup {
+            group_id,
+            kind,
+            basis: basis.to_vec(),
+            child_intents,
+        })
+    }
+
+    pub fn unfinished_publication_groups(&self) -> Result<Vec<PublicationGroup>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, kind, basis FROM publication_groups
+             WHERE retired = 0 ORDER BY group_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut groups = Vec::with_capacity(rows.len());
+        for (group_id, raw_kind, basis) in rows {
+            let kind = match raw_kind {
+                1 => PublicationGroupKind::LineageCreate,
+                2 => PublicationGroupKind::LineageDuplicate,
+                _ => {
+                    return Err(StoreError::BadIntent {
+                        intent_id: group_id,
+                        detail: format!("publication group has unknown kind {raw_kind}"),
+                    })
+                }
+            };
+            let mut children = self.conn.prepare(
+                "SELECT intent_id FROM publication_group_children
+                 WHERE group_id = ?1 ORDER BY ordinal",
+            )?;
+            let child_intents = children
+                .query_map([group_id], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if child_intents.is_empty() {
+                return Err(StoreError::BadIntent {
+                    intent_id: group_id,
+                    detail: "publication group has no child intents".into(),
+                });
+            }
+            groups.push(PublicationGroup {
+                group_id,
+                kind,
+                basis,
+                child_intents,
+            });
+        }
+        Ok(groups)
+    }
+
+    /// Retire a parent only after every named child reached a terminal durable
+    /// state. A caller must perform its final rescan before publishing the
+    /// healed input version; retirement merely proves no filesystem work is
+    /// left implicit.
+    pub fn retire_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
+        let pending: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM publication_group_children c
+             JOIN write_intents w ON w.intent_id = c.intent_id
+             WHERE c.group_id = ?1 AND w.retired = 0",
+            [group_id],
+            |row| row.get(0),
+        )?;
+        if pending != 0 {
+            return Err(StoreError::BadIntent {
+                intent_id: group_id,
+                detail: format!("publication group still has {pending} unfinished children"),
+            });
+        }
+        let changed = self.conn.execute(
+            "UPDATE publication_groups SET retired = 1
+             WHERE group_id = ?1 AND retired = 0",
+            [group_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::BadIntent {
+                intent_id: group_id,
+                detail: "no unfinished publication group with this id".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn record_intent(
         &mut self,
         target_path: &str,

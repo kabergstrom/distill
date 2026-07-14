@@ -91,6 +91,8 @@ fn every_section_13_table_exists() {
         "pins",
         "write_intents",
         "displaced",
+        "publication_groups",
+        "publication_group_children",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -417,5 +419,23 @@ fn write_intent_journal_shape() {
             "cleaned_at",
             "cleanup_reason"
         ]
+    );
+}
+
+#[test]
+fn multi_path_publication_parent_names_its_basis_and_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_conn(&dir);
+    assert_eq!(
+        columns(&conn, "publication_groups"),
+        ["group_id", "kind", "basis", "retired"]
+    );
+    assert_eq!(
+        columns(&conn, "publication_group_children"),
+        ["group_id", "ordinal", "intent_id"]
+    );
+    assert_eq!(
+        pk_columns(&conn, "publication_group_children"),
+        ["group_id", "ordinal"]
     );
 }

@@ -5,7 +5,10 @@
 //! sweep (§18's `displaced_retention_days`).
 
 use distill_core::id::ContentHash;
-use distill_store::journal::{CreationRecoveryOutcome, RenameAsideOutcome, RenameAsideState};
+use distill_store::journal::{
+    CreationRecoveryOutcome, JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome,
+    RenameAsideState,
+};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
@@ -54,6 +57,78 @@ fn intents_persist_with_their_full_shape() {
     assert!(intent.quarantine_paths.is_empty());
     assert_eq!(intent.rename_aside_state, RenameAsideState::Prepared);
     assert!(!intent.retired);
+}
+
+#[test]
+fn multi_path_parent_and_every_child_are_recorded_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let plans = [
+        JournalIntentPlan {
+            target_path: "root/a.bundle".into(),
+            temp_path: "root/.a.proposed".into(),
+            conflict_path: "root/a.conflict".into(),
+            pre_image_hash: Some(hash(b"a")),
+            proposed_hash: hash(b"new-a"),
+        },
+        JournalIntentPlan {
+            target_path: "root/b.bundle".into(),
+            temp_path: String::new(),
+            conflict_path: "root/b.conflict".into(),
+            pre_image_hash: Some(hash(b"b")),
+            proposed_hash: hash(b""),
+        },
+    ];
+
+    let group = store
+        .record_publication_group(
+            PublicationGroupKind::LineageDuplicate,
+            b"complete canonical claimant basis",
+            &plans,
+        )
+        .unwrap();
+    drop(store);
+
+    let store = Store::open(cfg(&dir)).unwrap();
+    let recovered = store.unfinished_publication_groups().unwrap();
+    assert_eq!(recovered, vec![group.clone()]);
+    let intents = store.unretired_intents().unwrap();
+    assert_eq!(
+        intents
+            .iter()
+            .map(|intent| intent.intent_id)
+            .collect::<Vec<_>>(),
+        group.child_intents
+    );
+    assert_eq!(intents[0].pre_image_hash, plans[0].pre_image_hash);
+    assert_eq!(intents[1].temp_path, "");
+}
+
+#[test]
+fn parent_cannot_retire_until_every_child_is_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let group = store
+        .record_publication_group(
+            PublicationGroupKind::LineageCreate,
+            b"missing destination basis",
+            &[JournalIntentPlan {
+                target_path: "root/lineage.bundle".into(),
+                temp_path: "root/.lineage.proposed".into(),
+                conflict_path: "root/lineage.conflict".into(),
+                pre_image_hash: None,
+                proposed_hash: hash(b"manifest"),
+            }],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.retire_publication_group(group.group_id),
+        Err(StoreError::BadIntent { .. })
+    ));
+    store.retire_intent(group.child_intents[0]).unwrap();
+    store.retire_publication_group(group.group_id).unwrap();
+    assert!(store.unfinished_publication_groups().unwrap().is_empty());
 }
 
 #[test]
