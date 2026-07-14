@@ -23,4 +23,5 @@ tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"

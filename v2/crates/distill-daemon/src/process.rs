@@ -8,11 +8,13 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use distill_core::attestation::CompiledTypeTable;
+use distill_schema::{ProjectSchemaAuthority, SchemaAuthorityError};
+use distill_store::state::{
+    CleanupDisposition, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+};
 
 use crate::config::{config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
-use crate::epoch::CandidateRequirements;
 use crate::watcher::{WatcherQueue, WatcherThread};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
@@ -31,12 +33,25 @@ pub struct DaemonProcess {
 }
 
 impl DaemonProcess {
-    pub fn start(
+    /// Start from the configured shared schema artifact. Production never
+    /// substitutes the bootstrap-only table for `assets.schema_path`.
+    pub fn start(config: DaemonConfig) -> Result<Self, DaemonProcessError> {
+        let schema_bytes = std::fs::read(&config.assets.schema_path).map_err(|source| {
+            DaemonProcessError::SchemaRead {
+                path: config.assets.schema_path.clone(),
+                source,
+            }
+        })?;
+        let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
+        Self::start_with_authority(config, authority)
+    }
+
+    pub fn start_with_authority(
         config: DaemonConfig,
-        compiled: CompiledTypeTable,
+        authority: ProjectSchemaAuthority,
     ) -> Result<Self, DaemonProcessError> {
-        let requirements = config.candidate_requirements(&compiled)?;
-        let targets = config.target_definitions(&compiled)?;
+        let targets =
+            config.target_definitions(authority.compiled_table(), authority.identity())?;
         let coordinator = Arc::new(DaemonCoordinator::open(
             config.store_config(),
             config.asset_roots(),
@@ -44,15 +59,16 @@ impl DaemonProcess {
             targets,
             config.pipeline.max_dependency_depth,
         )?);
+        // The first schema/module/target candidate may replace the scanner's
+        // root set. Publish it before attaching the filesystem watcher so the
+        // watcher is born against the installed scanner, never an obsolete
+        // startup instance.
+        let mut config_watch = ConfigWatch::new(config.clone());
+        config_watch.reconcile(&coordinator)?;
         let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new(WATCH_CAPACITY)));
         let watcher =
             WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue), DEBOUNCE)?;
         coordinator.reconcile_startup(&watcher_queue)?;
-        let mut config_watch = ConfigWatch::new(config.clone(), compiled.clone());
-        config_watch.reconcile(&coordinator)?;
-        let mut pipeline_watch =
-            PipelineWatch::new(config.modules.pipeline_dylib.clone(), requirements);
-        pipeline_watch.reconcile(&coordinator)?;
         reconcile_imports(&coordinator)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -63,7 +79,6 @@ impl DaemonProcess {
             Arc::clone(&stop),
             Arc::clone(&last_background_error),
             config_watch,
-            pipeline_watch,
         ));
 
         let (address_tx, address_rx) = mpsc::sync_channel(1);
@@ -138,6 +153,11 @@ pub enum DaemonProcessError {
     CoordinatorInit(CoordinatorInitError),
     Coordinator(CoordinatorError),
     Watch(crate::scanner::ScanError),
+    SchemaRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Schema(SchemaAuthorityError),
     Rpc(String),
 }
 
@@ -169,6 +189,11 @@ impl From<crate::scanner::ScanError> for DaemonProcessError {
         Self::Watch(error)
     }
 }
+impl From<SchemaAuthorityError> for DaemonProcessError {
+    fn from(error: SchemaAuthorityError) -> Self {
+        Self::Schema(error)
+    }
+}
 
 fn spawn_coordinator_loop(
     coordinator: Arc<DaemonCoordinator>,
@@ -176,7 +201,6 @@ fn spawn_coordinator_loop(
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     mut config_watch: ConfigWatch,
-    mut pipeline_watch: PipelineWatch,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("distill-coordinator".to_owned())
@@ -191,11 +215,9 @@ fn spawn_coordinator_loop(
                         WatchAction::Events(watcher.take_live_batch())
                     }
                 };
-                let result = config_watch.reconcile(&coordinator).and_then(|update| {
-                    if let Some((path, requirements, observed)) = update {
-                        pipeline_watch.reconfigure_published(path, requirements, observed);
-                    }
-                    match action {
+                let result = config_watch
+                    .reconcile(&coordinator)
+                    .and_then(|()| match action {
                         WatchAction::FullRescan => coordinator
                             .reconcile_full_scan()
                             .and_then(|_| reconcile_imports(&coordinator)),
@@ -203,9 +225,7 @@ fn spawn_coordinator_loop(
                         WatchAction::Events(events) => coordinator
                             .apply_watcher_batch(events)
                             .and_then(|_| reconcile_imports(&coordinator)),
-                    }
-                });
-                let result = result.and_then(|_| pipeline_watch.reconcile(&coordinator));
+                    });
                 let _ = coordinator.reap_retired_pipeline_epochs();
                 if let Err(error) = result {
                     *lock(&last_error) = Some(error.to_string());
@@ -217,54 +237,42 @@ fn spawn_coordinator_loop(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PipelineSourceState {
+enum ArtifactSourceState {
     Missing,
     Unreadable(std::io::ErrorKind),
     Bytes([u8; 32]),
 }
 
-struct PipelineWatch {
-    path: std::path::PathBuf,
-    requirements: CandidateRequirements,
-    observed: Option<PipelineSourceState>,
+struct SchemaObservation {
+    state: ArtifactSourceState,
+    outcome: Result<ProjectSchemaAuthority, String>,
 }
 
-impl PipelineWatch {
-    fn new(path: std::path::PathBuf, requirements: CandidateRequirements) -> Self {
-        Self {
-            path,
-            requirements,
-            observed: None,
-        }
-    }
-
-    fn reconcile(&mut self, coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
-        let state = observe_pipeline_source(&self.path);
-        if self.observed.as_ref() == Some(&state) {
-            return Ok(());
-        }
-        coordinator.publish_pipeline_candidate(&self.path, self.requirements.clone())?;
-        self.observed = Some(state);
-        Ok(())
-    }
-
-    fn reconfigure_published(
-        &mut self,
-        path: PathBuf,
-        requirements: CandidateRequirements,
-        observed: PipelineSourceState,
-    ) {
-        self.path = path;
-        self.requirements = requirements;
-        self.observed = Some(observed);
-    }
-}
-
-fn observe_pipeline_source(path: &Path) -> PipelineSourceState {
+fn observe_artifact_source(path: &Path) -> ArtifactSourceState {
     match std::fs::read(path) {
-        Ok(bytes) => PipelineSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PipelineSourceState::Missing,
-        Err(error) => PipelineSourceState::Unreadable(error.kind()),
+        Ok(bytes) => ArtifactSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArtifactSourceState::Missing,
+        Err(error) => ArtifactSourceState::Unreadable(error.kind()),
+    }
+}
+
+fn observe_schema_source(path: &Path) -> SchemaObservation {
+    match std::fs::read(path) {
+        Ok(bytes) => SchemaObservation {
+            state: ArtifactSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
+            outcome: ProjectSchemaAuthority::from_json(&bytes).map_err(|error| error.to_string()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SchemaObservation {
+            state: ArtifactSourceState::Missing,
+            outcome: Err(format!("schema artifact {} is missing", path.display())),
+        },
+        Err(error) => SchemaObservation {
+            state: ArtifactSourceState::Unreadable(error.kind()),
+            outcome: Err(format!(
+                "cannot read schema artifact {}: {error}",
+                path.display()
+            )),
+        },
     }
 }
 
@@ -281,86 +289,120 @@ struct ConfigObservation {
 
 struct ConfigWatch {
     path: PathBuf,
-    compiled: CompiledTypeTable,
     active: DaemonConfig,
     last_valid: DaemonConfig,
     observed: Option<ConfigSourceState>,
+    observed_schema: Option<ArtifactSourceState>,
+    observed_pipeline: Option<ArtifactSourceState>,
     rejected: bool,
 }
 
 impl ConfigWatch {
-    fn new(active: DaemonConfig, compiled: CompiledTypeTable) -> Self {
+    fn new(active: DaemonConfig) -> Self {
         Self {
             path: active.source_path.clone(),
-            compiled,
             last_valid: active.clone(),
             active,
             observed: None,
+            observed_schema: None,
+            observed_pipeline: None,
             rejected: false,
         }
     }
 
-    fn reconcile(
-        &mut self,
-        coordinator: &DaemonCoordinator,
-    ) -> Result<Option<(PathBuf, CandidateRequirements, PipelineSourceState)>, CoordinatorError>
-    {
+    fn reconcile(&mut self, coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
         let observation = observe_configuration(&self.path);
-        if self.observed.as_ref() == Some(&observation.state) {
-            return Ok(None);
-        }
-        let update = match observation.outcome {
+        match observation.outcome {
             Err((reason, message)) => {
+                if self.observed.as_ref() == Some(&observation.state) {
+                    return Ok(());
+                }
                 coordinator.publish_configuration_rejection(reason, message)?;
                 self.rejected = true;
-                None
+                self.observed = Some(observation.state);
+                return Ok(());
             }
             Ok(candidate) => {
-                let input_changed = input_configuration_changed(&self.active, &candidate);
-                let pipeline = if input_changed {
-                    let requirements = candidate
-                        .candidate_requirements(&self.compiled)
-                        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-                    let targets = candidate
-                        .target_definitions(&self.compiled)
-                        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-                    let path = candidate.modules.pipeline_dylib.clone();
-                    let observed = observe_pipeline_source(&path);
-                    coordinator.publish_configuration_candidate(
-                        candidate.asset_roots(),
-                        candidate.assets.lineage_manifest.clone(),
-                        targets,
-                        &path,
-                        requirements.clone(),
-                    )?;
-                    Some((path, requirements, observed))
-                } else if self.rejected {
-                    coordinator.heal_configuration_rejection()?;
-                    None
-                } else {
-                    None
-                };
-
-                if operational_configuration_changed(&self.active, &candidate) {
-                    coordinator.apply_operational_configuration(
-                        &candidate.store_config(),
-                        candidate.pipeline.max_dependency_depth,
-                    )?;
-                }
-
-                let restart = restart_changes(&self.last_valid, &candidate);
-                if !restart.is_empty() {
-                    coordinator.stage_restart_configuration(&restart)?;
-                }
-
-                apply_live_values(&mut self.active, &candidate);
-                self.last_valid = candidate;
-                self.rejected = false;
-                pipeline
+                return self.reconcile_valid(coordinator, observation.state, candidate);
             }
-        };
-        self.observed = Some(observation.state);
-        Ok(update)
+        }
+    }
+
+    fn reconcile_valid(
+        &mut self,
+        coordinator: &DaemonCoordinator,
+        config_state: ConfigSourceState,
+        candidate: DaemonConfig,
+    ) -> Result<(), CoordinatorError> {
+        let schema = observe_schema_source(&candidate.assets.schema_path);
+        let pipeline_state = observe_artifact_source(&candidate.modules.pipeline_dylib);
+        let config_changed = self.observed.as_ref() != Some(&config_state);
+        let schema_changed = self.observed_schema.as_ref() != Some(&schema.state);
+        let pipeline_changed = self.observed_pipeline.as_ref() != Some(&pipeline_state);
+        if !config_changed && !schema_changed && !pipeline_changed && !self.rejected {
+            return Ok(());
+        }
+
+        let input_changed = self.observed.is_none()
+            || input_configuration_changed(&self.active, &candidate)
+            || schema_changed
+            || pipeline_changed
+            || self.rejected;
+
+        match schema.outcome {
+            Err(message) if input_changed => {
+                let poison = PipelinePoison::new(
+                    PipelinePoisonCode::CandidateValidation,
+                    PipelinePoisonOrigin::CandidateOpen,
+                    CleanupDisposition::None,
+                    message,
+                )
+                .expect("schema candidate poison tuple is valid");
+                coordinator.publish_pipeline_rejection(poison)?;
+            }
+            Err(_) => {}
+            Ok(authority) if input_changed => {
+                let authority = Arc::new(authority);
+                let requirements = candidate
+                    .candidate_requirements(authority.compiled_table(), authority.identity())
+                    .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+                let targets = candidate
+                    .target_definitions(authority.compiled_table(), authority.identity())
+                    .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+                coordinator.publish_configuration_candidate(
+                    candidate.asset_roots(),
+                    candidate.assets.lineage_manifest.clone(),
+                    targets,
+                    &candidate.modules.pipeline_dylib,
+                    requirements,
+                    Arc::clone(&authority),
+                )?;
+            }
+            Ok(_) if self.rejected => {
+                coordinator.heal_configuration_rejection()?;
+            }
+            Ok(_) => {}
+        }
+
+        if operational_configuration_changed(&self.active, &candidate) {
+            coordinator.apply_operational_configuration(
+                &candidate.store_config(),
+                candidate.pipeline.max_dependency_depth,
+            )?;
+        }
+
+        let restart = restart_changes(&self.last_valid, &candidate);
+        if !restart.is_empty() {
+            coordinator.stage_restart_configuration(&restart)?;
+        }
+
+        apply_live_values(&mut self.active, &candidate);
+        self.last_valid = candidate;
+        self.observed = Some(config_state);
+        self.observed_schema = Some(schema.state);
+        self.observed_pipeline = Some(pipeline_state);
+        self.rejected = false;
+        Ok(())
     }
 }
 

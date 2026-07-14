@@ -1,5 +1,7 @@
 use distill_daemon::config::{DaemonConfig, DaemonConfigError};
-use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
+use distill_schema::bootstrap_gen_v1::{
+    consumer_bootstrap_authority_v1, consumer_compilation_identity_v1,
+};
 
 fn valid_config(temp: &tempfile::TempDir) -> String {
     std::fs::create_dir_all(temp.path().join("assets")).unwrap();
@@ -60,7 +62,9 @@ fn parses_and_validates_the_complete_configuration_surface() {
         .table()
         .compiled_table()
         .unwrap();
-    let definitions = config.target_definitions(&table).unwrap();
+    let definitions = config
+        .target_definitions(&table, consumer_compilation_identity_v1())
+        .unwrap();
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].name(), "dev");
 }
@@ -135,7 +139,41 @@ fn target_definition_hash_changes_for_a_bound_target_edit() {
         .compiled_table()
         .unwrap();
     assert_ne!(
-        a.target_definitions(&table).unwrap()[0].definition_hash(),
-        b.target_definitions(&table).unwrap()[0].definition_hash()
+        a.target_definitions(&table, consumer_compilation_identity_v1())
+            .unwrap()[0]
+            .definition_hash(),
+        b.target_definitions(&table, consumer_compilation_identity_v1())
+            .unwrap()[0]
+            .definition_hash()
+    );
+}
+
+#[test]
+fn target_and_module_requirements_bind_the_schema_artifact_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let config =
+        DaemonConfig::parse(temp.path().join("distill.toml"), &valid_config(&temp)).unwrap();
+    let table = consumer_bootstrap_authority_v1()
+        .unwrap()
+        .table()
+        .compiled_table()
+        .unwrap();
+    let first = consumer_compilation_identity_v1().clone();
+    let mut second = first.clone();
+    second.algorithm_version += 1;
+
+    let first_target = config.target_definitions(&table, &first).unwrap();
+    let second_target = config.target_definitions(&table, &second).unwrap();
+    assert_ne!(
+        first_target[0].definition_hash(),
+        second_target[0].definition_hash()
+    );
+    assert_eq!(
+        config
+            .candidate_requirements(&table, &second)
+            .unwrap()
+            .identity
+            .compilation,
+        second
     );
 }

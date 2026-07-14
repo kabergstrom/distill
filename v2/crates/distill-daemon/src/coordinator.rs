@@ -19,6 +19,7 @@ use distill_rpc::{
     DriftedInput, LineageManifestClaimant, LineageRepairState, PathMutation, PipelineDiagnostic,
     Server, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison, VersionPoisonV1,
 };
+use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileKind, FileState};
@@ -60,6 +61,7 @@ pub struct DaemonCoordinator {
     lineage_destination: RwLock<LineageDestination>,
     authoring: Arc<AuthoringService>,
     pipeline: Mutex<CoordinatedPipelineRuntime>,
+    schema_authority: RwLock<Option<Arc<ProjectSchemaAuthority>>>,
     configuration_poison: Mutex<Option<ConfigurationPoison>>,
     operational: Mutex<OperationalRuntime>,
 }
@@ -140,6 +142,7 @@ impl DaemonCoordinator {
             lineage_destination: RwLock::new(lineage_destination),
             authoring: backend,
             pipeline: Mutex::new(pipeline),
+            schema_authority: RwLock::new(None),
             configuration_poison: Mutex::new(None),
             operational: Mutex::new(operational),
         })
@@ -163,6 +166,13 @@ impl DaemonCoordinator {
 
     pub fn pipeline_snapshot(&self) -> PipelineSnapshot {
         lock_pipeline(&self.pipeline).host.snapshot()
+    }
+
+    pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
+        self.schema_authority
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn operational_configuration(&self) -> SchedulerConfig {
@@ -272,6 +282,7 @@ impl DaemonCoordinator {
         targets: Vec<TargetDefinition>,
         pipeline_source: &std::path::Path,
         mut requirements: CandidateRequirements,
+        schema_authority: Arc<ProjectSchemaAuthority>,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let filesystem = self
             .authoring
@@ -325,6 +336,11 @@ impl DaemonCoordinator {
                     .lineage_destination
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = destination;
+                *self
+                    .schema_authority
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::clone(&schema_authority));
                 self.configuration_poison
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -397,34 +413,8 @@ impl DaemonCoordinator {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(poison) => {
-                let store = Arc::clone(&self.store);
-                let diagnostic = poison.clone();
-                let result = self.server.coordinated_commit(base, || {
-                    let mut store = lock_store(&store);
-                    if store.input_version() != base {
-                        return Err(format!(
-                            "durable pipeline-poison basis is {:?}, expected {base:?}",
-                            store.input_version()
-                        ));
-                    }
-                    store
-                        .input_transaction(|transaction| {
-                            transaction.publish_pipeline_poison(&diagnostic)
-                        })
-                        .map_err(|error| error.to_string())?;
-                    Ok(Commit {
-                        pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
-                        ..Commit::default()
-                    })
-                });
-                match result {
-                    Ok(stamp) => {
-                        discard_pending(&mut runtime);
-                        runtime.host.install_poison(poison);
-                        return Ok(stamp);
-                    }
-                    Err(error) => return Err(CoordinatorError::Coordinated(error)),
-                }
+                drop(runtime);
+                return self.publish_pipeline_rejection(poison);
             }
         };
 
@@ -513,6 +503,44 @@ impl DaemonCoordinator {
             }
         }
         Ok(stamp)
+    }
+
+    /// Publish a candidate-input failure which occurs before a module can be
+    /// opened (for example, malformed watched schema JSON). The last durable
+    /// schema/target projection remains intact, while the new input version is
+    /// explicitly pipeline-poisoned and the live module is fenced.
+    pub fn publish_pipeline_rejection(
+        &self,
+        poison: PipelinePoison,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let base = self.server.current_stamp().version;
+        let store = Arc::clone(&self.store);
+        let diagnostic = poison.clone();
+        let result = self.server.coordinated_commit(base, || {
+            let mut store = lock_store(&store);
+            if store.input_version() != base {
+                return Err(format!(
+                    "durable pipeline-poison basis is {:?}, expected {base:?}",
+                    store.input_version()
+                ));
+            }
+            store
+                .input_transaction(|transaction| transaction.publish_pipeline_poison(&diagnostic))
+                .map_err(|error| error.to_string())?;
+            Ok(Commit {
+                pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
+                ..Commit::default()
+            })
+        });
+        match result {
+            Ok(stamp) => {
+                let mut runtime = lock_pipeline(&self.pipeline);
+                discard_pending(&mut runtime);
+                runtime.host.install_poison(poison);
+                Ok(stamp)
+            }
+            Err(error) => Err(CoordinatorError::Coordinated(error)),
+        }
     }
 
     pub fn reap_retired_pipeline_epochs(&self) -> Vec<UnloadOutcome> {

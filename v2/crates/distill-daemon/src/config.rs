@@ -8,6 +8,7 @@ use distill_build::keys::target_definition_hash;
 use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
 use distill_core::attestation::CompiledTypeTable;
 use distill_rpc::{LoadPolicyEntry, TargetDefinition, TargetDefinitionHash};
+use distill_schema::ngp_schema::CompilationIdentity;
 use distill_store::config::{parse_byte_size, ConfigValidationError};
 use distill_store::state::{ConfigurationPathKey, DscpV1, OwnedPathKind, OwnedPathSide};
 use distill_store::StoreConfig;
@@ -354,8 +355,8 @@ impl DaemonConfig {
     pub fn target_definitions(
         &self,
         compiled: &CompiledTypeTable,
+        identity: &CompilationIdentity,
     ) -> Result<Vec<TargetDefinition>, DaemonConfigError> {
-        let identity = distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1().clone();
         self.targets
             .iter()
             .map(|(name, target)| {
@@ -386,8 +387,9 @@ impl DaemonConfig {
     pub fn candidate_requirements(
         &self,
         compiled: &CompiledTypeTable,
+        identity: &CompilationIdentity,
     ) -> Result<CandidateRequirements, DaemonConfigError> {
-        let rpc_targets = self.target_definitions(compiled)?;
+        let rpc_targets = self.target_definitions(compiled, identity)?;
         let targets = rpc_targets
             .iter()
             .map(|target| PipelineTarget {
@@ -403,10 +405,8 @@ impl DaemonConfig {
                 digest: row.native_layout_digest,
             })
             .collect();
-        let compilation =
-            distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1().clone();
         Ok(CandidateRequirements {
-            identity: host_module_identity(compilation),
+            identity: host_module_identity(identity.clone()),
             measured_layouts,
             compiled_types: compiled.clone(),
             targets,

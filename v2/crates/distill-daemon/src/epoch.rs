@@ -1455,25 +1455,19 @@ pub(crate) fn stored_pipeline_epoch(
         schema_registry,
         registrations,
     };
-    let authority = consumer_authority(requirements)?;
+    let authority = consumer_authority()?;
     ValidatedPipelineEpoch::validate(epoch, &requirements.compiled_types, authority)
 }
 
-fn consumer_authority(
-    requirements: &CandidateRequirements,
-) -> Result<&'static HostBootstrapAuthorityV1, StoreError> {
-    let authority =
-        distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1().map_err(|_| {
-            StoreError::InvalidPipelineEpoch {
-                detail: "consumer bootstrap authority resource is invalid",
-            }
-        })?;
-    if &requirements.identity.compilation != authority.compilation_identity() {
-        return Err(StoreError::InvalidPipelineEpoch {
-            detail: "candidate DSCI differs from the store bootstrap authority",
-        });
-    }
-    Ok(authority)
+fn consumer_authority() -> Result<&'static HostBootstrapAuthorityV1, StoreError> {
+    // Project DSCI comes from the watched source-walk table. Bootstrap
+    // authority is row authority, not a substitute project identity: exact
+    // bootstrap DSNL/DSLH/DSRE equality is checked below by the sealed brand.
+    distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1().map_err(|_| {
+        StoreError::InvalidPipelineEpoch {
+            detail: "consumer bootstrap authority resource is invalid",
+        }
+    })
 }
 
 fn validate_requirements(
