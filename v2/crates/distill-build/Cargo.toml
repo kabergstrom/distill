@@ -10,7 +10,9 @@ unicode-normalization.workspace = true
 globset.workspace = true
 tempfile = "3"
 distill-core = { path = "../distill-core" }
+distill-bundle = { path = "../distill-bundle" }
 distill-json = { path = "../distill-json" }
 distill-migrate = { path = "../distill-migrate" }
 distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
+distill-wire = { path = "../distill-wire" }

@@ -3,6 +3,7 @@
 //! supplies snapshot/file backends while this crate owns deterministic
 //! folds, keys, validation, trace revalidation, and stack-safe traversal.
 
+pub mod artifact_encode;
 pub mod cache;
 pub mod codegen;
 pub mod dslf;
