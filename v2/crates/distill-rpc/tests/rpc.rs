@@ -3289,7 +3289,7 @@ fn target_bound_data_coverage_never_serves_runtime_types_outside_the_accepted_se
 }
 
 #[test]
-fn wire_tree_coverage_uses_only_current_verified_artifact_references() {
+fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
     let server = server_with(&[(1, false), (2, false)]);
     let hub = connect(&server, &[(1, false)]);
     let node = distill_wire::wire::WireNode::Unit { offset: 0 };
@@ -3342,6 +3342,15 @@ fn wire_tree_coverage_uses_only_current_verified_artifact_references() {
         ),
     );
 
+    assert_eq!(hub.wire_tree(layout_hash), RpcResult::Success(tree.clone()));
+
+    commit_one(
+        &server,
+        AssetMutation::Remove {
+            uuid: asset,
+            delta: AssetDeltaState::Deleted,
+        },
+    );
     assert_eq!(hub.wire_tree(layout_hash), RpcResult::Success(tree));
 }
 

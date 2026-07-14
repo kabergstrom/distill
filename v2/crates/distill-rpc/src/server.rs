@@ -2199,7 +2199,7 @@ impl Hub {
             .views
             .get(&state.current)
             .expect("current view must exist");
-        let referencing_hashes = current_view
+        let mut referencing_hashes = current_view
             .assets
             .values()
             .filter_map(|resolution| match resolution {
@@ -2212,7 +2212,30 @@ impl Hub {
             })
             .collect::<BTreeSet<_>>();
         if referencing_hashes.is_empty() {
-            return RpcResult::Failure(RpcFailure::WireTreeNotFound { hash });
+            let historical = state
+                .artifacts
+                .iter()
+                .filter_map(|(content_hash, artifact)| {
+                    (artifact.layout_hash == hash).then_some(*content_hash)
+                })
+                .collect::<BTreeSet<_>>();
+            if historical.is_empty() {
+                return RpcResult::Failure(RpcFailure::WireTreeNotFound { hash });
+            }
+            for content_hash in &historical {
+                let (required, _) = match verified_artifact_closure(&state, *content_hash) {
+                    Ok(verified) => verified,
+                    Err(error) => return RpcResult::Failure(error),
+                };
+                if required.is_subset(&connection.accepted_type_uuids) {
+                    return RpcResult::Success(tree.bytes.clone());
+                }
+            }
+            referencing_hashes.insert(
+                *historical
+                    .first()
+                    .expect("nonempty historical reference set was checked"),
+            );
         }
         let mut closure_by_asset = BTreeMap::new();
         for content_hash in referencing_hashes {
@@ -5133,6 +5156,14 @@ fn push_chunks(
     bytes: &[u8],
     chunk_size: usize,
 ) {
+    if bytes.is_empty() {
+        out.push_back(ArtifactChunk {
+            kind,
+            offset: 0,
+            bytes: Arc::from([]),
+        });
+        return;
+    }
     for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
         out.push_back(ArtifactChunk {
             kind: kind.clone(),
