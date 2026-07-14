@@ -175,11 +175,13 @@ fn spawn_coordinator_loop(
                     }
                 };
                 let result = match action {
-                    WatchAction::FullRescan => coordinator.reconcile_full_scan().map(|_| ()),
+                    WatchAction::FullRescan => coordinator
+                        .reconcile_full_scan()
+                        .and_then(|_| reconcile_imports(&coordinator)),
                     WatchAction::Events(events) if events.is_empty() => Ok(()),
-                    WatchAction::Events(events) => {
-                        coordinator.apply_watcher_batch(events).map(|_| ())
-                    }
+                    WatchAction::Events(events) => coordinator
+                        .apply_watcher_batch(events)
+                        .and_then(|_| reconcile_imports(&coordinator)),
                 };
                 if let Err(error) = result {
                     *lock(&last_error) = Some(error.to_string());
@@ -188,6 +190,12 @@ fn spawn_coordinator_loop(
             }
         })
         .expect("failed to start distill coordinator thread")
+}
+
+fn reconcile_imports(coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
+    coordinator.reconcile_directory_imports()?;
+    coordinator.reconcile_watched_imports()?;
+    Ok(())
 }
 
 enum WatchAction {

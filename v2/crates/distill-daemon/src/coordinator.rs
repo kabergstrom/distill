@@ -206,6 +206,66 @@ impl DaemonCoordinator {
         let scan = self.scanner.scan()?;
         self.publish_scan(scan)
     }
+
+    /// Rerun watched imports whose complete outcome-bearing basis drifted.
+    /// Each bundle publishes as its own version so a later conflict cannot
+    /// roll back an earlier per-file success.
+    pub fn reconcile_watched_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
+        let pending = self
+            .authoring
+            .watched_imports_needing_reimport()
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        let mut imported = Vec::with_capacity(pending.len());
+        for bundle in pending {
+            let base = self.server.current_stamp().version;
+            let authoring = Arc::clone(&self.authoring);
+            self.server
+                .coordinated_commit(base, || {
+                    authoring
+                        .prepare_reimport_bundle(base, bundle)
+                        .map(|prepared| prepared.commit)
+                        .map_err(|error| format!("{error:?}"))
+                })
+                .map_err(CoordinatorError::Coordinated)?;
+            imported.push(bundle);
+        }
+        Ok(imported)
+    }
+
+    /// Discover and apply authored directory-import rules. Every generated
+    /// bundle is a separate journaled/versioned fold; orphaned prior outputs
+    /// are deliberately retained and therefore never appear as deletion work.
+    pub fn reconcile_directory_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
+        let tasks = self
+            .authoring
+            .directory_import_tasks()
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        let mut imported = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let base = self.server.current_stamp().version;
+            let authoring = Arc::clone(&self.authoring);
+            let bundle = Arc::new(Mutex::new(None));
+            let captured = Arc::clone(&bundle);
+            self.server
+                .coordinated_commit(base, || {
+                    let prepared = authoring
+                        .prepare_directory_import(base, &task)
+                        .map_err(|error| format!("{error:?}"))?;
+                    *captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared.bundle);
+                    Ok(prepared.commit)
+                })
+                .map_err(CoordinatorError::Coordinated)?;
+            imported.push(
+                bundle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("coordinated directory import captured its bundle"),
+            );
+        }
+        Ok(imported)
+    }
 }
 
 enum ScanRejection {
@@ -598,7 +658,14 @@ fn publish_scan(
                     path: source.normalized_path.clone(),
                     format_version: bundle.format_version,
                     content_hash: ContentHash(source.file_hash.0),
-                    origin: None,
+                    origin: crate::importer::decoded_directory_origin(bundle).map_err(|error| {
+                        StoreError::InvalidConfiguration {
+                            error: format!(
+                                "invalid import record in {}: {error:?}",
+                                source.normalized_path
+                            ),
+                        }
+                    })?,
                 })?;
                 for (hash, schema) in &bundle.schemas {
                     let snapshot =

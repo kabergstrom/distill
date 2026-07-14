@@ -12,12 +12,14 @@ use distill_build::import::{
     fold_import, DirectoryOrigin, FileDep, FoldRequest, IdentitySource, ImportBackend,
     ImportContext, ImportError, ImportOutput, ImportRecord, ImportedBundle, ImportedEntry,
 };
-use distill_build::query::{normalize_identifier, normalize_path, FileQuery, RootName, RootedPath};
-use distill_build::trace::{CapabilityKey, Observed, RawFileFailureClass};
+use distill_build::query::{
+    file_query_result_hash, normalize_identifier, normalize_path, FileQuery, RootName, RootedPath,
+};
+use distill_build::trace::{CapabilityKey, DirectoryGrouping, Observed, RawFileFailureClass};
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
 use distill_core::attestation::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BootstrapControlSymbol,
-    IMPORT_RECORD_TYPE_UUID,
+    DIRECTORY_IMPORT_RULES_TYPE_UUID, IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
@@ -70,6 +72,35 @@ pub(crate) struct RegisteredImporter {
 
 pub(crate) type RegisteredImporters = BTreeMap<String, RegisteredImporter>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct DirectoryImportTask {
+    rules_bundle: BundleUuid,
+    rule: distill_build::import::ImportRuleId,
+    group: RootedPath,
+    importer: String,
+    sources: Vec<RootedPath>,
+    settings: AuthoredValue,
+    destination_root: String,
+    destination_path: String,
+    listing_dep: FileDep,
+}
+
+#[derive(Debug)]
+struct DecodedDirectoryRules {
+    listing: FileQuery,
+    rules: Vec<DecodedDirectoryRule>,
+}
+
+#[derive(Debug)]
+struct DecodedDirectoryRule {
+    id: distill_build::import::ImportRuleId,
+    matches: FileQuery,
+    group: DirectoryGrouping,
+    importer: String,
+    settings: AuthoredValue,
+    output: String,
+}
+
 impl RegisteredImporter {
     pub(crate) fn validate(importer: Arc<dyn AuthoringImporter>) -> Result<Self, RpcFailure> {
         let id = normalize_identifier(importer.id()).map_err(invalid)?;
@@ -109,6 +140,236 @@ impl RegisteredImporter {
 }
 
 impl AuthoringService {
+    /// Return every watched bundle whose complete committed read-set no longer
+    /// reproduces under the current rooted filesystem and importer-capability
+    /// projection. The caller reruns these under the single-writer RPC CAS.
+    pub fn watched_imports_needing_reimport(&self) -> Result<Vec<BundleUuid>, RpcFailure> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+        let capabilities = self.importer_capabilities()?;
+        let mut pending = Vec::new();
+        for meta in store.all_bundles().map_err(invalid)? {
+            let prior = match self.read_prior_import(&store, &meta) {
+                Ok(prior) => prior,
+                Err(_) => continue,
+            };
+            if !prior.model.record.watch {
+                continue;
+            }
+            let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+            if !revalidate_read_set(&prior.model.record.read_set, &mut backend) {
+                pending.push(meta.bundle);
+            }
+        }
+        pending.sort_unstable();
+        pending.dedup();
+        Ok(pending)
+    }
+
+    pub(crate) fn directory_import_tasks(&self) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+        let capabilities = self.importer_capabilities()?;
+        let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+        let mut all_rule_ids = BTreeMap::<[u8; 16], BundleUuid>::new();
+        let mut tasks = Vec::new();
+
+        for meta in store.all_bundles().map_err(invalid)? {
+            let root = store
+                .root_name(meta.root)
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("bundle root identity is missing"))?;
+            let path = self
+                .scanner
+                .physical_path(&root, &meta.path)
+                .map_err(invalid)?;
+            let bytes = self.scanner.read_identity_checked(&path).map_err(invalid)?;
+            if ContentHash(*blake3::hash(&bytes).as_bytes()) != meta.content_hash {
+                return Err(invalid(format!(
+                    "directory-rules bundle {} changed since the durable version",
+                    meta.path
+                )));
+            }
+            let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+            for entry in bundle
+                .assets
+                .values()
+                .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
+            {
+                let rules = decode_directory_rules(&entry.data)?;
+                for rule in &rules.rules {
+                    if let Some(prior) = all_rule_ids.insert(rule.id.0, bundle.uuid) {
+                        return Err(invalid(format!(
+                            "directory import rule {} is duplicated by bundles {prior} and {}",
+                            uuid_text(rule.id.0),
+                            bundle.uuid
+                        )));
+                    }
+                }
+                let mut listed = backend
+                    .enumerate(&rules.listing)
+                    .map_err(|error| invalid(format!("directory listing failed: {error:?}")))?;
+                listed.sort_unstable();
+                listed.dedup();
+                let listing_dep = FileDep::Listing {
+                    query: rules.listing.clone(),
+                    observed: Observed::Ok(file_query_result_hash(&listed)),
+                };
+                let mut groups = BTreeMap::<(usize, RootedPath), Vec<RootedPath>>::new();
+                for source in listed {
+                    let Some((index, rule)) = rules
+                        .rules
+                        .iter()
+                        .enumerate()
+                        .find(|(_, rule)| query_matches(&rule.matches, &source.path))
+                    else {
+                        continue;
+                    };
+                    let group = directory_group(rule.group, &source)?;
+                    groups.entry((index, group)).or_default().push(source);
+                }
+                for ((rule_index, group), mut sources) in groups {
+                    let rule = &rules.rules[rule_index];
+                    sources.sort_unstable();
+                    sources.dedup();
+                    let destination_path = render_directory_output(&rule.output, &group, &sources)?;
+                    let task = DirectoryImportTask {
+                        rules_bundle: bundle.uuid,
+                        rule: rule.id.clone(),
+                        group: group.clone(),
+                        importer: rule.importer.clone(),
+                        sources,
+                        settings: rule.settings.clone(),
+                        destination_root: group.root.0.clone(),
+                        destination_path,
+                        listing_dep: listing_dep.clone(),
+                    };
+                    if self.directory_task_needs_run(&store, &task, &capabilities)? {
+                        tasks.push(task);
+                    }
+                }
+            }
+        }
+        tasks.sort_by(|left, right| {
+            left.destination_root
+                .cmp(&right.destination_root)
+                .then_with(|| left.destination_path.cmp(&right.destination_path))
+                .then_with(|| left.rule.0.cmp(&right.rule.0))
+        });
+        for pair in tasks.windows(2) {
+            if pair[0].destination_root == pair[1].destination_root
+                && pair[0].destination_path == pair[1].destination_path
+            {
+                return Err(invalid(format!(
+                    "directory import rules collide at {}:{}",
+                    pair[0].destination_root, pair[0].destination_path
+                )));
+            }
+        }
+        Ok(tasks)
+    }
+
+    pub(crate) fn prepare_directory_import(
+        &self,
+        base: InputVersion,
+        task: &DirectoryImportTask,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        let importer = self.registered_importer(&task.importer)?;
+        validate_default_settings(
+            importer.settings_type_uuid,
+            importer.settings_hash,
+            &importer.settings_schema,
+            &task.settings,
+        )?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+        require_base(&store, base)?;
+        let destination = self.resolve_directory_destination(
+            &store,
+            &task.destination_root,
+            &task.destination_path,
+        )?;
+        let prior = destination
+            .meta
+            .as_ref()
+            .map(|meta| self.read_prior_import(&store, meta))
+            .transpose()?;
+        let origin = DirectoryOrigin {
+            rules_bundle: task.rules_bundle,
+            rule: task.rule.clone(),
+            group: task.group.clone(),
+        };
+        if prior
+            .as_ref()
+            .is_some_and(|prior| prior.model.record.origin.as_ref() != Some(&origin))
+        {
+            return Err(invalid(format!(
+                "directory import destination {}:{} is owned by another origin",
+                task.destination_root, task.destination_path
+            )));
+        }
+        drop(store);
+        self.execute_import(
+            base,
+            importer,
+            ImportInvocation {
+                destination,
+                prior,
+                sources: task.sources.clone(),
+                explicit_settings: Some(task.settings.clone()),
+                watch: true,
+                origin: Some(origin),
+                basis_deps: vec![task.listing_dep.clone()],
+            },
+        )
+    }
+
+    fn directory_task_needs_run(
+        &self,
+        store: &Store,
+        task: &DirectoryImportTask,
+        capabilities: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<bool, RpcFailure> {
+        let destination = self.resolve_directory_destination(
+            store,
+            &task.destination_root,
+            &task.destination_path,
+        )?;
+        let Some(meta) = destination.meta else {
+            return Ok(true);
+        };
+        let prior = self.read_prior_import(store, &meta)?;
+        let expected_origin = DirectoryOrigin {
+            rules_bundle: task.rules_bundle,
+            rule: task.rule.clone(),
+            group: task.group.clone(),
+        };
+        if prior.model.record.origin.as_ref() != Some(&expected_origin) {
+            return Err(invalid(format!(
+                "directory import output collides with an unowned bundle at {}:{}",
+                task.destination_root, task.destination_path
+            )));
+        }
+        if prior.model.record.importer != task.importer
+            || prior.model.record.sources != task.sources
+            || prior.model.settings != task.settings
+            || !prior.model.record.watch
+        {
+            return Ok(true);
+        }
+        let mut backend = RootedImportBackend::new(&self.scanner, capabilities);
+        Ok(!revalidate_read_set(
+            &prior.model.record.read_set,
+            &mut backend,
+        ))
+    }
+
     pub(crate) fn prepare_import_request(
         &self,
         base: InputVersion,
@@ -149,6 +410,8 @@ impl AuthoringService {
                 sources,
                 explicit_settings: Some(settings),
                 watch: request.watch,
+                origin: None,
+                basis_deps: Vec::new(),
             },
         )
     }
@@ -200,6 +463,8 @@ impl AuthoringService {
                 sources,
                 explicit_settings: None,
                 watch,
+                origin: None,
+                basis_deps: Vec::new(),
             },
         )?;
         debug_assert_eq!(prepared.bundle, bundle);
@@ -218,6 +483,8 @@ impl AuthoringService {
             sources,
             explicit_settings,
             watch,
+            origin,
+            basis_deps,
         } = invocation;
         let capabilities = self.importer_capabilities()?;
         let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
@@ -246,7 +513,8 @@ impl AuthoringService {
                 )
                 .map_err(|error| invalid(format!("importer {:?} failed: {error}", importer.id)))?
         };
-        let read_set = context.into_read_set();
+        let mut read_set = context.into_read_set();
+        read_set.extend(basis_deps);
         if read_set.iter().any(dep_has_failure) {
             return Err(invalid(
                 "an importer cannot publish after catching a failed context observation",
@@ -270,9 +538,11 @@ impl AuthoringService {
                 sources,
                 watch,
                 read_set: read_set.clone(),
-                origin: prior
-                    .as_ref()
-                    .and_then(|prior| prior.model.record.origin.clone()),
+                origin: origin.or_else(|| {
+                    prior
+                        .as_ref()
+                        .and_then(|prior| prior.model.record.origin.clone())
+                }),
             },
             &mut ids,
         )
@@ -298,6 +568,30 @@ impl AuthoringService {
             &mut ids,
         )?;
         let bundle = folded.bundle_uuid;
+        if store
+            .bundle(bundle)
+            .map_err(invalid)?
+            .is_some_and(|existing| {
+                destination.meta.as_ref().map(|meta| meta.bundle) != Some(existing.bundle)
+            })
+        {
+            return Err(invalid(format!(
+                "new import bundle identity {bundle} collides with the existing namespace"
+            )));
+        }
+        let proposed_bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+        for entry in proposed_bundle.assets.values() {
+            if store
+                .entry(entry.uuid)
+                .map_err(invalid)?
+                .is_some_and(|existing| existing.bundle != bundle)
+            {
+                return Err(invalid(format!(
+                    "import-generated asset identity {} collides with another bundle",
+                    entry.uuid
+                )));
+            }
+        }
         let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
         let basis = encode_import_basis(
             base,
@@ -384,6 +678,48 @@ impl AuthoringService {
         Ok(ImportDestination {
             root,
             path: path.to_owned(),
+            target,
+            meta,
+        })
+    }
+
+    fn resolve_directory_destination(
+        &self,
+        store: &Store,
+        root: &str,
+        path: &str,
+    ) -> Result<ImportDestination, RpcFailure> {
+        let root = normalize_identifier(root).map_err(invalid)?;
+        let path = normalize_path(path).map_err(invalid)?;
+        if !self.roots.iter().any(|candidate| candidate.name == root) {
+            return Err(invalid(format!(
+                "unknown directory import destination root {root:?}"
+            )));
+        }
+        let mut meta = None;
+        for candidate in store.all_bundles().map_err(invalid)? {
+            if candidate.path != path {
+                continue;
+            }
+            let candidate_root = store
+                .root_name(candidate.root)
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("bundle root identity is missing"))?;
+            if candidate_root == root {
+                meta = Some(candidate);
+                break;
+            }
+        }
+        let target = self.scanner.physical_path(&root, &path).map_err(invalid)?;
+        if meta.is_none() && std::fs::symlink_metadata(&target).is_ok() {
+            return Err(invalid(format!(
+                "directory import destination {}:{} is occupied by a non-bundle file",
+                root, path
+            )));
+        }
+        Ok(ImportDestination {
+            root,
+            path,
             target,
             meta,
         })
@@ -846,13 +1182,342 @@ fn decode_import_record(value: &AuthoredValue) -> Result<ImportRecord, RpcFailur
         AuthoredValue::Null => None,
         value => Some(decode_origin(value)?),
     };
+    let read_set = as_array(field(fields, "read_set")?, "ImportRecord.read_set")?
+        .iter()
+        .map(decode_file_dep)
+        .collect::<Result<_, _>>()?;
     Ok(ImportRecord {
         importer,
         sources,
         watch,
-        read_set: Vec::new(),
+        read_set,
         origin,
     })
+}
+
+pub(crate) fn decoded_import_record(bundle: &Bundle) -> Result<Option<ImportRecord>, RpcFailure> {
+    let Some(record) = bundle.assets.get("$record") else {
+        return Ok(None);
+    };
+    if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
+        return Err(invalid("$record has the wrong built-in type or role"));
+    }
+    decode_import_record(&record.data).map(Some)
+}
+
+pub(crate) fn decoded_directory_origin(
+    bundle: &Bundle,
+) -> Result<Option<distill_store::bundles::DirectoryOrigin>, RpcFailure> {
+    Ok(decoded_import_record(bundle)?
+        .and_then(|record| record.origin)
+        .map(|origin| distill_store::bundles::DirectoryOrigin {
+            rules_bundle: origin.rules_bundle,
+            rule: distill_store::bundles::DirectoryRuleId(origin.rule.0),
+            group_root: origin.group.root.0,
+            group_path: origin.group.path,
+        }))
+}
+
+fn decode_file_dep(value: &AuthoredValue) -> Result<FileDep, RpcFailure> {
+    let variants = as_object(value, "FileDep")?;
+    if variants.len() != 1 {
+        return Err(invalid("FileDep must contain exactly one variant"));
+    }
+    let (variant, payload) = variants.first_key_value().expect("one variant");
+    let fields = as_object(payload, "FileDep payload")?;
+    match variant.as_str() {
+        "Read" => Ok(FileDep::Read {
+            path: as_string(field(fields, "path")?, "FileDep.Read.path")?.to_owned(),
+            observed: decode_observed_content(field(fields, "observed")?)?,
+        }),
+        "Probe" => Ok(FileDep::Probe {
+            path: as_string(field(fields, "path")?, "FileDep.Probe.path")?.to_owned(),
+            observed: decode_observed_root(field(fields, "observed")?)?,
+        }),
+        "Listing" => Ok(FileDep::Listing {
+            query: decode_file_query(field(fields, "query")?)?,
+            observed: decode_observed_hash(field(fields, "observed")?)?,
+        }),
+        "Capability" => Ok(FileDep::Capability {
+            key: decode_capability_key(field(fields, "key")?)?,
+            observed: decode_observed_hash(field(fields, "observed")?)?,
+        }),
+        _ => Err(invalid(format!("unknown FileDep variant {variant:?}"))),
+    }
+}
+
+fn decode_observed_content(
+    value: &AuthoredValue,
+) -> Result<Observed<distill_build::import::FileContentObservation>, RpcFailure> {
+    let value = decode_observed_ok(value, "file content")?;
+    let fields = as_object(value, "FileContentObservation")?;
+    Ok(Observed::Ok(
+        distill_build::import::FileContentObservation {
+            path: decode_rooted_path(field(fields, "path")?)?,
+            hash: fixed_bytes(field(fields, "hash")?, "FileContentObservation.hash")?,
+        },
+    ))
+}
+
+fn decode_observed_root(value: &AuthoredValue) -> Result<Observed<Option<RootName>>, RpcFailure> {
+    Ok(Observed::Ok(
+        match decode_observed_ok(value, "root probe")? {
+            AuthoredValue::Null => None,
+            value => Some(RootName::new(as_string(value, "root probe value")?).map_err(invalid)?),
+        },
+    ))
+}
+
+fn decode_observed_hash(value: &AuthoredValue) -> Result<Observed<[u8; 32]>, RpcFailure> {
+    Ok(Observed::Ok(fixed_bytes(
+        decode_observed_ok(value, "hash observation")?,
+        "hash observation value",
+    )?))
+}
+
+fn decode_observed_ok<'a>(
+    value: &'a AuthoredValue,
+    context: &str,
+) -> Result<&'a AuthoredValue, RpcFailure> {
+    let variants = as_object(value, context)?;
+    let Some(payload) = variants.get("Ok") else {
+        return Err(invalid(format!(
+            "{context} contains a failed observation; committed import records permit only successful observations"
+        )));
+    };
+    if variants.len() != 1 {
+        return Err(invalid(format!("{context} must contain one Ok variant")));
+    }
+    field(as_object(payload, context)?, "value")
+}
+
+fn decode_capability_key(value: &AuthoredValue) -> Result<CapabilityKey, RpcFailure> {
+    let variants = as_object(value, "CapabilityKey")?;
+    if variants.len() != 1 {
+        return Err(invalid("CapabilityKey must contain exactly one variant"));
+    }
+    let (variant, payload) = variants.first_key_value().expect("one variant");
+    let fields = as_object(payload, "CapabilityKey payload")?;
+    match variant.as_str() {
+        "MigrationFn" => Ok(CapabilityKey::MigrationFn(
+            as_string(field(fields, "key")?, "MigrationFn.key")?.to_owned(),
+        )),
+        "DefaultTable" => Ok(CapabilityKey::DefaultTable(TypeUuid(fixed_bytes(
+            field(fields, "type_uuid")?,
+            "DefaultTable.type_uuid",
+        )?))),
+        "Importer" => Ok(CapabilityKey::Importer(
+            as_string(field(fields, "id")?, "Importer.id")?.to_owned(),
+        )),
+        "Processor" => Ok(CapabilityKey::Processor {
+            input: TypeUuid(fixed_bytes(field(fields, "input")?, "Processor.input")?),
+        }),
+        "Tool" => Ok(CapabilityKey::Tool(
+            as_string(field(fields, "id")?, "Tool.id")?.to_owned(),
+        )),
+        _ => Err(invalid(format!(
+            "unknown CapabilityKey variant {variant:?}"
+        ))),
+    }
+}
+
+fn decode_file_query(value: &AuthoredValue) -> Result<FileQuery, RpcFailure> {
+    let fields = as_object(value, "FileQuery")?;
+    let optional = |name: &str| -> Result<Option<String>, RpcFailure> {
+        match field(fields, name)? {
+            AuthoredValue::Null => Ok(None),
+            value => Ok(Some(as_string(value, name)?.to_owned())),
+        }
+    };
+    FileQuery::new(optional("path_prefix")?, optional("path_glob")?).map_err(invalid)
+}
+
+fn decode_directory_rules(value: &AuthoredValue) -> Result<DecodedDirectoryRules, RpcFailure> {
+    let fields = as_object(value, "DirectoryImportRules")?;
+    let listing = decode_file_query(field(fields, "listing")?)?;
+    let rules = as_array(field(fields, "rules")?, "DirectoryImportRules.rules")?
+        .iter()
+        .map(|value| {
+            let fields = as_object(value, "ImportRule")?;
+            Ok(DecodedDirectoryRule {
+                id: distill_build::import::ImportRuleId(fixed_bytes(
+                    field(fields, "id")?,
+                    "ImportRule.id",
+                )?),
+                matches: decode_file_query(field(fields, "matches")?)?,
+                group: decode_directory_grouping(field(fields, "group")?)?,
+                importer: normalize_identifier(as_string(
+                    field(fields, "importer")?,
+                    "ImportRule.importer",
+                )?)
+                .map_err(invalid)?,
+                settings: decode_wrapped_authored_value(field(fields, "settings")?, 0)?,
+                output: as_string(field(fields, "output")?, "ImportRule.output")?.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, RpcFailure>>()?;
+    if rules.is_empty() {
+        return Err(invalid("DirectoryImportRules.rules cannot be empty"));
+    }
+    Ok(DecodedDirectoryRules { listing, rules })
+}
+
+fn decode_directory_grouping(value: &AuthoredValue) -> Result<DirectoryGrouping, RpcFailure> {
+    let variants = as_object(value, "Grouping")?;
+    if variants.len() != 1 {
+        return Err(invalid("Grouping must contain exactly one variant"));
+    }
+    let (variant, payload) = variants.first_key_value().expect("one variant");
+    if !matches!(payload, AuthoredValue::Object(fields) if fields.is_empty()) {
+        return Err(invalid("Grouping unit payload must be an empty object"));
+    }
+    match variant.as_str() {
+        "PerFile" => Ok(DirectoryGrouping::PerFile),
+        "ByStem" => Ok(DirectoryGrouping::ByStem),
+        _ => Err(invalid(format!("unknown Grouping variant {variant:?}"))),
+    }
+}
+
+fn decode_wrapped_authored_value(
+    value: &AuthoredValue,
+    depth: usize,
+) -> Result<AuthoredValue, RpcFailure> {
+    if depth >= 1024 {
+        return Err(invalid("AuthoredValueV1 exceeds the nesting limit"));
+    }
+    let variants = as_object(value, "AuthoredValueV1")?;
+    if variants.len() != 1 {
+        return Err(invalid("AuthoredValueV1 must contain exactly one variant"));
+    }
+    let (variant, payload) = variants.first_key_value().expect("one variant");
+    let fields = as_object(payload, "AuthoredValueV1 payload")?;
+    match variant.as_str() {
+        "Null" if fields.is_empty() => Ok(AuthoredValue::Null),
+        "Bool" => Ok(AuthoredValue::Bool(as_bool(
+            field(fields, "value")?,
+            "AuthoredValueV1.Bool.value",
+        )?)),
+        "Int" => Ok(AuthoredValue::Int(as_i128(
+            field(fields, "value")?,
+            "AuthoredValueV1.Int.value",
+        )?)),
+        "UInt" => Ok(AuthoredValue::UInt(as_u128(
+            field(fields, "value")?,
+            "AuthoredValueV1.UInt.value",
+        )?)),
+        "Float" => Ok(AuthoredValue::Float(as_f64(
+            field(fields, "value")?,
+            "AuthoredValueV1.Float.value",
+        )?)),
+        "Str" => Ok(AuthoredValue::Str(
+            as_string(field(fields, "value")?, "AuthoredValueV1.Str.value")?.to_owned(),
+        )),
+        "Array" => Ok(AuthoredValue::Array(
+            as_array(field(fields, "value")?, "AuthoredValueV1.Array.value")?
+                .iter()
+                .map(|value| decode_wrapped_authored_value(value, depth + 1))
+                .collect::<Result<_, _>>()?,
+        )),
+        "Object" => Ok(AuthoredValue::Object(
+            as_object(field(fields, "value")?, "AuthoredValueV1.Object.value")?
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        decode_wrapped_authored_value(value, depth + 1)?,
+                    ))
+                })
+                .collect::<Result<_, RpcFailure>>()?,
+        )),
+        "Blob" => match field(fields, "value")? {
+            AuthoredValue::Blob(bytes) => Ok(AuthoredValue::Blob(bytes.clone())),
+            _ => Err(invalid("AuthoredValueV1.Blob.value must be blob bytes")),
+        },
+        _ => Err(invalid(format!(
+            "unknown or malformed AuthoredValueV1 variant {variant:?}"
+        ))),
+    }
+}
+
+fn query_matches(query: &FileQuery, path: &str) -> bool {
+    let prefix_matches = query.path_prefix.as_ref().is_none_or(|prefix| {
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    });
+    let glob_matches = query.path_glob.as_ref().is_none_or(|pattern| {
+        Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(path))
+    });
+    prefix_matches && glob_matches
+}
+
+fn directory_group(
+    grouping: DirectoryGrouping,
+    source: &RootedPath,
+) -> Result<RootedPath, RpcFailure> {
+    match grouping {
+        DirectoryGrouping::PerFile => Ok(source.clone()),
+        DirectoryGrouping::ByStem => {
+            let (parent, name) = split_parent_name(&source.path);
+            let stem = file_stem(name)?;
+            let path = if parent.is_empty() {
+                stem.to_owned()
+            } else {
+                format!("{parent}/{stem}")
+            };
+            RootedPath::new(&source.root.0, &path).map_err(invalid)
+        }
+    }
+}
+
+fn render_directory_output(
+    template: &str,
+    group: &RootedPath,
+    sources: &[RootedPath],
+) -> Result<String, RpcFailure> {
+    let first = sources
+        .first()
+        .ok_or_else(|| invalid("directory import group has no sources"))?;
+    if sources.iter().any(|source| source.root != group.root) {
+        return Err(invalid("directory import group spans multiple roots"));
+    }
+    let (parent, group_name) = split_parent_name(&group.path);
+    let (_, source_name) = split_parent_name(&first.path);
+    let rendered = template
+        .replace("{stem}", file_stem(group_name)?)
+        .replace("{name}", source_name);
+    if rendered.is_empty() || rendered.contains('/') || rendered.contains('\\') {
+        return Err(invalid(
+            "directory import output template must render one nonempty file name",
+        ));
+    }
+    normalize_path(&if parent.is_empty() {
+        rendered
+    } else {
+        format!("{parent}/{rendered}")
+    })
+    .map_err(invalid)
+}
+
+fn split_parent_name(path: &str) -> (&str, &str) {
+    path.rsplit_once('/')
+        .map_or(("", path), |(parent, name)| (parent, name))
+}
+
+fn file_stem(name: &str) -> Result<&str, RpcFailure> {
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name, |(stem, _)| if stem.is_empty() { name } else { stem });
+    if stem.is_empty() {
+        Err(invalid("directory import source has no file stem"))
+    } else {
+        Ok(stem)
+    }
+}
+
+fn uuid_text(bytes: [u8; 16]) -> String {
+    AssetUuid(bytes).to_string()
 }
 
 fn encode_file_dep(dep: &FileDep) -> Result<AuthoredValue, RpcFailure> {
@@ -1078,6 +1743,30 @@ fn as_bool(value: &AuthoredValue, context: &str) -> Result<bool, RpcFailure> {
     }
 }
 
+fn as_u128(value: &AuthoredValue, context: &str) -> Result<u128, RpcFailure> {
+    match value {
+        AuthoredValue::UInt(value) => Ok(*value),
+        _ => Err(invalid(format!("{context} must be an unsigned integer"))),
+    }
+}
+
+fn as_i128(value: &AuthoredValue, context: &str) -> Result<i128, RpcFailure> {
+    match value {
+        AuthoredValue::Int(value) => Ok(*value),
+        AuthoredValue::UInt(value) => {
+            i128::try_from(*value).map_err(|_| invalid(format!("{context} is outside i128 range")))
+        }
+        _ => Err(invalid(format!("{context} must be an integer"))),
+    }
+}
+
+fn as_f64(value: &AuthoredValue, context: &str) -> Result<f64, RpcFailure> {
+    match value {
+        AuthoredValue::Float(value) => Ok(*value),
+        _ => Err(invalid(format!("{context} must be a float"))),
+    }
+}
+
 fn field<'a>(
     fields: &'a BTreeMap<String, AuthoredValue>,
     name: &str,
@@ -1106,6 +1795,8 @@ struct ImportInvocation {
     sources: Vec<RootedPath>,
     explicit_settings: Option<AuthoredValue>,
     watch: bool,
+    origin: Option<DirectoryOrigin>,
+    basis_deps: Vec<FileDep>,
 }
 
 struct HashIdentitySource {
