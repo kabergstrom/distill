@@ -6,6 +6,7 @@ use distill_core::attestation::{
     CompiledTypeRow, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, SchemaNodeId,
 };
 use distill_core::id::BundleFileHash;
+use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{
     schema, CapnpClient, RemoteConnectOutcome, RemoteMetadataOutcome, StagedListener,
 };
@@ -120,6 +121,137 @@ fn canonical_artifact(
             }],
         },
     )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn remote_loader_client_preserves_typed_calls_and_rotates_reattestation() {
+    LocalSet::new()
+        .run_until(async {
+            let server = server();
+            let asset = AssetUuid([44; 16]);
+            let path = "assets/remote.bundle";
+            let wire = distill_wire::wire::WireNode::Unit { offset: 0 };
+            let layout_hash = distill_wire::dswl::dswl_hash(&wire).unwrap();
+            let wire_bytes: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire).unwrap());
+            server
+                .install_wire_tree(layout_hash, Arc::clone(&wire_bytes))
+                .unwrap();
+            let (content_hash, artifact) =
+                canonical_artifact(asset, TypeUuid([1; 16]), layout_hash, &[7, 8, 9]);
+            server.install_artifact(content_hash, artifact).unwrap();
+            let stamp = server
+                .commit(Commit {
+                    assets: vec![AssetMutation::Set {
+                        uuid: asset,
+                        resolution: StoredResolve::Drifted {
+                            input: DriftedInput::File("source.asset".into()),
+                        },
+                        delta: AssetDeltaState::Changed,
+                    }],
+                    paths: vec![PathMutation::Set {
+                        path: path.into(),
+                        candidates: std::collections::BTreeSet::from([asset]),
+                    }],
+                    ..Commit::default()
+                })
+                .unwrap();
+            let listener = Rc::new(
+                StagedListener::bind(server.root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let server_listener = Rc::clone(&listener);
+            let server_task =
+                tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let mut hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+
+            let snapshot = match hub.snapshot().await.unwrap() {
+                RemoteCall::Success(snapshot) => snapshot,
+                other => panic!("snapshot failed: {other:?}"),
+            };
+            assert_eq!(snapshot.basis().snapshot, stamp);
+            let resolved = match snapshot.resolve(asset).await.unwrap() {
+                RemoteCall::Success(terminal) => terminal,
+                other => panic!("resolve failed: {other:?}"),
+            };
+            assert!(matches!(
+                resolved.value,
+                ResolveResult::Drifted {
+                    input: DriftedInput::File(ref value),
+                    current,
+                } if value == "source.asset" && current == stamp
+            ));
+            let path_result = match snapshot.resolve_path(path).await.unwrap() {
+                RemoteCall::Success(terminal) => terminal.value,
+                other => panic!("path resolve failed: {other:?}"),
+            };
+            assert_eq!(path_result, PathResolveResult::Resolved(asset));
+
+            let mut fetched = match hub.fetch(content_hash).await.unwrap() {
+                RemoteCall::Success(terminal) => terminal,
+                other => panic!("fetch failed: {other:?}"),
+            };
+            let mut structural = Vec::new();
+            while let Some(chunk) = fetched.value.next_chunk().await.unwrap() {
+                assert_eq!(chunk.kind, ArtifactChunkKind::Structural);
+                structural.extend_from_slice(&chunk.bytes);
+            }
+            assert_eq!(
+                distill_wire::artifact::content_hash(&structural),
+                content_hash
+            );
+            assert_eq!(
+                match hub.wire_tree(layout_hash).await.unwrap() {
+                    RemoteCall::Success(bytes) => bytes,
+                    other => panic!("wire tree failed: {other:?}"),
+                },
+                wire_bytes
+            );
+
+            let mut subscription = match hub
+                .subscribe(stamp.version, vec![asset], vec![])
+                .await
+                .unwrap()
+            {
+                RemoteCall::Success(subscription) => subscription,
+                other => panic!("subscription failed: {other:?}"),
+            };
+            assert!(matches!(
+                subscription.next().await.unwrap(),
+                Some(StreamEvent::InitialDelta { .. })
+            ));
+
+            let mut next = request();
+            next.epoch = GameModuleEpoch(2);
+            let reattest = ReattestRequest {
+                epoch: next.epoch,
+                base_attestation_generation: 0,
+                successor_attestation_generation: 1,
+                target_definition_hash: next.target_definition_hash,
+                compiled_registry: next.compiled_registry,
+                dsca: next.dsca,
+                load_policy: next.load_policy,
+                policy_digest: next.policy_digest,
+            };
+            assert!(matches!(
+                hub.reattest(&reattest).await.unwrap(),
+                RemoteCall::Success(ReattestSuccess {
+                    installed_attestation_generation: 1,
+                    ..
+                })
+            ));
+            assert_eq!(hub.attestation_generation(), 1);
+
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
 }
 
 #[derive(Default)]

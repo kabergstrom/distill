@@ -10,6 +10,7 @@ mod bind;
 pub mod distill_rpc_capnp {
     include!(concat!(env!("OUT_DIR"), "/schema/distill_rpc_capnp.rs"));
 }
+pub mod capnp_loader;
 pub mod capnp_transport;
 mod protocol;
 mod server;

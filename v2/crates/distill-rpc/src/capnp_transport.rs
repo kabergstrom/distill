@@ -2568,7 +2568,7 @@ pub fn decode_authoring_inspection(
     })
 }
 
-fn read_attestation_failure(
+pub(crate) fn read_attestation_failure(
     failure: schema::attestation_failure::Reader<'_>,
 ) -> Result<crate::AttestationFailure, capnp::Error> {
     use schema::attestation_subject::Which;
@@ -2785,6 +2785,25 @@ fn validate_connect_failure_context(
             "server attestation failure does not describe the exact submitted request".to_owned(),
         ))
     }
+}
+
+pub(crate) fn validate_reattest_failure_context(
+    failure: &crate::AttestationFailure,
+    request: &ReattestRequest,
+) -> Result<(), capnp::Error> {
+    validate_connect_failure_context(
+        failure,
+        &ConnectRequest {
+            epoch: request.epoch,
+            target: String::new(),
+            target_definition_hash: request.target_definition_hash,
+            compiled_registry: request.compiled_registry.clone(),
+            dsca: request.dsca,
+            load_policy: request.load_policy.clone(),
+            policy_digest: request.policy_digest,
+            protocol: crate::PROTOCOL_VERSION,
+        },
+    )
 }
 
 fn encode_client_bootstrap_projection(rows: &[CompiledTypeRow]) -> Vec<u8> {
