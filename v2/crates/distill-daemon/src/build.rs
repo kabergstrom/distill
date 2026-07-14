@@ -2012,7 +2012,7 @@ fn resolve_reference(
     source_bundle: BundleUuid,
     value: &distill_json::AuthoredValue,
     expected: TypeUuid,
-    _strong: bool,
+    strong: bool,
     trace: &mut Vec<TraceOp>,
 ) -> Result<AssetUuid, String> {
     let query = decode_asset_reference_query(value).map_err(|error| format!("{error:?}"))?;
@@ -2060,6 +2060,20 @@ fn resolve_reference(
         asset,
         observed: role.clone(),
     });
+    if !strong && role == Observed::Ok(None) {
+        let terminal = source.ref_check(asset, expected);
+        trace.push(TraceOp::RefCheck {
+            asset,
+            expected_terminal: expected,
+            observed: terminal.clone(),
+        });
+        if terminal == Observed::Ok(None) {
+            return Ok(asset);
+        }
+        return Err(format!(
+            "absent weak asset {asset} has an inconsistent terminal-type observation"
+        ));
+    }
     if role != Observed::Ok(Some(EntryRole::Runtime)) {
         return Err(format!("referenced asset {asset} is not runtime eligible"));
     }
@@ -3566,5 +3580,34 @@ mod tests {
         let mut retyped = source;
         retyped.terminal_types.insert(ASSET, TypeUuid([88; 16]));
         assert!(!distill_build::trace::revalidate(&trace, &retyped));
+    }
+
+    #[test]
+    fn absent_weak_uuid_reference_is_legal_and_trace_invalidates_when_it_appears() {
+        let missing = AssetUuid([99; 16]);
+        let mut source = StoreTraceSource {
+            entries: BTreeMap::new(),
+            terminal_types: BTreeMap::new(),
+            roles: BTreeMap::new(),
+            paths: BTreeMap::new(),
+            tools: BTreeMap::new(),
+            capabilities: Vec::new(),
+            migration_controls: BTreeMap::new(),
+        };
+        let value = AuthoredValue::Str(missing.to_string());
+        let mut trace = Vec::new();
+        assert_eq!(
+            resolve_reference(&source, BUNDLE, &value, TYPE, false, &mut trace).unwrap(),
+            missing
+        );
+        assert_eq!(trace.len(), 2);
+        assert!(distill_build::trace::revalidate(&trace, &source));
+
+        let mut strong_trace = Vec::new();
+        assert!(resolve_reference(&source, BUNDLE, &value, TYPE, true, &mut strong_trace).is_err());
+
+        source.roles.insert(missing, EntryRole::Runtime);
+        source.terminal_types.insert(missing, TYPE);
+        assert!(!distill_build::trace::revalidate(&trace, &source));
     }
 }
