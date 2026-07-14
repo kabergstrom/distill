@@ -10,6 +10,7 @@ pub mod basis;
 pub mod component;
 pub mod io;
 pub mod orchestrator;
+pub mod rpc_io;
 pub mod runtime;
 pub mod storage;
 
@@ -26,6 +27,7 @@ pub use orchestrator::{
     FetchedInput, Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, PreparedValue,
     ReattestationState, RegistrationError,
 };
+pub use rpc_io::{RpcIo, RpcIoInitError};
 pub use runtime::{
     AdoptionId, CompletionDisposition, ConnectionEpoch, HandleId, ManifestEntry, ManifestState,
     OutstandingPurpose, RequestOwner, RequestTracker,

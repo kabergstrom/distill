@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use distill_build::query::AssetQuery;
 use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_store::state::SnapshotStamp;
@@ -17,7 +16,7 @@ pub struct ReqId(pub u64);
 pub enum DriftedInput {
     File(String),
     Asset(AssetUuid),
-    Query(Box<AssetQuery>),
+    Query(String),
     Dylib,
     Tool(String),
 }

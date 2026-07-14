@@ -9,5 +9,9 @@ blake3.workspace = true
 distill-asset = { path = "../distill-asset" }
 distill-build = { path = "../distill-build" }
 distill-core = { path = "../distill-core" }
+distill-rpc = { path = "../distill-rpc" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
+
+[dev-dependencies]
+distill-schema = { path = "../distill-schema" }
