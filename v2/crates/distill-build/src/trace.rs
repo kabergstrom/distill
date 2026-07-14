@@ -25,7 +25,7 @@ pub enum Observed<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolLaunchDiagnostic {
     pub id: String,
-    pub staged_hash: [u8; 32],
+    pub capsule_hash: [u8; 32],
     pub class: ToolLaunchFailureClass,
 }
 
@@ -34,6 +34,7 @@ pub enum ToolLaunchFailureClass {
     NotExecutable,
     MissingInterpreter,
     SpawnDenied,
+    CapsuleClosureUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -733,7 +734,9 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
             observed(e, o, |e, h| e.raw(h));
         }
         TraceOp::Tool { id, observed: o } => {
-            e.enum_variant(4);
+            // Tag 4 is permanently reserved for the removed ToolLaunch
+            // grammar. ToolEpoch observations use the closed v1 tag 10.
+            e.enum_variant(10);
             e.str(id);
             observed(e, o, |e, h| e.raw(h));
         }

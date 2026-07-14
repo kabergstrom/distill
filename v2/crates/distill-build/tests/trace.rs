@@ -84,7 +84,7 @@ fn dstr_tool_capability_miss_pins_typed_tool_key() {
     expected.extend_from_slice(b"DSTR");
     expected.push(1); // domain version
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(4); // TraceOp::Tool
+    expected.push(10); // TraceOp::Tool; historical ToolLaunch tag 4 is reserved
     expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
     expected.extend_from_slice(id.as_bytes());
     expected.push(2); // Observed::Err
@@ -108,7 +108,7 @@ fn dstr_tool_lookup_hit_records_the_exact_staged_hash() {
     expected.extend_from_slice(b"DSTR");
     expected.push(1);
     expected.extend_from_slice(&1_u32.to_le_bytes());
-    expected.push(4);
+    expected.push(10);
     expected.extend_from_slice(&(id.len() as u32).to_le_bytes());
     expected.extend_from_slice(id.as_bytes());
     expected.push(1);
