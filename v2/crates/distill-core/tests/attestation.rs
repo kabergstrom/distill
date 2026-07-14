@@ -124,6 +124,24 @@ fn dsca_rejects_duplicate_unsorted_and_forged_rows() {
 }
 
 #[test]
+fn compiled_table_boundary_encoding_roundtrips_and_authenticates_every_row() {
+    let extras = RegistryExtrasV1::canonical(vec![row(0, "x", RegistryExtraFact::Tag)]).unwrap();
+    let first = compiled(1, extras.clone());
+    let second = compiled(2, extras);
+    let table = CompiledTypeTable::canonical(vec![second, first]).unwrap();
+    let encoded = table.encode().unwrap();
+    assert_eq!(CompiledTypeTable::decode(&encoded).unwrap(), table);
+
+    let mut changed = encoded;
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    assert_eq!(
+        CompiledTypeTable::decode(&changed),
+        Err(AttestationError::CompiledDigestMismatch)
+    );
+}
+
+#[test]
 fn equal_dsnl_does_not_hide_logical_policy_or_extras_drift() {
     let base_extras = RegistryExtrasV1::canonical(vec![row(
         0,

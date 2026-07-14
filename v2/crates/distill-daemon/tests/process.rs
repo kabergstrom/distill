@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
+use distill_store::state::PipelineState;
 
 fn config(temp: &tempfile::TempDir) -> DaemonConfig {
     let assets = temp.path().join("assets");
@@ -56,12 +57,34 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     let mut socket = TcpStream::connect(process.rpc_address()).unwrap();
     socket.write_all(&[]).unwrap();
 
+    let before = process.coordinator().server().current_stamp().version.0;
+    assert!(matches!(
+        process
+            .coordinator()
+            .store()
+            .lock()
+            .unwrap()
+            .pipeline_state()
+            .unwrap(),
+        Some(PipelineState::Poisoned { .. })
+    ));
+
     std::fs::write(temp.path().join("assets/source.txt"), b"source").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while process.coordinator().server().current_stamp().version.0 < 2 {
+    while process.coordinator().server().current_stamp().version.0 <= before {
         assert!(Instant::now() < deadline, "watcher batch did not publish");
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(matches!(
+        process
+            .coordinator()
+            .store()
+            .lock()
+            .unwrap()
+            .pipeline_state()
+            .unwrap(),
+        Some(PipelineState::Poisoned { .. })
+    ));
     assert!(process.last_background_error().is_none());
     drop(process);
 }

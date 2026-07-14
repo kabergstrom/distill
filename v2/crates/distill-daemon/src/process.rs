@@ -10,6 +10,7 @@ use distill_core::attestation::CompiledTypeTable;
 
 use crate::config::{DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
+use crate::epoch::CandidateRequirements;
 use crate::watcher::{WatcherQueue, WatcherThread};
 
 const WATCH_CAPACITY: usize = 65_536;
@@ -30,6 +31,7 @@ impl DaemonProcess {
         config: DaemonConfig,
         compiled: CompiledTypeTable,
     ) -> Result<Self, DaemonProcessError> {
+        let requirements = config.candidate_requirements(&compiled)?;
         let targets = config.target_definitions(&compiled)?;
         let coordinator = Arc::new(DaemonCoordinator::open(
             config.store_config(),
@@ -41,6 +43,10 @@ impl DaemonProcess {
         let watcher =
             WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue), DEBOUNCE)?;
         coordinator.reconcile_startup(&watcher_queue)?;
+        let mut pipeline_watch =
+            PipelineWatch::new(config.modules.pipeline_dylib.clone(), requirements);
+        pipeline_watch.reconcile(&coordinator)?;
+        reconcile_imports(&coordinator)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let last_background_error = Arc::new(Mutex::new(None));
@@ -49,6 +55,7 @@ impl DaemonProcess {
             Arc::clone(&watcher_queue),
             Arc::clone(&stop),
             Arc::clone(&last_background_error),
+            pipeline_watch,
         ));
 
         let (address_tx, address_rx) = mpsc::sync_channel(1);
@@ -160,6 +167,7 @@ fn spawn_coordinator_loop(
     watcher: Arc<Mutex<WatcherQueue>>,
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    mut pipeline_watch: PipelineWatch,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("distill-coordinator".to_owned())
@@ -183,6 +191,8 @@ fn spawn_coordinator_loop(
                         .apply_watcher_batch(events)
                         .and_then(|_| reconcile_imports(&coordinator)),
                 };
+                let result = result.and_then(|_| pipeline_watch.reconcile(&coordinator));
+                let _ = coordinator.reap_retired_pipeline_epochs();
                 if let Err(error) = result {
                     *lock(&last_error) = Some(error.to_string());
                     lock(&watcher).force_overflow();
@@ -190,6 +200,45 @@ fn spawn_coordinator_loop(
             }
         })
         .expect("failed to start distill coordinator thread")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PipelineSourceState {
+    Missing,
+    Unreadable(std::io::ErrorKind),
+    Bytes([u8; 32]),
+}
+
+struct PipelineWatch {
+    path: std::path::PathBuf,
+    requirements: CandidateRequirements,
+    observed: Option<PipelineSourceState>,
+}
+
+impl PipelineWatch {
+    fn new(path: std::path::PathBuf, requirements: CandidateRequirements) -> Self {
+        Self {
+            path,
+            requirements,
+            observed: None,
+        }
+    }
+
+    fn reconcile(&mut self, coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
+        let state = match std::fs::read(&self.path) {
+            Ok(bytes) => PipelineSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PipelineSourceState::Missing
+            }
+            Err(error) => PipelineSourceState::Unreadable(error.kind()),
+        };
+        if self.observed.as_ref() == Some(&state) {
+            return Ok(());
+        }
+        coordinator.publish_pipeline_candidate(&self.path, self.requirements.clone())?;
+        self.observed = Some(state);
+        Ok(())
+    }
 }
 
 fn reconcile_imports(coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {

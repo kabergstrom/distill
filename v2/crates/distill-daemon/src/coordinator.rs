@@ -25,13 +25,20 @@ use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    AssetClaimant, ConfigurationState, DirectoryAliasSide, DscpV1, InputVersion,
-    PlatformFileIdentity, ReadableBundleSource, ScanFailureCode, ScanSubject, SkeletonFailureCode,
+    AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
+    InputVersion, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+    PipelineState as StoredPipelineState, PlatformFileIdentity, ReadableBundleSource,
+    ScanFailureCode, ScanSubject, SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
 use crate::authoring::{AuthoringService, AuthoringServiceInitError};
+use crate::epoch::{
+    stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
+    UnloadOutcome,
+};
 use crate::lineage_repair::LineageRepairBackendInitError;
+use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
@@ -49,6 +56,25 @@ pub struct DaemonCoordinator {
     server: Server,
     lineage_destination: LineageDestination,
     authoring: Arc<AuthoringService>,
+    pipeline: Mutex<CoordinatedPipelineRuntime>,
+}
+
+struct CoordinatedPipelineRuntime {
+    host: ModuleHost,
+    loader: DynamicPipelineModuleLoader,
+    pending: Option<PipelineEpoch>,
+}
+
+enum PipelinePublication {
+    Ready([u8; 32]),
+    SchemaAcceptanceRequired,
+    Poisoned(PipelinePoison),
+}
+
+fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) {
+    if let Some(pending) = runtime.pending.take() {
+        let _ = runtime.host.discard_unpublished(pending);
+    }
 }
 
 impl DaemonCoordinator {
@@ -58,6 +84,7 @@ impl DaemonCoordinator {
         lineage_destination: LineageDestination,
         targets: Vec<TargetDefinition>,
     ) -> Result<Self, CoordinatorInitError> {
+        let module_state_path = store_config.state_path.join("pipeline-host");
         let store = Arc::new(Mutex::new(Store::open(store_config)?));
         let scanner = RootedScanner::new(roots.clone())?;
         let backend = Arc::new(AuthoringService::new(
@@ -75,12 +102,21 @@ impl DaemonCoordinator {
             targets,
             backend.clone(),
         )?;
+        let bootstrap = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
+            .map_err(|error| CoordinatorInitError::Module(error.to_string()))?;
+        let pipeline = CoordinatedPipelineRuntime {
+            host: ModuleHost::new_with_bootstrap_authority(module_state_path, bootstrap)
+                .map_err(CoordinatorInitError::ModuleIo)?,
+            loader: DynamicPipelineModuleLoader,
+            pending: None,
+        };
         Ok(Self {
             store,
             scanner,
             server,
             lineage_destination,
             authoring: backend,
+            pipeline: Mutex::new(pipeline),
         })
     }
 
@@ -98,6 +134,149 @@ impl DaemonCoordinator {
 
     pub fn authoring_service(&self) -> &Arc<AuthoringService> {
         &self.authoring
+    }
+
+    pub fn pipeline_snapshot(&self) -> PipelineSnapshot {
+        lock_pipeline(&self.pipeline).host.snapshot()
+    }
+
+    /// Stage, attest, durably publish, and only then expose one pipeline
+    /// candidate. The store transaction and RPC commit share the exact base
+    /// version, so scanner or authoring work cannot split the epoch.
+    pub fn publish_pipeline_candidate(
+        &self,
+        source: &std::path::Path,
+        mut requirements: CandidateRequirements,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let base = self.server.current_stamp().version;
+        let mut runtime = lock_pipeline(&self.pipeline);
+        let prepared = {
+            let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
+            host.prepare_candidate(source, &mut requirements, loader)
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(poison) => {
+                let store = Arc::clone(&self.store);
+                let diagnostic = poison.clone();
+                let result = self.server.coordinated_commit(base, || {
+                    let mut store = lock_store(&store);
+                    if store.input_version() != base {
+                        return Err(format!(
+                            "durable pipeline-poison basis is {:?}, expected {base:?}",
+                            store.input_version()
+                        ));
+                    }
+                    store
+                        .input_transaction(|transaction| {
+                            transaction.publish_pipeline_poison(&diagnostic)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    Ok(Commit {
+                        pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
+                        ..Commit::default()
+                    })
+                });
+                match result {
+                    Ok(stamp) => {
+                        discard_pending(&mut runtime);
+                        runtime.host.install_poison(poison);
+                        return Ok(stamp);
+                    }
+                    Err(error) => return Err(CoordinatorError::Coordinated(error)),
+                }
+            }
+        };
+
+        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+            Ok(stored) => stored,
+            Err(error) => {
+                let _ = runtime.host.discard_unpublished(prepared);
+                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+            }
+        };
+        let publication = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&publication);
+        let store = Arc::clone(&self.store);
+        let result = self.server.coordinated_commit(base, || {
+            let mut store = lock_store(&store);
+            if store.input_version() != base {
+                return Err(format!(
+                    "durable pipeline basis is {:?}, expected {base:?}",
+                    store.input_version()
+                ));
+            }
+            store
+                .input_transaction(|transaction| transaction.publish_pipeline_epoch(&stored))
+                .map_err(|error| error.to_string())?;
+            let state = store
+                .pipeline_state()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "pipeline publication produced no durable state".to_owned())?;
+            let (diagnostic, result) = match state {
+                StoredPipelineState::Ready(epoch) => (
+                    PipelineDiagnostic::Ready,
+                    PipelinePublication::Ready(epoch.dylib_hash),
+                ),
+                StoredPipelineState::SchemaAcceptanceRequired { required, .. } => (
+                    PipelineDiagnostic::SchemaAcceptanceRequired(required.clone()),
+                    PipelinePublication::SchemaAcceptanceRequired,
+                ),
+                StoredPipelineState::Poisoned { error, .. } => (
+                    PipelineDiagnostic::Poisoned(error.clone()),
+                    PipelinePublication::Poisoned(error),
+                ),
+            };
+            *lock_publication(&captured) = Some(result);
+            Ok(Commit {
+                pipeline: Some(diagnostic),
+                ..Commit::default()
+            })
+        });
+        let stamp = match result {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                let _ = runtime.host.discard_unpublished(prepared);
+                return Err(CoordinatorError::Coordinated(error));
+            }
+        };
+        match lock_publication(&publication)
+            .take()
+            .expect("coordinated pipeline publication captured its durable state")
+        {
+            PipelinePublication::Ready(hash) if hash == prepared.dylib_hash() => {
+                discard_pending(&mut runtime);
+                runtime.host.install_ready(prepared);
+            }
+            PipelinePublication::SchemaAcceptanceRequired => {
+                discard_pending(&mut runtime);
+                let fence = PipelinePoison::new(
+                    PipelinePoisonCode::CandidateValidation,
+                    PipelinePoisonOrigin::CandidateOpen,
+                    CleanupDisposition::None,
+                    "pipeline candidate requires explicit schema acceptance",
+                )
+                .expect("schema-acceptance fence is a valid candidate poison");
+                runtime.host.install_poison(fence);
+                runtime.pending = Some(prepared);
+            }
+            PipelinePublication::Poisoned(poison) => {
+                let _ = runtime.host.discard_unpublished(prepared);
+                discard_pending(&mut runtime);
+                runtime.host.install_poison(poison);
+            }
+            PipelinePublication::Ready(_) => {
+                let _ = runtime.host.discard_unpublished(prepared);
+                return Err(CoordinatorError::InvalidManifest(
+                    "durable pipeline hash differs from the prepared module".to_owned(),
+                ));
+            }
+        }
+        Ok(stamp)
+    }
+
+    pub fn reap_retired_pipeline_epochs(&self) -> Vec<UnloadOutcome> {
+        lock_pipeline(&self.pipeline).host.reap_retired()
     }
 
     /// Reconcile one complete scan. A watcher generation is armed before the
@@ -376,6 +555,8 @@ pub enum CoordinatorInitError {
     Repair(LineageRepairBackendInitError),
     Authoring(AuthoringServiceInitError),
     Rpc(distill_rpc::AttestationShapeError),
+    Module(String),
+    ModuleIo(std::io::Error),
 }
 
 impl std::fmt::Display for CoordinatorInitError {
@@ -602,7 +783,7 @@ fn publish_scan(
         }
     };
 
-    let commit = rpc_commit(&candidate, &old_assets, &old_paths)?;
+    let mut commit = rpc_commit(&candidate, &old_assets, &old_paths)?;
     store.input_transaction(|transaction| {
         let mut root_ids = BTreeMap::new();
         let mut scanned_keys = BTreeSet::new();
@@ -698,7 +879,18 @@ fn publish_scan(
         }
         Ok(())
     })?;
+    commit.pipeline = Some(pipeline_diagnostic(store.pipeline_state()?));
     Ok(commit)
+}
+
+fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic {
+    match state {
+        Some(StoredPipelineState::Ready(_)) | None => PipelineDiagnostic::Ready,
+        Some(StoredPipelineState::SchemaAcceptanceRequired { required, .. }) => {
+            PipelineDiagnostic::SchemaAcceptanceRequired(required)
+        }
+        Some(StoredPipelineState::Poisoned { error, .. }) => PipelineDiagnostic::Poisoned(error),
+    }
 }
 
 /// Rescan the complete namespace and advance the durable projection from an
@@ -1065,6 +1257,22 @@ fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
 
 fn lock_watcher(watcher: &Mutex<WatcherQueue>) -> MutexGuard<'_, WatcherQueue> {
     watcher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_pipeline(
+    pipeline: &Mutex<CoordinatedPipelineRuntime>,
+) -> MutexGuard<'_, CoordinatedPipelineRuntime> {
+    pipeline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_publication(
+    publication: &Mutex<Option<PipelinePublication>>,
+) -> MutexGuard<'_, Option<PipelinePublication>> {
+    publication
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

@@ -14,6 +14,8 @@ use serde::Deserialize;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 use crate::coordinator::LineageDestination;
+use crate::epoch::{CandidateRequirements, MeasuredLayout, TargetDefinition as PipelineTarget};
+use crate::module_loader::host_module_identity;
 use crate::scanner::AssetRoot;
 
 #[derive(Debug, Clone)]
@@ -379,6 +381,46 @@ impl DaemonConfig {
             })
             .collect()
     }
+
+    pub fn candidate_requirements(
+        &self,
+        compiled: &CompiledTypeTable,
+    ) -> Result<CandidateRequirements, DaemonConfigError> {
+        let rpc_targets = self.target_definitions(compiled)?;
+        let targets = rpc_targets
+            .iter()
+            .map(|target| PipelineTarget {
+                name: target.name().to_owned(),
+                fingerprint: target.definition_hash().0,
+            })
+            .collect();
+        let measured_layouts = compiled
+            .rows
+            .iter()
+            .map(|row| MeasuredLayout {
+                type_id: type_uuid_hex(row.type_uuid.0),
+                digest: row.native_layout_digest,
+            })
+            .collect();
+        let compilation =
+            distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1().clone();
+        Ok(CandidateRequirements {
+            identity: host_module_identity(compilation),
+            measured_layouts,
+            compiled_types: compiled.clone(),
+            targets,
+            native_dependencies: Vec::new(),
+        })
+    }
+}
+
+fn type_uuid_hex(bytes: [u8; 16]) -> String {
+    let mut result = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut result, "{byte:02x}").expect("writing to String is infallible");
+    }
+    result
 }
 
 fn normalize_targets(

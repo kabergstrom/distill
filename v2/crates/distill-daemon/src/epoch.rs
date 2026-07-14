@@ -1,10 +1,8 @@
 //! Pipeline module staging, publication, poison, and unload fencing.
 //!
-//! The concrete `libloading` implementation belongs in the shared audited
-//! module-host layer. This crate owns the daemon state machine around that
-//! boundary and represents the host through [`PipelineModuleLoader`]. Identity,
-//! measured-layout, and complete semantic probes are called before the Rust-ABI
-//! registration call.
+//! The dynamic-library mechanics are provided by the shared `ngp-module-host`
+//! crate used by New Game Plus. This crate owns the Distill state machine and
+//! audited pipeline table layered on that common staging/residency boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -947,7 +945,7 @@ impl ModuleHost {
         }
     }
 
-    fn prepare_candidate(
+    pub(crate) fn prepare_candidate(
         &mut self,
         source: &Path,
         requirements: &mut CandidateRequirements,
@@ -1123,32 +1121,51 @@ impl ModuleHost {
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or("module");
-        let path = self
-            .state_dir
-            .join("modules")
-            .join(format!("pipeline-{id}.{extension}"));
-        std::fs::copy(source, &path).map_err(|error| {
-            format!("stage {} as {}: {error}", source.display(), path.display())
-        })?;
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("hash staged module {}: {error}", path.display()))?;
-        Ok(StagedModule {
-            path,
-            content_hash: *blake3::hash(&bytes).as_bytes(),
-        })
+        let mut attempt = 0_u32;
+        loop {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{attempt}")
+            };
+            let path = self
+                .state_dir
+                .join("modules")
+                .join(format!("pipeline-{id}{suffix}.{extension}"));
+            match ngp_module_host::stage_copy_to(source, &path) {
+                Ok(staged) => {
+                    return Ok(StagedModule {
+                        path,
+                        content_hash: staged.content_hash(),
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempt = attempt
+                        .checked_add(1)
+                        .ok_or_else(|| "pipeline staging path namespace exhausted".to_owned())?;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "stage {} as {}: {error}",
+                        source.display(),
+                        path.display()
+                    ))
+                }
+            }
+        }
     }
 
-    fn install_poison(&mut self, poison: PipelinePoison) {
+    pub(crate) fn install_poison(&mut self, poison: PipelinePoison) {
         self.retire_published_ready();
         self.published = Some(PublishedState::Poisoned(poison));
     }
 
-    fn install_ready(&mut self, epoch: PipelineEpoch) {
+    pub(crate) fn install_ready(&mut self, epoch: PipelineEpoch) {
         self.retire_published_ready();
         self.published = Some(PublishedState::Ready(epoch));
     }
 
-    fn discard_unpublished(&mut self, epoch: PipelineEpoch) -> Option<PipelinePoison> {
+    pub(crate) fn discard_unpublished(&mut self, epoch: PipelineEpoch) -> Option<PipelinePoison> {
         epoch.begin_drain();
         match unload_epoch(&epoch) {
             Ok(()) => None,
@@ -1378,7 +1395,7 @@ impl DurableModuleHost {
     }
 }
 
-fn stored_pipeline_epoch(
+pub(crate) fn stored_pipeline_epoch(
     prepared: &PipelineEpoch,
     requirements: &CandidateRequirements,
 ) -> Result<ValidatedPipelineEpoch, StoreError> {

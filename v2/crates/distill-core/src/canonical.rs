@@ -11,8 +11,10 @@
 
 use unicode_normalization::UnicodeNormalization;
 
-/// `CompilationIdentity` and `ModuleAbiIdentity` digests (§5).
+/// `CompilationIdentity` digest (§5).
 pub const DSCI: [u8; 4] = *b"DSCI";
+/// Host-interface `ModuleAbiIdentity` digest (§3, §5).
+pub const DSMA: [u8; 4] = *b"DSMA";
 /// Target-definition hash (§18).
 pub const DSTG: [u8; 4] = *b"DSTG";
 /// Candidate target-set identity (§5, §13, §18).

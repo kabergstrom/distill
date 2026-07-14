@@ -582,6 +582,41 @@ impl CompiledTypeTable {
         Self::from_canonical(self.rows.clone(), self.digest).map(|_| ())
     }
 
+    /// Canonical boundary encoding carried by pipeline modules, RPC
+    /// attestations, and pack manifests. Rows remain independently framed so
+    /// an unknown future row shape cannot desynchronize the enclosing table.
+    pub fn encode(&self) -> Result<Vec<u8>, AttestationError> {
+        self.validate()?;
+        let count = u32::try_from(self.rows.len()).map_err(|_| AttestationError::CountOverflow)?;
+        let mut out = Vec::new();
+        out.push(VERSION);
+        out.extend_from_slice(&count.to_le_bytes());
+        for row in &self.rows {
+            put_bytes(&mut out, &row.encode()?)?;
+        }
+        out.extend_from_slice(&self.digest.0);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, AttestationError> {
+        let mut reader = Reader::new(bytes);
+        let version = reader.u8()?;
+        if version != VERSION {
+            return Err(AttestationError::UnsupportedVersion(version));
+        }
+        let count = usize::try_from(reader.u32()?).map_err(|_| AttestationError::CountOverflow)?;
+        if count > bytes.len() {
+            return Err(AttestationError::CountOverflow);
+        }
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            rows.push(CompiledTypeRow::decode(reader.bytes()?)?);
+        }
+        let digest = CompiledAttestationDigest(reader.a32()?);
+        reader.finish()?;
+        Self::from_canonical(rows, digest)
+    }
+
     /// Independently derives the tag-annotation epoch from the compiled rows.
     pub fn tag_annotation_epoch(&self) -> Result<TagAnnotationEpoch, AttestationError> {
         compute_tag_annotation_epoch(&self.rows)
