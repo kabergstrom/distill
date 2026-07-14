@@ -13,7 +13,10 @@ use distill_wire::native::{
     CallbackPanic, CtorCursor, CtorEntry, CtorTable, DropTable, DropThunk, NativeLayoutNode,
     NativeTagEncoding, NativeVariantTag, PushError, ScalarKind, SkipEntry, SkipWriterTable,
 };
-use distill_wire::plan::{compile_plans, PlanId};
+use distill_wire::plan::{
+    compile_plans, CompiledPlans, FixupOp, FixupPlan, FixupPlanArena, NativeTagWrite, PlanId,
+    PlanMeta, WireTagRead,
+};
 use distill_wire::wire::{WireEnumForm, WireNode};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
@@ -2120,4 +2123,102 @@ fn failing_skip_drop_is_reported() {
         .unwrap_err();
     assert_eq!(err, ExecError::Callback { what: "skip drop" });
     assert_eq!(take_events(), vec!["skip:write", "skip:drop_failed"]);
+}
+
+#[test]
+fn fabricated_flat_copy_cannot_write_past_native_frame() {
+    let plans = CompiledPlans {
+        arena: FixupPlanArena {
+            plans: vec![FixupPlan {
+                ops: vec![FixupOp::FlatCopy {
+                    wire: 0..4,
+                    native: 2,
+                }],
+                whole_drop: None,
+            }],
+        },
+        metas: vec![PlanMeta {
+            wire_size: 4,
+            wire_align: 1,
+            native_size: 4,
+            native_align: 1,
+        }],
+    };
+    let env = make_env(vec![], vec![], vec![]);
+    let mut dst = [0_u8; 4];
+    let err = unsafe {
+        execute_fixup(
+            &plans,
+            PlanId(0),
+            &[1, 2, 3, 4],
+            &[],
+            &env,
+            dst.as_mut_ptr(),
+        )
+    }
+    .unwrap_err();
+    assert!(
+        matches!(err, ExecError::Integrity { ref detail } if detail.contains("native frame")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn fabricated_enum_tag_write_cannot_write_past_native_frame() {
+    let plans = CompiledPlans {
+        arena: FixupPlanArena {
+            plans: vec![
+                FixupPlan {
+                    ops: vec![FixupOp::SwitchVariant {
+                        wire_tag: WireTagRead::CanonicalU32 { offset: 0 },
+                        native: 3,
+                        variants: vec![(
+                            NativeTagWrite::Direct {
+                                offset: 2,
+                                size: 2,
+                                value: 1,
+                            },
+                            PlanId(1),
+                        )],
+                    }],
+                    whole_drop: None,
+                },
+                FixupPlan {
+                    ops: vec![],
+                    whole_drop: None,
+                },
+            ],
+        },
+        metas: vec![
+            PlanMeta {
+                wire_size: 4,
+                wire_align: 1,
+                native_size: 4,
+                native_align: 1,
+            },
+            PlanMeta {
+                wire_size: 4,
+                wire_align: 1,
+                native_size: 4,
+                native_align: 1,
+            },
+        ],
+    };
+    let env = make_env(vec![], vec![], vec![]);
+    let mut dst = [0_u8; 4];
+    let err = unsafe {
+        execute_fixup(
+            &plans,
+            PlanId(0),
+            &0_u32.to_le_bytes(),
+            &[],
+            &env,
+            dst.as_mut_ptr(),
+        )
+    }
+    .unwrap_err();
+    assert!(
+        matches!(err, ExecError::Integrity { ref detail } if detail.contains("native frame")),
+        "{err:?}"
+    );
 }

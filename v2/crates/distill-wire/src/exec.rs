@@ -226,6 +226,24 @@ fn integrity(detail: impl Into<String>) -> ExecError {
     }
 }
 
+fn checked_native_range(
+    offset: u64,
+    bytes: u64,
+    native_size: u32,
+    operation: &str,
+) -> Result<usize, ExecError> {
+    let end = offset
+        .checked_add(bytes)
+        .ok_or_else(|| integrity(format!("{operation} native range overflows")))?;
+    if end > u64::from(native_size) {
+        return Err(integrity(format!(
+            "{operation} native range {offset}..{end} exceeds the {native_size}-byte native frame"
+        )));
+    }
+    usize::try_from(offset)
+        .map_err(|_| integrity(format!("{operation} native offset does not fit usize")))
+}
+
 fn align_up(v: u32, align: u32) -> u32 {
     let a = align.max(1);
     let rem = v % a;
@@ -400,6 +418,20 @@ impl<'a> Executor<'a> {
         dst: *mut u8,
         depth: u32,
     ) -> Result<(), ExecError> {
+        let native_size = self.meta(id).native_size;
+        self.run_plan_in_native_frame(id, wire, dst, depth, native_size)
+    }
+
+    /// Variant sub-plans are enum-relative and therefore execute within the
+    /// enclosing enum's native frame rather than their payload node's size.
+    unsafe fn run_plan_in_native_frame(
+        &mut self,
+        id: PlanId,
+        wire: &[u8],
+        dst: *mut u8,
+        depth: u32,
+        native_size: u32,
+    ) -> Result<(), ExecError> {
         if depth > self.env.limits.max_depth {
             return Err(ExecError::DepthExceeded {
                 limit: self.env.limits.max_depth,
@@ -407,7 +439,7 @@ impl<'a> Executor<'a> {
         }
         let mark = self.stack.len();
         let plan = &self.plans.arena.plans[id.0 as usize];
-        match self.run_ops(&plan.ops, wire, dst, depth) {
+        match self.run_ops(&plan.ops, wire, dst, depth, native_size) {
             Ok(()) => {
                 if let Some(drop_id) = plan.whole_drop {
                     // Validate before disarming — after the swap there
@@ -443,6 +475,7 @@ impl<'a> Executor<'a> {
         wire: &[u8],
         dst: *mut u8,
         depth: u32,
+        native_size: u32,
     ) -> Result<(), ExecError> {
         for op in ops {
             match op {
@@ -457,9 +490,15 @@ impl<'a> Executor<'a> {
                             wire.len()
                         )));
                     }
+                    let native = checked_native_range(
+                        u64::from(*native),
+                        (end - start) as u64,
+                        native_size,
+                        "flat copy",
+                    )?;
                     std::ptr::copy_nonoverlapping(
                         wire.as_ptr().add(start),
-                        dst.add(*native as usize),
+                        dst.add(native),
                         end - start,
                     );
                 }
@@ -467,18 +506,30 @@ impl<'a> Executor<'a> {
                     self.validate_scalar(wire, *offset, *kind)?;
                 }
                 FixupOp::ConstructString { wire_slot, native } => {
+                    let native_offset = checked_native_range(
+                        u64::from(*native),
+                        std::mem::size_of::<String>() as u64,
+                        native_size,
+                        "string construction",
+                    )?;
                     let (off, len) = read_varref(wire, *wire_slot)?;
                     let bytes = self.var_range(off, len as u64, 1)?;
                     let s = std::str::from_utf8(bytes)
                         .map_err(|_| integrity("string payload is not UTF-8"))?;
                     self.charge()?;
-                    std::ptr::write(dst.add(*native as usize) as *mut String, s.to_owned());
+                    std::ptr::write(dst.add(native_offset) as *mut String, s.to_owned());
                     self.stack.push(Entry {
-                        ptr: dst.add(*native as usize),
+                        ptr: dst.add(native_offset),
                         drop: EntryDrop::String,
                     });
                 }
                 FixupOp::ConstructBlob { wire_slot, native } => {
+                    let native_offset = checked_native_range(
+                        u64::from(*native),
+                        std::mem::size_of::<Blob>() as u64,
+                        native_size,
+                        "blob construction",
+                    )?;
                     let (index, zero) = read_varref(wire, *wire_slot)?;
                     if zero != 0 {
                         return Err(integrity(format!(
@@ -492,9 +543,9 @@ impl<'a> Executor<'a> {
                         ))
                     })?;
                     self.charge()?;
-                    std::ptr::write(dst.add(*native as usize) as *mut Blob, blob.clone());
+                    std::ptr::write(dst.add(native_offset) as *mut Blob, blob.clone());
                     self.stack.push(Entry {
-                        ptr: dst.add(*native as usize),
+                        ptr: dst.add(native_offset),
                         drop: EntryDrop::Blob,
                     });
                 }
@@ -559,7 +610,15 @@ impl<'a> Executor<'a> {
                     native,
                     variants,
                 } => {
-                    self.switch_variant(wire, dst, wire_tag, *native, variants, depth)?;
+                    self.switch_variant(
+                        wire,
+                        dst,
+                        wire_tag,
+                        *native,
+                        variants,
+                        depth,
+                        native_size,
+                    )?;
                 }
                 FixupOp::Recurse {
                     wire: wire_off,
@@ -575,12 +634,13 @@ impl<'a> Executor<'a> {
                             wire.len()
                         )));
                     }
-                    self.run_plan(
-                        *plan,
-                        &wire[start..end],
-                        dst.add(*native as usize),
-                        depth + 1,
+                    let native = checked_native_range(
+                        u64::from(*native),
+                        u64::from(m.native_size),
+                        native_size,
+                        "recurse",
                     )?;
+                    self.run_plan(*plan, &wire[start..end], dst.add(native), depth + 1)?;
                 }
             }
         }
@@ -855,6 +915,7 @@ impl<'a> Executor<'a> {
         native: u32,
         variants: &[(NativeTagWrite, PlanId)],
         depth: u32,
+        native_size: u32,
     ) -> Result<(), ExecError> {
         let index = match wire_tag {
             WireTagRead::CanonicalU32 { offset } => {
@@ -892,7 +953,7 @@ impl<'a> Executor<'a> {
         let (write, plan) = &variants[index];
         // Variant plans are enum-relative on both sides and carry no
         // whole_drop of their own — the enum frame owns the value.
-        self.run_plan(*plan, wire, dst, depth + 1)?;
+        self.run_plan_in_native_frame(*plan, wire, dst, depth + 1, native_size)?;
         match write {
             NativeTagWrite::Direct {
                 offset,
@@ -905,10 +966,17 @@ impl<'a> Executor<'a> {
                 value,
             } => {
                 let bytes = value.to_le_bytes();
+                let size = (*size).min(16) as u64;
+                let native_offset = checked_native_range(
+                    u64::from(native) + u64::from(*offset),
+                    size,
+                    native_size,
+                    "enum tag write",
+                )?;
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    dst.add(native as usize + *offset as usize),
-                    (*size).min(16) as usize,
+                    dst.add(native_offset),
+                    size as usize,
                 );
             }
             NativeTagWrite::PayloadImplied | NativeTagWrite::None => {}
