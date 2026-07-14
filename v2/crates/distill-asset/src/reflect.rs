@@ -227,8 +227,37 @@ macro_rules! float {
     };
 }
 
-float!(f32, F32, "f32");
 float!(f64, F64, "f64");
+
+impl AssetReflect for f32 {
+    fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
+        scalar::<Self>(offset, ScalarKind::F32)
+    }
+
+    fn logical(builder: &mut LogicalBuilder) {
+        logical_primitive(builder, "f32")
+    }
+
+    fn encode(&self, sink: &mut dyn EncodeSink) {
+        sink.flat(&self.to_bits().to_le_bytes())
+    }
+
+    fn to_authored(&self) -> AuthoredValue {
+        if !self.is_finite() {
+            return AuthoredValue::Float(f64::from(*self));
+        }
+        let canonical = distill_json::write_f32(*self)
+            .expect("finite binary32 values always have a canonical decimal");
+        let semantic = canonical
+            .parse::<f64>()
+            .expect("the canonical binary32 decimal is also a binary64 token");
+        AuthoredValue::Float(semantic)
+    }
+
+    fn default_writer() -> Option<DefaultWriter> {
+        Some(crate::defaults::write_default::<Self>)
+    }
+}
 
 impl AssetReflect for () {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {

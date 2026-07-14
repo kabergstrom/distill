@@ -39,6 +39,15 @@ fn empty_map_authored_shape_is_selected_by_key_type_not_vacuous_entries() {
     assert_eq!(strings, AuthoredValue::Object(BTreeMap::new()));
 }
 
+#[test]
+fn f32_reflection_emits_the_shortest_binary32_authored_decimal() {
+    let authored = 0.1_f32.to_authored();
+    assert_eq!(distill_json::write(&authored).unwrap(), "0.1");
+
+    let negative_zero = (-0.0_f32).to_authored();
+    assert_eq!(distill_json::write(&negative_zero).unwrap(), "0");
+}
+
 impl Drop for PanickingDrop {
     fn drop(&mut self) {
         panic!("drop failed")
