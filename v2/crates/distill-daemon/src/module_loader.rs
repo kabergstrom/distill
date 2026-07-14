@@ -129,27 +129,34 @@ impl PipelineModuleLoader for DynamicPipelineModuleLoader {
         }
         Ok(Box::new(DynamicLoadedPipelineModule {
             image: Some(image),
-            table,
+            table: Some(table),
         }))
     }
 }
 
 struct DynamicLoadedPipelineModule {
     image: Option<ngp_module_host::HostedLibrary>,
-    table: PipelineModuleTableV1,
+    table: Option<PipelineModuleTableV1>,
+}
+
+impl DynamicLoadedPipelineModule {
+    fn table(&self) -> Result<PipelineModuleTableV1, ModuleCallError> {
+        self.table
+            .ok_or_else(|| ModuleCallError::new("pipeline module is already closed"))
+    }
 }
 
 impl LoadedPipelineModule for DynamicLoadedPipelineModule {
     fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError> {
-        decode_module_identity(&read_probe(self.table.identity)?)
+        decode_module_identity(&read_probe(self.table()?.identity)?)
     }
 
     fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError> {
-        decode_measured_layouts(&read_probe(self.table.measured_layouts)?)
+        decode_measured_layouts(&read_probe(self.table()?.measured_layouts)?)
     }
 
     fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError> {
-        CompiledTypeTable::decode(&read_probe(self.table.compiled_types)?)
+        CompiledTypeTable::decode(&read_probe(self.table()?.compiled_types)?)
             .map_err(|error| ModuleCallError::new(format!("invalid compiled-type table: {error}")))
     }
 
@@ -160,15 +167,19 @@ impl LoadedPipelineModule for DynamicLoadedPipelineModule {
     ) -> Result<BTreeSet<String>, ModuleCallError> {
         // SAFETY: this Rust-ABI entry is reached only after the host compared
         // the module's CompilationIdentity and ModuleAbiIdentity exactly.
-        unsafe { (self.table.register)(targets, arena) }
+        unsafe { (self.table()?.register)(targets, arena) }
     }
 
     fn unload(&mut self) -> Result<(), ModuleCallError> {
         // SAFETY: same checked Rust-ABI contract as `register`.
-        unsafe { (self.table.unload)() }
+        unsafe { (self.table()?.unload)() }
     }
 
     fn dlclose(&mut self) {
+        // Invalidate every copied call target before releasing the image. Even
+        // accidental trait-object reuse can now return only a closed-state
+        // error rather than jumping through a resident-table pointer.
+        self.table = None;
         if let Some(image) = self.image.take() {
             image.close();
         }
@@ -458,5 +469,56 @@ impl<'a> Reader<'a> {
         } else {
             Err(ModuleCallError::new("trailing bytes in module ABI payload"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn rejected_probe(
+        _buffer: *mut u8,
+        _capacity: u32,
+        _length: *mut u32,
+    ) -> i32 {
+        -1
+    }
+
+    unsafe fn empty_register(
+        _targets: &[TargetDefinition],
+        _arena: &mut CandidateRegistrationArena,
+    ) -> Result<BTreeSet<String>, ModuleCallError> {
+        Ok(BTreeSet::new())
+    }
+
+    unsafe fn empty_unload() -> Result<(), ModuleCallError> {
+        Ok(())
+    }
+
+    #[test]
+    fn closed_module_invalidates_every_copied_call_target() {
+        let mut module = DynamicLoadedPipelineModule {
+            image: None,
+            table: Some(PipelineModuleTableV1 {
+                abi_version: PIPELINE_MODULE_ABI_VERSION_V1,
+                identity: rejected_probe,
+                measured_layouts: rejected_probe,
+                compiled_types: rejected_probe,
+                register: empty_register,
+                unload: empty_unload,
+            }),
+        };
+
+        module.dlclose();
+        assert!(module
+            .identity()
+            .unwrap_err()
+            .detail()
+            .contains("already closed"));
+        assert!(module
+            .unload()
+            .unwrap_err()
+            .detail()
+            .contains("already closed"));
     }
 }
