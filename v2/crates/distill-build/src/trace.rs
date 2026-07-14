@@ -12,6 +12,10 @@ use crate::dslf::{DslfError, DslfV1};
 use crate::import::ImportRuleId;
 use crate::query::{AssetQuery, FileQuery};
 
+#[path = "trace_decode.rs"]
+mod decode;
+pub use decode::{decode_trace_canonical_bytes, decode_trace_payload_bytes, TraceDecodeError};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Observed<T> {
     Ok(T),
@@ -686,7 +690,9 @@ impl FailureRecord {
 }
 
 pub fn trace_digest(trace: &[TraceOp]) -> [u8; 32] {
-    *blake3::hash(&trace_canonical_bytes(trace)).as_bytes()
+    distill_core::canonical::domain_digest(DSTR, 1, |encoder| {
+        encoder.raw(&trace_payload_bytes(trace));
+    })
 }
 
 /// The exact DSTR v1 hash preimage. Exposing the bytes makes protocol tests
@@ -695,6 +701,16 @@ pub fn trace_canonical_bytes(trace: &[TraceOp]) -> Vec<u8> {
     let mut encoder = CanonicalEncoder::new();
     encoder.raw(&DSTR);
     encoder.u8(1);
+    encoder.raw(&trace_payload_bytes(trace));
+    encoder.into_bytes()
+}
+
+/// The serialized trace body stored in a result record. The CAS applies the
+/// `DSTR` domain and version to these bytes when deriving the candidate's
+/// secondary key, so storing the already-prefixed preimage would apply the
+/// domain twice.
+pub fn trace_payload_bytes(trace: &[TraceOp]) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new();
     encoder.seq(trace, encode_trace_op);
     encoder.into_bytes()
 }

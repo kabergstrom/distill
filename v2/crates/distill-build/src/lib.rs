@@ -9,6 +9,7 @@ pub mod dslf;
 pub mod import;
 pub mod keys;
 pub mod outputs;
+pub mod persist;
 pub mod pipeline;
 pub mod query;
 pub mod scheduler;

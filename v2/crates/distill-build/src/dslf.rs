@@ -23,6 +23,22 @@ pub enum LocalFailureClass {
     ArtifactEncoding = 8,
 }
 
+impl LocalFailureClass {
+    pub fn from_u16(value: u16) -> Option<Self> {
+        Some(match value {
+            1 => Self::Validator,
+            2 => Self::MigrationPlan,
+            3 => Self::Processor,
+            4 => Self::MigrationFunction,
+            5 => Self::OutputBinding,
+            6 => Self::Importer,
+            7 => Self::ImportIntake,
+            8 => Self::ArtifactEncoding,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DslfError {
     DuplicateImporterSource(RootedPath),

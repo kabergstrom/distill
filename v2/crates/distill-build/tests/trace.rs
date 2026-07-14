@@ -68,6 +68,74 @@ fn dstr_read_success_bytes_pin_one_based_operation_and_outcome_tags() {
     expected.push(1); // Observed::Ok
     expected.extend_from_slice(&hash.0);
     assert_eq!(actual, expected);
+    assert_eq!(
+        decode_trace_canonical_bytes(&actual).unwrap(),
+        vec![TraceOp::Read {
+            asset,
+            observed: Observed::Ok(hash),
+        }]
+    );
+    assert_eq!(
+        decode_trace_payload_bytes(&trace_payload_bytes(&[TraceOp::Read {
+            asset,
+            observed: Observed::Ok(hash),
+        }]))
+        .unwrap(),
+        vec![TraceOp::Read {
+            asset,
+            observed: Observed::Ok(hash),
+        }]
+    );
+}
+
+#[test]
+fn trace_digest_applies_the_dstr_domain_exactly_once() {
+    let trace = [TraceOp::Resolve {
+        path: "asset.bundle".into(),
+        observed: Observed::Ok(None),
+    }];
+    assert_eq!(
+        trace_digest(&trace),
+        *blake3::hash(&trace_canonical_bytes(&trace)).as_bytes()
+    );
+    assert_eq!(
+        trace_digest(&trace),
+        distill_core::canonical::domain_digest(distill_core::canonical::DSTR, 1, |encoder| encoder
+            .raw(&trace_payload_bytes(&trace)),)
+    );
+}
+
+#[test]
+fn persisted_trace_decoder_rejects_reserved_noncanonical_and_trailing_forms() {
+    assert_eq!(
+        decode_trace_payload_bytes(&[1, 0, 0, 0, 4]),
+        Err(TraceDecodeError::ReservedToolLaunch)
+    );
+
+    let failure = TraceOp::Read {
+        asset: AssetUuid([1; 16]),
+        observed: Observed::Err(StableFailureFingerprint::Ambiguous {
+            conflicting: vec![AssetUuid([2; 16]), AssetUuid([1; 16])],
+        }),
+    };
+    let mut bytes = trace_payload_bytes(&[failure]);
+    // Encoding canonicalizes the set. Make its second member equal to its
+    // first so the persisted form is no longer strict sorted/deduplicated.
+    let second = bytes.len() - 16;
+    let first = second - 16;
+    let copy = bytes[first..second].to_vec();
+    bytes[second..].copy_from_slice(&copy);
+    assert_eq!(
+        decode_trace_payload_bytes(&bytes),
+        Err(TraceDecodeError::NonCanonicalSet)
+    );
+
+    let mut trailing = trace_payload_bytes(&[]);
+    trailing.push(0);
+    assert_eq!(
+        decode_trace_payload_bytes(&trailing),
+        Err(TraceDecodeError::TrailingBytes)
+    );
 }
 
 #[test]
