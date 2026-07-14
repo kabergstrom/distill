@@ -304,10 +304,10 @@ impl LoaderIO for PackfileIO {
 
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis) {
         if !self.basis_matches(basis) {
-            self.events.push_back(IoEvent::IoError {
-                req: Some(req),
+            self.events.push_back(IoEvent::RequestError {
+                req,
                 message: "pack remounted: stale manifest basis".into(),
-                basis: Some(self.basis.clone()),
+                basis: self.basis.clone(),
             });
             return;
         }
@@ -330,10 +330,10 @@ impl LoaderIO for PackfileIO {
 
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis) {
         if !self.basis_matches(basis) {
-            self.events.push_back(IoEvent::IoError {
-                req: Some(req),
+            self.events.push_back(IoEvent::RequestError {
+                req,
                 message: "pack remounted: stale manifest basis".into(),
-                basis: Some(self.basis.clone()),
+                basis: self.basis.clone(),
             });
             return;
         }
@@ -346,10 +346,10 @@ impl LoaderIO for PackfileIO {
                 artifact,
                 basis: self.basis.clone(),
             }),
-            Err(error) => self.events.push_back(IoEvent::IoError {
-                req: Some(req),
+            Err(error) => self.events.push_back(IoEvent::RequestError {
+                req,
                 message: format!("mounted pack artifact integrity failure: {error:?}"),
-                basis: Some(self.basis.clone()),
+                basis: self.basis.clone(),
             }),
         }
     }
@@ -360,11 +360,16 @@ impl LoaderIO for PackfileIO {
                 error: "pack remounted: stale manifest basis".into(),
             }
         } else if let Some(paths) = &self.manifest.paths {
-            paths
-                .binary_search_by(|row| row.path.as_str().cmp(path))
-                .ok()
-                .map(|index| PathResolveResult::Resolved(paths[index].asset_uuid))
-                .unwrap_or(PathResolveResult::Missing)
+            match distill_build::query::normalize_path(path) {
+                Ok(path) => paths
+                    .binary_search_by(|row| row.path.as_str().cmp(path.as_str()))
+                    .ok()
+                    .map(|index| PathResolveResult::Resolved(paths[index].asset_uuid))
+                    .unwrap_or(PathResolveResult::Missing),
+                Err(error) => PathResolveResult::Failed {
+                    error: error.to_string(),
+                },
+            }
         } else {
             PathResolveResult::Unsupported
         };

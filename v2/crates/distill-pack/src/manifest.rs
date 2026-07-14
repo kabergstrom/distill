@@ -130,8 +130,9 @@ pub fn canonicalize(mut manifest: PackManifest) -> Result<PackManifest, Manifest
     sort_unique(&mut manifest.index, |v| v.ekey)?;
     sort_unique(&mut manifest.wire_trees, |v| v.layout_hash)?;
     if let Some(paths) = &mut manifest.paths {
-        for row in paths.iter() {
-            distill_build::query::normalize_path(&row.path).map_err(|_| ManifestError::BadPath)?;
+        for row in paths.iter_mut() {
+            row.path = distill_build::query::normalize_path(&row.path)
+                .map_err(|_| ManifestError::BadPath)?;
         }
         sort_unique(paths, |v| v.path.clone())?;
     }
@@ -522,7 +523,11 @@ fn decode_paths(bytes: &[u8]) -> Result<Vec<PathRow>, ManifestError> {
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let path = r.string()?;
-        distill_build::query::normalize_path(&path).map_err(|_| ManifestError::BadPath)?;
+        let normalized =
+            distill_build::query::normalize_path(&path).map_err(|_| ManifestError::BadPath)?;
+        if normalized != path {
+            return Err(ManifestError::BadPath);
+        }
         rows.push(PathRow {
             path,
             asset_uuid: AssetUuid(r.a16()?),
@@ -560,6 +565,24 @@ fn string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u32).to_le_bytes());
     out.extend_from_slice(value.as_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_paths, ManifestError};
+
+    #[test]
+    fn decoder_rejects_noncanonical_path_bytes() {
+        let path = "te\u{301}xtures/a.bundle";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&[1; 16]);
+
+        assert!(matches!(decode_paths(&bytes), Err(ManifestError::BadPath)));
+    }
+}
+
 pub fn load_policy_digest(rows: &[LoadPolicyRow]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"DSLP");

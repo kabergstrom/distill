@@ -472,6 +472,73 @@ fn one_basis_resolve_fetch_and_preconstructed_injection_commit_at_process_bounda
 }
 
 #[test]
+fn malformed_fetch_terminally_fails_its_candidate() {
+    let token = ModuleEpochToken::new(31);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 31, &token);
+    let asset_uuid = uuid(33);
+    let _handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (hash, _) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(
+        &mut loader,
+        hash,
+        FetchedArtifact {
+            structural: Arc::from([0_u8]),
+            blobs: Vec::new(),
+            wire_layout: Arc::from([]),
+        },
+    );
+    loader.process(&mut storage).unwrap();
+
+    let diagnostics = loader.take_diagnostics();
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| matches!(diagnostic, LoaderDiagnostic::Artifact(_))));
+    assert!(diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { failures, .. }
+            if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("artifact"))
+    )));
+}
+
+#[test]
+fn fetch_request_error_terminally_fails_its_candidate() {
+    let token = ModuleEpochToken::new(32);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 32, &token);
+    let asset_uuid = uuid(34);
+    let _handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (hash, _) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    let (req, request_basis) = loader.io().fetch_for(hash);
+    loader.io_mut().push(IoEvent::RequestError {
+        req,
+        message: "fetch failed".into(),
+        basis: request_basis,
+    });
+    loader.process(&mut storage).unwrap();
+
+    let diagnostics = loader.take_diagnostics();
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| matches!(diagnostic, LoaderDiagnostic::Io(message) if message == "fetch failed")));
+    assert!(diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { failures, .. }
+            if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("fetch failed"))
+    )));
+}
+
+#[test]
 fn pending_member_defers_the_whole_dependency_component() {
     let token = ModuleEpochToken::new(2);
     let mut loader = Loader::new(mock_io());

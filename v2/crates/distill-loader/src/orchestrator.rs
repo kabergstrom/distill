@@ -1030,32 +1030,42 @@ impl<I: LoaderIO> Loader<I> {
                 }
                 self.accept_fetched(content_hash, artifact, basis);
             }
-            IoEvent::IoError {
+            IoEvent::RequestError {
                 req,
                 message,
                 basis,
             } => {
-                if let (Some(req), Some(basis)) = (req, basis) {
-                    let record = self.requests.outstanding(req).cloned();
-                    if self.requests.complete(req, &basis) == CompletionDisposition::Accepted {
-                        if let Some(record) = record {
-                            if let RequestOwner::Handle(handle) = record.owner {
-                                if let Some(uuid) =
-                                    self.slots.get(&handle).and_then(|slot| slot.binding.uuid())
-                                {
-                                    if let Some(candidate) = self
-                                        .sweep
-                                        .as_mut()
-                                        .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-                                    {
-                                        candidate.terminal =
-                                            CandidateTerminal::Failed(message.clone());
-                                    }
-                                }
-                            }
+                let record = self.requests.outstanding(req).cloned();
+                let disposition = self.requests.complete(req, &basis);
+                if disposition != CompletionDisposition::Accepted {
+                    self.diagnostics
+                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    return Ok(());
+                }
+                match record.map(|record| (record.purpose, record.owner)) {
+                    Some((OutstandingPurpose::Resolve, RequestOwner::Handle(handle))) => {
+                        if let Some(uuid) =
+                            self.slots.get(&handle).and_then(|slot| slot.binding.uuid())
+                        {
+                            self.fail_candidate(uuid, &basis, message.clone());
                         }
                     }
+                    Some((OutstandingPurpose::Fetch, RequestOwner::Content(content_hash))) => {
+                        self.fail_content_candidate(content_hash, &basis, message.clone());
+                    }
+                    Some((OutstandingPurpose::ResolvePath, RequestOwner::Path(path))) => {
+                        self.accept_path(
+                            &path,
+                            PathResolveResult::Failed {
+                                error: message.clone(),
+                            },
+                        );
+                    }
+                    _ => self.diagnostics.push(LoaderDiagnostic::EventMismatch),
                 }
+                self.diagnostics.push(LoaderDiagnostic::Io(message));
+            }
+            IoEvent::ConnectionError { message } => {
                 self.diagnostics.push(LoaderDiagnostic::Io(message));
             }
         }
@@ -1185,6 +1195,10 @@ impl<I: LoaderIO> Loader<I> {
         artifact: FetchedArtifact,
         basis: IoBasis,
     ) {
+        let Some(uuid) = self.content_candidate_uuid(content_hash, &basis) else {
+            self.diagnostics.push(LoaderDiagnostic::EventMismatch);
+            return;
+        };
         let blob_bytes = artifact
             .blobs
             .iter()
@@ -1193,71 +1207,93 @@ impl<I: LoaderIO> Loader<I> {
         let parsed = match parse_artifact_parts(&artifact.structural, &blob_bytes) {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.diagnostics
-                    .push(LoaderDiagnostic::Artifact(error.to_string()));
+                self.reject_fetched(uuid, &basis, error.to_string());
                 return;
             }
         };
-        let uuid = parsed.asset_uuid;
+        if parsed.asset_uuid != uuid {
+            self.reject_fetched(
+                uuid,
+                &basis,
+                "fetched artifact asset UUID does not match resolve".to_owned(),
+            );
+            return;
+        }
         let type_uuid = parsed.terminal_type;
         let load_deps = parsed.load_deps.clone();
         if parsed.content_hash != content_hash {
-            self.diagnostics.push(LoaderDiagnostic::Artifact(
+            self.reject_fetched(
+                uuid,
+                &basis,
                 "fetched artifact content hash does not match resolve".to_owned(),
-            ));
+            );
             return;
         }
         let descriptor = match self.descriptors.get(&type_uuid) {
             Some(record) if self.epochs.can_issue_work(record.epoch) => record,
             _ => {
-                self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                    "no live descriptor for fetched terminal type {type_uuid}"
-                )));
+                self.reject_fetched(
+                    uuid,
+                    &basis,
+                    format!("no live descriptor for fetched terminal type {type_uuid}"),
+                );
                 return;
             }
         };
         if parsed.logical_hash != descriptor.descriptor.logical_hash {
-            self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                "logical hash disagrees with descriptor for {type_uuid}"
-            )));
+            self.reject_fetched(
+                uuid,
+                &basis,
+                format!("logical hash disagrees with descriptor for {type_uuid}"),
+            );
             return;
         }
         if let Err(error) = basis.load_policy().require_runtime(type_uuid) {
-            self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                "load policy rejects {type_uuid}: {error:?}"
-            )));
+            self.reject_fetched(
+                uuid,
+                &basis,
+                format!("load policy rejects {type_uuid}: {error:?}"),
+            );
             return;
         }
         let wire = match decode_dswl(&artifact.wire_layout) {
             Ok(wire) => wire,
             Err(error) => {
-                self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                    "invalid DSWL for {type_uuid}: {error:?}"
-                )));
+                self.reject_fetched(
+                    uuid,
+                    &basis,
+                    format!("invalid DSWL for {type_uuid}: {error:?}"),
+                );
                 return;
             }
         };
         match dswl_hash(&wire) {
             Ok(hash) if hash == parsed.layout_hash => {}
             Ok(_) => {
-                self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                    "DSWL hash disagrees with artifact header for {type_uuid}"
-                )));
+                self.reject_fetched(
+                    uuid,
+                    &basis,
+                    format!("DSWL hash disagrees with artifact header for {type_uuid}"),
+                );
                 return;
             }
             Err(error) => {
-                self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                    "cannot hash DSWL for {type_uuid}: {error:?}"
-                )));
+                self.reject_fetched(
+                    uuid,
+                    &basis,
+                    format!("cannot hash DSWL for {type_uuid}: {error:?}"),
+                );
                 return;
             }
         }
         let plans = match compile_plans(&wire, descriptor.descriptor.native_layout) {
             Ok(plans) => plans,
             Err(error) => {
-                self.diagnostics.push(LoaderDiagnostic::Artifact(format!(
-                    "cannot compile fixup plan for {type_uuid}: {error}"
-                )));
+                self.reject_fetched(
+                    uuid,
+                    &basis,
+                    format!("cannot compile fixup plan for {type_uuid}: {error}"),
+                );
                 return;
             }
         };
@@ -1344,6 +1380,57 @@ impl<I: LoaderIO> Loader<I> {
             basis,
             artifact,
         });
+    }
+
+    fn content_candidate_uuid(
+        &self,
+        content_hash: ContentHash,
+        basis: &IoBasis,
+    ) -> Option<AssetUuid> {
+        self.sweep
+            .as_ref()?
+            .candidates
+            .iter()
+            .find_map(|(uuid, candidate)| {
+                if &candidate.basis != basis {
+                    return None;
+                }
+                match &candidate.terminal {
+                    CandidateTerminal::Built {
+                        content_hash: expected,
+                        ..
+                    } if *expected == content_hash => Some(*uuid),
+                    _ => None,
+                }
+            })
+    }
+
+    fn reject_fetched(&mut self, uuid: AssetUuid, basis: &IoBasis, message: String) {
+        self.diagnostics
+            .push(LoaderDiagnostic::Artifact(message.clone()));
+        self.fail_candidate(uuid, basis, message);
+    }
+
+    fn fail_content_candidate(
+        &mut self,
+        content_hash: ContentHash,
+        basis: &IoBasis,
+        message: String,
+    ) {
+        if let Some(uuid) = self.content_candidate_uuid(content_hash, basis) {
+            self.fail_candidate(uuid, basis, message);
+        }
+    }
+
+    fn fail_candidate(&mut self, uuid: AssetUuid, basis: &IoBasis, message: String) {
+        if let Some(candidate) = self
+            .sweep
+            .as_mut()
+            .and_then(|sweep| sweep.candidates.get_mut(&uuid))
+            .filter(|candidate| &candidate.basis == basis)
+        {
+            candidate.terminal = CandidateTerminal::Failed(message);
+        }
     }
 
     fn mint_placeholders(&mut self, uuid: AssetUuid) {

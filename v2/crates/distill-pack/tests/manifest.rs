@@ -192,6 +192,41 @@ fn optional_path_table_is_directory_membership() {
 }
 
 #[test]
+fn path_rows_are_nfc_canonicalized_before_sorting_and_encoding() {
+    let mut manifest = sample();
+    manifest.paths = Some(vec![PathRow {
+        path: "te\u{301}xtures/a.bundle".into(),
+        asset_uuid: AssetUuid([1; 16]),
+    }]);
+
+    let canonical = canonicalize(manifest.clone()).unwrap();
+    assert_eq!(canonical.paths.unwrap()[0].path, "t\u{e9}xtures/a.bundle");
+    assert_eq!(
+        decode_manifest(&encode_manifest(&manifest).unwrap())
+            .unwrap()
+            .paths
+            .unwrap()[0]
+            .path,
+        "t\u{e9}xtures/a.bundle"
+    );
+
+    manifest.paths = Some(vec![
+        PathRow {
+            path: "te\u{301}xtures/a.bundle".into(),
+            asset_uuid: AssetUuid([1; 16]),
+        },
+        PathRow {
+            path: "t\u{e9}xtures/a.bundle".into(),
+            asset_uuid: AssetUuid([2; 16]),
+        },
+    ]);
+    assert!(matches!(
+        canonicalize(manifest),
+        Err(ManifestError::Duplicate)
+    ));
+}
+
+#[test]
 fn manifest_rejects_corruption_truncation_and_invalid_policy_bits() {
     let bytes = encode_manifest(&sample()).unwrap();
     for len in 0..bytes.len() {

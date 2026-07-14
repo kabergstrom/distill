@@ -96,10 +96,13 @@ pub enum IoEvent {
         assets: Vec<(AssetUuid, AssetDeltaState)>,
         paths: Vec<String>,
     },
-    IoError {
-        req: Option<ReqId>,
+    RequestError {
+        req: ReqId,
         message: String,
-        basis: Option<IoBasis>,
+        basis: IoBasis,
+    },
+    ConnectionError {
+        message: String,
     },
     ReconnectRequired {
         reason: ReconnectReason,

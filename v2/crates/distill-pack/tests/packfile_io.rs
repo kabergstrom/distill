@@ -204,6 +204,26 @@ fn absent_path_table_is_loudly_unsupported() {
 }
 
 #[test]
+fn packfile_io_normalizes_path_queries_before_lookup() {
+    let (manifest, archive, runtime, asset_uuid, _) = fixture(true);
+    let mut manifest = distill_pack::manifest::decode_manifest(&manifest).unwrap();
+    manifest.paths.as_mut().unwrap()[0].path = "t\u{e9}xtures/a.bundle".into();
+    let manifest = encode_manifest(&manifest).unwrap();
+    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let basis = io.begin_sweep();
+
+    io.resolve_path(ReqId(1), "te\u{301}xtures/a.bundle", &basis);
+
+    assert!(matches!(
+        &io.poll()[0],
+        IoEvent::PathResolved {
+            result: PathResolveResult::Resolved(got),
+            ..
+        } if *got == asset_uuid
+    ));
+}
+
+#[test]
 fn mount_refuses_wrong_runtime_or_archive_identity() {
     let (manifest, archive, mut runtime, _, _) = fixture(true);
     runtime.target_def_hash = [0; 32];
@@ -265,9 +285,6 @@ fn stale_pack_basis_cannot_read_after_remount() {
     io.resolve(ReqId(1), asset_uuid, &stale);
     assert!(matches!(
         &io.poll()[0],
-        IoEvent::IoError {
-            req: Some(ReqId(1)),
-            ..
-        }
+        IoEvent::RequestError { req: ReqId(1), .. }
     ));
 }
