@@ -121,3 +121,29 @@ resolved.
 
 The report's separate “unimplemented” section is omitted here because it was
 demonstrably stale: it claimed several present, tested crates were unstarted.
+
+## Local triage and resolution
+
+| Finding | Decision | Resolution / evidence |
+|---|---|---|
+| C-1 native write bounds | Endorsed as defense in depth; exploit claim overstated | Runtime bounds now cover flat copies, known built-ins, recurse frames, and enum tag writes, including enum-relative variant plans. Added fabricated-plan negatives. Distill `7c3d639`. |
+| C-2 callable table after close | Endorsed as lifecycle hardening; no current UAF call path | The table becomes `None` before the image closes and every call returns a typed closed-state error. Distill `48e0d5b`. |
+| C-3 f32 canonicality | Rejected | The design explicitly requires equality with the shortest authored binary32 token. `0.30000001192092896` must canonicalize to `0.3`; the existing negative test pins this. |
+| H-1 hash/`dlopen` path race | Endorsed | The shared host hashes an open descriptor and loads that same descriptor on Unix; Windows holds a handle denying write/delete replacement across path loading. New Game Plus `257159e`. |
+| H-2 Rust ABI entries | Rejected | `DESIGN.md` explicitly makes only the three pre-verification probes C ABI; `register`/`unload` are deliberately Rust ABI after exact `CompilationIdentity` and `ModuleAbiIdentity` equality. |
+| H-3 pointer-kind mismatch | Rejected | Raw pointers of either mutability classify as the same opaque, rejected class; no wire layout is produced. `Arc` is recognized by well-known type identity, not source-walk's raw-pointer enum. |
+| H-4 poisoned epoch leak growth | Rejected as a correctness change | Permanent leak is the specified fail-stop behavior after callback corruption. `retired_count` and per-epoch poison diagnostics expose it; process restart is the recovery boundary. |
+| H-5 pack activation monotonicity | Rejected | There is no pack-level generation authority. Archive generations locate physical records; `pack.current` intentionally selects a content-addressed manifest and may be explicitly rolled back. |
+| H-6 64 MiB probe cap | Rejected | Probe buffers are allocated and decoded sequentially, not three at once, and the in-process module already executes trusted native code. The cap prevents unbounded accidental reports without constraining large registries to an arbitrary 1 MiB. |
+| H-7 ingress ownership window | Rejected | `CallbackIngressGuard::drop` deliberately leaks an armed no-Drop capsule; it never calls `cleanup_reverse` or frees the linked node, so the alleged double-free path does not exist. |
+| M-1 source-byte ABI fingerprint | Rejected | Conservative invalidation is intentional at this safety boundary; it cannot accept an incompatible module. |
+| M-2 immutable-file comparison | Rejected | Performance observation only; byte identity is required when a hash-named file already exists. |
+| M-3 ZST dangling pointer | Rejected | The dynamic aligned non-null pointer is intentional for a runtime alignment; `NonNull::dangling()` cannot express that alignment. |
+| M-4 target-set clone | Rejected | Performance-only validation path; no semantic defect. |
+| M-5 identity NFC | Rejected | `CanonicalEncoder::str` NFC-normalizes every identity string before DSCI hashing, and module-boundary decoding independently requires NFC. |
+| M-6 SQLite foreign keys | Rejected | The DDL declares no foreign-key constraints; enabling the pragma would change nothing. |
+| M-7 integer/float f32 paths | Rejected | The separate integer path deliberately prevents double rounding beyond binary64's exact integer range, as required by the design. |
+
+**Resolved review outcome:** three defensive hardenings accepted and implemented;
+all remaining findings rejected with code/design evidence. No unaddressed
+CRITICAL or HIGH finding remains from this report.
