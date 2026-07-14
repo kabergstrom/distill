@@ -171,8 +171,8 @@ record. Loading never touches the artifact path directly: each epoch
 copies the dylib into daemon state, hashes the copy, and `dlopen`s the
 copy — the hashed bytes are exactly the loaded bytes, so a supervisor
 rebuild landing between hash and load can never run one build's code
-under another's identity (the same staging rule covers tool binaries,
-§9). Reloads use a **module epoch**, and rotation is **staged, never in
+under another's identity (the same staging rule covers package tools, while
+ambient tools are explicitly unstaged, §9). Reloads use a **module epoch**, and rotation is **staged, never in
 place**: a reload first opens a *candidate* epoch — copy, hash, `dlopen`,
 the identity checks below, a host-minted unpublished `ModuleEpochToken`,
 `register` into that token's status-bearing **registration arena**, and
@@ -3224,7 +3224,7 @@ pub struct ToolOutput { pub status: i32, pub stdout: Vec<u8>, pub stderr: Vec<u8
 pipeline code. Runtime `dlopen` is forbidden in importers, processors,
 validators, migrations, and default materializers, and no API resolves a
 tool entry to a library path or handle; code that must vary outside the
-statically linked pipeline cdylib runs as the staged §9 subprocess.
+statically linked pipeline cdylib runs as a §9 subprocess.
 
 Tool identity has two deliberately simple modes:
 
@@ -3443,10 +3443,11 @@ package has been evicted.
 If `id` is absent from that snapshot's ToolEpoch, `run_tool` records the
 terminal `TraceOp::Tool` miss and `MissingCapability { Tool(id) }` specified
 below; it does not attempt a launch and cannot use `ToolLaunch` as an alias.
-PATH lookup and symlink retargeting are never registration mechanisms. Package
-launches cannot access files outside the staged package; ambient launchers are
-explicitly outside that guarantee and are nonmemoizable without a trusted
-fingerprint. Hashing
+PATH lookup and symlink retargeting are never registration mechanisms. Distill
+constructs a package launch only from snapshotted members and uses the staged
+package as its cwd; the package author remains responsible for the process's OS
+access. Ambient launchers are explicitly unstaged and are nonmemoizable without
+a trusted fingerprint. Hashing
 labeled operations rather than a sorted multiset of
 content hashes means two dependencies that swap contents change the key.
 
@@ -3664,6 +3665,9 @@ then yields `NotExecutable`, `SpawnDenied`, `PackageUnavailable`, or
 `AmbientUnavailable`, the whole
 attempted result and its trace are discarded and the caller receives
 `TransientToolLaunchFailure { id, tool_hash, class }`; it is never memoized.
+An unfingerprinted ambient hit may return a successful `ToolOutput`, but it marks
+the complete calling processor attempt nonmemoizable, so neither success nor a
+later deterministic failure from that attempt enters a candidate bucket.
 DSTR v1 tag 4 is permanently reserved under the historical name `ToolLaunch`
 and every decoder MUST reject it. It has no payload grammar and can never be an
 alias for a ToolEpoch miss, a successful `Tool` observation, or a transient
@@ -6145,8 +6149,9 @@ pub enum DriftedInput {             // resolve names exactly what drifted
     Asset(AssetUuid),
     Query(AssetQuery),
     Dylib,
-    /// The named tool's staged bytes for this basis were evicted — the
-    /// snapshot's ToolEpoch capsule mapping (§9, §13) can no longer be honored.
+    /// The named package tool's staged directory for this basis was evicted —
+    /// the snapshot's ToolEpoch mapping (§9, §13) can no longer be honored.
+    /// Ambient path availability is a transient launch outcome instead.
     Tool(String),
 }
 ```

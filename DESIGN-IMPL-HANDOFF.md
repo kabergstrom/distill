@@ -418,8 +418,9 @@ Design subsections to implement:
     (R20/M18); `load_current` acknowledged as execution; memoized under processor
     candidate rules; trace-bearing, bucket-indexed result records.
 - **§9 Processing pipeline** (DESIGN.md 1679–2313):
-  - _Pipeline map_ — importer/processor registration, the `ToolEpoch` staged-tool
-    model (registration-time staging, snapshot-resolved execution), static
+  - _Pipeline map_ — importer/processor registration, the `ToolEpoch`
+    package-or-ambient model (package staging, explicit ambient toolchain
+    identity, snapshot-resolved execution), static
     linkage rule (R20/H6 + R22/M9 dlopen ban).
   - _Input hashes_ — the DSIH full-input-hash composition; per-field config
     policy table.
