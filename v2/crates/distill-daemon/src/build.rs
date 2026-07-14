@@ -298,32 +298,70 @@ fn build_asset(
     asset: AssetUuid,
     depth: usize,
 ) -> Result<NodePublication, BuildError> {
-    if let Some(cached) = context.memo.get(&asset) {
-        return Ok(cached.clone());
+    enum Frame {
+        Enter { asset: AssetUuid, depth: usize },
+        Assemble(PendingNodePublication),
     }
-    if depth > context.max_depth {
-        return Err(BuildError::Failed(format!(
-            "dependency depth exceeds configured limit {}",
-            context.max_depth
-        )));
+
+    let mut stack = vec![Frame::Enter { asset, depth }];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter { asset, depth } => {
+                if depth > context.max_depth {
+                    return Err(BuildError::Failed(format!(
+                        "dependency depth exceeds configured limit {} at asset {asset}",
+                        context.max_depth
+                    )));
+                }
+                if context.memo.contains_key(&asset) {
+                    continue;
+                }
+                if !context.visiting.insert(asset) {
+                    let mut cycle = context.visiting.iter().copied().collect::<Vec<_>>();
+                    cycle.push(asset);
+                    return Err(BuildError::Failed(format!(
+                        "strong-reference cycle reaches assets {cycle:?}"
+                    )));
+                }
+                let pending = match build_asset_inner(context, asset) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        context.visiting.remove(&asset);
+                        return Err(error);
+                    }
+                };
+                let dependencies = pending_dependency_parents(context, &pending)?;
+                stack.push(Frame::Assemble(pending));
+                for dependency in dependencies.into_iter().rev() {
+                    stack.push(Frame::Enter {
+                        asset: dependency,
+                        depth: depth + 1,
+                    });
+                }
+            }
+            Frame::Assemble(pending) => {
+                let asset = pending.asset;
+                let publication = match assemble_pending(context, pending) {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        context.visiting.remove(&asset);
+                        return Err(error);
+                    }
+                };
+                context.visiting.remove(&asset);
+                context.memo.insert(asset, publication);
+            }
+        }
     }
-    if !context.visiting.insert(asset) {
-        return Err(BuildError::Failed(format!(
-            "strong-reference cycle reaches asset {asset}"
-        )));
-    }
-    let result = build_asset_inner(context, asset, depth);
-    context.visiting.remove(&asset);
-    let publication = result?;
-    context.memo.insert(asset, publication.clone());
-    Ok(publication)
+    context.memo.get(&asset).cloned().ok_or_else(|| {
+        BuildError::Infrastructure("iterative build lost its root result".to_owned())
+    })
 }
 
 fn build_asset_inner(
     context: &mut BuildContext<'_>,
     asset: AssetUuid,
-    depth: usize,
-) -> Result<NodePublication, BuildError> {
+) -> Result<PendingNodePublication, BuildError> {
     let loaded = load_asset(context.store, &context.scanner, asset)?;
     if loaded.meta.authoring_only {
         return Err(BuildError::Failed(format!(
@@ -373,7 +411,7 @@ fn build_asset_inner(
     } else {
         process_chain(context, &loaded, &project, &chain, imported, current_value)?
     };
-    assemble_outputs(context, outputs, depth)
+    prepare_outputs(context, asset, outputs)
 }
 
 #[derive(Clone)]
@@ -386,6 +424,22 @@ struct EncodedNodeOutput {
     project: ProjectTypeAuthority,
     bytes: Vec<u8>,
     references: Vec<distill_wire::encode::EncodedReference>,
+}
+
+struct PendingArtifact {
+    content_hash: ContentHash,
+    structural: Arc<[u8]>,
+    blobs: Vec<Arc<[u8]>>,
+    encoded_type: TypeUuid,
+    terminal_type: TypeUuid,
+}
+
+struct PendingNodePublication {
+    asset: AssetUuid,
+    local_assets: BTreeSet<AssetUuid>,
+    rows: BTreeMap<String, ServedClosureRow>,
+    pending: Vec<PendingArtifact>,
+    wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
 
 fn process_chain(
@@ -856,19 +910,11 @@ fn output_type_set(output: &EncodedNodeOutput) -> Vec<TypeUuid> {
     types
 }
 
-fn assemble_outputs(
+fn prepare_outputs(
     context: &mut BuildContext<'_>,
+    asset: AssetUuid,
     outputs: Vec<EncodedNodeOutput>,
-    depth: usize,
-) -> Result<NodePublication, BuildError> {
-    struct PendingArtifact {
-        content_hash: ContentHash,
-        structural: Arc<[u8]>,
-        blobs: Vec<Arc<[u8]>>,
-        encoded_type: TypeUuid,
-        terminal_type: TypeUuid,
-    }
-
+) -> Result<PendingNodePublication, BuildError> {
     let local_assets = outputs
         .iter()
         .map(|output| output.asset)
@@ -925,6 +971,48 @@ fn assemble_outputs(
         });
     }
 
+    Ok(PendingNodePublication {
+        asset,
+        local_assets,
+        rows,
+        pending,
+        wire_trees,
+    })
+}
+
+fn pending_dependency_parents(
+    context: &BuildContext<'_>,
+    pending: &PendingNodePublication,
+) -> Result<Vec<AssetUuid>, BuildError> {
+    let mut dependencies = BTreeSet::new();
+    for row in pending.rows.values() {
+        for edge in &row.load_edges {
+            if pending.local_assets.contains(&edge.asset) {
+                continue;
+            }
+            let parent = context
+                .store
+                .resolve_child(edge.asset)
+                .map_err(BuildError::failed)?
+                .map_or(edge.asset, |(parent, _)| parent);
+            dependencies.insert(parent);
+        }
+    }
+    Ok(dependencies.into_iter().collect())
+}
+
+fn assemble_pending(
+    context: &BuildContext<'_>,
+    pending_node: PendingNodePublication,
+) -> Result<NodePublication, BuildError> {
+    let PendingNodePublication {
+        asset: _,
+        local_assets,
+        rows,
+        pending,
+        mut wire_trees,
+    } = pending_node;
+
     let mut closure = BTreeMap::new();
     for row in rows.values() {
         merge_closure_row(&mut closure, row.clone())?;
@@ -935,7 +1023,7 @@ fn assemble_outputs(
             if local_assets.contains(&edge.asset) {
                 continue;
             }
-            let (dependency, selected) = build_dependency(context, edge.asset, depth + 1)?;
+            let (dependency, selected) = dependency_from_memo(context, edge.asset)?;
             merge_closure_row(&mut closure, selected.clone())?;
             let selected_artifact = dependency
                 .artifacts
@@ -976,17 +1064,20 @@ fn assemble_outputs(
     })
 }
 
-fn build_dependency(
-    context: &mut BuildContext<'_>,
+fn dependency_from_memo(
+    context: &BuildContext<'_>,
     asset: AssetUuid,
-    depth: usize,
 ) -> Result<(NodePublication, ServedClosureRow), BuildError> {
     let derived = context
         .store
         .resolve_child(asset)
         .map_err(BuildError::failed)?;
     if let Some((parent, output_key)) = derived {
-        let publication = build_asset(context, parent, depth)?;
+        let publication = context.memo.get(&parent).cloned().ok_or_else(|| {
+            BuildError::Infrastructure(format!(
+                "iterative build assembled dependent {asset} before parent {parent}"
+            ))
+        })?;
         let selected = publication
             .outputs
             .get(&output_key)
@@ -998,7 +1089,11 @@ fn build_dependency(
             })?;
         Ok((publication, selected))
     } else {
-        let publication = build_asset(context, asset, depth)?;
+        let publication = context.memo.get(&asset).cloned().ok_or_else(|| {
+            BuildError::Infrastructure(format!(
+                "iterative build assembled a node before dependency {asset}"
+            ))
+        })?;
         let selected = publication.primary.clone();
         Ok((publication, selected))
     }
