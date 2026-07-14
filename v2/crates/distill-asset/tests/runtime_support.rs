@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::{
@@ -6,10 +7,11 @@ use std::sync::{
 };
 
 use distill_asset::{
-    default_table, placeholder, AssetHashMap, DeterministicState, EncodeContainer, EncodeSink,
-    EpochToken, ErasedValue, ModuleEpochPoisonCause,
+    default_table, placeholder, AssetHashMap, AssetReflect, DeterministicState, EncodeContainer,
+    EncodeSink, EpochToken, ErasedValue, ModuleEpochPoisonCause,
 };
 use distill_core::id::{AssetUuid, TypeUuid};
+use distill_json::AuthoredValue;
 
 #[distill_asset::asset(uuid = "00112233-4455-6677-8899-aabbccddeeff")]
 struct Counted {
@@ -28,6 +30,14 @@ struct Plain;
 
 #[distill_asset::asset(uuid = "10112233-4455-6677-8899-aabbccddeeff")]
 struct PanickingDrop;
+
+#[test]
+fn empty_map_authored_shape_is_selected_by_key_type_not_vacuous_entries() {
+    let binary = BTreeMap::<[u8; 16], u32>::new().to_authored();
+    let strings = BTreeMap::<String, u32>::new().to_authored();
+    assert_eq!(binary, AuthoredValue::Array(Vec::new()));
+    assert_eq!(strings, AuthoredValue::Object(BTreeMap::new()));
+}
 
 impl Drop for PanickingDrop {
     fn drop(&mut self) {

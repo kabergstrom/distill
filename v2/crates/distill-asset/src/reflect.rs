@@ -26,6 +26,11 @@ pub use crate::defaults::DefaultNode;
 /// proc-macro output in downstream crates calls it; implementations are
 /// an implementation detail and should normally come from `#[asset]`.
 pub trait AssetReflect: 'static {
+    /// Whether this key type uses JSON's object form for maps. This is a
+    /// property of the type, not of the observed entries: an empty non-string
+    /// map must still use the pair-array form.
+    const STRING_KEY: bool = false;
+
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode;
     fn logical(builder: &mut LogicalBuilder);
     fn encode(&self, sink: &mut dyn EncodeSink);
@@ -244,6 +249,8 @@ impl AssetReflect for () {
 }
 
 impl AssetReflect for String {
+    const STRING_KEY: bool = true;
+
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         NativeLayoutNode::Str {
             offset,
@@ -866,7 +873,7 @@ fn authored_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
 ) -> AuthoredValue {
     let mut entries: Vec<_> = entries.map(|(k, v)| (canonical_bytes(k), k, v)).collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    if entries.iter().all(|(_, k, _)| k.string_key().is_some()) {
+    if K::STRING_KEY {
         let mut object = BTreeMap::new();
         for (_, key, value) in entries {
             object.insert(
