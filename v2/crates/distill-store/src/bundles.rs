@@ -731,6 +731,24 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Raw deterministic asset-to-bundle projection, including poisoned
+    /// skeleton rows. Coordinated publishers capture it before advancing the
+    /// durable version so an in-memory tag-index fallback can retain the exact
+    /// affected bundle identity without a fallible post-commit store read.
+    pub fn all_asset_bundles(&self) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT asset_uuid, bundle_uuid FROM assets ORDER BY asset_uuid")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                AssetUuid(blob16(row.get::<_, Vec<u8>>(0)?)),
+                BundleUuid(blob16(row.get::<_, Vec<u8>>(1)?)),
+            ))
+        })?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Every generated bundle a rules bundle owns (§2, §8): the
     /// scan-derived ownership index orphan tracking re-derives after
     /// daemon-state loss — never precious.

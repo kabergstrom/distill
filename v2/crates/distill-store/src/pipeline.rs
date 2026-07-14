@@ -613,14 +613,38 @@ impl InputTxn<'_> {
     ) -> Result<bool, StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
-        let basis = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
-        let mismatches = schema_registry_mismatches(&epoch.schema_registry, &basis.current_cursors);
-        if !mismatches.is_empty() {
-            self.publish_schema_acceptance_required(epoch, &basis, &mismatches)?;
+        if let Some(required) = self.pipeline_acceptance_requirement(epoch)? {
+            self.publish_schema_acceptance_required(
+                epoch,
+                &required.manifest,
+                &required.mismatches,
+            )?;
             return Ok(false);
         }
         self.publish_ready_pipeline_epoch(epoch)?;
         Ok(true)
+    }
+
+    /// Compute the exact typed candidate outcome inside the owning input
+    /// transaction. Coordinators retain this value before commit, so no
+    /// fallible state re-read is required after the durable version advances.
+    pub fn pipeline_acceptance_requirement(
+        &self,
+        epoch: &ValidatedPipelineEpoch,
+    ) -> Result<Option<SchemaAcceptanceRequired>, StoreError> {
+        let manifest = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
+        let mismatches =
+            schema_registry_mismatches(&epoch.schema_registry, &manifest.current_cursors);
+        if mismatches.is_empty() {
+            return Ok(None);
+        }
+        let candidate = PipelineCandidateIdentity::try_from(epoch.epoch())
+            .map_err(StoreError::InvalidTargetSet)?;
+        Ok(Some(SchemaAcceptanceRequired {
+            manifest,
+            candidate,
+            mismatches,
+        }))
     }
 
     fn publish_ready_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {

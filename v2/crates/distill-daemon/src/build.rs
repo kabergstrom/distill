@@ -67,6 +67,17 @@ pub(crate) struct PublishedTagIndex {
 }
 
 impl PublishedTagIndex {
+    fn conservatively_poisoned(assets: &BTreeMap<AssetUuid, BundleUuid>) -> Self {
+        Self {
+            tags: assets
+                .keys()
+                .copied()
+                .map(|asset| (asset, BTreeMap::new()))
+                .collect(),
+            poisons: assets.clone(),
+        }
+    }
+
     pub(crate) fn apply(self, commit: &mut Commit) {
         for mutation in &mut commit.authoring {
             if let AuthoringMutation::Set(entry) = mutation {
@@ -674,6 +685,26 @@ fn build(
 /// Finish §10 tag indexing against a namespace that has advanced durably but
 /// is still hidden behind the coordinator's RPC publication lock.
 pub(crate) fn refine_published_tag_index(
+    store_handle: Arc<Mutex<Store>>,
+    scanner: RootedScanner,
+    authority: Arc<ProjectSchemaAuthority>,
+    pipeline: PipelineSnapshot,
+    targets: &BTreeMap<String, Target>,
+    max_depth: usize,
+    fallback_assets: &BTreeMap<AssetUuid, BundleUuid>,
+) -> PublishedTagIndex {
+    try_refine_published_tag_index(
+        store_handle,
+        scanner,
+        authority,
+        pipeline,
+        targets,
+        max_depth,
+    )
+    .unwrap_or_else(|_| PublishedTagIndex::conservatively_poisoned(fallback_assets))
+}
+
+fn try_refine_published_tag_index(
     store_handle: Arc<Mutex<Store>>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
@@ -3522,6 +3553,22 @@ mod tests {
     const MIGRATION_ASSET: AssetUuid = AssetUuid([76; 16]);
     const MIGRATION_BUNDLE: BundleUuid = BundleUuid([77; 16]);
 
+    #[test]
+    fn conservative_tag_index_preserves_exact_bundle_identity() {
+        let other_asset = AssetUuid([80; 16]);
+        let other_bundle = BundleUuid([81; 16]);
+        let assets = BTreeMap::from([(ASSET, BUNDLE), (other_asset, other_bundle)]);
+
+        let index = PublishedTagIndex::conservatively_poisoned(&assets);
+
+        assert_eq!(index.poisons, assets);
+        assert_eq!(
+            index.tags.keys().copied().collect::<Vec<_>>(),
+            vec![ASSET, other_asset]
+        );
+        assert!(index.tags.values().all(BTreeMap::is_empty));
+    }
+
     fn path(krate: &str, name: &str) -> TypePath {
         TypePath {
             name: Some(name.to_owned()),
@@ -4073,8 +4120,8 @@ mod tests {
             coordinator.pipeline_snapshot(),
             &BTreeMap::from([("dev".to_owned(), build_target)]),
             64,
-        )
-        .unwrap();
+            &BTreeMap::from([(ASSET, BUNDLE)]),
+        );
         let indexed = coordinator
             .store()
             .lock()

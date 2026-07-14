@@ -101,6 +101,10 @@ fn bundle_and_asset_rows_roundtrip() {
         store.entries_in_bundle(BundleUuid([1; 16])).unwrap(),
         [entry]
     );
+    assert_eq!(
+        store.all_asset_bundles().unwrap(),
+        BTreeMap::from([(AssetUuid([10; 16]), BundleUuid([1; 16]))])
+    );
 }
 
 // ---- directory-import ownership (§2, §8, §13) ----
