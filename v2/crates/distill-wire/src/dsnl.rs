@@ -28,6 +28,7 @@
 //! | backref | 0x0D | distance u32 (header offset = the slot's own origin; size and align = the referenced frame's, by rule) |
 //! | unit    | 0x0E | — (header size 0, align 1 by rule) |
 
+use crate::measured::{MeasuredNativeNode, MeasuredNativeTagEncoding, MeasuredNativeVariantTag};
 use crate::native::{LayoutHashError, NativeLayoutNode, NativeTagEncoding, NativeVariantTag};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
@@ -45,6 +46,25 @@ pub fn dsnl_bytes(root: &NativeLayoutNode) -> Result<Vec<u8>, LayoutHashError> {
 /// `blake3("DSNL" ‖ version:u8 ‖ root)` — the measured layout digest (§5).
 pub fn dsnl_hash(root: &NativeLayoutNode) -> Result<[u8; 32], LayoutHashError> {
     let body = dsnl_bytes(root)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"DSNL");
+    hasher.update(&[DSNL_VERSION]);
+    hasher.update(&body);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Serialize an owned schema-derived native tree under the same pinned DSNL
+/// grammar as a compiled static runtime tree.
+pub fn measured_dsnl_bytes(root: &MeasuredNativeNode) -> Result<Vec<u8>, LayoutHashError> {
+    let mut out = Vec::new();
+    let mut frames = Vec::new();
+    encode_measured(root, &mut out, &mut frames)?;
+    Ok(out)
+}
+
+/// `blake3("DSNL" || version || root)` for a schema-derived native tree.
+pub fn measured_dsnl_hash(root: &MeasuredNativeNode) -> Result<[u8; 32], LayoutHashError> {
+    let body = measured_dsnl_bytes(root)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"DSNL");
     hasher.update(&[DSNL_VERSION]);
@@ -261,6 +281,186 @@ fn encode(
         NativeLayoutNode::Unit { offset } => {
             header(out, 0x0E, offset, 0, 1);
         }
+    }
+    Ok(())
+}
+
+fn encode_measured(
+    node: &MeasuredNativeNode,
+    out: &mut Vec<u8>,
+    frames: &mut Vec<(u32, u32)>,
+) -> Result<(), LayoutHashError> {
+    match node {
+        MeasuredNativeNode::Scalar {
+            offset,
+            size,
+            align,
+            kind,
+        } => {
+            header(out, 0x01, *offset, *size, *align);
+            out.push(kind.grammar_id());
+        }
+        MeasuredNativeNode::Struct {
+            offset,
+            size,
+            align,
+            fields,
+        } => {
+            header(out, 0x02, *offset, *size, *align);
+            let mut sorted: Vec<_> = fields.iter().collect();
+            sorted.sort_by_key(|field| (field.node.offset(), field.declaration_index));
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            frames.push((*size, *align));
+            for field in sorted {
+                put_str(out, &field.name)?;
+                out.extend_from_slice(&field.declaration_index.to_le_bytes());
+                encode_measured(&field.node, out, frames)?;
+            }
+            frames.pop();
+        }
+        MeasuredNativeNode::Enum {
+            offset,
+            size,
+            align,
+            tag,
+            variants,
+        } => {
+            header(out, 0x03, *offset, *size, *align);
+            match tag {
+                MeasuredNativeTagEncoding::Direct { offset, size } => {
+                    out.push(0x00);
+                    out.extend_from_slice(&offset.to_le_bytes());
+                    out.push(*size);
+                }
+                MeasuredNativeTagEncoding::Niche {
+                    offset,
+                    size,
+                    niche_start,
+                } => {
+                    out.push(0x01);
+                    out.extend_from_slice(&offset.to_le_bytes());
+                    out.push(*size);
+                    out.extend_from_slice(&niche_start.to_le_bytes());
+                }
+                MeasuredNativeTagEncoding::Single => out.push(0x02),
+            }
+            let mut sorted: Vec<_> = variants.iter().collect();
+            sorted.sort_by_key(|variant| variant.declaration_index);
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            frames.push((*size, *align));
+            for variant in sorted {
+                put_str(out, &variant.name)?;
+                out.extend_from_slice(&variant.declaration_index.to_le_bytes());
+                match variant.tag {
+                    MeasuredNativeVariantTag::Direct { value } => {
+                        out.push(0x00);
+                        out.extend_from_slice(&value.to_le_bytes());
+                    }
+                    MeasuredNativeVariantTag::Niche { index } => {
+                        out.push(0x01);
+                        out.extend_from_slice(&index.to_le_bytes());
+                    }
+                    MeasuredNativeVariantTag::Untagged => out.push(0x02),
+                    MeasuredNativeVariantTag::Single => out.push(0x03),
+                }
+                encode_measured(&variant.node, out, frames)?;
+            }
+            frames.pop();
+        }
+        MeasuredNativeNode::Array {
+            offset,
+            size,
+            align,
+            len,
+            stride,
+            elem,
+        } => {
+            header(out, 0x04, *offset, *size, *align);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&stride.to_le_bytes());
+            encode_measured(elem, out, frames)?;
+        }
+        MeasuredNativeNode::Vec {
+            offset,
+            size,
+            align,
+            elem,
+        } => {
+            header(out, 0x05, *offset, *size, *align);
+            encode_measured(elem, out, frames)?;
+        }
+        MeasuredNativeNode::Set {
+            offset,
+            size,
+            align,
+            elem,
+        } => {
+            header(out, 0x06, *offset, *size, *align);
+            encode_measured(elem, out, frames)?;
+        }
+        MeasuredNativeNode::Map {
+            offset,
+            size,
+            align,
+            key,
+            value,
+        } => {
+            header(out, 0x07, *offset, *size, *align);
+            encode_measured(key, out, frames)?;
+            encode_measured(value, out, frames)?;
+        }
+        MeasuredNativeNode::BoxPtr {
+            offset,
+            size,
+            align,
+            inner,
+        } => {
+            header(out, 0x08, *offset, *size, *align);
+            encode_measured(inner, out, frames)?;
+        }
+        MeasuredNativeNode::ArcPtr {
+            offset,
+            size,
+            align,
+            inner,
+        } => {
+            header(out, 0x09, *offset, *size, *align);
+            encode_measured(inner, out, frames)?;
+        }
+        MeasuredNativeNode::Str {
+            offset,
+            size,
+            align,
+        } => {
+            header(out, 0x0A, *offset, *size, *align);
+        }
+        MeasuredNativeNode::Blob {
+            offset,
+            size,
+            align,
+        } => {
+            header(out, 0x0B, *offset, *size, *align);
+        }
+        MeasuredNativeNode::Skip {
+            offset,
+            size,
+            align,
+        } => {
+            header(out, 0x0C, *offset, *size, *align);
+        }
+        MeasuredNativeNode::BackRef { distance, offset } => {
+            let frame_count = frames.len() as u32;
+            let index = frames.len().checked_sub(1 + *distance as usize).ok_or(
+                LayoutHashError::BackRefOutOfRange {
+                    distance: *distance,
+                    frames: frame_count,
+                },
+            )?;
+            let (size, align) = frames[index];
+            header(out, 0x0D, *offset, size, align);
+            out.extend_from_slice(&distance.to_le_bytes());
+        }
+        MeasuredNativeNode::Unit { offset } => header(out, 0x0E, *offset, 0, 1),
     }
     Ok(())
 }

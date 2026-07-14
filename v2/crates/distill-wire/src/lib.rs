@@ -7,6 +7,7 @@ pub mod derive;
 pub mod dsnl;
 pub mod dswl;
 pub mod exec;
+pub mod measured;
 pub mod native;
 pub mod plan;
 pub mod wire;

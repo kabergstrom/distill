@@ -4,11 +4,15 @@
 mod common;
 
 use common::*;
-use distill_wire::dsnl::{dsnl_bytes, dsnl_hash, DSNL_VERSION};
+use distill_wire::dsnl::{
+    dsnl_bytes, dsnl_hash, measured_dsnl_bytes, measured_dsnl_hash, DSNL_VERSION,
+};
+use distill_wire::measured::derive_measured_native;
 use distill_wire::native::{
     CtorId, LayoutHashError, NativeLayoutNode, NativeTagEncoding, NativeVariantTag, ScalarKind,
     SkipDefaultId,
 };
+use ngp_schema::{PrimitiveType, SchemaTypeId};
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -42,6 +46,39 @@ fn hash_is_domain_prefixed_and_versioned() {
     hasher.update(&[DSNL_VERSION]);
     hasher.update(&body);
     assert_eq!(dsnl_hash(&node).unwrap(), *hasher.finalize().as_bytes());
+}
+
+#[test]
+fn shared_schema_projection_matches_the_static_dsnl_grammar() {
+    let schema = schema(vec![
+        prim(0, PrimitiveType::U32),
+        prim(1, PrimitiveType::U16),
+        strukt(
+            2,
+            "S",
+            8,
+            4,
+            vec![(named_field("a", 0), 0), (named_field("b", 1), 4)],
+        ),
+    ]);
+    let measured = derive_measured_native(view(&schema), SchemaTypeId(2)).unwrap();
+    let static_tree = nstruct(
+        0,
+        8,
+        4,
+        vec![
+            nfield("a", 0, scalar(0, ScalarKind::U32)),
+            nfield("b", 1, scalar(4, ScalarKind::U16)),
+        ],
+    );
+    assert_eq!(
+        measured_dsnl_bytes(&measured).unwrap(),
+        dsnl_bytes(&static_tree).unwrap()
+    );
+    assert_eq!(
+        measured_dsnl_hash(&measured).unwrap(),
+        dsnl_hash(&static_tree).unwrap()
+    );
 }
 
 #[test]
