@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use distill_core::id::ContentHash;
-use distill_store::journal::RecoveredEdit;
+use distill_store::journal::{
+    JournalIntentPlan, PublicationGroup, PublicationGroupKind, RecoveredEdit,
+};
 use distill_store::{Store, StoreError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +230,15 @@ impl QuarantineDriver {
                 outcomes.push((intent.intent_id, RecoveryOutcome::Rewrite(outcome)));
             }
         }
+        if let Some(pending) = store.unretired_intents()?.first() {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: pending.intent_id,
+                detail: "startup recovery stopped before the intent became terminal".into(),
+            })));
+        }
+        for group in store.unfinished_publication_groups()? {
+            store.retire_publication_group(group.group_id)?;
+        }
         Ok(outcomes)
     }
 
@@ -265,6 +276,54 @@ impl QuarantineDriver {
 impl PublicationDriver<'_> {
     pub fn recovered(&self) -> &[(i64, RecoveryOutcome)] {
         &self.recovered
+    }
+
+    pub fn record_group(
+        &mut self,
+        kind: PublicationGroupKind,
+        basis: &[u8],
+        plans: &[JournalIntentPlan],
+    ) -> Result<PublicationGroup, QuarantineError> {
+        self.store
+            .record_publication_group(kind, basis, plans)
+            .map_err(Into::into)
+    }
+
+    pub fn retire_group(&mut self, group_id: i64) -> Result<(), QuarantineError> {
+        self.store
+            .retire_publication_group(group_id)
+            .map_err(Into::into)
+    }
+
+    pub fn resume_group_replace(
+        &mut self,
+        intent_id: i64,
+        target: &Path,
+    ) -> Result<distill_store::journal::RenameAsideOutcome, QuarantineError> {
+        let quarantine = self.quarantine.quarantine_for(target)?;
+        self.store
+            .publish_journaled_replacement(intent_id, quarantine)
+            .map_err(Into::into)
+    }
+
+    pub fn resume_group_delete(
+        &mut self,
+        intent_id: i64,
+        target: &Path,
+    ) -> Result<distill_store::journal::DeletionRecoveryOutcome, QuarantineError> {
+        let quarantine = self.quarantine.quarantine_for(target)?;
+        self.store
+            .reconcile_journaled_deletion(intent_id, quarantine)
+            .map_err(Into::into)
+    }
+
+    pub fn resume_group_create(
+        &mut self,
+        intent_id: i64,
+    ) -> Result<distill_store::journal::CreationRecoveryOutcome, QuarantineError> {
+        self.store
+            .reconcile_journaled_creation(intent_id)
+            .map_err(Into::into)
     }
 
     pub fn journaled_replace(
