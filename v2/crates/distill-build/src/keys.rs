@@ -68,6 +68,16 @@ pub struct AppliedMigration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticMigration {
+    pub from: LogicalHash,
+    pub to: LogicalHash,
+    pub planner_version: u32,
+    /// Present only when the selected automatic plan executes a registered
+    /// default materializer from the pinned pipeline epoch.
+    pub dylib_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildImportInputs {
     pub asset: AssetUuid,
     pub bundle: BundleUuid,
@@ -78,6 +88,7 @@ pub struct BuildImportInputs {
     pub logical: LogicalHash,
     pub layout: LayoutHash,
     pub migrations: Vec<AppliedMigration>,
+    pub automatic_migration: Option<AutomaticMigration>,
     /// Validator code participates only when this authored type has at least
     /// one registered validator in the pinned epoch.
     pub validator_dylib_hash: Option<[u8; 32]>,
@@ -97,6 +108,12 @@ pub fn build_import_digest(inputs: &BuildImportInputs) -> [u8; 32] {
         e.raw(&inputs.layout.0);
         e.seq(&inputs.migrations, |e, migration| {
             e.raw(&migration.bundle_hash);
+            e.u32(migration.planner_version);
+            e.option(migration.dylib_hash, |e, hash| e.raw(hash));
+        });
+        e.option(inputs.automatic_migration.as_ref(), |e, migration| {
+            e.raw(&migration.from.0);
+            e.raw(&migration.to.0);
             e.u32(migration.planner_version);
             e.option(migration.dylib_hash, |e, hash| e.raw(hash));
         });

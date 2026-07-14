@@ -6,8 +6,8 @@ use std::sync::{Arc, Weak};
 use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec, EncodedArtifact};
 use distill_build::dslf::{DslfV1, LocalFailureClass, MigrationPlanFailureV1};
 use distill_build::keys::{
-    build_import_digest, static_inputs_canonical_bytes, static_inputs_digest, BuildImportInputs,
-    OutputHash, StaticInputs,
+    build_import_digest, static_inputs_canonical_bytes, static_inputs_digest, AppliedMigration,
+    AutomaticMigration, BuildImportInputs, OutputHash, StaticInputs,
 };
 use distill_build::persist::{lookup_persisted_candidate, PersistedOutcome};
 use distill_build::pipeline::{
@@ -50,6 +50,8 @@ use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::migration_control::{self, MigrationDecodeError, MigrationHeader};
 use crate::scanner::RootedScanner;
+
+const MIGRATION_PLANNER_VERSION: u32 = 1;
 
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
@@ -1308,6 +1310,88 @@ fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
     })
 }
 
+fn migration_key_inputs(
+    loaded: &LoadedAsset,
+    project: &ProjectTypeAuthority,
+    source: &StoreTraceSource,
+    dylib_hash: [u8; 32],
+) -> Result<(Vec<AppliedMigration>, Option<AutomaticMigration>), BuildError> {
+    if loaded.entry.schema_hash == project.logical_hash {
+        return Ok((Vec::new(), None));
+    }
+    let bundle = distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
+    let mut schema = bundle
+        .schemas
+        .get(&loaded.entry.schema_hash)
+        .ok_or_else(|| {
+            BuildError::Failed("bundle omitted the entry's old schema snapshot".to_owned())
+        })?
+        .clone();
+    let mut node = loaded.entry.schema_hash;
+    let mut visited = BTreeSet::from([node]);
+    let mut migrations = Vec::<AppliedMigration>::new();
+    loop {
+        if node == project.logical_hash {
+            return Ok((migrations, None));
+        }
+        let records = source
+            .migration_controls
+            .values()
+            .filter(|record| {
+                record.header.target_type_uuid == loaded.entry.type_uuid
+                    && record.header.from_hash == node
+            })
+            .collect::<Vec<_>>();
+        match records.as_slice() {
+            [] => {
+                let uses_pipeline_code = plan_automatic(&schema.root, &project.logical_schema.root)
+                    .is_ok_and(|plan| migration_ops_use_defaults(&plan));
+                return Ok((
+                    migrations,
+                    Some(AutomaticMigration {
+                        from: node,
+                        to: project.logical_hash,
+                        planner_version: MIGRATION_PLANNER_VERSION,
+                        dylib_hash: uses_pipeline_code.then_some(dylib_hash),
+                    }),
+                ));
+            }
+            [record] => {
+                let (Observed::Ok(bundle_hash), Some(edge)) = (&record.observed, &record.value)
+                else {
+                    return Ok((migrations, None));
+                };
+                if edge.target_type_uuid != loaded.entry.type_uuid
+                    || edge.from_hash != node
+                    || edge.from_schema != schema
+                    || !visited.insert(edge.to_hash)
+                {
+                    return Ok((migrations, None));
+                }
+                let edge_dylib = matches!(edge.kind, MigrationControlKind::Function { .. })
+                    .then_some(dylib_hash);
+                if let Some(existing) = migrations
+                    .iter_mut()
+                    .find(|migration| migration.bundle_hash == bundle_hash.0)
+                {
+                    if edge_dylib.is_some() {
+                        existing.dylib_hash = edge_dylib;
+                    }
+                } else {
+                    migrations.push(AppliedMigration {
+                        bundle_hash: bundle_hash.0,
+                        planner_version: MIGRATION_PLANNER_VERSION,
+                        dylib_hash: edge_dylib,
+                    });
+                }
+                node = edge.to_hash;
+                schema = edge.to_schema.clone();
+            }
+            _ => return Ok((migrations, None)),
+        }
+    }
+}
+
 fn migration_plan_error(
     type_uuid: TypeUuid,
     from: LogicalHash,
@@ -1834,6 +1918,9 @@ fn encode_or_hydrate(
     terminal_type: TypeUuid,
     validator_dylib_hash: Option<[u8; 32]>,
 ) -> Result<EncodedBuildImport, BuildError> {
+    let trace_source = capture_trace_source(context)?;
+    let (migrations, automatic_migration) =
+        migration_key_inputs(loaded, project, &trace_source, context.dylib_hash)?;
     let key = build_import_digest(&BuildImportInputs {
         asset: loaded.entry.uuid,
         bundle: loaded.meta.bundle,
@@ -1843,11 +1930,11 @@ fn encode_or_hydrate(
         canonical_bundle_bytes: loaded.bundle_bytes.clone(),
         logical: project.logical_hash,
         layout: project.layout_hash,
-        migrations: Vec::new(),
+        migrations,
+        automatic_migration,
         validator_dylib_hash,
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
     });
-    let trace_source = capture_trace_source(context)?;
     if let Some(hit) = lookup_persisted_candidate(
         context.store,
         KeyKind::BuildImport,
@@ -3466,6 +3553,7 @@ mod tests {
             logical: project.logical_hash,
             layout: project.layout_hash,
             migrations: Vec::new(),
+            automatic_migration: None,
             validator_dylib_hash: None,
             artifact_format_version: ARTIFACT_FORMAT_VERSION,
         });
