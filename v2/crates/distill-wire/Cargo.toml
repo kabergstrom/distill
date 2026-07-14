@@ -8,6 +8,7 @@ license.workspace = true
 blake3 = { workspace = true }
 unicode-normalization = { workspace = true }
 distill-core = { path = "../distill-core" }
+distill-json = { path = "../distill-json" }
 # The canonical structural blob path encoding is pinned in distill-bundle
 # (§6) and REUSED here: the §12 artifact blob table sorts by the same
 # encoded path bytes — one encoder, never two.

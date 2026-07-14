@@ -6,6 +6,7 @@ pub mod artifact;
 pub mod derive;
 pub mod dsnl;
 pub mod dswl;
+pub mod encode;
 pub mod exec;
 pub mod measured;
 pub mod native;
