@@ -962,6 +962,10 @@ pub enum MetadataReconnectReason {
 pub enum RpcFailure {
     LeaseExpired,
     PipelineUnavailable(Box<PipelineUnavailableDiagnostic>),
+    BuildDepthExceeded {
+        limit: usize,
+        chain: Vec<AssetUuid>,
+    },
     InvalidCursor {
         since: InputVersion,
         current: InputVersion,

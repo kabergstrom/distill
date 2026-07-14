@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 use distill_build::pipeline::Target;
 use distill_bundle::{AssetEntry, Bundle};
@@ -50,7 +50,7 @@ use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
-use crate::scheduler::{Scheduler, SchedulerConfig};
+use crate::scheduler::{Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{GenerationReplay, WatcherQueue, WatcherQueueError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,10 +80,33 @@ pub struct DaemonCoordinator {
     build_targets: RwLock<BTreeMap<String, Target>>,
     configuration_poison: Mutex<Option<ConfigurationPoison>>,
     operational: Mutex<OperationalRuntime>,
+    operational_wake: Condvar,
 }
 
 struct OperationalRuntime {
     scheduler: Scheduler,
+    next_job_id: u64,
+}
+
+struct ScheduledJobGuard<'a> {
+    coordinator: &'a DaemonCoordinator,
+    id: u64,
+}
+
+impl Drop for ScheduledJobGuard<'_> {
+    fn drop(&mut self) {
+        let mut operational = self
+            .coordinator
+            .operational
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operational
+            .scheduler
+            .complete(self.id)
+            .expect("admitted build remains active until its guard drops");
+        operational.scheduler.admit();
+        self.coordinator.operational_wake.notify_all();
+    }
 }
 
 struct CoordinatedPipelineRuntime {
@@ -158,6 +181,7 @@ impl DaemonCoordinator {
                 max_dependency_depth,
             })
             .map_err(|error| CoordinatorInitError::Operational(error.to_string()))?,
+            next_job_id: 1,
         };
         Ok(Self {
             store,
@@ -170,6 +194,7 @@ impl DaemonCoordinator {
             build_targets: RwLock::new(BTreeMap::new()),
             configuration_poison: Mutex::new(None),
             operational: Mutex::new(operational),
+            operational_wake: Condvar::new(),
         })
     }
 
@@ -280,24 +305,63 @@ impl DaemonCoordinator {
             .config()
     }
 
+    pub(crate) fn run_scheduled<R>(&self, class: WorkClass, run: impl FnOnce() -> R) -> R {
+        let mut operational = self
+            .operational
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = operational.next_job_id;
+        operational.next_job_id = operational
+            .next_job_id
+            .checked_add(1)
+            .expect("scheduler job identity exhausted");
+        operational
+            .scheduler
+            .try_enqueue(id, class)
+            .expect("fresh scheduler job identity is unique");
+        operational.scheduler.admit();
+        self.operational_wake.notify_all();
+        while !operational.scheduler.is_active(id) {
+            operational = self
+                .operational_wake
+                .wait(operational)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(operational);
+
+        let _guard = ScheduledJobGuard {
+            coordinator: self,
+            id,
+        };
+        run()
+    }
+
     pub fn apply_operational_configuration(
         &self,
         store_config: &StoreConfig,
         max_dependency_depth: usize,
     ) -> Result<(), CoordinatorError> {
-        let scheduler = Scheduler::new(SchedulerConfig {
+        let scheduler = SchedulerConfig {
             parallelism: store_config.parallelism,
             batch_reserved_workers: store_config.batch_reserved_workers,
             max_dependency_depth,
-        })
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        };
+        scheduler
+            .validate()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         lock_store(&self.store)
             .apply_operational_config(store_config)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.operational
+        let mut operational = self
+            .operational
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .scheduler = scheduler;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operational
+            .scheduler
+            .reconfigure(scheduler)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        operational.scheduler.admit();
+        self.operational_wake.notify_all();
         Ok(())
     }
 
@@ -1902,4 +1966,70 @@ fn lock_publication(
     publication
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn production_admission_limits_concurrent_build_closures() {
+        let temp = tempfile::tempdir().unwrap();
+        let assets = temp.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let mut config = StoreConfig::new(temp.path().join("state"));
+        config.parallelism = 1;
+        config.batch_reserved_workers = 1;
+        let coordinator = Arc::new(
+            DaemonCoordinator::open(
+                config,
+                vec![AssetRoot::new(
+                    "main",
+                    &assets,
+                    assets.join(".distill-displaced"),
+                )],
+                LineageDestination {
+                    root: "main".to_owned(),
+                    path: "schema/lineage.bundle".to_owned(),
+                },
+                Vec::new(),
+                8,
+            )
+            .unwrap(),
+        );
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let first = {
+            let coordinator = Arc::clone(&coordinator);
+            thread::spawn(move || {
+                coordinator.run_scheduled(WorkClass::Interactive, || {
+                    first_entered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                });
+            })
+        };
+        first_entered_rx.recv().unwrap();
+
+        let (second_entered_tx, second_entered_rx) = mpsc::sync_channel(1);
+        let second = {
+            let coordinator = Arc::clone(&coordinator);
+            thread::spawn(move || {
+                coordinator.run_scheduled(WorkClass::Interactive, || {
+                    second_entered_tx.send(()).unwrap();
+                });
+            })
+        };
+        assert!(second_entered_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        release_first_tx.send(()).unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+    }
 }

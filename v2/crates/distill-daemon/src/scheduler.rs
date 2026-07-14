@@ -164,6 +164,14 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Apply the complete operational-live scheduler configuration without
+    /// discarding queued or active jobs. Active excess drains naturally.
+    pub fn reconfigure(&mut self, config: SchedulerConfig) -> Result<(), SchedulerConfigError> {
+        config.validate()?;
+        self.config = config;
+        Ok(())
+    }
+
     /// Resize only the worker pool and re-clamp the live reservation. This is
     /// the operational-live `pipeline.parallelism` transition: active excess
     /// work drains naturally and is never cancelled.
@@ -187,6 +195,10 @@ impl Scheduler {
 
     pub fn active_len(&self) -> usize {
         self.active.len()
+    }
+
+    pub fn is_active(&self, id: u64) -> bool {
+        self.active.contains_key(&id)
     }
 
     fn contains(&self, id: u64) -> bool {

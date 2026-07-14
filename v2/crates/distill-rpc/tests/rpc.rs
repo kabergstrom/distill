@@ -202,6 +202,51 @@ impl BuildBackend for RecordingBuildBackend {
     }
 }
 
+#[derive(Default)]
+struct DepthLimitedBuildBackend {
+    calls: Mutex<usize>,
+}
+
+impl BuildBackend for DepthLimitedBuildBackend {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        *self.calls.lock().unwrap() += 1;
+        Err(RpcFailure::BuildDepthExceeded {
+            limit: 1,
+            chain: vec![request.requested_asset, asset_id(99)],
+        })
+    }
+}
+
+#[test]
+fn dependency_depth_exhaustion_is_typed_and_never_memoized() {
+    let server = server_with(&[(1, false)]);
+    let backend = Arc::new(DepthLimitedBuildBackend::default());
+    server.install_build_backend(backend.clone());
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    server
+        .commit(Commit {
+            assets: vec![set_asset(
+                entry.uuid,
+                StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                AssetDeltaState::Changed,
+            )],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let snapshot = snapshot(&connect(&server, &[(1, false)]));
+    let expected = RpcResult::Failure(RpcFailure::BuildDepthExceeded {
+        limit: 1,
+        chain: vec![entry.uuid, asset_id(99)],
+    });
+
+    assert_eq!(snapshot.resolve(entry.uuid), expected);
+    assert_eq!(snapshot.resolve(entry.uuid), expected);
+    assert_eq!(*backend.calls.lock().unwrap(), 2);
+}
+
 #[test]
 fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outputs() {
     let server = server_with(&[(1, false)]);

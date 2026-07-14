@@ -1,7 +1,7 @@
 //! Snapshot-pinned lazy build execution and durable build-import caching.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec, EncodedArtifact};
 use distill_build::dslf::{DslfV1, LocalFailureClass, MigrationPlanFailureV1};
@@ -14,7 +14,7 @@ use distill_build::pipeline::{
     PipelineChain, PipelineRegistry, PipelineStage, ProcessorRegistration, Target,
 };
 use distill_build::query::{asset_query_result_hash, AssetQuery};
-use distill_build::tool::{ProcessContext, StoreToolEpochSnapshot, ToolRuntimeBinding};
+use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
     control_failure_fingerprint, trace_payload_bytes, CapabilityKey, ControlFailureCode,
     ControlFailureSubject, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
@@ -43,7 +43,8 @@ use distill_store::cas::record::{
     LocalFailureClass as StoreLocalFailureClass,
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
-use distill_store::Store;
+use distill_store::pipeline::StagedTool;
+use distill_store::{Store, StoreError};
 use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
 
 use crate::callbacks::{CallbackInvokeError, DiagnosticSeverity};
@@ -51,6 +52,7 @@ use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::migration_control::{self, MigrationDecodeError, MigrationHeader};
 use crate::scanner::RootedScanner;
+use crate::scheduler::WorkClass;
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
@@ -74,8 +76,12 @@ impl BuildBackend for CoordinatorBuildBackend {
                 .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
                     operation: "build coordinator stopped".to_owned(),
                 })?;
-        let result = build(&coordinator, request);
-        match coordinator.sync_runtime_pipeline_poison() {
+        let (result, poison) = coordinator.run_scheduled(WorkClass::Interactive, || {
+            let result = build(&coordinator, request);
+            let poison = coordinator.sync_runtime_pipeline_poison();
+            (result, poison)
+        });
+        match poison {
             Ok(Some(poison)) => {
                 return Err(RpcFailure::PipelineUnavailable(Box::new(
                     PipelineUnavailableDiagnostic::PipelinePoison(poison),
@@ -91,6 +97,9 @@ impl BuildBackend for CoordinatorBuildBackend {
         match result {
             Ok(publication) => Ok(BuildBackendOutcome::Built(publication)),
             Err(BuildError::Drifted(input)) => Ok(BuildBackendOutcome::Drifted { input }),
+            Err(BuildError::DepthExceeded { limit, chain }) => {
+                Err(RpcFailure::BuildDepthExceeded { limit, chain })
+            }
             Err(BuildError::Failed(error)) => Ok(BuildBackendOutcome::Failed { error }),
             Err(BuildError::Migration { message, .. }) => {
                 Ok(BuildBackendOutcome::Failed { error: message })
@@ -107,6 +116,7 @@ impl BuildBackend for CoordinatorBuildBackend {
 #[derive(Debug)]
 enum BuildError {
     Drifted(DriftedInput),
+    DepthExceeded { limit: usize, chain: Vec<AssetUuid> },
     Failed(String),
     Migration { message: String, facts: Box<DslfV1> },
     Infrastructure(String),
@@ -145,8 +155,10 @@ struct NodePublication {
     wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
 
-struct BuildContext<'a> {
-    store: &'a mut Store,
+struct BuildContext {
+    store: Arc<Mutex<Store>>,
+    store_instance: distill_store::state::StoreInstanceId,
+    drifted_input: DriftedInput,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -155,9 +167,67 @@ struct BuildContext<'a> {
     target_definition: [u8; 32],
     dylib_hash: [u8; 32],
     basis: distill_store::state::InputVersion,
+    tools: PinnedToolEpoch,
+    execution_root: std::path::PathBuf,
     max_depth: usize,
     visiting: BTreeSet<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodePublication>,
+}
+
+#[derive(Clone)]
+struct PinnedToolEpoch {
+    tools: BTreeMap<String, StagedTool>,
+}
+
+impl PinnedToolEpoch {
+    fn capture(
+        store: &Store,
+        basis: distill_store::state::InputVersion,
+    ) -> Result<Self, BuildError> {
+        let hashes = store
+            .tool_hashes_at(basis)
+            .map_err(BuildError::infrastructure)?;
+        let mut tools = BTreeMap::new();
+        for (key, expected_hash) in hashes {
+            let tool = store
+                .tool_at(&key, basis)
+                .map_err(BuildError::infrastructure)?
+                .ok_or_else(|| {
+                    BuildError::Infrastructure(format!(
+                        "published tool {key:?} disappeared while pinning its epoch"
+                    ))
+                })?;
+            if tool.capsule_hash != expected_hash {
+                return Err(BuildError::Infrastructure(format!(
+                    "published tool {key:?} changed while pinning its epoch"
+                )));
+            }
+            tools.insert(key, tool);
+        }
+        Ok(Self { tools })
+    }
+}
+
+impl ToolEpochSnapshot for PinnedToolEpoch {
+    fn tool(&self, id: &str) -> Result<Option<StagedTool>, StoreError> {
+        Ok(self.tools.get(id).cloned())
+    }
+}
+
+fn lock_build_store(context: &BuildContext) -> Result<MutexGuard<'_, Store>, BuildError> {
+    let store = context
+        .store
+        .lock()
+        .map_err(|_| BuildError::Infrastructure("durable store mutex is poisoned".to_owned()))?;
+    if store.instance_id() != context.store_instance || store.input_version() != context.basis {
+        return Err(BuildError::Drifted(context.drifted_input.clone()));
+    }
+    Ok(store)
+}
+
+fn ensure_build_basis(context: &BuildContext) -> Result<(), BuildError> {
+    drop(lock_build_store(context)?);
+    Ok(())
 }
 
 fn build(
@@ -222,20 +292,28 @@ fn build(
         return Err(BuildError::Drifted(request.drifted_input.clone()));
     }
     let store_handle = coordinator.store();
-    let mut store = store_handle
-        .lock()
-        .map_err(|_| BuildError::Infrastructure("durable store mutex is poisoned".to_owned()))?;
-    if store.instance_id() != request.basis.instance
-        || store.input_version() != request.basis.version
-    {
-        return Err(BuildError::Drifted(request.drifted_input.clone()));
-    }
-    let root = load_asset(&store, &coordinator.scanner(), request.entry.uuid)?;
+    let scanner = coordinator.scanner();
+    let (root, tools, execution_root) = {
+        let store = store_handle.lock().map_err(|_| {
+            BuildError::Infrastructure("durable store mutex is poisoned".to_owned())
+        })?;
+        if store.instance_id() != request.basis.instance
+            || store.input_version() != request.basis.version
+        {
+            return Err(BuildError::Drifted(request.drifted_input.clone()));
+        }
+        let root = load_asset(&store, &scanner, request.entry.uuid)?;
+        let tools = PinnedToolEpoch::capture(&store, request.basis.version)?;
+        let execution_root = store.state_path().join("tool-runs");
+        (root, tools, execution_root)
+    };
     verify_request_entry(request, &root, &authority)?;
 
     let mut context = BuildContext {
-        store: &mut store,
-        scanner: coordinator.scanner(),
+        store: store_handle,
+        store_instance: request.basis.instance,
+        drifted_input: request.drifted_input.clone(),
+        scanner,
         authority,
         pipeline,
         registry,
@@ -243,11 +321,14 @@ fn build(
         target_definition: request.target_definition.0,
         dylib_hash,
         basis: request.basis.version,
+        tools,
+        execution_root,
         max_depth: coordinator.operational_configuration().max_dependency_depth,
         visiting: BTreeSet::new(),
         memo: BTreeMap::new(),
     };
-    let root = build_asset(&mut context, request.entry.uuid, 0)?;
+    let root = build_asset(&mut context, request.entry.uuid)?;
+    ensure_build_basis(&context)?;
     let selected = root
         .outputs
         .get(&request.output_key)
@@ -301,33 +382,36 @@ fn verify_request_entry(
 }
 
 fn build_asset(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     asset: AssetUuid,
-    depth: usize,
 ) -> Result<NodePublication, BuildError> {
     enum Frame {
-        Enter { asset: AssetUuid, depth: usize },
+        Enter {
+            asset: AssetUuid,
+            chain: Vec<AssetUuid>,
+        },
         Assemble(PendingNodePublication),
     }
 
-    let mut stack = vec![Frame::Enter { asset, depth }];
+    let mut stack = vec![Frame::Enter {
+        asset,
+        chain: vec![asset],
+    }];
     while let Some(frame) = stack.pop() {
         match frame {
-            Frame::Enter { asset, depth } => {
-                if depth > context.max_depth {
-                    return Err(BuildError::Failed(format!(
-                        "dependency depth exceeds configured limit {} at asset {asset}",
-                        context.max_depth
-                    )));
+            Frame::Enter { asset, chain } => {
+                if chain.len() > context.max_depth {
+                    return Err(BuildError::DepthExceeded {
+                        limit: context.max_depth,
+                        chain,
+                    });
                 }
                 if context.memo.contains_key(&asset) {
                     continue;
                 }
                 if !context.visiting.insert(asset) {
-                    let mut cycle = context.visiting.iter().copied().collect::<Vec<_>>();
-                    cycle.push(asset);
                     return Err(BuildError::Failed(format!(
-                        "strong-reference cycle reaches assets {cycle:?}"
+                        "strong-reference cycle reaches assets {chain:?}"
                     )));
                 }
                 let pending = match build_asset_inner(context, asset) {
@@ -340,9 +424,11 @@ fn build_asset(
                 let dependencies = pending_dependency_parents(context, &pending)?;
                 stack.push(Frame::Assemble(pending));
                 for dependency in dependencies.into_iter().rev() {
+                    let mut dependency_chain = chain.clone();
+                    dependency_chain.push(dependency);
                     stack.push(Frame::Enter {
                         asset: dependency,
-                        depth: depth + 1,
+                        chain: dependency_chain,
                     });
                 }
             }
@@ -366,10 +452,13 @@ fn build_asset(
 }
 
 fn build_asset_inner(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     asset: AssetUuid,
 ) -> Result<PendingNodePublication, BuildError> {
-    let loaded = load_asset(context.store, &context.scanner, asset)?;
+    let loaded = {
+        let store = lock_build_store(context)?;
+        load_asset(&store, &context.scanner, asset)?
+    };
     if loaded.meta.authoring_only {
         return Err(BuildError::Failed(format!(
             "authoring-only asset {asset} cannot enter a runtime build closure"
@@ -457,7 +546,7 @@ type EncodedBuildImport = (
 );
 
 fn process_chain(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
     chain: &PipelineChain,
@@ -482,17 +571,15 @@ fn process_chain(
     for stage in &chain.stages {
         let static_inputs = processor_static_inputs(context, loaded, stage, current_hash)?;
         let cached = hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?;
-        let execution_root = context.store.state_path().join("tool-runs");
-        std::fs::create_dir_all(&execution_root).map_err(BuildError::infrastructure)?;
+        std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
         let platform_id = context.target.compilation_identity.target_triple.clone();
         let system_runtime_id = context.target.compilation_identity.rustc.clone();
-        let tool_snapshot = StoreToolEpochSnapshot::new(context.store, context.basis);
         let mut process_context = ProcessContext::new(
-            &tool_snapshot,
+            &context.tools,
             ToolRuntimeBinding {
                 platform_id: &platform_id,
                 system_runtime_id: &system_runtime_id,
-                execution_root: &execution_root,
+                execution_root: &context.execution_root,
             },
         );
         let outcome = context
@@ -564,7 +651,7 @@ fn process_chain(
 }
 
 fn hydrate_complete_chain(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     chain: &PipelineChain,
     imported: &EncodedNodeOutput,
@@ -599,7 +686,7 @@ fn hydrate_complete_chain(
 }
 
 fn processor_static_inputs(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     loaded: &LoadedAsset,
     stage: &PipelineStage,
     input_hash: ContentHash,
@@ -640,7 +727,7 @@ fn processor_static_inputs(
 }
 
 fn hydrate_processor_stage(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     chain: &PipelineChain,
     stage: &PipelineStage,
@@ -648,15 +735,18 @@ fn hydrate_processor_stage(
 ) -> Result<Option<HydratedProcessorStage>, BuildError> {
     let key = static_inputs_digest(static_inputs);
     let trace_source = capture_trace_source(context)?;
-    let Some(hit) = lookup_persisted_candidate(
-        context.store,
-        KeyKind::Processor,
-        &key,
-        loaded.entry.uuid,
-        &trace_source,
-    )
-    .map_err(BuildError::infrastructure)?
-    else {
+    let hit = {
+        let mut store = lock_build_store(context)?;
+        lookup_persisted_candidate(
+            &mut store,
+            KeyKind::Processor,
+            &key,
+            loaded.entry.uuid,
+            &trace_source,
+        )
+        .map_err(BuildError::infrastructure)?
+    };
+    let Some(hit) = hit else {
         return Ok(None);
     };
     match hit.outcome {
@@ -749,7 +839,7 @@ fn expected_output_identity(
 }
 
 fn encode_processor_products(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     loaded: &LoadedAsset,
     chain: &PipelineChain,
     stage: &PipelineStage,
@@ -843,15 +933,14 @@ fn ensure_cached_stage_matches(
 }
 
 fn commit_processor_stage(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     static_inputs: &StaticInputs,
     trace: &[TraceOp],
     outputs: &[EncodedNodeOutput],
     debug: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), BuildError> {
-    context
-        .store
+    lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
@@ -882,7 +971,7 @@ fn commit_processor_stage(
 }
 
 fn commit_processor_failure(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     stage: &PipelineStage,
     static_inputs: &StaticInputs,
@@ -906,8 +995,7 @@ fn commit_processor_failure(
             detail,
         })
     };
-    context
-        .store
+    lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
@@ -955,7 +1043,7 @@ fn validate_cached_output_type_set(
 }
 
 fn prepare_outputs(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     asset: AssetUuid,
     outputs: Vec<EncodedNodeOutput>,
 ) -> Result<PendingNodePublication, BuildError> {
@@ -968,8 +1056,7 @@ fn prepare_outputs(
     let mut wire_trees = BTreeMap::new();
     for output in &outputs {
         verify_encoded_output(output)?;
-        context
-            .store
+        lock_build_store(context)?
             .put_wire_tree(&output.project.dswl_bytes)
             .map_err(BuildError::infrastructure)?;
         wire_trees.insert(
@@ -1025,17 +1112,17 @@ fn prepare_outputs(
 }
 
 fn pending_dependency_parents(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     pending: &PendingNodePublication,
 ) -> Result<Vec<AssetUuid>, BuildError> {
     let mut dependencies = BTreeSet::new();
+    let store = lock_build_store(context)?;
     for row in pending.rows.values() {
         for edge in &row.load_edges {
             if pending.local_assets.contains(&edge.asset) {
                 continue;
             }
-            let parent = context
-                .store
+            let parent = store
                 .resolve_child(edge.asset)
                 .map_err(BuildError::failed)?
                 .map_or(edge.asset, |(parent, _)| parent);
@@ -1046,7 +1133,7 @@ fn pending_dependency_parents(
 }
 
 fn assemble_pending(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     pending_node: PendingNodePublication,
 ) -> Result<NodePublication, BuildError> {
     let PendingNodePublication {
@@ -1109,11 +1196,10 @@ fn assemble_pending(
 }
 
 fn dependency_from_memo(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     asset: AssetUuid,
 ) -> Result<(NodePublication, ServedClosureRow), BuildError> {
-    let derived = context
-        .store
+    let derived = lock_build_store(context)?
         .resolve_child(asset)
         .map_err(BuildError::failed)?;
     if let Some((parent, output_key)) = derived {
@@ -1160,7 +1246,7 @@ fn verify_encoded_output(output: &EncodedNodeOutput) -> Result<(), BuildError> {
 }
 
 fn load_edges_for_output(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     source_asset: AssetUuid,
     load_deps: &[AssetUuid],
     references: &[distill_wire::encode::EncodedReference],
@@ -1190,23 +1276,22 @@ fn load_edges_for_output(
 }
 
 fn resolved_terminal_type(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     asset: AssetUuid,
 ) -> Result<TypeUuid, BuildError> {
-    if let Some(entry) = context.store.entry(asset).map_err(BuildError::failed)? {
+    let store = lock_build_store(context)?;
+    if let Some(entry) = store.entry(asset).map_err(BuildError::failed)? {
         return context
             .registry
             .chain(entry.type_uuid, &context.target)
             .map(|chain| chain.terminal)
             .map_err(BuildError::failed);
     }
-    let (parent, output_key) = context
-        .store
+    let (parent, output_key) = store
         .resolve_child(asset)
         .map_err(BuildError::failed)?
         .ok_or_else(|| BuildError::Failed(format!("missing strong reference {asset}")))?;
-    let parent = context
-        .store
+    let parent = store
         .entry(parent)
         .map_err(BuildError::failed)?
         .ok_or_else(|| BuildError::Failed("derived parent is missing".to_owned()))?;
@@ -1220,13 +1305,14 @@ fn resolved_terminal_type(
         .ok_or_else(|| BuildError::Failed("derived output is absent from pipeline map".to_owned()))
 }
 
-fn capture_trace_source(context: &BuildContext<'_>) -> Result<StoreTraceSource, BuildError> {
+fn capture_trace_source(context: &BuildContext) -> Result<StoreTraceSource, BuildError> {
     let epoch = context
         .pipeline
         .epoch()
         .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+    let store = lock_build_store(context)?;
     StoreTraceSource::capture(
-        context.store,
+        &store,
         &context.scanner,
         &context.registry,
         &context.target,
@@ -1457,7 +1543,7 @@ fn field_path_from_display(path: &str) -> FieldPath {
 }
 
 fn commit_migration_failure(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     key: [u8; 32],
     trace: &[TraceOp],
@@ -1485,8 +1571,7 @@ fn commit_migration_failure(
             detail,
         })
     };
-    context
-        .store
+    lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::BuildImport,
             static_input_key: key,
@@ -1500,7 +1585,7 @@ fn commit_migration_failure(
 }
 
 fn load_current_value(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
     trace_source: &StoreTraceSource,
@@ -1591,8 +1676,7 @@ fn load_current_value(
             "Migration chain stopped before the current schema",
         ));
     }
-    let placement = context
-        .store
+    let placement = lock_build_store(context)?
         .classify_lineage(
             loaded.entry.type_uuid,
             node,
@@ -1803,7 +1887,7 @@ fn select_migration_chain(
 }
 
 fn execute_custom_migration(
-    context: &BuildContext<'_>,
+    context: &BuildContext,
     source: &StoreTraceSource,
     trace: &mut Vec<TraceOp>,
     asset: AssetUuid,
@@ -1913,7 +1997,7 @@ fn execute_custom_migration(
 }
 
 fn encode_or_hydrate(
-    context: &mut BuildContext<'_>,
+    context: &mut BuildContext,
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
     terminal_type: TypeUuid,
@@ -1936,15 +2020,18 @@ fn encode_or_hydrate(
         validator_dylib_hash,
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
     });
-    if let Some(hit) = lookup_persisted_candidate(
-        context.store,
-        KeyKind::BuildImport,
-        &key,
-        loaded.entry.uuid,
-        &trace_source,
-    )
-    .map_err(BuildError::infrastructure)?
-    {
+    let hit = {
+        let mut store = lock_build_store(context)?;
+        lookup_persisted_candidate(
+            &mut store,
+            KeyKind::BuildImport,
+            &key,
+            loaded.entry.uuid,
+            &trace_source,
+        )
+        .map_err(BuildError::infrastructure)?
+    };
+    if let Some(hit) = hit {
         return match hit.outcome {
             PersistedOutcome::Success { outputs, aux }
                 if outputs.len() == 1 && outputs[0].output_key.is_empty() && aux.is_empty() =>
@@ -2013,8 +2100,7 @@ fn encode_or_hydrate(
                 error_paths,
             };
             let detail = facts.digest().map_err(BuildError::failed)?;
-            context
-                .store
+            lock_build_store(context)?
                 .commit_build(BuildCommit {
                     key_kind: KeyKind::BuildImport,
                     static_input_key: key,
@@ -2073,8 +2159,7 @@ fn encode_or_hydrate(
         loaded.entry.type_uuid,
         terminal_type,
     );
-    context
-        .store
+    lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::BuildImport,
             static_input_key: key,
@@ -2724,7 +2809,7 @@ impl TraceSource for StoreTraceSource {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::callbacks::{
         PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProducts,
@@ -3091,23 +3176,6 @@ mod tests {
         }
     }
 
-    struct CountingProcessor(Arc<AtomicUsize>);
-
-    impl PipelineProcessor for CountingProcessor {
-        fn process(
-            &self,
-            input: AuthoredValue,
-            _context: &mut dyn PipelineProcessContext,
-        ) -> Result<ProcessorProducts, ProcessorError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(ProcessorProducts {
-                primary: Some(input.clone()),
-                extras: BTreeMap::from([("metadata".to_owned(), input)]),
-                debug: BTreeMap::from([("processor-log".to_owned(), b"ok".to_vec())]),
-            })
-        }
-    }
-
     struct PrimaryCountingProcessor(Arc<AtomicUsize>);
 
     impl PipelineProcessor for PrimaryCountingProcessor {
@@ -3120,6 +3188,29 @@ mod tests {
             Ok(ProcessorProducts {
                 primary: Some(input),
                 extras: BTreeMap::new(),
+                debug: BTreeMap::new(),
+            })
+        }
+    }
+
+    struct StoreLockProbeProcessor {
+        calls: Arc<AtomicUsize>,
+        store: Arc<Mutex<Store>>,
+        observed_unlocked: Arc<AtomicBool>,
+    }
+
+    impl PipelineProcessor for StoreLockProbeProcessor {
+        fn process(
+            &self,
+            input: AuthoredValue,
+            _context: &mut dyn PipelineProcessContext,
+        ) -> Result<ProcessorProducts, ProcessorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.observed_unlocked
+                .store(self.store.try_lock().is_ok(), Ordering::SeqCst);
+            Ok(ProcessorProducts {
+                primary: Some(input.clone()),
+                extras: BTreeMap::from([("metadata".to_owned(), input)]),
                 debug: BTreeMap::new(),
             })
         }
@@ -3500,6 +3591,7 @@ mod tests {
         coordinator.install_schema_authority_for_test(authority.clone());
         coordinator.install_build_target_for_test("dev", build_target);
         let calls = Arc::new(AtomicUsize::new(0));
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
         coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch(
             "dev",
             target_hash.0,
@@ -3510,7 +3602,11 @@ mod tests {
                 selector: TargetSelector::new(None, None).unwrap(),
                 outputs: OutputDecls::new(TERMINAL, vec![("metadata".to_owned(), EXTRA)]).unwrap(),
             },
-            CountingProcessor(Arc::clone(&calls)),
+            StoreLockProbeProcessor {
+                calls: Arc::clone(&calls),
+                store: coordinator.store(),
+                observed_unlocked: Arc::clone(&observed_unlocked),
+            },
         ));
         let request = BuildRequest {
             basis: coordinator.server().current_stamp(),
@@ -3573,6 +3669,7 @@ mod tests {
         assert_eq!(first.artifacts.len(), 2);
         assert_eq!(first.wire_trees.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(observed_unlocked.load(Ordering::SeqCst));
         let root = first
             .artifacts
             .iter()
