@@ -359,6 +359,12 @@ impl DaemonConfig {
         self.targets
             .iter()
             .map(|(name, target)| {
+                if !target_matches_compilation_identity(target, identity) {
+                    return Err(DaemonConfigError::Target(format!(
+                        "{name}: configured {:?}/{:?} does not match schema compilation target `{}`; cross-target layouts are not emitted yet",
+                        target.os, target.arch, identity.target_triple
+                    )));
+                }
                 Target::new(
                     target.os,
                     target.arch,
@@ -427,6 +433,27 @@ impl DaemonConfig {
             native_dependencies: Vec::new(),
         })
     }
+}
+
+fn target_matches_compilation_identity(
+    target: &TargetSection,
+    identity: &CompilationIdentity,
+) -> bool {
+    let mut components = identity.target_triple.split('-');
+    let Some(arch) = components.next() else {
+        return false;
+    };
+    let components = components.collect::<Vec<_>>();
+    let arch_matches = matches!(
+        (target.arch, arch),
+        (TargetArch::Aarch64, "aarch64") | (TargetArch::X86_64, "x86_64")
+    );
+    let os_matches = match target.os {
+        TargetOs::Linux => components.contains(&"linux"),
+        TargetOs::MacOs => components.last() == Some(&"darwin"),
+        TargetOs::Windows => components.contains(&"windows"),
+    };
+    arch_matches && os_matches
 }
 
 /// Convert a rejected source candidate into the stable DSCP fact carried by

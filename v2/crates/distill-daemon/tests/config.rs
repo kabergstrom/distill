@@ -21,8 +21,8 @@ lineage_manifest = {{ root = "main", path = "schema/schema-lineage.bundle" }}
 pipeline_dylib = "{}"
 
 [targets.dev]
-os = "linux"
-arch = "x86_64"
+os = "macos"
+arch = "aarch64"
 apis = ["vulkan"]
 optimize = false
 debug_info = true
@@ -176,4 +176,24 @@ fn target_and_module_requirements_bind_the_schema_artifact_identity() {
             .compilation,
         second
     );
+}
+
+#[test]
+fn rejects_target_without_an_exact_schema_compilation_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = valid_config(&temp)
+        .replace("os = \"macos\"", "os = \"linux\"")
+        .replace("arch = \"aarch64\"", "arch = \"x86_64\"");
+    let config = DaemonConfig::parse(temp.path().join("distill.toml"), &source).unwrap();
+    let table = consumer_bootstrap_authority_v1()
+        .unwrap()
+        .table()
+        .compiled_table()
+        .unwrap();
+
+    let error = config
+        .candidate_requirements(&table, consumer_compilation_identity_v1())
+        .unwrap_err();
+
+    assert!(matches!(error, DaemonConfigError::Target(_)));
 }

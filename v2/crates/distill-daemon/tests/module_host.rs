@@ -1193,6 +1193,28 @@ fn equal_candidate_and_module_bootstrap_dsnl_forgery_fails_host_keyed_authority(
 }
 
 #[test]
+fn project_dsci_is_independent_of_the_sealed_bootstrap_row_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 7);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let mut candidate = requirements(7);
+    candidate.identity.compilation.source_fingerprint = [0xa5; 32];
+    candidate.identity.compilation.manifest_lock_hash = [0x5a; 32];
+    let mut module = fake_module(7, calls);
+    module.identity = candidate.identity.clone();
+    let mut loader = FakeLoader {
+        module: Some(module),
+        open_error: None,
+    };
+    let mut host = module_host(temp.path().join("state")).unwrap();
+
+    let published = host.publish_candidate(&source, candidate, &mut loader);
+
+    assert!(published.is_ok(), "{published:?}");
+}
+
+#[test]
 fn host_without_decoded_keyed_bootstrap_authority_never_opens_a_candidate() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");

@@ -2015,12 +2015,6 @@ fn validate_requirements(
     requirements: &mut CandidateRequirements,
     bootstrap_authority: &HostBootstrapAuthorityV1,
 ) -> Result<CanonicalTargetSet, String> {
-    if &requirements.identity.compilation != bootstrap_authority.compilation_identity() {
-        return Err(
-            "candidate CompilationIdentity does not match the host bootstrap resource DSCI"
-                .to_owned(),
-        );
-    }
     validate_candidate_linkage(&requirements.native_dependencies)
         .map_err(|error| error.to_string())?;
     if requirements.identity.module_abi.panic_strategy != "unwind" {

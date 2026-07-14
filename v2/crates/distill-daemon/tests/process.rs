@@ -22,8 +22,8 @@ lineage_manifest = {{ root = "main", path = "schema/lineage.bundle" }}
 [modules]
 pipeline_dylib = "{}"
 [targets.dev]
-os = "linux"
-arch = "x86_64"
+os = "macos"
+arch = "aarch64"
 apis = ["vulkan"]
 optimize = false
 [codegen]
