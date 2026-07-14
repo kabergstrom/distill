@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 
 use tokio::sync::Notify;
 use unicode_normalization::UnicodeNormalization;
@@ -21,9 +21,20 @@ const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 pub struct Server {
     inner: Arc<Mutex<ServerState>>,
     authoring_backend: Arc<dyn AuthoringBackend>,
+    build_backend: Arc<RwLock<Arc<dyn BuildBackend>>>,
 }
 
 struct UnavailableAuthoringBackend;
+
+struct UnavailableBuildBackend;
+
+impl BuildBackend for UnavailableBuildBackend {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        Ok(BuildBackendOutcome::Drifted {
+            input: request.drifted_input.clone(),
+        })
+    }
+}
 
 impl AuthoringBackend for UnavailableAuthoringBackend {
     fn prepare_import(
@@ -277,10 +288,65 @@ struct ServerState {
     targets: BTreeMap<String, TargetRuntime>,
     artifacts: HashMap<ContentHash, StoredArtifact>,
     wire_trees: HashMap<LayoutHash, StoredWireTree>,
+    build_results: HashMap<BuildKey, BuildResolution>,
+    build_flights: HashMap<BuildKey, Arc<BuildFlight>>,
     connections: Vec<Weak<Mutex<ConnectionState>>>,
     next_connection_id: u64,
     chunk_size: usize,
     restart_required_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BuildKey {
+    basis: SnapshotStamp,
+    target: String,
+    asset: AssetUuid,
+}
+
+#[derive(Debug, Clone)]
+enum BuildResolution {
+    Built(ContentHash),
+    Failed(String),
+    Drifted(DriftedInput),
+}
+
+struct BuildFlight {
+    completed: Mutex<Option<Result<(), RpcFailure>>>,
+    wake: Condvar,
+}
+
+impl BuildFlight {
+    fn new() -> Self {
+        Self {
+            completed: Mutex::new(None),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<(), RpcFailure> {
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while completed.is_none() {
+            completed = self
+                .wake
+                .wait(completed)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        completed
+            .as_ref()
+            .expect("completed build flight has an outcome")
+            .clone()
+    }
+
+    fn complete(&self, outcome: Result<(), RpcFailure>) {
+        *self
+            .completed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(outcome);
+        self.wake.notify_all();
+    }
 }
 
 #[derive(Clone)]
@@ -478,13 +544,26 @@ impl Server {
                 targets: target_map,
                 artifacts: HashMap::new(),
                 wire_trees: HashMap::new(),
+                build_results: HashMap::new(),
+                build_flights: HashMap::new(),
                 connections: Vec::new(),
                 next_connection_id: 1,
                 chunk_size: DEFAULT_CHUNK_SIZE,
                 restart_required_keys: BTreeSet::new(),
             })),
             authoring_backend,
+            build_backend: Arc::new(RwLock::new(Arc::new(UnavailableBuildBackend))),
         })
+    }
+
+    /// Replace the lazy-build implementation used by subsequent drifted
+    /// resolves. Existing snapshot capabilities remain valid because results
+    /// are keyed by their complete snapshot/target/asset basis.
+    pub fn install_build_backend(&self, backend: Arc<dyn BuildBackend>) {
+        *self
+            .build_backend
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = backend;
     }
 
     pub fn root(&self) -> Root {
@@ -645,6 +724,69 @@ impl Server {
         }
         state.wire_trees.insert(hash, tree);
         Ok(())
+    }
+
+    fn install_build_publication(
+        &self,
+        asset: AssetUuid,
+        publication: BuildPublication,
+    ) -> Result<ContentHash, RpcFailure> {
+        let root_hash = publication.root_content_hash;
+        let roots = publication
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.content_hash == root_hash)
+            .collect::<Vec<_>>();
+        if roots.len() != 1 {
+            return Err(RpcFailure::InvalidQuery {
+                detail: "lazy-build publication must contain its root artifact exactly once"
+                    .to_owned(),
+            });
+        }
+        let root = roots[0];
+        let root_blobs = root
+            .payload
+            .blobs
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&[u8]>>();
+        let parsed =
+            distill_wire::artifact::parse_artifact_parts(&root.payload.structural, &root_blobs)
+                .map_err(|error| RpcFailure::InvalidQuery {
+                    detail: format!("lazy-build root is not canonical DSTL: {error}"),
+                })?;
+        if parsed.asset_uuid != asset {
+            return Err(RpcFailure::InvalidQuery {
+                detail: "lazy-build root asset does not match the requested asset".to_owned(),
+            });
+        }
+        drop(parsed);
+
+        let mut wire_hashes = BTreeSet::new();
+        for tree in publication.wire_trees {
+            if !wire_hashes.insert(tree.layout_hash) {
+                return Err(RpcFailure::InvalidQuery {
+                    detail: "lazy-build publication contains a duplicate wire tree".to_owned(),
+                });
+            }
+            self.install_wire_tree(tree.layout_hash, tree.bytes)
+                .map_err(|error| RpcFailure::InvalidQuery {
+                    detail: format!("lazy-build wire-tree publication rejected: {error:?}"),
+                })?;
+        }
+        let mut artifact_hashes = BTreeSet::new();
+        for artifact in publication.artifacts {
+            if !artifact_hashes.insert(artifact.content_hash) {
+                return Err(RpcFailure::InvalidQuery {
+                    detail: "lazy-build publication contains a duplicate artifact".to_owned(),
+                });
+            }
+            self.install_artifact(artifact.content_hash, artifact.payload)
+                .map_err(|error| RpcFailure::InvalidQuery {
+                    detail: format!("lazy-build artifact publication rejected: {error:?}"),
+                })?;
+        }
+        Ok(root_hash)
     }
 
     /// Publish an input-version commit and deliver its filtered live delta.
@@ -2519,104 +2661,180 @@ impl Snapshot {
     }
 
     pub fn resolve(&self, uuid: AssetUuid) -> RpcResult<TerminalEvent<ResolveResult>> {
-        let state = self.server.lock();
-        let connection = lock_connection(&self.connection);
-        if let Some(result) = self.preflight(&state, &connection) {
-            return result;
-        }
-        if let Some(poison) = &self.view.version_poison {
-            return RpcResult::VersionPoisoned(poison.clone());
-        }
-        if let ConfigurationStatus::Poisoned(poison) = &self.view.configuration {
-            return RpcResult::ConfigurationPoisoned(poison.clone());
-        }
-        if self
-            .view
-            .authoring
-            .get(&uuid)
-            .is_some_and(|entry| entry.role == AuthoringEntryRole::AuthoringOnly)
-        {
+        loop {
+            let mut state = self.server.lock();
+            let connection = lock_connection(&self.connection);
+            if let Some(result) = self.preflight(&state, &connection) {
+                return result;
+            }
+            if let Some(poison) = &self.view.version_poison {
+                return RpcResult::VersionPoisoned(poison.clone());
+            }
+            if let ConfigurationStatus::Poisoned(poison) = &self.view.configuration {
+                return RpcResult::ConfigurationPoisoned(poison.clone());
+            }
+            if self
+                .view
+                .authoring
+                .get(&uuid)
+                .is_some_and(|entry| entry.role == AuthoringEntryRole::AuthoringOnly)
+            {
+                return RpcResult::Success(TerminalEvent {
+                    basis: self.basis.clone(),
+                    value: ResolveResult::RoleIneligible {
+                        observed: AuthoringEntryRole::AuthoringOnly,
+                    },
+                });
+            }
+            let runtime_entry = self
+                .view
+                .authoring
+                .get(&uuid)
+                .filter(|entry| entry.role == AuthoringEntryRole::Runtime)
+                .cloned();
+            let key = BuildKey {
+                basis: self.basis.snapshot,
+                target: connection.target.clone(),
+                asset: uuid,
+            };
+            let build_resolution = state.build_results.get(&key).cloned();
+            let version_resolution = self.view.assets.get(&uuid).cloned();
+
+            if build_resolution.is_none() {
+                if let (Some(VersionResolve::Drifted { input }), Some(entry)) =
+                    (&version_resolution, runtime_entry.clone())
+                {
+                    if let Some(flight) = state.build_flights.get(&key).cloned() {
+                        drop(connection);
+                        drop(state);
+                        if let Err(error) = flight.wait() {
+                            return RpcResult::Failure(error);
+                        }
+                        continue;
+                    }
+                    let flight = Arc::new(BuildFlight::new());
+                    state.build_flights.insert(key.clone(), flight.clone());
+                    let target_definition = state
+                        .targets
+                        .get(&connection.target)
+                        .expect("generation preflight guarantees the connected target")
+                        .definition
+                        .definition_hash();
+                    let request = BuildRequest {
+                        basis: self.basis.snapshot,
+                        target: connection.target.clone(),
+                        target_definition,
+                        entry,
+                        drifted_input: input.clone(),
+                    };
+                    drop(connection);
+                    drop(state);
+
+                    let backend = self
+                        .server
+                        .build_backend
+                        .read()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .clone();
+                    let outcome = backend.build(&request).and_then(|outcome| match outcome {
+                        BuildBackendOutcome::Built(publication) => self
+                            .server
+                            .install_build_publication(uuid, publication)
+                            .map(BuildResolution::Built),
+                        BuildBackendOutcome::Failed { error } => Ok(BuildResolution::Failed(error)),
+                        BuildBackendOutcome::Drifted { input } => {
+                            Ok(BuildResolution::Drifted(input))
+                        }
+                    });
+                    let mut state = self.server.lock();
+                    state.build_flights.remove(&key);
+                    if let Ok(resolution) = &outcome {
+                        state.build_results.insert(key, resolution.clone());
+                    }
+                    drop(state);
+                    let completed = outcome.as_ref().map(|_| ()).map_err(Clone::clone);
+                    flight.complete(completed);
+                    if let Err(error) = outcome {
+                        return RpcResult::Failure(error);
+                    }
+                    continue;
+                }
+            }
+
+            let resolution = build_resolution.map_or(version_resolution, |built| {
+                Some(match built {
+                    BuildResolution::Built(content_hash) => VersionResolve::Built { content_hash },
+                    BuildResolution::Failed(error) => VersionResolve::Failed { error },
+                    BuildResolution::Drifted(input) => VersionResolve::Drifted { input },
+                })
+            });
+            let (required, closure_rows) = if let Some(VersionResolve::Built { content_hash }) =
+                &resolution
+            {
+                match verified_artifact_closure(&state, *content_hash) {
+                    Ok((mut required, rows)) => {
+                        if let Some(entry) = &runtime_entry {
+                            let Some(root) = rows.iter().find(|row| row.asset == entry.uuid) else {
+                                return RpcResult::Failure(RpcFailure::InvalidQuery {
+                                    detail:
+                                        "built artifact closure omits its runtime metadata asset"
+                                            .to_owned(),
+                                });
+                            };
+                            if root.authored_type != entry.type_uuid
+                                || root.terminal_type != entry.terminal_type
+                            {
+                                return RpcResult::Failure(RpcFailure::InvalidQuery {
+                                        detail: "runtime metadata types do not match the authenticated artifact closure"
+                                            .to_owned(),
+                                    });
+                            }
+                            required.extend([entry.type_uuid, entry.terminal_type]);
+                        }
+                        (required, rows)
+                    }
+                    Err(error) => return RpcResult::Failure(error),
+                }
+            } else if let Some(entry) = &runtime_entry {
+                match served_rows_for_entry(&state, &self.view, entry) {
+                    Ok(verified) => verified,
+                    Err(error) => return RpcResult::Failure(error),
+                }
+            } else {
+                (BTreeSet::new(), Vec::new())
+            };
+            if let Some(expansion) = attestation_expansion(
+                self.basis.snapshot,
+                2,
+                &uuid.0,
+                &required,
+                &connection.accepted_type_uuids,
+                closure_rows,
+            ) {
+                return RpcResult::AttestationExpansionRequired(expansion);
+            }
+            let value = match resolution {
+                Some(VersionResolve::Built { content_hash }) => {
+                    let Some(_) = state.artifacts.get(&content_hash) else {
+                        return RpcResult::Failure(RpcFailure::ArtifactNotFound {
+                            hash: content_hash,
+                        });
+                    };
+                    ResolveResult::Built { content_hash }
+                }
+                Some(VersionResolve::Drifted { input }) => ResolveResult::Drifted {
+                    input,
+                    current: stamp(&state),
+                },
+                Some(VersionResolve::Failed { error }) => ResolveResult::Failed { error },
+                Some(VersionResolve::Deleted { at }) => ResolveResult::Deleted { at },
+                None => ResolveResult::Missing,
+            };
             return RpcResult::Success(TerminalEvent {
                 basis: self.basis.clone(),
-                value: ResolveResult::RoleIneligible {
-                    observed: AuthoringEntryRole::AuthoringOnly,
-                },
+                value,
             });
         }
-        let runtime_entry = self
-            .view
-            .authoring
-            .get(&uuid)
-            .filter(|entry| entry.role == AuthoringEntryRole::Runtime);
-        let (required, closure_rows) = if let Some(VersionResolve::Built { content_hash }) =
-            self.view.assets.get(&uuid)
-        {
-            match verified_artifact_closure(&state, *content_hash) {
-                Ok((mut required, rows)) => {
-                    if let Some(entry) = runtime_entry {
-                        let Some(root) = rows.iter().find(|row| row.asset == entry.uuid) else {
-                            return RpcResult::Failure(RpcFailure::InvalidQuery {
-                                detail: "built artifact closure omits its runtime metadata asset"
-                                    .to_owned(),
-                            });
-                        };
-                        if root.authored_type != entry.type_uuid
-                            || root.terminal_type != entry.terminal_type
-                        {
-                            return RpcResult::Failure(RpcFailure::InvalidQuery {
-                                    detail: "runtime metadata types do not match the authenticated artifact closure"
-                                        .to_owned(),
-                                });
-                        }
-                        required.extend([entry.type_uuid, entry.terminal_type]);
-                    }
-                    (required, rows)
-                }
-                Err(error) => return RpcResult::Failure(error),
-            }
-        } else if let Some(entry) = runtime_entry {
-            match served_rows_for_entry(&state, &self.view, entry) {
-                Ok(verified) => verified,
-                Err(error) => return RpcResult::Failure(error),
-            }
-        } else {
-            (BTreeSet::new(), Vec::new())
-        };
-        if let Some(expansion) = attestation_expansion(
-            self.basis.snapshot,
-            2,
-            &uuid.0,
-            &required,
-            &connection.accepted_type_uuids,
-            closure_rows,
-        ) {
-            return RpcResult::AttestationExpansionRequired(expansion);
-        }
-        let value = match self.view.assets.get(&uuid) {
-            Some(VersionResolve::Built { content_hash }) => {
-                let Some(_) = state.artifacts.get(content_hash) else {
-                    return RpcResult::Failure(RpcFailure::ArtifactNotFound {
-                        hash: *content_hash,
-                    });
-                };
-                ResolveResult::Built {
-                    content_hash: *content_hash,
-                }
-            }
-            Some(VersionResolve::Drifted { input }) => ResolveResult::Drifted {
-                input: input.clone(),
-                current: stamp(&state),
-            },
-            Some(VersionResolve::Failed { error }) => ResolveResult::Failed {
-                error: error.clone(),
-            },
-            Some(VersionResolve::Deleted { at }) => ResolveResult::Deleted { at: *at },
-            None => ResolveResult::Missing,
-        };
-        RpcResult::Success(TerminalEvent {
-            basis: self.basis.clone(),
-            value,
-        })
     }
 
     pub fn resolve_path(&self, path: &str) -> RpcResult<TerminalEvent<PathResolveResult>> {

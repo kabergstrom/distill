@@ -162,6 +162,93 @@ fn server_with(policies: &[(u8, bool)]) -> Server {
     Server::new(StoreInstanceId([9; 16]), vec![target_with(7, policies)]).unwrap()
 }
 
+#[derive(Default)]
+struct RecordingBuildBackend {
+    requests: Mutex<Vec<BuildRequest>>,
+}
+
+impl BuildBackend for RecordingBuildBackend {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        self.requests.lock().unwrap().push(request.clone());
+        let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
+        let wire_bytes: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
+        let layout_hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
+        let (content_hash, payload) = canonical_artifact(
+            request.entry.uuid,
+            request.entry.type_uuid,
+            request.entry.terminal_type,
+            request.entry.terminal_type,
+            layout_hash,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        Ok(BuildBackendOutcome::Built(BuildPublication {
+            root_content_hash: content_hash,
+            artifacts: vec![BuildArtifactPublication {
+                content_hash,
+                payload,
+            }],
+            wire_trees: vec![BuildWireTree {
+                layout_hash,
+                bytes: wire_bytes,
+            }],
+        }))
+    }
+}
+
+#[test]
+fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outputs() {
+    let server = server_with(&[(1, false)]);
+    let backend = Arc::new(RecordingBuildBackend::default());
+    server.install_build_backend(backend.clone());
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    let first_stamp = server
+        .commit(Commit {
+            assets: vec![set_asset(
+                entry.uuid,
+                StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                AssetDeltaState::Changed,
+            )],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+    let first = snapshot(&hub);
+
+    let first_hash = match first.resolve(entry.uuid).success().unwrap().value {
+        ResolveResult::Built { content_hash } => content_hash,
+        other => panic!("expected lazy build, got {other:?}"),
+    };
+    assert_eq!(
+        first.resolve(entry.uuid).success().unwrap().value,
+        ResolveResult::Built {
+            content_hash: first_hash
+        }
+    );
+    assert!(matches!(first.fetch(first_hash), RpcResult::Success(_)));
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    assert_eq!(backend.requests.lock().unwrap()[0].basis, first_stamp);
+
+    let second_stamp = server.commit(Commit::default()).unwrap();
+    let second = first.refresh().success().unwrap();
+    assert_eq!(second.stamp(), second_stamp);
+    assert_eq!(
+        second.resolve(entry.uuid).success().unwrap().value,
+        ResolveResult::Built {
+            content_hash: first_hash
+        }
+    );
+    let requests = backend.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].basis, second_stamp);
+    assert_eq!(requests[1].target, "dev");
+    assert_eq!(requests[1].target_definition, target_hash(7));
+}
+
 #[test]
 fn production_bootstrap_starts_at_the_durable_store_version() {
     let server = Server::new_at_version_with_authoring_backend(

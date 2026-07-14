@@ -1640,6 +1640,55 @@ pub trait AuthoringBackend: Send + Sync {
     }
 }
 
+/// Snapshot-pinned request issued when runtime resolution reaches a drifted
+/// asset. Implementations must build only from `entry` and inputs resolved at
+/// `basis`; a newer daemon input version is drift, not an implicit rebase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildRequest {
+    pub basis: SnapshotStamp,
+    pub target: String,
+    pub target_definition: TargetDefinitionHash,
+    pub entry: AuthoringEntry,
+    pub drifted_input: DriftedInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildWireTree {
+    pub layout_hash: LayoutHash,
+    /// Canonical DSWL body bytes (without the CAS domain/version prefix).
+    pub bytes: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildArtifactPublication {
+    pub content_hash: ContentHash,
+    pub payload: ArtifactPayload,
+}
+
+/// Complete content-addressed publication produced by one lazy build. The
+/// root artifact must be present in `artifacts`; dependency artifacts and all
+/// referenced wire trees may be published in the same atomic visibility step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildPublication {
+    pub root_content_hash: ContentHash,
+    pub artifacts: Vec<BuildArtifactPublication>,
+    pub wire_trees: Vec<BuildWireTree>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildBackendOutcome {
+    Built(BuildPublication),
+    Failed { error: String },
+    Drifted { input: DriftedInput },
+}
+
+/// Daemon integration seam for snapshot-pinned, target-specific lazy builds.
+/// The RPC server owns single-flight coordination and artifact publication;
+/// implementations must not call back into the [`crate::Server`].
+pub trait BuildBackend: Send + Sync {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetReferenceQuery {
     Uuid(AssetUuid),
