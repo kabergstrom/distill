@@ -930,6 +930,38 @@ impl PipelineEpoch {
             .collect()
     }
 
+    pub fn has_default_table(&self, type_uuid: TypeUuid) -> bool {
+        self.callback_rows().into_iter().any(|(_, callback)| {
+            matches!(callback, CallbackHandle::Defaults { descriptor, .. } if descriptor.type_uuid == type_uuid)
+        })
+    }
+
+    pub fn default_table_types(&self) -> Vec<TypeUuid> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Defaults { descriptor, .. } => Some(descriptor.type_uuid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn has_migration_function(&self, key: &str) -> bool {
+        self.callback_rows().into_iter().any(|(_, callback)| {
+            matches!(callback, CallbackHandle::Migration { key: registered, .. } if registered == key)
+        })
+    }
+
+    pub fn migration_function_keys(&self) -> Vec<String> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Migration { key, .. } => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
         self.callback_rows()
             .into_iter()
