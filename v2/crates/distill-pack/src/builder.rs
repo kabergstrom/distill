@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use distill_build::query::{AssetQuery as BuildAssetQuery, IntakeError};
 use distill_build::trace::PackDefinitionControlValue;
@@ -15,6 +16,7 @@ use distill_rpc::{
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 
+use crate::activation::{activate, publish_archive, publish_manifest, PointerError};
 use crate::archive::{encode_archive, ArchiveError, ArtifactPayload};
 use crate::manifest::{
     canonicalize, encode_manifest, verify_mounted_closure, ArchiveRef, ArtifactMetadata,
@@ -84,6 +86,7 @@ pub enum PackBuildError {
     },
     Archive(ArchiveError),
     Manifest(ManifestError),
+    Publication(PointerError),
 }
 
 impl fmt::Display for PackBuildError {
@@ -109,6 +112,12 @@ impl From<ArchiveError> for PackBuildError {
 impl From<ManifestError> for PackBuildError {
     fn from(value: ManifestError) -> Self {
         Self::Manifest(value)
+    }
+}
+
+impl From<PointerError> for PackBuildError {
+    fn from(value: PointerError) -> Self {
+        Self::Publication(value)
     }
 }
 
@@ -362,6 +371,34 @@ pub fn build_pack(
         archive_bytes: archive.bytes,
         archive_file_hash,
     })
+}
+
+/// Build, durably publish, and activate one v1 pack in the required order.
+/// The destination directory must already exist. If publication fails before
+/// activation, the old `pack.current` remains authoritative.
+#[allow(clippy::too_many_arguments)]
+pub fn build_publish_and_activate_pack(
+    directory: &Path,
+    definition: &PackDefinitionControlValue,
+    target: &PackBuildTarget,
+    compiled_registry: &CompiledTypeTable,
+    encoder_identity: &str,
+    snapshot: &Snapshot,
+    hub: &Hub,
+) -> Result<PackBuildOutput, PackBuildError> {
+    let output = build_pack(
+        definition,
+        target,
+        compiled_registry,
+        encoder_identity,
+        snapshot,
+        hub,
+    )?;
+    let archive_hash = publish_archive(directory, &output.archive_bytes)?;
+    debug_assert_eq!(archive_hash, output.archive_file_hash);
+    let manifest_hash = publish_manifest(directory, &output.manifest_bytes)?;
+    activate(directory, manifest_hash)?;
+    Ok(output)
 }
 
 fn to_rpc_query(query: BuildAssetQuery) -> distill_rpc::AssetQuery {

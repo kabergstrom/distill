@@ -1,13 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_build::query::AssetQuery as BuildAssetQuery;
 use distill_build::trace::PackDefinitionControlValue;
 use distill_bundle::PathComponent;
 use distill_core::attestation::{CompiledTypeRow, CompiledTypeTable, RegistryExtrasV1};
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use distill_pack::builder::{build_pack, PackBuildError, PackBuildTarget};
-use distill_pack::{PackTarget, PackfileIO, RuntimeAttestation};
+use distill_pack::builder::{
+    build_pack, build_publish_and_activate_pack, PackBuildError, PackBuildTarget,
+};
+use distill_pack::{
+    archive_filename, manifest_filename, manifest_hash, read_current, PackTarget, PackfileIO,
+    RuntimeAttestation,
+};
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
     AuthoringMutation, AuthoringValue, Commit, ConnectOutcome, ConnectRequest, GameModuleEpoch,
@@ -306,6 +313,61 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
         },
     )
     .unwrap();
+}
+
+#[test]
+fn build_publish_and_activate_pack_commits_the_complete_pack() {
+    let fixture = fixture();
+    let directory = std::env::temp_dir().join(format!(
+        "distill-pack-build-publish-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).unwrap();
+
+    let output = build_publish_and_activate_pack(
+        &directory,
+        &definition(fixture.root),
+        &PackBuildTarget {
+            name: "dev".into(),
+            manifest: fixture.target.clone(),
+            definition_hash: TARGET_HASH,
+        },
+        &fixture.compiled,
+        "zstd-test",
+        &fixture.snapshot,
+        &fixture.hub,
+    )
+    .unwrap();
+    let manifest_hash = manifest_hash(&output.manifest_bytes);
+
+    assert_eq!(read_current(&directory).unwrap(), manifest_hash);
+    assert_eq!(
+        fs::read(directory.join(manifest_filename(manifest_hash))).unwrap(),
+        output.manifest_bytes
+    );
+    assert_eq!(
+        fs::read(directory.join(archive_filename(output.archive_file_hash))).unwrap(),
+        output.archive_bytes
+    );
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+
+    PackfileIO::mount(
+        &fs::read(directory.join(manifest_filename(manifest_hash))).unwrap(),
+        vec![fs::read(directory.join(archive_filename(output.archive_file_hash))).unwrap()],
+        &RuntimeAttestation {
+            target: fixture.target,
+            target_def_hash: TARGET_HASH,
+            compiled_types: fixture.compiled,
+            bootstrap_authority: consumer_bootstrap_authority_v1().unwrap(),
+        },
+    )
+    .unwrap();
+
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
