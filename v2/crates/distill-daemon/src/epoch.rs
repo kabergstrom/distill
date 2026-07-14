@@ -2406,12 +2406,33 @@ pub(crate) fn processor_test_epoch<P: crate::callbacks::PipelineProcessor>(
     descriptor: crate::callbacks::ProcessorDescriptor,
     processor: P,
 ) -> PipelineEpoch {
+    processor_test_epoch_with(
+        target,
+        target_definition_hash,
+        descriptor,
+        processor,
+        |_| {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn processor_test_epoch_with<
+    P: crate::callbacks::PipelineProcessor,
+    F: FnOnce(&mut CandidateRegistrationArena),
+>(
+    target: &str,
+    target_definition_hash: [u8; 32],
+    descriptor: crate::callbacks::ProcessorDescriptor,
+    processor: P,
+    configure: F,
+) -> PipelineEpoch {
     let token = ModuleEpochToken::new(9002);
     let mut arena = CandidateRegistrationArena::new(token.clone());
     arena
         .register_processor(descriptor, processor)
         .into_result()
         .expect("test processor registration is valid");
+    configure(&mut arena);
     let registration = arena.registration_set(BTreeSet::from([target.to_owned()]));
     let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
         name: target.to_owned(),

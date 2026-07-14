@@ -28,7 +28,7 @@ use distill_core::lineage::lineage_chain_digest;
 use distill_json::AuthoredValue;
 use distill_migrate::{
     conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, EdgeKind, FieldPath,
-    MigrationOp,
+    MigrationError, MigrationOp,
 };
 use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactPayload, AssetReferenceQuery,
@@ -75,6 +75,9 @@ impl BuildBackend for CoordinatorBuildBackend {
             Ok(publication) => Ok(BuildBackendOutcome::Built(publication)),
             Err(BuildError::Drifted(input)) => Ok(BuildBackendOutcome::Drifted { input }),
             Err(BuildError::Failed(error)) => Ok(BuildBackendOutcome::Failed { error }),
+            Err(BuildError::Migration { message, .. }) => {
+                Ok(BuildBackendOutcome::Failed { error: message })
+            }
             Err(BuildError::Infrastructure(error)) => {
                 Err(RpcFailure::AuthoringBackendUnavailable {
                     operation: format!("build: {error}"),
@@ -88,6 +91,7 @@ impl BuildBackend for CoordinatorBuildBackend {
 enum BuildError {
     Drifted(DriftedInput),
     Failed(String),
+    Migration { message: String, facts: Box<DslfV1> },
     Infrastructure(String),
 }
 
@@ -98,6 +102,13 @@ impl BuildError {
 
     fn infrastructure(error: impl std::fmt::Debug) -> Self {
         Self::Infrastructure(format!("{error:?}"))
+    }
+
+    fn migration(message: impl Into<String>, facts: DslfV1) -> Self {
+        Self::Migration {
+            message: message.into(),
+            facts: Box::new(facts),
+        }
     }
 }
 
@@ -1147,28 +1158,95 @@ fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
     })
 }
 
+fn migration_plan_error(
+    type_uuid: TypeUuid,
+    from: LogicalHash,
+    to: LogicalHash,
+    failure: MigrationPlanFailureV1,
+    message: impl Into<String>,
+) -> BuildError {
+    BuildError::migration(
+        message,
+        DslfV1::MigrationPlan {
+            type_uuid,
+            from,
+            to,
+            failure,
+        },
+    )
+}
+
+fn migration_execution_failure(error: &MigrationError) -> MigrationPlanFailureV1 {
+    let path = match error {
+        MigrationError::MissingDefault { path, .. }
+        | MigrationError::InputPathMissing { path }
+        | MigrationError::InputShape { path, .. }
+        | MigrationError::WidenOutOfRange { path, .. }
+        | MigrationError::DuplicateSetElement { path }
+        | MigrationError::MapKeyCollision { path }
+        | MigrationError::MapKeyNotString { path }
+        | MigrationError::DuplicateWrite { path }
+        | MigrationError::MissingWrite { path }
+        | MigrationError::PlanShape { path, .. }
+        | MigrationError::Unencodable { path } => field_path_from_display(path),
+        MigrationError::DuplicateMapVariantFrom { at, .. } => field_path_from_display(at),
+        MigrationError::NonConforming { .. }
+        | MigrationError::PlanInvalid(_)
+        | MigrationError::FunctionFailed { .. } => FieldPath::root(),
+    };
+    match error {
+        MigrationError::MissingDefault { .. } => MigrationPlanFailureV1::MissingDefault { path },
+        MigrationError::MapKeyCollision { .. } => MigrationPlanFailureV1::MapKeyCollision { path },
+        MigrationError::DuplicateSetElement { .. } => {
+            MigrationPlanFailureV1::SetElementCollision { path }
+        }
+        MigrationError::DuplicateWrite { .. } => {
+            MigrationPlanFailureV1::DuplicateDestination { path }
+        }
+        MigrationError::MissingWrite { .. } => {
+            MigrationPlanFailureV1::UnwrittenDestination { path }
+        }
+        _ => MigrationPlanFailureV1::MissingPath { path },
+    }
+}
+
+fn field_path_from_display(path: &str) -> FieldPath {
+    FieldPath(
+        path.strip_prefix('$')
+            .unwrap_or(path)
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 fn commit_migration_failure(
     context: &mut BuildContext<'_>,
     loaded: &LoadedAsset,
     key: [u8; 32],
     trace: &[TraceOp],
-    from: distill_core::id::LogicalHash,
-    to: distill_core::id::LogicalHash,
-    failure: MigrationPlanFailureV1,
+    facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = if trace.last().is_some_and(TraceOp::failed) {
         StoreFailureCause::Op
     } else {
-        let detail = DslfV1::MigrationPlan {
-            type_uuid: loaded.entry.type_uuid,
-            from,
-            to,
-            failure,
-        }
-        .digest()
-        .map_err(BuildError::failed)?;
+        let facts = facts.ok_or_else(|| {
+            BuildError::Infrastructure(
+                "migration failure is neither trace-caused nor locally fingerprinted".to_owned(),
+            )
+        })?;
+        let detail = facts.digest().map_err(BuildError::failed)?;
         StoreFailureCause::Local(StoreFailureFingerprint::Local {
-            class: StoreLocalFailureClass::MigrationPlan,
+            class: match facts.class() {
+                LocalFailureClass::MigrationPlan => StoreLocalFailureClass::MigrationPlan,
+                LocalFailureClass::MigrationFunction => StoreLocalFailureClass::MigrationFunction,
+                class => {
+                    return Err(BuildError::Infrastructure(format!(
+                        "invalid build-import migration failure class {class:?}"
+                    )))
+                }
+            },
             detail,
         })
     };
@@ -1218,32 +1296,64 @@ fn load_current_value(
         EntryLineageV1::Manifest(stamp) => Some(stamp.clone()),
         EntryLineageV1::Bootstrap { .. } => None,
     };
+    let last_custom_edge = selected.edges.last().map(|edge| edge.asset);
     for edge in selected.edges {
         if edge.target_type_uuid != loaded.entry.type_uuid
             || edge.from_hash != node
             || edge.from_schema != schema
         {
-            return Err(BuildError::Failed(format!(
-                "Migration control {} does not continue the selected schema chain",
-                edge.asset
-            )));
+            return Err(migration_plan_error(
+                loaded.entry.type_uuid,
+                node,
+                edge.to_hash,
+                MigrationPlanFailureV1::NonConformingOutput {
+                    edge: edge.asset,
+                    path: FieldPath::root(),
+                },
+                format!(
+                    "Migration control {} does not continue the selected schema chain",
+                    edge.asset
+                ),
+            ));
         }
-        value = execute_custom_migration(context, trace_source, trace, &edge, value)?;
+        value = execute_custom_migration(
+            context,
+            trace_source,
+            trace,
+            loaded.entry.uuid,
+            &edge,
+            value,
+        )?;
         schema = edge.to_schema.clone();
         node = edge.to_hash;
         tail_stamp = Some(edge.to_lineage.clone());
     }
     if node == project.logical_hash {
         if schema != project.logical_schema {
-            return Err(BuildError::Failed(
-                "Migration chain reached the current hash with a different schema".to_owned(),
+            let edge = last_custom_edge.unwrap_or(loaded.entry.uuid);
+            return Err(migration_plan_error(
+                loaded.entry.type_uuid,
+                loaded.entry.schema_hash,
+                project.logical_hash,
+                MigrationPlanFailureV1::NonConformingOutput {
+                    edge,
+                    path: FieldPath::root(),
+                },
+                "Migration chain reached the current hash with a different schema",
             ));
         }
         return Ok(value);
     }
     if !selected.needs_automatic_tail {
-        return Err(BuildError::Failed(
-            "Migration chain stopped before the current schema".to_owned(),
+        return Err(migration_plan_error(
+            loaded.entry.type_uuid,
+            node,
+            project.logical_hash,
+            MigrationPlanFailureV1::MissingReverseEdge {
+                missing_from: node,
+                missing_to: project.logical_hash,
+            },
+            "Migration chain stopped before the current schema",
         ));
     }
     let placement = context
@@ -1256,13 +1366,31 @@ fn load_current_value(
         )
         .map_err(BuildError::infrastructure)?;
     if !placement.permits_automatic_diff() {
-        return Err(BuildError::Failed(format!(
-            "asset {} cannot automatically migrate the custom-chain tail from {} to {}: {placement:?}",
-            loaded.entry.uuid, node, project.logical_hash
-        )));
+        return Err(migration_plan_error(
+            loaded.entry.type_uuid,
+            node,
+            project.logical_hash,
+            MigrationPlanFailureV1::MissingReverseEdge {
+                missing_from: node,
+                missing_to: project.logical_hash,
+            },
+            format!(
+                "asset {} cannot automatically migrate the custom-chain tail from {} to {}: {placement:?}",
+                loaded.entry.uuid, node, project.logical_hash
+            ),
+        ));
     }
-    let plan = plan_automatic(&schema.root, &project.logical_schema.root)
-        .map_err(|error| BuildError::Failed(error.to_string()))?;
+    let plan = plan_automatic(&schema.root, &project.logical_schema.root).map_err(|error| {
+        migration_plan_error(
+            loaded.entry.type_uuid,
+            node,
+            project.logical_hash,
+            MigrationPlanFailureV1::MissingPath {
+                path: FieldPath::root(),
+            },
+            error.to_string(),
+        )
+    })?;
     validate_plan(
         &plan,
         &schema.root,
@@ -1270,7 +1398,15 @@ fn load_current_value(
         EdgeKind::Automatic,
     )
     .map_err(|errors| {
-        BuildError::Failed(format!("automatic migration plan rejected: {errors:?}"))
+        migration_plan_error(
+            loaded.entry.type_uuid,
+            node,
+            project.logical_hash,
+            MigrationPlanFailureV1::MissingPath {
+                path: FieldPath::root(),
+            },
+            format!("automatic migration plan rejected: {errors:?}"),
+        )
     })?;
 
     if migration_ops_use_defaults(&plan) {
@@ -1303,12 +1439,27 @@ fn load_current_value(
         if let Some(callback) = defaults.take_error() {
             BuildError::Failed(format!("default callback failed: {callback}"))
         } else {
-            BuildError::Failed(error.to_string())
+            migration_plan_error(
+                loaded.entry.type_uuid,
+                node,
+                project.logical_hash,
+                migration_execution_failure(&error),
+                error.to_string(),
+            )
         }
     })?
     .value;
     conforms(&migrated, &project.logical_schema.root).map_err(|error| {
-        BuildError::Failed(format!("migrated value is non-conforming: {error}"))
+        migration_plan_error(
+            loaded.entry.type_uuid,
+            node,
+            project.logical_hash,
+            MigrationPlanFailureV1::NonConformingOutput {
+                edge: last_custom_edge.unwrap_or(loaded.entry.uuid),
+                path: FieldPath::root(),
+            },
+            format!("migrated value is non-conforming: {error}"),
+        )
     })?;
     Ok(migrated)
 }
@@ -1383,19 +1534,34 @@ fn select_migration_chain(
             1 => {
                 let edge = outgoing.pop().expect("one outgoing edge");
                 if !visited.insert(edge.to_hash) {
-                    return Err(BuildError::Failed(format!(
-                        "Migration graph cycle revisits {}",
-                        edge.to_hash
-                    )));
+                    let mut cycle_edges = selected
+                        .edges
+                        .iter()
+                        .map(|selected| selected.asset)
+                        .collect::<Vec<_>>();
+                    cycle_edges.push(edge.asset);
+                    return Err(migration_plan_error(
+                        type_uuid,
+                        start,
+                        target,
+                        MigrationPlanFailureV1::Cycle { cycle_edges },
+                        format!("Migration graph cycle revisits {}", edge.to_hash),
+                    ));
                 }
                 node = edge.to_hash;
                 selected.edges.push(edge);
             }
             _ => {
-                return Err(BuildError::Failed(format!(
-                    "ambiguous Migration graph at {node}: {:?}",
-                    outgoing.iter().map(|edge| edge.asset).collect::<Vec<_>>()
-                )));
+                let conflicting_edges = outgoing.iter().map(|edge| edge.asset).collect::<Vec<_>>();
+                return Err(migration_plan_error(
+                    type_uuid,
+                    start,
+                    target,
+                    MigrationPlanFailureV1::AmbiguousEdge {
+                        conflicting_edges: conflicting_edges.clone(),
+                    },
+                    format!("ambiguous Migration graph at {node}: {conflicting_edges:?}"),
+                ));
             }
         }
     }
@@ -1405,6 +1571,7 @@ fn execute_custom_migration(
     context: &BuildContext<'_>,
     source: &StoreTraceSource,
     trace: &mut Vec<TraceOp>,
+    asset: AssetUuid,
     edge: &MigrationControlValue,
     input: AuthoredValue,
 ) -> Result<AuthoredValue, BuildError> {
@@ -1417,10 +1584,18 @@ fn execute_custom_migration(
                 EdgeKind::Custom,
             )
             .map_err(|errors| {
-                BuildError::Failed(format!(
-                    "Migration control {} has an invalid custom plan: {errors:?}",
-                    edge.asset
-                ))
+                migration_plan_error(
+                    edge.target_type_uuid,
+                    edge.from_hash,
+                    edge.to_hash,
+                    MigrationPlanFailureV1::MissingPath {
+                        path: FieldPath::root(),
+                    },
+                    format!(
+                        "Migration control {} has an invalid custom plan: {errors:?}",
+                        edge.asset
+                    ),
+                )
             })?;
             let epoch = context
                 .pipeline
@@ -1434,7 +1609,15 @@ fn execute_custom_migration(
                 &edge.to_schema.root,
                 &defaults,
             )
-            .map_err(|error| BuildError::Failed(error.to_string()))?
+            .map_err(|error| {
+                migration_plan_error(
+                    edge.target_type_uuid,
+                    edge.from_hash,
+                    edge.to_hash,
+                    migration_execution_failure(&error),
+                    error.to_string(),
+                )
+            })?
             .value
         }
         MigrationControlKind::Function { key } => {
@@ -1449,19 +1632,47 @@ fn execute_custom_migration(
                     "Migration function capability {key:?} is unavailable: {error:?}"
                 )));
             }
-            context
+            match context
                 .pipeline
                 .epoch()
                 .map_err(|poison| BuildError::Failed(poison.to_string()))?
                 .invoke_migration(key, input)
-                .map_err(BuildError::failed)?
+            {
+                Ok(output) => output,
+                Err(CallbackInvokeError::Rejected(error)) => {
+                    return Err(BuildError::migration(
+                        format!(
+                            "Migration function {key:?} rejected asset {asset} with code {}: {}",
+                            error.code, error.message
+                        ),
+                        DslfV1::MigrationFunction {
+                            asset,
+                            type_uuid: edge.target_type_uuid,
+                            from: edge.from_hash,
+                            to: edge.to_hash,
+                            function_key: key.clone(),
+                            migration_error_code: error.code,
+                        },
+                    ));
+                }
+                Err(error) => return Err(BuildError::failed(error)),
+            }
         }
     };
     conforms(&output, &edge.to_schema.root).map_err(|error| {
-        BuildError::Failed(format!(
-            "Migration control {} produced a non-conforming value: {error}",
-            edge.asset
-        ))
+        migration_plan_error(
+            edge.target_type_uuid,
+            edge.from_hash,
+            edge.to_hash,
+            MigrationPlanFailureV1::NonConformingOutput {
+                edge: edge.asset,
+                path: FieldPath::root(),
+            },
+            format!(
+                "Migration control {} produced a non-conforming value: {error}",
+                edge.asset
+            ),
+        )
     })?;
     Ok(output)
 }
@@ -1523,17 +1734,13 @@ fn encode_or_hydrate(
         match load_current_value(context, loaded, project, &trace_source, &mut trace) {
             Ok(value) => value,
             Err(error) => {
-                commit_migration_failure(
-                    context,
-                    loaded,
-                    key,
-                    &trace,
-                    loaded.entry.schema_hash,
-                    project.logical_hash,
-                    MigrationPlanFailureV1::MissingPath {
-                        path: FieldPath::root(),
-                    },
-                )?;
+                let facts = match &error {
+                    BuildError::Migration { facts, .. } => Some(facts.as_ref()),
+                    _ => None,
+                };
+                if trace.last().is_some_and(TraceOp::failed) || facts.is_some() {
+                    commit_migration_failure(context, loaded, key, &trace, facts)?;
+                }
                 return Err(error);
             }
         };
@@ -2520,6 +2727,36 @@ mod tests {
         current_hash: LogicalHash,
         current_schema: &LogicalSchema,
     ) -> Bundle {
+        migration_bundle_with_kind(
+            old_hash,
+            old_schema,
+            current_hash,
+            current_schema,
+            MigrationKindV1::Ops {
+                ops: vec![
+                    MigrationOpV1::DropField {
+                        at: FieldPathV1 {
+                            segments: vec!["value".to_owned()],
+                        },
+                    },
+                    MigrationOpV1::WriteValue {
+                        to: FieldPathV1 {
+                            segments: vec!["value".to_owned()],
+                        },
+                        value: AuthoredValueV1::UInt { value: 42 },
+                    },
+                ],
+            },
+        )
+    }
+
+    fn migration_bundle_with_kind(
+        old_hash: LogicalHash,
+        old_schema: &LogicalSchema,
+        current_hash: LogicalHash,
+        current_schema: &LogicalSchema,
+        kind: MigrationKindV1,
+    ) -> Bundle {
         let old_epochs = vec![AcceptedSchemaEpoch {
             digest: old_hash,
             forward_parent: None,
@@ -2557,21 +2794,7 @@ mod tests {
                 cursor: 1,
                 chain: lineage_chain_digest(TYPE, &current_epochs, 1),
             },
-            kind: MigrationKindV1::Ops {
-                ops: vec![
-                    MigrationOpV1::DropField {
-                        at: FieldPathV1 {
-                            segments: vec!["value".to_owned()],
-                        },
-                    },
-                    MigrationOpV1::WriteValue {
-                        to: FieldPathV1 {
-                            segments: vec!["value".to_owned()],
-                        },
-                        value: AuthoredValueV1::UInt { value: 42 },
-                    },
-                ],
-            },
+            kind,
         };
         let migration_schema = crate::logical_node::decode_logical_schema_bytes(
             &distill_asset::build::logical_schema_bytes::<MigrationV1>(),
@@ -2849,6 +3072,78 @@ mod tests {
         let parsed =
             distill_wire::artifact::parse_artifact_parts(&root.payload.structural, &blobs).unwrap();
         assert_eq!(parsed.fixed, [42, 0]);
+
+        let function_migration = migration_bundle_with_kind(
+            old_hash,
+            &old_schema,
+            project.logical_hash,
+            &project.logical_schema,
+            MigrationKindV1::Function {
+                key: "upgrade".to_owned(),
+            },
+        );
+        std::fs::write(
+            assets.join("migration.bundle"),
+            distill_bundle::write_bundle(&function_migration).unwrap(),
+        )
+        .unwrap();
+        coordinator.reconcile_full_scan().unwrap();
+        let migration_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&migration_calls);
+        coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch_with(
+            "dev",
+            target_hash.0,
+            crate::callbacks::ProcessorDescriptor {
+                id: "identity".to_owned(),
+                version: 1,
+                input: TYPE,
+                selector: TargetSelector::new(None, None).unwrap(),
+                outputs: OutputDecls::new(TERMINAL, Vec::<(String, TypeUuid)>::new()).unwrap(),
+            },
+            PrimaryCountingProcessor(Arc::clone(&calls)),
+            move |arena| {
+                arena
+                    .register_migration(
+                        "upgrade",
+                        move |mut value: AuthoredValue| -> Result<
+                            AuthoredValue,
+                            crate::callbacks::MigrationFunctionError,
+                        > {
+                            callback_calls.fetch_add(1, Ordering::SeqCst);
+                            let AuthoredValue::Object(fields) = &mut value else {
+                                panic!("test migration input is a struct");
+                            };
+                            fields.insert("value".to_owned(), AuthoredValue::UInt(55));
+                            Ok(value)
+                        },
+                    )
+                    .into_result()
+                    .unwrap();
+            },
+        ));
+        request.basis = coordinator.server().current_stamp();
+
+        let function = build(&coordinator, &request).unwrap();
+        assert_eq!(migration_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let root = function
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.content_hash == function.root_content_hash)
+            .unwrap();
+        let blobs = root
+            .payload
+            .blobs
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&[u8]>>();
+        let parsed =
+            distill_wire::artifact::parse_artifact_parts(&root.payload.structural, &blobs).unwrap();
+        assert_eq!(parsed.fixed, [55, 0]);
+
+        assert_eq!(build(&coordinator, &request).unwrap(), function);
+        assert_eq!(migration_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
