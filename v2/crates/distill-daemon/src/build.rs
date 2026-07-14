@@ -209,7 +209,9 @@ fn build(
             .extras
             .get(&request.output_key)
             .copied()
-            .ok_or_else(|| BuildError::Drifted(DriftedInput::Asset(request.requested_asset)))?
+            .ok_or(BuildError::Drifted(DriftedInput::Asset(
+                request.requested_asset,
+            )))?
     };
     if request.entry.terminal_type != requested_chain.terminal
         || request.requested_terminal_type != expected_requested_type
@@ -246,7 +248,9 @@ fn build(
     let selected = root
         .outputs
         .get(&request.output_key)
-        .ok_or_else(|| BuildError::Drifted(DriftedInput::Asset(request.requested_asset)))?;
+        .ok_or(BuildError::Drifted(DriftedInput::Asset(
+            request.requested_asset,
+        )))?;
     Ok(BuildPublication {
         root_content_hash: selected.content_hash,
         artifacts: root.artifacts.into_values().collect(),
@@ -442,6 +446,13 @@ struct PendingNodePublication {
     wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
 
+type HydratedProcessorStage = (Vec<EncodedNodeOutput>, BTreeMap<String, Vec<u8>>);
+type EncodedBuildImport = (
+    Vec<u8>,
+    Vec<distill_wire::encode::EncodedReference>,
+    Option<AuthoredValue>,
+);
+
 fn process_chain(
     context: &mut BuildContext<'_>,
     loaded: &LoadedAsset,
@@ -631,7 +642,7 @@ fn hydrate_processor_stage(
     chain: &PipelineChain,
     stage: &PipelineStage,
     static_inputs: &StaticInputs,
-) -> Result<Option<(Vec<EncodedNodeOutput>, BTreeMap<String, Vec<u8>>)>, BuildError> {
+) -> Result<Option<HydratedProcessorStage>, BuildError> {
     let key = static_inputs_digest(static_inputs);
     let trace_source = capture_trace_source(context)?;
     let Some(hit) = lookup_persisted_candidate(
@@ -1822,14 +1833,7 @@ fn encode_or_hydrate(
     project: &ProjectTypeAuthority,
     terminal_type: TypeUuid,
     validator_dylib_hash: Option<[u8; 32]>,
-) -> Result<
-    (
-        Vec<u8>,
-        Vec<distill_wire::encode::EncodedReference>,
-        Option<AuthoredValue>,
-    ),
-    BuildError,
-> {
+) -> Result<EncodedBuildImport, BuildError> {
     let key = build_import_digest(&BuildImportInputs {
         asset: loaded.entry.uuid,
         bundle: loaded.meta.bundle,
@@ -2105,8 +2109,8 @@ fn load_asset(
             bundle_meta.path.clone(),
         )));
     }
-    let (local_id, entry) = find_bundle_asset(&bundle, asset)
-        .ok_or_else(|| BuildError::Drifted(DriftedInput::Asset(asset)))?;
+    let (local_id, entry) =
+        find_bundle_asset(&bundle, asset).ok_or(BuildError::Drifted(DriftedInput::Asset(asset)))?;
     if local_id != meta.local_id
         || entry.type_uuid != meta.type_uuid
         || entry.schema_hash != meta.logical_hash

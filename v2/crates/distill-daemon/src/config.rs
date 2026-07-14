@@ -383,7 +383,7 @@ impl DaemonConfig {
         self.build_targets(identity)?
             .iter()
             .map(|(name, target)| {
-                let definition_hash = TargetDefinitionHash(target_definition_hash(&target, &[]));
+                let definition_hash = TargetDefinitionHash(target_definition_hash(target, &[]));
                 let policy = compiled
                     .rows
                     .iter()

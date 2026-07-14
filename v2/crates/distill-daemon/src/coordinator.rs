@@ -6,6 +6,7 @@
 //! projection for the same successor version.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use distill_build::pipeline::Target;
@@ -56,6 +57,16 @@ use crate::watcher::{GenerationReplay, WatcherQueue, WatcherQueueError};
 pub struct LineageDestination {
     pub root: String,
     pub path: String,
+}
+
+pub(crate) struct ConfigurationCandidate {
+    pub roots: Vec<AssetRoot>,
+    pub lineage_destination: LineageDestination,
+    pub targets: Vec<TargetDefinition>,
+    pub build_targets: BTreeMap<String, Target>,
+    pub pipeline_source: PathBuf,
+    pub requirements: CandidateRequirements,
+    pub schema_authority: Arc<ProjectSchemaAuthority>,
 }
 
 pub struct DaemonCoordinator {
@@ -352,16 +363,19 @@ impl DaemonCoordinator {
         }
     }
 
-    pub fn publish_configuration_candidate(
+    pub(crate) fn publish_configuration_candidate(
         &self,
-        roots: Vec<AssetRoot>,
-        lineage_destination: LineageDestination,
-        targets: Vec<TargetDefinition>,
-        build_targets: BTreeMap<String, Target>,
-        pipeline_source: &std::path::Path,
-        mut requirements: CandidateRequirements,
-        schema_authority: Arc<ProjectSchemaAuthority>,
+        candidate: ConfigurationCandidate,
     ) -> Result<SnapshotStamp, CoordinatorError> {
+        let ConfigurationCandidate {
+            roots,
+            lineage_destination,
+            targets,
+            build_targets,
+            pipeline_source,
+            mut requirements,
+            schema_authority,
+        } = candidate;
         let filesystem = self
             .authoring
             .prepare_filesystem_candidate(roots, lineage_destination)
@@ -372,7 +386,7 @@ impl DaemonCoordinator {
         let mut runtime = lock_pipeline(&self.pipeline);
         let prepared_epoch = {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
-            host.prepare_candidate(pipeline_source, &mut requirements, loader)
+            host.prepare_candidate(&pipeline_source, &mut requirements, loader)
         };
         let authored_types = requirements
             .compiled_types

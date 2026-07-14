@@ -260,6 +260,12 @@ struct Entry {
     drop: EntryDrop,
 }
 
+#[derive(Clone, Copy)]
+struct NativeWindow {
+    base: u32,
+    size: u32,
+}
+
 enum EntryDrop {
     /// Whole-value glue from the generated drop table.
     Table(DropId),
@@ -614,10 +620,12 @@ impl<'a> Executor<'a> {
                         wire,
                         dst,
                         wire_tag,
-                        *native,
+                        NativeWindow {
+                            base: *native,
+                            size: native_size,
+                        },
                         variants,
                         depth,
-                        native_size,
                     )?;
                 }
                 FixupOp::Recurse {
@@ -912,10 +920,9 @@ impl<'a> Executor<'a> {
         wire: &[u8],
         dst: *mut u8,
         wire_tag: &WireTagRead,
-        native: u32,
+        native: NativeWindow,
         variants: &[(NativeTagWrite, PlanId)],
         depth: u32,
-        native_size: u32,
     ) -> Result<(), ExecError> {
         let index = match wire_tag {
             WireTagRead::CanonicalU32 { offset } => {
@@ -953,7 +960,7 @@ impl<'a> Executor<'a> {
         let (write, plan) = &variants[index];
         // Variant plans are enum-relative on both sides and carry no
         // whole_drop of their own — the enum frame owns the value.
-        self.run_plan_in_native_frame(*plan, wire, dst, depth + 1, native_size)?;
+        self.run_plan_in_native_frame(*plan, wire, dst, depth + 1, native.size)?;
         match write {
             NativeTagWrite::Direct {
                 offset,
@@ -968,9 +975,9 @@ impl<'a> Executor<'a> {
                 let bytes = value.to_le_bytes();
                 let size = (*size).min(16) as u64;
                 let native_offset = checked_native_range(
-                    u64::from(native) + u64::from(*offset),
+                    u64::from(native.base) + u64::from(*offset),
                     size,
-                    native_size,
+                    native.size,
                     "enum tag write",
                 )?;
                 std::ptr::copy_nonoverlapping(

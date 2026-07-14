@@ -321,11 +321,9 @@ impl ConfigWatch {
                 coordinator.publish_configuration_rejection(reason, message)?;
                 self.rejected = true;
                 self.observed = Some(observation.state);
-                return Ok(());
+                Ok(())
             }
-            Ok(candidate) => {
-                return self.reconcile_valid(coordinator, observation.state, candidate);
-            }
+            Ok(candidate) => self.reconcile_valid(coordinator, observation.state, candidate),
         }
     }
 
@@ -374,13 +372,15 @@ impl ConfigWatch {
                     .build_targets(authority.identity())
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
                 coordinator.publish_configuration_candidate(
-                    candidate.asset_roots(),
-                    candidate.assets.lineage_manifest.clone(),
-                    targets,
-                    build_targets,
-                    &candidate.modules.pipeline_dylib,
-                    requirements,
-                    Arc::clone(&authority),
+                    crate::coordinator::ConfigurationCandidate {
+                        roots: candidate.asset_roots(),
+                        lineage_destination: candidate.assets.lineage_manifest.clone(),
+                        targets,
+                        build_targets,
+                        pipeline_source: candidate.modules.pipeline_dylib.clone(),
+                        requirements,
+                        schema_authority: Arc::clone(&authority),
+                    },
                 )?;
             }
             Ok(_) if self.rejected => {
