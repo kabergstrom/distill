@@ -1,7 +1,7 @@
-//! Offline import, processing, dependency-trace, and scheduling core
+//! Offline import, processing, and dependency-trace core
 //! (§§8–10). The crate is deliberately IO-abstract: daemon integration
 //! supplies snapshot/file backends while this crate owns deterministic
-//! folds, keys, validation, trace revalidation, and stack-safe traversal.
+//! folds, keys, validation, and trace revalidation.
 
 pub mod artifact_encode;
 pub mod cache;
@@ -13,6 +13,5 @@ pub mod outputs;
 pub mod persist;
 pub mod pipeline;
 pub mod query;
-pub mod scheduler;
 pub mod tool;
 pub mod trace;
