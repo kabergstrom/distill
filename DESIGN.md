@@ -287,13 +287,15 @@ run as subprocesses as they do today. Pipeline-only native dependencies
 (shaderc, spirv-cross) must be **statically linked** into the pipeline
 cdylib — the dylib hash is the module's code identity and covers only
 that one file, so a dependent `.so`/`.dylib`/DLL loaded at runtime could
-change while every cache key stayed put. Runtime `dlopen` by pipeline
-code is therefore **banned outright**: there is deliberately no staged-
-library resolution/open API. Anything dynamic is a §9 tool subprocess
-invoked through `run_tool`, whose complete hermetic execution closure is
-staged and hashed as a content-addressed `ToolExecutionCapsule` (§9). (The daemon module host's own
-staged `dlopen` of the pipeline cdylib above is the hosting boundary, not
-pipeline code.) The system runtime (libc, libSystem)
+change while every cache key stayed put. This is a pipeline build/link
+contract checked by the pipeline build, not by teaching the daemon to parse
+platform executable formats or reproduce the OS loader. Runtime `dlopen` by
+pipeline code is therefore **banned outright**: there is deliberately no
+staged-library resolution/open API. Anything dynamic is a §9 tool subprocess
+invoked through `run_tool`, registered either as a complete hashed package
+directory or as an explicitly ambient toolchain (§9). (The daemon module
+host's own staged `dlopen` of the pipeline cdylib above is the hosting boundary,
+not pipeline code.) The system runtime (libc, libSystem)
 is acknowledged as part of `CompilationIdentity`'s (target, rustc) pair
 (§5) and outside the dylib hash; system-runtime drift is not tracked
 (§22).
@@ -640,11 +642,11 @@ impl Registry {
     pub fn defaults<T: AssetType>(&mut self, table: &'static DefaultTable<T>)
         -> RegistrationStatus;
     /// Tool registry behind ctx.run_tool (§9). Registration is an input
-    /// event: the daemon resolves, stages, and verifies the complete
-    /// ToolExecutionCapsule closure and publishes (id → capsule object +
-    /// DSCT hash) as input-versioned state (§9, §13) — jobs resolve the
-    /// tool through their pinned snapshot and launch only that capsule,
-    /// never this live path or an ambient dependency.
+    /// event: the daemon snapshots a complete package directory or records an
+    /// explicitly ambient toolchain identity, then publishes (id → execution
+    /// identity + DSCT hash) as input-versioned state (§9, §13). Jobs resolve
+    /// the tool through their pinned snapshot; an ambient registration without
+    /// a trusted fingerprint makes every calling attempt nonmemoizable.
     pub fn tool(&mut self, id: &str, spec: ToolRegistration) -> RegistrationStatus;
 }
 
@@ -1072,7 +1074,7 @@ spec defect, since that is how two meanings come to share bytes:
 | `"DSRE"` | one type's canonical RegistryExtras v1 row table (§3, §5) |
 | `"DSCA"` | compiled per-type attestation aggregate — sorted TypeUuid/logical hash/DSNL/build_only/RegistryExtras v1 projection (§3, §5, §§15–17) |
 | `"DSAE"` | RPC served-closure identity in `AttestationExpansionRequired` — pinned snapshot/request subject plus verified canonical closure rows (§3, §§15, §17) |
-| `"DSCT"` | complete hermetic `ToolExecutionCapsule` identity — staged bytes, launch closure/metadata, sanitized environment, cwd policy, and platform/runtime declaration (§9, §13) |
+| `"DSCT"` | tool-execution identity — complete packaged-directory bytes or explicit ambient toolchain identity, plus sanitized environment and cwd policy (§9, §13) |
 | `"DSWL"` | layout hash — the wire tree (§12) |
 | `"DSFT"` | fixup-table identity — the measured digest extended with the binary's generated-table assignment (§5, §12) |
 | `"DSSI"` | static-input key (§9) |
@@ -1389,8 +1391,8 @@ domainless because their meaning is byte equality rather than a semantic
 record: `ContentHash` over complete DSTL artifact bytes; tracked raw-file and
 `BundleFileHash` values over the exact observed file bytes, whether valid or
 malformed (canonical bundle validation is independent); staged pipeline-
-dylib hashes over the executable bytes; each `ToolCapsuleFile.bytes_hash` over
-that exact staged member's bytes (the DSCT aggregate remains semantic); CAS record
+dylib hashes over the executable bytes; each `ToolPackageFile.bytes_hash` over
+that exact packaged member's bytes (the DSCT aggregate remains semantic); CAS record
 `content_hash` values over payload bytes; and pack/archive per-file
 trailers and archive-reference file hashes over the preceding/full named
 file bytes as §16 specifies. This list is closed: a new domainless digest
@@ -3224,89 +3226,82 @@ validators, migrations, and default materializers, and no API resolves a
 tool entry to a library path or handle; code that must vary outside the
 statically linked pipeline cdylib runs as the staged §9 subprocess.
 
-Tool identity is the complete hermetic execution closure, not the launcher
-file alone:
+Tool identity has two deliberately simple modes:
 
 ```rust
 pub struct ToolRegistration {
-    pub launcher: PathBuf,
-    pub declared_resources: Vec<ToolResourceDeclaration>,
-    pub plugins: Vec<ToolResourceDeclaration>,
+    pub source: ToolSource,
     pub environment: Vec<(String, String)>,
     pub cwd_policy: ToolCwdPolicy,
-    pub platform: ToolPlatformBinding,
 }
-pub struct ToolResourceDeclaration {
-    pub source: PathBuf,
-    pub capsule_path: String,
+pub enum ToolSource {
+    Package { root: PathBuf, launcher: String },
+    Ambient {
+        launcher: PathBuf,
+        toolchain_id: String,
+        trusted_fingerprint: Option<[u8; 32]>,
+    },
 }
-pub struct ToolExecutionCapsuleV1 {
-    pub files: Vec<ToolCapsuleFile>,
-    pub resolved_interpreter: Option<String>, // canonical capsule path
-    pub launch: ToolLaunchMetadataV1,
+pub struct ToolExecutionIdentityV2 {
+    pub source: ToolSourceIdentityV2,
     pub environment: Vec<(String, String)>,
     pub cwd_policy: ToolCwdPolicy,
-    pub platform: ToolPlatformBinding,
 }
-#[repr(u8)]
-pub enum ToolCapsuleFileRole {
-    Launcher = 1, Interpreter = 2, NonSystemDso = 3,
-    Plugin = 4, DeclaredResource = 5,
+pub enum ToolSourceIdentityV2 {
+    Package { launcher: String, files: Vec<ToolPackageFile> } = 1,
+    Ambient {
+        launcher: String,
+        toolchain_id: String,
+        trusted_fingerprint: Option<[u8; 32]>,
+    } = 2,
 }
-pub struct ToolCapsuleFile {
-    pub path: String, pub role: ToolCapsuleFileRole,
-    pub executable: bool, pub len: u64, pub bytes_hash: [u8; 32],
+pub struct ToolPackageFile {
+    pub path: String,
+    pub executable: bool,
+    pub len: u64,
+    pub bytes_hash: [u8; 32],
 }
 #[repr(u8)]
 pub enum ToolCwdPolicy {
-    EmptyScratch = 1, ReadOnlyCapsuleRoot = 2,
-    ReadOnlyDeclaredSubdir(String) = 3,
-}
-#[repr(u8)]
-pub enum ToolPlatformBinding {
-    Pinned { platform_id: String, system_runtime_id: String } = 1,
-    ExplicitResidual { platform_id: String,
-                       system_runtime_class: String } = 2,
-}
-pub struct ToolLaunchMetadataV1 {
-    pub argv0: String,                 // canonical capsule path
-    pub interpreter_args: Vec<String>, // shebang/loader arguments
-}
-pub struct ToolExecutionCapsule {
-    pub object: ToolExecutionCapsuleV1,
-    pub hash: [u8; 32],                // DSCT aggregate below
+    EmptyScratch = 1,
+    ReadOnlyPackageRoot = 2,
+    ReadOnlyPackageSubdir(String) = 3,
 }
 ```
 
-Registration resolves the launcher or script bytes, its resolved interpreter,
-the complete executable non-system DSO closure, every declared plugin and
-resource byte, and executable mode/launch metadata before publication. Capsule
-paths are NFC UTF-8 with `/`, relative, traversal-free, unique, and sorted by
-`(path bytes, role)`; each `bytes_hash` is raw blake3 of the staged bytes and
-`len` is checked. Environment keys/values are NFC strings, keys are unique and
-raw-byte sorted, and the published vector is the complete sanitized environment
-used at launch: ambient variables including `PATH`, locale, home, and temp are
-cleared unless present literally. The cwd-policy tags above are closed; the
-declared subdirectory must name a staged directory. Platform/runtime binding is
-also closed: either it pins the platform plus system-runtime identity, or it
-commits the explicit named residual class rather than silently inheriting one.
-All platform/runtime strings are nonempty NFC UTF-8; `Pinned` equality is
-rechecked against the configured platform resolver before launch, while an
-`ExplicitResidual` literally commits the named ambient class and may never be
-encoded as an empty or generic "current" value.
+`Package` is the cacheable hermetic mode. Registration recursively snapshots
+every regular file below `root`, rejects symlinks and special files, requires
+`launcher` to be a canonical relative path naming an executable package file,
+and stages the complete directory no-replace. Package paths are NFC UTF-8 with
+`/`, relative, traversal-free, unique, and raw-byte sorted; each `bytes_hash` is
+raw blake3 of the staged bytes and `len` is checked. Distill deliberately does
+not parse ELF, Mach-O, PE, shebangs, or native loader search metadata. Producing
+a self-contained package for the target host is the responsibility of the tool
+package/build system; all packaged bytes, including any bundled interpreters,
+plugins, resources, or libraries, are already covered by the directory snapshot.
 
-`DSCT v1 = blake3("DSCT" || 0x01 || canonical ToolExecutionCapsuleV1)` using
-§5's record codec and the fixed tags above. Because the canonical file rows
-commit every byte hash, DSCT transitively commits the launcher/script,
-interpreter, non-system DSO/plugin closure, and resources as well as launch
-metadata, environment, cwd, and platform/runtime policy. Registration stages
-every file content-addressed with no-replace semantics, reopens and verifies
-the complete closure, then atomically publishes the capsule object and DSCT
-hash as snapshot input. An unresolved interpreter/DSO/plugin/resource,
-ambiguous dependency, noncanonical metadata, or incomplete platform binding
-refuses registration and publishes no tool row. A closure that cannot be
-revalidated at execution time yields only the transient nonmemoized launch
-outcome below; it can never be treated as a cacheable tool invocation.
+`Ambient` names one canonical absolute executable path plus a nonempty NFC
+`toolchain_id`. It is not copied and Distill does not inspect its adjacent files
+or native dependencies. With `trusted_fingerprint: Some`, the caller asserts a
+stable toolchain/package identity and the invocation may memoize; the fingerprint
+and toolchain ID both enter DSCT. With `None`, the tool may run but every build
+attempt that calls it is nonmemoizable: no success or failure record from that
+attempt enters a candidate bucket. This makes local SDK discovery usable without
+pretending that an ambient installation is reproducible.
+
+Environment keys/values are NFC strings, keys are unique and raw-byte sorted,
+and the published vector is the complete sanitized environment used at launch:
+ambient variables including `PATH`, locale, home, and temp are cleared unless
+present literally. `ReadOnlyPackageRoot` and `ReadOnlyPackageSubdir` are valid
+only for package tools; ambient tools use `EmptyScratch`.
+
+`DSCT v2 = blake3("DSCT" || 0x02 || canonical ToolExecutionIdentityV2)` using
+§5's record codec and the fixed tags above. A package DSCT commits every package
+file row plus launch/environment/cwd metadata. An ambient DSCT commits the exact
+launcher path, toolchain ID, optional trusted fingerprint, environment, and cwd
+policy. Registration publishes the identity and DSCT hash as snapshot input.
+Packaged files are reopened and verified at launch; an unavailable package or
+ambient executable yields only the transient nonmemoized launch outcome below.
 
 ### Pipeline map
 
@@ -3413,7 +3408,7 @@ canonically ordered sequence of every context operation *with its label
 and its observed outcome*: each entry records
 `Observed<T> = Ok(T) | Err(StableFailureFingerprint)` (declared below) —
 `read(uuid) → ContentHash`, `resolve(path) → uuid | NONE`,
-`query(selector) → result-set hash`, `tool(id) → DSCT capsule hash` on
+`query(selector) → result-set hash`, `tool(id) → DSCT execution-identity hash` on
 success; on failure a typed, content-derived fingerprint (ambiguity: the
 sorted conflicting ids; poison: the poison row's identity; a missing
 strong reference: the query and expected terminal; a descendant build
@@ -3430,27 +3425,28 @@ binaries invoked as subprocesses are trace operations, never static
 inputs (which tool runs can depend on inputs, and the dylib hash cannot
 see them), revalidated on every lookup like all trace entries.
 Pipeline-dylib hashes are §5 byte-identity digests over the staged dylib.
-Tool identity is instead the domain-separated semantic/composite DSCT capsule
-aggregate above; a launcher byte hash alone is never a trace identity.
+Tool identity is instead the domain-separated semantic/composite DSCT aggregate
+above; a launcher byte hash alone is never a trace identity.
 Subprocesses launch only through `ctx.run_tool(id, args)`, and the tool
 a job runs is a **snapshot input**: registering or replacing a tool
-(`Registry::tool`, §3) stages and verifies a complete content-addressed
-capsule under daemon state and publishes the (tool key → capsule object +
-DSCT hash) mapping as
+(`Registry::tool`, §3) snapshots a package directory or records an explicit
+ambient toolchain and publishes the (tool key → execution identity + DSCT hash)
+mapping as
 input-versioned **ToolEpoch** state (§13) — a registration change
 advances the input version like any other input event. A job resolves
-`id` through its pinned snapshot and launches the exact capsule the
-published DSCT names — never the live registered path, ambient interpreter,
-DSO, plugin, resource, environment, or cwd — so one snapshot can never select
-a different execution closure before and after a swap. A swap mid-epoch
-invalidates traces into rebuilds that run the new capsule. Staged
+`id` through its pinned snapshot. Package tools launch only the staged package
+the published DSCT names; ambient tools launch their explicit path, and only a
+trusted fingerprint makes that call memoizable. A swap mid-epoch invalidates
+traces into rebuilds that run the new registration. Staged package
 versions coexist; `DriftedInput::Tool` (§15) covers an old basis whose
-capsule closure has been evicted.
+package has been evicted.
 If `id` is absent from that snapshot's ToolEpoch, `run_tool` records the
 terminal `TraceOp::Tool` miss and `MissingCapability { Tool(id) }` specified
 below; it does not attempt a launch and cannot use `ToolLaunch` as an alias.
-PATH lookup, symlink retargeting, or access to undeclared adjacent files is
-not a conforming capsule launch. Hashing
+PATH lookup and symlink retargeting are never registration mechanisms. Package
+launches cannot access files outside the staged package; ambient launchers are
+explicitly outside that guarantee and are nonmemoizable without a trusted
+fingerprint. Hashing
 labeled operations rather than a sorted multiset of
 content hashes means two dependencies that swap contents change the key.
 
@@ -3568,13 +3564,13 @@ pub enum StableFailureFingerprint {
     Local { class: LocalFailureClass, detail: [u8; 32] },
 }
 pub enum ToolErrorClass {
-    NotExecutable, MissingInterpreter, SpawnDenied, CapsuleClosureUnavailable,
+    NotExecutable, SpawnDenied, PackageUnavailable, AmbientUnavailable,
 }
 /// A post-lookup execution outcome. It is returned only to the attempted
 /// caller and never enters StableFailureFingerprint, DSTR, or a memo bucket.
 pub struct TransientToolLaunchFailure {
     pub id: String,
-    pub capsule_hash: [u8; 32],
+    pub tool_hash: [u8; 32],
     pub class: ToolErrorClass,
 }
 // LocalFailureClass and its exact DSLF payload grammar are declared in §5.
@@ -3610,7 +3606,7 @@ pub enum TraceOp {                         // the labeled, outcome-bearing trace
                                            // Ok(None) is a first-class miss,
                                            // never a failure
     Query   { query: AssetQuery, observed: Observed<[u8; 32]> },  // domain-prefixed (§10)
-    /// The tool key and aggregate DSCT capsule hash the snapshot's ToolEpoch
+    /// The tool key and aggregate DSCT execution hash the snapshot's ToolEpoch
     /// (§13) resolved it to — snapshot-pinned, never a live path. A miss is
     /// Observed::Err(MissingCapability { key: CapabilityKey::Tool(id) }).
     Tool    { id: String, observed: Observed<[u8; 32]> },
@@ -3662,12 +3658,12 @@ followed by the declared NFC string or raw TypeUuid fields. A ToolEpoch lookup
 miss records `TraceOp::Tool { id, observed:
 Err(MissingCapability { key: Tool(id) }) }` as the terminal operation and sets
 `FailureCause::Op`; revalidation against a later snapshot heals when `id`
-resolves to a verified capsule hash. A lookup hit records
-`Observed::Ok(capsule_hash)` before execution. If that exact capsule
-then yields `NotExecutable`, `MissingInterpreter`, `SpawnDenied`, or
-`CapsuleClosureUnavailable`, the whole
+resolves to a verified tool identity. A lookup hit records
+`Observed::Ok(tool_hash)` before execution. If that exact registration
+then yields `NotExecutable`, `SpawnDenied`, `PackageUnavailable`, or
+`AmbientUnavailable`, the whole
 attempted result and its trace are discarded and the caller receives
-`TransientToolLaunchFailure { id, capsule_hash, class }`; it is never memoized.
+`TransientToolLaunchFailure { id, tool_hash, class }`; it is never memoized.
 DSTR v1 tag 4 is permanently reserved under the historical name `ToolLaunch`
 and every decoder MUST reject it. It has no payload grammar and can never be an
 alias for a ToolEpoch miss, a successful `Tool` observation, or a transient
@@ -5157,7 +5153,7 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `schemas` | logical hash → schema JSON (cache, rebuilt from bundle snapshots) |
 | `artifacts` | static-input-key digest → candidate bucket: (trace digest → trace + output table), revalidated most-recent-first on lookup (§9 — the build-cache lookup; the full input hash is never stored, and commits append candidates, never overwrite); derived-output: child uuid → (parent uuid, output key) — input-versioned, derived per published version from its assets × pinned pipeline map (§9), the only authority for child resolution, commit rows verified against it; ContentHash → segment, offset, len (the CAS extent index) |
 | `pipeline_state` | importer/processor registrations and versions; the pipeline dylib content hash (a input-hash input wherever pipeline code runs); a never-reused daemon compiled-table generation plus complete rows/DSCA; and the full **load-policy table** — sorted `(type_uuid, build_only)` rows and `blake3("DSLP" ‖ version:u8 ‖ count:u32 ‖ rows)` (§9). Every compiled table publication advances that full-table generation even if a later table returns to byte equality; it exists for staging/build invalidation and the §17 reattest validate/install race CAS, not as a global Hub fence. Packs use the shared grammar over exact §3 `B(C)`; RPC Hubs use it over accepted `A`, §§16–17. Load-policy changes are input-versioned, re-run affected closure validation, emit component invalidations, and advance/fence only a Hub whose own accepted-set projection changed |
-| `tools` | **ToolEpoch** state (§9): tool key → (verified `ToolExecutionCapsuleV1` object, DSCT hash) — input-versioned; registering or replacing a tool stages the full launcher/interpreter/non-system DSO/plugin/resource closure no-replace and publishes it at an input version, so snapshots pin the complete launch closure and jobs execute only that capsule through `run_tool`. No row can be resolved to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
+| `tools` | **ToolEpoch** state (§9): tool key → (`ToolExecutionIdentityV2`, DSCT hash, optional staged package root) — input-versioned. Package registrations snapshot and stage their complete directory no-replace; ambient registrations retain an explicit absolute launcher and toolchain identity, and are nonmemoizable unless they carry a trusted fingerprint. No row resolves to a library handle: runtime `dlopen` in pipeline code and a staged-library API are banned (§3, §9) |
 | `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; non-bootstrap `EntryLineageV1::Manifest` stamps and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing/duplicate manifest leaves this table unavailable and hard-stops schema-dependent work; only §6's unbound exact-basis local repair surface remains mutable until one valid authority publishes |
 
 Each published input-version header stores either no global poison or the exact
@@ -8488,7 +8484,7 @@ ships; an unclassified key is a spec defect:
 | `assets.lineage_manifest` | input-versioned epoch | normalized rooted destination for Missing-manifest repair; staging requires a named configured root and valid §10 path, and changing it cannot move or select an existing manifest |
 | `[targets]` definitions | input-versioned epoch | joins the combined execution candidate (§3): the pipeline map re-validates against the new target set; bound Hubs receive `ReconnectRequired` (§17) |
 | `modules.pipeline_dylib` | input-versioned epoch | module epoch rotation (§3) through the staged-candidate mechanism |
-| tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a fully resolved, verified, content-addressed ToolExecutionCapsule plus DSCT hash publishes at an input version |
+| tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a complete staged package or explicit ambient toolchain identity plus DSCT hash publishes at an input version |
 | `pipeline.parallelism` | operational-live | must remain ≥1; the pool resizes, re-clamps `batch_reserved_workers`, and lets already-active excess slots drain; no identity, key, or version implication |
 | `pipeline.max_dependency_depth` | operational-live | the next request runs under the new budget — safe because depth exhaustion is never memoized (§9) |
 | `pipeline.batch_reserved_workers` | operational-live | staging requires `1 <= value <= max(1, parallelism - 1)`; live changes re-clamp at the next scheduling decision while active slots drain (§13) |
@@ -8787,11 +8783,12 @@ ordinary §10 dependency kinds.
   determinant of the full input hash; stored-trace revalidation (verifying
   traces) covers the rest — external tools included, as `tool(id) → hash`
   trace operations resolved through the snapshot's ToolEpoch state (§9,
-  §13: the staged binary hash the snapshot published); in-flight
+  §13: the DSCT execution identity the snapshot published); in-flight
   coalescing keys on the static-input key, with
   per-waiter revalidation across snapshots. (Refined in R31: the observed
-  hash is the aggregate DSCT `ToolExecutionCapsule` identity, not the launcher
-  byte hash.)
+  hash is the aggregate DSCT tool identity, not the launcher byte hash. An
+  unfingerprinted ambient call never commits a candidate and therefore cannot
+  be a cache hit.)
 - **Build results are output tables** (§9, §13): the cache unit is
   `output_key → ContentHash` plus the trace, committed atomically with a
   derived-output index (`child uuid → parent, key` — stage-free,
@@ -8924,19 +8921,20 @@ ordinary §10 dependency kinds.
   failed `unload` leaks the module
   rather than dlclosing corrupt state. The host itself is one shared
   crate factored out of newgameplus's `module_state.rs`, consumed by
-  engine and daemon alike — shared, never duplicated. Dylibs and tool binaries are
-  **staged, content-addressed** — copy into daemon state, hash the copy,
-  load/execute exactly the copy the hash names; tool staging runs at
-  registration and publishes as input-versioned ToolEpoch state (§9,
-  §13), so snapshots pin their tool bytes; staged versions coexist — no
-  hash-then-swap race, no frozen-copy livelock. (Refined in R23: the C-ABI
+  engine and daemon alike — shared, never duplicated. Dylibs are **staged,
+  content-addressed** — copy into daemon state, hash the copy, and load exactly
+  the copy the hash names. Package tools similarly stage their complete package
+  directory; ambient tools are explicitly outside byte staging and are
+  nonmemoizable unless a trusted fingerprint is declared. Tool registration
+  publishes input-versioned ToolEpoch state (§9, §13), so snapshots pin the
+  selected registration. (Refined in R23: the C-ABI
   bootstrap also exports the complete sorted per-type compiled attestation
   and `DSCA` aggregate — TypeUuid, DSLH, DSNL, build_only, and every remaining
   excluded semantic/policy bit — checked before registration and on reload;
   every reverse host callback is independently contained by a host-side
-  status thunk.) (Refined in R31: dylibs retain byte identity, but tools now
-  stage and hash the complete hermetic `ToolExecutionCapsuleV1` under DSCT;
-  launcher-only copy/hash identity is superseded.)
+  status thunk.) (Refined in R31, then simplified in R32: dylibs retain byte
+  identity; DSCT now identifies either a complete package-directory snapshot or
+  an explicit ambient toolchain registration.)
 - **Version domains** (§13): input versions (fs/code/authoring) and the
   memo sequence (build commits) are separate; builds never advance an
   input version. The store partitions by the same authority:
@@ -9669,29 +9667,26 @@ ordinary §10 dependency kinds.
   lookups record `TraceOp::Capability` hit and miss, and failure
   records terminate in a `FailureCause` — the failing op or a `Local`
   fingerprint for deterministic local failures — §9, §13.)
-- **Tools are ToolEpoch snapshot inputs** (§3, §9, §13, §15):
-  registering or replacing a tool stages a content-addressed copy
-  under daemon state and publishes (tool key → staged path + hash) at
-  an input version; jobs execute the staged copy resolved through
-  their snapshot, never the live registered path — one snapshot can
-  never select different tool bytes before and after a swap — and
-  `DriftedInput::Tool` covers an old basis whose staged bytes were
-  evicted. (Refined in R31: the published object is the complete verified
-  `ToolExecutionCapsuleV1` plus DSCT hash; launcher-only staging is no longer a
-  cacheable tool identity.)
+- **Tools are ToolEpoch snapshot inputs** (§3, §9, §13, §15): registering or
+  replacing a tool publishes a complete package snapshot or an explicit ambient
+  toolchain identity plus DSCT hash at an input version. Jobs resolve that
+  registration through their snapshot. `DriftedInput::Tool` covers an evicted
+  package; ambient availability is a transient launch property. An ambient
+  registration without a trusted fingerprint may execute but never memoizes.
 - **Pipeline-only native deps link statically** (§3, §20): the dylib
   hash is the module's code identity and covers only that one file, so
   pipeline-only libraries must be statically linked into the cdylib; a
-  dependency the module must dlopen is required to be a registered §9
-  tool (staged + hashed) loaded from its staged path. The system
+  dependency must instead execute out of process as a registered §9 tool. The
+  daemon does not parse the pipeline image or reproduce platform-loader
+  resolution; static linkage is enforced by the pipeline build. The system
   runtime is acknowledged as part of CompilationIdentity's (target,
   rustc) and outside the dylib hash — the residual: system-runtime
   drift is not tracked. (Refined in R22: the staged-library alternative
   is withdrawn. Pipeline runtime `dlopen` is banned and no library-open
   API exists; dynamic tools run only as `run_tool` subprocesses, §§3,
-  9, 13.) (Refined in R31: each subprocess capsule commits its resolved
-  interpreter, non-system DSO/plugin/resource closure and explicit
-  platform/system-runtime binding or residual.)
+  9, 13. Refined in R32: tool packages are closed by hashing their complete
+  directory, not by parsing executables; ambient tools require an explicit
+  toolchain identity and trusted fingerprint to memoize.)
 - **`build_only` has a load-policy digest** (§5, §9, §13, §15, §16):
   blake3 over the sorted (type_uuid, build_only) pairs of the current
   registry, input-versioned; closure validation (loader sweep, pack
@@ -9923,10 +9918,10 @@ ordinary §10 dependency kinds.
   on the first epoch that supplies the registration. (Refined in R29: tool is
   fixed `CapabilityKey` tag 5; a ToolEpoch miss terminates `TraceOp::Tool`,
   while post-hit launch failure is distinct. Refined in R30: it is a transient
-  `{id, staged_hash, class}` that discards the attempt and never memoizes;
+  `{id, tool_hash, class}` that discards the attempt and never memoizes;
   historical DSTR tag 4 `ToolLaunch` is permanently reserved/rejected, and
-  the successful/missing Tool observation is tag 10. Refined in R31: the field
-  is `capsule_hash`, the aggregate DSCT identity; transience is unchanged.)
+  the successful/missing Tool observation is tag 10. The field is `tool_hash`,
+  the aggregate DSCT identity; transience is unchanged.)
 - **Deletion is exchange-and-verify too** (§2, §14, §17): whole-bundle
   deletion was a bare unlink behind a base-version check — exactly the
   TOCTOU the replacement protocol closes for rewrites. Every deletion
@@ -10708,12 +10703,12 @@ ordinary §10 dependency kinds.
   `CapabilityKey::Tool(String)` is fixed tag 5 after tags 1..4. An absent tool
   terminates `TraceOp::Tool` with
   `Observed::Err(MissingCapability { Tool(id) })` and heals when revalidation
-  resolves a staged hash. (Refined in R30: a hit records
-  `Observed::Ok(staged_hash)`; post-hit launch failures are transient,
+  resolves a tool identity. (Refined in R30: a hit records
+  `Observed::Ok(tool_hash)`; post-hit launch failures are transient,
   trace-discarding, and never memoized, while DSTR v1 tag 4 `ToolLaunch` is
   permanently reserved and decode-rejected and `Tool` uses tag 10.) (Refined
-  in R31: both historical hash references now mean the aggregate DSCT capsule
-  hash, and the transient carrier field is `capsule_hash`.)
+  in R31/R32: both historical hash references now mean the aggregate DSCT tool
+  hash, and the transient carrier field is `tool_hash`.)
 - **Configuration poison carries its complete DSCP reason** (§§5, 13, 17–18):
   Rust state, persistence, and Cap'n Proto now carry the exact same-code typed
   `DscpV1` detail in addition to code/hash/message. Decode validates version,
@@ -10731,12 +10726,12 @@ ordinary §10 dependency kinds.
 <!-- R30_LEDGER_BEGIN count=11 -->
 - **Tool lookup and execution failures are distinct** (§§9, 13): an absent
   ToolEpoch key is the memoizable `MissingCapability { Tool(id) }`; a hit
-  records `Observed::Ok(staged_hash)`, while NotExecutable,
-  MissingInterpreter, and SpawnDenied return transient
-  `{id, staged_hash, class}` and discard the attempted trace/result. DSTR v1
+  records `Observed::Ok(tool_hash)`, while NotExecutable, SpawnDenied,
+  PackageUnavailable, and AmbientUnavailable return transient
+  `{id, tool_hash, class}` and discard the attempted trace/result. DSTR v1
   tag 4 `ToolLaunch` is permanently reserved and decode-rejected; `Tool` is
-  fixed tag 10. (Refined in R31: a hit records the aggregate DSCT
-  `capsule_hash` and the transient carrier uses that field; the R30
+  fixed tag 10. A hit records the aggregate DSCT `tool_hash`, and the transient
+  carrier uses that field; the R30
   trace-discarding/nonmemoized outcome rule is unchanged.)
 - **Missing-lineage repair has destination-aware exact preimages** (§§6,
   13–14, 17): inspection distinguishes `Absent`, occupied canonical bundle,
@@ -10813,15 +10808,34 @@ ordinary §10 dependency kinds.
   identity and exact required TypeUuid set, RpcIO reattests `A union required`,
   and retries. `CompiledAttestationChanged` now means only drift inside `A`;
   pack boundaries remain exact `B(C)`.
-- **Tool traces commit a hermetic execution capsule** (§§3, 5, 9, 13): DSCT
-  covers launcher/script bytes, resolved interpreter, executable non-system
-  DSO/plugin/resource closure, launch metadata, sanitized environment, cwd
-  policy, and pinned platform/system-runtime identity or explicit residual.
-  Registration stages and verifies that full closure no-replace and refuses an
-  incomplete cacheable row; `TraceOp::Tool::Ok` and revalidation use the DSCT
-  capsule hash, while R30 post-lookup launch outcomes and execution-time
-  `CapsuleClosureUnavailable` remain transient and nonmemoized.
+- **R31 tool capsules are superseded by R32 packaging** (§§3, 5, 9, 13): R31
+  introduced recursive interpreter/DSO/plugin/resource closure discovery. R32
+  removes that executable-loader model: DSCT v2 covers a complete package
+  directory or an explicit ambient toolchain identity. `TraceOp::Tool::Ok` and
+  revalidation use the DSCT tool hash; post-lookup launch failures remain
+  transient and nonmemoized.
 <!-- R31_LEDGER_END -->
+
+<!-- R32_LEDGER_BEGIN count=4 -->
+- **Tool packaging replaces executable-loader emulation** (§§3, 5, 9, 13):
+  DSCT v2 identifies either a recursively snapshotted package directory or an
+  explicit ambient toolchain registration. Distill does not parse ELF, Mach-O,
+  PE, shebang, interpreter, DSO, rpath, or platform-loader metadata. Package
+  production is responsible for supplying every byte the tool needs.
+- **Ambient tools are honest about cache authority** (§§9, 13): an ambient
+  registration carries an absolute launcher and `toolchain_id`. A caller-supplied
+  trusted fingerprint permits memoization; without one the tool may run, but the
+  complete calling processor attempt is never committed as a success or failure
+  candidate.
+- **Package identity is directory identity** (§§5, 9, 13): package DSCT commits
+  every canonical regular-file path, executable bit, length, and byte hash plus
+  the launcher, sanitized environment, and cwd policy. Symlinks and special files
+  are rejected; launch reopens and verifies the staged package.
+- **Pipeline static linkage is a build contract** (§§3, 9, 20): pipeline-only
+  native dependencies remain statically linked and runtime `dlopen` remains
+  banned, but the daemon does not parse candidate binaries or implement an OS
+  loader policy. The pipeline build/CI owns that linkage check.
+<!-- R32_LEDGER_END -->
 
 ### Open — remaining
 

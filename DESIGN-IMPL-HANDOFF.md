@@ -250,7 +250,11 @@ durability (the reason for the file fsync).
 
 **M9 — runtime dlopen banned (§§3/9/13).** BAN runtime `dlopen` in pipeline
 code outright: anything dynamic is a §9 tool subprocess via `run_tool`. Extend
-§3's static-linkage rule (R20/H6). No staged-library API exists by design.
+§3's static-linkage rule (R20/H6). No staged-library API exists by design. The
+daemon does not parse candidate binaries to enforce this; the pipeline build/CI
+owns the static-linkage check. Tool registration uses DSCT v2: either a complete
+hashed package directory, or an explicit ambient launcher/toolchain identity.
+Unfingerprinted ambient calls run without committing a memo candidate.
 Reconcile the R20/H6 ledger bullet.
 
 **M10 — extras terminal (§§9/12).** An extra output is encoded directly:
@@ -401,7 +405,8 @@ Design subsections to implement:
 
 - **§8 Import pipeline** (DESIGN.md 1314–1679):
   - _Authoring import (impure)_ — importers read source bytes, emit bundle
-    contents. The `run_tool` subprocess model (dlopen banned, R22/M9). Directory
+    contents. The `run_tool` package/ambient subprocess model (dlopen banned,
+    R22/M9/R32). Directory
     import with STABLE rule IDs and the `DirectoryOrigin` record (R21/M12 +
     R22/H7).
   - _Read-sets and watched imports_ — the OUTCOME-BEARING read-set (R22/H2): read
