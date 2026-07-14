@@ -36,6 +36,7 @@ use distill_store::state::{
 use distill_store::{Store, StoreConfig, StoreError};
 
 use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
+use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
     stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
     UnloadOutcome,
@@ -83,7 +84,10 @@ enum PipelinePublication {
 }
 
 enum ConfigurationPipelinePublication {
-    Epoch(ValidatedPipelineEpoch),
+    Epoch {
+        epoch: ValidatedPipelineEpoch,
+        tools: BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1>,
+    },
     Poison(PipelinePoison),
 }
 
@@ -305,8 +309,18 @@ impl DaemonCoordinator {
                         return Err(CoordinatorError::InvalidManifest(error.to_string()));
                     }
                 };
+                if let Err(error) = self.authoring.prepare_pipeline_importers(
+                    EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
+                ) {
+                    let _ = runtime.host.discard_unpublished(prepared);
+                    return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+                }
+                let tools = prepared.tool_epoch();
                 (
-                    ConfigurationPipelinePublication::Epoch(stored),
+                    ConfigurationPipelinePublication::Epoch {
+                        epoch: stored,
+                        tools,
+                    },
                     Some(prepared),
                 )
             }
@@ -347,15 +361,19 @@ impl DaemonCoordinator {
                     .take();
                 match (&pipeline, prepared_epoch.take(), stored_pipeline) {
                     (
-                        ConfigurationPipelinePublication::Epoch(_),
+                        ConfigurationPipelinePublication::Epoch { .. },
                         Some(prepared),
                         StoredPipelineState::Ready(epoch),
                     ) if epoch.dylib_hash == prepared.dylib_hash() => {
+                        let importers = EpochAuthoringImporter::all(&prepared);
                         discard_pending(&mut runtime);
                         runtime.host.install_ready(prepared);
+                        authoring
+                            .replace_pipeline_importers(importers)
+                            .expect("candidate importer metadata was prevalidated");
                     }
                     (
-                        ConfigurationPipelinePublication::Epoch(_),
+                        ConfigurationPipelinePublication::Epoch { .. },
                         Some(prepared),
                         StoredPipelineState::SchemaAcceptanceRequired { .. },
                     ) => {
@@ -369,15 +387,17 @@ impl DaemonCoordinator {
                         .expect("schema-acceptance fence is valid");
                         runtime.host.install_poison(fence);
                         runtime.pending = Some(prepared);
+                        authoring.install_pipeline_importers(BTreeMap::new());
                     }
                     (
-                        ConfigurationPipelinePublication::Epoch(_),
+                        ConfigurationPipelinePublication::Epoch { .. },
                         Some(prepared),
                         StoredPipelineState::Poisoned { error, .. },
                     ) => {
                         let _ = runtime.host.discard_unpublished(prepared);
                         discard_pending(&mut runtime);
                         runtime.host.install_poison(error);
+                        authoring.install_pipeline_importers(BTreeMap::new());
                     }
                     (
                         ConfigurationPipelinePublication::Poison(poison),
@@ -386,6 +406,7 @@ impl DaemonCoordinator {
                     ) => {
                         discard_pending(&mut runtime);
                         runtime.host.install_poison(poison.clone());
+                        authoring.install_pipeline_importers(BTreeMap::new());
                     }
                     _ => unreachable!(
                         "durable configuration pipeline state must match its prepared candidate"
@@ -425,9 +446,19 @@ impl DaemonCoordinator {
                 return Err(CoordinatorError::InvalidManifest(error.to_string()));
             }
         };
+        if let Err(error) =
+            self.authoring
+                .prepare_pipeline_importers(EpochAuthoringImporter::metadata_only(
+                    prepared.importer_descriptors(),
+                ))
+        {
+            let _ = runtime.host.discard_unpublished(prepared);
+            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+        }
         let publication = Arc::new(Mutex::new(None));
         let captured = Arc::clone(&publication);
         let store = Arc::clone(&self.store);
+        let tools = prepared.tool_epoch();
         let result = self.server.coordinated_commit(base, || {
             let mut store = lock_store(&store);
             if store.input_version() != base {
@@ -437,7 +468,12 @@ impl DaemonCoordinator {
                 ));
             }
             store
-                .input_transaction(|transaction| transaction.publish_pipeline_epoch(&stored))
+                .input_transaction(|transaction| {
+                    if transaction.publish_pipeline_epoch(&stored)? {
+                        transaction.publish_tool_epoch(&tools)?;
+                    }
+                    Ok(())
+                })
                 .map_err(|error| error.to_string())?;
             let state = store
                 .pipeline_state()
@@ -475,8 +511,12 @@ impl DaemonCoordinator {
             .expect("coordinated pipeline publication captured its durable state")
         {
             PipelinePublication::Ready(hash) if hash == prepared.dylib_hash() => {
+                let importers = EpochAuthoringImporter::all(&prepared);
                 discard_pending(&mut runtime);
                 runtime.host.install_ready(prepared);
+                self.authoring
+                    .replace_pipeline_importers(importers)
+                    .expect("candidate importer metadata was prevalidated");
             }
             PipelinePublication::SchemaAcceptanceRequired => {
                 discard_pending(&mut runtime);
@@ -489,11 +529,13 @@ impl DaemonCoordinator {
                 .expect("schema-acceptance fence is a valid candidate poison");
                 runtime.host.install_poison(fence);
                 runtime.pending = Some(prepared);
+                self.authoring.install_pipeline_importers(BTreeMap::new());
             }
             PipelinePublication::Poisoned(poison) => {
                 let _ = runtime.host.discard_unpublished(prepared);
                 discard_pending(&mut runtime);
                 runtime.host.install_poison(poison);
+                self.authoring.install_pipeline_importers(BTreeMap::new());
             }
             PipelinePublication::Ready(_) => {
                 let _ = runtime.host.discard_unpublished(prepared);
@@ -537,6 +579,7 @@ impl DaemonCoordinator {
                 let mut runtime = lock_pipeline(&self.pipeline);
                 discard_pending(&mut runtime);
                 runtime.host.install_poison(poison);
+                self.authoring.install_pipeline_importers(BTreeMap::new());
                 Ok(stamp)
             }
             Err(error) => Err(CoordinatorError::Coordinated(error)),
@@ -1149,8 +1192,10 @@ fn publish_scan(
             transaction.project_verified_lineage_manifest(manifest)?;
         }
         match pipeline {
-            Some(ConfigurationPipelinePublication::Epoch(epoch)) => {
-                transaction.publish_pipeline_epoch(epoch)?;
+            Some(ConfigurationPipelinePublication::Epoch { epoch, tools }) => {
+                if transaction.publish_pipeline_epoch(epoch)? {
+                    transaction.publish_tool_epoch(tools)?;
+                }
             }
             Some(ConfigurationPipelinePublication::Poison(poison)) => {
                 transaction.publish_pipeline_poison(poison)?;

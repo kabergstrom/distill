@@ -18,6 +18,7 @@ pub use distill_core::attestation::{
     BootstrapAuthorityMismatch, CompiledAttestationDigest,
     CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
 };
+use distill_core::id::TypeUuid;
 pub use distill_core::target_set::TargetSetHash;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 pub use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1 as HostBootstrapAuthorityV1;
@@ -33,6 +34,13 @@ pub use distill_store::state::{
 };
 use distill_store::{Store, StoreError};
 
+use crate::callbacks::{
+    erase_callback, CallbackHandle, CallbackInvokeError, DefaultsDescriptor, Diagnostics,
+    ImporterDescriptor, InfallibleCallbackError, MigrationFunctionError, PipelineDefaults,
+    PipelineImporter, PipelineMigration, PipelineProcessContext, PipelineProcessor,
+    PipelineValidator, ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor,
+    ValidatorDescriptor,
+};
 use crate::policy::{
     validate_candidate_linkage, CodeLoadRequest, CodeLoadingPolicy, NativeDependency,
 };
@@ -152,6 +160,7 @@ struct RegistrationCapsuleNode {
     next: Option<NonNull<RegistrationCapsuleNode>>,
     installation_seq: u64,
     registration: Option<Registration>,
+    callback: CallbackHandle,
 }
 
 // SAFETY: construction requires the caller to promise that the opaque object
@@ -189,11 +198,27 @@ impl ErasedRegistrationCapsule {
             next: None,
             installation_seq: 0,
             registration: None,
+            callback: CallbackHandle::None,
         });
         // SAFETY: Box never produces a null pointer. The no-Drop capsule is
         // linked into exactly one arena, which frees the node after successful
         // payload cleanup and retains it after failure.
         Self(unsafe { NonNull::new_unchecked(Box::into_raw(node)) })
+    }
+
+    fn from_callback<T: Send + Sync + 'static>(
+        callback: T,
+        owner: ModuleEpochToken,
+        handle: CallbackHandle,
+    ) -> Self {
+        let pointer = erase_callback(callback);
+        // SAFETY: `erase_callback` allocates a `ManuallyDrop<T>` whose address
+        // is stable. The matching generic cleanup thunk destroys T under
+        // containment and deallocates only after successful destruction.
+        let capsule =
+            unsafe { Self::from_raw(pointer, owner, crate::callbacks::cleanup_callback::<T>) };
+        unsafe { (*capsule.0.as_ptr()).callback = handle };
+        capsule
     }
 }
 
@@ -307,6 +332,111 @@ impl CandidateRegistrationArena {
         }
     }
 
+    pub fn register_importer<T: PipelineImporter>(
+        &mut self,
+        descriptor: ImporterDescriptor,
+        callback: T,
+    ) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Importer,
+            id: descriptor.id.clone(),
+            version: descriptor.version,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            callback,
+            self.owner.clone(),
+            CallbackHandle::importer::<T>(descriptor),
+        );
+        self.install(registration, capsule)
+    }
+
+    pub fn register_processor<T: PipelineProcessor>(
+        &mut self,
+        descriptor: ProcessorDescriptor,
+        callback: T,
+    ) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Processor,
+            id: descriptor.id.clone(),
+            version: descriptor.version,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            callback,
+            self.owner.clone(),
+            CallbackHandle::processor::<T>(descriptor),
+        );
+        self.install(registration, capsule)
+    }
+
+    pub fn register_validator<T: PipelineValidator>(
+        &mut self,
+        descriptor: ValidatorDescriptor,
+        callback: T,
+    ) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Validator,
+            id: descriptor.id.clone(),
+            version: 1,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            callback,
+            self.owner.clone(),
+            CallbackHandle::validator::<T>(descriptor),
+        );
+        self.install(registration, capsule)
+    }
+
+    pub fn register_migration<T: PipelineMigration>(
+        &mut self,
+        key: impl Into<String>,
+        callback: T,
+    ) -> RegistrationStatus {
+        let key = key.into();
+        let registration = Registration {
+            kind: RegistrationKind::Migration,
+            id: key.clone(),
+            version: 1,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            callback,
+            self.owner.clone(),
+            CallbackHandle::migration::<T>(key),
+        );
+        self.install(registration, capsule)
+    }
+
+    pub fn register_defaults<T: PipelineDefaults>(
+        &mut self,
+        descriptor: DefaultsDescriptor,
+        callback: T,
+    ) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Defaults,
+            id: descriptor.type_uuid.to_string(),
+            version: 1,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            callback,
+            self.owner.clone(),
+            CallbackHandle::defaults::<T>(descriptor),
+        );
+        self.install(registration, capsule)
+    }
+
+    pub fn register_tool(&mut self, descriptor: ToolDescriptor) -> RegistrationStatus {
+        let registration = Registration {
+            kind: RegistrationKind::Tool,
+            id: descriptor.id.clone(),
+            version: 1,
+        };
+        let capsule = ErasedRegistrationCapsule::from_callback(
+            descriptor.clone(),
+            self.owner.clone(),
+            CallbackHandle::Tool(descriptor),
+        );
+        self.install(registration, capsule)
+    }
+
     /// Transfer one module-owned object into the unpublished arena. Metadata
     /// validation is intentionally performed only after `register` returns so
     /// even a later duplicate is already owned and can be rolled back safely.
@@ -358,6 +488,10 @@ impl CandidateRegistrationArena {
             ))
         } else if duplicate {
             Err(ModuleCallError::new("duplicate non-validator registration"))
+        } else if let Err(error) =
+            Self::validate_callback_from(prior_head, installed, unsafe { &node.as_ref().callback })
+        {
+            Err(error)
         } else {
             match self.next_installation_seq.checked_add(1) {
                 Some(next) => {
@@ -378,6 +512,71 @@ impl CandidateRegistrationArena {
             disposition: RegistrationDisposition::Consumed,
             result,
         }
+    }
+
+    fn validate_callback_from(
+        mut prior: Option<NonNull<RegistrationCapsuleNode>>,
+        registration: &Registration,
+        callback: &CallbackHandle,
+    ) -> Result<(), ModuleCallError> {
+        let normalized = distill_build::query::normalize_identifier(&registration.id)
+            .map_err(|error| ModuleCallError::new(format!("invalid registration id: {error:?}")))?;
+        if normalized != registration.id {
+            return Err(ModuleCallError::new(
+                "registration id is not in canonical normalized form",
+            ));
+        }
+        let matches = match (registration.kind, callback) {
+            (_, CallbackHandle::None) => true,
+            (RegistrationKind::Importer, CallbackHandle::Importer { descriptor, .. }) => {
+                descriptor.id == registration.id && descriptor.version == registration.version
+            }
+            (RegistrationKind::Processor, CallbackHandle::Processor { descriptor, .. }) => {
+                descriptor.id == registration.id && descriptor.version == registration.version
+            }
+            (RegistrationKind::Validator, CallbackHandle::Validator { descriptor, .. }) => {
+                descriptor.id == registration.id
+            }
+            (RegistrationKind::Migration, CallbackHandle::Migration { key, .. }) => {
+                key == &registration.id
+            }
+            (RegistrationKind::Defaults, CallbackHandle::Defaults { descriptor, .. }) => {
+                descriptor.type_uuid.to_string() == registration.id
+            }
+            (RegistrationKind::Tool, CallbackHandle::Tool(descriptor)) => {
+                descriptor.id == registration.id
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(ModuleCallError::new(
+                "registration metadata does not match its executable callback",
+            ));
+        }
+
+        if let CallbackHandle::Processor { descriptor, .. } = callback {
+            while let Some(node) = prior {
+                // SAFETY: prior nodes are linked and live for the complete
+                // candidate lifetime.
+                let linked = unsafe { node.as_ref() };
+                if let CallbackHandle::Processor {
+                    descriptor: existing,
+                    ..
+                } = &linked.callback
+                {
+                    if existing.input == descriptor.input
+                        && existing.selector.overlaps(&descriptor.selector)
+                    {
+                        return Err(ModuleCallError::new(format!(
+                            "processors {:?} and {:?} overlap for input {}",
+                            existing.id, descriptor.id, descriptor.input
+                        )));
+                    }
+                }
+                prior = linked.next;
+            }
+        }
+        Ok(())
     }
 
     pub fn installed_len(&self) -> usize {
@@ -699,6 +898,265 @@ impl PipelineEpoch {
 
     pub fn registrations(&self) -> &RegistrationSet {
         &self.0.registration
+    }
+
+    pub fn importer_descriptors(&self) -> Vec<ImporterDescriptor> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Importer { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn processor_descriptors(&self) -> Vec<ProcessorDescriptor> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Processor { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn validator_descriptors(&self) -> Vec<ValidatorDescriptor> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Validator { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
+        self.callback_rows()
+            .into_iter()
+            .filter_map(|(_, callback)| match callback {
+                CallbackHandle::Tool(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn tool_epoch(
+        &self,
+    ) -> BTreeMap<String, distill_store::pipeline::ToolCapsuleRegistrationV1> {
+        self.tool_descriptors()
+            .into_iter()
+            .map(|descriptor| (descriptor.id, descriptor.registration))
+            .collect()
+    }
+
+    pub fn invoke_importer(
+        &self,
+        id: &str,
+        context: &mut dyn crate::importer::AuthoringImportContext,
+        settings: &distill_json::AuthoredValue,
+    ) -> Result<
+        distill_build::import::ImportOutput,
+        CallbackInvokeError<crate::importer::AuthoringImporterError>,
+    > {
+        let _job = self.callback_job()?;
+        let Some((pointer, CallbackHandle::Importer { call, .. })) = self
+            .callback_rows()
+            .into_iter()
+            .find(|(_, callback)| matches!(callback, CallbackHandle::Importer { descriptor, .. } if descriptor.id == id))
+        else {
+            return Err(CallbackInvokeError::Missing);
+        };
+        // SAFETY: the job pins the epoch and therefore the registration arena
+        // and staged image for the complete call. The handle and allocation
+        // were created by the same generic registration constructor.
+        match unsafe { call(pointer, context, settings) } {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(CallbackInvokeError::Rejected(error)),
+            Err(_) => {
+                self.callback_panicked("importer");
+                Err(CallbackInvokeError::Panicked)
+            }
+        }
+    }
+
+    pub fn invoke_processor(
+        &self,
+        id: &str,
+        input: distill_json::AuthoredValue,
+        context: &mut dyn PipelineProcessContext,
+    ) -> Result<ProcessorProducts, CallbackInvokeError<ProcessorError>> {
+        let _job = self.callback_job()?;
+        let Some((pointer, CallbackHandle::Processor { descriptor, call })) = self
+            .callback_rows()
+            .into_iter()
+            .find(|(_, callback)| matches!(callback, CallbackHandle::Processor { descriptor, .. } if descriptor.id == id))
+        else {
+            return Err(CallbackInvokeError::Missing);
+        };
+        match unsafe { call(pointer, input, context) } {
+            Ok(Ok(output)) => {
+                let missing_primary = output.primary.is_none();
+                let actual_extras = output.extras.keys().cloned().collect::<BTreeSet<_>>();
+                let expected_extras = descriptor
+                    .outputs
+                    .extras
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let invalid_debug =
+                    output.debug.keys().any(
+                        |key| match distill_build::query::normalize_identifier(key) {
+                            Ok(normalized) => normalized != *key,
+                            Err(_) => true,
+                        },
+                    );
+                if missing_primary || actual_extras != expected_extras || invalid_debug {
+                    Err(CallbackInvokeError::HostRejected(format!(
+                        "processor {:?} did not bind its closed primary/extras/debug declaration",
+                        descriptor.id
+                    )))
+                } else {
+                    Ok(output)
+                }
+            }
+            Ok(Err(error)) if error.code == 0 => Err(CallbackInvokeError::HostRejected(
+                "processor failure code zero is reserved".to_owned(),
+            )),
+            Ok(Err(error)) => Err(CallbackInvokeError::Rejected(error)),
+            Err(_) => {
+                self.callback_panicked("processor");
+                Err(CallbackInvokeError::Panicked)
+            }
+        }
+    }
+
+    pub fn invoke_validators(
+        &self,
+        asset_type: TypeUuid,
+        asset: &distill_json::AuthoredValue,
+    ) -> Result<Vec<crate::callbacks::Diagnostic>, InfallibleCallbackError> {
+        let _job = self.callback_job()?;
+        let callbacks = self
+            .callback_rows()
+            .into_iter()
+            .filter(|(_, callback)| matches!(callback, CallbackHandle::Validator { descriptor, .. } if descriptor.asset_type == asset_type))
+            .collect::<Vec<_>>();
+        let mut diagnostics = Diagnostics::default();
+        for (pointer, callback) in callbacks {
+            let CallbackHandle::Validator { call, .. } = callback else {
+                unreachable!("validator predicate returned another kind")
+            };
+            match unsafe { call(pointer, asset, &mut diagnostics) } {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    self.callback_panicked("validator");
+                    return Err(CallbackInvokeError::Panicked);
+                }
+            }
+        }
+        Ok(diagnostics.into_rows())
+    }
+
+    pub fn invoke_migration(
+        &self,
+        key: &str,
+        value: distill_json::AuthoredValue,
+    ) -> Result<distill_json::AuthoredValue, CallbackInvokeError<MigrationFunctionError>> {
+        let _job = self.callback_job()?;
+        let Some((pointer, CallbackHandle::Migration { call, .. })) = self
+            .callback_rows()
+            .into_iter()
+            .find(|(_, callback)| matches!(callback, CallbackHandle::Migration { key: registered, .. } if registered == key))
+        else {
+            return Err(CallbackInvokeError::Missing);
+        };
+        match unsafe { call(pointer, value) } {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) if error.code == 0 => Err(CallbackInvokeError::HostRejected(
+                "migration-function failure code zero is reserved".to_owned(),
+            )),
+            Ok(Err(error)) => Err(CallbackInvokeError::Rejected(error)),
+            Err(_) => {
+                self.callback_panicked("migration function");
+                Err(CallbackInvokeError::Panicked)
+            }
+        }
+    }
+
+    pub fn invoke_field_default(
+        &self,
+        type_uuid: TypeUuid,
+        schema: &distill_schema::ngp_schema::SchemaNode,
+        at: &distill_migrate::FieldPath,
+    ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
+        self.invoke_default(type_uuid, schema, at, false)
+    }
+
+    pub fn invoke_parent_default(
+        &self,
+        type_uuid: TypeUuid,
+        schema: &distill_schema::ngp_schema::SchemaNode,
+        at: &distill_migrate::FieldPath,
+    ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
+        self.invoke_default(type_uuid, schema, at, true)
+    }
+
+    fn invoke_default(
+        &self,
+        type_uuid: TypeUuid,
+        schema: &distill_schema::ngp_schema::SchemaNode,
+        at: &distill_migrate::FieldPath,
+        parent: bool,
+    ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
+        let _job = self.callback_job()?;
+        let Some((pointer, CallbackHandle::Defaults { field, parent: parent_call, .. })) = self
+            .callback_rows()
+            .into_iter()
+            .find(|(_, callback)| matches!(callback, CallbackHandle::Defaults { descriptor, .. } if descriptor.type_uuid == type_uuid))
+        else {
+            return Err(CallbackInvokeError::Missing);
+        };
+        let call = if parent { parent_call } else { field };
+        match unsafe { call(pointer, schema, at) } {
+            Ok(output) => Ok(output),
+            Err(_) => {
+                self.callback_panicked("default materializer");
+                Err(CallbackInvokeError::Panicked)
+            }
+        }
+    }
+
+    fn callback_rows(&self) -> Vec<(*const u8, CallbackHandle)> {
+        let arena = lock_unpoisoned(&self.0.registration_arena);
+        let Some(arena) = arena.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::with_capacity(arena.installed_len);
+        let mut cursor = arena.head;
+        while let Some(node) = cursor {
+            // SAFETY: the arena owns every linked node. `self` pins the epoch,
+            // so cleanup cannot begin while these copied handles are used.
+            let node = unsafe { node.as_ref() };
+            rows.push((node.pointer.cast_const(), node.callback.clone()));
+            cursor = node.next;
+        }
+        rows.reverse();
+        rows
+    }
+
+    fn callback_job<E>(&self) -> Result<EpochJobGuard, CallbackInvokeError<E>> {
+        self.try_start_job().map_err(|error| {
+            CallbackInvokeError::Unavailable(match error {
+                EpochWorkError::Poisoned(poison) => poison.message,
+                EpochWorkError::Retired { epoch_id } => {
+                    format!("pipeline epoch {epoch_id} is retired")
+                }
+            })
+        })
+    }
+
+    fn callback_panicked(&self, kind: &str) {
+        self.report_runtime_panic(format!("registered {kind} callback panicked"));
     }
 
     pub fn try_start_job(&self) -> Result<EpochJobGuard, EpochWorkError> {
@@ -1302,10 +1760,13 @@ impl DurableModuleHost {
                 });
             }
         };
-        if let Err(source) = self
-            .store
-            .input_transaction(|transaction| transaction.publish_pipeline_epoch(&stored))
-        {
+        let tools = prepared.tool_epoch();
+        if let Err(source) = self.store.input_transaction(|transaction| {
+            if transaction.publish_pipeline_epoch(&stored)? {
+                transaction.publish_tool_epoch(&tools)?;
+            }
+            Ok(())
+        }) {
             let cleanup_poison = self.host.discard_unpublished(prepared);
             return Err(DurablePublishError::Store {
                 source: Box::new(source),
@@ -1872,4 +2333,321 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+    use crate::callbacks::{
+        DiagnosticSeverity, MigrationFunctionError, PipelineDefaults, PipelineImporter,
+        PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorProducts,
+    };
+    use crate::importer::{AuthoringImportContext, AuthoringImporterError};
+    use distill_build::import::{ImportError, ImportOutput};
+    use distill_build::outputs::OutputDecls;
+    use distill_build::pipeline::TargetSelector;
+    use distill_build::query::{FileQuery, RootedPath};
+    use distill_build::tool::{ToolOutput, ToolRunError};
+    use distill_core::tool::{ToolCwdPolicy, ToolLaunchMetadataV1, ToolPlatformBinding};
+    use distill_migrate::FieldPath;
+    use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
+    use distill_store::pipeline::ToolCapsuleRegistrationV1;
+
+    struct NoopModule;
+
+    impl LoadedPipelineModule for NoopModule {
+        fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn register(
+            &mut self,
+            _targets: &[TargetDefinition],
+            _arena: &mut CandidateRegistrationArena,
+        ) -> Result<BTreeSet<String>, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn unload(&mut self) -> Result<(), ModuleCallError> {
+            Ok(())
+        }
+
+        fn dlclose(&mut self) {}
+    }
+
+    struct Importer;
+
+    impl PipelineImporter for Importer {
+        fn import(
+            &self,
+            _context: &mut dyn AuthoringImportContext,
+            settings: &distill_json::AuthoredValue,
+        ) -> Result<ImportOutput, AuthoringImporterError> {
+            let mut output = ImportOutput::new();
+            output
+                .entry("main", TypeUuid([2; 16]), settings.clone())
+                .unwrap();
+            Ok(output)
+        }
+    }
+
+    struct ImportContext;
+
+    impl AuthoringImportContext for ImportContext {
+        fn sources(&self) -> &[RootedPath] {
+            &[]
+        }
+
+        fn read(&mut self, _path: &str) -> Result<Vec<u8>, ImportError> {
+            unreachable!()
+        }
+
+        fn probe(&mut self, _path: &str) -> Result<bool, ImportError> {
+            unreachable!()
+        }
+
+        fn enumerate(&mut self, _query: &FileQuery) -> Result<Vec<RootedPath>, ImportError> {
+            unreachable!()
+        }
+
+        fn importer_capability(&mut self, _id: &str) -> Result<[u8; 32], ImportError> {
+            unreachable!()
+        }
+    }
+
+    struct Process;
+
+    impl PipelineProcessor for Process {
+        fn process(
+            &self,
+            input: distill_json::AuthoredValue,
+            _context: &mut dyn PipelineProcessContext,
+        ) -> Result<ProcessorProducts, crate::callbacks::ProcessorError> {
+            Ok(ProcessorProducts {
+                primary: Some(input),
+                ..ProcessorProducts::default()
+            })
+        }
+    }
+
+    struct ProcessContext;
+
+    impl PipelineProcessContext for ProcessContext {
+        fn run_tool(
+            &mut self,
+            _id: &str,
+            _args: &[String],
+            _stdin: &[u8],
+        ) -> Result<ToolOutput, ToolRunError> {
+            unreachable!()
+        }
+    }
+
+    struct Validator;
+
+    impl PipelineValidator for Validator {
+        fn validate(
+            &self,
+            _asset: &distill_json::AuthoredValue,
+            diagnostics: &mut Diagnostics,
+        ) -> Result<(), distill_asset::CallbackPanic> {
+            diagnostics.warn(FieldPath::of(&["value"]), "checked");
+            Ok(())
+        }
+    }
+
+    struct Defaults;
+
+    impl PipelineDefaults for Defaults {
+        fn field_default(
+            &self,
+            _to_schema: &SchemaNode,
+            _at: &FieldPath,
+        ) -> Option<distill_json::AuthoredValue> {
+            Some(distill_json::AuthoredValue::UInt(7))
+        }
+
+        fn parent_default(
+            &self,
+            _to_schema: &SchemaNode,
+            _at: &FieldPath,
+        ) -> Option<distill_json::AuthoredValue> {
+            Some(distill_json::AuthoredValue::UInt(8))
+        }
+    }
+
+    #[test]
+    fn every_registration_kind_retains_an_executable_epoch_owned_surface() {
+        let token = ModuleEpochToken::new(91);
+        let mut arena = CandidateRegistrationArena::new(token.clone());
+        let schema = LogicalSchema {
+            root: SchemaNode::Unit,
+        };
+        arena
+            .register_importer(
+                ImporterDescriptor {
+                    id: "source".into(),
+                    version: 3,
+                    settings_type_uuid: TypeUuid([1; 16]),
+                    settings_schema: schema.clone(),
+                    default_settings: distill_json::AuthoredValue::UInt(1),
+                },
+                Importer,
+            )
+            .into_result()
+            .unwrap();
+        arena
+            .register_processor(
+                ProcessorDescriptor {
+                    id: "cook".into(),
+                    version: 4,
+                    input: TypeUuid([2; 16]),
+                    selector: TargetSelector::new(None, None).unwrap(),
+                    outputs: OutputDecls::new(TypeUuid([3; 16]), vec![]).unwrap(),
+                },
+                Process,
+            )
+            .into_result()
+            .unwrap();
+        arena
+            .register_validator(
+                ValidatorDescriptor {
+                    id: "lint".into(),
+                    asset_type: TypeUuid([2; 16]),
+                },
+                Validator,
+            )
+            .into_result()
+            .unwrap();
+        arena
+            .register_migration("upgrade", |value| -> Result<_, MigrationFunctionError> {
+                Ok(value)
+            })
+            .into_result()
+            .unwrap();
+        arena
+            .register_defaults(
+                DefaultsDescriptor {
+                    type_uuid: TypeUuid([2; 16]),
+                },
+                Defaults,
+            )
+            .into_result()
+            .unwrap();
+        arena
+            .register_tool(ToolDescriptor {
+                id: "compiler".into(),
+                registration: ToolCapsuleRegistrationV1 {
+                    files: vec![],
+                    resolved_interpreter: None,
+                    launch: ToolLaunchMetadataV1 {
+                        argv0: "bin/compiler".into(),
+                        interpreter_args: vec![],
+                    },
+                    environment: vec![],
+                    cwd_policy: ToolCwdPolicy::EmptyScratch,
+                    platform: ToolPlatformBinding::Pinned {
+                        platform_id: "test".into(),
+                        system_runtime_id: "test".into(),
+                    },
+                },
+            })
+            .into_result()
+            .unwrap();
+
+        let registration = arena.registration_set(BTreeSet::from(["desktop".into()]));
+        let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
+            name: "desktop".into(),
+            target_definition_hash: [1; 32],
+        }])
+        .unwrap();
+        let epoch = PipelineEpoch::new(
+            91,
+            StagedModule {
+                path: PathBuf::from("pipeline-test"),
+                content_hash: [9; 32],
+            },
+            token,
+            target_set,
+            registration,
+            arena,
+            Box::new(NoopModule),
+        );
+
+        let imported = epoch
+            .invoke_importer(
+                "source",
+                &mut ImportContext,
+                &distill_json::AuthoredValue::UInt(11),
+            )
+            .unwrap();
+        assert_eq!(
+            imported.entries()["main"].value,
+            distill_json::AuthoredValue::UInt(11)
+        );
+        let processed = epoch
+            .invoke_processor(
+                "cook",
+                distill_json::AuthoredValue::UInt(12),
+                &mut ProcessContext,
+            )
+            .unwrap();
+        assert_eq!(
+            processed.primary,
+            Some(distill_json::AuthoredValue::UInt(12))
+        );
+        let diagnostics = epoch
+            .invoke_validators(TypeUuid([2; 16]), &distill_json::AuthoredValue::Null)
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            epoch
+                .invoke_migration("upgrade", distill_json::AuthoredValue::UInt(13))
+                .unwrap(),
+            distill_json::AuthoredValue::UInt(13)
+        );
+        assert_eq!(
+            epoch
+                .invoke_field_default(TypeUuid([2; 16]), &schema.root, &FieldPath::root())
+                .unwrap(),
+            Some(distill_json::AuthoredValue::UInt(7))
+        );
+        assert_eq!(epoch.tool_descriptors()[0].id, "compiler");
+
+        epoch.begin_drain();
+        assert!(unload_epoch(&epoch).is_ok());
+    }
+
+    #[test]
+    fn overlapping_processor_selectors_reject_the_complete_candidate() {
+        let token = ModuleEpochToken::new(92);
+        let mut arena = CandidateRegistrationArena::new(token);
+        let descriptor = |id: &str| ProcessorDescriptor {
+            id: id.into(),
+            version: 1,
+            input: TypeUuid([5; 16]),
+            selector: TargetSelector::new(None, None).unwrap(),
+            outputs: OutputDecls::new(TypeUuid([6; 16]), vec![]).unwrap(),
+        };
+        arena
+            .register_processor(descriptor("first"), Process)
+            .into_result()
+            .unwrap();
+        let error = arena
+            .register_processor(descriptor("second"), Process)
+            .into_result()
+            .unwrap_err();
+        assert!(error.detail().contains("overlap"));
+        assert!(arena.rejected().is_some());
+        arena.cleanup_reverse().unwrap();
+    }
 }

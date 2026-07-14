@@ -1186,6 +1186,40 @@ fn replacing_a_tool_republishes_and_staged_copies_coexist() {
 }
 
 #[test]
+fn complete_tool_epoch_tombstones_removed_keys_without_hiding_old_snapshots() {
+    let (_d, mut store) = store();
+    let first = BTreeMap::from([
+        (
+            "compiler".to_owned(),
+            tool_capsule(b"compiler", b"compiler config"),
+        ),
+        (
+            "linker".to_owned(),
+            tool_capsule(b"linker", b"linker config"),
+        ),
+    ]);
+    let (_, version_one) = store
+        .input_transaction(|txn| txn.publish_tool_epoch(&first))
+        .unwrap();
+
+    let second = BTreeMap::from([(
+        "compiler".to_owned(),
+        tool_capsule(b"compiler v2", b"compiler config v2"),
+    )]);
+    let (_, version_two) = store
+        .input_transaction(|txn| txn.publish_tool_epoch(&second))
+        .unwrap();
+
+    assert!(store.tool_at("linker", version_one).unwrap().is_some());
+    assert!(store.tool_at("linker", version_two).unwrap().is_none());
+    assert!(store.tool("linker").unwrap().is_none());
+    assert_eq!(
+        store.tool("compiler").unwrap().unwrap().input_version,
+        version_two
+    );
+}
+
+#[test]
 fn a_failed_transaction_publishes_no_tool_mapping() {
     let (_d, mut store) = store();
     let err = store

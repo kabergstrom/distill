@@ -193,6 +193,7 @@ fn tools_table_is_the_tool_epoch() {
         columns(&conn, "tools"),
         [
             "tool_key",
+            "present",
             "capsule_object",
             "capsule_hash",
             "input_version"

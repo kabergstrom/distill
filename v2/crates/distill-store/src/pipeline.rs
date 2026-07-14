@@ -610,15 +610,17 @@ impl InputTxn<'_> {
     pub fn publish_pipeline_epoch(
         &mut self,
         epoch: &ValidatedPipelineEpoch,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         validate_target_set(&epoch.target_set)?;
         validate_bootstrap_schema_registry(&epoch.schema_registry)?;
         let basis = manifest_basis(&self.txn)?.ok_or(StoreError::LineageManifestUnavailable)?;
         let mismatches = schema_registry_mismatches(&epoch.schema_registry, &basis.current_cursors);
         if !mismatches.is_empty() {
-            return self.publish_schema_acceptance_required(epoch, &basis, &mismatches);
+            self.publish_schema_acceptance_required(epoch, &basis, &mismatches)?;
+            return Ok(false);
         }
-        self.publish_ready_pipeline_epoch(epoch)
+        self.publish_ready_pipeline_epoch(epoch)?;
+        Ok(true)
     }
 
     fn publish_ready_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
@@ -827,9 +829,10 @@ impl InputTxn<'_> {
         }
         verify_capsule_root(key, &root, &capsule)?;
         self.txn.execute(
-            "INSERT INTO tools(tool_key, capsule_object, capsule_hash, input_version)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO tools(tool_key, present, capsule_object, capsule_hash, input_version)
+             VALUES (?1, 1, ?2, ?3, ?4)
              ON CONFLICT(tool_key, input_version) DO UPDATE SET
+               present = 1,
                capsule_object = excluded.capsule_object,
                capsule_hash = excluded.capsule_hash",
             rusqlite::params![
@@ -846,6 +849,53 @@ impl InputTxn<'_> {
             capsule_hash,
             input_version: self.version(),
         })
+    }
+
+    /// Publish one complete ToolEpoch projection. Keys absent from `tools`
+    /// receive input-versioned tombstones so a removed registration cannot
+    /// fall through to an older live capsule at a newer snapshot.
+    pub fn publish_tool_epoch(
+        &mut self,
+        tools: &BTreeMap<String, ToolCapsuleRegistrationV1>,
+    ) -> Result<Vec<StagedTool>, StoreError> {
+        let mut previous = BTreeSet::new();
+        {
+            let mut statement = self.txn.prepare(
+                "SELECT candidate.tool_key
+                   FROM tools AS candidate
+                  WHERE candidate.input_version = (
+                        SELECT MAX(prior.input_version)
+                          FROM tools AS prior
+                         WHERE prior.tool_key = candidate.tool_key
+                           AND prior.input_version <= ?1)
+                    AND candidate.present = 1",
+            )?;
+            let rows = statement.query_map(
+                [i64::try_from(self.base_stamp().version.0).unwrap_or(i64::MAX)],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                previous.insert(row?);
+            }
+        }
+
+        let mut staged = Vec::with_capacity(tools.len());
+        for (key, registration) in tools {
+            staged.push(self.stage_tool(key, registration.clone())?);
+        }
+        let current = tools.keys().cloned().collect::<BTreeSet<_>>();
+        for removed in previous.difference(&current) {
+            self.txn.execute(
+                "INSERT INTO tools(tool_key, present, capsule_object, capsule_hash, input_version)
+                 VALUES (?1, 0, X'', ?2, ?3)
+                 ON CONFLICT(tool_key, input_version) DO UPDATE SET
+                   present = 0,
+                   capsule_object = X'',
+                   capsule_hash = excluded.capsule_hash",
+                rusqlite::params![removed, [0_u8; 32].as_slice(), self.version().0 as i64,],
+            )?;
+        }
+        Ok(staged)
     }
 
     /// Initialize the disposable lineage projection from the already parsed,
@@ -2263,7 +2313,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT capsule_object, capsule_hash, input_version
+                "SELECT present, capsule_object, capsule_hash, input_version
                    FROM tools
                   WHERE tool_key = ?1 AND input_version <= ?2
                   ORDER BY input_version DESC
@@ -2271,16 +2321,20 @@ impl Store {
                 rusqlite::params![key, i64::try_from(basis.0).unwrap_or(i64::MAX)],
                 |r| {
                     Ok((
-                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, bool>(0)?,
                         r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, i64>(2)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((record, hash, input_version)) = row else {
+        let Some((present, record, hash, input_version)) = row else {
             return Ok(None);
         };
+        if !present {
+            return Ok(None);
+        }
         let capsule = ToolExecutionCapsuleV1::decode_record(&record)
             .map_err(StoreError::InvalidToolCapsule)?;
         let capsule_hash: [u8; 32] = hash.try_into().map_err(|_| {

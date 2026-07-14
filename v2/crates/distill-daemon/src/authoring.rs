@@ -41,7 +41,8 @@ pub struct AuthoringService {
     quarantine: RwLock<QuarantineDriver>,
     lineage_destination: RwLock<LineageDestination>,
     lineage: RwLock<LineageRepairBackend>,
-    pub(crate) importers: RwLock<RegisteredImporters>,
+    pub(crate) builtin_importers: RwLock<RegisteredImporters>,
+    pub(crate) pipeline_importers: RwLock<RegisteredImporters>,
 }
 
 pub(crate) struct AuthoringFilesystemCandidate {
@@ -82,7 +83,8 @@ impl AuthoringService {
             quarantine: RwLock::new(quarantine),
             lineage_destination: RwLock::new(lineage_destination),
             lineage: RwLock::new(lineage),
-            importers: RwLock::new(BTreeMap::new()),
+            builtin_importers: RwLock::new(BTreeMap::new()),
+            pipeline_importers: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -154,10 +156,14 @@ impl AuthoringService {
     ) -> Result<(), RpcFailure> {
         let registered = RegisteredImporter::validate(importer)?;
         let mut importers = self
-            .importers
+            .builtin_importers
             .write()
             .map_err(|_| invalid("importer registry lock is poisoned"))?;
-        if importers.contains_key(&registered.id) {
+        let pipeline = self
+            .pipeline_importers
+            .read()
+            .map_err(|_| invalid("pipeline importer registry lock is poisoned"))?;
+        if importers.contains_key(&registered.id) || pipeline.contains_key(&registered.id) {
             return Err(invalid(format!(
                 "importer {:?} is already registered",
                 registered.id
@@ -165,6 +171,46 @@ impl AuthoringService {
         }
         importers.insert(registered.id.clone(), registered);
         Ok(())
+    }
+
+    pub(crate) fn replace_pipeline_importers(
+        &self,
+        importers: Vec<Arc<dyn crate::importer::AuthoringImporter>>,
+    ) -> Result<(), RpcFailure> {
+        let next = self.prepare_pipeline_importers(importers)?;
+        self.install_pipeline_importers(next);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_pipeline_importers(
+        &self,
+        importers: Vec<Arc<dyn crate::importer::AuthoringImporter>>,
+    ) -> Result<RegisteredImporters, RpcFailure> {
+        let mut next = BTreeMap::new();
+        for importer in importers {
+            let registered = RegisteredImporter::validate(importer)?;
+            if next.insert(registered.id.clone(), registered).is_some() {
+                return Err(invalid("pipeline epoch contains a duplicate importer id"));
+            }
+        }
+        let builtins = self
+            .builtin_importers
+            .read()
+            .map_err(|_| invalid("built-in importer registry lock is poisoned"))?;
+        if let Some(id) = next.keys().find(|id| builtins.contains_key(*id)) {
+            return Err(invalid(format!(
+                "pipeline importer {id:?} conflicts with a built-in importer"
+            )));
+        }
+        drop(builtins);
+        Ok(next)
+    }
+
+    pub(crate) fn install_pipeline_importers(&self, next: RegisteredImporters) {
+        *self
+            .pipeline_importers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     }
 
     fn prepare_direct_write(

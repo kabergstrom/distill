@@ -61,7 +61,13 @@ pub trait AuthoringImporter: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthoringImporterError {
     Dependency(ImportError),
-    Rejected { code: u32, message: String },
+    Rejected {
+        code: u32,
+        message: String,
+    },
+    /// Epoch fencing, callback panic, or host infrastructure. This outcome is
+    /// never stable importer data and therefore must not be memoized.
+    PipelineUnavailable(String),
 }
 
 impl AuthoringImporterError {
@@ -76,6 +82,7 @@ impl AuthoringImporterError {
         match self {
             Self::Dependency(error) => format!("{error:?}"),
             Self::Rejected { message, .. } => message.clone(),
+            Self::PipelineUnavailable(message) => message.clone(),
         }
     }
 }
@@ -680,6 +687,11 @@ impl AuthoringService {
                             "importer failure code zero is reserved",
                         )));
                     }
+                    AuthoringImporterError::PipelineUnavailable(message) => {
+                        return Err(ImportExecutionError::unmemoized(invalid(format!(
+                            "pipeline importer became unavailable: {message}"
+                        ))));
+                    }
                 };
                 let message = error.message();
                 let memoized = self
@@ -863,22 +875,47 @@ impl AuthoringService {
 
     fn registered_importer(&self, id: &str) -> Result<RegisteredImporter, RpcFailure> {
         let id = normalize_identifier(id).map_err(invalid)?;
-        self.importers
+        if let Some(importer) = self
+            .pipeline_importers
             .read()
-            .map_err(|_| invalid("importer registry lock is poisoned"))?
+            .map_err(|_| invalid("pipeline importer registry lock is poisoned"))?
+            .get(&id)
+            .cloned()
+        {
+            return Ok(importer);
+        }
+        self.builtin_importers
+            .read()
+            .map_err(|_| invalid("built-in importer registry lock is poisoned"))?
             .get(&id)
             .cloned()
             .ok_or_else(|| invalid(format!("importer {id:?} is not registered")))
     }
 
     fn importer_capabilities(&self) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
-        Ok(self
-            .importers
+        let mut capabilities = self
+            .builtin_importers
             .read()
-            .map_err(|_| invalid("importer registry lock is poisoned"))?
+            .map_err(|_| invalid("built-in importer registry lock is poisoned"))?
             .iter()
             .map(|(id, importer)| (id.clone(), importer.capability_hash))
-            .collect())
+            .collect::<BTreeMap<_, _>>();
+        for (id, importer) in self
+            .pipeline_importers
+            .read()
+            .map_err(|_| invalid("pipeline importer registry lock is poisoned"))?
+            .iter()
+        {
+            if capabilities
+                .insert(id.clone(), importer.capability_hash)
+                .is_some()
+            {
+                return Err(invalid(format!(
+                    "importer {id:?} is registered by both the built-in and pipeline registries"
+                )));
+            }
+        }
+        Ok(capabilities)
     }
 
     fn resolve_explicit_destination(
