@@ -79,6 +79,10 @@ impl DaemonCoordinator {
         Arc::clone(&self.store)
     }
 
+    pub fn scanner(&self) -> RootedScanner {
+        self.scanner.clone()
+    }
+
     /// Reconcile one complete scan. A watcher generation is armed before the
     /// caller starts this method; queued events are unioned through
     /// [`Self::apply_watcher_batch`] after this transaction.

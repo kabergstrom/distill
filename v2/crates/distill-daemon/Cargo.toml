@@ -16,6 +16,7 @@ distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.2"
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]

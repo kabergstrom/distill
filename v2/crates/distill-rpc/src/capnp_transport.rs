@@ -137,6 +137,22 @@ impl StagedListener {
             drop(self.accept_one().await?);
         }
     }
+
+    /// Production accept loop with supervisor-owned shutdown. Existing
+    /// connection tasks are detached and finish independently; shutdown stops
+    /// admitting new unauthenticated loopback peers immediately.
+    pub async fn serve_until<F>(&self, shutdown: F) -> Result<(), TransportError>
+    where
+        F: Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                result = self.accept_one() => drop(result?),
+                () = &mut shutdown => return Ok(()),
+            }
+        }
+    }
 }
 
 /// Remote bootstrap client plus the local task driving its single-threaded
