@@ -8,7 +8,7 @@ use distill_core::attestation::{
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination};
-use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter};
+use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
 use distill_daemon::scanner::AssetRoot;
 use distill_json::AuthoredValue;
 use distill_rpc::{
@@ -52,24 +52,22 @@ impl AuthoringImporter for ByteImporter {
         &self,
         context: &mut dyn AuthoringImportContext,
         _settings: &AuthoredValue,
-    ) -> Result<distill_build::import::ImportOutput, String> {
+    ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
         let source = context
             .sources()
             .first()
-            .ok_or_else(|| "one source is required".to_owned())?
+            .ok_or_else(|| AuthoringImporterError::rejected(1, "one source is required"))?
             .path
             .clone();
-        let bytes = context
-            .read(&source)
-            .map_err(|error| format!("{error:?}"))?;
+        let bytes = context.read(&source)?;
         let value = std::str::from_utf8(&bytes)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| AuthoringImporterError::rejected(2, error.to_string()))?
             .parse::<u8>()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| AuthoringImporterError::rejected(3, error.to_string()))?;
         let mut output = distill_build::import::ImportOutput::new();
         output
             .entry("asset", TYPE_UUID, AuthoredValue::UInt(value.into()))
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|error| AuthoringImporterError::rejected(4, format!("{error:?}")))?;
         Ok(output)
     }
 }
@@ -306,7 +304,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         coordinator.reconcile_watched_imports().unwrap(),
         vec![imported_bundle]
     );
-    let second = distill_bundle::parse_bundle(&std::fs::read(path).unwrap()).unwrap();
+    let second = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(second.uuid, imported_bundle);
     assert_eq!(second.assets["asset"].uuid, first_asset);
     assert_eq!(second.assets["asset"].data, AuthoredValue::UInt(8));
@@ -314,6 +312,86 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(
         coordinator.store().lock().unwrap().input_version(),
         InputVersion(4)
+    );
+
+    std::fs::write(assets.join("source.txt"), b"not-a-byte").unwrap();
+    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    let failed = coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .watched_import_failure(imported_bundle)
+        .unwrap()
+        .expect("stable failed attempt is retained");
+    assert_eq!(
+        failed.terminal,
+        distill_store::imports::WatchedImportTerminal::Importer { code: 3 }
+    );
+    assert_eq!(
+        coordinator.store().lock().unwrap().input_version(),
+        InputVersion(4),
+        "memoizing a failure is not an input event"
+    );
+    let failed_memo = failed.memo_seq;
+    assert!(coordinator
+        .authoring_service()
+        .watched_imports_needing_reimport()
+        .unwrap()
+        .is_empty());
+    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    assert_eq!(
+        coordinator.store().lock().unwrap().memo_seq(),
+        failed_memo,
+        "an unchanged failure must not spin"
+    );
+
+    std::fs::write(assets.join("source.txt"), b"9").unwrap();
+    assert_eq!(
+        coordinator.reconcile_watched_imports().unwrap(),
+        vec![imported_bundle]
+    );
+    assert!(coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .watched_import_failure(imported_bundle)
+        .unwrap()
+        .is_none());
+    let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(9));
+    assert_eq!(
+        coordinator.store().lock().unwrap().input_version(),
+        InputVersion(5)
+    );
+
+    std::fs::remove_file(assets.join("source.txt")).unwrap();
+    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    assert_eq!(
+        coordinator
+            .store()
+            .lock()
+            .unwrap()
+            .watched_import_failure(imported_bundle)
+            .unwrap()
+            .unwrap()
+            .terminal,
+        distill_store::imports::WatchedImportTerminal::Dependency
+    );
+    assert!(coordinator
+        .authoring_service()
+        .watched_imports_needing_reimport()
+        .unwrap()
+        .is_empty());
+    std::fs::write(assets.join("source.txt"), b"10").unwrap();
+    assert_eq!(
+        coordinator.reconcile_watched_imports().unwrap(),
+        vec![imported_bundle]
+    );
+    let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(10));
+    assert_eq!(
+        coordinator.store().lock().unwrap().input_version(),
+        InputVersion(6)
     );
 }
 

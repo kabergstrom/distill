@@ -14,6 +14,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod files;
+pub mod imports;
 pub mod journal;
 pub mod pipeline;
 pub mod state;

@@ -15,7 +15,10 @@ use distill_build::import::{
 use distill_build::query::{
     file_query_result_hash, normalize_identifier, normalize_path, FileQuery, RootName, RootedPath,
 };
-use distill_build::trace::{CapabilityKey, DirectoryGrouping, Observed, RawFileFailureClass};
+use distill_build::trace::{
+    CapabilityKey, DirectoryGrouping, LocalFailureClass, Observed, RawFileFailureClass, RawFileOp,
+    RawFileSubject, StableFailureFingerprint,
+};
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
 use distill_core::attestation::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BootstrapControlSymbol,
@@ -30,6 +33,7 @@ use distill_rpc::{
 };
 use distill_schema::ngp_schema::{node_hash, snapshot_to_json, verify_snapshot, LogicalSchema};
 use distill_store::bundles::BundleMeta;
+use distill_store::imports::{WatchedImportFailure, WatchedImportTerminal};
 use distill_store::journal::PublicationGroupKind;
 use distill_store::Store;
 use globset::Glob;
@@ -47,7 +51,39 @@ pub trait AuthoringImporter: Send + Sync {
         &self,
         context: &mut dyn AuthoringImportContext,
         settings: &AuthoredValue,
-    ) -> Result<ImportOutput, String>;
+    ) -> Result<ImportOutput, AuthoringImporterError>;
+}
+
+/// Closed bridge failure: a context dependency keeps its exact observed
+/// fingerprint, while importer-owned deterministic rejection carries the
+/// stable non-zero code defined by that importer version. Messages are
+/// presentation only and never decide wakeup or equality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoringImporterError {
+    Dependency(ImportError),
+    Rejected { code: u32, message: String },
+}
+
+impl AuthoringImporterError {
+    pub fn rejected(code: u32, message: impl Into<String>) -> Self {
+        Self::Rejected {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Dependency(error) => format!("{error:?}"),
+            Self::Rejected { message, .. } => message.clone(),
+        }
+    }
+}
+
+impl From<ImportError> for AuthoringImporterError {
+    fn from(error: ImportError) -> Self {
+        Self::Dependency(error)
+    }
 }
 
 pub trait AuthoringImportContext {
@@ -159,7 +195,11 @@ impl AuthoringService {
                 continue;
             }
             let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
-            if !revalidate_read_set(&prior.model.record.read_set, &mut backend) {
+            let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+                Some(failure) => decode_attempt_basis(&failure.basis)?,
+                None => prior.model.record.read_set.clone(),
+            };
+            if !revalidate_read_set(&basis, &mut backend) {
                 pending.push(meta.bundle);
             }
         }
@@ -273,11 +313,24 @@ impl AuthoringService {
         Ok(tasks)
     }
 
-    pub(crate) fn prepare_directory_import(
+    pub(crate) fn prepare_watched_directory_import(
         &self,
         base: InputVersion,
         task: &DirectoryImportTask,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
+    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
+        let (importer, invocation) = self.directory_import_invocation(base, task)?;
+        match self.execute_import(base, importer, invocation) {
+            Ok(prepared) => Ok(Some(prepared)),
+            Err(error) if error.memoized => Ok(None),
+            Err(error) => Err(error.into_rpc()),
+        }
+    }
+
+    fn directory_import_invocation(
+        &self,
+        base: InputVersion,
+        task: &DirectoryImportTask,
+    ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let importer = self.registered_importer(&task.importer)?;
         validate_default_settings(
             importer.settings_type_uuid,
@@ -315,8 +368,7 @@ impl AuthoringService {
             )));
         }
         drop(store);
-        self.execute_import(
-            base,
+        Ok((
             importer,
             ImportInvocation {
                 destination,
@@ -327,7 +379,7 @@ impl AuthoringService {
                 origin: Some(origin),
                 basis_deps: vec![task.listing_dep.clone()],
             },
-        )
+        ))
     }
 
     fn directory_task_needs_run(
@@ -364,10 +416,11 @@ impl AuthoringService {
             return Ok(true);
         }
         let mut backend = RootedImportBackend::new(&self.scanner, capabilities);
-        Ok(!revalidate_read_set(
-            &prior.model.record.read_set,
-            &mut backend,
-        ))
+        let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+            Some(failure) => decode_attempt_basis(&failure.basis)?,
+            None => prior.model.record.read_set.clone(),
+        };
+        Ok(!revalidate_read_set(&basis, &mut backend))
     }
 
     pub(crate) fn prepare_import_request(
@@ -414,6 +467,7 @@ impl AuthoringService {
                 basis_deps: Vec::new(),
             },
         )
+        .map_err(ImportExecutionError::into_rpc)
     }
 
     pub(crate) fn prepare_reimport_bundle(
@@ -454,6 +508,89 @@ impl AuthoringService {
         let sources = prior.model.record.sources.clone();
         let watch = prior.model.record.watch;
         drop(store);
+        let prepared = self
+            .execute_import(
+                base,
+                importer,
+                ImportInvocation {
+                    destination,
+                    prior: Some(prior),
+                    sources,
+                    explicit_settings: None,
+                    watch,
+                    origin: None,
+                    basis_deps: Vec::new(),
+                },
+            )
+            .map_err(ImportExecutionError::into_rpc)?;
+        debug_assert_eq!(prepared.bundle, bundle);
+        Ok(prepared)
+    }
+
+    /// Coordinator-only watched retry. A stable failed attempt that was
+    /// durably memoized is a handled outcome, not a background-loop error.
+    pub(crate) fn prepare_watched_reimport(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
+        match self.prepare_reimport_for_watcher(base, bundle) {
+            Ok(prepared) => Ok(Some(prepared)),
+            Err(error) if error.memoized => Ok(None),
+            Err(error) => Err(error.into_rpc()),
+        }
+    }
+
+    fn prepare_reimport_for_watcher(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<PreparedImportCommit, ImportExecutionError> {
+        let store = self.store.lock().map_err(|_| {
+            ImportExecutionError::unmemoized(invalid("durable store coordinator mutex is poisoned"))
+        })?;
+        require_base(&store, base).map_err(ImportExecutionError::unmemoized)?;
+        let meta = store
+            .bundle(bundle)
+            .map_err(invalid)
+            .map_err(ImportExecutionError::unmemoized)?
+            .ok_or_else(|| {
+                ImportExecutionError::unmemoized(invalid(format!(
+                    "cannot reimport unknown bundle {bundle}"
+                )))
+            })?;
+        let prior = self
+            .read_prior_import(&store, &meta)
+            .map_err(ImportExecutionError::unmemoized)?;
+        let importer = self
+            .registered_importer(&prior.model.record.importer)
+            .map_err(ImportExecutionError::unmemoized)?;
+        if prior.settings_type_uuid != importer.settings_type_uuid {
+            return Err(ImportExecutionError::unmemoized(invalid(
+                "the recorded settings entry type no longer matches the importer registration",
+            )));
+        }
+        let root = store
+            .root_name(meta.root)
+            .map_err(invalid)
+            .map_err(ImportExecutionError::unmemoized)?
+            .ok_or_else(|| {
+                ImportExecutionError::unmemoized(invalid("bundle root identity is missing"))
+            })?;
+        let target = self
+            .scanner
+            .physical_path(&root, &meta.path)
+            .map_err(invalid)
+            .map_err(ImportExecutionError::unmemoized)?;
+        let destination = ImportDestination {
+            root,
+            path: meta.path.clone(),
+            target,
+            meta: Some(meta),
+        };
+        let sources = prior.model.record.sources.clone();
+        let watch = prior.model.record.watch;
+        drop(store);
         let prepared = self.execute_import(
             base,
             importer,
@@ -476,7 +613,7 @@ impl AuthoringService {
         base: InputVersion,
         importer: RegisteredImporter,
         invocation: ImportInvocation,
-    ) -> Result<PreparedImportCommit, RpcFailure> {
+    ) -> Result<PreparedImportCommit, ImportExecutionError> {
         let ImportInvocation {
             destination,
             prior,
@@ -486,39 +623,97 @@ impl AuthoringService {
             origin,
             basis_deps,
         } = invocation;
-        let capabilities = self.importer_capabilities()?;
+        let capabilities = self
+            .importer_capabilities()
+            .map_err(ImportExecutionError::unmemoized)?;
         let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
-        let mut context =
-            ImportContext::new(&importer.id, sources.clone(), &mut backend).map_err(invalid)?;
+        let mut context = ImportContext::new(&importer.id, sources.clone(), &mut backend)
+            .map_err(invalid)
+            .map_err(ImportExecutionError::unmemoized)?;
         let observed_capability = context
             .importer_capability(&importer.id)
-            .map_err(|error| invalid(format!("importer capability lookup failed: {error:?}")))?;
+            .map_err(|error| invalid(format!("importer capability lookup failed: {error:?}")))
+            .map_err(ImportExecutionError::unmemoized)?;
         if observed_capability != importer.capability_hash {
-            return Err(invalid("importer capability changed before execution"));
+            return Err(ImportExecutionError::unmemoized(invalid(
+                "importer capability changed before execution",
+            )));
         }
-        let output = {
+        let result = {
             let mut adapter = TracedImportContext {
                 context: &mut context,
             };
-            importer
-                .executor
-                .import(
-                    &mut adapter,
-                    explicit_settings.as_ref().unwrap_or_else(|| {
-                        prior
-                            .as_ref()
-                            .map(|prior| &prior.model.settings)
-                            .unwrap_or(&importer.default_settings)
-                    }),
-                )
-                .map_err(|error| invalid(format!("importer {:?} failed: {error}", importer.id)))?
+            importer.executor.import(
+                &mut adapter,
+                explicit_settings.as_ref().unwrap_or_else(|| {
+                    prior
+                        .as_ref()
+                        .map(|prior| &prior.model.settings)
+                        .unwrap_or(&importer.default_settings)
+                }),
+            )
         };
         let mut read_set = context.into_read_set();
         read_set.extend(basis_deps);
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                let terminal = match &error {
+                    AuthoringImporterError::Dependency(dependency)
+                        if read_set
+                            .last()
+                            .and_then(dep_failure)
+                            .is_some_and(|failure| failure == &dependency.fingerprint) =>
+                    {
+                        WatchedImportTerminal::Dependency
+                    }
+                    AuthoringImporterError::Rejected { code, .. } if *code != 0 => {
+                        WatchedImportTerminal::Importer { code: *code }
+                    }
+                    AuthoringImporterError::Dependency(_) => {
+                        return Err(ImportExecutionError::unmemoized(invalid(
+                            "importer returned a dependency failure that is not its terminal observation",
+                        )));
+                    }
+                    AuthoringImporterError::Rejected { .. } => {
+                        return Err(ImportExecutionError::unmemoized(invalid(
+                            "importer failure code zero is reserved",
+                        )));
+                    }
+                };
+                let message = error.message();
+                let memoized = self
+                    .record_failed_attempt(
+                        base,
+                        destination.meta.as_ref(),
+                        watch,
+                        &read_set,
+                        terminal,
+                        &message,
+                    )
+                    .map_err(ImportExecutionError::unmemoized)?;
+                return Err(ImportExecutionError {
+                    rpc: invalid(format!("importer {:?} failed: {message}", importer.id)),
+                    memoized,
+                });
+            }
+        };
         if read_set.iter().any(dep_has_failure) {
-            return Err(invalid(
-                "an importer cannot publish after catching a failed context observation",
-            ));
+            let message = "an importer cannot publish after catching a failed context observation";
+            let memoized = self
+                .record_failed_attempt(
+                    base,
+                    destination.meta.as_ref(),
+                    watch,
+                    &read_set,
+                    WatchedImportTerminal::Dependency,
+                    message,
+                )
+                .map_err(ImportExecutionError::unmemoized)?;
+            return Err(ImportExecutionError {
+                rpc: invalid(message),
+                memoized,
+            });
         }
 
         let seed = import_identity_seed(
@@ -546,19 +741,23 @@ impl AuthoringService {
             },
             &mut ids,
         )
-        .map_err(|error| invalid(format!("import fold failed: {error:?}")))?;
+        .map_err(|error| invalid(format!("import fold failed: {error:?}")))
+        .map_err(ImportExecutionError::unmemoized)?;
 
-        let store = self
+        let mut store = self
             .store
             .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
-        require_base(&store, base)?;
-        let capabilities = self.importer_capabilities()?;
+            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))
+            .map_err(ImportExecutionError::unmemoized)?;
+        require_base(&store, base).map_err(ImportExecutionError::unmemoized)?;
+        let capabilities = self
+            .importer_capabilities()
+            .map_err(ImportExecutionError::unmemoized)?;
         let mut recheck = RootedImportBackend::new(&self.scanner, &capabilities);
         if !revalidate_read_set(&read_set, &mut recheck) {
-            return Err(invalid(
+            return Err(ImportExecutionError::unmemoized(invalid(
                 "import read-set changed before publication; the result was discarded",
-            ));
+            )));
         }
         let bytes = build_import_bundle(
             &store,
@@ -566,30 +765,35 @@ impl AuthoringService {
             &folded,
             prior.as_ref().map(|prior| &prior.bundle),
             &mut ids,
-        )?;
+        )
+        .map_err(ImportExecutionError::unmemoized)?;
         let bundle = folded.bundle_uuid;
         if store
             .bundle(bundle)
-            .map_err(invalid)?
+            .map_err(invalid)
+            .map_err(ImportExecutionError::unmemoized)?
             .is_some_and(|existing| {
                 destination.meta.as_ref().map(|meta| meta.bundle) != Some(existing.bundle)
             })
         {
-            return Err(invalid(format!(
+            return Err(ImportExecutionError::unmemoized(invalid(format!(
                 "new import bundle identity {bundle} collides with the existing namespace"
-            )));
+            ))));
         }
-        let proposed_bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+        let proposed_bundle = distill_bundle::parse_bundle(&bytes)
+            .map_err(invalid)
+            .map_err(ImportExecutionError::unmemoized)?;
         for entry in proposed_bundle.assets.values() {
             if store
                 .entry(entry.uuid)
-                .map_err(invalid)?
+                .map_err(invalid)
+                .map_err(ImportExecutionError::unmemoized)?
                 .is_some_and(|existing| existing.bundle != bundle)
             {
-                return Err(invalid(format!(
+                return Err(ImportExecutionError::unmemoized(invalid(format!(
                     "import-generated asset identity {} collides with another bundle",
                     entry.uuid
-                )));
+                ))));
             }
         }
         let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
@@ -600,16 +804,61 @@ impl AuthoringService {
             importer.capability_hash,
             &bytes,
         );
+        if destination.meta.is_some() {
+            store
+                .clear_watched_import_failure(bundle)
+                .map_err(invalid)
+                .map_err(ImportExecutionError::unmemoized)?;
+        }
         drop(store);
-        let commit = self.publish_file(
-            base,
-            PublicationGroupKind::Import,
-            &basis,
-            destination.target,
-            preimage,
-            Some(bytes),
-        )?;
+        let commit = self
+            .publish_file(
+                base,
+                PublicationGroupKind::Import,
+                &basis,
+                destination.target,
+                preimage,
+                Some(bytes),
+            )
+            .map_err(ImportExecutionError::unmemoized)?;
         Ok(PreparedImportCommit { bundle, commit })
+    }
+
+    fn record_failed_attempt(
+        &self,
+        base: InputVersion,
+        destination: Option<&BundleMeta>,
+        watch: bool,
+        read_set: &[FileDep],
+        terminal: WatchedImportTerminal,
+        message: &str,
+    ) -> Result<bool, RpcFailure> {
+        let Some(destination) = destination.filter(|_| watch) else {
+            return Ok(false);
+        };
+        let basis = encode_attempt_basis(read_set)?;
+        let capabilities = self.importer_capabilities()?;
+        let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+        if !revalidate_read_set(read_set, &mut backend) {
+            return Ok(false);
+        }
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+        require_base(&store, base)?;
+        let memo_seq = store.memo_seq();
+        store
+            .record_watched_import_failure(&WatchedImportFailure {
+                bundle: destination.bundle,
+                attempted_input_version: base,
+                basis,
+                terminal,
+                message: message.to_owned(),
+                memo_seq,
+            })
+            .map_err(invalid)?;
+        Ok(true)
     }
 
     fn registered_importer(&self, id: &str) -> Result<RegisteredImporter, RpcFailure> {
@@ -960,16 +1209,41 @@ fn revalidate_read_set(read_set: &[FileDep], backend: &mut impl ImportBackend) -
                         hash: *blake3::hash(&bytes).as_bytes(),
                     })
             }
-            Err(_) => false,
+            Err(class) => {
+                *observed
+                    == Observed::Err(StableFailureFingerprint::RawFile {
+                        op: RawFileOp::Read,
+                        subject: RawFileSubject::Path(path.clone()),
+                        class,
+                    })
+            }
         },
-        FileDep::Probe { path, observed } => backend
-            .probe(path)
-            .is_ok_and(|value| *observed == Observed::Ok(value)),
-        FileDep::Listing { query, observed } => backend.enumerate(query).is_ok_and(|mut paths| {
-            paths.sort_unstable();
-            paths.dedup();
-            *observed == Observed::Ok(distill_build::query::file_query_result_hash(&paths))
-        }),
+        FileDep::Probe { path, observed } => match backend.probe(path) {
+            Ok(value) => *observed == Observed::Ok(value),
+            Err(class) => {
+                *observed
+                    == Observed::Err(StableFailureFingerprint::RawFile {
+                        op: RawFileOp::Probe,
+                        subject: RawFileSubject::Path(path.clone()),
+                        class,
+                    })
+            }
+        },
+        FileDep::Listing { query, observed } => match backend.enumerate(query) {
+            Ok(mut paths) => {
+                paths.sort_unstable();
+                paths.dedup();
+                *observed == Observed::Ok(distill_build::query::file_query_result_hash(&paths))
+            }
+            Err(class) => {
+                *observed
+                    == Observed::Err(StableFailureFingerprint::RawFile {
+                        op: RawFileOp::Enumerate,
+                        subject: RawFileSubject::Query(query.clone()),
+                        class,
+                    })
+            }
+        },
         FileDep::Capability { key, observed } => {
             *observed
                 == backend.capability(key).map_or_else(
@@ -987,12 +1261,28 @@ fn revalidate_read_set(read_set: &[FileDep], backend: &mut impl ImportBackend) -
 }
 
 fn dep_has_failure(dep: &FileDep) -> bool {
+    dep_failure(dep).is_some()
+}
+
+fn dep_failure(dep: &FileDep) -> Option<&distill_build::trace::StableFailureFingerprint> {
     match dep {
-        FileDep::Read { observed, .. } => matches!(observed, Observed::Err(_)),
-        FileDep::Probe { observed, .. } => matches!(observed, Observed::Err(_)),
-        FileDep::Listing { observed, .. } | FileDep::Capability { observed, .. } => {
-            matches!(observed, Observed::Err(_))
+        FileDep::Read {
+            observed: Observed::Err(failure),
+            ..
         }
+        | FileDep::Probe {
+            observed: Observed::Err(failure),
+            ..
+        }
+        | FileDep::Listing {
+            observed: Observed::Err(failure),
+            ..
+        }
+        | FileDep::Capability {
+            observed: Observed::Err(failure),
+            ..
+        } => Some(failure),
+        _ => None,
     }
 }
 
@@ -1243,6 +1533,283 @@ fn decode_file_dep(value: &AuthoredValue) -> Result<FileDep, RpcFailure> {
             observed: decode_observed_hash(field(fields, "observed")?)?,
         }),
         _ => Err(invalid(format!("unknown FileDep variant {variant:?}"))),
+    }
+}
+
+fn encode_attempt_basis(read_set: &[FileDep]) -> Result<Vec<u8>, RpcFailure> {
+    let value = object([
+        (
+            "read_set",
+            AuthoredValue::Array(
+                read_set
+                    .iter()
+                    .map(encode_attempt_file_dep)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        ),
+        ("version", AuthoredValue::UInt(1)),
+    ]);
+    distill_json::write(&value)
+        .map(String::into_bytes)
+        .map_err(invalid)
+}
+
+fn decode_attempt_basis(bytes: &[u8]) -> Result<Vec<FileDep>, RpcFailure> {
+    let text = std::str::from_utf8(bytes).map_err(invalid)?;
+    let value = distill_json::parse(text).map_err(invalid)?;
+    if distill_json::write(&value).map_err(invalid)?.as_bytes() != bytes {
+        return Err(invalid(
+            "watched import failure basis is not canonical JSON",
+        ));
+    }
+    let fields = as_object(&value, "watched import failure basis")?;
+    if fields.len() != 2 || as_u128(field(fields, "version")?, "basis.version")? != 1 {
+        return Err(invalid("unsupported watched import failure basis"));
+    }
+    as_array(field(fields, "read_set")?, "basis.read_set")?
+        .iter()
+        .map(decode_attempt_file_dep)
+        .collect()
+}
+
+fn encode_attempt_file_dep(dep: &FileDep) -> Result<AuthoredValue, RpcFailure> {
+    let (variant, fields) = match dep {
+        FileDep::Read { path, observed } => (
+            "Read",
+            object([
+                ("observed", encode_attempt_content(observed)?),
+                ("path", AuthoredValue::Str(path.clone())),
+            ]),
+        ),
+        FileDep::Probe { path, observed } => (
+            "Probe",
+            object([
+                ("observed", encode_attempt_root(observed)?),
+                ("path", AuthoredValue::Str(path.clone())),
+            ]),
+        ),
+        FileDep::Listing { query, observed } => (
+            "Listing",
+            object([
+                ("observed", encode_attempt_hash(observed)?),
+                ("query", encode_file_query(query)),
+            ]),
+        ),
+        FileDep::Capability { key, observed } => (
+            "Capability",
+            object([
+                ("key", encode_capability_key(key)),
+                ("observed", encode_attempt_hash(observed)?),
+            ]),
+        ),
+    };
+    Ok(object([(variant, fields)]))
+}
+
+fn decode_attempt_file_dep(value: &AuthoredValue) -> Result<FileDep, RpcFailure> {
+    let variants = as_object(value, "attempted FileDep")?;
+    if variants.len() != 1 {
+        return Err(invalid("attempted FileDep must contain one variant"));
+    }
+    let (variant, payload) = variants.first_key_value().expect("one variant");
+    let fields = as_object(payload, "attempted FileDep payload")?;
+    match variant.as_str() {
+        "Read" => Ok(FileDep::Read {
+            path: as_string(field(fields, "path")?, "FileDep.Read.path")?.to_owned(),
+            observed: decode_attempt_content(field(fields, "observed")?)?,
+        }),
+        "Probe" => Ok(FileDep::Probe {
+            path: as_string(field(fields, "path")?, "FileDep.Probe.path")?.to_owned(),
+            observed: decode_attempt_root(field(fields, "observed")?)?,
+        }),
+        "Listing" => Ok(FileDep::Listing {
+            query: decode_file_query(field(fields, "query")?)?,
+            observed: decode_attempt_hash(field(fields, "observed")?)?,
+        }),
+        "Capability" => Ok(FileDep::Capability {
+            key: decode_capability_key(field(fields, "key")?)?,
+            observed: decode_attempt_hash(field(fields, "observed")?)?,
+        }),
+        _ => Err(invalid(format!(
+            "unknown attempted FileDep variant {variant:?}"
+        ))),
+    }
+}
+
+fn encode_attempt_content(
+    observed: &Observed<distill_build::import::FileContentObservation>,
+) -> Result<AuthoredValue, RpcFailure> {
+    match observed {
+        Observed::Ok(_) => encode_observed_content(observed),
+        Observed::Err(failure) => encode_attempt_error(failure),
+    }
+}
+
+fn encode_attempt_root(observed: &Observed<Option<RootName>>) -> Result<AuthoredValue, RpcFailure> {
+    match observed {
+        Observed::Ok(_) => encode_observed_root(observed),
+        Observed::Err(failure) => encode_attempt_error(failure),
+    }
+}
+
+fn encode_attempt_hash(observed: &Observed<[u8; 32]>) -> Result<AuthoredValue, RpcFailure> {
+    match observed {
+        Observed::Ok(_) => encode_observed_hash(observed),
+        Observed::Err(failure) => encode_attempt_error(failure),
+    }
+}
+
+fn encode_attempt_error(failure: &StableFailureFingerprint) -> Result<AuthoredValue, RpcFailure> {
+    Ok(object([(
+        "Err",
+        object([("failure", encode_import_failure(failure)?)]),
+    )]))
+}
+
+fn decode_attempt_content(
+    value: &AuthoredValue,
+) -> Result<Observed<distill_build::import::FileContentObservation>, RpcFailure> {
+    if observed_is(value, "Ok")? {
+        decode_observed_content(value)
+    } else {
+        decode_attempt_error(value).map(Observed::Err)
+    }
+}
+
+fn decode_attempt_root(value: &AuthoredValue) -> Result<Observed<Option<RootName>>, RpcFailure> {
+    if observed_is(value, "Ok")? {
+        decode_observed_root(value)
+    } else {
+        decode_attempt_error(value).map(Observed::Err)
+    }
+}
+
+fn decode_attempt_hash(value: &AuthoredValue) -> Result<Observed<[u8; 32]>, RpcFailure> {
+    if observed_is(value, "Ok")? {
+        decode_observed_hash(value)
+    } else {
+        decode_attempt_error(value).map(Observed::Err)
+    }
+}
+
+fn observed_is(value: &AuthoredValue, variant: &str) -> Result<bool, RpcFailure> {
+    let variants = as_object(value, "attempted observation")?;
+    if variants.len() != 1 || (!variants.contains_key("Ok") && !variants.contains_key("Err")) {
+        return Err(invalid(
+            "attempted observation must contain one Ok or Err variant",
+        ));
+    }
+    Ok(variants.contains_key(variant))
+}
+
+fn decode_attempt_error(value: &AuthoredValue) -> Result<StableFailureFingerprint, RpcFailure> {
+    let variants = as_object(value, "attempted observation")?;
+    let payload = variants
+        .get("Err")
+        .ok_or_else(|| invalid("attempted failure has no Err variant"))?;
+    decode_import_failure(field(as_object(payload, "Err payload")?, "failure")?)
+}
+
+fn encode_import_failure(failure: &StableFailureFingerprint) -> Result<AuthoredValue, RpcFailure> {
+    let (variant, payload) = match failure {
+        StableFailureFingerprint::RawFile { op, subject, class } => (
+            "RawFile",
+            object([
+                ("class", AuthoredValue::UInt(*class as u8 as u128)),
+                ("op", AuthoredValue::UInt(*op as u8 as u128)),
+                (
+                    "subject",
+                    match subject {
+                        RawFileSubject::Path(path) => {
+                            object([("Path", AuthoredValue::Str(path.clone()))])
+                        }
+                        RawFileSubject::Query(query) => {
+                            object([("Query", encode_file_query(query))])
+                        }
+                    },
+                ),
+            ]),
+        ),
+        StableFailureFingerprint::MissingCapability { key } => (
+            "MissingCapability",
+            object([("key", encode_capability_key(key))]),
+        ),
+        StableFailureFingerprint::Local { class, detail } => (
+            "Local",
+            object([
+                ("class", AuthoredValue::UInt(*class as u16 as u128)),
+                ("detail", byte_array(detail)),
+            ]),
+        ),
+        _ => {
+            return Err(invalid(
+                "failure fingerprint is not valid in an authoring import basis",
+            ));
+        }
+    };
+    Ok(object([(variant, payload)]))
+}
+
+fn decode_import_failure(value: &AuthoredValue) -> Result<StableFailureFingerprint, RpcFailure> {
+    let variants = as_object(value, "import failure fingerprint")?;
+    if variants.len() != 1 {
+        return Err(invalid(
+            "import failure fingerprint must contain one variant",
+        ));
+    }
+    let (variant, payload) = variants.first_key_value().expect("one variant");
+    let fields = as_object(payload, "import failure payload")?;
+    match variant.as_str() {
+        "RawFile" => {
+            let op = match as_u128(field(fields, "op")?, "RawFile.op")? {
+                0 => RawFileOp::Read,
+                1 => RawFileOp::Probe,
+                2 => RawFileOp::Enumerate,
+                value => return Err(invalid(format!("unknown raw-file op {value}"))),
+            };
+            let class = match as_u128(field(fields, "class")?, "RawFile.class")? {
+                0 => RawFileFailureClass::NotFound,
+                1 => RawFileFailureClass::PermissionDenied,
+                2 => RawFileFailureClass::ListingFailed,
+                3 => RawFileFailureClass::OtherStable,
+                value => return Err(invalid(format!("unknown raw-file failure class {value}"))),
+            };
+            let subject = as_object(field(fields, "subject")?, "RawFile.subject")?;
+            if subject.len() != 1 {
+                return Err(invalid("raw-file subject must contain one variant"));
+            }
+            let subject = if let Some(path) = subject.get("Path") {
+                RawFileSubject::Path(as_string(path, "RawFile.Path")?.to_owned())
+            } else if let Some(query) = subject.get("Query") {
+                RawFileSubject::Query(decode_file_query(query)?)
+            } else {
+                return Err(invalid("unknown raw-file subject"));
+            };
+            Ok(StableFailureFingerprint::RawFile { op, subject, class })
+        }
+        "MissingCapability" => Ok(StableFailureFingerprint::MissingCapability {
+            key: decode_capability_key(field(fields, "key")?)?,
+        }),
+        "Local" => {
+            let class = match as_u128(field(fields, "class")?, "Local.class")? {
+                1 => LocalFailureClass::Validator,
+                2 => LocalFailureClass::MigrationPlan,
+                3 => LocalFailureClass::Processor,
+                4 => LocalFailureClass::MigrationFunction,
+                5 => LocalFailureClass::OutputBinding,
+                6 => LocalFailureClass::Importer,
+                7 => LocalFailureClass::ImportIntake,
+                8 => LocalFailureClass::ArtifactEncoding,
+                value => return Err(invalid(format!("unknown local failure class {value}"))),
+            };
+            Ok(StableFailureFingerprint::Local {
+                class,
+                detail: fixed_bytes(field(fields, "detail")?, "Local.detail")?,
+            })
+        }
+        _ => Err(invalid(format!(
+            "unknown import failure fingerprint {variant:?}"
+        ))),
     }
 }
 
@@ -1797,6 +2364,24 @@ struct ImportInvocation {
     watch: bool,
     origin: Option<DirectoryOrigin>,
     basis_deps: Vec<FileDep>,
+}
+
+struct ImportExecutionError {
+    rpc: RpcFailure,
+    memoized: bool,
+}
+
+impl ImportExecutionError {
+    fn unmemoized(rpc: RpcFailure) -> Self {
+        Self {
+            rpc,
+            memoized: false,
+        }
+    }
+
+    fn into_rpc(self) -> RpcFailure {
+        self.rpc
+    }
 }
 
 struct HashIdentitySource {

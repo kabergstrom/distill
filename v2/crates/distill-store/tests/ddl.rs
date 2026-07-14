@@ -93,11 +93,34 @@ fn every_section_13_table_exists() {
         "displaced",
         "publication_groups",
         "publication_group_children",
+        "watched_import_failures",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
     assert_eq!(got, expected);
+}
+
+#[test]
+fn watched_import_failures_are_memo_state_keyed_by_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_conn(&dir);
+    assert_eq!(
+        columns(&conn, "watched_import_failures"),
+        [
+            "bundle_uuid",
+            "attempted_input_version",
+            "basis",
+            "terminal_kind",
+            "terminal_code",
+            "message",
+            "memo_seq"
+        ]
+    );
+    assert_eq!(
+        pk_columns(&conn, "watched_import_failures"),
+        ["bundle_uuid"]
+    );
 }
 
 #[test]

@@ -674,6 +674,30 @@ impl Server {
         commit_locked(&mut state, commit).map_err(CoordinatedCommitError::Invalid)
     }
 
+    /// Serialize an attempted coordinator publication that may terminate in
+    /// durable memo state only. `None` leaves the RPC input version untouched;
+    /// this is used by failed watched imports whose outcome basis is recorded
+    /// without pretending that source inputs changed.
+    pub fn coordinated_maybe_commit(
+        &self,
+        base: InputVersion,
+        publish: impl FnOnce() -> Result<Option<Commit>, String>,
+    ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
+        let mut state = self.lock();
+        if state.current != base {
+            return Err(CoordinatedCommitError::Stale {
+                expected: base,
+                observed: state.current,
+            });
+        }
+        let Some(commit) = publish().map_err(CoordinatedCommitError::Publication)? else {
+            return Ok(None);
+        };
+        commit_locked(&mut state, commit)
+            .map(Some)
+            .map_err(CoordinatedCommitError::Invalid)
+    }
+
     /// Discard cursor history strictly before `oldest_available`.
     pub fn discard_history_before(&self, oldest_available: InputVersion) {
         let mut state = self.lock();

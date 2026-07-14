@@ -398,15 +398,18 @@ impl DaemonCoordinator {
         for bundle in pending {
             let base = self.server.current_stamp().version;
             let authoring = Arc::clone(&self.authoring);
-            self.server
-                .coordinated_commit(base, || {
+            let publication = self
+                .server
+                .coordinated_maybe_commit(base, || {
                     authoring
-                        .prepare_reimport_bundle(base, bundle)
-                        .map(|prepared| prepared.commit)
+                        .prepare_watched_reimport(base, bundle)
+                        .map(|prepared| prepared.map(|prepared| prepared.commit))
                         .map_err(|error| format!("{error:?}"))
                 })
                 .map_err(CoordinatorError::Coordinated)?;
-            imported.push(bundle);
+            if publication.is_some() {
+                imported.push(bundle);
+            }
         }
         Ok(imported)
     }
@@ -425,23 +428,29 @@ impl DaemonCoordinator {
             let authoring = Arc::clone(&self.authoring);
             let bundle = Arc::new(Mutex::new(None));
             let captured = Arc::clone(&bundle);
-            self.server
-                .coordinated_commit(base, || {
+            let publication = self
+                .server
+                .coordinated_maybe_commit(base, || {
                     let prepared = authoring
-                        .prepare_directory_import(base, &task)
+                        .prepare_watched_directory_import(base, &task)
                         .map_err(|error| format!("{error:?}"))?;
+                    let Some(prepared) = prepared else {
+                        return Ok(None);
+                    };
                     *captured
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared.bundle);
-                    Ok(prepared.commit)
+                    Ok(Some(prepared.commit))
                 })
                 .map_err(CoordinatorError::Coordinated)?;
-            imported.push(
-                bundle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .expect("coordinated directory import captured its bundle"),
-            );
+            if publication.is_some() {
+                imported.push(
+                    bundle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .expect("coordinated directory import captured its bundle"),
+                );
+            }
         }
         Ok(imported)
     }
