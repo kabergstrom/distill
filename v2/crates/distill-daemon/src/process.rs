@@ -370,10 +370,14 @@ impl ConfigWatch {
                 let targets = candidate
                     .target_definitions(authority.compiled_table(), authority.identity())
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+                let build_targets = candidate
+                    .build_targets(authority.identity())
+                    .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
                 coordinator.publish_configuration_candidate(
                     candidate.asset_roots(),
                     candidate.assets.lineage_manifest.clone(),
                     targets,
+                    build_targets,
                     &candidate.modules.pipeline_dylib,
                     requirements,
                     Arc::clone(&authority),

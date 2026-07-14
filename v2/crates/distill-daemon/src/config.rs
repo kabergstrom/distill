@@ -352,15 +352,14 @@ impl DaemonConfig {
 
     /// Host-identity target binding. Cross-target layout emission remains the
     /// explicitly named §22 gate; it cannot substitute a caller hash here.
-    pub fn target_definitions(
+    pub fn build_targets(
         &self,
-        compiled: &CompiledTypeTable,
         identity: &CompilationIdentity,
-    ) -> Result<Vec<TargetDefinition>, DaemonConfigError> {
+    ) -> Result<BTreeMap<String, Target>, DaemonConfigError> {
         self.targets
             .iter()
             .map(|(name, target)| {
-                let target = Target::new(
+                Target::new(
                     target.os,
                     target.arch,
                     target.apis.clone(),
@@ -368,7 +367,22 @@ impl DaemonConfig {
                     target.debug_info,
                     identity.clone(),
                 )
-                .map_err(|error| DaemonConfigError::Target(format!("{name}: {error:?}")))?;
+                .map(|target| (name.clone(), target))
+                .map_err(|error| DaemonConfigError::Target(format!("{name}: {error:?}")))
+            })
+            .collect()
+    }
+
+    /// Host-identity target binding. Cross-target layout emission remains the
+    /// explicitly named §22 gate; it cannot substitute a caller hash here.
+    pub fn target_definitions(
+        &self,
+        compiled: &CompiledTypeTable,
+        identity: &CompilationIdentity,
+    ) -> Result<Vec<TargetDefinition>, DaemonConfigError> {
+        self.build_targets(identity)?
+            .iter()
+            .map(|(name, target)| {
                 let definition_hash = TargetDefinitionHash(target_definition_hash(&target, &[]));
                 let policy = compiled
                     .rows

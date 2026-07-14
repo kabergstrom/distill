@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
+use distill_build::pipeline::Target;
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::attestation::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
@@ -63,6 +64,7 @@ pub struct DaemonCoordinator {
     authoring: Arc<AuthoringService>,
     pipeline: Mutex<CoordinatedPipelineRuntime>,
     schema_authority: RwLock<Option<Arc<ProjectSchemaAuthority>>>,
+    build_targets: RwLock<BTreeMap<String, Target>>,
     configuration_poison: Mutex<Option<ConfigurationPoison>>,
     operational: Mutex<OperationalRuntime>,
 }
@@ -147,6 +149,7 @@ impl DaemonCoordinator {
             authoring: backend,
             pipeline: Mutex::new(pipeline),
             schema_authority: RwLock::new(None),
+            build_targets: RwLock::new(BTreeMap::new()),
             configuration_poison: Mutex::new(None),
             operational: Mutex::new(operational),
         })
@@ -184,6 +187,14 @@ impl DaemonCoordinator {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn build_target(&self, name: &str) -> Option<Target> {
+        self.build_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     #[cfg(test)]
@@ -299,6 +310,7 @@ impl DaemonCoordinator {
         roots: Vec<AssetRoot>,
         lineage_destination: LineageDestination,
         targets: Vec<TargetDefinition>,
+        build_targets: BTreeMap<String, Target>,
         pipeline_source: &std::path::Path,
         mut requirements: CandidateRequirements,
         schema_authority: Arc<ProjectSchemaAuthority>,
@@ -370,6 +382,10 @@ impl DaemonCoordinator {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(Arc::clone(&schema_authority));
+                *self
+                    .build_targets
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = build_targets.clone();
                 self.configuration_poison
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
