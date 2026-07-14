@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -85,9 +85,18 @@ CREATE INDEX assets_by_bundle ON assets(bundle_uuid);
 CREATE TABLE asset_tags (
     asset_uuid BLOB NOT NULL,
     tag        TEXT NOT NULL,
+    value      TEXT,
     PRIMARY KEY (asset_uuid, tag)
 );
-CREATE INDEX asset_tags_by_tag ON asset_tags(tag);
+CREATE INDEX asset_tags_by_tag ON asset_tags(tag, value);
+CREATE TABLE asset_tag_index (
+    asset_uuid       BLOB NOT NULL PRIMARY KEY,
+    tag_epoch        BLOB NOT NULL,
+    planner_version  INTEGER,
+    dylib_hash       BLOB,
+    trace             BLOB NOT NULL,
+    poison            TEXT
+);
 CREATE TABLE path_index (
     path       TEXT NOT NULL,
     root_id    INTEGER NOT NULL,

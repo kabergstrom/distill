@@ -359,6 +359,7 @@ struct VersionView {
     authoring: BTreeMap<AssetUuid, AuthoringEntry>,
     paths: BTreeMap<String, BTreeSet<AssetUuid>>,
     derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
+    tag_poisons: BTreeMap<AssetUuid, BundleUuid>,
     lineage_repair: Option<LineageRepairState>,
 }
 
@@ -530,6 +531,7 @@ impl Server {
             authoring: BTreeMap::new(),
             paths: BTreeMap::new(),
             derived_outputs: BTreeMap::new(),
+            tag_poisons: BTreeMap::new(),
             lineage_repair: None,
         });
         let mut views = BTreeMap::new();
@@ -2681,6 +2683,9 @@ impl Snapshot {
                     .to_owned(),
             });
         }
+        if let Some(error) = tag_query_poison(&self.view, &query, AuthoringEntryRole::Runtime) {
+            return RpcResult::Failure(error);
+        }
         RpcResult::Success(query_asset_entries(
             &self.view,
             &query,
@@ -3075,46 +3080,14 @@ impl AuthoringSnapshot {
         } else {
             AuthoringEntryRole::Runtime
         };
+        if let Some(error) = tag_query_poison(&self.view, &query, role) {
+            return RpcResult::Failure(error);
+        }
         let values = self
             .view
             .authoring
             .iter()
-            .filter(|(uuid, entry)| {
-                query.uuid.is_none_or(|wanted| wanted == **uuid)
-                    && query
-                        .bundle_path
-                        .as_ref()
-                        .is_none_or(|path| path == &entry.normalized_path)
-                    && query
-                        .local_id
-                        .as_ref()
-                        .is_none_or(|local_id| local_id == &entry.local_id)
-                    && query
-                        .bundle_uuid
-                        .is_none_or(|bundle| bundle == entry.bundle)
-                    && query
-                        .authored_type
-                        .is_none_or(|type_uuid| type_uuid == entry.type_uuid)
-                    && query
-                        .terminal_type
-                        .is_none_or(|type_uuid| type_uuid == entry.terminal_type)
-                    && query.tag.as_ref().is_none_or(|tag| {
-                        entry.tags.get(&tag.tag).is_some_and(|value| {
-                            tag.value.as_ref().is_none_or(|wanted| {
-                                value.as_ref().is_some_and(|actual| actual == wanted)
-                            })
-                        })
-                    })
-                    && query
-                        .path_prefix
-                        .as_ref()
-                        .is_none_or(|prefix| entry.normalized_path.starts_with(prefix))
-                    && query
-                        .path_glob
-                        .as_ref()
-                        .is_none_or(|glob| path_glob_matches(glob, &entry.normalized_path))
-                    && entry.role == role
-            })
+            .filter(|(uuid, entry)| query_asset_entry_matches(entry, **uuid, &query, role))
             .map(|(uuid, _)| *uuid)
             .collect();
         RpcResult::Success(values)
@@ -3705,44 +3678,72 @@ fn query_asset_entries(
 ) -> Vec<AssetUuid> {
     view.authoring
         .iter()
-        .filter(|(uuid, entry)| {
-            query.uuid.is_none_or(|wanted| wanted == **uuid)
-                && query
-                    .bundle_path
-                    .as_ref()
-                    .is_none_or(|path| path == &entry.normalized_path)
-                && query
-                    .local_id
-                    .as_ref()
-                    .is_none_or(|local_id| local_id == &entry.local_id)
-                && query
-                    .bundle_uuid
-                    .is_none_or(|bundle| bundle == entry.bundle)
-                && query
-                    .authored_type
-                    .is_none_or(|type_uuid| type_uuid == entry.type_uuid)
-                && query
-                    .terminal_type
-                    .is_none_or(|type_uuid| type_uuid == entry.terminal_type)
-                && query.tag.as_ref().is_none_or(|tag| {
-                    entry.tags.get(&tag.tag).is_some_and(|value| {
-                        tag.value.as_ref().is_none_or(|wanted| {
-                            value.as_ref().is_some_and(|actual| actual == wanted)
-                        })
-                    })
-                })
-                && query
-                    .path_prefix
-                    .as_ref()
-                    .is_none_or(|prefix| entry.normalized_path.starts_with(prefix))
-                && query
-                    .path_glob
-                    .as_ref()
-                    .is_none_or(|glob| path_glob_matches(glob, &entry.normalized_path))
-                && entry.role == role
-        })
+        .filter(|(uuid, entry)| query_asset_entry_matches(entry, **uuid, query, role))
         .map(|(uuid, _)| *uuid)
         .collect()
+}
+
+fn tag_query_poison(
+    view: &VersionView,
+    query: &AssetQuery,
+    role: AuthoringEntryRole,
+) -> Option<RpcFailure> {
+    query.tag.as_ref()?;
+    let mut without_tag = query.clone();
+    without_tag.tag = None;
+    let bundles = view
+        .tag_poisons
+        .iter()
+        .filter_map(|(asset, bundle)| {
+            let entry = view.authoring.get(asset)?;
+            query_asset_entry_matches(entry, *asset, &without_tag, role).then_some(*bundle)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    (!bundles.is_empty()).then_some(RpcFailure::TagIndexPoisoned { bundles })
+}
+
+fn query_asset_entry_matches(
+    entry: &AuthoringEntry,
+    uuid: AssetUuid,
+    query: &AssetQuery,
+    role: AuthoringEntryRole,
+) -> bool {
+    query.uuid.is_none_or(|wanted| wanted == uuid)
+        && query
+            .bundle_path
+            .as_ref()
+            .is_none_or(|path| path == &entry.normalized_path)
+        && query
+            .local_id
+            .as_ref()
+            .is_none_or(|local_id| local_id == &entry.local_id)
+        && query
+            .bundle_uuid
+            .is_none_or(|bundle| bundle == entry.bundle)
+        && query
+            .authored_type
+            .is_none_or(|type_uuid| type_uuid == entry.type_uuid)
+        && query
+            .terminal_type
+            .is_none_or(|type_uuid| type_uuid == entry.terminal_type)
+        && query.tag.as_ref().is_none_or(|tag| {
+            entry.tags.get(&tag.tag).is_some_and(|value| {
+                tag.value
+                    .as_ref()
+                    .is_none_or(|wanted| value.as_ref().is_some_and(|actual| actual == wanted))
+            })
+        })
+        && query
+            .path_prefix
+            .as_ref()
+            .is_none_or(|prefix| entry.normalized_path.starts_with(prefix))
+        && query
+            .path_glob
+            .as_ref()
+            .is_none_or(|glob| path_glob_matches(glob, &entry.normalized_path))
+        && entry.role == role
 }
 
 fn metadata_entry(entry: &AuthoringEntry) -> MetadataEntry {
@@ -4347,6 +4348,11 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
             }
         }
     }
+    if let Some(tag_projection) = commit.tag_projection {
+        for (uuid, entry) in &mut view.authoring {
+            entry.tags = tag_projection.get(uuid).cloned().unwrap_or_default();
+        }
+    }
     let mut path_deltas = Vec::with_capacity(commit.paths.len());
     for mutation in commit.paths {
         match mutation {
@@ -4362,6 +4368,9 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
     }
     if let Some(derived_outputs) = commit.derived_outputs {
         view.derived_outputs = derived_outputs;
+    }
+    if let Some(tag_poisons) = commit.tag_poisons {
+        view.tag_poisons = tag_poisons;
     }
     if let Some(configuration) = commit.configuration {
         view.configuration = configuration;
@@ -4418,6 +4427,21 @@ fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
                     uuid: *child,
                     detail: "derived output does not match its canonical parent/key identity"
                         .to_owned(),
+                });
+            }
+        }
+    }
+    if let Some(tag_projection) = &commit.tag_projection {
+        for (uuid, tags) in tag_projection {
+            if tags.iter().any(|(tag, value)| {
+                !valid_identifier(tag)
+                    || value
+                        .as_deref()
+                        .is_some_and(|value| !valid_identifier(value))
+            }) {
+                return Err(AdminError::InvalidAuthoringIdentity {
+                    uuid: *uuid,
+                    detail: "tag projection contains a noncanonical name or value".to_owned(),
                 });
             }
         }

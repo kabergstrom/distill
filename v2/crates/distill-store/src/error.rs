@@ -66,6 +66,12 @@ pub enum StoreError {
         bundle: distill_core::id::BundleUuid,
         error: String,
     },
+    /// A §10 tag query could include entries whose current-schema
+    /// `load_current` indexing failed. Returning a smaller result would be
+    /// unsound, so the complete canonical poisoned-bundle set is reported.
+    TagIndexPoisoned {
+        bundles: Vec<distill_core::id::BundleUuid>,
+    },
     /// A runtime/query/pack surface attempted to select an authoring-only
     /// control entry. Tooling metadata inspection uses a separate API.
     RoleIneligible { asset: distill_core::id::AssetUuid },
@@ -277,6 +283,15 @@ impl fmt::Display for StoreError {
             StoreError::BundlePoisoned { bundle, error } => {
                 write!(f, "bundle {bundle} is poisoned: {error}")
             }
+            StoreError::TagIndexPoisoned { bundles } => write!(
+                f,
+                "tag index is poisoned for bundles: {}",
+                bundles
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             StoreError::RoleIneligible { asset } => write!(
                 f,
                 "asset {asset} is authoring-only and ineligible for runtime selection"

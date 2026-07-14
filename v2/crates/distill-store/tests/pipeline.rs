@@ -888,7 +888,7 @@ fn retirement_is_blocked_by_migration_endpoints_and_live_authored_entries() {
                 type_uuid: T,
                 logical_hash: h(1),
                 authoring_only: false,
-                tags: vec![],
+                tags: Default::default(),
             })
         })
         .unwrap();
@@ -957,7 +957,7 @@ fn retirement_requires_exact_control_basis_and_blocks_later_type_references() {
                 type_uuid: T,
                 logical_hash: h(1),
                 authoring_only: false,
-                tags: vec![],
+                tags: Default::default(),
             })
         })
         .unwrap_err();

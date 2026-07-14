@@ -184,7 +184,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 type_uuid: TypeUuid([3u8; 16]),
                 logical_hash: LogicalHash([4u8; 32]),
                 authoring_only: false,
-                tags: vec!["t".into()],
+                tags: std::collections::BTreeMap::from([("t".into(), None)]),
             })?;
             txn.project_verified_lineage_manifest(
                 &VerifiedSchemaLineageManifest::from_verified_source(

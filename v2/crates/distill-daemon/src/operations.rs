@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_bundle::{Bundle, EntryLineageV1};
@@ -47,6 +47,10 @@ impl AuthoringService {
             quarantine: self.quarantine_snapshot(),
             lineage_destination: self.lineage_destination_snapshot(),
             pipeline_projection: self.pipeline_projection(),
+            tag_index_coordinator: self
+                .tag_index_coordinator()
+                .as_ref()
+                .map_or_else(Weak::new, Arc::downgrade),
         };
         let planned = match operation {
             LongRunningOp::RenameWithFixups(payload) => {
@@ -321,6 +325,7 @@ struct OperationRuntime {
     quarantine: QuarantineDriver,
     lineage_destination: LineageDestination,
     pipeline_projection: PipelineProjection,
+    tag_index_coordinator: Weak<crate::coordinator::DaemonCoordinator>,
 }
 
 enum PlannedOperation {
@@ -430,6 +435,7 @@ impl OperationRuntime {
             &self.store,
             base,
             &self.pipeline_projection,
+            self.tag_index_coordinator.upgrade().as_deref(),
         )?;
         Ok(DeferredOperationResult {
             commit,

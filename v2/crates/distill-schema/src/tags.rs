@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use distill_json::AuthoredValue;
 use ngp_schema::classify::{classify, Class};
 use ngp_schema::{Field, FieldIdentifier, Schema, SchemaTypeId};
-use unicode_normalization::{is_nfc, UnicodeNormalization};
+use unicode_normalization::UnicodeNormalization;
 
 const MAX_TAG_WALK_DEPTH: usize = 512;
 
@@ -256,12 +256,7 @@ fn field_name(id: &FieldIdentifier) -> Option<String> {
 
 fn canonical_identifier(path: &str, value: &str) -> Result<String, TagExtractionError> {
     let normalized = value.nfc().collect::<String>();
-    if !is_nfc(value)
-        || normalized.is_empty()
-        || normalized.len() > 255
-        || matches!(normalized.as_str(), "." | "..")
-        || normalized.contains(['/', '\\', '\0'])
-    {
+    if normalized.is_empty() || normalized.len() > 255 || normalized.contains('\0') {
         return Err(TagExtractionError::InvalidIdentifier {
             path: path.to_owned(),
             value: value.to_owned(),

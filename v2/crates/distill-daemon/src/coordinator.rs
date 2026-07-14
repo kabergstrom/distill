@@ -115,12 +115,6 @@ struct CoordinatedPipelineRuntime {
     pending: Option<PipelineEpoch>,
 }
 
-enum PipelinePublication {
-    Ready([u8; 32]),
-    SchemaAcceptanceRequired,
-    Poisoned(PipelinePoison),
-}
-
 enum ConfigurationPipelinePublication {
     Epoch {
         epoch: ValidatedPipelineEpoch,
@@ -207,6 +201,7 @@ impl DaemonCoordinator {
     pub fn attach_build_backend(self: &Arc<Self>) {
         self.server
             .install_build_backend(Arc::new(crate::build::CoordinatorBuildBackend::new(self)));
+        self.authoring.attach_tag_index_coordinator(self);
     }
 
     pub fn store(&self) -> Arc<Mutex<Store>> {
@@ -534,14 +529,27 @@ impl DaemonCoordinator {
         };
         let filesystem = Arc::new(Mutex::new(Some(filesystem)));
         let captured = Arc::clone(&filesystem);
+        let tag_epoch = schema_authority
+            .compiled_table()
+            .tag_annotation_epoch()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
+            .0;
+        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let authoring = Arc::clone(&self.authoring);
         self.server
             .coordinated_replace_target_set(base, targets, || {
-                let commit =
-                    publish_scan(&store, base, candidate, true, Some(&pipeline), &projection)
-                        .map_err(|error| error.to_string())?;
+                let mut commit = publish_scan(
+                    &store,
+                    base,
+                    candidate,
+                    true,
+                    Some(&pipeline),
+                    &projection,
+                    tag_epoch,
+                )
+                .map_err(|error| error.to_string())?;
                 let stored_pipeline = lock_store(&store)
                     .pipeline_state()
                     .map_err(|error| error.to_string())?
@@ -624,6 +632,15 @@ impl DaemonCoordinator {
                         "durable configuration pipeline state must match its prepared candidate"
                     ),
                 }
+                crate::build::refine_published_tag_index(
+                    Arc::clone(&store),
+                    self.scanner.clone(),
+                    Arc::clone(&schema_authority),
+                    runtime.host.snapshot(),
+                    &build_targets,
+                    max_dependency_depth,
+                )?
+                .apply(&mut commit);
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)
@@ -667,96 +684,116 @@ impl DaemonCoordinator {
             let _ = runtime.host.discard_unpublished(prepared);
             return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
         }
-        let publication = Arc::new(Mutex::new(None));
-        let captured = Arc::clone(&publication);
         let store = Arc::clone(&self.store);
         let tools = prepared.tool_epoch();
+        let authority = self.schema_authority().ok_or_else(|| {
+            CoordinatorError::InvalidManifest(
+                "pipeline publication requires project schema authority".to_owned(),
+            )
+        })?;
+        let tag_epoch = authority
+            .compiled_table()
+            .tag_annotation_epoch()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
+            .0;
+        let assets = lock_store(&store)
+            .all_asset_ids()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let targets = self
+            .build_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let scanner = self.scanner.clone();
+        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+        let mut prepared = Some(prepared);
         let result = self.server.coordinated_commit(base, || {
-            let mut store = lock_store(&store);
-            if store.input_version() != base {
+            let mut durable = lock_store(&store);
+            if durable.input_version() != base {
                 return Err(format!(
                     "durable pipeline basis is {:?}, expected {base:?}",
-                    store.input_version()
+                    durable.input_version()
                 ));
             }
-            store
+            durable
                 .input_transaction(|transaction| {
                     if transaction.publish_pipeline_epoch(&stored)? {
                         transaction.publish_tool_epoch(&tools)?;
                     }
+                    for asset in &assets {
+                        transaction.set_tag_index_pending(*asset, tag_epoch)?;
+                    }
                     Ok(())
                 })
                 .map_err(|error| error.to_string())?;
-            let state = store
+            let state = durable
                 .pipeline_state()
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "pipeline publication produced no durable state".to_owned())?;
-            let (diagnostic, result) = match state {
-                StoredPipelineState::Ready(epoch) => (
-                    PipelineDiagnostic::Ready,
-                    PipelinePublication::Ready(epoch.dylib_hash),
-                ),
-                StoredPipelineState::SchemaAcceptanceRequired { required, .. } => (
-                    PipelineDiagnostic::SchemaAcceptanceRequired(required.clone()),
-                    PipelinePublication::SchemaAcceptanceRequired,
-                ),
-                StoredPipelineState::Poisoned { error, .. } => (
-                    PipelineDiagnostic::Poisoned(error.clone()),
-                    PipelinePublication::Poisoned(error),
-                ),
+            drop(durable);
+            let candidate = prepared
+                .take()
+                .expect("pipeline candidate is installed once");
+            let diagnostic = match state {
+                StoredPipelineState::Ready(epoch) if epoch.dylib_hash == candidate.dylib_hash() => {
+                    let importers = EpochAuthoringImporter::all(&candidate);
+                    discard_pending(&mut runtime);
+                    runtime.host.install_ready(candidate);
+                    self.authoring
+                        .replace_pipeline_importers(importers)
+                        .expect("candidate importer metadata was prevalidated");
+                    PipelineDiagnostic::Ready
+                }
+                StoredPipelineState::Ready(_) => {
+                    let _ = runtime.host.discard_unpublished(candidate);
+                    return Err("durable pipeline hash differs from the prepared module".to_owned());
+                }
+                StoredPipelineState::SchemaAcceptanceRequired { required, .. } => {
+                    discard_pending(&mut runtime);
+                    let fence = PipelinePoison::new(
+                        PipelinePoisonCode::CandidateValidation,
+                        PipelinePoisonOrigin::CandidateOpen,
+                        CleanupDisposition::None,
+                        "pipeline candidate requires explicit schema acceptance",
+                    )
+                    .expect("schema-acceptance fence is a valid candidate poison");
+                    runtime.host.install_poison(fence);
+                    runtime.pending = Some(candidate);
+                    self.authoring.install_pipeline_importers(BTreeMap::new());
+                    PipelineDiagnostic::SchemaAcceptanceRequired(required)
+                }
+                StoredPipelineState::Poisoned { error, .. } => {
+                    let _ = runtime.host.discard_unpublished(candidate);
+                    discard_pending(&mut runtime);
+                    runtime.host.install_poison(error.clone());
+                    self.authoring.install_pipeline_importers(BTreeMap::new());
+                    PipelineDiagnostic::Poisoned(error)
+                }
             };
-            *lock_publication(&captured) = Some(result);
-            Ok(Commit {
+            let mut commit = Commit {
                 pipeline: Some(diagnostic),
                 ..Commit::default()
-            })
+            };
+            crate::build::refine_published_tag_index(
+                Arc::clone(&store),
+                scanner,
+                Arc::clone(&authority),
+                runtime.host.snapshot(),
+                &targets,
+                max_dependency_depth,
+            )?
+            .apply(&mut commit);
+            Ok(commit)
         });
-        let stamp = match result {
-            Ok(stamp) => stamp,
+        match result {
+            Ok(stamp) => Ok(stamp),
             Err(error) => {
-                let _ = runtime.host.discard_unpublished(prepared);
-                return Err(CoordinatorError::Coordinated(error));
-            }
-        };
-        match lock_publication(&publication)
-            .take()
-            .expect("coordinated pipeline publication captured its durable state")
-        {
-            PipelinePublication::Ready(hash) if hash == prepared.dylib_hash() => {
-                let importers = EpochAuthoringImporter::all(&prepared);
-                discard_pending(&mut runtime);
-                runtime.host.install_ready(prepared);
-                self.authoring
-                    .replace_pipeline_importers(importers)
-                    .expect("candidate importer metadata was prevalidated");
-            }
-            PipelinePublication::SchemaAcceptanceRequired => {
-                discard_pending(&mut runtime);
-                let fence = PipelinePoison::new(
-                    PipelinePoisonCode::CandidateValidation,
-                    PipelinePoisonOrigin::CandidateOpen,
-                    CleanupDisposition::None,
-                    "pipeline candidate requires explicit schema acceptance",
-                )
-                .expect("schema-acceptance fence is a valid candidate poison");
-                runtime.host.install_poison(fence);
-                runtime.pending = Some(prepared);
-                self.authoring.install_pipeline_importers(BTreeMap::new());
-            }
-            PipelinePublication::Poisoned(poison) => {
-                let _ = runtime.host.discard_unpublished(prepared);
-                discard_pending(&mut runtime);
-                runtime.host.install_poison(poison);
-                self.authoring.install_pipeline_importers(BTreeMap::new());
-            }
-            PipelinePublication::Ready(_) => {
-                let _ = runtime.host.discard_unpublished(prepared);
-                return Err(CoordinatorError::InvalidManifest(
-                    "durable pipeline hash differs from the prepared module".to_owned(),
-                ));
+                if let Some(candidate) = prepared.take() {
+                    let _ = runtime.host.discard_unpublished(candidate);
+                }
+                Err(CoordinatorError::Coordinated(error))
             }
         }
-        Ok(stamp)
     }
 
     /// Publish a candidate-input failure which occurs before a module can be
@@ -845,10 +882,36 @@ impl DaemonCoordinator {
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let projection = self.authoring.pipeline_projection();
+        let authority = self.schema_authority();
+        let tag_epoch = authority
+            .as_ref()
+            .and_then(|authority| authority.compiled_table().tag_annotation_epoch().ok())
+            .map_or([0; 32], |epoch| epoch.0);
+        let pipeline = self.pipeline_snapshot();
+        let build_targets = self
+            .build_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+        let scanner = self.scanner.clone();
         self.server
             .coordinated_commit(base, || {
-                publish_scan(&store, base, candidate, false, None, &projection)
-                    .map_err(|error| error.to_string())
+                let mut commit =
+                    publish_scan(&store, base, candidate, false, None, &projection, tag_epoch)
+                        .map_err(|error| error.to_string())?;
+                if let Some(authority) = authority {
+                    crate::build::refine_published_tag_index(
+                        Arc::clone(&store),
+                        scanner,
+                        authority,
+                        pipeline,
+                        &build_targets,
+                        max_dependency_depth,
+                    )?
+                    .apply(&mut commit);
+                }
+                Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)
     }
@@ -1406,6 +1469,7 @@ fn publish_scan(
     advance_configuration: bool,
     pipeline: Option<&ConfigurationPipelinePublication>,
     projection: &PipelineProjection,
+    tag_epoch: [u8; 32],
 ) -> Result<Commit, StoreError> {
     let (derived_outputs, derived_poison) = projected_derived_outputs(&candidate, projection)?;
     candidate.version_poison = VersionPoison::select_canonical(
@@ -1550,8 +1614,9 @@ fn publish_scan(
                         type_uuid: entry.type_uuid,
                         logical_hash: entry.schema_hash,
                         authoring_only: entry.authoring_only,
-                        tags: Vec::new(),
+                        tags: BTreeMap::new(),
                     })?;
+                    transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
                 }
                 if let Some(primary) = &bundle.primary {
                     transaction.set_path_entry(
@@ -1586,11 +1651,35 @@ pub(crate) fn publish_current_scan(
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
     projection: &PipelineProjection,
+    coordinator: Option<&DaemonCoordinator>,
 ) -> Result<Commit, String> {
     let scan = scanner.scan().map_err(|error| error.to_string())?;
     let candidate = ScanCandidate::build(scanner, lineage_destination, scan, None)
         .map_err(|error| error.to_string())?;
-    publish_scan(store, base, candidate, false, None, projection).map_err(|error| error.to_string())
+    let authority = coordinator.and_then(DaemonCoordinator::schema_authority);
+    let tag_epoch = authority
+        .as_ref()
+        .and_then(|authority| authority.compiled_table().tag_annotation_epoch().ok())
+        .map_or([0; 32], |epoch| epoch.0);
+    let mut commit = publish_scan(store, base, candidate, false, None, projection, tag_epoch)
+        .map_err(|error| error.to_string())?;
+    if let (Some(coordinator), Some(authority)) = (coordinator, authority) {
+        let targets = coordinator
+            .build_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        crate::build::refine_published_tag_index(
+            Arc::clone(store),
+            scanner.clone(),
+            authority,
+            coordinator.pipeline_snapshot(),
+            &targets,
+            coordinator.operational_configuration().max_dependency_depth,
+        )?
+        .apply(&mut commit);
+    }
+    Ok(commit)
 }
 
 fn rpc_commit(
@@ -1606,6 +1695,7 @@ fn rpc_commit(
         version_poison: Some(candidate.version_poison.clone()),
         lineage_repair: Some(candidate.lineage_repair.clone()),
         derived_outputs: Some(derived_outputs),
+        tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
     if candidate.version_poison.is_some() {
@@ -1634,6 +1724,11 @@ fn rpc_commit(
                 entry,
                 projection.interface(entry.type_uuid).terminal,
             )?));
+            commit
+                .tag_poisons
+                .as_mut()
+                .expect("scan commit initializes tag poisons")
+                .insert(entry.uuid, bundle.uuid);
         }
         if let Some(primary) = &bundle.primary {
             paths
@@ -1956,14 +2051,6 @@ fn lock_pipeline(
     pipeline: &Mutex<CoordinatedPipelineRuntime>,
 ) -> MutexGuard<'_, CoordinatedPipelineRuntime> {
     pipeline
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn lock_publication(
-    publication: &Mutex<Option<PipelinePublication>>,
-) -> MutexGuard<'_, Option<PipelinePublication>> {
-    publication
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

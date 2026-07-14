@@ -17,13 +17,15 @@
 //! claimed, not what the malformed bytes might claim, so a poison is
 //! scoped only by facts validated from the bytes being poisoned.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use rusqlite::OptionalExtension;
 
 use crate::db::{meta_get_blob, meta_set_blob, InputTxn, Store};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::files::RootId;
-use crate::state::VersionPoison;
+use crate::state::{InputVersion, VersionPoison};
 
 /// One `bundles` row (§13): the physical key, matching `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +84,7 @@ pub struct AssetRecord {
     pub type_uuid: TypeUuid,
     pub logical_hash: LogicalHash,
     pub authoring_only: bool,
-    pub tags: Vec<String>,
+    pub tags: BTreeMap<String, Option<String>>,
 }
 
 /// The fully validated, complete namespace skeleton a malformed file's
@@ -112,7 +114,7 @@ pub struct SkeletonEntry {
     pub local_id: String,
     pub type_uuid: TypeUuid,
     pub authoring_only: bool,
-    pub tags: Vec<String>,
+    pub tags: BTreeMap<String, Option<String>>,
 }
 
 /// What `entry()` returns (§13's `EntryMeta`).
@@ -124,7 +126,29 @@ pub struct EntryMeta {
     pub type_uuid: TypeUuid,
     pub logical_hash: LogicalHash,
     pub authoring_only: bool,
-    pub tags: Vec<String>,
+    pub tags: BTreeMap<String, Option<String>>,
+}
+
+/// Complete §10 tag-index publication for one asset. The current-schema tags
+/// and every input that could change `load_current` are replaced atomically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagIndexUpdate {
+    pub asset: AssetUuid,
+    pub tags: BTreeMap<String, Option<String>>,
+    pub tag_epoch: [u8; 32],
+    pub planner_version: Option<u32>,
+    pub dylib_hash: Option<[u8; 32]>,
+    pub trace: Vec<u8>,
+    pub poison: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagIndexState {
+    pub tag_epoch: [u8; 32],
+    pub planner_version: Option<u32>,
+    pub dylib_hash: Option<[u8; 32]>,
+    pub trace: Vec<u8>,
+    pub poison: Option<String>,
 }
 
 /// Recorded dependency kinds (§10, §13's `deps`).
@@ -215,6 +239,11 @@ impl InputTxn<'_> {
             [bundle.0.as_slice()],
         )?;
         self.txn.execute(
+            "DELETE FROM asset_tag_index WHERE asset_uuid IN
+               (SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1)",
+            [bundle.0.as_slice()],
+        )?;
+        self.txn.execute(
             "DELETE FROM assets WHERE bundle_uuid = ?1",
             [bundle.0.as_slice()],
         )?;
@@ -245,12 +274,39 @@ impl InputTxn<'_> {
             "DELETE FROM asset_tags WHERE asset_uuid = ?1",
             [rec.asset.0.as_slice()],
         )?;
-        for tag in &rec.tags {
+        for (tag, value) in &rec.tags {
             self.txn.execute(
-                "INSERT OR IGNORE INTO asset_tags(asset_uuid, tag) VALUES (?1, ?2)",
-                rusqlite::params![rec.asset.0.as_slice(), tag],
+                "INSERT OR REPLACE INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![rec.asset.0.as_slice(), tag, value],
             )?;
         }
+        self.txn.execute(
+            "DELETE FROM asset_tag_index WHERE asset_uuid = ?1",
+            [rec.asset.0.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Install the conservative half of a two-phase tag publication in the
+    /// same transaction as the asset identity. A crash before refinement is
+    /// therefore a query failure, never an empty successful index.
+    pub fn set_tag_index_pending(
+        &mut self,
+        asset: AssetUuid,
+        tag_epoch: [u8; 32],
+    ) -> Result<(), StoreError> {
+        self.txn.execute(
+            "INSERT INTO asset_tag_index(
+                asset_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
+             ) VALUES (?1, ?2, NULL, NULL, X'', 'tag indexing pending')
+             ON CONFLICT(asset_uuid) DO UPDATE SET
+                tag_epoch = excluded.tag_epoch,
+                planner_version = NULL,
+                dylib_hash = NULL,
+                trace = X'',
+                poison = excluded.poison",
+            rusqlite::params![asset.0.as_slice(), tag_epoch.as_slice()],
+        )?;
         Ok(())
     }
 
@@ -372,10 +428,10 @@ impl InputTxn<'_> {
                     i64::from(entry.authoring_only),
                 ],
             )?;
-            for tag in &entry.tags {
+            for (tag, value) in &entry.tags {
                 self.txn.execute(
-                    "INSERT OR IGNORE INTO asset_tags(asset_uuid, tag) VALUES (?1, ?2)",
-                    rusqlite::params![entry.asset.0.as_slice(), tag],
+                    "INSERT OR REPLACE INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![entry.asset.0.as_slice(), tag, value],
                 )?;
             }
         }
@@ -422,6 +478,119 @@ impl Store {
             });
         }
         Ok(())
+    }
+
+    /// Complete tag extraction after the owning input transaction has made
+    /// the candidate namespace readable but before that version is exposed by
+    /// the coordinator's RPC publication lock. This deliberately does not
+    /// advance the input version: a crash between the namespace transaction
+    /// and this refinement leaves the conservative pending poison intact.
+    pub fn refine_unpublished_tag_index(
+        &mut self,
+        expected: InputVersion,
+        updates: &[TagIndexUpdate],
+    ) -> Result<(), StoreError> {
+        if self.input_version() != expected {
+            return Err(StoreError::InvalidConfiguration {
+                error: format!(
+                    "tag-index refinement basis {:?}, current {:?}",
+                    expected,
+                    self.input_version()
+                ),
+            });
+        }
+        let mut assets = BTreeSet::new();
+        let txn = self.conn.transaction()?;
+        for update in updates {
+            if !assets.insert(update.asset) {
+                return Err(StoreError::InvalidConfiguration {
+                    error: format!("duplicate tag-index update for {}", update.asset),
+                });
+            }
+            let exists: bool = txn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)",
+                [update.asset.0.as_slice()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::InvalidConfiguration {
+                    error: format!("tag-index update names missing asset {}", update.asset),
+                });
+            }
+            if update.poison.is_some() && !update.tags.is_empty() {
+                return Err(StoreError::InvalidConfiguration {
+                    error: format!("poisoned tag-index update {} carried tags", update.asset),
+                });
+            }
+            txn.execute(
+                "DELETE FROM asset_tags WHERE asset_uuid = ?1",
+                [update.asset.0.as_slice()],
+            )?;
+            for (tag, value) in &update.tags {
+                txn.execute(
+                    "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![update.asset.0.as_slice(), tag, value],
+                )?;
+            }
+            txn.execute(
+                "INSERT INTO asset_tag_index(
+                    asset_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(asset_uuid) DO UPDATE SET
+                    tag_epoch = excluded.tag_epoch,
+                    planner_version = excluded.planner_version,
+                    dylib_hash = excluded.dylib_hash,
+                    trace = excluded.trace,
+                    poison = excluded.poison",
+                rusqlite::params![
+                    update.asset.0.as_slice(),
+                    update.tag_epoch.as_slice(),
+                    update.planner_version.map(i64::from),
+                    update.dylib_hash.map(|hash| hash.to_vec()),
+                    update.trace,
+                    update.poison,
+                ],
+            )?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn tag_index_state(&self, asset: AssetUuid) -> Result<Option<TagIndexState>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tag_epoch, planner_version, dylib_hash, trace, poison
+                 FROM asset_tag_index WHERE asset_uuid = ?1",
+                [asset.0.as_slice()],
+                |row| {
+                    let planner = row
+                        .get::<_, Option<i64>>(1)?
+                        .map(|value| u32::try_from(value).unwrap_or(u32::MAX));
+                    Ok(TagIndexState {
+                        tag_epoch: blob32(row.get(0)?),
+                        planner_version: planner,
+                        dylib_hash: row.get::<_, Option<Vec<u8>>>(2)?.map(blob32),
+                        trace: row.get(3)?,
+                        poison: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn tag_poisoned_bundles(&self, authoring_only: bool) -> Result<Vec<BundleUuid>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a ON a.asset_uuid = i.asset_uuid
+             WHERE i.poison IS NOT NULL AND a.authoring_only = ?1
+             ORDER BY a.bundle_uuid",
+        )?;
+        let rows =
+            statement.query_map([i64::from(authoring_only)], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| row.map(|bytes| BundleUuid(blob16(bytes))))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// The current version's global poison, if any (§13's
@@ -634,14 +803,15 @@ impl Store {
                 rusqlite::types::Type::Null,
             ))
         })?;
-        let mut tags: Vec<String> = {
+        let tags: BTreeMap<String, Option<String>> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT tag FROM asset_tags WHERE asset_uuid = ?1")?;
-            let rows = stmt.query_map([asset.0.as_slice()], |r| r.get(0))?;
+                .prepare("SELECT tag, value FROM asset_tags WHERE asset_uuid = ?1 ORDER BY tag")?;
+            let rows = stmt.query_map([asset.0.as_slice()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
             rows.collect::<Result<_, _>>()?
         };
-        tags.sort();
         Ok(Some(EntryMeta {
             asset,
             bundle: BundleUuid(blob16(bundle_bytes)),
@@ -737,15 +907,30 @@ impl Store {
     /// matching any poisoned bundle's entries fails naming that bundle —
     /// the same shape as §10's tag poisoning.
     pub fn assets_by_tag(&self, tag: &str) -> Result<Vec<AssetUuid>, StoreError> {
+        self.assets_by_tag_value(tag, None)
+    }
+
+    pub fn assets_by_tag_value(
+        &self,
+        tag: &str,
+        value: Option<&str>,
+    ) -> Result<Vec<AssetUuid>, StoreError> {
         self.check_version_poison()?;
+        let poisoned = self.tag_poisoned_bundles(false)?;
+        if !poisoned.is_empty() {
+            return Err(StoreError::TagIndexPoisoned { bundles: poisoned });
+        }
         let mut stmt = self.conn.prepare(
             "SELECT a.asset_uuid, b.bundle_uuid, b.poison FROM asset_tags t
              JOIN assets a ON a.asset_uuid = t.asset_uuid
              JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-             WHERE t.tag = ?1 AND a.authoring_only = 0 ORDER BY a.asset_uuid",
+             WHERE t.tag = ?1 AND (?2 IS NULL OR t.value = ?2)
+               AND a.authoring_only = 0 ORDER BY a.asset_uuid",
         )?;
         let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>)> = stmt
-            .query_map([tag], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map(rusqlite::params![tag, value], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<Result<_, _>>()?;
         let mut out = Vec::with_capacity(rows.len());
         for (asset_bytes, bundle_bytes, poison) in rows {
@@ -763,15 +948,30 @@ impl Store {
     /// Explicit tooling-only tag lookup. This surface cannot be used as a
     /// processor-input, runtime-reference, or pack-root selector.
     pub fn authoring_assets_by_tag(&self, tag: &str) -> Result<Vec<AssetUuid>, StoreError> {
+        self.authoring_assets_by_tag_value(tag, None)
+    }
+
+    pub fn authoring_assets_by_tag_value(
+        &self,
+        tag: &str,
+        value: Option<&str>,
+    ) -> Result<Vec<AssetUuid>, StoreError> {
         self.check_version_poison()?;
+        let poisoned = self.tag_poisoned_bundles(true)?;
+        if !poisoned.is_empty() {
+            return Err(StoreError::TagIndexPoisoned { bundles: poisoned });
+        }
         let mut stmt = self.conn.prepare(
             "SELECT a.asset_uuid, b.bundle_uuid, b.poison FROM asset_tags t
              JOIN assets a ON a.asset_uuid = t.asset_uuid
              JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-             WHERE t.tag = ?1 AND a.authoring_only = 1 ORDER BY a.asset_uuid",
+             WHERE t.tag = ?1 AND (?2 IS NULL OR t.value = ?2)
+               AND a.authoring_only = 1 ORDER BY a.asset_uuid",
         )?;
         let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>)> = stmt
-            .query_map([tag], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(rusqlite::params![tag, value], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<Result<_, _>>()?;
         let mut out = Vec::with_capacity(rows.len());
         for (asset_bytes, bundle_bytes, poison) in rows {

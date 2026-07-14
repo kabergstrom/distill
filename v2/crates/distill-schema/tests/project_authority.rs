@@ -230,7 +230,7 @@ fn current_schema_tag_extraction_reads_and_validates_annotated_string_values() {
         SchemaTypeId(0),
         &AuthoredValue::Object(BTreeMap::from([(
             "category".to_owned(),
-            AuthoredValue::Str("../enemy".to_owned()),
+            AuthoredValue::Str("enemy\0hidden".to_owned()),
         )])),
     );
     assert!(invalid.is_err());

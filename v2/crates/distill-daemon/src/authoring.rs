@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
 use distill_core::attestation::is_bootstrap_control_type;
@@ -45,6 +45,7 @@ pub struct AuthoringService {
     pub(crate) builtin_importers: RwLock<RegisteredImporters>,
     pub(crate) pipeline_importers: RwLock<RegisteredImporters>,
     pipeline_projection: RwLock<PipelineProjection>,
+    tag_index_coordinator: RwLock<Weak<crate::coordinator::DaemonCoordinator>>,
 }
 
 pub(crate) struct AuthoringFilesystemCandidate {
@@ -88,7 +89,27 @@ impl AuthoringService {
             builtin_importers: RwLock::new(BTreeMap::new()),
             pipeline_importers: RwLock::new(BTreeMap::new()),
             pipeline_projection: RwLock::new(PipelineProjection::default()),
+            tag_index_coordinator: RwLock::new(Weak::new()),
         })
+    }
+
+    pub(crate) fn attach_tag_index_coordinator(
+        &self,
+        coordinator: &Arc<crate::coordinator::DaemonCoordinator>,
+    ) {
+        *self
+            .tag_index_coordinator
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(coordinator);
+    }
+
+    pub(crate) fn tag_index_coordinator(
+        &self,
+    ) -> Option<Arc<crate::coordinator::DaemonCoordinator>> {
+        self.tag_index_coordinator
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
     }
 
     pub(crate) fn pipeline_projection(&self) -> PipelineProjection {
@@ -323,6 +344,7 @@ impl AuthoringService {
             &self.store,
             base,
             &self.pipeline_projection(),
+            self.tag_index_coordinator().as_deref(),
         )
         .map_err(invalid)
     }

@@ -654,6 +654,51 @@ fn authoring_payload_decoder_materializes_authenticated_blob_bytes() {
 }
 
 #[test]
+fn tag_queries_fail_when_other_selectors_could_include_a_poisoned_entry() {
+    let server = server_with(&[(1, false), (2, false)]);
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    server
+        .commit(Commit {
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            tag_poisons: Some(BTreeMap::from([(entry.uuid, entry.bundle)])),
+            ..Commit::default()
+        })
+        .unwrap();
+    let hub = connect(&server, &[(1, false), (2, false)]);
+    let pinned = snapshot(&hub);
+    assert_eq!(
+        pinned.query(AssetQuery {
+            tag: Some(TagSelector {
+                tag: "group".to_owned(),
+                value: Some("group-1".to_owned()),
+            }),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Failure(RpcFailure::TagIndexPoisoned {
+            bundles: vec![entry.bundle],
+        })
+    );
+    assert_eq!(
+        pinned.query(AssetQuery {
+            authored_type: Some(type_id(2)),
+            tag: Some(TagSelector {
+                tag: "group".to_owned(),
+                value: None,
+            }),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Success(Vec::new())
+    );
+    assert_eq!(
+        pinned.query(AssetQuery {
+            authored_type: Some(type_id(1)),
+            ..AssetQuery::default()
+        }),
+        RpcResult::Success(vec![entry.uuid])
+    );
+}
+
+#[test]
 fn authoring_commit_authenticates_schema_and_exact_blob_index_coverage() {
     let server = server_with(&[(1, false)]);
     let valid = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);

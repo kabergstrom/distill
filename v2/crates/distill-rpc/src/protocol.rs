@@ -987,6 +987,9 @@ pub enum RpcFailure {
     InvalidQuery {
         detail: String,
     },
+    TagIndexPoisoned {
+        bundles: Vec<BundleUuid>,
+    },
     StaleInputVersion {
         expected: InputVersion,
         got: InputVersion,
@@ -2018,6 +2021,14 @@ pub struct Commit {
     /// `Some` replaces the complete derived-output namespace for the new
     /// immutable version. `None` preserves it for metadata-only commits.
     pub derived_outputs: Option<BTreeMap<AssetUuid, DerivedOutputEntry>>,
+    /// `Some` replaces the complete per-entry §10 tag-poison projection.
+    /// A tag query whose other selectors could include one of these assets
+    /// fails instead of returning an under-approximation.
+    pub tag_poisons: Option<BTreeMap<AssetUuid, BundleUuid>>,
+    /// Complete value-bearing tag replacement independent of authored-value
+    /// mutations. Pipeline-only publications use this to reindex the current
+    /// namespace without replaying unrelated identity rows.
+    pub tag_projection: Option<BTreeMap<AssetUuid, BTreeMap<String, Option<String>>>>,
     pub configuration: Option<ConfigurationStatus>,
     pub pipeline: Option<PipelineDiagnostic>,
     /// `Some(None)` heals version poison; `Some(Some(_))` publishes it.

@@ -34,12 +34,12 @@ use distill_migrate::{
 };
 use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactPayload, AssetReferenceQuery,
-    BuildArtifactPublication, BuildBackend, BuildBackendOutcome, BuildPublication, BuildRequest,
-    BuildWireTree, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow,
-    ServedLoadEdge,
+    AuthoringMutation, BuildArtifactPublication, BuildBackend, BuildBackendOutcome,
+    BuildPublication, BuildRequest, BuildWireTree, Commit, DriftedInput,
+    PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow, ServedLoadEdge,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
-use distill_store::bundles::{BundleMeta, EntryMeta};
+use distill_store::bundles::{BundleMeta, EntryMeta, TagIndexUpdate};
 use distill_store::cas::record::{
     FailureCause as StoreFailureCause, FailureFingerprint as StoreFailureFingerprint, KeyKind,
     LocalFailureClass as StoreLocalFailureClass,
@@ -60,6 +60,23 @@ use crate::scanner::RootedScanner;
 use crate::scheduler::WorkClass;
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
+
+pub(crate) struct PublishedTagIndex {
+    tags: BTreeMap<AssetUuid, BTreeMap<String, Option<String>>>,
+    poisons: BTreeMap<AssetUuid, BundleUuid>,
+}
+
+impl PublishedTagIndex {
+    pub(crate) fn apply(self, commit: &mut Commit) {
+        for mutation in &mut commit.authoring {
+            if let AuthoringMutation::Set(entry) = mutation {
+                entry.tags = self.tags.get(&entry.uuid).cloned().unwrap_or_default();
+            }
+        }
+        commit.tag_projection = Some(self.tags);
+        commit.tag_poisons = Some(self.poisons);
+    }
+}
 
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
@@ -651,6 +668,252 @@ fn build(
         root_content_hash: selected.content_hash,
         artifacts: root.artifacts.into_values().collect(),
         wire_trees: root.wire_trees.into_values().collect(),
+    })
+}
+
+/// Finish §10 tag indexing against a namespace that has advanced durably but
+/// is still hidden behind the coordinator's RPC publication lock.
+pub(crate) fn refine_published_tag_index(
+    store_handle: Arc<Mutex<Store>>,
+    scanner: RootedScanner,
+    authority: Arc<ProjectSchemaAuthority>,
+    pipeline: PipelineSnapshot,
+    targets: &BTreeMap<String, Target>,
+    max_depth: usize,
+) -> Result<PublishedTagIndex, String> {
+    let tag_epoch = authority
+        .compiled_table()
+        .tag_annotation_epoch()
+        .map_err(|error| format!("cannot derive DSTA for tag publication: {error}"))?
+        .0;
+    let (store_instance, basis, assets, tools, execution_root) = {
+        let store = store_handle
+            .lock()
+            .map_err(|_| "durable store mutex is poisoned".to_owned())?;
+        (
+            store.instance_id(),
+            store.input_version(),
+            store
+                .all_asset_ids()
+                .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
+            PinnedToolEpoch::capture(&store, store.input_version())
+                .map_err(|error| format!("pin tag-index tools: {error:?}"))?,
+            store.state_path().join("tag-index-runs"),
+        )
+    };
+    let epoch = pipeline.epoch();
+    let ready = epoch.ok();
+    let target = targets.values().next().cloned();
+    let registry = match (ready, target.as_ref()) {
+        (Some(epoch), Some(_)) => Some(
+            PipelineRegistry::new(
+                epoch
+                    .processor_descriptors()
+                    .into_iter()
+                    .map(|descriptor| {
+                        ProcessorRegistration::new(
+                            &descriptor.id,
+                            descriptor.version,
+                            descriptor.input,
+                            descriptor.selector,
+                            descriptor.outputs,
+                            epoch.dylib_hash(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("tag-index pipeline map: {error:?}"))?,
+            )
+            .map_err(|error| format!("tag-index pipeline map: {error:?}"))?,
+        ),
+        _ => None,
+    };
+
+    let mut tags = BTreeMap::new();
+    let mut poisons = BTreeMap::new();
+    let mut updates = Vec::with_capacity(assets.len());
+    if let (Some(epoch), Some(target), Some(registry)) = (ready, target, registry) {
+        let dylib_hash = epoch.dylib_hash();
+        let target_definition = distill_build::keys::target_definition_hash(&target, &[]);
+        let mut context = BuildContext {
+            store: Arc::clone(&store_handle),
+            store_instance,
+            drifted_input: DriftedInput::Dylib,
+            scanner: scanner.clone(),
+            authority: Arc::clone(&authority),
+            pipeline: pipeline.clone(),
+            registry,
+            target,
+            target_definition,
+            dylib_hash,
+            basis,
+            tools,
+            execution_root,
+            max_depth,
+            visiting: BTreeSet::new(),
+            callback_chain: Vec::new(),
+            memo: BTreeMap::new(),
+        };
+        for asset in assets {
+            let indexed = index_one_tag_entry(&mut context, asset, tag_epoch);
+            match indexed {
+                Ok(update) => {
+                    tags.insert(asset, update.tags.clone());
+                    updates.push(update);
+                }
+                Err((bundle, error, trace, migrated)) => {
+                    poisons.insert(asset, bundle);
+                    updates.push(TagIndexUpdate {
+                        asset,
+                        tags: BTreeMap::new(),
+                        tag_epoch,
+                        planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
+                        dylib_hash: migrated.then_some(dylib_hash),
+                        trace,
+                        poison: Some(error),
+                    });
+                }
+            }
+        }
+    } else {
+        let unavailable = pipeline.epoch().err().map_or_else(
+            || "no build target is published".to_owned(),
+            |error| error.to_string(),
+        );
+        let store = store_handle
+            .lock()
+            .map_err(|_| "durable store mutex is poisoned".to_owned())?;
+        for asset in assets {
+            let direct = (|| {
+                let loaded = load_asset(&store, &scanner, asset)
+                    .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), false))?;
+                let bundle = loaded.meta.bundle;
+                let project = authority
+                    .project_type(loaded.entry.type_uuid)
+                    .ok_or_else(|| {
+                        (
+                            bundle,
+                            format!(
+                                "type {} has no project schema authority",
+                                loaded.entry.type_uuid
+                            ),
+                            false,
+                        )
+                    })?;
+                let migrated = loaded.entry.schema_hash != project.logical_hash;
+                if migrated {
+                    return Err((bundle, format!("tag load unavailable: {unavailable}"), true));
+                }
+                distill_schema::extract_search_tags(
+                    authority.schema(),
+                    project.schema_type,
+                    &loaded.entry.data,
+                )
+                .map_err(|error| (bundle, error.to_string(), false))
+            })();
+            match direct {
+                Ok(extracted) => {
+                    let extracted = extracted
+                        .into_iter()
+                        .map(|(name, value)| (name, Some(value)))
+                        .collect::<BTreeMap<_, _>>();
+                    tags.insert(asset, extracted.clone());
+                    updates.push(TagIndexUpdate {
+                        asset,
+                        tags: extracted,
+                        tag_epoch,
+                        planner_version: None,
+                        dylib_hash: None,
+                        trace: Vec::new(),
+                        poison: None,
+                    });
+                }
+                Err((bundle, error, migrated)) => {
+                    poisons.insert(asset, bundle);
+                    updates.push(TagIndexUpdate {
+                        asset,
+                        tags: BTreeMap::new(),
+                        tag_epoch,
+                        planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
+                        dylib_hash: None,
+                        trace: Vec::new(),
+                        poison: Some(error),
+                    });
+                }
+            }
+        }
+    }
+    store_handle
+        .lock()
+        .map_err(|_| "durable store mutex is poisoned".to_owned())?
+        .refine_unpublished_tag_index(basis, &updates)
+        .map_err(|error| format!("publish tag index: {error}"))?;
+    Ok(PublishedTagIndex { tags, poisons })
+}
+
+fn index_one_tag_entry(
+    context: &mut BuildContext,
+    asset: AssetUuid,
+    tag_epoch: [u8; 32],
+) -> Result<TagIndexUpdate, (BundleUuid, String, Vec<u8>, bool)> {
+    let loaded = {
+        let store = lock_build_store(context)
+            .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), Vec::new(), false))?;
+        load_asset(&store, &context.scanner, asset)
+            .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), Vec::new(), false))?
+    };
+    let bundle = loaded.meta.bundle;
+    let Some(project) = context
+        .authority
+        .project_type(loaded.entry.type_uuid)
+        .cloned()
+    else {
+        return Err((
+            bundle,
+            format!(
+                "type {} has no project schema authority",
+                loaded.entry.type_uuid
+            ),
+            Vec::new(),
+            false,
+        ));
+    };
+    let migrated = loaded.entry.schema_hash != project.logical_hash;
+    let source = capture_trace_source(context)
+        .map_err(|error| (bundle, format!("{error:?}"), Vec::new(), migrated))?;
+    let mut trace = Vec::new();
+    let current =
+        load_current_value(context, &loaded, &project, &source, &mut trace).map_err(|error| {
+            (
+                bundle,
+                format!("{error:?}"),
+                trace_payload_bytes(&trace),
+                migrated,
+            )
+        })?;
+    let extracted = distill_schema::extract_search_tags(
+        context.authority.schema(),
+        project.schema_type,
+        &current,
+    )
+    .map_err(|error| {
+        (
+            bundle,
+            error.to_string(),
+            trace_payload_bytes(&trace),
+            migrated,
+        )
+    })?
+    .into_iter()
+    .map(|(name, value)| (name, Some(value)))
+    .collect();
+    Ok(TagIndexUpdate {
+        asset,
+        tags: extracted,
+        tag_epoch,
+        planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
+        dylib_hash: migrated.then_some(context.dylib_hash),
+        trace: trace_payload_bytes(&trace),
+        poison: None,
     })
 }
 
@@ -2745,7 +3008,7 @@ struct TraceEntry {
     authored_type: TypeUuid,
     terminal_type: TypeUuid,
     role: EntryRole,
-    tags: Vec<String>,
+    tags: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Clone)]
@@ -2758,6 +3021,7 @@ struct StoreTraceSource {
     capabilities: Vec<(CapabilityKey, [u8; 32])>,
     migration_controls: BTreeMap<AssetUuid, MigrationControlRecord>,
     content_hashes: BTreeMap<AssetUuid, ContentHash>,
+    tag_poisons: BTreeMap<AssetUuid, BundleUuid>,
 }
 
 struct TraceCaptureBasis<'a> {
@@ -2902,18 +3166,20 @@ impl StoreTraceSource {
             .map(|bundle| (bundle.bundle, bundle.path))
             .collect::<BTreeMap<_, _>>();
         let mut entries = BTreeMap::new();
+        let mut tag_poisons = BTreeMap::new();
         for asset in store.all_asset_ids().map_err(BuildError::infrastructure)? {
             let Some(entry) = store.entry(asset).map_err(BuildError::failed)? else {
                 continue;
             };
-            let bundle_path = bundles.get(&entry.bundle).cloned().ok_or_else(|| {
+            let bundle = entry.bundle;
+            let bundle_path = bundles.get(&bundle).cloned().ok_or_else(|| {
                 BuildError::Infrastructure("trace entry owner bundle is missing".to_owned())
             })?;
             entries.insert(
                 asset,
                 TraceEntry {
                     asset,
-                    bundle: entry.bundle,
+                    bundle,
                     bundle_path,
                     local_id: entry.local_id,
                     authored_type: entry.type_uuid,
@@ -2930,6 +3196,13 @@ impl StoreTraceSource {
                     tags: entry.tags,
                 },
             );
+            if store
+                .tag_index_state(asset)
+                .map_err(BuildError::infrastructure)?
+                .is_some_and(|state| state.poison.is_some())
+            {
+                tag_poisons.insert(asset, bundle);
+            }
         }
         let mut paths = BTreeMap::<String, Vec<AssetUuid>>::new();
         for (path, _, asset) in store
@@ -3012,6 +3285,7 @@ impl StoreTraceSource {
             capabilities,
             migration_controls,
             content_hashes,
+            tag_poisons,
         })
     }
 
@@ -3064,7 +3338,11 @@ impl StoreTraceSource {
             })
             .filter(|entry| {
                 query.tag.as_ref().is_none_or(|tag| {
-                    tag.value.is_none() && entry.tags.iter().any(|actual| actual == &tag.tag)
+                    entry.tags.get(&tag.tag).is_some_and(|actual| {
+                        tag.value
+                            .as_ref()
+                            .is_none_or(|wanted| actual.as_ref() == Some(wanted))
+                    })
                 })
             })
             .filter(|entry| {
@@ -3120,6 +3398,18 @@ impl TraceSource for StoreTraceSource {
     }
 
     fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]> {
+        if query.tag.is_some() {
+            let mut without_tag = query.clone();
+            without_tag.tag = None;
+            let candidates = self.query_results(&without_tag);
+            if let Some(bundle) = candidates
+                .iter()
+                .filter_map(|asset| self.tag_poisons.get(asset))
+                .min()
+            {
+                return Observed::Err(StableFailureFingerprint::Poisoned { bundle: *bundle });
+            }
+        }
         Observed::Ok(asset_query_result_hash(&self.query_results(query)))
     }
 
@@ -3762,7 +4052,7 @@ mod tests {
             })
             .unwrap();
         coordinator.install_schema_authority_for_test(authority.clone());
-        coordinator.install_build_target_for_test("dev", build_target);
+        coordinator.install_build_target_for_test("dev", build_target.clone());
         let calls = Arc::new(AtomicUsize::new(0));
         coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch(
             "dev",
@@ -3776,6 +4066,25 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
+        refine_published_tag_index(
+            coordinator.store(),
+            coordinator.scanner(),
+            Arc::clone(&authority),
+            coordinator.pipeline_snapshot(),
+            &BTreeMap::from([("dev".to_owned(), build_target)]),
+            64,
+        )
+        .unwrap();
+        let indexed = coordinator
+            .store()
+            .lock()
+            .unwrap()
+            .tag_index_state(ASSET)
+            .unwrap()
+            .unwrap();
+        assert_eq!(indexed.planner_version, Some(MIGRATION_PLANNER_VERSION));
+        assert!(indexed.dylib_hash.is_some());
+        assert!(indexed.poison.is_none());
         let mut request = BuildRequest {
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
@@ -4163,7 +4472,7 @@ mod tests {
                     authored_type: TYPE,
                     terminal_type: TYPE,
                     role: EntryRole::Runtime,
-                    tags: Vec::new(),
+                    tags: BTreeMap::new(),
                 },
             )]),
             terminal_types: BTreeMap::from([(ASSET, TYPE)]),
@@ -4173,6 +4482,7 @@ mod tests {
             capabilities: Vec::new(),
             migration_controls: BTreeMap::new(),
             content_hashes: BTreeMap::new(),
+            tag_poisons: BTreeMap::new(),
         };
         let mut trace = Vec::new();
         assert_eq!(
@@ -4217,6 +4527,7 @@ mod tests {
             capabilities: Vec::new(),
             migration_controls: BTreeMap::new(),
             content_hashes: BTreeMap::new(),
+            tag_poisons: BTreeMap::new(),
         };
         let value = AuthoredValue::Str(missing.to_string());
         let mut trace = Vec::new();

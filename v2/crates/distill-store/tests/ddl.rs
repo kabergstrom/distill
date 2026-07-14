@@ -66,6 +66,7 @@ fn every_section_13_table_exists() {
         "bundles",
         "assets",
         "asset_tags",
+        "asset_tag_index",
         "path_index",
         "deps",
         "schemas",
@@ -181,7 +182,18 @@ fn assets_row_shape() {
             "logical_hash"
         ]
     );
-    assert_eq!(columns(&conn, "asset_tags"), ["asset_uuid", "tag"]);
+    assert_eq!(columns(&conn, "asset_tags"), ["asset_uuid", "tag", "value"]);
+    assert_eq!(
+        columns(&conn, "asset_tag_index"),
+        [
+            "asset_uuid",
+            "tag_epoch",
+            "planner_version",
+            "dylib_hash",
+            "trace",
+            "poison"
+        ]
+    );
 }
 
 #[test]

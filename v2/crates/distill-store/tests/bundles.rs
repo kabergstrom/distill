@@ -6,13 +6,14 @@
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{
     AssetRecord, BundleMeta, DepKind, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
-    SkeletonEntry,
+    SkeletonEntry, TagIndexUpdate,
 };
 use distill_store::files::RootId;
 use distill_store::state::{
     ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
+use std::collections::BTreeMap;
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -54,7 +55,7 @@ fn asset_record(asset_n: u8, bundle_n: u8, tags: &[&str]) -> AssetRecord {
         type_uuid: TypeUuid([9u8; 16]),
         logical_hash: LogicalHash([8u8; 32]),
         authoring_only: false,
-        tags: tags.iter().map(|s| s.to_string()).collect(),
+        tags: tags.iter().map(|tag| ((*tag).to_owned(), None)).collect(),
     }
 }
 
@@ -88,9 +89,10 @@ fn bundle_and_asset_rows_roundtrip() {
     assert_eq!(entry.local_id, "entry-10");
     assert_eq!(entry.type_uuid, TypeUuid([9u8; 16]));
     assert_eq!(entry.logical_hash, LogicalHash([8u8; 32]));
-    let mut tags = entry.tags.clone();
-    tags.sort();
-    assert_eq!(tags, ["hero", "texture"]);
+    assert_eq!(
+        entry.tags,
+        BTreeMap::from([("hero".to_owned(), None), ("texture".to_owned(), None)])
+    );
 
     assert!(store.entry(AssetUuid([99u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([99u8; 16])).unwrap().is_none());
@@ -205,7 +207,51 @@ fn upsert_asset_replaces_tags_wholesale() {
         .input_transaction(|txn| txn.upsert_asset(&asset_record(10, 1, &["updated"])))
         .unwrap();
     let entry = store.entry(AssetUuid([10u8; 16])).unwrap().unwrap();
-    assert_eq!(entry.tags, ["updated"]);
+    assert_eq!(entry.tags, BTreeMap::from([("updated".to_owned(), None)]));
+}
+
+#[test]
+fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates() {
+    let (_d, mut store) = store();
+    seed(&mut store);
+    let (_, version) = store
+        .input_transaction(|txn| txn.set_tag_index_pending(AssetUuid([10; 16]), [7; 32]))
+        .unwrap();
+    assert!(matches!(
+        store.assets_by_tag("anything"),
+        Err(StoreError::TagIndexPoisoned { bundles }) if bundles == [BundleUuid([1; 16])]
+    ));
+
+    store
+        .refine_unpublished_tag_index(
+            version,
+            &[TagIndexUpdate {
+                asset: AssetUuid([10; 16]),
+                tags: BTreeMap::from([("category".to_owned(), Some("enemy".to_owned()))]),
+                tag_epoch: [7; 32],
+                planner_version: Some(1),
+                dylib_hash: Some([8; 32]),
+                trace: vec![1, 2, 3],
+                poison: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .assets_by_tag_value("category", Some("enemy"))
+            .unwrap(),
+        [AssetUuid([10; 16])]
+    );
+    assert!(store
+        .assets_by_tag_value("category", Some("friend"))
+        .unwrap()
+        .is_empty());
+    let state = store.tag_index_state(AssetUuid([10; 16])).unwrap().unwrap();
+    assert_eq!(state.tag_epoch, [7; 32]);
+    assert_eq!(state.planner_version, Some(1));
+    assert_eq!(state.dylib_hash, Some([8; 32]));
+    assert_eq!(state.trace, [1, 2, 3]);
+    assert_eq!(state.poison, None);
 }
 
 #[test]
@@ -377,7 +423,7 @@ fn skeleton_entry(asset_n: u8, tags: &[&str]) -> SkeletonEntry {
         local_id: format!("entry-{asset_n}"),
         type_uuid: TypeUuid([9u8; 16]),
         authoring_only: false,
-        tags: tags.iter().map(|s| s.to_string()).collect(),
+        tags: tags.iter().map(|tag| ((*tag).to_owned(), None)).collect(),
     }
 }
 
