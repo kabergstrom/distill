@@ -1,9 +1,26 @@
+use distill_core::attestation::BOOTSTRAP_CONTROL_SPEC_V1_BYTES;
+use distill_schema::bootstrap_builtins_v1::generated_bootstrap_control_spec_v1;
 use distill_schema::bootstrap_gen_v1::{
     check_bootstrap_generation_v1, consumer_bootstrap_authority_v1,
     consumer_compilation_identity_v1, decode_generator_input_v1,
     generate_bootstrap_table_artifact_v1, local_generator_input_bytes_v1,
     EMBEDDED_CONSUMER_BOOTSTRAP_RESOURCE_NAME_V1,
 };
+
+#[test]
+fn pack_definition_roots_carry_the_authoring_only_selector() {
+    let needle = b"authoring_only";
+    let generated = generated_bootstrap_control_spec_v1()
+        .unwrap()
+        .encode()
+        .unwrap();
+    assert!(generated.windows(needle.len()).any(|row| row == needle));
+    assert!(
+        BOOTSTRAP_CONTROL_SPEC_V1_BYTES
+            .windows(needle.len())
+            .any(|row| row == needle)
+    );
+}
 
 #[test]
 fn real_generator_is_byte_deterministic_and_exactly_dsci_keyed() {
@@ -29,8 +46,8 @@ fn real_generator_is_byte_deterministic_and_exactly_dsci_keyed() {
     assert_eq!(
         *blake3::hash(first.bytes()).as_bytes(),
         [
-            171, 95, 137, 13, 223, 32, 218, 223, 30, 117, 100, 52, 163, 173, 70, 25, 64, 100,
-            231, 84, 19, 53, 164, 88, 237, 97, 245, 139, 201, 50, 189, 210,
+            224, 127, 89, 107, 28, 163, 108, 146, 88, 123, 215, 172, 159, 253, 68, 121, 184,
+            227, 8, 27, 9, 218, 136, 226, 115, 152, 58, 46, 59, 227, 249, 38,
         ]
     );
 }

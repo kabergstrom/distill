@@ -36,6 +36,7 @@ pub struct AssetQueryV1 {
     pub tag: Option<TagSelectorV1>,
     pub path_prefix: Option<String>,
     pub path_glob: Option<String>,
+    pub authoring_only: Option<bool>,
 }
 
 #[asset(uuid = "b0000000-0000-4000-8000-000000000002")]

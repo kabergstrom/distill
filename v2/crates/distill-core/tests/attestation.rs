@@ -324,12 +324,12 @@ fn dsta_changes_only_with_the_exact_tag_projection() {
 fn embedded_bootstrap_spec_is_closed_canonical_and_byte_pinned() {
     let spec = BootstrapControlSpecV1::embedded().unwrap();
     assert_eq!(spec.type_uuids(), BOOTSTRAP_CONTROL_TYPE_UUIDS);
-    assert_eq!(BOOTSTRAP_CONTROL_SPEC_V1_BYTES.len(), 6_633);
+    assert_eq!(BOOTSTRAP_CONTROL_SPEC_V1_BYTES.len(), 6_665);
     assert_eq!(
         *blake3::hash(BOOTSTRAP_CONTROL_SPEC_V1_BYTES).as_bytes(),
         [
-            224, 249, 146, 111, 7, 217, 173, 146, 202, 8, 99, 38, 123, 147, 63, 164, 124, 126, 194,
-            112, 37, 56, 212, 238, 221, 220, 211, 95, 192, 45, 118, 136,
+            218, 81, 157, 37, 74, 13, 180, 254, 227, 76, 81, 7, 128, 165, 194, 121, 236, 68,
+            227, 76, 50, 219, 246, 41, 164, 225, 35, 213, 34, 229, 91, 230,
         ]
     );
     assert!(BOOTSTRAP_CONTROL_TYPE_UUIDS

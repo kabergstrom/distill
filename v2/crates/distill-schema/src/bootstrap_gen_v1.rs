@@ -31,9 +31,9 @@ pub const BOOTSTRAP_TABLE_VERSION_V1: u8 = 1;
 // A literal, target-native fixture generated on the checked-in toolchain.
 // Per-target fixtures use different DSCI keys; no runtime fallback exists.
 pub const EMBEDDED_CONSUMER_BOOTSTRAP_RESOURCE_NAME_V1: &str =
-    "bootstrap/control-table-v1/8a1e7525705b5b5eb81e10afc0435b0a2a58c4995dd5a31637ec4878e196247c.dsca";
+    "bootstrap/control-table-v1/d9ddc71fcabf0e0ce5f67c73b6d30b760c8dff9df04362cfe072488411cc7e65.dsca";
 const EMBEDDED_CONSUMER_BOOTSTRAP_RESOURCE_V1: &[u8] = include_bytes!(
-    "../bootstrap/control-table-v1/8a1e7525705b5b5eb81e10afc0435b0a2a58c4995dd5a31637ec4878e196247c.dsca"
+    "../bootstrap/control-table-v1/d9ddc71fcabf0e0ce5f67c73b6d30b760c8dff9df04362cfe072488411cc7e65.dsca"
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +190,7 @@ pub fn consumer_compilation_identity_v1() -> &'static CompilationIdentity {
         )
         .to_owned(),
         source_fingerprint: decode_hex_32(
-            "b096d53c63c3bb239c4c39e8b86568234f7fc8b65f00cb0e37800fcd3cdf089d",
+            "aeab7b481d6e37c1e4289ef0bba5c126c8a50e34bc1998883125d4c346ca73fc",
         ),
         features: BTreeSet::from([(
             "distill-schema".to_owned(),
