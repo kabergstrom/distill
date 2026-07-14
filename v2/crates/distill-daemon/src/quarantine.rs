@@ -70,6 +70,7 @@ impl From<StoreError> for QuarantineError {
 
 /// Maps every daemon-owned/watched filesystem root to a quarantine directory
 /// on that filesystem. Longest-root matching makes nested roots deterministic.
+#[derive(Clone)]
 pub struct QuarantineDriver {
     roots: Vec<QuarantineRoot>,
 }

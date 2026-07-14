@@ -61,13 +61,13 @@ struct ServerOperationCompletion {
     server: Server,
     connection: Arc<Mutex<ConnectionState>>,
     base: InputVersion,
-    commit: Mutex<Option<Commit>>,
+    publication: Mutex<Option<PreparedOperationPublication>>,
 }
 
 impl ProgressCompletion for ServerOperationCompletion {
     fn complete(&self) -> Result<(), String> {
-        let commit = self
-            .commit
+        let publication = self
+            .publication
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take()
@@ -80,13 +80,21 @@ impl ProgressCompletion for ServerOperationCompletion {
             ));
         }
         drop(connection);
+        let (commit, terminal_error) = match publication {
+            PreparedOperationPublication::Immediate(commit) => (*commit, None),
+            PreparedOperationPublication::Deferred(operation) => {
+                let completed = operation.complete(self.base)?;
+                (completed.commit, completed.terminal_error)
+            }
+        };
         commit_locked(&mut state, commit)
             .map(|_| ())
-            .map_err(|error| format!("long-running operation commit rejected: {error:?}"))
+            .map_err(|error| format!("long-running operation commit rejected: {error:?}"))?;
+        terminal_error.map_or(Ok(()), Err)
     }
 
     fn cancel(&self) -> bool {
-        self.commit
+        self.publication
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take()
@@ -1900,7 +1908,7 @@ impl Hub {
                 server: self.server.clone(),
                 connection: self.connection.clone(),
                 base,
-                commit: Mutex::new(Some(prepared.commit)),
+                publication: Mutex::new(Some(prepared.publication)),
             }),
         })
     }

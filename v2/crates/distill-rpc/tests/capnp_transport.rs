@@ -164,9 +164,9 @@ impl AuthoringBackend for RecordingAuthoringBackend {
             | LongRunningOp::DiskMigration(payload)
             | LongRunningOp::Doctor(payload) => payload.clone(),
         };
-        Ok(PreparedOperationCommit {
-            commit: Commit::default(),
-            progress: vec![
+        Ok(PreparedOperationCommit::immediate(
+            Commit::default(),
+            vec![
                 AuthoringProgressEvent {
                     sequence: 0,
                     state: AuthoringProgressState::Started,
@@ -183,7 +183,7 @@ impl AuthoringBackend for RecordingAuthoringBackend {
                     payload: Arc::from([]),
                 },
             ],
-        })
+        ))
     }
 }
 

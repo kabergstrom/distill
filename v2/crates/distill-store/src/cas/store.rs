@@ -518,6 +518,29 @@ impl Store {
         Ok(bytes)
     }
 
+    /// Full doctor verification of every indexed CAS extent. Each record is
+    /// read through the ordinary hash-checking path, so an index/segment drift
+    /// cannot be reported healthy merely because its framing still decodes.
+    pub fn verify_all_cas_extents(&self) -> Result<usize, StoreError> {
+        let hashes = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT content_hash FROM cas_extents ORDER BY content_hash")?;
+            let hashes = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                .map(|row| {
+                    let bytes = row?;
+                    bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+                })
+                .collect::<Result<Vec<[u8; 32]>, _>>()?;
+            hashes
+        };
+        for hash in &hashes {
+            self.cas_read(hash)?;
+        }
+        Ok(hashes.len())
+    }
+
     pub(crate) fn read_extent(
         &self,
         segment: u64,

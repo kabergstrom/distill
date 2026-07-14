@@ -1541,8 +1541,24 @@ impl Store {
             .into_iter()
             .filter(|e| e.quarantined_at < cutoff)
             .collect::<Vec<_>>();
+        self.clean_displaced_entries(&expired, now_secs, "retention-expired")
+    }
+
+    /// Explicit `doctor clean`: destroy every retained displacement while
+    /// keeping its row as permanent named audit history.
+    pub fn clean_all_displaced(&mut self, now_secs: i64) -> Result<usize, StoreError> {
+        let entries = self.quarantined_entries()?;
+        self.clean_displaced_entries(&entries, now_secs, "doctor-clean")
+    }
+
+    fn clean_displaced_entries(
+        &mut self,
+        entries: &[DisplacedEntry],
+        now_secs: i64,
+        reason: &str,
+    ) -> Result<usize, StoreError> {
         let mut touched_dirs = std::collections::BTreeSet::new();
-        for entry in &expired {
+        for entry in entries {
             match std::fs::remove_file(&entry.path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1554,9 +1570,9 @@ impl Store {
                 }
             }
             self.conn.execute(
-                "UPDATE displaced SET cleaned_at = ?2, cleanup_reason = 'retention-expired'
+                "UPDATE displaced SET cleaned_at = ?2, cleanup_reason = ?3
                  WHERE displacement_id = ?1",
-                rusqlite::params![entry.displacement_id, now_secs],
+                rusqlite::params![entry.displacement_id, now_secs, reason],
             )?;
             if let Some(parent) = entry.path.parent() {
                 touched_dirs.insert(parent.to_path_buf());
@@ -1565,7 +1581,7 @@ impl Store {
         for dir in touched_dirs {
             crate::cas::manifest::fsync_dir(&dir)?;
         }
-        Ok(expired.len())
+        Ok(entries.len())
     }
 }
 

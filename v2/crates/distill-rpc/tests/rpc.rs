@@ -223,9 +223,9 @@ impl AuthoringBackend for RecordingAuthoringBackend {
             | LongRunningOp::DiskMigration(payload)
             | LongRunningOp::Doctor(payload) => payload.clone(),
         };
-        Ok(PreparedOperationCommit {
-            commit: Commit::default(),
-            progress: vec![
+        Ok(PreparedOperationCommit::immediate(
+            Commit::default(),
+            vec![
                 AuthoringProgressEvent {
                     sequence: 0,
                     state: AuthoringProgressState::Started,
@@ -242,7 +242,7 @@ impl AuthoringBackend for RecordingAuthoringBackend {
                     payload: Arc::from([]),
                 },
             ],
-        })
+        ))
     }
 
     fn prepare_resolve_duplicate_lineage(
@@ -2522,6 +2522,44 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
             ..AssetQuery::default()
         }),
         reconnect,
+    );
+}
+
+#[test]
+fn long_running_operation_payloads_are_canonical_and_closed() {
+    let rename = RenameWithFixupsRequest {
+        bundle: BundleUuid([9; 16]),
+        destination_root: "assets".into(),
+        destination_path: "renamed/item.bundle".into(),
+    };
+    assert_eq!(
+        RenameWithFixupsRequest::decode(&rename.encode()).unwrap(),
+        rename
+    );
+
+    let migration = DiskMigrationRequest {
+        bundles: vec![BundleUuid([1; 16]), BundleUuid([2; 16])],
+    };
+    let encoded = migration.encode().unwrap();
+    assert_eq!(DiskMigrationRequest::decode(&encoded).unwrap(), migration);
+    assert_eq!(
+        DiskMigrationRequest {
+            bundles: vec![BundleUuid([2; 16]), BundleUuid([1; 16])],
+        }
+        .encode(),
+        Err(OperationPayloadError::NonCanonicalOrder)
+    );
+
+    for request in [
+        DoctorRequest::Verify,
+        DoctorRequest::Clean,
+        DoctorRequest::RebuildIndexes,
+    ] {
+        assert_eq!(DoctorRequest::decode(&request.encode()).unwrap(), request);
+    }
+    assert_eq!(
+        DoctorRequest::decode(&[1, 99]),
+        Err(OperationPayloadError::InvalidTag(99))
     );
 }
 

@@ -182,16 +182,11 @@ impl<'w, 's> Walker<'w, 's> {
                 AuthoredValue::Null => Ok(()),
                 v => Err(self.err_shape("unit (null)", v)),
             },
-            // Refs encode as strings (path or uuid — §4); content is not
-            // interpreted here.
-            SchemaNode::AssetRef(_) => match value {
-                AuthoredValue::Str(_) => Ok(()),
-                v => Err(self.err_shape("asset reference (string)", v)),
-            },
-            SchemaNode::WeakRef(_) => match value {
-                AuthoredValue::Str(_) => Ok(()),
-                v => Err(self.err_shape("weak reference (string)", v)),
-            },
+            // §4 reference queries use either the bare string shorthand or a
+            // closed {path?, asset?} object. Resolution happens later, but the
+            // bundle boundary still rejects malformed/unknown query fields.
+            SchemaNode::AssetRef(_) => self.check_reference(value, "asset reference"),
+            SchemaNode::WeakRef(_) => self.check_reference(value, "weak reference"),
             SchemaNode::Blob => self.handle_blob(value),
             SchemaNode::Option(inner) => match value {
                 AuthoredValue::Null => Ok(()),
@@ -305,6 +300,22 @@ impl<'w, 's> Walker<'w, 's> {
                 let target = self.frames[index];
                 self.walk(target, value)
             }
+        }
+    }
+
+    fn check_reference(&self, value: &AuthoredValue, expected: &str) -> Result<(), BundleError> {
+        match value {
+            AuthoredValue::Str(_) => Ok(()),
+            AuthoredValue::Object(fields)
+                if !fields.is_empty()
+                    && fields.keys().all(|name| name == "path" || name == "asset")
+                    && fields
+                        .values()
+                        .all(|value| matches!(value, AuthoredValue::Str(_))) =>
+            {
+                Ok(())
+            }
+            value => Err(self.err_shape(format!("{expected} query"), value)),
         }
     }
 

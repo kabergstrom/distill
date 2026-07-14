@@ -38,7 +38,7 @@ pub struct AuthoringService {
     pub(crate) store: Arc<Mutex<Store>>,
     pub(crate) roots: Vec<AssetRoot>,
     pub(crate) scanner: RootedScanner,
-    quarantine: QuarantineDriver,
+    pub(crate) quarantine: QuarantineDriver,
     pub(crate) lineage_destination: LineageDestination,
     lineage: LineageRepairBackend,
     pub(crate) importers: RwLock<RegisteredImporters>,
@@ -441,12 +441,10 @@ impl AuthoringBackend for AuthoringService {
 
     fn prepare_operation(
         &self,
-        _base: InputVersion,
-        _operation: &LongRunningOp,
+        base: InputVersion,
+        operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
-        Err(RpcFailure::AuthoringBackendUnavailable {
-            operation: "operation".into(),
-        })
+        self.prepare_long_operation(base, operation)
     }
 
     fn prepare_create_missing_lineage(

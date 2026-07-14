@@ -1285,6 +1285,204 @@ pub enum LongRunningOp {
     Doctor(Arc<[u8]>),
 }
 
+/// Canonical request carried by [`LongRunningOp::RenameWithFixups`].  The
+/// bundle UUID identifies the inode to move; the destination remains rooted so
+/// two configured roots can never be selected by ambient path lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameWithFixupsRequest {
+    pub bundle: BundleUuid,
+    pub destination_root: String,
+    pub destination_path: String,
+}
+
+/// Canonical request carried by [`LongRunningOp::DiskMigration`].  Empty means
+/// every authored bundle with a pending forward migration; otherwise the list
+/// is raw-UUID sorted and unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskMigrationRequest {
+    pub bundles: Vec<BundleUuid>,
+}
+
+/// Closed maintenance request carried by [`LongRunningOp::Doctor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorRequest {
+    Verify,
+    /// Explicitly remove every currently retained displaced inode while
+    /// preserving its audit row. This is distinct from the normal retention
+    /// sweep.
+    Clean,
+    RebuildIndexes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationPayloadError {
+    Truncated,
+    TrailingBytes,
+    UnsupportedVersion(u8),
+    InvalidTag(u8),
+    InvalidUtf8,
+    CountOverflow,
+    NonCanonicalOrder,
+}
+
+impl std::fmt::Display for OperationPayloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "long-running operation payload: {self:?}")
+    }
+}
+
+impl std::error::Error for OperationPayloadError {}
+
+impl RenameWithFixupsRequest {
+    pub fn encode(&self) -> Arc<[u8]> {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&self.bundle.0);
+        encode_operation_text(&mut bytes, &self.destination_root);
+        encode_operation_text(&mut bytes, &self.destination_path);
+        Arc::from(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
+        let mut reader = OperationPayloadReader::new(bytes)?;
+        let request = Self {
+            bundle: BundleUuid(reader.array()?),
+            destination_root: reader.text()?,
+            destination_path: reader.text()?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+impl DiskMigrationRequest {
+    pub fn encode(&self) -> Result<Arc<[u8]>, OperationPayloadError> {
+        if !self.bundles.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            return Err(OperationPayloadError::NonCanonicalOrder);
+        }
+        let count =
+            u32::try_from(self.bundles.len()).map_err(|_| OperationPayloadError::CountOverflow)?;
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for bundle in &self.bundles {
+            bytes.extend_from_slice(&bundle.0);
+        }
+        Ok(Arc::from(bytes))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
+        let mut reader = OperationPayloadReader::new(bytes)?;
+        let count =
+            usize::try_from(reader.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
+        if count > reader.remaining() / 16 {
+            return Err(OperationPayloadError::CountOverflow);
+        }
+        let mut bundles = Vec::with_capacity(count);
+        for _ in 0..count {
+            bundles.push(BundleUuid(reader.array()?));
+        }
+        reader.finish()?;
+        if !bundles.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            return Err(OperationPayloadError::NonCanonicalOrder);
+        }
+        Ok(Self { bundles })
+    }
+}
+
+impl DoctorRequest {
+    pub fn encode(self) -> Arc<[u8]> {
+        Arc::from([1, self.tag()])
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
+        let mut reader = OperationPayloadReader::new(bytes)?;
+        let request = match reader.u8()? {
+            1 => Self::Verify,
+            2 => Self::Clean,
+            3 => Self::RebuildIndexes,
+            tag => return Err(OperationPayloadError::InvalidTag(tag)),
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Verify => 1,
+            Self::Clean => 2,
+            Self::RebuildIndexes => 3,
+        }
+    }
+}
+
+fn encode_operation_text(bytes: &mut Vec<u8>, text: &str) {
+    let len = u32::try_from(text.len()).expect("operation text exceeds the RPC message limit");
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+}
+
+struct OperationPayloadReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> OperationPayloadReader<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, OperationPayloadError> {
+        let Some((&version, _)) = bytes.split_first() else {
+            return Err(OperationPayloadError::Truncated);
+        };
+        if version != 1 {
+            return Err(OperationPayloadError::UnsupportedVersion(version));
+        }
+        Ok(Self { bytes, position: 1 })
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.position)
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], OperationPayloadError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or(OperationPayloadError::Truncated)?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(OperationPayloadError::Truncated)?;
+        self.position = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], OperationPayloadError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| OperationPayloadError::Truncated)
+    }
+
+    fn u8(&mut self) -> Result<u8, OperationPayloadError> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, OperationPayloadError> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn text(&mut self) -> Result<String, OperationPayloadError> {
+        let len = usize::try_from(self.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_owned)
+            .map_err(|_| OperationPayloadError::InvalidUtf8)
+    }
+
+    fn finish(self) -> Result<(), OperationPayloadError> {
+        if self.position == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(OperationPayloadError::TrailingBytes)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthoringProgressState {
     Started,
@@ -1316,10 +1514,60 @@ pub struct PreparedImportCommit {
     pub commit: Commit,
 }
 
+pub trait DeferredOperation: Send + Sync {
+    /// Execute the already-validated operation against `base`. The RPC server
+    /// invokes this only when the client consumes the terminal Completed
+    /// event, while holding its publication serialization lock.
+    fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedOperationCommit {
+pub struct DeferredOperationResult {
     pub commit: Commit,
+    /// A per-file operation may publish earlier successful files before a
+    /// later conflict. The version must still commit; this terminal diagnostic
+    /// changes Completed to Failed only after that commit is visible.
+    pub terminal_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum PreparedOperationPublication {
+    Immediate(Box<Commit>),
+    Deferred(Arc<dyn DeferredOperation>),
+}
+
+impl std::fmt::Debug for PreparedOperationPublication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Immediate(commit) => formatter.debug_tuple("Immediate").field(commit).finish(),
+            Self::Deferred(_) => formatter.write_str("Deferred(..)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedOperationCommit {
+    pub publication: PreparedOperationPublication,
     pub progress: Vec<AuthoringProgressEvent>,
+}
+
+impl PreparedOperationCommit {
+    pub fn immediate(commit: Commit, progress: Vec<AuthoringProgressEvent>) -> Self {
+        Self {
+            publication: PreparedOperationPublication::Immediate(Box::new(commit)),
+            progress,
+        }
+    }
+
+    pub fn deferred(
+        operation: Arc<dyn DeferredOperation>,
+        progress: Vec<AuthoringProgressEvent>,
+    ) -> Self {
+        Self {
+            publication: PreparedOperationPublication::Deferred(operation),
+            progress,
+        }
+    }
 }
 
 /// Daemon integration seam for workflows that require importer, filesystem,

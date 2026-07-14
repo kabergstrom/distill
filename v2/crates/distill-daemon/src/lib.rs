@@ -8,6 +8,7 @@ pub mod epoch;
 pub mod importer;
 pub mod lineage_repair;
 mod logical_node;
+mod operations;
 pub mod policy;
 pub mod process;
 pub mod quarantine;

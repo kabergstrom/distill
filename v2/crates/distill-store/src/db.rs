@@ -390,6 +390,14 @@ impl Store {
         &self.last_recovery
     }
 
+    /// Rebuild every SQLite index from authoritative table rows. This is a
+    /// maintenance action only; callers publish its input-version event in the
+    /// same transaction boundary as their other doctor result state.
+    pub fn rebuild_indexes(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch("REINDEX")?;
+        Ok(())
+    }
+
     /// Recovery adopted committed groups and advanced the persisted memo
     /// counter inside its own transactions; sync the cached value.
     pub(crate) fn set_memo_seq(&mut self, seq: u64) {

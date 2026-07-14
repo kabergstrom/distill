@@ -327,6 +327,27 @@ fn the_retention_sweep_removes_only_expired_entries() {
 }
 
 #[test]
+fn doctor_clean_removes_fresh_entries_but_keeps_named_audit_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let intent = record(&mut store, 7);
+    let root = dir.path().join("asset-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("fresh.tmp");
+    std::fs::write(&source, b"fresh displacement").unwrap();
+    let quarantined = store
+        .quarantine_displaced(intent, &source, &quarantine_dir(&dir))
+        .unwrap();
+
+    assert_eq!(store.clean_all_displaced(1234).unwrap(), 1);
+    assert!(!quarantined.exists());
+    assert!(store.quarantined_entries().unwrap().is_empty());
+    let history = store.displacement_history().unwrap();
+    assert_eq!(history[0].cleaned_at, Some(1234));
+    assert_eq!(history[0].cleanup_reason.as_deref(), Some("doctor-clean"));
+}
+
+#[test]
 fn deletion_is_rename_into_quarantine_then_preimage_verification() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("asset-root");
