@@ -1,7 +1,8 @@
 use distill_build::keys::*;
-use distill_build::pipeline::{GraphicsApi, Target, TargetOs};
+use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
 use distill_build::trace::{Observed, TraceOp};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
+use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
 
 fn statics() -> StaticInputs {
     StaticInputs {
@@ -76,10 +77,85 @@ fn full_input_hash_includes_labeled_trace() {
 fn target_definition_hash_includes_full_api_set() {
     let vk = GraphicsApi::new("vulkan").unwrap();
     let gl = GraphicsApi::new("opengl").unwrap();
-    let a = Target::new(TargetOs::Linux, [vk.clone()].into_iter().collect()).unwrap();
-    let b = Target::new(TargetOs::Linux, [vk, gl].into_iter().collect()).unwrap();
+    let a = Target::new(
+        TargetOs::Linux,
+        TargetArch::X86_64,
+        [vk.clone()].into_iter().collect(),
+        false,
+        true,
+        consumer_compilation_identity_v1().clone(),
+    )
+    .unwrap();
+    let b = Target::new(
+        TargetOs::Linux,
+        TargetArch::X86_64,
+        [vk, gl].into_iter().collect(),
+        false,
+        true,
+        consumer_compilation_identity_v1().clone(),
+    )
+    .unwrap();
     assert_ne!(
         target_definition_hash(&a, &[]),
         target_definition_hash(&b, &[])
     );
+}
+
+#[test]
+fn target_definition_hash_binds_arch_options_and_compilation_identity() {
+    let api = [GraphicsApi::new("vulkan").unwrap()].into_iter().collect();
+    let identity = consumer_compilation_identity_v1().clone();
+    let base = Target::new(
+        TargetOs::Linux,
+        TargetArch::X86_64,
+        api,
+        false,
+        true,
+        identity.clone(),
+    )
+    .unwrap();
+    let mut changed_identity = identity;
+    changed_identity.algorithm_version += 1;
+    let variants = [
+        Target::new(
+            TargetOs::Linux,
+            TargetArch::Aarch64,
+            base.apis.clone(),
+            false,
+            true,
+            base.compilation_identity.clone(),
+        )
+        .unwrap(),
+        Target::new(
+            TargetOs::Linux,
+            TargetArch::X86_64,
+            base.apis.clone(),
+            true,
+            true,
+            base.compilation_identity.clone(),
+        )
+        .unwrap(),
+        Target::new(
+            TargetOs::Linux,
+            TargetArch::X86_64,
+            base.apis.clone(),
+            false,
+            false,
+            base.compilation_identity.clone(),
+        )
+        .unwrap(),
+        Target::new(
+            TargetOs::Linux,
+            TargetArch::X86_64,
+            base.apis.clone(),
+            false,
+            true,
+            changed_identity,
+        )
+        .unwrap(),
+    ];
+    let base_hash = target_definition_hash(&base, &[]);
+    for variant in variants {
+        assert_ne!(base_hash, target_definition_hash(&variant, &[]));
+    }
 }

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use distill_build::outputs::OutputDecls;
 use distill_build::pipeline::*;
 use distill_core::id::TypeUuid;
+use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
 
 fn set<T: Ord>(v: impl IntoIterator<Item = T>) -> BTreeSet<T> {
     v.into_iter().collect()
@@ -23,6 +24,17 @@ fn reg(id: &str, input: u8, output: u8, selector: TargetSelector) -> ProcessorRe
     .unwrap()
 }
 
+fn target(apis: BTreeSet<GraphicsApi>) -> Result<Target, PipelineError> {
+    Target::new(
+        TargetOs::Linux,
+        TargetArch::X86_64,
+        apis,
+        false,
+        true,
+        consumer_compilation_identity_v1().clone(),
+    )
+}
+
 #[test]
 fn selector_requires_coverage_and_overlap_is_rejected() {
     let vk = GraphicsApi::new("vulkan").unwrap();
@@ -32,7 +44,7 @@ fn selector_requires_coverage_and_overlap_is_rejected() {
         Some(set([vk.clone(), gl.clone()])),
     )
     .unwrap();
-    let target = Target::new(TargetOs::Linux, set([vk.clone(), gl.clone()])).unwrap();
+    let target = target(set([vk.clone(), gl.clone()])).unwrap();
     assert!(selector.matches(&target));
     let partial = TargetSelector::new(None, Some(set([vk]))).unwrap();
     assert!(!partial.matches(&target));
@@ -55,7 +67,7 @@ fn chains_are_type_changing_and_detect_cycles_and_duplicate_extra_keys() {
     let mut b = reg("b", 2, 3, all.clone());
     b.outputs = OutputDecls::new(ty(3), vec![("other".into(), ty(8))]).unwrap();
     let registry = PipelineRegistry::new(vec![a, b]).unwrap();
-    let target = Target::new(TargetOs::Linux, set([GraphicsApi::new("vulkan").unwrap()])).unwrap();
+    let target = target(set([GraphicsApi::new("vulkan").unwrap()])).unwrap();
     let chain = registry.chain(ty(1), &target).unwrap();
     assert_eq!(chain.terminal, ty(3));
     assert_eq!(chain.stages.len(), 2);
@@ -87,10 +99,7 @@ fn terminal_and_extra_sets_must_be_target_invariant() {
         TargetSelector::new(linux, Some(set([gl.clone()]))).unwrap(),
     );
     let registry = PipelineRegistry::new(vec![a, b]).unwrap();
-    let targets = [
-        Target::new(TargetOs::Linux, set([vk])).unwrap(),
-        Target::new(TargetOs::Linux, set([gl])).unwrap(),
-    ];
+    let targets = [target(set([vk])).unwrap(), target(set([gl])).unwrap()];
     assert!(matches!(
         registry.validate_target_invariance(&[ty(1)], &targets),
         Err(PipelineError::TargetVariantInterface { .. })
@@ -100,5 +109,5 @@ fn terminal_and_extra_sets_must_be_target_invariant() {
 #[test]
 fn present_empty_selector_and_target_api_sets_are_rejected() {
     assert!(TargetSelector::new(None, Some(BTreeSet::new())).is_err());
-    assert!(Target::new(TargetOs::Linux, BTreeSet::new()).is_err());
+    assert!(target(BTreeSet::new()).is_err());
 }

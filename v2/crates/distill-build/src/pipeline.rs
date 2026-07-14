@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::TypeUuid;
+use distill_schema::ngp_schema::CompilationIdentity;
 
 use crate::outputs::OutputDecls;
 use crate::query::{normalize_identifier, IntakeError};
@@ -12,8 +13,12 @@ pub enum TargetOs {
     Linux,
     MacOs,
     Windows,
-    Ios,
-    Android,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TargetArch {
+    Aarch64,
+    X86_64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -28,15 +33,33 @@ impl GraphicsApi {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub os: TargetOs,
+    pub arch: TargetArch,
     pub apis: BTreeSet<GraphicsApi>,
+    pub optimize: bool,
+    pub debug_info: bool,
+    pub compilation_identity: CompilationIdentity,
 }
 
 impl Target {
-    pub fn new(os: TargetOs, apis: BTreeSet<GraphicsApi>) -> Result<Self, PipelineError> {
+    pub fn new(
+        os: TargetOs,
+        arch: TargetArch,
+        apis: BTreeSet<GraphicsApi>,
+        optimize: bool,
+        debug_info: bool,
+        compilation_identity: CompilationIdentity,
+    ) -> Result<Self, PipelineError> {
         if apis.is_empty() {
             return Err(PipelineError::EmptyTargetApis);
         }
-        Ok(Self { os, apis })
+        Ok(Self {
+            os,
+            arch,
+            apis,
+            optimize,
+            debug_info,
+            compilation_identity,
+        })
     }
 }
 
