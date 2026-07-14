@@ -58,7 +58,8 @@ fn every_section_13_table_exists() {
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), registrations (the pipeline_state registration list), pins
     // (the eviction observability rule), write_intents + displaced
-    // (§14's journal and quarantine, which live in daemon state).
+    // (§14's journal and quarantine, which live in daemon state), and
+    // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
         "files",
         "dirty_files",
@@ -94,12 +95,23 @@ fn every_section_13_table_exists() {
         "displaced",
         "publication_groups",
         "publication_group_children",
+        "codegen_outputs",
         "watched_import_failures",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
     assert_eq!(got, expected);
+}
+
+#[test]
+fn codegen_outputs_are_exact_preimage_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_conn(&dir);
+    assert_eq!(
+        columns(&conn, "codegen_outputs"),
+        ["relative_path", "content_hash"]
+    );
 }
 
 #[test]

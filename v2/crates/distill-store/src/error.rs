@@ -172,6 +172,9 @@ pub enum StoreError {
     },
     /// A configuration transition was structurally invalid.
     InvalidConfiguration { error: String },
+    /// A codegen filesystem publication was prepared from a different set of
+    /// daemon-owned pre-images than the store currently records.
+    CodegenStateDrift,
     /// The `CURRENT` generation manifest is malformed or unreadable.
     BadGenerationManifest { path: PathBuf, detail: String },
     /// A CAS frame failed validation at the stated segment offset:
@@ -414,6 +417,9 @@ impl fmt::Display for StoreError {
             ),
             StoreError::InvalidConfiguration { error } => {
                 write!(f, "invalid configuration transition: {error}")
+            }
+            StoreError::CodegenStateDrift => {
+                write!(f, "codegen output pre-image state changed before publication")
             }
             StoreError::BadGenerationManifest { path, detail } => {
                 write!(f, "bad CURRENT manifest at {}: {detail}", path.display())
