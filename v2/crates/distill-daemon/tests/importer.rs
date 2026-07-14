@@ -141,6 +141,10 @@ fn bytes(value: [u8; 16]) -> AuthoredValue {
 }
 
 fn directory_rules_bundle() -> Vec<u8> {
+    directory_rules_bundle_with_rule(true)
+}
+
+fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
     let row = BootstrapControlSpecV1::embedded()
         .unwrap()
         .0
@@ -155,23 +159,26 @@ fn directory_rules_bundle() -> Vec<u8> {
             ("path_prefix", AuthoredValue::Null),
         ])
     };
-    let data = object([
-        ("listing", query()),
+    let matches = if include_rule {
+        query()
+    } else {
+        object([
+            ("path_glob", AuthoredValue::Str("*.other".into())),
+            ("path_prefix", AuthoredValue::Null),
+        ])
+    };
+    let rules = vec![object([
+        ("group", object([("PerFile", object([]))])),
+        ("id", bytes(if include_rule { [97; 16] } else { [100; 16] })),
+        ("importer", AuthoredValue::Str("byte-importer".into())),
+        ("matches", matches),
+        ("output", AuthoredValue::Str("{stem}.bundle".into())),
         (
-            "rules",
-            AuthoredValue::Array(vec![object([
-                ("group", object([("PerFile", object([]))])),
-                ("id", bytes([97; 16])),
-                ("importer", AuthoredValue::Str("byte-importer".into())),
-                ("matches", query()),
-                ("output", AuthoredValue::Str("{stem}.bundle".into())),
-                (
-                    "settings",
-                    object([("UInt", object([("value", AuthoredValue::UInt(5))]))]),
-                ),
-            ])]),
+            "settings",
+            object([("UInt", object([("value", AuthoredValue::UInt(5))]))]),
         ),
-    ]);
+    ])];
+    let data = object([("listing", query()), ("rules", AuthoredValue::Array(rules))]);
     distill_bundle::write_bundle(&Bundle {
         format_version: 1,
         uuid: BundleUuid([98; 16]),
@@ -485,8 +492,74 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .reconcile_directory_imports()
         .unwrap()
         .is_empty());
+    let failure = coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .watched_import_failure(generated.uuid)
+        .unwrap()
+        .expect("listing loss is durable orphan state");
+    assert_eq!(
+        failure.terminal,
+        distill_store::imports::WatchedImportTerminal::DirectoryOrphan
+    );
+    let orphan_memo = failure.memo_seq;
+    assert!(coordinator
+        .reconcile_directory_imports()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        coordinator.store().lock().unwrap().memo_seq(),
+        orphan_memo,
+        "an unchanged orphan must not spin memo state"
+    );
     assert!(
         generated_path.exists(),
         "lost groups are orphaned, never deleted"
     );
+
+    std::fs::write(assets.join("foo.src"), b"9").unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_directory_imports().unwrap();
+    assert!(coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .watched_import_failure(generated.uuid)
+        .unwrap()
+        .is_none());
+
+    std::fs::write(
+        assets.join("rules.bundle"),
+        directory_rules_bundle_with_rule(false),
+    )
+    .unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+    assert!(coordinator
+        .reconcile_directory_imports()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        coordinator
+            .store()
+            .lock()
+            .unwrap()
+            .watched_import_failure(generated.uuid)
+            .unwrap()
+            .unwrap()
+            .terminal,
+        distill_store::imports::WatchedImportTerminal::DirectoryOrphan,
+        "deleting a stable rule id orphans its existing outputs"
+    );
+
+    std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_directory_imports().unwrap();
+    assert!(coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .watched_import_failure(generated.uuid)
+        .unwrap()
+        .is_none());
 }

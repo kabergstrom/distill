@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -289,13 +289,14 @@ CREATE TABLE watched_import_failures (
     bundle_uuid             BLOB NOT NULL PRIMARY KEY,
     attempted_input_version INTEGER NOT NULL,
     basis                   BLOB NOT NULL,
-    terminal_kind           INTEGER NOT NULL CHECK (terminal_kind IN (1, 2)),
+    terminal_kind           INTEGER NOT NULL CHECK (terminal_kind IN (1, 2, 3)),
     terminal_code           INTEGER,
     message                 TEXT NOT NULL,
     memo_seq                INTEGER NOT NULL,
     CHECK ((terminal_kind = 1 AND terminal_code IS NULL)
         OR (terminal_kind = 2 AND terminal_code IS NOT NULL
-            AND terminal_code BETWEEN 1 AND 4294967295))
+            AND terminal_code BETWEEN 1 AND 4294967295)
+        OR (terminal_kind = 3 AND terminal_code IS NULL))
 );
 ";
 

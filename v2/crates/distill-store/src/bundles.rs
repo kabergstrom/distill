@@ -45,7 +45,7 @@ pub struct BundleMeta {
 /// A generated bundle's directory-import provenance (§2, §8, §13): who
 /// owns it and which group produced it — what orphan tracking re-derives
 /// ownership from after daemon-state loss.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DirectoryOrigin {
     pub rules_bundle: BundleUuid,
     /// Stable authored UUID-style rule identity (R22/H7), never the

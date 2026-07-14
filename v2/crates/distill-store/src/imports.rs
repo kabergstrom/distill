@@ -20,6 +20,9 @@ pub enum WatchedImportTerminal {
     /// The importer rejected otherwise successful observations with its
     /// stable, non-zero module-defined code.
     Importer { code: u32 },
+    /// A directory-generated bundle whose exact persisted origin is no
+    /// longer produced by the current rules and listing projection.
+    DirectoryOrphan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +49,7 @@ impl Store {
                 });
             }
             WatchedImportTerminal::Importer { code } => (2_i64, Some(i64::from(code))),
+            WatchedImportTerminal::DirectoryOrphan => (3_i64, None),
         };
         if failure.basis.is_empty() {
             return Err(StoreError::InvalidConfiguration {
@@ -102,6 +106,7 @@ impl Store {
                         (2, Some(code)) if (1..=i64::from(u32::MAX)).contains(&code) => {
                             WatchedImportTerminal::Importer { code: code as u32 }
                         }
+                        (3, None) => WatchedImportTerminal::DirectoryOrphan,
                         _ => return Err(rusqlite::Error::InvalidQuery),
                     };
                     Ok(WatchedImportFailure {

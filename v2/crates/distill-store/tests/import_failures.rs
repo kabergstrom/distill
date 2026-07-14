@@ -56,3 +56,29 @@ fn dependency_terminal_forbids_an_importer_code_and_upsert_replaces_atomically()
     assert_eq!(loaded.basis, vec![2]);
     assert_eq!(loaded.terminal, WatchedImportTerminal::Dependency);
 }
+
+#[test]
+fn directory_orphan_terminal_roundtrips_without_an_importer_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+    let bundle = BundleUuid([9; 16]);
+    store
+        .record_watched_import_failure(&WatchedImportFailure {
+            bundle,
+            attempted_input_version: store.input_version(),
+            basis: vec![3],
+            terminal: WatchedImportTerminal::DirectoryOrphan,
+            message: "orphaned".into(),
+            memo_seq: store.memo_seq(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        store
+            .watched_import_failure(bundle)
+            .unwrap()
+            .unwrap()
+            .terminal,
+        WatchedImportTerminal::DirectoryOrphan
+    );
+}

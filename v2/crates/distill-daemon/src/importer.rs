@@ -32,7 +32,7 @@ use distill_rpc::{
     decode_authoring_payload, ImportRequest, InputVersion, PreparedImportCommit, RpcFailure,
 };
 use distill_schema::ngp_schema::{node_hash, snapshot_to_json, verify_snapshot, LogicalSchema};
-use distill_store::bundles::BundleMeta;
+use distill_store::bundles::{BundleMeta, DirectoryOrigin as StoredDirectoryOrigin};
 use distill_store::imports::{WatchedImportFailure, WatchedImportTerminal};
 use distill_store::journal::PublicationGroupKind;
 use distill_store::Store;
@@ -203,6 +203,9 @@ impl AuthoringService {
             }
             let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
             let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+                Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
+                    continue;
+                }
                 Some(failure) => decode_attempt_basis(&failure.basis)?,
                 None => prior.model.record.read_set.clone(),
             };
@@ -216,16 +219,18 @@ impl AuthoringService {
     }
 
     pub(crate) fn directory_import_tasks(&self) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        let store = self
+        let mut store = self
             .store
             .lock()
             .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
         let capabilities = self.importer_capabilities()?;
         let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
         let mut all_rule_ids = BTreeMap::<[u8; 16], BundleUuid>::new();
+        let mut active_origins = BTreeSet::<StoredDirectoryOrigin>::new();
         let mut tasks = Vec::new();
+        let bundles = store.all_bundles().map_err(invalid)?;
 
-        for meta in store.all_bundles().map_err(invalid)? {
+        for meta in &bundles {
             let root = store
                 .root_name(meta.root)
                 .map_err(invalid)?
@@ -295,6 +300,12 @@ impl AuthoringService {
                         destination_path,
                         listing_dep: listing_dep.clone(),
                     };
+                    active_origins.insert(StoredDirectoryOrigin {
+                        rules_bundle: task.rules_bundle,
+                        rule: distill_store::bundles::DirectoryRuleId(task.rule.0),
+                        group_root: task.group.root.0.clone(),
+                        group_path: task.group.path.clone(),
+                    });
                     if self.directory_task_needs_run(&store, &task, &capabilities)? {
                         tasks.push(task);
                     }
@@ -317,7 +328,61 @@ impl AuthoringService {
                 )));
             }
         }
+        self.record_directory_orphans(&mut store, &bundles, &active_origins, &capabilities)?;
         Ok(tasks)
+    }
+
+    fn record_directory_orphans(
+        &self,
+        store: &mut Store,
+        bundles: &[BundleMeta],
+        active_origins: &BTreeSet<StoredDirectoryOrigin>,
+        capabilities: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<(), RpcFailure> {
+        let mut backend = RootedImportBackend::new(&self.scanner, capabilities);
+        for meta in bundles {
+            let Some(origin) = &meta.origin else {
+                continue;
+            };
+            if active_origins.contains(origin) {
+                continue;
+            }
+            let prior = self.read_prior_import(store, meta)?;
+            let current_basis = prior
+                .model
+                .record
+                .read_set
+                .iter()
+                .map(|dep| observe_file_dep(dep, &mut backend))
+                .collect::<Vec<_>>();
+            let basis = encode_attempt_basis(&current_basis)?;
+            let message = format!(
+                "directory import orphaned: rule {} no longer produces group {}:{}",
+                origin.rule, origin.group_root, origin.group_path
+            );
+            if store
+                .watched_import_failure(meta.bundle)
+                .map_err(invalid)?
+                .is_some_and(|failure| {
+                    failure.terminal == WatchedImportTerminal::DirectoryOrphan
+                        && failure.basis == basis
+                        && failure.message == message
+                })
+            {
+                continue;
+            }
+            store
+                .record_watched_import_failure(&WatchedImportFailure {
+                    bundle: meta.bundle,
+                    attempted_input_version: store.input_version(),
+                    basis,
+                    terminal: WatchedImportTerminal::DirectoryOrphan,
+                    message,
+                    memo_seq: store.memo_seq(),
+                })
+                .map_err(invalid)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_watched_directory_import(
@@ -424,6 +489,9 @@ impl AuthoringService {
         }
         let mut backend = RootedImportBackend::new(&self.scanner, capabilities);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+            Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
+                return Ok(true);
+            }
             Some(failure) => decode_attempt_basis(&failure.basis)?,
             None => prior.model.record.read_set.clone(),
         };
@@ -1245,64 +1313,61 @@ fn root_explicit_sources(
 }
 
 fn revalidate_read_set(read_set: &[FileDep], backend: &mut impl ImportBackend) -> bool {
-    read_set.iter().all(|expected| match expected {
-        FileDep::Read { path, observed } => match backend.read(path) {
-            Ok((path, bytes)) => {
-                *observed
-                    == Observed::Ok(distill_build::import::FileContentObservation {
-                        path,
-                        hash: *blake3::hash(&bytes).as_bytes(),
-                    })
-            }
-            Err(class) => {
-                *observed
-                    == Observed::Err(StableFailureFingerprint::RawFile {
-                        op: RawFileOp::Read,
-                        subject: RawFileSubject::Path(path.clone()),
-                        class,
-                    })
-            }
+    read_set
+        .iter()
+        .all(|expected| *expected == observe_file_dep(expected, backend))
+}
+
+fn observe_file_dep(dep: &FileDep, backend: &mut impl ImportBackend) -> FileDep {
+    match dep {
+        FileDep::Read { path, .. } => FileDep::Read {
+            path: path.clone(),
+            observed: match backend.read(path) {
+                Ok((path, bytes)) => Observed::Ok(distill_build::import::FileContentObservation {
+                    path,
+                    hash: *blake3::hash(&bytes).as_bytes(),
+                }),
+                Err(class) => Observed::Err(StableFailureFingerprint::RawFile {
+                    op: RawFileOp::Read,
+                    subject: RawFileSubject::Path(path.clone()),
+                    class,
+                }),
+            },
         },
-        FileDep::Probe { path, observed } => match backend.probe(path) {
-            Ok(value) => *observed == Observed::Ok(value),
-            Err(class) => {
-                *observed
-                    == Observed::Err(StableFailureFingerprint::RawFile {
-                        op: RawFileOp::Probe,
-                        subject: RawFileSubject::Path(path.clone()),
-                        class,
-                    })
-            }
+        FileDep::Probe { path, .. } => FileDep::Probe {
+            path: path.clone(),
+            observed: match backend.probe(path) {
+                Ok(value) => Observed::Ok(value),
+                Err(class) => Observed::Err(StableFailureFingerprint::RawFile {
+                    op: RawFileOp::Probe,
+                    subject: RawFileSubject::Path(path.clone()),
+                    class,
+                }),
+            },
         },
-        FileDep::Listing { query, observed } => match backend.enumerate(query) {
-            Ok(mut paths) => {
-                paths.sort_unstable();
-                paths.dedup();
-                *observed == Observed::Ok(distill_build::query::file_query_result_hash(&paths))
-            }
-            Err(class) => {
-                *observed
-                    == Observed::Err(StableFailureFingerprint::RawFile {
-                        op: RawFileOp::Enumerate,
-                        subject: RawFileSubject::Query(query.clone()),
-                        class,
-                    })
-            }
+        FileDep::Listing { query, .. } => FileDep::Listing {
+            query: query.clone(),
+            observed: match backend.enumerate(query) {
+                Ok(mut paths) => {
+                    paths.sort_unstable();
+                    paths.dedup();
+                    Observed::Ok(distill_build::query::file_query_result_hash(&paths))
+                }
+                Err(class) => Observed::Err(StableFailureFingerprint::RawFile {
+                    op: RawFileOp::Enumerate,
+                    subject: RawFileSubject::Query(query.clone()),
+                    class,
+                }),
+            },
         },
-        FileDep::Capability { key, observed } => {
-            *observed
-                == backend.capability(key).map_or_else(
-                    || {
-                        Observed::Err(
-                            distill_build::trace::StableFailureFingerprint::MissingCapability {
-                                key: key.clone(),
-                            },
-                        )
-                    },
-                    Observed::Ok,
-                )
-        }
-    })
+        FileDep::Capability { key, .. } => FileDep::Capability {
+            key: key.clone(),
+            observed: backend.capability(key).map_or_else(
+                || Observed::Err(StableFailureFingerprint::MissingCapability { key: key.clone() }),
+                Observed::Ok,
+            ),
+        },
+    }
 }
 
 fn dep_has_failure(dep: &FileDep) -> bool {
