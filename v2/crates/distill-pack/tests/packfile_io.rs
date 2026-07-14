@@ -242,6 +242,37 @@ fn mount_refuses_wrong_runtime_or_archive_identity() {
 }
 
 #[test]
+fn mount_rejects_a_compiled_row_outside_exact_artifact_boundary() {
+    let (manifest_bytes, archive, mut runtime, _, _) = fixture(true);
+    let mut manifest = distill_pack::manifest::decode_manifest(&manifest_bytes).unwrap();
+    let extra_type = TypeUuid([0x77; 16]);
+    manifest.compiled_types.rows.push(
+        CompiledTypeRow::new(
+            extra_type,
+            LogicalHash([0x77; 32]),
+            [0x77; 32],
+            false,
+            RegistryExtrasV1::default(),
+        )
+        .unwrap(),
+    );
+    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
+    manifest.load_policy.push(LoadPolicyRow {
+        type_uuid: extra_type,
+        build_only: false,
+    });
+    runtime.compiled_types = manifest.compiled_types.clone();
+    let manifest = encode_manifest(&manifest).unwrap();
+
+    assert!(matches!(
+        PackfileIO::mount(&manifest, vec![archive], &runtime),
+        Err(MountError::Manifest(
+            distill_pack::manifest::ManifestError::CompiledCoverage
+        ))
+    ));
+}
+
+#[test]
 fn equal_pack_and_runtime_bootstrap_forgery_fails_independent_local_authority() {
     let (manifest_bytes, archive, mut runtime, _, _) = fixture(true);
     let mut manifest = distill_pack::manifest::decode_manifest(&manifest_bytes).unwrap();

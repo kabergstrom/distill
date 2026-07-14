@@ -18,8 +18,8 @@ use distill_wire::exec::Blob;
 
 use crate::archive::{decode_archive, ArchiveError, ArchiveObjectKind, DecodedArchive, EKey};
 use crate::manifest::{
-    decode_manifest, manifest_hash, verify_artifact_metadata, verify_attestation, ArtifactMetadata,
-    ManifestError, PackManifest, PackTarget,
+    decode_manifest, manifest_hash, verify_artifact_metadata, verify_attestation,
+    verify_mounted_closure, ArtifactMetadata, ManifestError, PackManifest, PackTarget,
 };
 
 #[derive(Debug, Clone)]
@@ -118,10 +118,13 @@ impl PackfileIO {
                 return Err(MountError::UnreferencedEncoding(encoding.content_hash));
             }
         }
+        let mut artifact_metadata = Vec::with_capacity(manifest.assets.len());
         for row in &manifest.assets {
             let (_, metadata) = decode_fetched(&manifest, &archives, row.content_hash)?;
             verify_artifact_metadata(row, &metadata)?;
+            artifact_metadata.push(metadata);
         }
+        verify_mounted_closure(&manifest, &artifact_metadata)?;
         let rows = manifest
             .load_policy
             .iter()
@@ -275,6 +278,7 @@ fn decode_fetched(
     let metadata = ArtifactMetadata {
         asset_uuid: parts.asset_uuid,
         authored_type: parts.authored_type,
+        encoded_type: parts.encoded_type,
         terminal_type: parts.terminal_type,
         logical_hash: parts.logical_hash,
         load_deps: parts.load_deps.clone(),

@@ -249,9 +249,10 @@ fn artifact_header_crosscheck_is_bidirectional_and_exact() {
     let header = ArtifactMetadata {
         asset_uuid: row.asset_uuid,
         authored_type: row.authored_type,
+        encoded_type: row.terminal_type,
         terminal_type: row.terminal_type,
         logical_hash: row.logical_hash,
-        load_deps: row.load_deps.clone(),
+        load_deps: row.load_deps.iter().map(|edge| edge.asset_uuid).collect(),
     };
     assert!(verify_artifact_metadata(row, &header).is_ok());
     let mut wrong = header;
@@ -359,7 +360,7 @@ fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
 }
 
 #[test]
-fn manifest_requires_exact_asset_closure_union_five_bootstrap_rows() {
+fn manifest_requires_bootstrap_and_all_manifest_visible_boundary_types() {
     let mut manifest = sample();
     let missing_bootstrap = manifest
         .compiled_types
@@ -400,8 +401,24 @@ fn manifest_requires_exact_asset_closure_union_five_bootstrap_rows() {
         build_only: false,
     });
 
+    assert!(encode_manifest(&manifest).is_ok());
+    let row = &manifest.assets[0];
+    let mut metadata = ArtifactMetadata {
+        asset_uuid: row.asset_uuid,
+        authored_type: row.authored_type,
+        encoded_type: type_uuid,
+        terminal_type: row.terminal_type,
+        logical_hash: row.logical_hash,
+        load_deps: Vec::new(),
+    };
+    assert!(verify_mounted_closure(
+        &canonicalize(manifest.clone()).unwrap(),
+        &[metadata.clone()]
+    )
+    .is_ok());
+    metadata.encoded_type = row.terminal_type;
     assert_eq!(
-        encode_manifest(&manifest),
+        verify_mounted_closure(&canonicalize(manifest).unwrap(), &[metadata]),
         Err(ManifestError::CompiledCoverage)
     );
 }
@@ -427,10 +444,50 @@ fn bootstrap_rows_are_boundary_only_and_cannot_enter_the_asset_closure() {
 fn manifest_rejects_load_dependencies_absent_from_the_asset_table() {
     let mut manifest = sample();
     let missing = AssetUuid([13; 16]);
-    manifest.assets[0].load_deps.push(missing);
+    let expected_terminal = manifest.assets[0].terminal_type;
+    manifest.assets[0].load_deps.push(ManifestLoadEdge {
+        asset_uuid: missing,
+        expected_terminal,
+    });
 
     assert_eq!(
         encode_manifest(&manifest),
         Err(ManifestError::MissingDependency(missing))
+    );
+}
+
+#[test]
+fn manifest_rejects_a_typed_edge_that_disagrees_with_its_target() {
+    let mut manifest = sample();
+    let target = manifest.assets[0].clone();
+    let target_uuid = AssetUuid([13; 16]);
+    let wrong_terminal = TypeUuid([99; 16]);
+    manifest.assets.push(ManifestAssetRow {
+        asset_uuid: target_uuid,
+        ..target
+    });
+    manifest.assets[0].load_deps.push(ManifestLoadEdge {
+        asset_uuid: target_uuid,
+        expected_terminal: wrong_terminal,
+    });
+    manifest.compiled_types.rows.push(
+        CompiledTypeRow::new(
+            wrong_terminal,
+            LogicalHash([99; 32]),
+            [99; 32],
+            false,
+            RegistryExtrasV1::default(),
+        )
+        .unwrap(),
+    );
+    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
+    manifest.load_policy.push(LoadPolicyRow {
+        type_uuid: wrong_terminal,
+        build_only: false,
+    });
+
+    assert_eq!(
+        encode_manifest(&manifest),
+        Err(ManifestError::CompiledMismatch(wrong_terminal))
     );
 }
