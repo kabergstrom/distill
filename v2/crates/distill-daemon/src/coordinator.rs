@@ -23,7 +23,8 @@ use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileKind, FileState};
 use distill_store::pipeline::{
-    AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, VerifiedSchemaLineageManifest,
+    AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, ValidatedPipelineEpoch,
+    VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
@@ -77,6 +78,11 @@ enum PipelinePublication {
     Ready([u8; 32]),
     SchemaAcceptanceRequired,
     Poisoned(PipelinePoison),
+}
+
+enum ConfigurationPipelinePublication {
+    Epoch(ValidatedPipelineEpoch),
+    Poison(PipelinePoison),
 }
 
 fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) {
@@ -259,33 +265,62 @@ impl DaemonCoordinator {
         }
     }
 
-    pub fn publish_filesystem_configuration(
+    pub fn publish_configuration_candidate(
         &self,
         roots: Vec<AssetRoot>,
         lineage_destination: LineageDestination,
+        targets: Vec<TargetDefinition>,
+        pipeline_source: &std::path::Path,
+        mut requirements: CandidateRequirements,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let prepared = self
+        let filesystem = self
             .authoring
             .prepare_filesystem_candidate(roots, lineage_destination)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let scan = prepared.scanner().scan()?;
-        let destination = prepared.lineage_destination().clone();
-        let candidate = ScanCandidate::build(prepared.scanner(), &destination, scan, None)?;
-        let prepared = Arc::new(Mutex::new(Some(prepared)));
-        let captured = Arc::clone(&prepared);
+        let scan = filesystem.scanner().scan()?;
+        let destination = filesystem.lineage_destination().clone();
+        let candidate = ScanCandidate::build(filesystem.scanner(), &destination, scan, None)?;
+        let mut runtime = lock_pipeline(&self.pipeline);
+        let prepared_epoch = {
+            let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
+            host.prepare_candidate(pipeline_source, &mut requirements, loader)
+        };
+        let (pipeline, mut prepared_epoch) = match prepared_epoch {
+            Ok(prepared) => {
+                let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        let _ = runtime.host.discard_unpublished(prepared);
+                        return Err(CoordinatorError::InvalidManifest(error.to_string()));
+                    }
+                };
+                (
+                    ConfigurationPipelinePublication::Epoch(stored),
+                    Some(prepared),
+                )
+            }
+            Err(poison) => (ConfigurationPipelinePublication::Poison(poison), None),
+        };
+        let filesystem = Arc::new(Mutex::new(Some(filesystem)));
+        let captured = Arc::clone(&filesystem);
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let authoring = Arc::clone(&self.authoring);
         self.server
-            .coordinated_commit(base, || {
-                let commit = publish_scan(&store, base, candidate, true)
+            .coordinated_replace_target_set(base, targets, || {
+                let commit = publish_scan(&store, base, candidate, true, Some(&pipeline))
                     .map_err(|error| error.to_string())?;
-                let prepared: AuthoringFilesystemCandidate = captured
+                let stored_pipeline = lock_store(&store)
+                    .pipeline_state()
+                    .map_err(|error| error.to_string())?
+                    .expect("configuration candidate published pipeline state");
+                let filesystem: AuthoringFilesystemCandidate = captured
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .expect("configuration candidate installs once");
-                authoring.install_filesystem_candidate(prepared);
+                self.scanner.replace_from(filesystem.scanner());
+                authoring.install_filesystem_candidate(filesystem);
                 *self
                     .lineage_destination
                     .write()
@@ -294,6 +329,52 @@ impl DaemonCoordinator {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
+                match (&pipeline, prepared_epoch.take(), stored_pipeline) {
+                    (
+                        ConfigurationPipelinePublication::Epoch(_),
+                        Some(prepared),
+                        StoredPipelineState::Ready(epoch),
+                    ) if epoch.dylib_hash == prepared.dylib_hash() => {
+                        discard_pending(&mut runtime);
+                        runtime.host.install_ready(prepared);
+                    }
+                    (
+                        ConfigurationPipelinePublication::Epoch(_),
+                        Some(prepared),
+                        StoredPipelineState::SchemaAcceptanceRequired { .. },
+                    ) => {
+                        discard_pending(&mut runtime);
+                        let fence = PipelinePoison::new(
+                            PipelinePoisonCode::CandidateValidation,
+                            PipelinePoisonOrigin::CandidateOpen,
+                            CleanupDisposition::None,
+                            "pipeline candidate requires explicit schema acceptance",
+                        )
+                        .expect("schema-acceptance fence is valid");
+                        runtime.host.install_poison(fence);
+                        runtime.pending = Some(prepared);
+                    }
+                    (
+                        ConfigurationPipelinePublication::Epoch(_),
+                        Some(prepared),
+                        StoredPipelineState::Poisoned { error, .. },
+                    ) => {
+                        let _ = runtime.host.discard_unpublished(prepared);
+                        discard_pending(&mut runtime);
+                        runtime.host.install_poison(error);
+                    }
+                    (
+                        ConfigurationPipelinePublication::Poison(poison),
+                        None,
+                        StoredPipelineState::Poisoned { .. },
+                    ) => {
+                        discard_pending(&mut runtime);
+                        runtime.host.install_poison(poison.clone());
+                    }
+                    _ => unreachable!(
+                        "durable configuration pipeline state must match its prepared candidate"
+                    ),
+                }
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)
@@ -482,7 +563,8 @@ impl DaemonCoordinator {
         let store = Arc::clone(&self.store);
         self.server
             .coordinated_commit(base, || {
-                publish_scan(&store, base, candidate, false).map_err(|error| error.to_string())
+                publish_scan(&store, base, candidate, false, None)
+                    .map_err(|error| error.to_string())
             })
             .map_err(CoordinatorError::Coordinated)
     }
@@ -971,6 +1053,7 @@ fn publish_scan(
     base: InputVersion,
     candidate: ScanCandidate,
     advance_configuration: bool,
+    pipeline: Option<&ConfigurationPipelinePublication>,
 ) -> Result<Commit, StoreError> {
     let mut store = lock_store(store);
     if store.input_version() != base {
@@ -1036,6 +1119,15 @@ fn publish_scan(
         }
         if let Some(manifest) = &candidate.lineage_manifest {
             transaction.project_verified_lineage_manifest(manifest)?;
+        }
+        match pipeline {
+            Some(ConfigurationPipelinePublication::Epoch(epoch)) => {
+                transaction.publish_pipeline_epoch(epoch)?;
+            }
+            Some(ConfigurationPipelinePublication::Poison(poison)) => {
+                transaction.publish_pipeline_poison(poison)?;
+            }
+            None => {}
         }
 
         if candidate.version_poison.is_none() {
@@ -1120,7 +1212,7 @@ pub(crate) fn publish_current_scan(
     let scan = scanner.scan().map_err(|error| error.to_string())?;
     let candidate = ScanCandidate::build(scanner, lineage_destination, scan, None)
         .map_err(|error| error.to_string())?;
-    publish_scan(store, base, candidate, false).map_err(|error| error.to_string())
+    publish_scan(store, base, candidate, false, None).map_err(|error| error.to_string())
 }
 
 fn rpc_commit(

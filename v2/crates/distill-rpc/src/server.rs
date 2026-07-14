@@ -698,6 +698,59 @@ impl Server {
             .map_err(CoordinatedCommitError::Invalid)
     }
 
+    /// Replace the complete configuration-bound target set in the same
+    /// publication lock and input version as its durable coordinator commit.
+    /// Validation finishes before the durable closure runs; installation is
+    /// then infallible and connections are generation-fenced before unlock.
+    pub fn coordinated_replace_target_set(
+        &self,
+        base: InputVersion,
+        replacements: Vec<TargetDefinition>,
+        publish: impl FnOnce() -> Result<Commit, String>,
+    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
+        let bootstrap_authority = consumer_bootstrap_authority_v1().map_err(|error| {
+            CoordinatedCommitError::Publication(format!(
+                "bootstrap authority unavailable: {}",
+                error.0
+            ))
+        })?;
+        let mut replacement_map = BTreeMap::new();
+        for replacement in replacements {
+            validate_attestation_shape(
+                replacement.compiled_registry(),
+                replacement.dsca(),
+                replacement.load_policy(),
+                replacement.policy_digest(),
+            )
+            .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
+            bootstrap_authority
+                .validate_boundary_rows(
+                    replacement.compiled_registry(),
+                    distill_core::attestation::BundleFormatVersion::V1,
+                )
+                .map_err(AttestationShapeError::Bootstrap)
+                .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
+            let name = replacement.name().to_owned();
+            if replacement_map.insert(name.clone(), replacement).is_some() {
+                return Err(CoordinatedCommitError::Publication(
+                    AttestationShapeError::DuplicateTarget { target: name }.to_string(),
+                ));
+            }
+        }
+
+        let mut state = self.lock();
+        if state.current != base {
+            return Err(CoordinatedCommitError::Stale {
+                expected: base,
+                observed: state.current,
+            });
+        }
+        let commit = publish().map_err(CoordinatedCommitError::Publication)?;
+        let stamp = commit_locked(&mut state, commit).map_err(CoordinatedCommitError::Invalid)?;
+        install_target_set(&mut state, replacement_map);
+        Ok(stamp)
+    }
+
     /// Discard cursor history strictly before `oldest_available`.
     pub fn discard_history_before(&self, oldest_available: InputVersion) {
         let mut state = self.lock();
@@ -3180,10 +3233,9 @@ fn generation_fence(state: &ServerState, connection: &ConnectionState) -> Option
     if state.protocol_epoch != connection.protocol_epoch {
         return Some(ReconnectReason::ProtocolEpochChanged);
     }
-    let target = state
-        .targets
-        .get(&connection.target)
-        .expect("connected target must exist");
+    let Some(target) = state.targets.get(&connection.target) else {
+        return Some(ReconnectReason::TargetDefinitionChanged);
+    };
     if target.target_generation != connection.target_generation {
         return Some(ReconnectReason::TargetDefinitionChanged);
     }
@@ -3730,6 +3782,77 @@ fn notify_live_delta(state: &mut ServerState, delta: &HistoryDelta) {
                 paths,
             }),
         );
+    }
+}
+
+fn install_target_set(state: &mut ServerState, replacements: BTreeMap<String, TargetDefinition>) {
+    let mut prior = std::mem::take(&mut state.targets);
+    let mut installed = BTreeMap::new();
+    let mut reconnect = Vec::new();
+    for (name, definition) in replacements {
+        let runtime = if let Some(mut runtime) = prior.remove(&name) {
+            let target_changed =
+                runtime.definition.definition_hash() != definition.definition_hash();
+            let policy_changed = runtime.definition.load_policy() != definition.load_policy()
+                || runtime.definition.policy_digest() != definition.policy_digest();
+            let compiled_changed =
+                runtime.definition.compiled_registry() != definition.compiled_registry();
+            if target_changed {
+                runtime.target_generation = runtime
+                    .target_generation
+                    .checked_add(1)
+                    .expect("target generation exhausted");
+            }
+            if policy_changed {
+                runtime.policy_authority_generation = runtime
+                    .policy_authority_generation
+                    .checked_add(1)
+                    .expect("policy authority generation exhausted");
+            }
+            if compiled_changed {
+                runtime.compiled_table_generation = runtime
+                    .compiled_table_generation
+                    .checked_add(1)
+                    .expect("compiled table generation exhausted");
+            }
+            runtime.definition = definition;
+            if target_changed {
+                reconnect.push((name.clone(), ReconnectReason::TargetDefinitionChanged));
+            } else {
+                if policy_changed {
+                    reconnect.push((name.clone(), ReconnectReason::LoadPolicyChanged));
+                }
+                if compiled_changed {
+                    reconnect.push((name.clone(), ReconnectReason::CompiledAttestationChanged));
+                }
+            }
+            runtime
+        } else {
+            TargetRuntime {
+                definition,
+                target_generation: 0,
+                policy_authority_generation: 0,
+                compiled_table_generation: 0,
+            }
+        };
+        installed.insert(name, runtime);
+    }
+    reconnect.extend(
+        prior
+            .into_keys()
+            .map(|name| (name, ReconnectReason::TargetDefinitionChanged)),
+    );
+    state.targets = installed;
+    for (name, reason) in reconnect {
+        match reason {
+            ReconnectReason::TargetDefinitionChanged => notify_reconnect(state, &name, reason),
+            ReconnectReason::LoadPolicyChanged | ReconnectReason::CompiledAttestationChanged => {
+                notify_projection_reconnect(state, &name, reason)
+            }
+            ReconnectReason::StoreInstanceChanged | ReconnectReason::ProtocolEpochChanged => {
+                unreachable!("target-set replacement cannot produce a global reconnect")
+            }
+        }
     }
 }
 

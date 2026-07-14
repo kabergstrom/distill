@@ -3288,3 +3288,31 @@ fn content_hash_records_are_immutable() {
         Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash })
     );
 }
+
+#[test]
+fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_removed_hubs() {
+    let server = server_with(&[(1, false)]);
+    let changed = connect(&server, &[(1, false)]);
+    let stamp = server
+        .coordinated_replace_target_set(
+            InputVersion(0),
+            vec![target_with(8, &[(1, false)])],
+            || Ok(Commit::default()),
+        )
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(1));
+    assert_reconnect(changed.snapshot(), ReconnectReason::TargetDefinitionChanged);
+
+    let replacement = match server.root().connect(request_for(8, 1, &[(1, false)])) {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("expected replacement connection, got {other:?}"),
+    };
+    let stamp = server
+        .coordinated_replace_target_set(InputVersion(1), Vec::new(), || Ok(Commit::default()))
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(2));
+    assert_reconnect(
+        replacement.snapshot(),
+        ReconnectReason::TargetDefinitionChanged,
+    );
+}

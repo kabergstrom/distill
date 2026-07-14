@@ -24,6 +24,7 @@ pipeline_dylib = "{}"
 os = "linux"
 arch = "x86_64"
 apis = ["vulkan"]
+optimize = false
 [codegen]
 rs_mod_path = "{}"
 auto_codegen = false
@@ -226,5 +227,83 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         before
+    );
+}
+
+#[test]
+fn target_configuration_and_pipeline_validation_publish_as_one_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let compiled = consumer_bootstrap_authority_v1()
+        .unwrap()
+        .table()
+        .compiled_table()
+        .unwrap();
+    let process = DaemonProcess::start(config(&temp), compiled).unwrap();
+    let before = process.coordinator().server().current_stamp().version;
+    let edited = config_source(&temp).replace("optimize = false", "optimize = true");
+    std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
+
+    wait_until(
+        || process.coordinator().server().current_stamp().version > before,
+        "target configuration did not publish",
+    );
+    let after = process.coordinator().server().current_stamp().version;
+    assert_eq!(after.0, before.0 + 1);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        process.coordinator().server().current_stamp().version,
+        after
+    );
+    assert!(process.last_background_error().is_none());
+}
+
+#[test]
+fn root_configuration_reconciles_new_namespace_in_the_same_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let compiled = consumer_bootstrap_authority_v1()
+        .unwrap()
+        .table()
+        .compiled_table()
+        .unwrap();
+    let process = DaemonProcess::start(config(&temp), compiled).unwrap();
+    let before = process.coordinator().server().current_stamp().version;
+    let second = temp.path().join("second-assets");
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(second.join("new.txt"), b"new root").unwrap();
+    let edited = config_source(&temp).replace(
+        &temp.path().join("assets").display().to_string(),
+        &second.display().to_string(),
+    );
+    std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
+
+    wait_until(
+        || {
+            process.coordinator().server().current_stamp().version > before
+                && process
+                    .coordinator()
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .all_files()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, path, _)| path == "new.txt")
+        },
+        "new root was not reconciled",
+    );
+    let after = process.coordinator().server().current_stamp().version;
+    assert_eq!(after.0, before.0 + 1);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        process.coordinator().server().current_stamp().version,
+        after
+    );
+    assert_eq!(
+        process
+            .coordinator()
+            .scanner()
+            .physical_path("main", "new.txt")
+            .unwrap(),
+        std::fs::canonicalize(&second).unwrap().join("new.txt")
     );
 }

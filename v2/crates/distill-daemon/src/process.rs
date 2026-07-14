@@ -192,8 +192,8 @@ fn spawn_coordinator_loop(
                     }
                 };
                 let result = config_watch.reconcile(&coordinator).and_then(|update| {
-                    if let Some((path, requirements)) = update {
-                        pipeline_watch.reconfigure(path, requirements);
+                    if let Some((path, requirements, observed)) = update {
+                        pipeline_watch.reconfigure_published(path, requirements, observed);
                     }
                     match action {
                         WatchAction::FullRescan => coordinator
@@ -239,13 +239,7 @@ impl PipelineWatch {
     }
 
     fn reconcile(&mut self, coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
-        let state = match std::fs::read(&self.path) {
-            Ok(bytes) => PipelineSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                PipelineSourceState::Missing
-            }
-            Err(error) => PipelineSourceState::Unreadable(error.kind()),
-        };
+        let state = observe_pipeline_source(&self.path);
         if self.observed.as_ref() == Some(&state) {
             return Ok(());
         }
@@ -254,10 +248,23 @@ impl PipelineWatch {
         Ok(())
     }
 
-    fn reconfigure(&mut self, path: PathBuf, requirements: CandidateRequirements) {
+    fn reconfigure_published(
+        &mut self,
+        path: PathBuf,
+        requirements: CandidateRequirements,
+        observed: PipelineSourceState,
+    ) {
         self.path = path;
         self.requirements = requirements;
-        self.observed = None;
+        self.observed = Some(observed);
+    }
+}
+
+fn observe_pipeline_source(path: &Path) -> PipelineSourceState {
+    match std::fs::read(path) {
+        Ok(bytes) => PipelineSourceState::Bytes(*blake3::hash(&bytes).as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PipelineSourceState::Missing,
+        Err(error) => PipelineSourceState::Unreadable(error.kind()),
     }
 }
 
@@ -296,7 +303,8 @@ impl ConfigWatch {
     fn reconcile(
         &mut self,
         coordinator: &DaemonCoordinator,
-    ) -> Result<Option<(PathBuf, CandidateRequirements)>, CoordinatorError> {
+    ) -> Result<Option<(PathBuf, CandidateRequirements, PipelineSourceState)>, CoordinatorError>
+    {
         let observation = observe_configuration(&self.path);
         if self.observed.as_ref() == Some(&observation.state) {
             return Ok(None);
@@ -309,14 +317,29 @@ impl ConfigWatch {
             }
             Ok(candidate) => {
                 let input_changed = input_configuration_changed(&self.active, &candidate);
-                if input_changed {
-                    coordinator.publish_filesystem_configuration(
+                let pipeline = if input_changed {
+                    let requirements = candidate
+                        .candidate_requirements(&self.compiled)
+                        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+                    let targets = candidate
+                        .target_definitions(&self.compiled)
+                        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+                    let path = candidate.modules.pipeline_dylib.clone();
+                    let observed = observe_pipeline_source(&path);
+                    coordinator.publish_configuration_candidate(
                         candidate.asset_roots(),
                         candidate.assets.lineage_manifest.clone(),
+                        targets,
+                        &path,
+                        requirements.clone(),
                     )?;
+                    Some((path, requirements, observed))
                 } else if self.rejected {
                     coordinator.heal_configuration_rejection()?;
-                }
+                    None
+                } else {
+                    None
+                };
 
                 if operational_configuration_changed(&self.active, &candidate) {
                     coordinator.apply_operational_configuration(
@@ -330,16 +353,6 @@ impl ConfigWatch {
                     coordinator.stage_restart_configuration(&restart)?;
                 }
 
-                let pipeline = input_changed.then(|| {
-                    candidate
-                        .candidate_requirements(&self.compiled)
-                        .map(|requirements| {
-                            (candidate.modules.pipeline_dylib.clone(), requirements)
-                        })
-                });
-                let pipeline = pipeline
-                    .transpose()
-                    .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
                 apply_live_values(&mut self.active, &candidate);
                 self.last_valid = candidate;
                 self.rejected = false;
