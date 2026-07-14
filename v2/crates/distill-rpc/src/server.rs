@@ -385,6 +385,24 @@ impl Server {
         targets: Vec<TargetDefinition>,
         authoring_backend: Arc<dyn AuthoringBackend>,
     ) -> Result<Self, AttestationShapeError> {
+        Self::new_at_version_with_authoring_backend(
+            instance,
+            InputVersion(0),
+            targets,
+            authoring_backend,
+        )
+    }
+
+    /// Construct the RPC projection at an already-open durable store's
+    /// current input version. Production performs startup reconciliation as
+    /// the next coordinated commit; it must never replay `version` empty
+    /// commits merely to make two counters agree.
+    pub fn new_at_version_with_authoring_backend(
+        instance: StoreInstanceId,
+        version: InputVersion,
+        targets: Vec<TargetDefinition>,
+        authoring_backend: Arc<dyn AuthoringBackend>,
+    ) -> Result<Self, AttestationShapeError> {
         let bootstrap_authority = consumer_bootstrap_authority_v1()
             .map_err(|error| AttestationShapeError::BootstrapAuthorityUnavailable(error.0))?;
         let mut target_map = BTreeMap::new();
@@ -419,7 +437,7 @@ impl Server {
         }
         let stamp = SnapshotStamp {
             instance,
-            version: InputVersion(0),
+            version,
         };
         let view = Arc::new(VersionView {
             stamp,
@@ -432,16 +450,16 @@ impl Server {
             lineage_repair: None,
         });
         let mut views = BTreeMap::new();
-        views.insert(InputVersion(0), view);
+        views.insert(version, view);
         Ok(Self {
             inner: Arc::new(Mutex::new(ServerState {
                 bootstrap_authority,
                 instance,
                 protocol_epoch: PROTOCOL_VERSION,
-                current: InputVersion(0),
+                current: version,
                 views,
                 history: VecDeque::new(),
-                oldest_available_cursor: InputVersion(0),
+                oldest_available_cursor: version,
                 targets: target_map,
                 artifacts: HashMap::new(),
                 wire_trees: HashMap::new(),
@@ -1669,18 +1687,11 @@ impl Hub {
         authoring_gate(&state, &connection, base).map(AuthoringGate::into_result)
     }
 
-    fn publish_prepared_import(
-        &self,
-        base: InputVersion,
+    fn publish_prepared_import_locked(
+        state: &mut ServerState,
         prepared: PreparedImportCommit,
     ) -> RpcResult<BundleUuid> {
-        let mut state = self.server.lock();
-        let connection = lock_connection(&self.connection);
-        if let Some(gate) = authoring_gate(&state, &connection, base) {
-            return gate.into_result();
-        }
-        drop(connection);
-        match commit_locked(&mut state, prepared.commit) {
+        match commit_locked(state, prepared.commit) {
             Ok(_) => RpcResult::Success(prepared.bundle),
             Err(error) => authoring_admin_failure(error),
         }
@@ -1696,6 +1707,17 @@ impl Hub {
             return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
                 detail: "authoring operation batch must not be empty".to_owned(),
             });
+        }
+        drop(connection);
+        let backend = Arc::clone(&self.server.authoring_backend);
+        match backend.prepare_write(base, &ops) {
+            Ok(Some(commit)) => {
+                return commit_locked(&mut state, commit)
+                    .map(|stamp| RpcResult::Success(stamp.version))
+                    .unwrap_or_else(authoring_admin_failure);
+            }
+            Ok(None) => {}
+            Err(error) => return RpcResult::Failure(error),
         }
         let current_view = state
             .views
@@ -1757,7 +1779,6 @@ impl Hub {
                 },
             )
             .collect();
-        drop(connection);
         commit_locked(
             &mut state,
             Commit {
@@ -1775,21 +1796,29 @@ impl Hub {
         if let Err(detail) = validate_import_request(&request) {
             return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { detail });
         }
-        if let Some(result) = self.authoring_gate(base) {
-            return result;
+        let backend = Arc::clone(&self.server.authoring_backend);
+        let mut state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(gate) = authoring_gate(&state, &connection, base) {
+            return gate.into_result();
         }
-        let prepared = match self.server.authoring_backend.prepare_import(base, &request) {
+        drop(connection);
+        let prepared = match backend.prepare_import(base, &request) {
             Ok(prepared) => prepared,
             Err(error) => return RpcResult::Failure(error),
         };
-        self.publish_prepared_import(base, prepared)
+        Self::publish_prepared_import_locked(&mut state, prepared)
     }
 
     pub fn reimport(&self, base: InputVersion, bundle: BundleUuid) -> RpcResult<BundleUuid> {
-        if let Some(result) = self.authoring_gate(base) {
-            return result;
+        let backend = Arc::clone(&self.server.authoring_backend);
+        let mut state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(gate) = authoring_gate(&state, &connection, base) {
+            return gate.into_result();
         }
-        let prepared = match self.server.authoring_backend.prepare_reimport(base, bundle) {
+        drop(connection);
+        let prepared = match backend.prepare_reimport(base, bundle) {
             Ok(prepared) => prepared,
             Err(error) => return RpcResult::Failure(error),
         };
@@ -1798,7 +1827,7 @@ impl Hub {
                 detail: "reimport backend changed the bundle identity".to_owned(),
             });
         }
-        self.publish_prepared_import(base, prepared)
+        Self::publish_prepared_import_locked(&mut state, prepared)
     }
 
     pub fn operation(

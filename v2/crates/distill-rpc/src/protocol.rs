@@ -1326,6 +1326,23 @@ pub struct PreparedOperationCommit {
 /// migration, or doctor services. Implementations prepare a side-effect-free
 /// commit; publication remains an atomic RPC-server CAS step.
 pub trait AuthoringBackend: Send + Sync {
+    /// Execute an ordinary authoring batch against `base` and return the
+    /// rescan-proven in-memory projection when the backend owns durable
+    /// publication. `Ok(None)` retains the in-memory-only implementation used
+    /// by embedders and tests that have no filesystem authority.
+    ///
+    /// The RPC coordinator invokes this while holding its publication lock;
+    /// production implementations must compare their durable store version
+    /// with `base`, publish, rescan, and advance that store exactly once before
+    /// returning. They must not call back into the [`crate::Server`].
+    fn prepare_write(
+        &self,
+        _base: InputVersion,
+        _operations: &[AuthoringOp],
+    ) -> Result<Option<Commit>, RpcFailure> {
+        Ok(None)
+    }
+
     fn prepare_import(
         &self,
         base: InputVersion,

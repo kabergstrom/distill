@@ -162,6 +162,20 @@ fn server_with(policies: &[(u8, bool)]) -> Server {
     Server::new(StoreInstanceId([9; 16]), vec![target_with(7, policies)]).unwrap()
 }
 
+#[test]
+fn production_bootstrap_starts_at_the_durable_store_version() {
+    let server = Server::new_at_version_with_authoring_backend(
+        StoreInstanceId([9; 16]),
+        InputVersion(41),
+        vec![target_with(7, &[(1, false)])],
+        Arc::new(RecordingAuthoringBackend::default()),
+    )
+    .unwrap();
+
+    assert_eq!(server.current_stamp().version, InputVersion(41));
+    assert_eq!(snapshot(&connect(&server, &[(1, false)])).stamp().version, InputVersion(41));
+}
+
 #[derive(Default)]
 struct RecordingAuthoringBackend {
     imports: Mutex<Vec<ImportRequest>>,
@@ -247,6 +261,66 @@ impl AuthoringBackend for RecordingAuthoringBackend {
             ..Commit::default()
         })
     }
+}
+
+#[derive(Default)]
+struct DurableWriteBackend {
+    bases: Mutex<Vec<InputVersion>>,
+}
+
+impl AuthoringBackend for DurableWriteBackend {
+    fn prepare_write(
+        &self,
+        base: InputVersion,
+        _operations: &[AuthoringOp],
+    ) -> Result<Option<Commit>, RpcFailure> {
+        self.bases.lock().unwrap().push(base);
+        Ok(Some(Commit::default()))
+    }
+
+    fn prepare_import(
+        &self,
+        _base: InputVersion,
+        _request: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("write test does not import")
+    }
+
+    fn prepare_reimport(
+        &self,
+        _base: InputVersion,
+        _bundle: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("write test does not reimport")
+    }
+
+    fn prepare_operation(
+        &self,
+        _base: InputVersion,
+        _operation: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        unreachable!("write test does not run operations")
+    }
+}
+
+#[test]
+fn durable_write_backend_owns_the_committed_projection() {
+    let backend = Arc::new(DurableWriteBackend::default());
+    let server = Server::new_at_version_with_authoring_backend(
+        StoreInstanceId([9; 16]),
+        InputVersion(8),
+        vec![target_with(7, &[(1, false)])],
+        backend.clone(),
+    )
+    .unwrap();
+    let hub = connect(&server, &[(1, false)]);
+
+    assert_eq!(
+        hub.write(InputVersion(8), vec![AuthoringOp::Remove { uuid: asset_id(7) }]),
+        RpcResult::Success(InputVersion(9))
+    );
+    assert_eq!(*backend.bases.lock().unwrap(), [InputVersion(8)]);
+    assert_eq!(server.current_stamp().version, InputVersion(9));
 }
 
 fn connect(server: &Server, policies: &[(u8, bool)]) -> Hub {
