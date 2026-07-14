@@ -2,6 +2,7 @@
 //! scheduling, code-loading policy, and displaced-inode quarantine.
 
 pub mod authoring;
+mod build;
 pub mod callbacks;
 pub mod config;
 pub mod coordinator;

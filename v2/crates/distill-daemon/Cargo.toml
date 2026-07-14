@@ -15,6 +15,7 @@ distill-migrate = { path = "../distill-migrate" }
 distill-rpc = { path = "../distill-rpc" }
 distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
+distill-wire = { path = "../distill-wire" }
 globset = { workspace = true }
 ngp-module-host = { path = "../../../../newgameplus/ngp-module-host" }
 serde = { version = "1", features = ["derive"] }

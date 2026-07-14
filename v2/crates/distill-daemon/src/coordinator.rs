@@ -156,6 +156,13 @@ impl DaemonCoordinator {
         &self.server
     }
 
+    /// Attach this coordinator as the RPC server's production lazy-build
+    /// authority after it has been placed in its final `Arc`.
+    pub fn attach_build_backend(self: &Arc<Self>) {
+        self.server
+            .install_build_backend(Arc::new(crate::build::CoordinatorBuildBackend::new(self)));
+    }
+
     pub fn store(&self) -> Arc<Mutex<Store>> {
         Arc::clone(&self.store)
     }
@@ -177,6 +184,14 @@ impl DaemonCoordinator {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
+        *self
+            .schema_authority
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(authority);
     }
 
     pub fn operational_configuration(&self) -> SchedulerConfig {

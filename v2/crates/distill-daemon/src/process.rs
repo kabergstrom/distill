@@ -59,6 +59,7 @@ impl DaemonProcess {
             targets,
             config.pipeline.max_dependency_depth,
         )?);
+        coordinator.attach_build_backend();
         // The first schema/module/target candidate may replace the scanner's
         // root set. Publish it before attaching the filesystem watcher so the
         // watcher is born against the installed scanner, never an obsolete
