@@ -992,8 +992,12 @@ impl Server {
         keys.sort();
         keys.dedup();
         let mut state = self.lock();
+        let replacement = keys.iter().cloned().collect::<BTreeSet<_>>();
+        if state.restart_required_keys == replacement {
+            return stamp(&state);
+        }
+        state.restart_required_keys = replacement;
         if !keys.is_empty() {
-            state.restart_required_keys.extend(keys);
             let keys = state
                 .restart_required_keys
                 .iter()

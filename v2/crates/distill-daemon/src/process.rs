@@ -291,7 +291,6 @@ struct ConfigObservation {
 struct ConfigWatch {
     path: PathBuf,
     active: DaemonConfig,
-    last_valid: DaemonConfig,
     observed: Option<ConfigSourceState>,
     observed_schema: Option<ArtifactSourceState>,
     observed_pipeline: Option<ArtifactSourceState>,
@@ -302,7 +301,6 @@ impl ConfigWatch {
     fn new(active: DaemonConfig) -> Self {
         Self {
             path: active.source_path.clone(),
-            last_valid: active.clone(),
             active,
             observed: None,
             observed_schema: None,
@@ -396,13 +394,14 @@ impl ConfigWatch {
             )?;
         }
 
-        let restart = restart_changes(&self.last_valid, &candidate);
+        let restart = restart_changes(&self.active, &candidate);
         if !restart.is_empty() {
             coordinator.stage_restart_configuration(&restart)?;
+        } else {
+            coordinator.clear_restart_configuration()?;
         }
 
         apply_live_values(&mut self.active, &candidate);
-        self.last_valid = candidate;
         self.observed = Some(config_state);
         self.observed_schema = Some(schema.state);
         self.observed_pipeline = Some(pipeline_state);

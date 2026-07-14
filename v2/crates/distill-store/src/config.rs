@@ -291,6 +291,13 @@ impl Store {
         }))
     }
 
+    /// Clear a staged restart candidate that has been edited back to the
+    /// active startup values. This is not an input event.
+    pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
+        self.conn.execute("DELETE FROM pending_restart", [])?;
+        Ok(())
+    }
+
     pub fn configuration_state(&self) -> Result<ConfigurationState, StoreError> {
         let row: Option<PersistedConfigurationRow> = self
             .conn

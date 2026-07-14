@@ -139,6 +139,18 @@ fn restart_only_changes_stage_without_advancing_or_replacing_active_values() {
 }
 
 #[test]
+fn a_reverted_restart_candidate_clears_pending_state_without_advancing() {
+    let (_dir, mut store) = open();
+    store
+        .stage_pending_restart(&[RestartOnlyChange::AutoCodegen(true)])
+        .unwrap();
+    let before = store.input_version();
+    store.clear_pending_restart().unwrap();
+    assert_eq!(store.input_version(), before);
+    assert!(store.pending_restart().unwrap().is_none());
+}
+
+#[test]
 fn invalid_restart_value_is_rejected_before_pending_state_exists() {
     let (_dir, mut store) = open();
     let non_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 9999);

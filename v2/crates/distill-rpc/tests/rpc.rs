@@ -2448,6 +2448,26 @@ fn pending_restart_state_is_queued_after_the_cursor_bound_first_message() {
 }
 
 #[test]
+fn restart_required_replaces_the_prior_pending_key_set() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    server.restart_required(vec!["daemon.address".to_owned()]);
+    server.restart_required(vec!["codegen.auto_codegen".to_owned()]);
+    let install = hub
+        .subscribe(InputVersion(0), vec![], vec![])
+        .success()
+        .unwrap();
+    install.deltas.next().unwrap();
+    assert!(matches!(
+        install.deltas.next(),
+        Some(StreamEvent::Asset {
+            event: AssetEvent::RestartRequired { keys },
+            ..
+        }) if keys == vec!["codegen.auto_codegen"]
+    ));
+}
+
+#[test]
 fn delta_stream_capability_keeps_the_connection_alive_after_hub_drop() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);

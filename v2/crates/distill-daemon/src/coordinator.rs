@@ -121,7 +121,12 @@ impl DaemonCoordinator {
         max_dependency_depth: usize,
     ) -> Result<Self, CoordinatorInitError> {
         let module_state_path = store_config.state_path.join("pipeline-host");
-        let store = Arc::new(Mutex::new(Store::open(store_config.clone())?));
+        let mut opened_store = Store::open(store_config.clone())?;
+        if opened_store.pending_restart()?.is_some() {
+            opened_store
+                .input_transaction(|transaction| transaction.adopt_pending_restart().map(|_| ()))?;
+        }
+        let store = Arc::new(Mutex::new(opened_store));
         let scanner = RootedScanner::new(roots.clone())?;
         let backend = Arc::new(AuthoringService::new(
             Arc::clone(&store),
@@ -301,6 +306,14 @@ impl DaemonCoordinator {
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         self.server.restart_required(pending.keys.clone());
         Ok(pending)
+    }
+
+    pub fn clear_restart_configuration(&self) -> Result<(), CoordinatorError> {
+        lock_store(&self.store)
+            .clear_pending_restart()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        self.server.restart_required(Vec::new());
+        Ok(())
     }
 
     fn configuration_poison(&self) -> Option<ConfigurationPoison> {

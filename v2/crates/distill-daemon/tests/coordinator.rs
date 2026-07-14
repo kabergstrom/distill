@@ -15,8 +15,9 @@ use distill_rpc::{
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
+use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
-use distill_store::StoreConfig;
+use distill_store::{Store, StoreConfig};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
     let type_uuid = TypeUuid([71; 16]);
@@ -89,6 +90,33 @@ fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {
         256,
     )
     .unwrap()
+}
+
+#[test]
+fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join(".distill");
+    let pending_generation = {
+        let mut store = Store::open(StoreConfig::new(&state)).unwrap();
+        store
+            .stage_pending_restart(&[RestartOnlyChange::AutoCodegen(true)])
+            .unwrap()
+            .generation
+    };
+
+    let coordinator = coordinator(&temp);
+    let store = coordinator.store();
+    let store = store.lock().unwrap();
+    assert_eq!(store.input_version(), InputVersion(1));
+    assert!(store.pending_restart().unwrap().is_none());
+    assert!(matches!(
+        store.configuration_state().unwrap(),
+        ConfigurationState::Ready(epoch) if epoch.generation == pending_generation
+    ));
+    assert_eq!(
+        coordinator.server().current_stamp().version,
+        InputVersion(1)
+    );
 }
 
 #[test]
