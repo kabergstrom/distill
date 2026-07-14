@@ -15,11 +15,9 @@ fn pack_definition_roots_carry_the_authoring_only_selector() {
         .encode()
         .unwrap();
     assert!(generated.windows(needle.len()).any(|row| row == needle));
-    assert!(
-        BOOTSTRAP_CONTROL_SPEC_V1_BYTES
-            .windows(needle.len())
-            .any(|row| row == needle)
-    );
+    assert!(BOOTSTRAP_CONTROL_SPEC_V1_BYTES
+        .windows(needle.len())
+        .any(|row| row == needle));
 }
 
 #[test]
@@ -46,8 +44,8 @@ fn real_generator_is_byte_deterministic_and_exactly_dsci_keyed() {
     assert_eq!(
         *blake3::hash(first.bytes()).as_bytes(),
         [
-            224, 127, 89, 107, 28, 163, 108, 146, 88, 123, 215, 172, 159, 253, 68, 121, 184,
-            227, 8, 27, 9, 218, 136, 226, 115, 152, 58, 46, 59, 227, 249, 38,
+            100, 140, 176, 94, 141, 222, 208, 226, 198, 202, 15, 146, 47, 1, 89, 249, 58, 160, 197,
+            114, 250, 48, 135, 141, 179, 167, 123, 152, 124, 214, 180, 250,
         ]
     );
 }
