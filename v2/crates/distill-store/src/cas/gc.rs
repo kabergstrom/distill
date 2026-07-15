@@ -21,6 +21,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
+use distill_wire::artifact::{parse_artifact, ARTIFACT_MAGIC};
+
 use crate::artifacts::PinKind;
 use crate::cas::manifest::{self, GenerationManifest, ManifestSegment, SegmentKind};
 use crate::cas::record::{
@@ -172,7 +174,9 @@ impl Store {
     }
 
     /// The whole pin/evict unit of one result record: every output and
-    /// aux ContentHash (§13).
+    /// aux ContentHash plus each output artifact's wire-tree LayoutHash
+    /// (§13). The layout is part of the observable artifact and must live
+    /// for exactly as long as any result that names it.
     fn result_unit_hashes(
         &self,
         segment: u64,
@@ -186,6 +190,18 @@ impl Store {
         if let ResultOutcome::Success { outputs, aux } = &payload.outcome {
             for row in outputs {
                 hashes.push(row.content_hash.0);
+                let artifact = self.cas_read(&row.content_hash.0)?;
+                if artifact.starts_with(&ARTIFACT_MAGIC) {
+                    let view = parse_artifact(&artifact).map_err(|error| {
+                        StoreError::BadResultPayload {
+                            detail: format!(
+                                "output {} is not a valid artifact: {error}",
+                                row.output_key
+                            ),
+                        }
+                    })?;
+                    hashes.push(view.layout_hash.0);
+                }
             }
             for row in aux {
                 hashes.push(row.content_hash.0);

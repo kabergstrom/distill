@@ -4,11 +4,12 @@
 //! as one unit, and the check runs inside the same transaction that
 //! deletes the index rows.
 
-use distill_core::id::AssetUuid;
+use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_store::artifacts::PinKind;
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::{Store, StoreConfig, StoreError};
+use distill_wire::artifact::{write_artifact, ArtifactHeader};
 use distill_wire::dswl::dswl_bytes;
 use distill_wire::wire::WireNode;
 
@@ -50,6 +51,28 @@ fn commit_with_aux(
         receipt.aux[0].1 .0,
         receipt.trace_digest,
     )
+}
+
+fn commit_artifact(store: &mut Store, key: u8, artifact: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let receipt = store
+        .commit_build(BuildCommit {
+            key_kind: KeyKind::Processor,
+            static_input_key: [key; 32],
+            asset_uuid: PARENT,
+            static_inputs_canonical: vec![],
+            trace: vec![key],
+            outcome: CommitOutcome::Success {
+                payload_kind: PayloadKind::ProcessorOutput,
+                outputs: vec![OutputSpec {
+                    output_key: String::new(),
+                    type_uuids: vec![],
+                    bytes: artifact.to_vec(),
+                }],
+                aux: vec![],
+            },
+        })
+        .unwrap();
+    (receipt.outputs[0].1 .0, receipt.trace_digest)
 }
 
 // ---- eviction ----
@@ -168,6 +191,56 @@ fn a_shared_extent_survives_until_its_last_referencing_result_is_evicted() {
         .unwrap());
     assert!(matches!(
         store.cas_read(&out1),
+        Err(StoreError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn a_wire_tree_is_part_of_every_result_that_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let wire_bytes = dswl_bytes(&WireNode::Unit { offset: 0 }).unwrap();
+    let layout = store.put_wire_tree(&wire_bytes).unwrap();
+    let artifact = write_artifact(
+        &ArtifactHeader {
+            asset_uuid: PARENT,
+            authored_type: TypeUuid([1; 16]),
+            terminal_type: TypeUuid([2; 16]),
+            encoded_type: TypeUuid([3; 16]),
+            logical_hash: LogicalHash([4; 32]),
+            layout_hash: layout,
+        },
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let (_, digest1) = commit_artifact(&mut store, 1, &artifact);
+    let (_, digest2) = commit_artifact(&mut store, 2, &artifact);
+
+    assert!(store
+        .evict_result(KeyKind::Processor, &[1; 32], &digest1)
+        .unwrap());
+    assert_eq!(
+        store.wire_tree_read(layout).unwrap(),
+        wire_bytes,
+        "the second result still references the shared layout"
+    );
+
+    store
+        .pin(PinKind::Manifest, "current", &[layout.0])
+        .unwrap();
+    assert!(matches!(
+        store.evict_result(KeyKind::Processor, &[2; 32], &digest2),
+        Err(StoreError::Pinned { hash }) if hash == layout.0
+    ));
+    store.unpin_holder(PinKind::Manifest, "current").unwrap();
+    assert!(store
+        .evict_result(KeyKind::Processor, &[2; 32], &digest2)
+        .unwrap());
+    assert!(matches!(
+        store.wire_tree_read(layout),
         Err(StoreError::NotFound { .. })
     ));
 }
