@@ -291,10 +291,7 @@ fn decode_fetched(
         if value.kind != ArchiveObjectKind::Structural {
             return Err(MountError::ObjectKind(*key));
         }
-        let raw = decode_structural(archive.payload(*key)?)?;
-        if raw.len() as u64 != value.raw_len {
-            return Err(MountError::Archive(ArchiveError::BadLength));
-        }
+        let raw = decode_structural(archive.payload(*key)?, value.raw_len)?;
         structural.extend_from_slice(&raw);
     }
     let mut blob_ranges = Vec::new();

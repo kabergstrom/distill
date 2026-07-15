@@ -1184,6 +1184,30 @@ impl<I: LoaderIO> Loader<I> {
             return;
         }
         let type_uuid = parsed.terminal_type;
+        let mut expected_terminal_types = self
+            .sweep
+            .as_ref()
+            .and_then(|sweep| sweep.candidates.get(&uuid))
+            .map(|candidate| candidate.expected_terminal_types.clone())
+            .unwrap_or_default();
+        expected_terminal_types.extend(
+            self.handles_for_uuid(uuid)
+                .into_iter()
+                .filter_map(|handle| self.slots.get(&handle)?.expected_type),
+        );
+        if expected_terminal_types
+            .iter()
+            .any(|expected| *expected != type_uuid)
+        {
+            self.reject_fetched(
+                uuid,
+                &basis,
+                format!(
+                    "handle terminal type mismatch: expected {expected_terminal_types:?}, got {type_uuid}"
+                ),
+            );
+            return;
+        }
         let load_deps = parsed.load_deps.clone();
         let edge_assets = artifact
             .load_edges
@@ -1939,6 +1963,15 @@ impl<I: LoaderIO> Loader<I> {
                                 content_hash: hash,
                                 error: error.clone(),
                                 built_from: stamp,
+                            };
+                        }
+                    }
+                    for handle in self.handles_for_uuid(*uuid) {
+                        if let Some(slot) = self.slots.get_mut(&handle) {
+                            slot.status = if slot.current.is_some() {
+                                LoadStatus::Loaded
+                            } else {
+                                LoadStatus::Unloaded
                             };
                         }
                     }

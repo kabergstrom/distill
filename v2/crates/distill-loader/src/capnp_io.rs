@@ -423,15 +423,13 @@ impl Driver {
                     .await;
                     return true;
                 }
-                let Ok(request_slot) = std::sync::Arc::clone(&self.request_slots)
-                    .acquire_owned()
-                    .await
-                else {
-                    return false;
-                };
+                let request_slots = std::sync::Arc::clone(&self.request_slots);
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 tokio::task::spawn_local(async move {
+                    let Ok(request_slot) = request_slots.acquire_owned().await else {
+                        return;
+                    };
                     let _request_slot = request_slot;
                     let event = resolve_event(snapshot, req, uuid, basis).await;
                     let _ = send_event(&events, event).await;
@@ -450,12 +448,7 @@ impl Driver {
                     .await;
                     return true;
                 }
-                let Ok(request_slot) = std::sync::Arc::clone(&self.request_slots)
-                    .acquire_owned()
-                    .await
-                else {
-                    return false;
-                };
+                let request_slots = std::sync::Arc::clone(&self.request_slots);
                 let hub = self.hub.clone();
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
@@ -463,6 +456,9 @@ impl Driver {
                 let wake = Rc::clone(&self.fetch_wake);
                 let spool_directory = self.spool_directory.clone();
                 tokio::task::spawn_local(async move {
+                    let Ok(request_slot) = request_slots.acquire_owned().await else {
+                        return;
+                    };
                     let _request_slot = request_slot;
                     let completion = fetch_event(
                         (hub, snapshot),
@@ -486,15 +482,13 @@ impl Driver {
                     .await;
                     return true;
                 }
-                let Ok(request_slot) = std::sync::Arc::clone(&self.request_slots)
-                    .acquire_owned()
-                    .await
-                else {
-                    return false;
-                };
+                let request_slots = std::sync::Arc::clone(&self.request_slots);
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 tokio::task::spawn_local(async move {
+                    let Ok(request_slot) = request_slots.acquire_owned().await else {
+                        return;
+                    };
                     let _request_slot = request_slot;
                     let event = path_event(snapshot, req, path, basis).await;
                     let _ = send_event(&events, event).await;
@@ -809,7 +803,8 @@ async fn fetch_event(
         Err(error) => return Completion::event(request_error(req, request_basis, error)),
     };
     let payload = match permit.storage {
-        FetchStorage::Memory => match collect_remote_chunks(&mut terminal.value).await {
+        FetchStorage::Memory => match collect_remote_chunks(&mut terminal.value, total_bytes).await
+        {
             Ok((structural, blobs)) => {
                 let observed = blobs.iter().try_fold(structural.len(), |total, blob| {
                     total.checked_add(blob.len())
@@ -865,9 +860,11 @@ async fn fetch_event(
 
 async fn collect_remote_chunks(
     stream: &mut distill_rpc::capnp_loader::RemoteChunkStream,
+    total_bytes: usize,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
     let mut structural = Vec::new();
     let mut blobs = std::collections::BTreeMap::<u32, Vec<u8>>::new();
+    let mut total = 0usize;
     loop {
         match stream.next_chunk().await {
             Ok(Some(chunk)) => {
@@ -880,11 +877,22 @@ async fn collect_remote_chunks(
                 if chunk.offset != output.len() as u64 {
                     return Err("artifact chunks are not contiguous".into());
                 }
+                total = total
+                    .checked_add(chunk.bytes.len())
+                    .ok_or_else(|| "artifact stream length overflow".to_owned())?;
+                if total > total_bytes {
+                    return Err("artifact stream exceeds its authenticated total".into());
+                }
                 output.extend_from_slice(&chunk.bytes);
             }
             Ok(None) => {
                 if blobs.keys().copied().ne(0..blobs.len() as u32) {
                     return Err("artifact blob chunk indices are not contiguous".into());
+                }
+                if total != total_bytes {
+                    return Err(
+                        "artifact stream length differs from its authenticated total".into(),
+                    );
                 }
                 return Ok((structural, blobs.into_values().collect()));
             }

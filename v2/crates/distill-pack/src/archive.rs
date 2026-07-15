@@ -160,11 +160,22 @@ pub fn encode_archive(
 fn encode_structural(raw: &[u8], level: i32) -> Result<Vec<u8>, ArchiveError> {
     let mut encoder = zstd::stream::Encoder::new(Vec::new(), level)?;
     encoder.window_log(18)?; // 2^18 = the canonical 256 KiB block bound.
+    encoder.include_contentsize(true)?;
+    encoder.set_pledged_src_size(Some(raw.len() as u64))?;
     encoder.write_all(raw)?;
     Ok(encoder.finish()?)
 }
 
-pub(crate) fn decode_structural(stored: &[u8]) -> Result<Vec<u8>, ArchiveError> {
+pub(crate) fn decode_structural(stored: &[u8], expected_len: u64) -> Result<Vec<u8>, ArchiveError> {
+    if expected_len > STRUCTURAL_CHUNK_SIZE as u64 {
+        return Err(ArchiveError::BadLength);
+    }
+    let frame_len = zstd::zstd_safe::get_frame_content_size(stored)
+        .map_err(|_| ArchiveError::BadLength)?
+        .ok_or(ArchiveError::BadLength)?;
+    if frame_len != expected_len {
+        return Err(ArchiveError::BadLength);
+    }
     if zstd::zstd_safe::get_dict_id_from_frame(stored).is_some() {
         return Err(ArchiveError::ExternalDictionary);
     }
@@ -175,8 +186,14 @@ pub(crate) fn decode_structural(stored: &[u8]) -> Result<Vec<u8>, ArchiveError> 
     }
     let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(stored))?;
     decoder.window_log_max(18)?;
-    let mut raw = Vec::new();
-    decoder.read_to_end(&mut raw)?;
+    let capacity = usize::try_from(expected_len).map_err(|_| ArchiveError::BadLength)?;
+    let mut raw = Vec::with_capacity(capacity);
+    decoder
+        .take(expected_len.saturating_add(1))
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 != expected_len {
+        return Err(ArchiveError::BadLength);
+    }
     Ok(raw)
 }
 
@@ -266,10 +283,7 @@ pub(crate) fn scan_archive(bytes: &[u8]) -> Result<ScannedArchive, ArchiveError>
                 if raw_len > STRUCTURAL_CHUNK_SIZE as u64 {
                     return Err(ArchiveError::BadLength);
                 }
-                let raw = decode_structural(stored)?;
-                if raw.len() as u64 != raw_len {
-                    return Err(ArchiveError::BadLength);
-                }
+                let _ = decode_structural(stored, raw_len)?;
             }
             ArchiveObjectKind::Blob => {
                 if raw_len != stored.len() as u64 {
@@ -366,13 +380,26 @@ mod tests {
         let raw = vec![7u8; STRUCTURAL_CHUNK_SIZE];
         let frame = encode_structural(&raw, 3).unwrap();
         assert!(zstd::zstd_safe::get_dict_id_from_frame(&frame).is_none());
-        assert_eq!(decode_structural(&frame).unwrap(), raw);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+            Some(raw.len() as u64)
+        );
+        assert_eq!(decode_structural(&frame, raw.len() as u64).unwrap(), raw);
 
         let mut concatenated = frame.clone();
         concatenated.extend_from_slice(&frame);
         assert!(matches!(
-            decode_structural(&concatenated),
+            decode_structural(&concatenated, raw.len() as u64),
             Err(ArchiveError::MultipleFrames)
+        ));
+
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&raw).unwrap();
+        let missing_size = encoder.finish().unwrap();
+        assert!(matches!(
+            decode_structural(&missing_size, raw.len() as u64),
+            Err(ArchiveError::BadLength)
         ));
     }
 }

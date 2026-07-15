@@ -206,3 +206,37 @@ fn ambient_tool_runs_directly_and_trust_controls_memoization() {
         assert_eq!(cacheable, trusted);
     }
 }
+
+#[test]
+fn tool_output_is_drained_while_large_stdin_is_written() {
+    let (directory, mut store) = new_store();
+    let script = br#"#!/bin/sh
+head -c 262144 /dev/zero
+cat >/dev/null
+"#;
+    store
+        .input_transaction(|txn| {
+            txn.register_tool(
+                "duplex",
+                ToolRegistrationV2 {
+                    source: ResolvedToolSourceV2::Package {
+                        launcher: "bin/duplex".into(),
+                        files: vec![ResolvedToolPackageFile {
+                            path: "bin/duplex".into(),
+                            executable: true,
+                            bytes: script.to_vec(),
+                        }],
+                    },
+                    environment: Vec::new(),
+                    cwd_policy: ToolCwdPolicy::EmptyScratch,
+                },
+            )
+        })
+        .unwrap();
+    let snapshot = StoreToolEpochSnapshot::new(&store, store.input_version());
+    let mut process = context(&snapshot, directory.path());
+    let output = process.run_tool("duplex", &[], &vec![7; 262_144]).unwrap();
+    assert_eq!(output.status, 0);
+    assert_eq!(output.stdout.len(), 262_144);
+    assert!(output.stderr.is_empty());
+}

@@ -365,17 +365,26 @@ fn launch(
         .stdin
         .take()
         .ok_or_else(|| LaunchError::Infrastructure("spawned tool has no stdin pipe".to_owned()))?;
-    if let Err(error) = child_stdin.write_all(stdin) {
-        let _ = child.kill();
-        let _ = child.wait();
+    // A child is allowed to produce output before consuming all input. Drain
+    // stdout/stderr through `wait_with_output` while a separate writer feeds
+    // stdin, otherwise both sides can fill their pipe and deadlock.
+    let input = stdin.to_vec();
+    let writer = std::thread::spawn(move || {
+        let result = child_stdin.write_all(&input);
+        drop(child_stdin);
+        result
+    });
+    let output = child.wait_with_output().map_err(|error| {
+        LaunchError::Infrastructure(format!("failed to collect tool output: {error}"))
+    })?;
+    let written = writer
+        .join()
+        .map_err(|_| LaunchError::Infrastructure("tool stdin writer panicked".to_owned()))?;
+    if let Err(error) = written {
         return Err(LaunchError::Infrastructure(format!(
             "failed to write tool stdin: {error}"
         )));
     }
-    drop(child_stdin);
-    let output = child.wait_with_output().map_err(|error| {
-        LaunchError::Infrastructure(format!("failed to collect tool output: {error}"))
-    })?;
     Ok(ToolOutput {
         status: output.status.code().unwrap_or(-1),
         stdout: output.stdout,

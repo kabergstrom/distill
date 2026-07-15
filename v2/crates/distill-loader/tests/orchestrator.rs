@@ -515,6 +515,30 @@ fn malformed_fetch_terminally_fails_its_candidate() {
 }
 
 #[test]
+fn typed_handle_rejects_an_artifact_with_another_terminal_type() {
+    let token = ModuleEpochToken::new(36);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 36, &token);
+    let asset_uuid = uuid(36);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (hash, artifact) = artifact::<B>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+    assert!(storage.updates.is_empty());
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::Artifact(message) if message.contains("handle terminal type mismatch")
+    )));
+}
+
+#[test]
 fn local_build_only_descriptor_rejects_runtime_artifact() {
     let token = ModuleEpochToken::new(35);
     let mut loader = Loader::new(mock_io());
