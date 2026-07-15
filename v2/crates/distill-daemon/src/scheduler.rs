@@ -75,13 +75,6 @@ impl std::fmt::Display for SchedulerError {
 
 impl std::error::Error for SchedulerError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchedulerResize {
-    pub active_slots_to_drain: usize,
-    pub batch_reserved_workers: usize,
-    pub single_worker_alternates: bool,
-}
-
 /// FIFO within each class. At two or more workers, batch work owns a reserved
 /// minimum while every other slot retains strict interactive priority. At one
 /// worker the selected class alternates whenever both are pending.
@@ -107,14 +100,6 @@ impl Scheduler {
 
     pub fn config(&self) -> SchedulerConfig {
         self.config
-    }
-
-    pub fn enqueue(&mut self, id: u64, class: WorkClass) {
-        assert!(!self.contains(id), "{}", SchedulerError::DuplicateJob(id));
-        match class {
-            WorkClass::Interactive => self.interactive.push_back(id),
-            WorkClass::Batch => self.batch.push_back(id),
-        }
     }
 
     pub fn try_enqueue(&mut self, id: u64, class: WorkClass) -> Result<(), SchedulerError> {
@@ -147,54 +132,12 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Operational-live resize. Work above the new limit remains active and
-    /// simply drains; no admission occurs until active count falls below it.
-    pub fn resize(
-        &mut self,
-        parallelism: usize,
-        batch_reserved_workers: usize,
-    ) -> Result<(), SchedulerConfigError> {
-        let next = SchedulerConfig {
-            parallelism,
-            batch_reserved_workers,
-            max_dependency_depth: self.config.max_dependency_depth,
-        };
-        next.validate()?;
-        self.config = next;
-        Ok(())
-    }
-
     /// Apply the complete operational-live scheduler configuration without
     /// discarding queued or active jobs. Active excess drains naturally.
     pub fn reconfigure(&mut self, config: SchedulerConfig) -> Result<(), SchedulerConfigError> {
         config.validate()?;
         self.config = config;
         Ok(())
-    }
-
-    /// Resize only the worker pool and re-clamp the live reservation. This is
-    /// the operational-live `pipeline.parallelism` transition: active excess
-    /// work drains naturally and is never cancelled.
-    pub fn resize_parallelism(
-        &mut self,
-        parallelism: usize,
-    ) -> Result<SchedulerResize, SchedulerConfigError> {
-        if parallelism == 0 {
-            return Err(SchedulerConfigError::ParallelismZero);
-        }
-        let reservation_max = parallelism.saturating_sub(1).max(1);
-        self.config.parallelism = parallelism;
-        self.config.batch_reserved_workers =
-            self.config.batch_reserved_workers.clamp(1, reservation_max);
-        Ok(SchedulerResize {
-            active_slots_to_drain: self.active.len().saturating_sub(parallelism),
-            batch_reserved_workers: self.config.batch_reserved_workers,
-            single_worker_alternates: parallelism == 1,
-        })
-    }
-
-    pub fn active_len(&self) -> usize {
-        self.active.len()
     }
 
     pub fn is_active(&self, id: u64) -> bool {
@@ -241,77 +184,5 @@ impl Scheduler {
                 .map(|id| (id, WorkClass::Interactive)),
             WorkClass::Batch => self.batch.pop_front().map(|id| (id, WorkClass::Batch)),
         }
-    }
-}
-
-pub struct ChainFrame<T> {
-    name: String,
-    run: Box<dyn FnOnce() -> ChainStep<T> + Send>,
-}
-
-impl<T> ChainFrame<T> {
-    pub fn new(
-        name: impl Into<String>,
-        run: impl FnOnce() -> ChainStep<T> + Send + 'static,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            run: Box::new(run),
-        }
-    }
-}
-
-pub enum ChainStep<T> {
-    Complete(T),
-    Continue(ChainFrame<T>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChainDepthExceeded {
-    pub limit: usize,
-    pub chain: Vec<String>,
-}
-
-impl ChainDepthExceeded {
-    /// Depth is caller-local resource policy, so this outcome must never enter
-    /// the build-failure memo table.
-    pub const fn memoizable(&self) -> bool {
-        false
-    }
-}
-
-impl std::fmt::Display for ChainDepthExceeded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "dependency depth {} exceeded: {}",
-            self.limit,
-            self.chain.join(" -> ")
-        )
-    }
-}
-
-impl std::error::Error for ChainDepthExceeded {}
-
-/// Execute an arbitrarily deep cooperative chain with one native call frame.
-/// A cache consult is represented by one frame which immediately completes,
-/// so no historical subtree contributes to this request's live depth.
-pub fn run_trampolined<T>(
-    mut frame: ChainFrame<T>,
-    max_depth: usize,
-) -> Result<T, ChainDepthExceeded> {
-    let mut chain = Vec::new();
-    loop {
-        chain.push(frame.name);
-        if chain.len() > max_depth {
-            return Err(ChainDepthExceeded {
-                limit: max_depth,
-                chain,
-            });
-        }
-        frame = match (frame.run)() {
-            ChainStep::Complete(value) => return Ok(value),
-            ChainStep::Continue(next) => next,
-        };
     }
 }

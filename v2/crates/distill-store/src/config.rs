@@ -63,34 +63,6 @@ impl StoreConfig {
     pub fn validate_scheduler(&self) -> Result<(), ConfigValidationError> {
         validate_scheduler(self.parallelism, self.batch_reserved_workers)
     }
-
-    /// Apply an operational-live pool resize. Existing work above the new
-    /// slot limit drains rather than being cancelled; reservation is
-    /// re-clamped so at least one interactive slot remains. At one worker,
-    /// the sole slot alternates oldest-batch and interactive work.
-    pub fn resize_parallelism(
-        &mut self,
-        parallelism: usize,
-        active_slots: usize,
-    ) -> Result<SchedulerResize, ConfigValidationError> {
-        if parallelism == 0 {
-            return Err(ConfigValidationError::ParallelismZero);
-        }
-        self.parallelism = parallelism;
-        self.batch_reserved_workers = self
-            .batch_reserved_workers
-            .clamp(1, parallelism.saturating_sub(1).max(1));
-        Ok(SchedulerResize {
-            active_slots_to_drain: active_slots.saturating_sub(parallelism),
-            single_worker_alternates: parallelism == 1,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchedulerResize {
-    pub active_slots_to_drain: usize,
-    pub single_worker_alternates: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

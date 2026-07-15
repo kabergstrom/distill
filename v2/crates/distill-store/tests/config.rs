@@ -62,29 +62,6 @@ fn scheduler_bounds_preserve_progress_for_both_classes() {
 }
 
 #[test]
-fn live_resize_reclamps_reservation_and_drains_excess_active_slots() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = StoreConfig::new(dir.path().join(".distill"));
-    cfg.batch_reserved_workers = 4;
-    let resize = cfg.resize_parallelism(3, 8).unwrap();
-    assert_eq!(cfg.parallelism, 3);
-    assert_eq!(
-        cfg.batch_reserved_workers, 2,
-        "one interactive slot remains"
-    );
-    assert_eq!(resize.active_slots_to_drain, 5);
-    assert!(!resize.single_worker_alternates);
-
-    let one = cfg.resize_parallelism(1, 3).unwrap();
-    assert_eq!(cfg.batch_reserved_workers, 1);
-    assert_eq!(one.active_slots_to_drain, 2);
-    assert!(
-        one.single_worker_alternates,
-        "the sole slot alternates oldest batch/interactive"
-    );
-}
-
-#[test]
 fn operational_store_values_apply_without_copying_restart_state() {
     let (_dir, mut store) = open();
     let original_state_path = store.operational_config().state_path;
