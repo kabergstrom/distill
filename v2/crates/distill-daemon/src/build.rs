@@ -347,6 +347,34 @@ impl ArtifactLeaseBackend for CoordinatorBuildBackend {
         };
         let _ = store.unpin_holder(PinKind::Lease, &format!("rpc-lease-{holder}"));
     }
+
+    fn pin_pack_session(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
+        let coordinator = self
+            .coordinator
+            .upgrade()
+            .ok_or_else(|| "build coordinator stopped".to_owned())?;
+        coordinator
+            .store()
+            .lock()
+            .map_err(|_| "durable store mutex is poisoned".to_owned())?
+            .pin(
+                PinKind::PackSession,
+                &format!("rpc-pack-session-{holder}"),
+                hashes,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_pack_session(&self, holder: u64) {
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            return;
+        };
+        let store_handle = coordinator.store();
+        let Ok(mut store) = store_handle.lock() else {
+            return;
+        };
+        let _ = store.unpin_holder(PinKind::PackSession, &format!("rpc-pack-session-{holder}"));
+    }
 }
 
 impl ArtifactPayloadBackend for CoordinatorBuildBackend {
@@ -1132,15 +1160,8 @@ fn build(
 
 pub(crate) fn doctor_verify_builds(
     coordinator: &Arc<DaemonCoordinator>,
+    requests: &[BuildRequest],
 ) -> Result<Vec<String>, String> {
-    let requests = match coordinator.server().verification_build_requests() {
-        Ok(requests) => requests,
-        Err(error) => {
-            return Ok(vec![format!(
-                "build verification is unavailable for the current authority state: {error:?}"
-            )])
-        }
-    };
     let mut defects = Vec::new();
     for request in requests {
         let run = |request: BuildRequest, verify_fresh| {
@@ -2277,6 +2298,11 @@ fn commit_processor_stage(
     outputs: &[EncodedNodeOutput],
     debug: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), BuildError> {
+    for output in outputs {
+        lock_build_store(context)?
+            .put_wire_tree(&output.project.dswl_bytes)
+            .map_err(BuildError::infrastructure)?;
+    }
     lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
@@ -3440,7 +3466,9 @@ fn encode_or_hydrate(
         validator_dylib_hash,
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
     });
-    let hit = {
+    let hit = if context.verify_fresh {
+        None
+    } else {
         let mut store = lock_build_store(context)?;
         lookup_persisted_candidate(
             &mut store,
@@ -3603,6 +3631,9 @@ fn encode_or_hydrate(
     );
     if !context.verify_fresh {
         lock_build_store(context)?
+            .put_wire_tree(&project.dswl_bytes)
+            .map_err(BuildError::infrastructure)?;
+        lock_build_store(context)?
             .commit_build(BuildCommit {
                 key_kind: KeyKind::BuildImport,
                 static_input_key: key,
@@ -3755,7 +3786,7 @@ fn load_asset(
     }
     let bundle = distill_bundle::parse_bundle(&bundle_bytes).map_err(BuildError::failed)?;
     let canonical = distill_bundle::write_bundle(&bundle).map_err(BuildError::failed)?;
-    if canonical != bundle_bytes || bundle.uuid != bundle_meta.bundle {
+    if bundle.uuid != bundle_meta.bundle {
         return Err(BuildError::Drifted(DriftedInput::File(
             bundle_meta.path.clone(),
         )));
@@ -3771,7 +3802,7 @@ fn load_asset(
     Ok(LoadedAsset {
         meta,
         bundle_meta,
-        bundle_bytes,
+        bundle_bytes: canonical,
         entry: entry.clone(),
     })
 }
@@ -4352,8 +4383,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::callbacks::{
-        PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProduct,
-        ProcessorProducts,
+        Diagnostics, PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorError,
+        ProcessorProduct, ProcessorProducts, ValidatorDescriptor,
     };
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
@@ -4919,6 +4950,19 @@ mod tests {
         }
     }
 
+    struct CountingValidator(Arc<AtomicUsize>);
+
+    impl PipelineValidator for CountingValidator {
+        fn validate(
+            &self,
+            _asset: &AuthoredValue,
+            _diagnostics: &mut Diagnostics,
+        ) -> Result<(), distill_asset::CallbackPanic> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     struct StoreLockProbeProcessor {
         calls: Arc<AtomicUsize>,
         store: Arc<Mutex<Store>>,
@@ -5391,7 +5435,9 @@ mod tests {
         coordinator.install_build_target_for_test("dev", build_target);
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_unlocked = Arc::new(AtomicBool::new(false));
-        coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch(
+        let validator_calls = Arc::new(AtomicUsize::new(0));
+        let registered_validator_calls = Arc::clone(&validator_calls);
+        coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch_with(
             "dev",
             target_hash.0,
             crate::callbacks::ProcessorDescriptor {
@@ -5406,8 +5452,20 @@ mod tests {
                 store: coordinator.store(),
                 observed_unlocked: Arc::clone(&observed_unlocked),
             },
+            move |arena| {
+                arena
+                    .register_validator(
+                        ValidatorDescriptor {
+                            id: "validate-import".to_owned(),
+                            asset_type: TYPE,
+                        },
+                        CountingValidator(registered_validator_calls),
+                    )
+                    .into_result()
+                    .unwrap();
+            },
         ));
-        let request = BuildRequest {
+        let mut request = BuildRequest {
             work_class: BuildWorkClass::Interactive,
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
@@ -5482,12 +5540,12 @@ mod tests {
             local_id: "entry".to_owned(),
             authored_type: TYPE,
             terminal_type: TERMINAL,
-            canonical_bundle_bytes: bundle_bytes,
+            canonical_bundle_bytes: bundle_bytes.clone(),
             logical: project.logical_hash,
             layout: project.layout_hash,
             migrations: Vec::new(),
             automatic_migration: None,
-            validator_dylib_hash: None,
+            validator_dylib_hash: Some([9; 32]),
             artifact_format_version: ARTIFACT_FORMAT_VERSION,
         });
         let import_candidates = coordinator
@@ -5505,6 +5563,7 @@ mod tests {
         assert_eq!(first.artifacts.len(), 2);
         assert_eq!(first.wire_trees.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
         assert!(observed_unlocked.load(Ordering::SeqCst));
         let root = first
             .artifacts
@@ -5557,6 +5616,22 @@ mod tests {
         assert_eq!(hydrated, first);
         assert_eq!(coordinator.store().lock().unwrap().memo_seq(), first_memo);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
+
+        let noncanonical = [b"\n  ".as_slice(), bundle_bytes.as_slice()].concat();
+        std::fs::write(assets.join("byte.bundle"), noncanonical).unwrap();
+        coordinator.reconcile_full_scan().unwrap();
+        request.basis = coordinator.server().current_stamp();
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
+
+        assert_eq!(
+            build_with_runtime_mode(&coordinator, &request, true).unwrap(),
+            first
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(validator_calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]

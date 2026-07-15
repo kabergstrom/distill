@@ -18,6 +18,8 @@ const MAX_RETAINED_HISTORY_DELTAS: usize = 4096;
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MAX_SNAPSHOT_LEASES: usize = 1024;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
+pub const MAX_SUBSCRIBED_ASSETS: usize = 4096;
+pub const MAX_SUBSCRIBED_PATHS: usize = 4096;
 
 /// Resource bounds for target-bound RPC capabilities. Snapshot leases are
 /// absolute: clients obtain a fresh capability through `refresh`. Hub
@@ -272,6 +274,16 @@ pub struct Snapshot {
     lease: Arc<ViewLease>,
 }
 
+/// A single bounded pack-build scope attached to one snapshot lease. Calls
+/// renew both the snapshot and its target connection; expiration or drop
+/// releases every CAS pin held under the distinct pack-session pin class.
+pub struct PackSession {
+    server: Server,
+    connection: Arc<Mutex<ConnectionState>>,
+    lease: Arc<ViewLease>,
+    state: Arc<PackSessionLease>,
+}
+
 #[derive(Clone)]
 pub struct AuthoringSnapshot {
     server: Server,
@@ -308,19 +320,30 @@ struct ArtifactLease {
     alive: Mutex<bool>,
 }
 
+struct PackSessionLease {
+    holder: u64,
+    backend: Arc<dyn ArtifactLeaseBackend>,
+    alive: Mutex<bool>,
+}
+
 /// Owns every resource retained by one snapshot capability. Expiration drops
 /// the pinned version view as well as its CAS pins, so abandoned Cap'n Proto
 /// capabilities cannot keep old daemon state alive after their lease ends.
 struct ViewLease {
-    deadline: Instant,
+    deadline: Mutex<Instant>,
     expiry_active: Arc<AtomicBool>,
     view: Mutex<Option<Arc<VersionView>>>,
     artifact: Option<Arc<ArtifactLease>>,
+    pack_session: Mutex<Option<Arc<PackSessionLease>>>,
 }
 
 impl ViewLease {
     fn view(&self) -> Option<Arc<VersionView>> {
-        if !self.expiry_active.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+        let deadline = *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.expiry_active.load(Ordering::Acquire) || Instant::now() >= deadline {
             return None;
         }
         self.view
@@ -344,6 +367,39 @@ impl ViewLease {
             .take();
         if let Some(artifact) = &self.artifact {
             artifact.expire();
+        }
+        let pack_session = self
+            .pack_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pack_session) = pack_session {
+            pack_session.expire();
+        }
+    }
+
+    fn renew(&self, deadline: Instant) -> bool {
+        if !self.expiry_active.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut current = self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Instant::now() >= *current || !self.expiry_active.load(Ordering::Acquire) {
+            return false;
+        }
+        *current = deadline;
+        true
+    }
+
+    fn expire_if_due(&self, scheduled_deadline: Instant) {
+        let current = *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current == scheduled_deadline && Instant::now() >= current {
+            self.expire();
         }
     }
 
@@ -390,6 +446,65 @@ impl ArtifactLease {
         };
         if release {
             self.backend.release_lease(self.holder);
+        }
+    }
+}
+
+impl PackSessionLease {
+    fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
+        let alive = self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*alive {
+            return Err(RpcFailure::LeaseExpired);
+        }
+        self.backend
+            .pin_pack_session(self.holder, hashes)
+            .map_err(|detail| RpcFailure::InvalidQuery {
+                detail: format!("cannot pin artifact to pack-build session: {detail}"),
+            })
+    }
+
+    fn expire(&self) {
+        let release = {
+            let mut alive = self
+                .alive
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *alive, false)
+        };
+        if release {
+            self.backend.release_pack_session(self.holder);
+        }
+    }
+}
+
+impl Drop for PackSessionLease {
+    fn drop(&mut self) {
+        if *self
+            .alive
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            self.backend.release_pack_session(self.holder);
+        }
+    }
+}
+
+impl Drop for PackSession {
+    fn drop(&mut self) {
+        self.state.expire();
+        let mut slot = self
+            .lease
+            .pack_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            slot.take();
         }
     }
 }
@@ -624,16 +739,29 @@ enum LeaseExpiryTarget {
 }
 
 impl LeaseExpiryTarget {
-    fn expire(self) {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::View(left), Self::View(right)) => Weak::ptr_eq(left, right),
+            (Self::Connection(left), Self::Connection(right)) => Weak::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    fn expire_if_due(self, scheduled_deadline: Instant) {
         match self {
             Self::View(lease) => {
                 if let Some(lease) = lease.upgrade() {
-                    lease.expire();
+                    lease.expire_if_due(scheduled_deadline);
                 }
             }
             Self::Connection(connection) => {
                 if let Some(connection) = connection.upgrade() {
-                    expire_connection(&mut lock_connection(&connection));
+                    let mut connection = lock_connection(&connection);
+                    if connection.deadline == scheduled_deadline
+                        && Instant::now() >= connection.deadline
+                    {
+                        expire_connection(&mut connection);
+                    }
                 }
             }
         }
@@ -675,6 +803,7 @@ impl LeaseExpiryScheduler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::compact(&mut entries);
+        entries.retain(|entry| !entry.target.same(&target));
         entries.push(ScheduledLeaseExpiry {
             deadline,
             active: Arc::downgrade(active),
@@ -730,7 +859,8 @@ impl LeaseExpiryScheduler {
                     let mut index = 0;
                     while index < entries.len() {
                         if entries[index].deadline <= now {
-                            due.push(entries.swap_remove(index).target);
+                            let entry = entries.swap_remove(index);
+                            due.push((entry.deadline, entry.target));
                         } else {
                             index += 1;
                         }
@@ -754,8 +884,8 @@ impl LeaseExpiryScheduler {
                     }
                 }
             };
-            for target in due {
-                target.expire();
+            for (deadline, target) in due {
+                target.expire_if_due(deadline);
             }
         }
     }
@@ -903,13 +1033,15 @@ impl Server {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let policy = *policy_guard;
         let expiry_active = Arc::new(AtomicBool::new(true));
+        let deadline = Instant::now()
+            .checked_add(policy.ttl)
+            .expect("validated RPC lease TTL must fit in Instant");
         let lease = Arc::new(ViewLease {
-            deadline: Instant::now()
-                .checked_add(policy.ttl)
-                .expect("validated RPC lease TTL must fit in Instant"),
+            deadline: Mutex::new(deadline),
             expiry_active: Arc::clone(&expiry_active),
             view: Mutex::new(Some(view)),
             artifact,
+            pack_session: Mutex::new(None),
         });
         let evicted = {
             let mut leases = self
@@ -929,7 +1061,7 @@ impl Server {
         };
         drop(policy_guard);
         LeaseExpiryScheduler::schedule(
-            lease.deadline,
+            deadline,
             &expiry_active,
             LeaseExpiryTarget::View(Arc::downgrade(&lease)),
         );
@@ -2664,6 +2796,28 @@ impl Hub {
             .difference(&connection.subscribed_paths)
             .cloned()
             .collect();
+        if connection
+            .subscribed_assets
+            .len()
+            .checked_add(new_assets.len())
+            .is_none_or(|count| count > MAX_SUBSCRIBED_ASSETS)
+        {
+            return RpcResult::Failure(RpcFailure::ResourceLimit {
+                resource: "subscribed assets".to_owned(),
+                limit: MAX_SUBSCRIBED_ASSETS,
+            });
+        }
+        if connection
+            .subscribed_paths
+            .len()
+            .checked_add(new_paths.len())
+            .is_none_or(|count| count > MAX_SUBSCRIBED_PATHS)
+        {
+            return RpcResult::Failure(RpcFailure::ResourceLimit {
+                resource: "subscribed paths".to_owned(),
+                limit: MAX_SUBSCRIBED_PATHS,
+            });
+        }
         connection.subscribed_assets.extend(requested_assets);
         connection.subscribed_paths.extend(requested_paths);
 
@@ -2777,6 +2931,56 @@ impl Snapshot {
 
     pub fn expire_lease(&self) {
         self.lease.expire();
+    }
+
+    /// Open the sole renewable pack-build scope for this snapshot. The scope
+    /// remains bounded by the snapshot/connection policy and owns a distinct
+    /// durable pin holder that is released on drop or lease expiry.
+    pub fn open_pack_session(&self) -> RpcResult<PackSession> {
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(result) = self.preflight(&state, &connection) {
+            return result;
+        }
+        let mut slot = self
+            .lease
+            .pack_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return RpcResult::Failure(RpcFailure::ResourceLimit {
+                resource: "pack sessions per snapshot".to_owned(),
+                limit: 1,
+            });
+        }
+        let session_state = Arc::new(PackSessionLease {
+            holder: self.server.next_lease_id.fetch_add(1, Ordering::Relaxed),
+            backend: self
+                .server
+                .lease_backend
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+            alive: Mutex::new(true),
+        });
+        *slot = Some(Arc::clone(&session_state));
+        drop(slot);
+        drop(connection);
+        drop(state);
+
+        let session = PackSession {
+            server: self.server.clone(),
+            connection: Arc::clone(&self.connection),
+            lease: Arc::clone(&self.lease),
+            state: session_state,
+        };
+        match session.keep_alive() {
+            RpcResult::Success(()) => RpcResult::Success(session),
+            RpcResult::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
+            RpcResult::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
+            RpcResult::VersionPoisoned(poison) => RpcResult::VersionPoisoned(poison),
+            RpcResult::Failure(error) => RpcResult::Failure(error),
+        }
     }
 
     pub fn refresh(&self) -> RpcResult<Snapshot> {
@@ -3179,6 +3383,65 @@ impl Snapshot {
             return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
         }
         None
+    }
+}
+
+impl PackSession {
+    /// Extend the fixed snapshot and connection deadlines. Renewal never
+    /// revives an expired capability and preserves every generation fence.
+    pub fn keep_alive(&self) -> RpcResult<()> {
+        let policy = *self
+            .server
+            .lease_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now()
+            .checked_add(policy.ttl)
+            .expect("validated RPC lease TTL must fit in Instant");
+        let state = self.server.lock();
+        let mut connection = lock_connection(&self.connection);
+        if let Some(reason) = generation_fence(&state, &connection) {
+            return RpcResult::ReconnectRequired { reason };
+        }
+        if !connection_lease_alive(&connection) || !self.lease.renew(deadline) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
+        connection.deadline = deadline;
+        let connection_active = Arc::clone(&connection.expiry_active);
+        drop(connection);
+        drop(state);
+        LeaseExpiryScheduler::schedule(
+            deadline,
+            &self.lease.expiry_active,
+            LeaseExpiryTarget::View(Arc::downgrade(&self.lease)),
+        );
+        LeaseExpiryScheduler::schedule(
+            deadline,
+            &connection_active,
+            LeaseExpiryTarget::Connection(Arc::downgrade(&self.connection)),
+        );
+        RpcResult::Success(())
+    }
+
+    /// Add immutable CAS objects to this scope's PackSession pin holder.
+    pub fn pin(&self, hashes: &[[u8; 32]]) -> RpcResult<()> {
+        match self.keep_alive() {
+            RpcResult::Success(()) => {}
+            RpcResult::ReconnectRequired { reason } => {
+                return RpcResult::ReconnectRequired { reason };
+            }
+            RpcResult::ConfigurationPoisoned(poison) => {
+                return RpcResult::ConfigurationPoisoned(poison);
+            }
+            RpcResult::VersionPoisoned(poison) => {
+                return RpcResult::VersionPoisoned(poison);
+            }
+            RpcResult::Failure(error) => return RpcResult::Failure(error),
+        }
+        match self.state.pin(hashes) {
+            Ok(()) => RpcResult::Success(()),
+            Err(error) => RpcResult::Failure(error),
+        }
     }
 }
 

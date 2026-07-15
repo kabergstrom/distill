@@ -38,8 +38,8 @@ use distill_store::pipeline::{
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
-    PipelineState as StoredPipelineState, PlatformFileIdentity, ReadableBundleSource,
-    ScanFailureCode, ScanSubject, SkeletonFailureCode,
+    PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
+    SkeletonFailureCode,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -53,8 +53,8 @@ use crate::lineage_repair::LineageRepairBackendInitError;
 use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{
-    AssetRoot, DaemonOwnedDirectoryKind, ObservedFileIdentity, RootedScanner, ScanDelta,
-    ScanDiagnostic, ScanError, ScanSnapshot, ScannedBundle, ScannedFileKind,
+    AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanDiagnostic, ScanError,
+    ScanSnapshot, ScannedBundle, ScannedFileKind,
 };
 use crate::scheduler::{Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
@@ -87,7 +87,9 @@ pub struct DaemonCoordinator {
     scanner: RootedScanner,
     scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     scan_projection: Mutex<ScanProjectionIndex>,
+    scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
+    scan_rejection: Mutex<Option<PendingScanRejection>>,
     server: Server,
     lineage_destination: RwLock<LineageDestination>,
     authoring: Arc<AuthoringService>,
@@ -192,7 +194,9 @@ impl DaemonCoordinator {
             scanner,
             scan_snapshot,
             scan_projection: Mutex::new(ScanProjectionIndex::default()),
+            scan_initialized: AtomicBool::new(false),
             scan_healthy: AtomicBool::new(true),
+            scan_rejection: Mutex::new(None),
             server,
             lineage_destination: RwLock::new(lineage_destination),
             authoring: backend,
@@ -450,10 +454,28 @@ impl DaemonCoordinator {
     }
 
     fn configuration_poison(&self) -> Option<ConfigurationPoison> {
-        self.configuration_poison
+        let source = self
+            .configuration_poison
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        let scan = self
+            .scan_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|pending| pending.rejection.configuration.clone());
+        ConfigurationPoison::select_canonical(source.into_iter().chain(scan))
+            .ok()
+            .flatten()
+    }
+
+    fn pending_scan_version_poison(&self) -> Option<VersionPoison> {
+        self.scan_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|pending| pending.rejection.version.clone())
     }
 
     fn lineage_destination(&self) -> LineageDestination {
@@ -531,20 +553,32 @@ impl DaemonCoordinator {
         // observed asset snapshot. A physical complete scan is reserved for
         // an actual configured-root replacement; the lineage destination is
         // projection authority, not filesystem watch coverage.
-        let scan = if filesystem_changed {
+        let candidate_scan_heals =
+            filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
+        let scan = if candidate_scan_heals {
             filesystem.scanner().scan()?
         } else {
             lock_scan_snapshot(&self.scan_snapshot).clone()
         };
         let installed_snapshot = scan.clone();
         let destination = filesystem.lineage_destination().clone();
-        let candidate = ScanCandidate::build(
+        let mut candidate = ScanCandidate::build(
             filesystem.scanner(),
             &destination,
             scan,
             None,
             Some(&schema_authority),
         )?;
+        if !candidate_scan_heals {
+            candidate.version_poison = VersionPoison::select_canonical(
+                candidate
+                    .version_poison
+                    .take()
+                    .into_iter()
+                    .chain(self.pending_scan_version_poison()),
+            )
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        }
         let mut runtime = lock_pipeline(&self.pipeline);
         let prepared_epoch = {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
@@ -650,6 +684,14 @@ impl DaemonCoordinator {
                 authoring.install_filesystem_candidate(filesystem);
                 *lock_scan_snapshot(&self.scan_snapshot) = installed_snapshot;
                 *lock_scan_projection(&self.scan_projection) = installed_projection;
+                self.scan_initialized.store(true, Ordering::Release);
+                if candidate_scan_heals {
+                    self.scan_rejection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    self.scan_healthy.store(true, Ordering::Release);
+                }
                 *self
                     .lineage_destination
                     .write()
@@ -882,6 +924,21 @@ impl DaemonCoordinator {
         &self,
         poison: PipelinePoison,
     ) -> Result<SnapshotStamp, CoordinatorError> {
+        self.publish_pipeline_rejection_inner(poison, false)
+    }
+
+    pub(crate) fn publish_pipeline_rejection_healing_configuration(
+        &self,
+        poison: PipelinePoison,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        self.publish_pipeline_rejection_inner(poison, true)
+    }
+
+    fn publish_pipeline_rejection_inner(
+        &self,
+        poison: PipelinePoison,
+        heal_configuration: bool,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let diagnostic = poison.clone();
@@ -893,10 +950,26 @@ impl DaemonCoordinator {
                     store.input_version()
                 ));
             }
+            let generation = match store
+                .configuration_state()
+                .map_err(|error| error.to_string())?
+            {
+                ConfigurationState::Ready(epoch) => epoch.generation,
+                ConfigurationState::Poisoned { last_good, .. } => {
+                    last_good.map_or(0, |epoch| epoch.generation)
+                }
+            };
             store
-                .input_transaction(|transaction| transaction.publish_pipeline_poison(&diagnostic))
+                .input_transaction(|transaction| {
+                    transaction.publish_pipeline_poison(&diagnostic)?;
+                    if heal_configuration {
+                        transaction.publish_configuration_ready(generation)?;
+                    }
+                    Ok(())
+                })
                 .map_err(|error| error.to_string())?;
             Ok(Commit {
+                configuration: heal_configuration.then_some(ConfigurationStatus::Ready),
                 pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
                 pipeline_epoch_changed: true,
                 ..Commit::default()
@@ -908,6 +981,12 @@ impl DaemonCoordinator {
                 discard_pending(&mut runtime);
                 runtime.host.install_poison(poison);
                 self.authoring.install_pipeline_importers(BTreeMap::new());
+                if heal_configuration {
+                    self.configuration_poison
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                }
                 Ok(stamp)
             }
             Err(error) => Err(CoordinatorError::Coordinated(error)),
@@ -968,6 +1047,54 @@ impl DaemonCoordinator {
         &self,
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
+        let pending_subjects = self
+            .scan_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|pending| pending.subjects.clone())
+            .unwrap_or_default();
+        let event_keys = batch
+            .paths
+            .iter()
+            .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
+            .collect::<Vec<_>>();
+        let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
+            prefix.0 == candidate.0
+                && (prefix.1.is_empty()
+                    || candidate.1 == prefix.1
+                    || candidate
+                        .1
+                        .strip_prefix(&prefix.1)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        };
+        let heals_pending_rejection = pending_subjects.iter().any(|subject| {
+            let physical_overlap = batch.paths.iter().any(|event| {
+                event == subject || subject.starts_with(event) || event.starts_with(subject)
+            });
+            physical_overlap
+                || self
+                    .scanner
+                    .event_path_key(subject)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|subject_key| {
+                        event_keys.iter().any(|event_key| {
+                            logical_contains(&subject_key, event_key)
+                                || logical_contains(event_key, &subject_key)
+                        })
+                    })
+        });
+        let mut scan_paths = batch.paths.clone();
+        if heals_pending_rejection {
+            // Revalidate the complete rejected subject set, but no unrelated
+            // root or subtree. This lets independently repaired defects heal
+            // across separate native batches without falling back to a full
+            // scan.
+            scan_paths.extend(pending_subjects);
+            scan_paths.sort_unstable();
+            scan_paths.dedup();
+        }
         let mut renames = Vec::new();
         for rename in &batch.renames {
             let from = self.scanner.event_path_key(&rename.from)?;
@@ -983,7 +1110,7 @@ impl DaemonCoordinator {
             }
         }
         let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
-        let delta = match self.scanner.scan_incremental_delta(&baseline, &batch.paths) {
+        let delta = match self.scanner.scan_incremental_delta(&baseline, &scan_paths) {
             Ok(None) => return Ok(self.server.current_stamp()),
             Ok(Some(delta)) => delta,
             Err(error) => {
@@ -992,6 +1119,14 @@ impl DaemonCoordinator {
                 return self.publish_scan_rejection(&error);
             }
         };
+        let healed_rejection = heals_pending_rejection
+            .then(|| {
+                self.scan_rejection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            })
+            .flatten();
         if delta.is_same_namespace_observation(&baseline)
             && renames.is_empty()
             && self.scan_healthy.load(Ordering::Acquire)
@@ -1014,13 +1149,26 @@ impl DaemonCoordinator {
                     self.configuration_poison(),
                 )
             });
-        let plan = match prepared {
+        let mut plan = match prepared {
             Ok(plan) => plan,
             Err(error) => {
                 index.restore(checkpoint)?;
+                if let Some(rejection) = healed_rejection {
+                    *self
+                        .scan_rejection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                }
                 return Err(error);
             }
         };
+        plan.version_poison = VersionPoison::select_canonical(
+            plan.version_poison
+                .take()
+                .into_iter()
+                .chain(self.pending_scan_version_poison()),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let tag_epoch = authority
@@ -1069,11 +1217,23 @@ impl DaemonCoordinator {
                 if plan.version_poison.is_none() {
                     index.clear_published_pending();
                 }
-                self.scan_healthy.store(true, Ordering::Release);
+                self.scan_healthy.store(
+                    self.scan_rejection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_none(),
+                    Ordering::Release,
+                );
                 Ok(stamp)
             }
             Err(error) => {
                 index.restore(checkpoint)?;
+                if let Some(rejection) = healed_rejection {
+                    *self
+                        .scan_rejection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                }
                 Err(CoordinatorError::Coordinated(error))
             }
         }
@@ -1081,17 +1241,18 @@ impl DaemonCoordinator {
 
     fn publish_cached_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         let scan = lock_scan_snapshot(&self.scan_snapshot).clone();
-        self.publish_scan(scan)
+        self.publish_scan_with_renames(scan, &[], false)
     }
 
     fn publish_scan(&self, scan: ScanSnapshot) -> Result<SnapshotStamp, CoordinatorError> {
-        self.publish_scan_with_renames(scan, &[])
+        self.publish_scan_with_renames(scan, &[], true)
     }
 
     fn publish_scan_with_renames(
         &self,
         scan: ScanSnapshot,
         renames: &[LogicalRename],
+        heals_scan_rejection: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let published_snapshot = scan.clone();
         let authority = self.schema_authority();
@@ -1102,6 +1263,16 @@ impl DaemonCoordinator {
             self.configuration_poison(),
             authority.as_deref(),
         )?;
+        if !heals_scan_rejection {
+            candidate.version_poison = VersionPoison::select_canonical(
+                candidate
+                    .version_poison
+                    .take()
+                    .into_iter()
+                    .chain(self.pending_scan_version_poison()),
+            )
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        }
         candidate.renames.extend_from_slice(renames);
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
@@ -1145,15 +1316,33 @@ impl DaemonCoordinator {
             .map_err(CoordinatorError::Coordinated)?;
         *lock_scan_snapshot(&self.scan_snapshot) = published_snapshot;
         *lock_scan_projection(&self.scan_projection) = published_projection;
-        self.scan_healthy.store(true, Ordering::Release);
+        self.scan_initialized.store(true, Ordering::Release);
+        if heals_scan_rejection {
+            self.scan_rejection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        self.scan_healthy.store(
+            self.scan_rejection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            Ordering::Release,
+        );
         Ok(stamp)
     }
 
     fn publish_scan_rejection(&self, error: &ScanError) -> Result<SnapshotStamp, CoordinatorError> {
         let rejection = classify_scan_rejection(&self.scanner, error)?;
+        let pending = PendingScanRejection {
+            rejection: rejection.clone(),
+            subjects: self.scanner.rejection_subjects(error),
+        };
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
-        self.server
+        let stamp = self
+            .server
             .coordinated_commit(base, || {
                 let mut store = lock_store(&store);
                 if store.input_version() != base {
@@ -1162,51 +1351,64 @@ impl DaemonCoordinator {
                         store.input_version()
                     ));
                 }
-                let commit = match &rejection {
-                    ScanRejection::Version(poison) => {
-                        let configuration = self.configuration_poison();
-                        store
-                            .input_transaction(|transaction| {
-                                transaction.set_version_poisons([poison.clone()])?;
-                                if let Some(configuration) = &configuration {
-                                    transaction.publish_configuration_poison(
-                                        &configuration.detail,
-                                        &configuration.message,
-                                    )?;
-                                }
-                                Ok(())
-                            })
-                            .map_err(|error| error.to_string())?;
-                        Commit {
-                            configuration: configuration.map(ConfigurationStatus::Poisoned),
-                            version_poison: Some(Some(poison.clone())),
-                            ..Commit::default()
-                        }
+                let source_configuration = self
+                    .configuration_poison
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let configuration = ConfigurationPoison::select_canonical(
+                    source_configuration
+                        .into_iter()
+                        .chain(rejection.configuration.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+                let previous_scan_configuration = self
+                    .scan_rejection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|pending| pending.rejection.configuration.is_some());
+                let generation = match store
+                    .configuration_state()
+                    .map_err(|error| error.to_string())?
+                {
+                    ConfigurationState::Ready(epoch) => epoch.generation,
+                    ConfigurationState::Poisoned { last_good, .. } => {
+                        last_good.map_or(0, |epoch| epoch.generation)
                     }
-                    ScanRejection::Configuration { reason, message } => {
-                        let observed = ConfigurationPoison::from_reason(reason, message);
-                        let poison = ConfigurationPoison::select_canonical(
-                            self.configuration_poison().into_iter().chain([observed]),
-                        )
-                        .map_err(|error| error.to_string())?
-                        .expect("one scan configuration poison");
-                        store
-                            .input_transaction(|transaction| {
-                                transaction.set_version_poisons([])?;
-                                transaction
-                                    .publish_configuration_poison(&poison.detail, &poison.message)
-                            })
-                            .map_err(|error| error.to_string())?;
-                        Commit {
-                            configuration: Some(ConfigurationStatus::Poisoned(poison)),
-                            version_poison: Some(None),
-                            ..Commit::default()
+                };
+                store
+                    .input_transaction(|transaction| {
+                        transaction.set_version_poisons(rejection.version.clone())?;
+                        if let Some(configuration) = &configuration {
+                            transaction.publish_configuration_poison(
+                                &configuration.detail,
+                                &configuration.message,
+                            )?;
+                        } else if previous_scan_configuration {
+                            transaction.publish_configuration_ready(generation)?;
                         }
-                    }
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                let commit = Commit {
+                    configuration: configuration
+                        .clone()
+                        .map(ConfigurationStatus::Poisoned)
+                        .or_else(|| {
+                            previous_scan_configuration.then_some(ConfigurationStatus::Ready)
+                        }),
+                    version_poison: Some(rejection.version.clone()),
+                    ..Commit::default()
                 };
                 Ok(commit)
             })
-            .map_err(CoordinatorError::Coordinated)
+            .map_err(CoordinatorError::Coordinated)?;
+        *self
+            .scan_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
+        Ok(stamp)
     }
 
     /// Rerun watched imports whose complete outcome-bearing basis drifted.
@@ -1346,66 +1548,122 @@ impl DaemonCoordinator {
     }
 }
 
-enum ScanRejection {
-    Version(VersionPoison),
-    Configuration {
-        reason: Box<DscpV1>,
-        message: String,
-    },
+#[derive(Clone)]
+struct ScanRejection {
+    version: Option<VersionPoison>,
+    configuration: Option<ConfigurationPoison>,
+}
+
+#[derive(Clone)]
+struct PendingScanRejection {
+    rejection: ScanRejection,
+    subjects: Vec<PathBuf>,
 }
 
 fn classify_scan_rejection(
     scanner: &RootedScanner,
     error: &ScanError,
 ) -> Result<ScanRejection, CoordinatorError> {
+    if let ScanError::Multiple(errors) = error {
+        let classified = errors
+            .iter()
+            .map(|error| classify_scan_rejection(scanner, error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let version = VersionPoison::select_canonical(
+            classified.iter().filter_map(|item| item.version.clone()),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let configuration = ConfigurationPoison::select_canonical(
+            classified.into_iter().filter_map(|item| item.configuration),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        return Ok(ScanRejection {
+            version,
+            configuration,
+        });
+    }
+    if let ScanError::InvalidPhysicalPath {
+        root_name,
+        raw_relative_path,
+        failure,
+    } = error
+    {
+        let poison = VersionPoison::new(
+            VersionPoisonV1::InvalidPhysicalPath {
+                root_name: root_name.clone(),
+                raw_relative_path: raw_relative_path.clone(),
+                failure: *failure,
+            },
+            error.to_string(),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        return Ok(ScanRejection {
+            version: Some(poison),
+            configuration: None,
+        });
+    }
+    if let ScanError::SameRootNormalizedPathCollision {
+        root_name,
+        normalized_path,
+        claims,
+    } = error
+    {
+        let poison = VersionPoison::new(
+            VersionPoisonV1::SameRootNormalizedPathCollision {
+                root_name: root_name.clone(),
+                normalized_path: normalized_path.clone(),
+                claims: claims.clone(),
+            },
+            error.to_string(),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        return Ok(ScanRejection {
+            version: Some(poison),
+            configuration: None,
+        });
+    }
     if let ScanError::DirectoryAlias {
         first_root,
         first,
         second_root,
         second,
-        identity,
     } = error
     {
-        let identity = platform_identity(*identity);
-        return Ok(ScanRejection::Configuration {
-            reason: Box::new(DscpV1::DirectoryAlias {
-                first: DirectoryAliasSide {
-                    normalized_path: scanner.normalized_observed_path(first_root, first),
-                    identity,
-                },
-                second: DirectoryAliasSide {
-                    normalized_path: scanner.normalized_observed_path(second_root, second),
-                    identity,
-                },
-            }),
-            message: error.to_string(),
+        let reason = DscpV1::DirectoryAlias {
+            first: DirectoryAliasSide {
+                normalized_path: scanner.normalized_observed_path(first_root, first),
+            },
+            second: DirectoryAliasSide {
+                normalized_path: scanner.normalized_observed_path(second_root, second),
+            },
+        };
+        return Ok(ScanRejection {
+            version: None,
+            configuration: Some(ConfigurationPoison::from_reason(&reason, error.to_string())),
         });
     }
     if let ScanError::DaemonOwnedDirectoryAlias {
         path,
         owned_path,
         kind,
-        identity,
     } = error
     {
         use unicode_normalization::UnicodeNormalization;
 
-        let identity = platform_identity(*identity);
-        return Ok(ScanRejection::Configuration {
-            reason: Box::new(DscpV1::DirectoryAlias {
-                first: DirectoryAliasSide {
-                    normalized_path: scanner.normalized_observed_subject(path),
-                    identity,
-                },
-                second: DirectoryAliasSide {
-                    normalized_path: format!(
-                        "daemon-owned:{kind}:{}",
-                        owned_path.to_string_lossy().nfc().collect::<String>()
-                    ),
-                    identity,
-                },
-            }),
-            message: error.to_string(),
+        let reason = DscpV1::DirectoryAlias {
+            first: DirectoryAliasSide {
+                normalized_path: scanner.normalized_observed_subject(path),
+            },
+            second: DirectoryAliasSide {
+                normalized_path: format!(
+                    "daemon-owned:{kind}:{}",
+                    owned_path.to_string_lossy().nfc().collect::<String>()
+                ),
+            },
+        };
+        return Ok(ScanRejection {
+            version: None,
+            configuration: Some(ConfigurationPoison::from_reason(&reason, error.to_string())),
         });
     }
     let (path, failure) = match error {
@@ -1429,8 +1687,11 @@ fn classify_scan_rejection(
         ),
         ScanError::InvalidLogicalPath(_) => (None, ScanFailureCode::InvalidFileType),
         ScanError::InvalidRootName(_)
+        | ScanError::Multiple(_)
         | ScanError::DuplicateRootName(_)
         | ScanError::UnknownRoot(_)
+        | ScanError::InvalidPhysicalPath { .. }
+        | ScanError::SameRootNormalizedPathCollision { .. }
         | ScanError::DirectoryAlias { .. }
         | ScanError::DaemonOwnedDirectoryAlias { .. } => (None, ScanFailureCode::IoDataLoss),
     };
@@ -1443,29 +1704,10 @@ fn classify_scan_rejection(
     let detail = VersionPoisonV1::UnreadableScanSubtree { subject, failure };
     let poison = VersionPoison::new(detail, error.to_string())
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-    Ok(ScanRejection::Version(poison))
-}
-
-fn platform_identity(identity: ObservedFileIdentity) -> PlatformFileIdentity {
-    match identity {
-        #[cfg(unix)]
-        ObservedFileIdentity::Unix { device, inode } => {
-            PlatformFileIdentity::Unix { device, inode }
-        }
-        #[cfg(windows)]
-        ObservedFileIdentity::Windows {
-            volume_serial,
-            file_id,
-        } => PlatformFileIdentity::Windows {
-            volume_serial,
-            file_id,
-        },
-        #[cfg(not(any(unix, windows)))]
-        ObservedFileIdentity::Portable => PlatformFileIdentity::Unix {
-            device: 0,
-            inode: 0,
-        },
-    }
+    Ok(ScanRejection {
+        version: Some(poison),
+        configuration: None,
+    })
 }
 
 #[derive(Debug)]

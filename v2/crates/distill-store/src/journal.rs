@@ -162,10 +162,10 @@ pub enum NoReplaceMoveError {
 /// tests inject races at exact move boundaries on every supported host.
 /// Filesystem authority used by the durable publication state machine.
 ///
-/// Production normally uses the native pathname implementation. Callers
-/// retaining a directory capability (notably generated-source publication)
-/// provide a descriptor-relative implementation so recovery cannot escape
-/// that retained namespace.
+/// Production implementations validate their configured canonical workspace
+/// boundary before each mutation and reject symlinked publication entries.
+/// The state machine assumes a trusted local workspace, while revalidation
+/// catches ordinary concurrent path drift before state is published.
 pub trait JournalFilesystem {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError>;
     fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError>;

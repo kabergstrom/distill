@@ -1099,13 +1099,8 @@ pub enum OwnedPathKind {
     PipelineModule = 4, CodegenOutput = 5, Quarantine = 6,
 }
 pub struct OwnedPathSide { pub kind: OwnedPathKind, pub path: String }
-#[repr(u8)]
-pub enum PlatformFileIdentity {
-    Unix { device: u64, inode: u64 } = 1,
-    Windows { volume_serial: u64, file_id: [u8; 16] } = 2,
-}
 pub struct DirectoryAliasSide {
-    pub normalized_path: String, pub identity: PlatformFileIdentity,
+    pub normalized_path: String,
 }
 #[repr(u8)]
 pub enum ConfigurationSourcePathBytes {
@@ -1146,10 +1141,7 @@ semantically symmetric
 pair is canonically ordered before encoding: `ConfigurationPathKey` and
 `OwnedPathKind` are their fixed `u8` values above (unknown values reject),
 `OwnedPathOverlap` sorts the two `(kind:u8, path)` records by canonical bytes,
-and `DirectoryAlias` sorts its two `(normalized_path,
-PlatformFileIdentity canonical bytes)` records the same way;
-`PlatformFileIdentity` has fixed tags `Unix=1` and `Windows=2` and encodes the
-fields shown above in declaration order. A new symmetric
+and `DirectoryAlias` sorts its two `normalized_path` records the same way. A new symmetric
 variant must state its pair ordering explicitly.
 `DuplicateTargetName` is code 13 everywhere (candidate validation, persisted
 configuration state, RPC `ConfigurationPoison.code`, and diagnostic decode)
@@ -1852,7 +1844,7 @@ rows.
 destination-aware basis plus proposed canonical bundle bytes. Inside one
 coordinator action
 it requires StoreInstanceId/stamp/configured path and missing DSCP to remain
-exact, descriptor-relatively reopens the destination, requires its
+exact, revalidates and reopens the destination under its configured root, requires its
 `Absent|Occupied { file_hash, kind }` state to match byte-for-byte, and checks
 that no manifest claimant has appeared. It validates the proposed bytes as one
 canonical bundle containing a built-in `SchemaLineageManifest` entry marked
@@ -3771,11 +3763,9 @@ string that is not `.` or `..` and contains no `/`, `\`, or NUL; no
 leading, trailing, or doubled separators. Anything else — absolute paths,
 traversal steps, empty components — is **rejected at intake** (import
 context calls, query construction, scan): containment in the root is
-lexical, by construction, never by `canonicalize()` after the fact — and
-the lexical rule governs path *strings* only; what the daemon physically
-opens is additionally governed by §14's descriptor-relative opens and
-symlink identity revalidation, so a retargeted link cannot turn a
-lexically contained path into an out-of-root read.
+lexical, by construction — and the lexical rule governs path *strings* only.
+What the daemon physically opens is additionally governed by §14's canonical
+root containment and observe/revalidate/retry rules.
 For a physical scan name rejected before this normalized String exists, the
 scanner publishes §7's `InvalidPhysicalPath` DSVP using the complete lossless
 Unix-byte or Windows-UTF-16 arm and exact failure code; it never repairs the
@@ -5418,7 +5408,7 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
 
 - **Watcher → incremental batched transactions.** Native OS events retain their
   affected physical paths and ordered rename pairs, debounce for ~40ms, and
-  publish one transaction after descriptor-relative re-observation. Event
+  publish one transaction after path-local re-observation. Event
   metadata is never trusted as namespace authority: a file create/write/remove
   re-observes exactly that path, a directory create or rename-to enumerates only
   that subtree (closing the recursive-watch installation race), and a directory
@@ -5494,50 +5484,50 @@ v2 improvements over v1's tracker:
   escaping the asset roots are errors; startup reconciliation
   content-hashes files per the watermark rule above — equal metadata is
   trusted only strictly below the previous session's clean watermark.
-- **Daemon-owned directories are excluded by identity.** Configuration
+- **Daemon-owned directories are excluded by canonical path.** Configuration
   validation already requires `state_path`, module artifact paths, and
   every daemon-owned output directory to be disjoint from every asset
   root (§18 — a staging-time error naming both paths, because a daemon
   writing inside a watched root would advance input versions with its
   own outputs: CAS writes and module rebuilds re-triggering watched
   imports indefinitely). The scanner enforces it again as defense in
-  depth: it records each daemon-owned directory's retained
-  `PlatformFileIdentity` and skips any directory matching one during
-  traversal — a symlink or mount trick that smuggles daemon state
-  inside a root is skipped and surfaced as a named diagnostic, never
-  scanned, queried, or published to watchers. The per-root
+  depth: it canonicalizes the daemon-owned paths during configuration staging
+  and rejects any overlap or alias with a configured asset root. The scanner
+  skips the configured canonical paths during traversal and surfaces an overlap
+  as a named diagnostic, never scanning, querying, or publishing it. The per-root
   **quarantine directories** (below) are the one deliberate exception
   to the disjointness rule — they must live on their root's filesystem
   to receive displaced inodes by rename — and are excluded by exactly
-  this identity mechanism: never scanned, watched, queried, or
+  this canonical-path mechanism: never scanned, watched, queried, or
   published, so nothing in them can advance an input version.
-- **Symlinks are followed by identity, not by path.** The scanner carries a
-  per-recursion **ancestry set** of `PlatformFileIdentity` values: encountering
-  an ancestor identity is a named cycle diagnostic carrying the complete
-  path chain and is never recursed, so cycles terminate without confusing
-  them with aliases. Separately, a scan-global identity map records the first
-  normalized physical path for every directory. Encountering the same
-  identity at a non-ancestor path is an alias configuration error naming both
+- **Symlinks are followed by canonical target path.** The scanner resolves a
+  directory before traversing it and requires the canonical target to remain
+  inside a configured root. It carries a per-recursion canonical-path ancestry
+  set: encountering an ancestor path is a named cycle diagnostic carrying the
+  complete path chain and is never recursed, so cycles terminate without
+  confusing them with aliases. Separately, a scan-global map records the first
+  normalized physical path for every canonical directory. Encountering the same
+  canonical directory at a non-ancestor path is an alias configuration error naming both
   paths: the configuration epoch is poisoned and the scan candidate publishes
-  **no file, bundle, asset, query, or watcher rows**. The same-inode case is
+  **no file, bundle, asset, query, or watcher rows**. The same-target case is
   checked eagerly across all configured asset roots (including roots reached
   through distinct spellings/symlinks) and poisons before the first scan is
-  publishable. No path is silently chosen as canonical. A symlinked directory admitted into the watched set
-  records its target's `PlatformFileIdentity`; every later traversal
-  **revalidates** that identity before use and opens
-  **descriptor-relative** beneath the root (`openat` from the retained
-  directory handle, `O_NOFOLLOW` per component except at the recorded
-  link itself; platform equivalents elsewhere) — a link retargeted
-  between check and open fails the identity check into a rescan or a
-  named error instead of being silently followed, so escape is prevented
-  at open time, never by a scan-time lexical check a retarget could
-  invalidate (§10's path grammar governs strings; this rule governs what
-  is opened). A link resolving outside every configured root remains an
-  error. Daemon-owned output directories get the same treatment for
-  writes: every write under `rs_mod_path` (§20) opens
-  descriptor-relative from the retained directory handle with
-  per-component no-follow, so a symlink planted among generated files
-  cannot redirect a daemon write.
+  publishable. No path is silently chosen as canonical. Before opening an
+  observed file or entering an observed directory, the scanner resolves it
+  again, repeats containment and type checks, and after the read revalidates the
+  relevant metadata/content observation. Drift retries the observation or
+  produces the named scan error; a link resolving outside every configured
+  root remains an error.
+- **Trusted local-workspace boundary.** Configured asset roots and daemon-owned
+  output directories are developer-controlled local workspaces. Distill must
+  remain correct under ordinary concurrent editor, build, rename, and deletion
+  activity by observing, reopening, revalidating, and retrying with
+  `std::fs` APIs. It does not claim to confine a malicious local process that
+  deliberately races namespace replacement between those operations. Daemon
+  writes revalidate their canonical output directory and destination parent
+  immediately before mutation and reject symlinked destination entries; drift
+  fails or retries without publishing state. A Windows cook target does not by
+  itself promise that the daemon is supported as a Windows host process.
 - **Swap-verify-or-swap-back publication.** Every daemon rewrite of an
   authored file (adoption, watched imports, disk migration, rename
   fixups — and §20's generated source files) publishes by **journal,
@@ -7091,11 +7081,10 @@ boundaries. Before writing anything, the generator materializes and
 validates the **entire generated namespace** — filenames, module names,
 and `mod.rs` entries — for collisions. Any collision is a build/codegen
 failure naming every claimant, and the batch writes nothing; replacement
-is never a collision policy. Writes are **descriptor-relative with no-follow semantics**:
-the codegen service opens from a retained `rs_mod_path` directory
-handle, `O_NOFOLLOW` per component (§14's open rule applied to
-daemon-owned output), so a symlink planted in the output tree cannot
-redirect a generated write. Generated content is escaped as data: every
+is never a collision policy. Before each batch the codegen service canonicalizes
+and revalidates `rs_mod_path`, and it rejects symlinked destination entries;
+filesystem drift fails or retries the batch without publishing state (§14).
+Generated content is escaped as data: every
 string literal is emitted through Rust string escaping — authored
 text can never terminate a literal or smuggle tokens into generated source.
 
@@ -7962,22 +7951,13 @@ ordinary §10 dependency kinds.
   layouts hash equal, and the fixup-table identity (which adds table
   assignment) extends it rather than leaking into it; `"DSNL"` joins
   the §5 domain table.
-- **Symlinks follow by identity** (§10, §14): scans keep a visited
-  `PlatformFileIdentity` set — revisits are named alias/cycle diagnostics,
-  never recursion — and admitted symlinked directories record their
-  target identity, revalidated before use, with opens
-  descriptor-relative beneath the root (per-component no-follow except
-  at the recorded link): a retarget between check and open fails the
-  identity check, never silently escapes; the lexical path grammar
-  governs strings, §14 governs what is opened. (Refined in R23: an ancestry
-  identity set detects cycles, while a separate global identity map rejects
-  every non-ancestor alias — same-inode configured roots included — as
-  configuration poison before rows publish; aliases and cycles are no longer
-  conflated by one visited set.)
-  (Refined in R30: every scanner, ancestry, retained-target, daemon-owned
-  directory, and DSCP alias identity uses the closed fixed-tag sum
-  `Unix { device, inode } | Windows { volume_serial, file_id[16] }`; no wire or
-  persistence grammar assumes Unix fields.)
+- **Symlinks follow canonical targets** (§10, §14): scans keep a canonical-path
+  ancestry set for cycle diagnostics and a scan-global canonical-directory map
+  for aliases; every non-ancestor alias — same-directory configured roots
+  included — is configuration poison before rows publish. Opens repeat
+  canonical containment and type checks, and reads revalidate their observations.
+  This is the R37 simplification of the former R23/R30 retained-identity and
+  descriptor-relative design.
 - **Canonical JSON bytes are total** (§6): RFC 8785 is the reference
   serialization with named deviations — UTF-8 byte-order keys,
   parse-error duplicates, minimal escaping, no insignificant
@@ -8207,10 +8187,9 @@ ordinary §10 dependency kinds.
   directory must not be nested inside any asset root — a staging-time
   config error naming both paths, since a daemon writing inside a
   watched root would advance input versions with its own outputs
-  indefinitely — and the scanner excludes daemon-owned directories by
-  retained (device, inode) identity as defense in depth. (Refined in R30:
-  every such persisted/scanner identity is the fixed-tag cross-platform
-  `PlatformFileIdentity`, with Unix and Windows arms.)
+  indefinitely — and staging plus scanning reject canonical-path overlap or
+  alias as defense in depth. R37 removes the former persisted platform-identity
+  mechanism.
 - **The DSBI key is a pre-key plus discovered trace** (§8, §9, §13):
   the static pre-key covers everything computable before work (entry
   identity, canonical bundle bytes, hashes, format version); the
@@ -8473,8 +8452,8 @@ ordinary §10 dependency kinds.
   filenames and module names now use a pinned injective encoding
   (`[a-z0-9]` pass-through, everything else `_hex_`-escaped with the
   introducer itself escaped, under a pinned keyword-avoiding prefix)
-  over NFC-normalized identifiers; codegen writes are
-  descriptor-relative with no-follow semantics, and every generated
+  over NFC-normalized identifiers; codegen revalidates its canonical output
+  directory and rejects symlinked destinations before writes, and every generated
   string literal and identifier is escaped. (Refined in R22: local_id is
   bundle-local, so the global name also appends `_` plus full lowercase
   AssetUuid hex; the entire generated namespace is collision-checked
@@ -9170,11 +9149,11 @@ ordinary §10 dependency kinds.
   schema acceptance required, and retired-type authority. No current usable
   epoch—especially no `last_good`—mints no Hub; retry waits for new published
   state/reconnect rather than looping successful attestation.
-- **Physical file identity is cross-platform and closed** (§§5, 14, 17–18):
-  configuration aliases, scanner ancestry/global maps, retained symlink
-  targets, and daemon-owned directory exclusion use fixed tags for
-  `Unix {device,inode}` or `Windows {volume_serial,file_id[16]}` in memory,
-  persistence, hashing, and wire decode.
+- **Filesystem identity is not a persisted protocol fact** (§§5, 14, 17–18):
+  R37 replaces the former cross-platform physical-identity grammar with
+  canonical configured paths plus observe/revalidate/retry. Directory-alias
+  DSCP detail carries the two normalized paths; implementation-local metadata
+  may be used transiently but is not hashed, persisted, or exposed on the wire.
 - **Unreadable scan coverage is version poison** (§§7, 13–14, 17): DSVP code
   7 carries `Root {root_name}` or `Subtree {root_name, raw_relative_path}` and
   one of PermissionDenied, NotFound, InvalidFileType,
@@ -9307,7 +9286,7 @@ ordinary §10 dependency kinds.
 - **Native watcher batches preserve incremental workloads** (§§13–14, 19):
   R35 corrects the over-simplified sticky-full-scan model. Startup still arms
   the watcher before its complete reconciliation, but events retain affected
-  paths and ordered rename pairs and are replayed by descriptor-relative
+  paths and ordered rename pairs and are replayed by path-local
   path/subtree observation. Normal live activity never scans or rehashes
   unrelated tree state; a complete scan after startup is reserved for root-set
   replacement, explicit verification, or an admitted native overflow/
@@ -9323,6 +9302,18 @@ ordinary §10 dependency kinds.
   CAS; the DSSI flight table, cross-job wait graph, waiter threads, and
   cooperative parking machinery are removed.
 <!-- R36_LEDGER_END -->
+
+<!-- R37_LEDGER_BEGIN count=1 -->
+- **Filesystem operations use a trusted-workspace model** (§§5, 10, 14, 18,
+  20): configured roots and daemon-owned output directories are trusted local
+  developer workspaces. Standard Rust path and file APIs, canonical containment,
+  and observe/revalidate/retry cover ordinary concurrent edits and renames;
+  adversarial local namespace races are outside the contract. Retained directory
+  handles, descriptor-relative traversal, and persisted platform file identities
+  are removed. Windows remains a supported cook target, not an implied daemon-host
+  platform promise. R35's fully incremental post-startup workload invariant is
+  unchanged.
+<!-- R37_LEDGER_END -->
 
 ### Open — remaining
 

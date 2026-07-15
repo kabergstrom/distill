@@ -175,7 +175,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
 
 #[cfg(unix)]
 #[test]
-fn disabled_existing_codegen_output_is_still_identity_excluded() {
+fn disabled_existing_codegen_output_is_still_excluded() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -298,6 +298,49 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
         },
         "valid configuration did not clear its malformed-source poison",
     );
+}
+
+#[test]
+fn valid_configuration_with_malformed_schema_heals_only_configuration_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let process = DaemonProcess::start(config(&temp)).unwrap();
+    let config_path = temp.path().join("distill.toml");
+    std::fs::write(&config_path, "not = [valid").unwrap();
+    wait_until(
+        || {
+            matches!(
+                process
+                    .coordinator()
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .configuration_state()
+                    .unwrap(),
+                ConfigurationState::Poisoned { reason, .. }
+                    if matches!(reason.detail.as_ref(), DscpV1::MalformedConfiguration { .. })
+            )
+        },
+        "malformed configuration was not published",
+    );
+
+    std::fs::write(temp.path().join("schema.json"), b"not-json").unwrap();
+    std::fs::write(&config_path, config_source(&temp)).unwrap();
+    wait_until(
+        || {
+            let store = process.coordinator().store();
+            let store = store.lock().unwrap();
+            matches!(
+                store.configuration_state().unwrap(),
+                ConfigurationState::Ready(_)
+            ) && matches!(
+                store.pipeline_state().unwrap(),
+                Some(PipelineState::Poisoned { error, .. })
+                    if error.message.contains("schema authority")
+            )
+        },
+        "valid configuration did not heal independently of malformed schema",
+    );
+    assert!(process.last_background_error().is_none());
 }
 
 #[test]

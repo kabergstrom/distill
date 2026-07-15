@@ -16,7 +16,7 @@ use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringProgressEvent, AuthoringProgressState, Commit, DeferredOperation,
+    AuthoringProgressEvent, AuthoringProgressState, BuildRequest, Commit, DeferredOperation,
     DeferredOperationResult, DiskMigrationRequest, DoctorRequest, InputVersion, LongRunningOp,
     PreparedOperationCommit, RenameWithFixupsRequest, RpcFailure,
 };
@@ -80,22 +80,27 @@ impl AuthoringService {
             LongRunningOp::Doctor(payload) => {
                 let request =
                     DoctorRequest::decode(payload).map_err(|error| invalid(error.to_string()))?;
-                let (import_failures, schema_repairs, schema_repair_failures) =
-                    if request == DoctorRequest::Verify {
-                        let (repairs, failures) = self.plan_schema_repairs(base)?;
-                        (
-                            self.verify_watched_import_fixpoints(base)?,
-                            repairs,
-                            failures,
-                        )
-                    } else {
-                        (Vec::new(), Vec::new(), Vec::new())
-                    };
+                // Snapshot the RPC-owned request set while prepare_operation is
+                // outside the server publication lock. The deferred completion
+                // runs under that lock and must never re-enter it.
+                let build_requests = if request == DoctorRequest::Verify {
+                    match runtime.tag_index_coordinator.upgrade() {
+                        Some(coordinator) => coordinator
+                            .server()
+                            .verification_build_requests()
+                            .map_err(|error| {
+                                format!(
+                                    "build verification is unavailable for the current authority state: {error:?}"
+                                )
+                            }),
+                        None => Err("build coordinator stopped during doctor verify".to_owned()),
+                    }
+                } else {
+                    Ok(Vec::new())
+                };
                 PlannedOperation::Doctor {
                     request,
-                    import_failures,
-                    schema_repairs,
-                    schema_repair_failures,
+                    build_requests,
                 }
             }
         };
@@ -382,9 +387,7 @@ enum PlannedOperation {
     },
     Doctor {
         request: DoctorRequest,
-        import_failures: Vec<distill_core::id::BundleUuid>,
-        schema_repairs: Vec<OperationFile>,
-        schema_repair_failures: Vec<String>,
+        build_requests: Result<Vec<BuildRequest>, String>,
     },
 }
 
@@ -401,16 +404,8 @@ impl DeferredOperation for DeferredAuthoringOperation {
             }
             PlannedOperation::Doctor {
                 request,
-                import_failures,
-                schema_repairs,
-                schema_repair_failures,
-            } => self.runtime.run_doctor(
-                base,
-                *request,
-                import_failures,
-                schema_repairs,
-                schema_repair_failures,
-            ),
+                build_requests,
+            } => self.runtime.run_doctor(base, *request, build_requests),
         }
     }
 }
@@ -515,10 +510,39 @@ impl OperationRuntime {
         &self,
         base: InputVersion,
         request: DoctorRequest,
-        import_failures: &[distill_core::id::BundleUuid],
-        schema_repairs: &[OperationFile],
-        schema_repair_failures: &[String],
+        build_requests: &Result<Vec<BuildRequest>, String>,
     ) -> Result<DeferredOperationResult, String> {
+        // Keep the repository-wide reimport and schema walks deferred until
+        // the client consumes Completed. Until then the progress stream can
+        // be cancelled without starting either workload.
+        let coordinator = if request == DoctorRequest::Verify {
+            Some(
+                self.tag_index_coordinator
+                    .upgrade()
+                    .ok_or_else(|| "build coordinator stopped during doctor verify".to_owned())?,
+            )
+        } else {
+            None
+        };
+        let (import_failures, schema_repairs, schema_repair_failures) =
+            if request == DoctorRequest::Verify {
+                let authoring = coordinator
+                    .as_ref()
+                    .expect("verify coordinator was required")
+                    .authoring_service();
+                let (repairs, failures) = authoring
+                    .plan_schema_repairs(base)
+                    .map_err(|error| format!("{error:?}"))?;
+                (
+                    authoring
+                        .verify_watched_import_fixpoints(base)
+                        .map_err(|error| format!("{error:?}"))?,
+                    repairs,
+                    failures,
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
         let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
             let observed = self.scanner.scan().map_err(|error| error.to_string())?;
             let published = self
@@ -535,11 +559,15 @@ impl OperationRuntime {
             (false, Vec::new())
         };
         let build_defects = if request == DoctorRequest::Verify {
-            let coordinator = self
-                .tag_index_coordinator
-                .upgrade()
-                .ok_or_else(|| "build coordinator stopped during doctor verify".to_owned())?;
-            crate::build::doctor_verify_builds(&coordinator)?
+            match build_requests {
+                Ok(requests) => crate::build::doctor_verify_builds(
+                    coordinator
+                        .as_ref()
+                        .expect("verify coordinator was required"),
+                    requests,
+                )?,
+                Err(defect) => vec![defect.clone()],
+            }
         } else {
             Vec::new()
         };
@@ -611,12 +639,12 @@ impl OperationRuntime {
         if schema_repairs.is_empty() {
             return self.advance_empty(base, terminal_error);
         }
-        let basis = encode_schema_repair_basis(base, schema_repairs);
+        let basis = encode_schema_repair_basis(base, &schema_repairs);
         let mut result = self.publish_files(
             base,
             PublicationGroupKind::SchemaRepair,
             &basis,
-            schema_repairs,
+            &schema_repairs,
         )?;
         result.terminal_error = match (terminal_error, result.terminal_error) {
             (Some(left), Some(right)) => Some(format!("{left}; {right}")),

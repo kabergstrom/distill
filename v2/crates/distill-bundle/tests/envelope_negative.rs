@@ -9,7 +9,10 @@ use distill_bundle::{
     extract_namespace_skeleton, parse_bundle, repair_missing_schemas, write_bundle, Bundle,
     BundleError as E, EntryLineageV1,
 };
-use distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS;
+use distill_core::bootstrap::{
+    BootstrapControlSpecV1, BootstrapControlSymbol, BOOTSTRAP_CONTROL_TYPE_UUIDS,
+};
+use distill_core::id::TypeUuid;
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
 use distill_json::AuthoredValue as V;
 use ngp_schema::{SchemaNode as N, SnapshotError};
@@ -26,6 +29,91 @@ fn valid_plain() -> (Vec<u8>, Bundle) {
         Some("a"),
     );
     (write_bundle(&b).unwrap(), b)
+}
+
+fn byte_array(bytes: &[u8]) -> V {
+    V::Array(
+        bytes
+            .iter()
+            .map(|byte| V::UInt(u128::from(*byte)))
+            .collect(),
+    )
+}
+
+fn migration_endpoint_stamp(type_uuid: TypeUuid, hash: distill_core::id::LogicalHash) -> V {
+    let epochs = vec![AcceptedSchemaEpoch {
+        digest: hash,
+        forward_parent: None,
+    }];
+    obj(&[
+        (
+            "chain",
+            byte_array(&lineage_chain_digest(type_uuid, &epochs, 0)),
+        ),
+        ("cursor", u(0)),
+        (
+            "epochs",
+            arr(vec![obj(&[
+                ("digest", byte_array(&hash.0)),
+                ("forward_parent", V::Null),
+            ])]),
+        ),
+    ])
+}
+
+fn migration_bundle() -> (Bundle, distill_core::id::LogicalHash) {
+    let from_schema = simple_schema();
+    let to_schema = schema(st(&[(
+        "value",
+        N::Primitive(ngp_schema::PrimitiveKind::U8),
+    )]));
+    let from_hash = lh(&from_schema);
+    let to_hash = lh(&to_schema);
+    let target_type = TypeUuid([0x31; 16]);
+    let row = BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::Migration)
+        .unwrap();
+    let migration_schema = ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    let data = obj(&[
+        ("from_hash", byte_array(&from_hash.0)),
+        (
+            "from_lineage",
+            migration_endpoint_stamp(target_type, from_hash),
+        ),
+        ("kind", obj(&[("Ops", obj(&[("ops", arr(Vec::new()))]))])),
+        ("target_type_uuid", byte_array(&target_type.0)),
+        ("to_hash", byte_array(&to_hash.0)),
+        ("to_lineage", migration_endpoint_stamp(target_type, to_hash)),
+    ]);
+    (
+        Bundle {
+            format_version: 1,
+            uuid: BUNDLE_UUID.parse().unwrap(),
+            primary: None,
+            schemas: BTreeMap::from([
+                (from_hash, from_schema),
+                (to_hash, to_schema),
+                (row.logical_hash, migration_schema),
+            ]),
+            assets: BTreeMap::from([(
+                "migration".to_owned(),
+                distill_bundle::AssetEntry {
+                    uuid: UUID_A.parse().unwrap(),
+                    type_uuid: row.type_uuid,
+                    schema_hash: row.logical_hash,
+                    lineage: EntryLineageV1::Bootstrap {
+                        bundle_format_version: 1,
+                    },
+                    authoring_only: true,
+                    data,
+                },
+            )]),
+        },
+        from_hash,
+    )
 }
 
 // ---- schema closure & snapshot verification ----
@@ -59,6 +147,38 @@ fn exact_held_schema_repairs_plain_bundle_canonically() {
         .expect("missing schema is repairable");
     assert_eq!(repaired, plain);
     assert_eq!(parse_bundle(&repaired).unwrap(), bundle);
+}
+
+#[test]
+fn migration_endpoint_hashes_are_required_and_exactly_repairable() {
+    let (bundle, missing_hash) = migration_bundle();
+    let canonical = write_bundle(&bundle).unwrap();
+    let missing = mutate_envelope(&canonical, |env| {
+        as_obj(as_obj(env).get_mut("schemas").unwrap()).remove(&missing_hash.to_string());
+    });
+
+    assert!(matches!(
+        parse_bundle(&missing),
+        Err(E::MissingSchema {
+            local_id,
+            schema_hash,
+        }) if local_id == "migration" && schema_hash == missing_hash
+    ));
+    let holders = BTreeMap::from([(missing_hash, bundle.schemas[&missing_hash].clone())]);
+    assert_eq!(
+        repair_missing_schemas(&missing, &holders).unwrap(),
+        Some(canonical)
+    );
+
+    let mut writer_missing = bundle;
+    writer_missing.schemas.remove(&missing_hash);
+    assert!(matches!(
+        write_bundle(&writer_missing),
+        Err(E::MissingSchema {
+            local_id,
+            schema_hash,
+        }) if local_id == "migration" && schema_hash == missing_hash
+    ));
 }
 
 #[test]

@@ -354,11 +354,13 @@ pub(crate) fn write(bundle: &Bundle) -> Result<Vec<u8>, BundleError> {
                 local_id: local_id.clone(),
             });
         }
-        if !bundle.schemas.contains_key(&entry.schema_hash) {
-            return Err(E::MissingSchema {
-                local_id: local_id.clone(),
-                schema_hash: entry.schema_hash,
-            });
+        for schema_hash in envelope::schema_references(entry) {
+            if !bundle.schemas.contains_key(&schema_hash) {
+                return Err(E::MissingSchema {
+                    local_id: local_id.clone(),
+                    schema_hash,
+                });
+            }
         }
         envelope::validate_entry_lineage(
             local_id,

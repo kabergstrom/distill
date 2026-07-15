@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
-use distill_daemon::scanner::{AssetRoot, RootedScanner, ScanError, ScannedFileKind};
+use distill_daemon::scanner::{
+    AssetRoot, RootedScanner, ScanDiagnostic, ScanError, ScannedFileKind,
+};
 use distill_json::AuthoredValue;
 use distill_rpc::{LineageRepairDestination, OccupiedLineageDestinationKind};
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
@@ -242,7 +244,7 @@ fn replacement_roots_are_shared_by_existing_scanner_clones() {
 }
 
 #[test]
-fn same_directory_identity_under_two_roots_is_never_tiebroken() {
+fn same_canonical_directory_under_two_roots_is_never_tiebroken() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");
     std::fs::create_dir_all(&root).unwrap();
@@ -302,7 +304,7 @@ fn in_root_file_symlinks_are_identity_checked_and_reported() {
 
 #[cfg(unix)]
 #[test]
-fn retained_root_capability_rejects_path_replacement() {
+fn configured_root_revalidation_rejects_path_replacement() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -365,4 +367,134 @@ fn incremental_target_edit_reobserves_file_symlink_alias() {
             .content_hash,
         expected
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_event_preserves_the_native_decomposed_filename() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    let decomposed = root.join("cafe\u{301}.txt");
+    std::fs::write(&decomposed, b"before").unwrap();
+    let scanner = scanner(&temp);
+    let baseline = scanner.scan().unwrap();
+
+    std::fs::write(&decomposed, b"after").unwrap();
+    let updated = scanner
+        .scan_incremental(&baseline, std::slice::from_ref(&decomposed))
+        .unwrap()
+        .unwrap();
+
+    let normalized = "caf\u{e9}.txt";
+    let before = baseline
+        .file_rows()
+        .find(|file| file.normalized_path == normalized)
+        .unwrap();
+    let after = updated
+        .file_rows()
+        .find(|file| file.normalized_path == normalized)
+        .unwrap();
+    assert_ne!(after.content_hash, before.content_hash);
+    assert_eq!(updated.files.len(), baseline.files.len());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn distinct_native_names_that_normalize_together_are_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("caf\u{e9}.txt"), b"precomposed").unwrap();
+    std::fs::write(root.join("cafe\u{301}.txt"), b"decomposed").unwrap();
+    let scanner = scanner(&temp);
+
+    assert!(matches!(
+        scanner.scan(),
+        Err(ScanError::SameRootNormalizedPathCollision {
+            normalized_path,
+            claims,
+            ..
+        }) if normalized_path == "caf\u{e9}.txt" && claims.len() == 2
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_native_filename_is_a_typed_physical_path_defect() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    let invalid = root.join(std::ffi::OsString::from_vec(vec![b'b', 0xff]));
+    std::fs::write(invalid, b"invalid name").unwrap();
+    let scanner = scanner(&temp);
+
+    assert!(matches!(
+        scanner.scan(),
+        Err(ScanError::InvalidPhysicalPath {
+            failure: distill_store::state::PhysicalPathFailureCode::InvalidUnixUtf8,
+            ..
+        })
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_scan_aggregates_independent_root_defects() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(
+        first.join(std::ffi::OsString::from_vec(vec![0xfe])),
+        b"first",
+    )
+    .unwrap();
+    std::fs::write(
+        second.join(std::ffi::OsString::from_vec(vec![0xff])),
+        b"second",
+    )
+    .unwrap();
+    let scanner = RootedScanner::new([
+        AssetRoot::new("first", &first, first.join(".q")),
+        AssetRoot::new("second", &second, second.join(".q")),
+    ])
+    .unwrap();
+
+    assert!(matches!(
+        scanner.scan(),
+        Err(ScanError::Multiple(errors)) if errors.len() == 2
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_symlink_cycle_is_excluded_with_a_diagnostic() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("kept.txt"), b"kept").unwrap();
+    symlink(&root, nested.join("back-to-root")).unwrap();
+    let scanner = scanner(&temp);
+
+    let scan = scanner.scan().unwrap();
+    assert!(scan
+        .file_rows()
+        .any(|file| file.normalized_path == "nested/kept.txt"));
+    assert!(scan.diagnostic_rows().any(|diagnostic| matches!(
+        diagnostic,
+        ScanDiagnostic::DirectoryCycle {
+            normalized_path,
+            path_chain,
+            ..
+        } if normalized_path == "nested/back-to-root" && path_chain.len() >= 3
+    )));
 }

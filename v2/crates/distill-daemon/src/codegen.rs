@@ -5,11 +5,9 @@
 //! and §14 publication/recovery mechanics.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
-use std::ffi::{CStr, CString};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -140,6 +138,13 @@ impl CodegenService {
                 CodegenAttempt::failure(basis, trace, failure)
             }
             Err(error) => {
+                // The epoch remains healthy after a host-owned context panic.
+                // Do not latch this basis: the infrastructure fault may be
+                // transient and retrying does not repeat a deterministic
+                // module rejection.
+                if retryable_codegen_callback_failure(&error) {
+                    return Err(error.to_string());
+                }
                 let _ = daemon.sync_runtime_pipeline_poison();
                 self.last_attempted = Some(basis);
                 return Err(error.to_string());
@@ -190,6 +195,10 @@ impl CodegenService {
         drop(publication);
         Ok(())
     }
+}
+
+fn retryable_codegen_callback_failure(error: &CallbackInvokeError<CodegenFailure>) -> bool {
+    matches!(error, CallbackInvokeError::HostRejected(_))
 }
 
 struct AuthoredCodegenContext {
@@ -679,111 +688,75 @@ fn observe_authored_asset(
 #[derive(Debug)]
 struct OutputDirectory {
     path: PathBuf,
-    handle: File,
     identity: FileIdentity,
-    #[cfg(unix)]
-    quarantine_handle: File,
 }
 
 impl OutputDirectory {
     fn open(path: &Path) -> Result<Self, String> {
         ensure_real_directory_tree(path)?;
-        if fs::symlink_metadata(path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
+        let link_metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("inspect codegen output {}: {error}", path.display()))?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.is_dir() {
             return Err(format!(
                 "codegen output {} is not a real directory",
                 path.display()
             ));
         }
-        let handle = open_output_directory(path)
-            .map_err(|error| format!("open codegen output {}: {error}", path.display()))?;
-        let metadata = handle
-            .metadata()
-            .map_err(|error| format!("inspect codegen output handle: {error}"))?;
-        if !metadata.is_dir() {
+        let path = fs::canonicalize(path)
+            .map_err(|error| format!("canonicalize codegen output {}: {error}", path.display()))?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("inspect codegen output {}: {error}", path.display()))?;
+        let quarantine = path.join(".distill-quarantine");
+        fs::create_dir_all(&quarantine).map_err(|error| {
+            format!(
+                "create codegen quarantine {}: {error}",
+                quarantine.display()
+            )
+        })?;
+        let quarantine_metadata = fs::symlink_metadata(&quarantine).map_err(|error| {
+            format!(
+                "inspect codegen quarantine {}: {error}",
+                quarantine.display()
+            )
+        })?;
+        if quarantine_metadata.file_type().is_symlink() || !quarantine_metadata.is_dir() {
             return Err(format!(
-                "codegen output {} is not a real directory",
-                path.display()
+                "codegen quarantine {} is not a real directory",
+                quarantine.display()
             ));
         }
-        let identity = file_identity(&metadata);
-        #[cfg(unix)]
-        let quarantine_handle = open_or_create_output_directory(
-            &handle,
-            OsStr::new(".distill-quarantine"),
-            &path.join(".distill-quarantine"),
-        )?;
         Ok(Self {
-            path: path.to_path_buf(),
-            handle,
-            identity,
-            #[cfg(unix)]
-            quarantine_handle,
+            path,
+            identity: file_identity(&metadata),
         })
     }
 
     fn verify(&self) -> Result<(), String> {
-        let metadata = self
-            .handle
-            .metadata()
-            .map_err(|error| format!("reinspect codegen output handle: {error}"))?;
-        if !metadata.is_dir() || file_identity(&metadata) != self.identity {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            format!("reinspect codegen output {}: {error}", self.path.display())
+        })?;
+        let canonical = fs::canonicalize(&self.path).map_err(|error| {
+            format!(
+                "canonicalize codegen output {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || canonical != self.path
+            || file_identity(&metadata) != self.identity
+        {
             return Err(format!(
-                "codegen output directory {} changed identity",
+                "codegen output directory {} changed",
                 self.path.display()
             ));
-        }
-        #[cfg(not(unix))]
-        {
-            let current = fs::symlink_metadata(&self.path).map_err(|error| {
-                format!("reinspect codegen output {}: {error}", self.path.display())
-            })?;
-            if current.file_type().is_symlink()
-                || !current.is_dir()
-                || file_identity(&current) != self.identity
-            {
-                return Err(format!(
-                    "codegen output directory {} changed identity",
-                    self.path.display()
-                ));
-            }
         }
         Ok(())
     }
 
     fn write_same_dir_temp(&self, target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
-        #[cfg(unix)]
-        {
-            for _ in 0..64 {
-                let temp = unique_sibling(target, "proposal");
-                let name = self.root_file_name(&temp)?;
-                match create_new_at(&self.handle, name) {
-                    Ok(mut file) => {
-                        file.write_all(bytes).map_err(|error| {
-                            format!("write proposed temp {}: {error}", temp.display())
-                        })?;
-                        file.sync_all().map_err(|error| {
-                            format!("sync proposed temp {}: {error}", temp.display())
-                        })?;
-                        self.handle.sync_all().map_err(|error| {
-                            format!("sync codegen output {}: {error}", self.path.display())
-                        })?;
-                        return Ok(temp);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => {
-                        return Err(format!("create proposed temp {}: {error}", temp.display()))
-                    }
-                }
-            }
-            Err("could not allocate a unique codegen proposal temp".into())
-        }
-        #[cfg(not(unix))]
-        {
-            crate::lineage_repair::write_same_dir_temp(target, bytes)
-        }
+        self.verify()?;
+        crate::lineage_repair::write_same_dir_temp(target, bytes)
     }
 
     fn read_owned_file(&self, target: &Path) -> Result<Vec<u8>, String> {
@@ -795,75 +768,46 @@ impl OutputDirectory {
     }
 
     fn entry_exists(&self, target: &Path) -> Result<bool, String> {
-        #[cfg(unix)]
-        {
-            let name = self.root_file_name(target)?;
-            entry_exists_at(&self.handle, name)
-                .map_err(|error| format!("inspect generated path {}: {error}", target.display()))
-        }
-        #[cfg(not(unix))]
-        {
-            match fs::symlink_metadata(target) {
-                Ok(_) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(format!(
-                    "inspect generated path {}: {error}",
-                    target.display()
-                )),
+        self.verify()?;
+        match fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(format!("generated path {} is a symlink", target.display()))
             }
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "inspect generated path {}: {error}",
+                target.display()
+            )),
         }
     }
 
     fn entry_names(&self) -> Result<Vec<OsString>, String> {
-        #[cfg(unix)]
-        {
-            read_directory_names_at(&self.handle)
-                .map_err(|error| format!("enumerate generated namespace: {error}"))
-        }
-        #[cfg(not(unix))]
-        {
-            fs::read_dir(&self.path)
-                .map_err(|error| {
+        self.verify()?;
+        fs::read_dir(&self.path)
+            .map_err(|error| {
+                format!(
+                    "enumerate generated namespace {}: {error}",
+                    self.path.display()
+                )
+            })?
+            .map(|entry| {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
                     format!(
-                        "enumerate generated namespace {}: {error}",
-                        self.path.display()
+                        "inspect generated entry {}: {error}",
+                        entry.path().display()
                     )
-                })?
-                .map(|entry| {
-                    entry
-                        .map(|entry| entry.file_name())
-                        .map_err(|e| e.to_string())
-                })
-                .collect()
-        }
-    }
-
-    #[cfg(unix)]
-    fn root_file_name<'a>(&self, path: &'a Path) -> Result<&'a OsStr, String> {
-        let relative = path.strip_prefix(&self.path).map_err(|_| {
-            format!(
-                "codegen journal path {} is outside retained output {}",
-                path.display(),
-                self.path.display()
-            )
-        })?;
-        let mut components = relative.components();
-        let name = match components.next() {
-            Some(Component::Normal(name)) => name,
-            _ => {
-                return Err(format!(
-                    "codegen journal path {} is not a direct output child",
-                    path.display()
-                ))
-            }
-        };
-        if components.next().is_some() {
-            return Err(format!(
-                "codegen journal path {} is not a direct output child",
-                path.display()
-            ));
-        }
-        Ok(name)
+                })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "generated entry {} is a symlink",
+                        entry.path().display()
+                    ));
+                }
+                Ok(entry.file_name())
+            })
+            .collect()
     }
 
     fn quarantine_root(&self) -> QuarantineRoot {
@@ -884,10 +828,9 @@ fn ensure_real_directory_tree(path: &Path) -> Result<(), String> {
     {
         return Err("codegen output path contains a parent component".into());
     }
-    // The configured absolute path is opened once and its final directory
-    // itself must not be a symlink. Platform aliases in ancestors (for
-    // example macOS /var -> /private/var) are outside the generated namespace;
-    // subsequent publication is fenced against that retained identity.
+    // Ancestor aliases (for example macOS /var -> /private/var) are resolved
+    // when OutputDirectory stores its canonical path. The final configured
+    // entry itself must be a real directory.
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)
@@ -918,45 +861,26 @@ impl<'a> OutputJournalFilesystem<'a> {
         }
     }
 
-    #[cfg(unix)]
-    fn parent_and_name<'b>(&self, path: &'b Path) -> Result<(&File, &'b OsStr), StoreError> {
-        let relative = path.strip_prefix(&self.output.path).map_err(|_| {
-            self.invalid_path(path, "journal path escapes the retained codegen output")
-        })?;
-        let components = relative.components().collect::<Vec<_>>();
-        match components.as_slice() {
-            [Component::Normal(name)] => Ok((&self.output.handle, name)),
-            [Component::Normal(directory), Component::Normal(name)]
-                if *directory == OsStr::new(".distill-quarantine") =>
-            {
-                Ok((&self.output.quarantine_handle, name))
-            }
-            _ => {
-                Err(self.invalid_path(path, "journal path is outside the flat generated namespace"))
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn directory(&self, path: &Path) -> Result<&File, StoreError> {
-        if path == self.output.path {
-            Ok(&self.output.handle)
-        } else if path == self.output.path.join(".distill-quarantine") {
-            Ok(&self.output.quarantine_handle)
-        } else {
-            Err(self.invalid_path(path, "journal directory is outside codegen output"))
-        }
-    }
-
-    #[cfg(not(unix))]
     fn validate_path(&self, path: &Path) -> Result<(), StoreError> {
-        let relative = path.strip_prefix(&self.output.path).map_err(|_| {
-            self.invalid_path(path, "journal path escapes the retained codegen output")
+        self.output.verify().map_err(|detail| StoreError::Io {
+            path: self.output.path.clone(),
+            source: std::io::Error::other(detail),
         })?;
-        if relative.components().any(|component| {
-            !matches!(component, Component::Normal(_)) || matches!(component, Component::ParentDir)
-        }) {
-            return Err(self.invalid_path(path, "journal path is not canonical"));
+        let relative = path
+            .strip_prefix(&self.output.path)
+            .map_err(|_| self.invalid_path(path, "journal path escapes the codegen output"))?;
+        let components = relative.components().collect::<Vec<_>>();
+        let valid = match components.as_slice() {
+            [] | [Component::Normal(_)] => true,
+            [Component::Normal(directory), Component::Normal(_)] => {
+                *directory == OsStr::new(".distill-quarantine")
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(
+                self.invalid_path(path, "journal path is outside the flat generated namespace")
+            );
         }
         Ok(())
     }
@@ -964,170 +888,103 @@ impl<'a> OutputJournalFilesystem<'a> {
 
 impl JournalFilesystem for OutputJournalFilesystem<'_> {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
-        #[cfg(unix)]
-        {
-            let (directory, name) = self.parent_and_name(path)?;
-            let mut file = match open_file_at(
-                directory,
-                name,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            ) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(source) => {
-                    return Err(StoreError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    })
-                }
-            };
-            let opened = file.metadata().map_err(|source| StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            if !opened.is_file() {
-                return Err(self.invalid_path(path, "journal path is not a regular file"));
-            }
-            let opened_modified = opened.modified().ok();
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|source| StoreError::Io {
+        self.validate_path(path)?;
+        let opened = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StoreError::Io {
                     path: path.to_path_buf(),
                     source,
-                })?;
-            let after = file.metadata().map_err(|source| StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            let current = open_file_at(
-                directory,
-                name,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )
-            .and_then(|file| file.metadata())
+                })
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(self.invalid_path(path, "journal path is not a real regular file"));
+            }
+            Ok(metadata) => metadata,
+        };
+        let mut file = File::open(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let opened_identity = file_identity(&opened);
+        let opened_modified = opened.modified().ok();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
             .map_err(|source| StoreError::Io {
                 path: path.to_path_buf(),
                 source,
             })?;
-            if file_identity(&opened) != file_identity(&after)
-                || file_identity(&opened) != file_identity(&current)
-                || opened.len() != bytes.len() as u64
-                || after.len() != bytes.len() as u64
-                || opened_modified != after.modified().ok()
-            {
-                return Err(self.invalid_path(path, "journal file changed while it was read"));
-            }
-            Ok(Some(bytes))
-        }
-        #[cfg(not(unix))]
+        let after = file.metadata().map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let current = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if current.file_type().is_symlink()
+            || file_identity(&after) != opened_identity
+            || file_identity(&current) != opened_identity
+            || opened.len() != bytes.len() as u64
+            || after.len() != bytes.len() as u64
+            || opened_modified != after.modified().ok()
         {
-            self.validate_path(path)?;
-            match fs::symlink_metadata(path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(source) => Err(StoreError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                }),
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                    Err(self.invalid_path(path, "journal path is not a real regular file"))
-                }
-                Ok(metadata) => {
-                    let bytes = fs::read(path).map_err(|source| StoreError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
-                    let current = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
-                    if current.file_type().is_symlink()
-                        || file_identity(&metadata) != file_identity(&current)
-                        || metadata.len() != bytes.len() as u64
-                    {
-                        return Err(
-                            self.invalid_path(path, "journal file changed while it was read")
-                        );
-                    }
-                    Ok(Some(bytes))
-                }
-            }
+            return Err(self.invalid_path(path, "journal file changed while it was read"));
         }
+        Ok(Some(bytes))
     }
 
     fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError> {
         if path != self.output.path.join(".distill-quarantine") {
             return Err(self.invalid_path(path, "journal may create only codegen quarantine"));
         }
-        #[cfg(unix)]
-        {
-            self.output
-                .quarantine_handle
-                .metadata()
-                .map(|_| ())
-                .map_err(|source| StoreError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })
+        self.validate_path(path)?;
+        fs::create_dir_all(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let metadata = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(self.invalid_path(path, "quarantine is not a real directory"));
         }
-        #[cfg(not(unix))]
-        {
-            fs::create_dir_all(path).map_err(|source| StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+        Ok(())
     }
 
     fn sync_file(&mut self, path: &Path) -> Result<(), StoreError> {
-        #[cfg(unix)]
-        {
-            let (directory, name) = self.parent_and_name(path)?;
-            open_file_at(
-                directory,
-                name,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )
+        self.validate_path(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(self.invalid_path(path, "journal path is not a real regular file"));
+        }
+        File::open(path)
             .and_then(|file| file.sync_all())
             .map_err(|source| StoreError::Io {
                 path: path.to_path_buf(),
                 source,
             })
-        }
-        #[cfg(not(unix))]
-        {
-            self.validate_path(path)?;
-            File::open(path)
-                .and_then(|file| file.sync_all())
-                .map_err(|source| StoreError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })
-        }
     }
 
     fn sync_dir(&mut self, path: &Path) -> Result<(), StoreError> {
-        #[cfg(unix)]
-        {
-            self.directory(path)?
-                .sync_all()
-                .map_err(|source| StoreError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })
+        self.validate_path(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(self.invalid_path(path, "journal path is not a real directory"));
         }
-        #[cfg(not(unix))]
-        {
-            self.validate_path(path)?;
-            File::open(path)
-                .and_then(|file| file.sync_all())
-                .map_err(|source| StoreError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })
-        }
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
     }
 
     fn ensure_same_filesystem(
@@ -1135,41 +992,28 @@ impl JournalFilesystem for OutputJournalFilesystem<'_> {
         source: &Path,
         destination_dir: &Path,
     ) -> Result<(), StoreError> {
+        self.validate_path(source)?;
+        self.validate_path(destination_dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let (source_directory, source_name) = self.parent_and_name(source)?;
-            let source_metadata = open_file_at(
-                source_directory,
-                source_name,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )
-            .and_then(|file| file.metadata())
-            .map_err(|source_error| StoreError::Io {
+            let source_metadata = fs::metadata(source).map_err(|source_error| StoreError::Io {
                 path: source.to_path_buf(),
                 source: source_error,
             })?;
             let destination_metadata =
-                self.directory(destination_dir)?
-                    .metadata()
-                    .map_err(|source_error| StoreError::Io {
-                        path: destination_dir.to_path_buf(),
-                        source: source_error,
-                    })?;
+                fs::metadata(destination_dir).map_err(|source_error| StoreError::Io {
+                    path: destination_dir.to_path_buf(),
+                    source: source_error,
+                })?;
             if source_metadata.dev() != destination_metadata.dev() {
                 return Err(StoreError::CrossFilesystemQuarantine {
                     source: source.to_path_buf(),
                     quarantine: destination_dir.to_path_buf(),
                 });
             }
-            Ok(())
         }
-        #[cfg(not(unix))]
-        {
-            self.validate_path(source)?;
-            self.validate_path(destination_dir)
-        }
+        Ok(())
     }
 
     fn move_no_replace(
@@ -1177,288 +1021,36 @@ impl JournalFilesystem for OutputJournalFilesystem<'_> {
         source: &Path,
         destination: &Path,
     ) -> Result<(), NoReplaceMoveError> {
-        #[cfg(unix)]
-        {
-            let (source_directory, source_name) = self
-                .parent_and_name(source)
-                .map_err(NoReplaceMoveError::Other)?;
-            let (destination_directory, destination_name) = self
-                .parent_and_name(destination)
-                .map_err(NoReplaceMoveError::Other)?;
-            link_at(
-                source_directory,
-                source_name,
-                destination_directory,
-                destination_name,
-            )
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    NoReplaceMoveError::DestinationExists
-                } else {
-                    NoReplaceMoveError::Other(StoreError::Io {
-                        path: destination.to_path_buf(),
-                        source: error,
-                    })
-                }
-            })?;
-            unlink_at(source_directory, source_name).map_err(|source_error| {
+        self.validate_path(source)
+            .and_then(|()| self.validate_path(destination))
+            .map_err(NoReplaceMoveError::Other)?;
+        let source_metadata = fs::symlink_metadata(source).map_err(|source_error| {
+            NoReplaceMoveError::Other(StoreError::Io {
+                path: source.to_path_buf(),
+                source: source_error,
+            })
+        })?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(NoReplaceMoveError::Other(
+                self.invalid_path(source, "move source is not a real regular file"),
+            ));
+        }
+        match fs::hard_link(source, destination) {
+            Ok(()) => fs::remove_file(source).map_err(|source_error| {
                 NoReplaceMoveError::Other(StoreError::Io {
                     path: source.to_path_buf(),
                     source: source_error,
                 })
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            self.validate_path(source)
-                .and_then(|()| self.validate_path(destination))
-                .map_err(NoReplaceMoveError::Other)?;
-            match fs::hard_link(source, destination) {
-                Ok(()) => fs::remove_file(source).map_err(|source_error| {
-                    NoReplaceMoveError::Other(StoreError::Io {
-                        path: source.to_path_buf(),
-                        source: source_error,
-                    })
-                }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Err(NoReplaceMoveError::DestinationExists)
-                }
-                Err(source_error) => Err(NoReplaceMoveError::Other(StoreError::Io {
-                    path: destination.to_path_buf(),
-                    source: source_error,
-                })),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(NoReplaceMoveError::DestinationExists)
             }
+            Err(source_error) => Err(NoReplaceMoveError::Other(StoreError::Io {
+                path: destination.to_path_buf(),
+                source: source_error,
+            })),
         }
     }
-}
-
-fn open_output_directory(path: &Path) -> std::io::Result<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        File::open(path)
-    }
-}
-
-#[cfg(unix)]
-fn c_name(name: &OsStr) -> std::io::Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))
-}
-
-#[cfg(unix)]
-fn open_file_at(
-    directory: &File,
-    name: &OsStr,
-    flags: libc::c_int,
-    mode: libc::mode_t,
-) -> std::io::Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let name = c_name(name)?;
-    // SAFETY: the descriptor and C string remain live for openat; the new
-    // descriptor is transferred exactly once into File.
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            flags,
-            libc::c_uint::from(mode),
-        )
-    };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(descriptor) })
-}
-
-#[cfg(unix)]
-fn create_new_at(directory: &File, name: &OsStr) -> std::io::Result<File> {
-    open_file_at(
-        directory,
-        name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        0o600,
-    )
-}
-
-#[cfg(unix)]
-fn open_or_create_output_directory(
-    parent: &File,
-    name: &OsStr,
-    path: &Path,
-) -> Result<File, String> {
-    use std::os::fd::AsRawFd;
-    let encoded = c_name(name).map_err(|error| error.to_string())?;
-    // SAFETY: mkdirat reads the live parent descriptor and C string only.
-    let status = unsafe { libc::mkdirat(parent.as_raw_fd(), encoded.as_ptr(), 0o700) };
-    if status != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(format!(
-                "create codegen quarantine {}: {error}",
-                path.display()
-            ));
-        }
-    }
-    let directory = open_file_at(
-        parent,
-        name,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    )
-    .map_err(|error| format!("open codegen quarantine {}: {error}", path.display()))?;
-    parent
-        .sync_all()
-        .map_err(|error| format!("sync codegen output after quarantine create: {error}"))?;
-    Ok(directory)
-}
-
-#[cfg(unix)]
-fn entry_exists_at(directory: &File, name: &OsStr) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let name = c_name(name)?;
-    // SAFETY: stat is an out parameter and the descriptor/name remain live.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    let status = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            &mut stat,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if status == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::NotFound {
-        Ok(false)
-    } else {
-        Err(error)
-    }
-}
-
-#[cfg(unix)]
-fn read_directory_names_at(directory: &File) -> std::io::Result<Vec<OsString>> {
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::ffi::OsStringExt;
-
-    struct Dir(*mut libc::DIR);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            // SAFETY: fdopendir returned this sole owned DIR pointer.
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-
-    let descriptor = open_file_at(
-        directory,
-        OsStr::new("."),
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    )?
-    .into_raw_fd();
-    // SAFETY: fdopendir consumes the independently owned descriptor.
-    let pointer = unsafe { libc::fdopendir(descriptor) };
-    if pointer.is_null() {
-        let error = std::io::Error::last_os_error();
-        // SAFETY: fdopendir did not consume the descriptor on failure.
-        unsafe { libc::close(descriptor) };
-        return Err(error);
-    }
-    let directory = Dir(pointer);
-    let mut names = Vec::new();
-    loop {
-        set_codegen_errno(0);
-        // SAFETY: the DIR remains live and the returned name is copied before
-        // the next call.
-        let entry = unsafe { libc::readdir(directory.0) };
-        if entry.is_null() {
-            let error = codegen_errno();
-            if error != 0 {
-                return Err(std::io::Error::from_raw_os_error(error));
-            }
-            break;
-        }
-        // SAFETY: POSIX dirent names are NUL terminated within d_name.
-        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if bytes != b"." && bytes != b".." {
-            names.push(OsString::from_vec(bytes.to_vec()));
-        }
-    }
-    Ok(names)
-}
-
-#[cfg(unix)]
-fn link_at(
-    source_directory: &File,
-    source: &OsStr,
-    destination_directory: &File,
-    destination: &OsStr,
-) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let source = c_name(source)?;
-    let destination = c_name(destination)?;
-    // SAFETY: linkat reads the live descriptors and names only.
-    let status = unsafe {
-        libc::linkat(
-            source_directory.as_raw_fd(),
-            source.as_ptr(),
-            destination_directory.as_raw_fd(),
-            destination.as_ptr(),
-            0,
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn unlink_at(directory: &File, name: &OsStr) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let name = c_name(name)?;
-    // SAFETY: unlinkat reads the live descriptor and name only.
-    let status = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn set_codegen_errno(value: libc::c_int) {
-    // SAFETY: errno is thread-local and used immediately around readdir.
-    unsafe { *codegen_errno_pointer() = value };
-}
-
-#[cfg(unix)]
-fn codegen_errno() -> libc::c_int {
-    // SAFETY: this returns the current thread's live errno cell.
-    unsafe { *codegen_errno_pointer() }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-unsafe fn codegen_errno_pointer() -> *mut libc::c_int {
-    // SAFETY: delegated to the C runtime's thread-local errno accessor.
-    unsafe { libc::__errno_location() }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-unsafe fn codegen_errno_pointer() -> *mut libc::c_int {
-    // SAFETY: delegated to the C runtime's thread-local errno accessor.
-    unsafe { libc::__error() }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1556,6 +1148,16 @@ mod tests {
 
     fn generated(asset: u8, bytes: &[u8]) -> GeneratedFile {
         GeneratedFile::new(AssetUuid([asset; 16]), bytes.to_vec())
+    }
+
+    #[test]
+    fn host_rejected_codegen_context_failures_remain_retryable() {
+        assert!(retryable_codegen_callback_failure(
+            &CallbackInvokeError::HostRejected("host context panic".to_owned())
+        ));
+        assert!(!retryable_codegen_callback_failure(
+            &CallbackInvokeError::Panicked
+        ));
     }
 
     #[test]
@@ -1761,7 +1363,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn retained_output_capability_cannot_be_redirected_by_path_replacement() {
+    fn output_path_replacement_is_rejected_without_writing_outside() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1785,18 +1387,16 @@ mod tests {
         fs::write(outside.join(&relative), b"outside\n").unwrap();
         symlink(&outside, &output.path).unwrap();
 
-        world.publish_files(basis, &[replacement]).unwrap();
-        assert_eq!(
-            fs::read(retained.join(&relative)).unwrap(),
-            b"replacement\n"
-        );
+        let error = world.publish_files(basis, &[replacement]).unwrap_err();
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(fs::read(retained.join(&relative)).unwrap(), b"initial\n");
         assert_eq!(fs::read(outside.join(&relative)).unwrap(), b"outside\n");
         assert!(!outside.join("mod.rs").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn codegen_recovery_uses_the_retained_output_capability() {
+    fn codegen_recovery_rejects_output_path_replacement() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1836,14 +1436,14 @@ mod tests {
 
         let mut store = store.lock().unwrap();
         let mut filesystem = OutputJournalFilesystem::new(&output);
-        let publication = quarantine
-            .admit_codegen_publication(&mut store, &mut filesystem)
-            .unwrap();
-        assert_eq!(publication.recovered().len(), 1);
-        drop(publication);
-        assert_eq!(fs::read(retained.join("mod.rs")).unwrap(), proposed_bytes);
+        let error = match quarantine.admit_codegen_publication(&mut store, &mut filesystem) {
+            Ok(_) => panic!("replacement output path must reject recovery"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("changed"));
+        assert!(!retained.join("mod.rs").exists());
         assert!(!outside.join("mod.rs").exists());
-        assert_eq!(store.codegen_outputs().unwrap(), outputs);
-        assert!(store.unfinished_publication_groups().unwrap().is_empty());
+        assert!(store.codegen_outputs().unwrap().is_empty());
+        assert_eq!(store.unfinished_publication_groups().unwrap().len(), 1);
     }
 }

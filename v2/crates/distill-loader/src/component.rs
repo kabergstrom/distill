@@ -110,6 +110,63 @@ impl ComponentPlanner {
     }
 }
 
+/// Find every back-edge cycle in a load-dependency graph without using the
+/// native stack. Each returned path repeats its first member at the end, so
+/// diagnostics preserve the complete cycle (`A -> B -> ... -> A`).
+pub fn load_cycles(graph: &BTreeMap<AssetUuid, Vec<AssetUuid>>) -> Vec<Vec<AssetUuid>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        Gray,
+        Black,
+    }
+
+    let mut colors = BTreeMap::<AssetUuid, Color>::new();
+    let mut cycles = Vec::new();
+    for root in graph.keys().copied() {
+        if colors.contains_key(&root) {
+            continue;
+        }
+        let mut path = vec![root];
+        let mut positions = BTreeMap::from([(root, 0usize)]);
+        let mut stack = vec![(root, 0usize)];
+        colors.insert(root, Color::Gray);
+
+        while let Some((node, next_dependency)) = stack.last_mut() {
+            let dependencies = graph.get(node).map(Vec::as_slice).unwrap_or_default();
+            if *next_dependency == dependencies.len() {
+                let node = *node;
+                stack.pop();
+                path.pop();
+                positions.remove(&node);
+                colors.insert(node, Color::Black);
+                continue;
+            }
+
+            let dependency = dependencies[*next_dependency];
+            *next_dependency += 1;
+            if !graph.contains_key(&dependency) {
+                continue;
+            }
+            match colors.get(&dependency).copied() {
+                None => {
+                    colors.insert(dependency, Color::Gray);
+                    positions.insert(dependency, path.len());
+                    path.push(dependency);
+                    stack.push((dependency, 0));
+                }
+                Some(Color::Gray) => {
+                    let start = positions[&dependency];
+                    let mut cycle = path[start..].to_vec();
+                    cycle.push(dependency);
+                    cycles.push(cycle);
+                }
+                Some(Color::Black) => {}
+            }
+        }
+    }
+    cycles
+}
+
 fn union_edges(
     parent: AssetUuid,
     children: &BTreeSet<AssetUuid>,

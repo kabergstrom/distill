@@ -165,8 +165,8 @@ pub enum BundleError {
         field: &'static str,
         found: String,
     },
-    /// Schema-closure violation (§6): the entry's `schema_hash` does not
-    /// resolve in the bundle's own `schemas`.
+    /// Schema-closure violation (§6, §11): an entry schema or Migration
+    /// endpoint hash does not resolve in the bundle's own `schemas`.
     MissingSchema {
         local_id: String,
         schema_hash: LogicalHash,

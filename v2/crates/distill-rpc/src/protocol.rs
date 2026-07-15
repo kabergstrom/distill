@@ -292,6 +292,10 @@ pub enum RpcFailure {
         since: InputVersion,
         current: InputVersion,
     },
+    ResourceLimit {
+        resource: String,
+        limit: usize,
+    },
     ArtifactNotFound {
         hash: ContentHash,
     },
@@ -1029,6 +1033,17 @@ pub trait BuildBackend: Send + Sync {
 pub trait ArtifactLeaseBackend: Send + Sync {
     fn pin_lease(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String>;
     fn release_lease(&self, holder: u64);
+
+    /// Pins retained only while a bounded, renewable pack-build session is
+    /// alive. Backends that do not distinguish durable pin classes can use
+    /// the ordinary lease implementation.
+    fn pin_pack_session(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
+        self.pin_lease(holder, hashes)
+    }
+
+    fn release_pack_session(&self, holder: u64) {
+        self.release_lease(holder);
+    }
 }
 
 /// Payload storage seam. Production reads immutable artifact and DSWL bytes

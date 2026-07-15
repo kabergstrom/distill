@@ -16,9 +16,8 @@ use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
 use distill_rpc::{AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, StreamEvent};
 use tokio::sync::mpsc;
-use tokio::sync::Notify;
 
-use crate::admission::{Admission, FetchAdmission, FetchPermit};
+use crate::admission::{Admission, FetchAdmission};
 use crate::io::{
     AssetDeltaState, DriftedInput, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ReqId,
     ResolveResult, RuntimeTarget,
@@ -126,9 +125,9 @@ impl RpcIo {
 
 impl Drop for RpcIo {
     fn drop(&mut self) {
-        for permit in std::mem::take(&mut self.delivered_fetches) {
-            let _ = self.commands.blocking_send(Command::ReleaseFetch(permit));
-        }
+        self.delivered_fetches.clear();
+        let (_closed_sender, replacement) = mpsc::channel(1);
+        drop(std::mem::replace(&mut self.events, replacement));
         let _ = self.commands.blocking_send(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -209,9 +208,7 @@ impl LoaderIO for RpcIo {
     }
 
     fn poll(&mut self) -> Vec<IoEvent> {
-        for permit in std::mem::take(&mut self.delivered_fetches) {
-            self.send(Command::ReleaseFetch(permit));
-        }
+        self.delivered_fetches.clear();
         while let Ok(completion) = self.events.try_recv() {
             if let Some(permit) = completion.fetch_permit {
                 self.delivered_fetches.push(permit);
@@ -225,6 +222,10 @@ impl LoaderIO for RpcIo {
 struct Completion {
     event: IoEvent,
     fetch_permit: Option<FetchPermit>,
+}
+
+struct FetchPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 async fn send_event(events: &mpsc::Sender<Completion>, event: IoEvent) -> bool {
@@ -264,7 +265,6 @@ enum Command {
     UnsubscribeAsset(AssetUuid),
     SubscribePath(String),
     UnsubscribePath(String),
-    ReleaseFetch(FetchPermit),
     Shutdown,
 }
 
@@ -339,15 +339,14 @@ fn run_thread(
             events,
             subscriptions: Rc::new(RefCell::new(Subscriptions::default())),
             delta_task: None,
-            fetch_admission: Rc::new(RefCell::new(FetchAdmission::new(
+            fetch_admission: FetchAdmission::new(
                 config.fetch_memory_budget,
                 config.spool_threshold,
-            ))),
-            fetch_wake: Rc::new(Notify::new()),
+            ),
             request_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 IN_FLIGHT_REQUEST_LIMIT,
             )),
-            fetch_finalize_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            fetch_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             spool_directory: config.spool_directory,
         }
         .run()
@@ -365,10 +364,9 @@ struct Driver {
     events: mpsc::Sender<Completion>,
     subscriptions: Rc<RefCell<Subscriptions>>,
     delta_task: Option<tokio::task::JoinHandle<()>>,
-    fetch_admission: Rc<RefCell<FetchAdmission>>,
-    fetch_wake: Rc<Notify>,
+    fetch_admission: FetchAdmission,
     request_slots: std::sync::Arc<tokio::sync::Semaphore>,
-    fetch_finalize_slot: std::sync::Arc<tokio::sync::Semaphore>,
+    fetch_slot: std::sync::Arc<tokio::sync::Semaphore>,
     spool_directory: Option<PathBuf>,
 }
 
@@ -426,12 +424,12 @@ impl Driver {
                     return true;
                 }
                 let request_slots = std::sync::Arc::clone(&self.request_slots);
+                let Ok(request_slot) = request_slots.acquire_owned().await else {
+                    return false;
+                };
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 tokio::task::spawn_local(async move {
-                    let Ok(request_slot) = request_slots.acquire_owned().await else {
-                        return;
-                    };
                     let _request_slot = request_slot;
                     let event = resolve_event(snapshot, req, uuid, basis).await;
                     let _ = send_event(&events, event).await;
@@ -451,29 +449,27 @@ impl Driver {
                     return true;
                 }
                 let request_slots = std::sync::Arc::clone(&self.request_slots);
-                let fetch_finalize_slot = std::sync::Arc::clone(&self.fetch_finalize_slot);
+                let Ok(request_slot) = request_slots.acquire_owned().await else {
+                    return false;
+                };
+                let fetch_slot = std::sync::Arc::clone(&self.fetch_slot);
+                let Ok(fetch_slot) = fetch_slot.acquire_owned().await else {
+                    return false;
+                };
                 let hub = self.hub.clone();
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
-                let admission = Rc::clone(&self.fetch_admission);
-                let wake = Rc::clone(&self.fetch_wake);
+                let admission = self.fetch_admission;
                 let spool_directory = self.spool_directory.clone();
                 tokio::task::spawn_local(async move {
-                    let Ok(request_slot) = request_slots.acquire_owned().await else {
-                        return;
-                    };
                     let _request_slot = request_slot;
-                    let Ok(fetch_finalize_slot) = fetch_finalize_slot.acquire_owned().await else {
-                        return;
-                    };
-                    let _fetch_finalize_slot = fetch_finalize_slot;
                     let completion = fetch_event(
                         (hub, snapshot),
                         req,
                         content_hash,
                         basis,
                         admission,
-                        wake,
+                        FetchPermit { _slot: fetch_slot },
                         spool_directory,
                     )
                     .await;
@@ -490,12 +486,12 @@ impl Driver {
                     return true;
                 }
                 let request_slots = std::sync::Arc::clone(&self.request_slots);
+                let Ok(request_slot) = request_slots.acquire_owned().await else {
+                    return false;
+                };
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 tokio::task::spawn_local(async move {
-                    let Ok(request_slot) = request_slots.acquire_owned().await else {
-                        return;
-                    };
                     let _request_slot = request_slot;
                     let event = path_event(snapshot, req, path, basis).await;
                     let _ = send_event(&events, event).await;
@@ -524,10 +520,6 @@ impl Driver {
                 if removed {
                     self.unsubscribe(Vec::new(), vec![path]).await;
                 }
-            }
-            Command::ReleaseFetch(permit) => {
-                let _ = self.fetch_admission.borrow_mut().release(permit);
-                self.fetch_wake.notify_waiters();
             }
             Command::Shutdown => return false,
         }
@@ -781,8 +773,8 @@ async fn fetch_event(
     req: ReqId,
     content_hash: ContentHash,
     request_basis: IoBasis,
-    admission: Rc<RefCell<FetchAdmission>>,
-    wake: Rc<Notify>,
+    admission: FetchAdmission,
+    permit: FetchPermit,
     spool_directory: Option<PathBuf>,
 ) -> Completion {
     let (hub, snapshot) = remote;
@@ -805,13 +797,8 @@ async fn fetch_event(
             ))
         }
     };
-    let mut permit = match acquire_fetch(admission, wake, total_bytes).await {
-        Ok(permit) => permit,
-        Err(error) => return Completion::event(request_error(req, request_basis, error)),
-    };
-    let payload = match permit.storage {
-        FetchStorage::Memory => match collect_remote_chunks(&mut terminal.value, total_bytes).await
-        {
+    let payload = match admission.admit(total_bytes) {
+        Admission::Memory => match collect_remote_chunks(&mut terminal.value, total_bytes).await {
             Ok((structural, blobs)) => {
                 let observed = blobs.iter().try_fold(structural.len(), |total, blob| {
                     total.checked_add(blob.len())
@@ -829,7 +816,7 @@ async fn fetch_event(
                 return Completion::event(request_error(req, request_basis, error));
             }
         },
-        FetchStorage::Spool => {
+        Admission::Spool => {
             match spool_remote_chunks(&mut terminal.value, total_bytes, spool_directory.as_deref())
                 .await
             {
@@ -861,10 +848,7 @@ async fn fetch_event(
             ))
         }
     };
-    if let Err(error) = resize_fetch(&mut permit, admitted_bytes).await {
-        return Completion::event(request_error(req, request_basis, error));
-    }
-    let spool = permit.admission.borrow().should_spool(admitted_bytes);
+    let spool = admission.should_spool(admitted_bytes);
     match payload.finish(
         layout_hash,
         load_edges,
@@ -879,7 +863,7 @@ async fn fetch_event(
                 artifact,
                 basis,
             },
-            fetch_permit: Some(permit.into_permit()),
+            fetch_permit: Some(permit),
         },
         Err(error) => Completion::event(request_error(req, request_basis, error)),
     }
@@ -924,90 +908,6 @@ async fn collect_remote_chunks(
                 return Ok((structural, blobs.into_values().collect()));
             }
             Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FetchStorage {
-    Memory,
-    Spool,
-}
-
-struct FetchAdmissionGuard {
-    admission: Rc<RefCell<FetchAdmission>>,
-    wake: Rc<Notify>,
-    permit: Option<FetchPermit>,
-    storage: FetchStorage,
-}
-
-impl Drop for FetchAdmissionGuard {
-    fn drop(&mut self) {
-        if let Some(permit) = self.permit.take() {
-            let _ = self.admission.borrow_mut().release(permit);
-            self.wake.notify_waiters();
-        }
-    }
-}
-
-impl FetchAdmissionGuard {
-    fn into_permit(mut self) -> FetchPermit {
-        self.permit
-            .take()
-            .expect("an admitted fetch guard always owns its permit")
-    }
-}
-
-async fn resize_fetch(guard: &mut FetchAdmissionGuard, bytes: usize) -> Result<(), String> {
-    loop {
-        let notified = guard.wake.notified();
-        let resized = {
-            let permit = guard
-                .permit
-                .as_mut()
-                .expect("an admitted fetch guard always owns its permit");
-            guard
-                .admission
-                .borrow_mut()
-                .resize(permit, bytes)
-                .map_err(|error| format!("fetch admission resize failed: {error:?}"))?
-        };
-        if resized {
-            return Ok(());
-        }
-        notified.await;
-    }
-}
-
-async fn acquire_fetch(
-    admission: Rc<RefCell<FetchAdmission>>,
-    wake: Rc<Notify>,
-    bytes: usize,
-) -> Result<FetchAdmissionGuard, String> {
-    loop {
-        let notified = wake.notified();
-        let decision = admission
-            .borrow_mut()
-            .admit(bytes)
-            .map_err(|error| format!("fetch admission failed: {error:?}"))?;
-        match decision {
-            Admission::Memory(permit) => {
-                return Ok(FetchAdmissionGuard {
-                    admission,
-                    wake: Rc::clone(&wake),
-                    permit: Some(permit),
-                    storage: FetchStorage::Memory,
-                })
-            }
-            Admission::Spool(permit) => {
-                return Ok(FetchAdmissionGuard {
-                    admission,
-                    wake: Rc::clone(&wake),
-                    permit: Some(permit),
-                    storage: FetchStorage::Spool,
-                })
-            }
-            Admission::Wait => notified.await,
         }
     }
 }

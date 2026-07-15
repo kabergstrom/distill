@@ -11,7 +11,7 @@ use distill_build::trace::PackDefinitionControlValue;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    ArtifactChunkKind, AuthoringValue, ConfigurationPoison, Hub, PathResolveResult,
+    ArtifactChunkKind, AuthoringValue, ConfigurationPoison, Hub, PackSession, PathResolveResult,
     ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
@@ -77,6 +77,9 @@ pub enum PackBuildError {
         type_uuid: TypeUuid,
     },
     InvalidWireTree(LayoutHash),
+    LoadCycle {
+        cycle: Vec<AssetUuid>,
+    },
     Path {
         path: String,
         result: PathResolveResult,
@@ -364,8 +367,10 @@ pub fn build_pack(
     if definition.roots.is_empty() {
         return Err(PackBuildError::NoRoots);
     }
+    let pack_session = rpc_success(snapshot.open_pack_session())?;
     let mut pending = BTreeSet::new();
     for (index, root) in definition.roots.iter().enumerate() {
+        rpc_success(pack_session.keep_alive())?;
         let root = root
             .clone()
             .close(None)
@@ -382,6 +387,7 @@ pub fn build_pack(
         if artifacts.contains_key(&asset) {
             continue;
         }
+        rpc_success(pack_session.keep_alive())?;
         let resolved = terminal(snapshot, rpc_success(snapshot.resolve_batch(asset))?)?;
         let content_hash = match resolved {
             ResolveResult::Built { content_hash } => content_hash,
@@ -412,6 +418,7 @@ pub fn build_pack(
         let terminal_type = parsed.terminal_type;
         let layout_hash = parsed.layout_hash;
         drop(parsed);
+        rpc_success(pack_session.pin(&[content_hash.0, layout_hash.0]))?;
         pending.extend(load_deps.iter().copied());
         artifacts.insert(
             asset,
@@ -426,11 +433,29 @@ pub fn build_pack(
         );
     }
 
+    let graph = artifacts
+        .iter()
+        .map(|(asset, artifact)| {
+            (
+                *asset,
+                artifact
+                    .load_edges
+                    .iter()
+                    .map(|edge| edge.asset)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some(cycle) = distill_loader::load_cycles(&graph).into_iter().next() {
+        return Err(PackBuildError::LoadCycle { cycle });
+    }
+
     for type_uuid in artifacts
         .values()
         .map(|artifact| artifact.terminal_type)
         .collect::<BTreeSet<_>>()
     {
+        rpc_success(pack_session.keep_alive())?;
         if rpc_success(snapshot.runtime_type_policy(type_uuid))?.build_only {
             return Err(PackBuildError::BuildOnlyType { type_uuid });
         }
@@ -442,6 +467,7 @@ pub fn build_pack(
         .map(|artifact| artifact.layout_hash)
         .collect::<BTreeSet<_>>()
     {
+        rpc_success(pack_session.keep_alive())?;
         let bytes = rpc_success(hub.wire_tree(layout_hash))?.to_vec();
         let root = distill_wire::dswl::decode_dswl(&bytes)
             .map_err(|_| PackBuildError::InvalidWireTree(layout_hash))?;
@@ -475,7 +501,11 @@ pub fn build_pack(
         .collect::<BTreeMap<_, _>>();
 
     let paths = if definition.include_path_table {
-        Some(build_paths(snapshot, artifacts.keys().copied())?)
+        Some(build_paths(
+            snapshot,
+            &pack_session,
+            artifacts.keys().copied(),
+        )?)
     } else {
         None
     };
@@ -617,10 +647,12 @@ fn collect_chunks(
 
 fn build_paths(
     snapshot: &Snapshot,
+    pack_session: &PackSession,
     assets: impl IntoIterator<Item = AssetUuid>,
 ) -> Result<Vec<PathRow>, PackBuildError> {
     let mut paths = Vec::new();
     for asset in assets {
+        rpc_success(pack_session.keep_alive())?;
         let entry = match snapshot.entry(asset) {
             RpcResult::Failure(RpcFailure::AssetNotFound { uuid }) if uuid == asset => continue,
             result => rpc_success(result)?,

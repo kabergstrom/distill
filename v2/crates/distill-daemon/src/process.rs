@@ -114,13 +114,17 @@ impl DaemonProcess {
             Arc::clone(&watcher_queue),
         )?;
         let watcher_control = watcher.control();
-        config_watch.reconcile(&coordinator, &watcher_control, ControlInvalidation::all())?;
         let mut codegen = CodegenService::new(
             &coordinator,
             &config.codegen.rs_mod_path,
             config.codegen.auto_codegen,
         )
         .map_err(DaemonProcessError::Codegen)?;
+        // Retain an existing daemon-owned output before the first candidate
+        // performs its mandatory startup scan. Otherwise an authored symlink
+        // to that output can be misclassified as a root escape during the
+        // narrow gap between candidate publication and service construction.
+        config_watch.reconcile(&coordinator, &watcher_control, ControlInvalidation::all())?;
         coordinator.reconcile_startup(&watcher_queue)?;
         reconcile_imports(&coordinator, true, false)?;
         coordinator.sweep_displaced_retention(unix_seconds())?;
@@ -571,7 +575,11 @@ impl ConfigWatch {
                     message.clone(),
                 )
                 .expect("schema candidate poison tuple is valid");
-                coordinator.publish_pipeline_rejection(poison)?;
+                if self.rejected {
+                    coordinator.publish_pipeline_rejection_healing_configuration(poison)?;
+                } else {
+                    coordinator.publish_pipeline_rejection(poison)?;
+                }
                 if self.rejected {
                     self.staged = candidate;
                     self.observed = Some(config_state);
@@ -579,6 +587,7 @@ impl ConfigWatch {
                     self.observed_pipeline = Some(pipeline_state.clone());
                     self.cached_schema = Some(schema);
                     self.cached_pipeline = Some(pipeline_state);
+                    self.rejected = false;
                     self.source_rejected = false;
                     return Ok(true);
                 }

@@ -1,14 +1,12 @@
 //! Filesystem-side authority for §14 scanning and §6 lineage repair.
 //!
 //! Logical paths are accepted only in their canonical root-relative form.
-//! Physical traversal is identity checked, quarantine identities are excluded,
-//! directory aliases/cycles are errors, and a file is accepted only when the
-//! identity opened for reading still names the path after the read.
+//! Physical traversal is confined to canonical configured roots, daemon-owned
+//! paths are excluded, directory aliases/cycles are errors, and a file is
+//! accepted only when its observation remains stable through the read.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
-#[cfg(unix)]
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -20,6 +18,7 @@ use distill_core::id::{BundleFileHash, ContentHash};
 use distill_rpc::{
     LineageManifestClaimant, LineageRepairDestination, OccupiedLineageDestinationKind,
 };
+use distill_store::state::{PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,10 +44,21 @@ impl AssetRoot {
 
 #[derive(Debug)]
 pub enum ScanError {
+    Multiple(Vec<ScanError>),
     InvalidRootName(String),
     DuplicateRootName(String),
     UnknownRoot(String),
     InvalidLogicalPath(String),
+    InvalidPhysicalPath {
+        root_name: String,
+        raw_relative_path: PlatformPathBytes,
+        failure: PhysicalPathFailureCode,
+    },
+    SameRootNormalizedPathCollision {
+        root_name: String,
+        normalized_path: String,
+        claims: Vec<PhysicalPathClaim>,
+    },
     RootUnavailable {
         root: String,
         path: PathBuf,
@@ -69,13 +79,11 @@ pub enum ScanError {
         first: PathBuf,
         second_root: String,
         second: PathBuf,
-        identity: ObservedFileIdentity,
     },
     DaemonOwnedDirectoryAlias {
         path: PathBuf,
         owned_path: PathBuf,
         kind: DaemonOwnedDirectoryKind,
-        identity: ObservedFileIdentity,
     },
     FileIdentityChanged {
         path: PathBuf,
@@ -88,10 +96,34 @@ pub enum ScanError {
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Multiple(errors) => write!(
+                f,
+                "{} canonical scan defects: {}",
+                errors.len(),
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
             Self::InvalidRootName(name) => write!(f, "invalid canonical root name {name:?}"),
             Self::DuplicateRootName(name) => write!(f, "duplicate asset root {name:?}"),
             Self::UnknownRoot(name) => write!(f, "unknown asset root {name:?}"),
             Self::InvalidLogicalPath(path) => write!(f, "invalid canonical logical path {path:?}"),
+            Self::InvalidPhysicalPath {
+                root_name, failure, ..
+            } => write!(
+                f,
+                "invalid physical path in root {root_name:?}: {failure:?}"
+            ),
+            Self::SameRootNormalizedPathCollision {
+                root_name,
+                normalized_path,
+                ..
+            } => write!(
+                f,
+                "distinct physical paths in root {root_name:?} normalize to {normalized_path:?}"
+            ),
             Self::RootUnavailable { root, path } => {
                 write!(
                     f,
@@ -107,11 +139,11 @@ impl std::fmt::Display for ScanError {
                 target.display()
             ),
             Self::DirectoryCycle { path } => {
-                write!(f, "directory identity cycle at {}", path.display())
+                write!(f, "directory cycle at {}", path.display())
             }
             Self::DirectoryAlias { first, second, .. } => write!(
                 f,
-                "one directory identity is reachable as both {} and {}",
+                "one canonical directory is reachable as both {} and {}",
                 first.display(),
                 second.display()
             ),
@@ -122,7 +154,7 @@ impl std::fmt::Display for ScanError {
                 ..
             } => write!(
                 f,
-                "{} aliases retained {kind} directory {}",
+                "{} aliases {kind} directory {}",
                 path.display(),
                 owned_path.display()
             ),
@@ -153,21 +185,12 @@ impl std::error::Error for ScanError {
 struct CanonicalRoot {
     configured: AssetRoot,
     canonical_path: PathBuf,
-    directory: DirectoryCapability,
-}
-
-#[derive(Debug, Clone)]
-struct DirectoryCapability {
-    #[cfg(unix)]
-    file: Arc<File>,
-    #[cfg(not(unix))]
-    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub struct RootedScanner {
     roots: Arc<RwLock<BTreeMap<String, CanonicalRoot>>>,
-    daemon_owned: Arc<RwLock<BTreeMap<FileIdentity, RetainedDaemonDirectory>>>,
+    daemon_owned: Arc<RwLock<BTreeMap<PathBuf, DaemonOwnedDirectory>>>,
     revision: Arc<AtomicU64>,
 }
 
@@ -196,13 +219,9 @@ impl std::fmt::Display for DaemonOwnedDirectoryKind {
 }
 
 #[derive(Debug, Clone)]
-struct RetainedDaemonDirectory {
+struct DaemonOwnedDirectory {
     kind: DaemonOwnedDirectoryKind,
     path: PathBuf,
-    identity: FileIdentity,
-    // Keeping the descriptor alive pins the identity even if the configured
-    // spelling is subsequently exchanged or renamed.
-    _directory: DirectoryCapability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +242,7 @@ pub struct ScannedFile {
     pub modified_nanos: i64,
     pub size: u64,
     pub content_hash: Option<ContentHash>,
+    raw_relative_path: PlatformPathBytes,
 }
 
 /// A `.bundle` candidate remains in the report even when its envelope is
@@ -243,8 +263,8 @@ pub struct ScanSnapshot {
     pub files: BTreeMap<(String, String), ScannedFile>,
     logical_roots: BTreeMap<String, BTreeSet<String>>,
     pub bundles: BTreeMap<(String, String), Arc<ScannedBundle>>,
-    directory_identities: BTreeMap<(String, String), DirectoryObservation>,
-    directory_by_identity: BTreeMap<FileIdentity, (String, String, PathBuf)>,
+    directory_observations: BTreeMap<(String, String), DirectoryObservation>,
+    directory_by_target: BTreeMap<PathBuf, (String, String, PathBuf)>,
     symlink_aliases: BTreeMap<(String, String), PathBuf>,
     aliases_by_target: BTreeMap<PathBuf, BTreeSet<(String, String)>>,
     diagnostics: BTreeMap<(String, String), ScanDiagnostic>,
@@ -261,7 +281,11 @@ pub enum ScanDiagnostic {
         physical_path: PathBuf,
         owned_path: PathBuf,
         kind: DaemonOwnedDirectoryKind,
-        identity: ObservedFileIdentity,
+    },
+    DirectoryCycle {
+        root_name: String,
+        normalized_path: String,
+        path_chain: Vec<PathBuf>,
     },
 }
 
@@ -274,12 +298,24 @@ impl std::fmt::Display for ScanDiagnostic {
                 physical_path,
                 owned_path,
                 kind,
-                identity,
             } => write!(
                 formatter,
-                "daemon-owned-directory-alias: {root_name}/{normalized_path} ({}) aliases retained {kind} directory {} with identity {identity:?}; subtree skipped",
+                "daemon-owned-directory-alias: {root_name}/{normalized_path} ({}) aliases {kind} directory {}; subtree skipped",
                 physical_path.display(),
                 owned_path.display(),
+            ),
+            Self::DirectoryCycle {
+                root_name,
+                normalized_path,
+                path_chain,
+            } => write!(
+                formatter,
+                "directory-cycle: {root_name}/{normalized_path} revisits a canonical ancestor through {}; recursion edge skipped",
+                path_chain
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
             ),
         }
     }
@@ -313,12 +349,7 @@ impl ScanSnapshot {
                         && left.normalized_path == right.normalized_path
                         && left.file_hash == right.file_hash
                 })
-            && self.directory_identities.len() == other.directory_identities.len()
-            && self.directory_identities.iter().all(|(key, left)| {
-                other.directory_identities.get(key).is_some_and(|right| {
-                    left.identity == right.identity && left.physical_path == right.physical_path
-                })
-            })
+            && self.directory_observations == other.directory_observations
             && self.symlink_aliases == other.symlink_aliases
     }
 
@@ -362,10 +393,10 @@ impl ScanSnapshot {
                 remove_logical_root(&mut self.logical_roots, &key.1, &key.0);
             }
             remove_matching(&mut self.bundles, affected);
-            let removed_directories = matching_keys(&self.directory_identities, affected);
+            let removed_directories = matching_keys(&self.directory_observations, affected);
             for key in removed_directories {
-                if let Some(observation) = self.directory_identities.remove(&key) {
-                    self.directory_by_identity.remove(&observation.identity);
+                if let Some(observation) = self.directory_observations.remove(&key) {
+                    self.directory_by_target.remove(&observation.canonical_path);
                 }
             }
             let removed_aliases = matching_keys(&self.symlink_aliases, affected);
@@ -384,16 +415,16 @@ impl ScanSnapshot {
             self.files.insert(key, file);
         }
         self.bundles.extend(delta.observed.bundles);
-        for (key, observation) in delta.observed.directory_identities {
-            self.directory_by_identity.insert(
-                observation.identity,
+        for (key, observation) in delta.observed.directory_observations {
+            self.directory_by_target.insert(
+                observation.canonical_path.clone(),
                 (
                     key.0.clone(),
                     key.1.clone(),
                     observation.physical_path.clone(),
                 ),
             );
-            self.directory_identities.insert(key, observation);
+            self.directory_observations.insert(key, observation);
         }
         for (key, target) in delta.observed.symlink_aliases {
             self.aliases_by_target
@@ -446,8 +477,8 @@ impl ScanDelta {
                 && matching_bundle_observations(&baseline.bundles, affected).eq(
                     matching_bundle_observations(&self.observed.bundles, affected),
                 )
-                && matching_values(&baseline.directory_identities, affected).eq(matching_values(
-                    &self.observed.directory_identities,
+                && matching_values(&baseline.directory_observations, affected).eq(matching_values(
+                    &self.observed.directory_observations,
                     affected,
                 ))
                 && matching_values(&baseline.symlink_aliases, affected)
@@ -458,7 +489,7 @@ impl ScanDelta {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectoryObservation {
-    identity: FileIdentity,
+    canonical_path: PathBuf,
     physical_path: PathBuf,
 }
 
@@ -466,16 +497,14 @@ struct DirectoryObservation {
 struct PendingDirectory {
     root_name: String,
     physical_path: PathBuf,
-    directory: DirectoryCapability,
     relative_components: Vec<String>,
-    ancestry: BTreeSet<FileIdentity>,
+    ancestry: BTreeSet<PathBuf>,
+    path_chain: Vec<PathBuf>,
     entry_guards: Vec<EntryGuard>,
 }
 
 #[derive(Debug, Clone)]
 struct EntryGuard {
-    parent: DirectoryCapability,
-    name: std::ffi::OsString,
     display_path: PathBuf,
     target_identity: FileIdentity,
     symlink_identity: Option<FileIdentity>,
@@ -485,8 +514,10 @@ struct EntryGuard {
 struct OpenedChild {
     file: File,
     metadata: Metadata,
+    canonical_path: PathBuf,
+    identity: FileIdentity,
     symlink_identity: Option<FileIdentity>,
-    daemon_owned: Option<RetainedDaemonDirectory>,
+    daemon_owned: Option<DaemonOwnedDirectory>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -494,44 +525,9 @@ enum FileIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
-    Windows {
-        volume_serial: u64,
-        file_id: [u8; 16],
-    },
+    Windows { volume_serial: u64, file_index: u64 },
     #[cfg(not(any(unix, windows)))]
     Portable { len: u64, modified_nanos: u128 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservedFileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial: u64,
-        file_id: [u8; 16],
-    },
-    #[cfg(not(any(unix, windows)))]
-    Portable,
-}
-
-impl From<FileIdentity> for ObservedFileIdentity {
-    fn from(identity: FileIdentity) -> Self {
-        match identity {
-            #[cfg(unix)]
-            FileIdentity::Unix { device, inode } => Self::Unix { device, inode },
-            #[cfg(windows)]
-            FileIdentity::Windows {
-                volume_serial,
-                file_id,
-            } => Self::Windows {
-                volume_serial,
-                file_id,
-            },
-            #[cfg(not(any(unix, windows)))]
-            FileIdentity::Portable { .. } => Self::Portable,
-        }
-    }
 }
 
 impl RootedScanner {
@@ -565,7 +561,7 @@ impl RootedScanner {
         })
     }
 
-    /// Retain one daemon-owned directory capability and exclude its identity
+    /// Record one daemon-owned canonical directory and exclude it
     /// from every current and future root candidate. Duplicate registrations
     /// converge on the canonical `(kind, path)` representative.
     pub(crate) fn retain_daemon_owned_directory(
@@ -577,26 +573,22 @@ impl RootedScanner {
             path: path.as_ref().to_path_buf(),
             source,
         })?;
-        let directory = DirectoryCapability::open_root(&path).map_err(|source| ScanError::Io {
+        let metadata = fs::metadata(&path).map_err(|source| ScanError::Io {
             path: path.clone(),
             source,
         })?;
-        let metadata = directory_metadata(&directory, &path)?;
         if !metadata.is_dir() {
             return Err(ScanError::NonRegularFile { path });
         }
-        let identity = file_identity(&metadata);
-        let retained = RetainedDaemonDirectory {
+        let retained = DaemonOwnedDirectory {
             kind,
-            path,
-            identity,
-            _directory: directory,
+            path: path.clone(),
         };
         let mut directories = self
             .daemon_owned
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match directories.entry(identity) {
+        match directories.entry(path) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(retained);
             }
@@ -666,12 +658,11 @@ impl RootedScanner {
             })
     }
 
-    /// Canonical configured roots to hand to the native watcher. The watcher
-    /// never derives authority from these strings; every delivered path is
-    /// reopened through this scanner's retained directory capabilities.
+    /// Canonical configured roots to hand to the native watcher. Every
+    /// delivered path is re-observed and checked against these roots.
     /// Native-watch roots and the daemon-owned quarantine prefixes nested
     /// beneath them. The watcher filters the latter before queue admission;
-    /// scanner identity checks remain the defense-in-depth boundary.
+    /// scanner canonical containment remains the defense-in-depth boundary.
     pub(crate) fn watch_coverage(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let roots = self.root_snapshot();
         let watched = roots
@@ -723,7 +714,7 @@ impl RootedScanner {
             .clone()
     }
 
-    fn daemon_owned_snapshot(&self) -> BTreeMap<FileIdentity, RetainedDaemonDirectory> {
+    fn daemon_owned_snapshot(&self) -> BTreeMap<PathBuf, DaemonOwnedDirectory> {
         self.daemon_owned
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -754,6 +745,48 @@ impl RootedScanner {
             .next()
             .cloned()
             .map(|root_name| distill_store::state::ScanSubject::Root { root_name })
+    }
+
+    pub(crate) fn rejection_subjects(&self, error: &ScanError) -> Vec<PathBuf> {
+        let rooted_raw = |root_name: &str, raw: &PlatformPathBytes| {
+            let roots = self.root_snapshot();
+            roots.get(root_name).and_then(|root| {
+                platform_path(raw).map(|relative| root.canonical_path.join(relative))
+            })
+        };
+        match error {
+            ScanError::Multiple(errors) => errors
+                .iter()
+                .flat_map(|error| self.rejection_subjects(error))
+                .collect(),
+            ScanError::RootUnavailable { path, .. }
+            | ScanError::Io { path, .. }
+            | ScanError::SymlinkEscape { path, .. }
+            | ScanError::DirectoryCycle { path }
+            | ScanError::FileIdentityChanged { path }
+            | ScanError::NonRegularFile { path } => vec![path.clone()],
+            ScanError::DirectoryAlias { first, second, .. } => {
+                vec![first.clone(), second.clone()]
+            }
+            ScanError::DaemonOwnedDirectoryAlias { path, .. } => vec![path.clone()],
+            ScanError::InvalidPhysicalPath {
+                root_name,
+                raw_relative_path,
+                ..
+            } => rooted_raw(root_name, raw_relative_path)
+                .into_iter()
+                .collect(),
+            ScanError::SameRootNormalizedPathCollision {
+                root_name, claims, ..
+            } => claims
+                .iter()
+                .filter_map(|claim| rooted_raw(root_name, &claim.raw_relative_path))
+                .collect(),
+            ScanError::InvalidRootName(_)
+            | ScanError::DuplicateRootName(_)
+            | ScanError::UnknownRoot(_)
+            | ScanError::InvalidLogicalPath(_) => Vec::new(),
+        }
     }
 
     pub fn normalized_observed_path(&self, root: &str, path: &Path) -> String {
@@ -851,19 +884,29 @@ impl RootedScanner {
     pub fn scan(&self) -> Result<ScanSnapshot, ScanError> {
         let roots = self.validated_root_snapshot()?;
         let daemon_owned = self.daemon_owned_snapshot();
-        let stack = roots
-            .values()
-            .rev()
-            .map(|root| PendingDirectory {
+        let mut snapshot = ScanSnapshot::default();
+        let mut errors = Vec::new();
+        for root in roots.values() {
+            let pending = PendingDirectory {
                 root_name: root.configured.name.clone(),
                 physical_path: root.canonical_path.clone(),
-                directory: root.directory.clone(),
                 relative_components: Vec::new(),
                 ancestry: BTreeSet::new(),
+                path_chain: vec![root.canonical_path.clone()],
                 entry_guards: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        scan_pending(&roots, &daemon_owned, stack)
+            };
+            match scan_pending(&roots, &daemon_owned, vec![pending]) {
+                Ok(observed) => merge_scan_snapshot(&mut snapshot, observed),
+                Err(ScanError::Multiple(mut nested)) => errors.append(&mut nested),
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            rebuild_reverse_indexes(&mut snapshot)?;
+            Ok(snapshot)
+        } else {
+            Err(combine_scan_errors(errors))
+        }
     }
 
     /// Re-observe only native-event paths and directory subtrees, merging the
@@ -876,7 +919,10 @@ impl RootedScanner {
     ) -> Result<Option<ScanDelta>, ScanError> {
         let roots = self.validated_root_snapshot()?;
         let daemon_owned = self.daemon_owned_snapshot();
-        let mut affected = BTreeSet::<(String, String)>::new();
+        // Keep the native physical spelling alongside its normalized logical
+        // identity.  Reopening from the latter is incorrect on filesystems
+        // where NFC-equivalent names are distinct.
+        let mut affected = BTreeMap::<(String, String), Option<PathBuf>>::new();
         for event_path in event_paths {
             if let Some((root, path)) = event_key(&roots, event_path)? {
                 let mut canonical_event = roots[&root].canonical_path.clone();
@@ -884,27 +930,45 @@ impl RootedScanner {
                     canonical_event.push(component);
                 }
                 for alias in aliases_affected_by(&baseline.aliases_by_target, &canonical_event) {
-                    affected.insert(alias);
+                    affected.entry(alias).or_insert(None);
                 }
-                affected.insert((root, path));
+                affected.insert((root, path), Some(event_path.clone()));
             }
         }
         if affected.is_empty() {
             return Ok(None);
         }
-        let affected = collapse_affected(affected);
+        let physical = affected.clone();
+        let affected = collapse_affected(affected.into_keys().collect());
         let mut observed = ScanSnapshot::default();
+        let mut errors = Vec::new();
         for (root, path) in &affected {
-            if let Some(partial) = scan_logical_path(&roots, &daemon_owned, root, path)? {
-                observed.files.extend(partial.files);
-                observed.bundles.extend(partial.bundles);
-                observed
-                    .directory_identities
-                    .extend(partial.directory_identities);
-                observed.symlink_aliases.extend(partial.symlink_aliases);
-                observed.diagnostics.extend(partial.diagnostics);
+            let result = match physical
+                .get(&(root.clone(), path.clone()))
+                .and_then(Option::as_deref)
+            {
+                Some(event_path) => scan_event_path(&roots, &daemon_owned, root, path, event_path),
+                None => scan_logical_path(&roots, &daemon_owned, root, path),
+            };
+            let partial = match result {
+                Ok(partial) => partial,
+                Err(ScanError::Multiple(mut nested)) => {
+                    errors.append(&mut nested);
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            if let Some(partial) = partial {
+                merge_scan_snapshot(&mut observed, partial);
             }
         }
+        if !errors.is_empty() {
+            return Err(combine_scan_errors(errors));
+        }
+        validate_incremental_physical_collisions(baseline, &observed)?;
         rebuild_reverse_indexes(&mut observed)?;
         validate_incremental_directory_aliases(baseline, &affected, &observed)?;
         Ok(Some(ScanDelta { affected, observed }))
@@ -952,15 +1016,13 @@ impl RootedScanner {
                 path: path.to_path_buf(),
             });
         }
-        let mut directory = root.0.directory.clone();
         let mut display = root.0.configured.path.clone();
         let mut entry_guards = Vec::new();
         for (index, component) in components.iter().enumerate() {
             display.push(component);
-            let opened =
-                open_scanned_child(&directory, component, &display, &roots, &daemon_owned)?;
+            let opened = open_scanned_child(&display, &roots, &daemon_owned)?;
             reject_daemon_owned_access(&opened, &display)?;
-            let guard = EntryGuard::new(&directory, component, &display, &opened);
+            let guard = EntryGuard::new(&display, &opened);
             if index + 1 == components.len() {
                 if !opened.metadata.is_file() {
                     return Err(ScanError::NonRegularFile { path: display });
@@ -974,55 +1036,85 @@ impl RootedScanner {
                 return Err(ScanError::NonRegularFile { path: display });
             }
             entry_guards.push(guard);
-            directory = DirectoryCapability::from_open_directory(opened.file, &display);
+            drop(opened.file);
         }
         unreachable!("nonempty component walk returns at its final component")
     }
 
     fn validated_root_snapshot(&self) -> Result<BTreeMap<String, CanonicalRoot>, ScanError> {
         let roots = self.root_snapshot();
+        let mut errors = Vec::new();
         for root in roots.values() {
-            let current_path = fs::canonicalize(&root.configured.path).map_err(|_| {
-                ScanError::RootUnavailable {
-                    root: root.configured.name.clone(),
-                    path: root.configured.path.clone(),
+            let result = (|| {
+                let current_path = fs::canonicalize(&root.configured.path).map_err(|_| {
+                    ScanError::RootUnavailable {
+                        root: root.configured.name.clone(),
+                        path: root.configured.path.clone(),
+                    }
+                })?;
+                let current = fs::metadata(&current_path).map_err(|source| ScanError::Io {
+                    path: current_path.clone(),
+                    source,
+                })?;
+                if current_path != root.canonical_path || !current.is_dir() {
+                    return Err(ScanError::RootUnavailable {
+                        root: root.configured.name.clone(),
+                        path: root.configured.path.clone(),
+                    });
                 }
-            })?;
-            let retained = directory_metadata(&root.directory, &root.canonical_path)?;
-            let current = fs::metadata(&current_path).map_err(|source| ScanError::Io {
-                path: current_path.clone(),
-                source,
-            })?;
-            if current_path != root.canonical_path
-                || !current.is_dir()
-                || file_identity(&current) != file_identity(&retained)
-            {
-                return Err(ScanError::RootUnavailable {
-                    root: root.configured.name.clone(),
-                    path: root.configured.path.clone(),
-                });
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(error);
             }
         }
-        Ok(roots)
+        if errors.is_empty() {
+            Ok(roots)
+        } else if errors.len() == 1 {
+            Err(errors.pop().expect("one root validation error"))
+        } else {
+            Err(ScanError::Multiple(errors))
+        }
     }
 }
 
 fn scan_pending(
     roots: &BTreeMap<String, CanonicalRoot>,
-    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
     mut stack: Vec<PendingDirectory>,
 ) -> Result<ScanSnapshot, ScanError> {
     let mut snapshot = ScanSnapshot::default();
+    let mut errors = Vec::new();
     while let Some(pending) = stack.pop() {
-        revalidate_entry_guards(&pending.entry_guards, roots, daemon_owned)?;
-        let metadata = directory_metadata(&pending.directory, &pending.physical_path)?;
+        if let Err(error) = revalidate_entry_guards(&pending.entry_guards, roots, daemon_owned) {
+            errors.push(error);
+            continue;
+        }
+        let metadata = match directory_metadata(&pending.physical_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
         if !metadata.is_dir() {
-            return Err(ScanError::NonRegularFile {
+            errors.push(ScanError::NonRegularFile {
                 path: pending.physical_path,
             });
+            continue;
         }
+        let canonical_path = match fs::canonicalize(&pending.physical_path) {
+            Ok(path) => path,
+            Err(source) => {
+                errors.push(ScanError::Io {
+                    path: pending.physical_path,
+                    source,
+                });
+                continue;
+            }
+        };
         let identity = file_identity(&metadata);
-        if let Some(retained) = daemon_owned.get(&identity) {
+        if let Some(retained) = daemon_owned.get(&canonical_path) {
             if retained.kind == DaemonOwnedDirectoryKind::Quarantine {
                 continue;
             }
@@ -1035,16 +1127,23 @@ fn scan_pending(
             );
             continue;
         }
-        if pending.ancestry.contains(&identity) {
-            return Err(ScanError::DirectoryCycle {
-                path: pending.physical_path,
-            });
+        if pending.ancestry.contains(&canonical_path) {
+            let normalized_path = pending.relative_components.join("/");
+            snapshot.diagnostics.insert(
+                (pending.root_name.clone(), normalized_path.clone()),
+                ScanDiagnostic::DirectoryCycle {
+                    root_name: pending.root_name,
+                    normalized_path,
+                    path_chain: pending.path_chain,
+                },
+            );
+            continue;
         }
         let normalized_directory = pending.relative_components.join("/");
-        snapshot.directory_identities.insert(
+        snapshot.directory_observations.insert(
             (pending.root_name.clone(), normalized_directory.clone()),
             DirectoryObservation {
-                identity,
+                canonical_path: canonical_path.clone(),
                 physical_path: pending.physical_path.clone(),
             },
         );
@@ -1056,30 +1155,68 @@ fn scan_pending(
                 modified_nanos: modified_nanos(&metadata),
                 size: metadata.len(),
                 content_hash: None,
+                raw_relative_path: raw_relative_path(
+                    roots,
+                    &pending.root_name,
+                    &pending.physical_path,
+                ),
             };
             snapshot
                 .files
                 .insert((file.root_name.clone(), file.normalized_path.clone()), file);
         }
 
-        let mut entries = read_directory_names(&pending.directory, &pending.physical_path)?;
+        let mut entries = match read_directory_names(&pending.physical_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
         entries.sort_by_key(|entry| os_sort_key(entry));
-        let after = directory_metadata(&pending.directory, &pending.physical_path)?;
-        if file_identity(&after) != identity {
-            return Err(ScanError::FileIdentityChanged {
+        let after = match directory_metadata(&pending.physical_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        let after_canonical =
+            fs::canonicalize(&pending.physical_path).map_err(|source| ScanError::Io {
+                path: pending.physical_path.clone(),
+                source,
+            })?;
+        if file_identity(&after) != identity || after_canonical != canonical_path {
+            errors.push(ScanError::FileIdentityChanged {
                 path: pending.physical_path,
             });
+            continue;
         }
-        revalidate_entry_guards(&pending.entry_guards, roots, daemon_owned)?;
+        if let Err(error) = revalidate_entry_guards(&pending.entry_guards, roots, daemon_owned) {
+            errors.push(error);
+            continue;
+        }
 
         for entry in entries.into_iter().rev() {
-            let component = normalize_component(&entry)?;
+            let physical = pending.physical_path.join(&entry);
+            let component =
+                match normalize_scanned_component(roots, &pending.root_name, &physical, &entry) {
+                    Ok(component) => component,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
             let mut relative = pending.relative_components.clone();
             relative.push(component);
-            let physical = pending.physical_path.join(&entry);
-            let opened =
-                open_scanned_child(&pending.directory, &entry, &physical, roots, daemon_owned)?;
-            let guard = EntryGuard::new(&pending.directory, &entry, &physical, &opened);
+            let opened = match open_scanned_child(&physical, roots, daemon_owned) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            let guard = EntryGuard::new(&physical, &opened);
             if opened.metadata.is_dir() {
                 if let Some(retained) = &opened.daemon_owned {
                     if retained.kind == DaemonOwnedDirectoryKind::Quarantine {
@@ -1095,20 +1232,22 @@ fn scan_pending(
                     continue;
                 }
                 let mut ancestry = pending.ancestry.clone();
-                ancestry.insert(identity);
+                ancestry.insert(canonical_path.clone());
                 let mut entry_guards = pending.entry_guards.clone();
                 entry_guards.push(guard);
-                let directory = DirectoryCapability::from_open_directory(opened.file, &physical);
+                let mut path_chain = pending.path_chain.clone();
+                path_chain.push(physical.clone());
+                drop(opened.file);
                 stack.push(PendingDirectory {
                     root_name: pending.root_name.clone(),
                     physical_path: physical,
-                    directory,
                     relative_components: relative,
                     ancestry,
+                    path_chain,
                     entry_guards,
                 });
             } else if opened.metadata.is_file() {
-                observe_opened_file(
+                if let Err(error) = observe_opened_file(
                     roots,
                     daemon_owned,
                     &mut snapshot,
@@ -1118,20 +1257,78 @@ fn scan_pending(
                     opened,
                     &pending.entry_guards,
                     guard,
-                )?;
+                ) {
+                    errors.push(error);
+                }
             } else {
-                return Err(ScanError::NonRegularFile { path: physical });
+                errors.push(ScanError::NonRegularFile { path: physical });
             }
         }
     }
-    rebuild_reverse_indexes(&mut snapshot)?;
-    Ok(snapshot)
+    if let Err(error) = rebuild_reverse_indexes(&mut snapshot) {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(snapshot)
+    } else {
+        Err(combine_scan_errors(errors))
+    }
+}
+
+fn combine_scan_errors(errors: Vec<ScanError>) -> ScanError {
+    let mut flattened = Vec::new();
+    let mut pending = errors;
+    while let Some(error) = pending.pop() {
+        match error {
+            ScanError::Multiple(nested) => pending.extend(nested),
+            error => flattened.push(error),
+        }
+    }
+    let mut collisions = BTreeMap::<(String, String), Vec<PhysicalPathClaim>>::new();
+    let mut other = Vec::new();
+    for error in flattened {
+        match error {
+            ScanError::SameRootNormalizedPathCollision {
+                root_name,
+                normalized_path,
+                claims,
+            } => collisions
+                .entry((root_name, normalized_path))
+                .or_default()
+                .extend(claims),
+            error => other.push(error),
+        }
+    }
+    for ((root_name, normalized_path), mut claims) in collisions {
+        claims.sort();
+        claims.dedup();
+        other.push(ScanError::SameRootNormalizedPathCollision {
+            root_name,
+            normalized_path,
+            claims,
+        });
+    }
+    if other.len() == 1 {
+        other.pop().expect("one combined scan error")
+    } else {
+        ScanError::Multiple(other)
+    }
+}
+
+fn merge_scan_snapshot(target: &mut ScanSnapshot, source: ScanSnapshot) {
+    target.files.extend(source.files);
+    target.bundles.extend(source.bundles);
+    target
+        .directory_observations
+        .extend(source.directory_observations);
+    target.symlink_aliases.extend(source.symlink_aliases);
+    target.diagnostics.extend(source.diagnostics);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn observe_opened_file(
     roots: &BTreeMap<String, CanonicalRoot>,
-    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
     snapshot: &mut ScanSnapshot,
     root_name: &str,
     relative: Vec<String>,
@@ -1146,6 +1343,31 @@ fn observe_opened_file(
     revalidate_entry_guards(parent_guards, roots, daemon_owned)?;
     revalidate_entry_guards(std::slice::from_ref(&guard), roots, daemon_owned)?;
     let normalized_path = relative.join("/");
+    let raw_relative_path = raw_relative_path(roots, root_name, &physical);
+    let file_hash = BundleFileHash::of_observed_bytes(&bytes);
+    if let Some(existing) = snapshot
+        .files
+        .get(&(root_name.to_owned(), normalized_path.clone()))
+        .filter(|existing| existing.raw_relative_path != raw_relative_path)
+    {
+        let mut claims = vec![
+            PhysicalPathClaim {
+                raw_relative_path: existing.raw_relative_path.clone(),
+                file_hash: BundleFileHash(existing.content_hash.expect("regular file hash").0),
+            },
+            PhysicalPathClaim {
+                raw_relative_path,
+                file_hash,
+            },
+        ];
+        claims.sort();
+        claims.dedup();
+        return Err(ScanError::SameRootNormalizedPathCollision {
+            root_name: root_name.to_owned(),
+            normalized_path,
+            claims,
+        });
+    }
     let file = ScannedFile {
         root_name: root_name.to_owned(),
         normalized_path: normalized_path.clone(),
@@ -1157,6 +1379,7 @@ fn observe_opened_file(
         modified_nanos: modified_nanos(&metadata),
         size: metadata.len(),
         content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+        raw_relative_path,
     };
     snapshot
         .files
@@ -1183,7 +1406,7 @@ fn observe_opened_file(
         let bundle = ScannedBundle {
             root_name: root_name.to_owned(),
             normalized_path: normalized_path.clone(),
-            file_hash: BundleFileHash::of_observed_bytes(&bytes),
+            file_hash,
             parsed,
             namespace_skeleton,
             bytes,
@@ -1197,7 +1420,7 @@ fn observe_opened_file(
 
 fn scan_logical_path(
     roots: &BTreeMap<String, CanonicalRoot>,
-    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
     root_name: &str,
     path: &str,
 ) -> Result<Option<ScanSnapshot>, ScanError> {
@@ -1211,40 +1434,98 @@ fn scan_logical_path(
             vec![PendingDirectory {
                 root_name: root_name.to_owned(),
                 physical_path: root.canonical_path.clone(),
-                directory: root.directory.clone(),
                 relative_components: Vec::new(),
                 ancestry: BTreeSet::new(),
+                path_chain: vec![root.canonical_path.clone()],
                 entry_guards: Vec::new(),
             }],
         )
         .map(Some);
     }
 
-    let components = validate_logical_path(path)?;
-    let mut directory = root.directory.clone();
+    let components = validate_logical_path(path)?
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let physical_components = components.iter().map(OsString::from).collect();
+    scan_path_components(
+        roots,
+        daemon_owned,
+        root_name,
+        components,
+        physical_components,
+    )
+}
+
+fn scan_event_path(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
+    root_name: &str,
+    normalized_path: &str,
+    event_path: &Path,
+) -> Result<Option<ScanSnapshot>, ScanError> {
+    let root = roots
+        .get(root_name)
+        .ok_or_else(|| ScanError::UnknownRoot(root_name.to_owned()))?;
+    let relative = event_path
+        .strip_prefix(&root.canonical_path)
+        .or_else(|_| event_path.strip_prefix(&root.configured.path))
+        .map_err(|_| ScanError::InvalidLogicalPath(event_path.to_string_lossy().into_owned()))?;
+    let physical_components = relative
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect::<Vec<_>>();
+    let logical_components = physical_components
+        .iter()
+        .map(|component| {
+            let physical = root.canonical_path.join(relative);
+            normalize_scanned_component(roots, root_name, &physical, component)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if logical_components.join("/") != normalized_path {
+        return Err(ScanError::InvalidLogicalPath(normalized_path.to_owned()));
+    }
+    if logical_components.is_empty() {
+        return scan_logical_path(roots, daemon_owned, root_name, normalized_path);
+    }
+    scan_path_components(
+        roots,
+        daemon_owned,
+        root_name,
+        logical_components,
+        physical_components,
+    )
+}
+
+fn scan_path_components(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
+    root_name: &str,
+    components: Vec<String>,
+    physical_components: Vec<OsString>,
+) -> Result<Option<ScanSnapshot>, ScanError> {
+    let root = roots
+        .get(root_name)
+        .ok_or_else(|| ScanError::UnknownRoot(root_name.to_owned()))?;
     let mut physical = root.canonical_path.clone();
     let mut relative = Vec::new();
     let mut entry_guards = Vec::new();
     let mut ancestry = BTreeSet::new();
-    let mut parent_identity = file_identity(&directory_metadata(&directory, &physical)?);
-    for (index, component) in components.iter().enumerate() {
-        physical.push(component);
-        relative.push((*component).to_owned());
-        let opened = match open_scanned_child(
-            &directory,
-            component.as_ref(),
-            &physical,
-            roots,
-            daemon_owned,
-        ) {
+    let mut parent_canonical_path = root.canonical_path.clone();
+    for (index, (component, physical_component)) in
+        components.iter().zip(&physical_components).enumerate()
+    {
+        physical.push(physical_component);
+        relative.push(component.clone());
+        let opened = match open_scanned_child(&physical, roots, daemon_owned) {
             Ok(opened) => opened,
             Err(ScanError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None)
             }
             Err(error) => return Err(error),
         };
-        let guard = EntryGuard::new(&directory, component.as_ref(), &physical, &opened);
-        let final_component = index + 1 == components.len();
+        let guard = EntryGuard::new(&physical, &opened);
+        let final_component = index + 1 == physical_components.len();
         if final_component && opened.metadata.is_file() {
             let mut snapshot = ScanSnapshot::default();
             observe_opened_file(
@@ -1277,20 +1558,22 @@ fn scan_logical_path(
             }
             return Ok(Some(snapshot));
         }
-        ancestry.insert(parent_identity);
-        parent_identity = file_identity(&opened.metadata);
+        ancestry.insert(parent_canonical_path);
+        parent_canonical_path = opened.canonical_path.clone();
         entry_guards.push(guard);
-        directory = DirectoryCapability::from_open_directory(opened.file, &physical);
+        drop(opened.file);
         if final_component {
+            let mut path_chain = vec![root.canonical_path.clone()];
+            path_chain.extend(entry_guards.iter().map(|guard| guard.display_path.clone()));
             return scan_pending(
                 roots,
                 daemon_owned,
                 vec![PendingDirectory {
                     root_name: root_name.to_owned(),
                     physical_path: physical,
-                    directory,
                     relative_components: relative,
                     ancestry,
+                    path_chain,
                     entry_guards,
                 }],
             )
@@ -1319,7 +1602,14 @@ fn event_key(
     };
     let components = relative
         .components()
-        .map(|component| normalize_component(component.as_os_str()))
+        .map(|component| {
+            normalize_scanned_component(
+                roots,
+                &root.configured.name,
+                event_path,
+                component.as_os_str(),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some((root.configured.name.clone(), components.join("/"))))
 }
@@ -1432,9 +1722,10 @@ fn validate_incremental_directory_aliases(
     affected: &[(String, String)],
     observed: &ScanSnapshot,
 ) -> Result<(), ScanError> {
-    for ((root, path), observation) in &observed.directory_identities {
-        let Some((first_root, first_path, first)) =
-            baseline.directory_by_identity.get(&observation.identity)
+    for ((root, path), observation) in &observed.directory_observations {
+        let Some((first_root, first_path, first)) = baseline
+            .directory_by_target
+            .get(&observation.canonical_path)
         else {
             continue;
         };
@@ -1451,9 +1742,46 @@ fn validate_incremental_directory_aliases(
                 first: first.clone(),
                 second_root: root.clone(),
                 second: observation.physical_path.clone(),
-                identity: observation.identity.into(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_incremental_physical_collisions(
+    baseline: &ScanSnapshot,
+    observed: &ScanSnapshot,
+) -> Result<(), ScanError> {
+    for (key, current) in &observed.files {
+        let Some(previous) = baseline
+            .files
+            .get(key)
+            .filter(|previous| previous.raw_relative_path != current.raw_relative_path)
+        else {
+            continue;
+        };
+        let (Some(previous_hash), Some(current_hash)) =
+            (previous.content_hash, current.content_hash)
+        else {
+            continue;
+        };
+        let mut claims = vec![
+            PhysicalPathClaim {
+                raw_relative_path: previous.raw_relative_path.clone(),
+                file_hash: BundleFileHash(previous_hash.0),
+            },
+            PhysicalPathClaim {
+                raw_relative_path: current.raw_relative_path.clone(),
+                file_hash: BundleFileHash(current_hash.0),
+            },
+        ];
+        claims.sort();
+        claims.dedup();
+        return Err(ScanError::SameRootNormalizedPathCollision {
+            root_name: key.0.clone(),
+            normalized_path: key.1.clone(),
+            claims,
+        });
     }
     Ok(())
 }
@@ -1467,22 +1795,31 @@ fn rebuild_reverse_indexes(snapshot: &mut ScanSnapshot) -> Result<(), ScanError>
             .or_default()
             .insert(root.clone());
     }
-    snapshot.directory_by_identity.clear();
-    for ((root, path), observed) in &snapshot.directory_identities {
-        if let Some((first_root, first_path, first)) = snapshot.directory_by_identity.insert(
-            observed.identity,
-            (root.clone(), path.clone(), observed.physical_path.clone()),
-        ) {
+    snapshot.directory_by_target.clear();
+    let mut alias_errors = Vec::new();
+    for ((root, path), observed) in &snapshot.directory_observations {
+        if let Some((first_root, first_path, first)) = snapshot
+            .directory_by_target
+            .get(&observed.canonical_path)
+            .cloned()
+        {
             if first_root != *root || first_path != *path {
-                return Err(ScanError::DirectoryAlias {
+                alias_errors.push(ScanError::DirectoryAlias {
                     first_root,
                     first,
                     second_root: root.clone(),
                     second: observed.physical_path.clone(),
-                    identity: observed.identity.into(),
                 });
             }
+        } else {
+            snapshot.directory_by_target.insert(
+                observed.canonical_path.clone(),
+                (root.clone(), path.clone(), observed.physical_path.clone()),
+            );
         }
+    }
+    if !alias_errors.is_empty() {
+        return Err(combine_scan_errors(alias_errors));
     }
     snapshot.aliases_by_target.clear();
     for (alias, target) in &snapshot.symlink_aliases {
@@ -1495,368 +1832,105 @@ fn rebuild_reverse_indexes(snapshot: &mut ScanSnapshot) -> Result<(), ScanError>
     Ok(())
 }
 
-impl DirectoryCapability {
-    fn open_root(path: &Path) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(path)?;
-            Ok(Self {
-                file: Arc::new(file),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {
-                path: path.to_path_buf(),
-            })
-        }
-    }
-
-    fn from_open_directory(file: File, _path: &Path) -> Self {
-        #[cfg(unix)]
-        {
-            Self {
-                file: Arc::new(file),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            drop(file);
-            Self {
-                path: _path.to_path_buf(),
-            }
-        }
-    }
+fn directory_metadata(path: &Path) -> Result<Metadata, ScanError> {
+    fs::metadata(path).map_err(|source| ScanError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
-fn directory_metadata(
-    directory: &DirectoryCapability,
-    display_path: &Path,
-) -> Result<Metadata, ScanError> {
-    #[cfg(unix)]
-    {
-        directory.file.metadata().map_err(|source| ScanError::Io {
-            path: display_path.to_path_buf(),
-            source,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        fs::metadata(&directory.path).map_err(|source| ScanError::Io {
-            path: display_path.to_path_buf(),
-            source,
-        })
-    }
-}
-
-#[cfg(unix)]
-fn read_directory_names(
-    directory: &DirectoryCapability,
-    display_path: &Path,
-) -> Result<Vec<OsString>, ScanError> {
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::ffi::OsStringExt;
-
-    struct Dir(*mut libc::DIR);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            // SAFETY: fdopendir returned this sole owned DIR pointer.
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-
-    // `dup` would share the retained descriptor's directory offset, causing
-    // later or concurrent scans to start wherever an earlier scan stopped.
-    // Opening `.` relative to the retained capability creates a fresh open
-    // file description for this enumeration without consulting a pathname.
-    let descriptor = open_at(directory, OsStr::new("."), false)
+fn read_directory_names(path: &Path) -> Result<Vec<OsString>, ScanError> {
+    fs::read_dir(path)
         .map_err(|source| ScanError::Io {
-            path: display_path.to_path_buf(),
-            source,
-        })?
-        .into_raw_fd();
-    // SAFETY: fdopendir consumes the independently owned descriptor.
-    let pointer = unsafe { libc::fdopendir(descriptor) };
-    if pointer.is_null() {
-        let source = std::io::Error::last_os_error();
-        // SAFETY: fdopendir did not consume the descriptor on failure.
-        unsafe { libc::close(descriptor) };
-        return Err(ScanError::Io {
-            path: display_path.to_path_buf(),
-            source,
-        });
-    }
-    let directory = Dir(pointer);
-    let mut names = Vec::new();
-    loop {
-        set_errno(0);
-        // SAFETY: the DIR remains live for this call; each returned entry is
-        // copied before the next readdir invocation.
-        let entry = unsafe { libc::readdir(directory.0) };
-        if entry.is_null() {
-            let error = errno();
-            if error != 0 {
-                return Err(ScanError::Io {
-                    path: display_path.to_path_buf(),
-                    source: std::io::Error::from_raw_os_error(error),
-                });
-            }
-            break;
-        }
-        // SAFETY: POSIX dirent names are NUL terminated within d_name.
-        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if bytes != b"." && bytes != b".." {
-            names.push(OsString::from_vec(bytes.to_vec()));
-        }
-    }
-    Ok(names)
-}
-
-#[cfg(not(unix))]
-fn read_directory_names(
-    directory: &DirectoryCapability,
-    display_path: &Path,
-) -> Result<Vec<std::ffi::OsString>, ScanError> {
-    fs::read_dir(&directory.path)
-        .map_err(|source| ScanError::Io {
-            path: display_path.to_path_buf(),
+            path: path.to_path_buf(),
             source,
         })?
         .map(|entry| {
             entry
                 .map(|entry| entry.file_name())
                 .map_err(|source| ScanError::Io {
-                    path: display_path.to_path_buf(),
+                    path: path.to_path_buf(),
                     source,
                 })
         })
         .collect()
 }
 
-#[cfg(unix)]
-fn set_errno(value: libc::c_int) {
-    // SAFETY: errno is thread-local and this function is used immediately
-    // around readdir on the same thread.
-    unsafe { *errno_pointer() = value };
-}
-
-#[cfg(unix)]
-fn errno() -> libc::c_int {
-    // SAFETY: errno_pointer returns this thread's live errno cell.
-    unsafe { *errno_pointer() }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-unsafe fn errno_pointer() -> *mut libc::c_int {
-    // SAFETY: delegated to the C runtime's thread-local errno accessor.
-    unsafe { libc::__errno_location() }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-unsafe fn errno_pointer() -> *mut libc::c_int {
-    // SAFETY: delegated to the C runtime's thread-local errno accessor.
-    unsafe { libc::__error() }
-}
-
-#[cfg(unix)]
-fn child_symlink_identity(
-    directory: &DirectoryCapability,
-    name: &OsStr,
-) -> std::io::Result<Option<FileIdentity>> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
-    // SAFETY: zeroed stat is an out parameter for fstatat; the directory
-    // descriptor and C string remain live for the call.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    let status = unsafe {
-        libc::fstatat(
-            directory.file.as_raw_fd(),
-            name.as_ptr(),
-            &mut stat,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if status != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(
-        ((stat.st_mode & libc::S_IFMT) == libc::S_IFLNK).then_some(FileIdentity::Unix {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
-        }),
-    )
-}
-
-#[cfg(unix)]
-fn open_at(directory: &DirectoryCapability, name: &OsStr, follow: bool) -> std::io::Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
-    if !follow {
-        flags |= libc::O_NOFOLLOW;
-    }
-    // SAFETY: openat receives a live directory descriptor and C string; on
-    // success the returned descriptor is transferred exactly once to File.
-    let descriptor = unsafe { libc::openat(directory.file.as_raw_fd(), name.as_ptr(), flags) };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(descriptor) })
-}
-
 fn open_scanned_child(
-    directory: &DirectoryCapability,
-    name: &std::ffi::OsStr,
     physical: &Path,
     roots: &BTreeMap<String, CanonicalRoot>,
-    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
 ) -> Result<OpenedChild, ScanError> {
-    #[cfg(unix)]
-    {
-        let symlink_identity =
-            child_symlink_identity(directory, name).map_err(|source| ScanError::Io {
-                path: physical.to_path_buf(),
-                source,
-            })?;
-        let is_symlink = symlink_identity.is_some();
-        let expected = if is_symlink {
-            let canonical = fs::canonicalize(physical).map_err(|source| ScanError::Io {
-                path: physical.to_path_buf(),
-                source,
-            })?;
-            let metadata = fs::metadata(&canonical).map_err(|source| ScanError::Io {
-                path: canonical.clone(),
-                source,
-            })?;
-            let retained = metadata
-                .is_dir()
-                .then(|| daemon_owned.get(&file_identity(&metadata)))
-                .flatten();
-            if retained.is_none()
-                && !roots
-                    .values()
-                    .any(|candidate| canonical.starts_with(&candidate.canonical_path))
-            {
-                return Err(ScanError::SymlinkEscape {
-                    path: physical.to_path_buf(),
-                    target: canonical,
-                });
-            }
-            Some(metadata)
-        } else {
-            None
-        };
-        let file = open_at(directory, name, is_symlink).map_err(|source| ScanError::Io {
+    let path = physical.to_path_buf();
+    let link_metadata = fs::symlink_metadata(&path).map_err(|source| ScanError::Io {
+        path: physical.to_path_buf(),
+        source,
+    })?;
+    let symlink_identity = link_metadata
+        .file_type()
+        .is_symlink()
+        .then(|| file_identity(&link_metadata));
+    let canonical_path = fs::canonicalize(&path).map_err(|source| ScanError::Io {
+        path: physical.to_path_buf(),
+        source,
+    })?;
+    let inside_root = roots
+        .values()
+        .any(|candidate| canonical_path.starts_with(&candidate.canonical_path));
+    if !inside_root && !daemon_owned.contains_key(&canonical_path) {
+        return Err(ScanError::SymlinkEscape {
             path: physical.to_path_buf(),
-            source,
-        })?;
-        let metadata = file.metadata().map_err(|source| ScanError::Io {
-            path: physical.to_path_buf(),
-            source,
-        })?;
-        let current_symlink_identity =
-            child_symlink_identity(directory, name).map_err(|source| ScanError::Io {
-                path: physical.to_path_buf(),
-                source,
-            })?;
-        if current_symlink_identity != symlink_identity
-            || expected.as_ref().is_some_and(|expected| {
-                file_identity(expected) != file_identity(&metadata)
-                    || expected.is_dir() != metadata.is_dir()
-                    || expected.is_file() != metadata.is_file()
-            })
-        {
-            return Err(ScanError::FileIdentityChanged {
-                path: physical.to_path_buf(),
-            });
-        }
-        Ok(OpenedChild {
-            file,
-            daemon_owned: metadata
-                .is_dir()
-                .then(|| daemon_owned.get(&file_identity(&metadata)).cloned())
-                .flatten(),
-            metadata,
-            symlink_identity,
-        })
+            target: canonical_path,
+        });
     }
-    #[cfg(not(unix))]
+    let expected = fs::metadata(&canonical_path).map_err(|source| ScanError::Io {
+        path: canonical_path.clone(),
+        source,
+    })?;
+    let file = File::open(&path).map_err(|source| ScanError::Io {
+        path: physical.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ScanError::Io {
+        path: physical.to_path_buf(),
+        source,
+    })?;
+    let identity = file_identity(&metadata);
+
+    let current_link = fs::symlink_metadata(&path).map_err(|source| ScanError::Io {
+        path: physical.to_path_buf(),
+        source,
+    })?;
+    let current_symlink_identity = current_link
+        .file_type()
+        .is_symlink()
+        .then(|| file_identity(&current_link));
+    let current_canonical = fs::canonicalize(&path).map_err(|source| ScanError::Io {
+        path: physical.to_path_buf(),
+        source,
+    })?;
+    if current_symlink_identity != symlink_identity
+        || current_canonical != canonical_path
+        || file_identity(&expected) != identity
+        || expected.is_dir() != metadata.is_dir()
+        || expected.is_file() != metadata.is_file()
     {
-        let link_metadata = fs::symlink_metadata(physical).map_err(|source| ScanError::Io {
+        return Err(ScanError::FileIdentityChanged {
             path: physical.to_path_buf(),
-            source,
-        })?;
-        let symlink_identity = link_metadata
-            .file_type()
-            .is_symlink()
-            .then(|| file_identity(&link_metadata));
-        let is_symlink = symlink_identity.is_some();
-        if is_symlink {
-            let canonical = fs::canonicalize(physical).map_err(|source| ScanError::Io {
-                path: physical.to_path_buf(),
-                source,
-            })?;
-            let metadata = fs::metadata(&canonical).map_err(|source| ScanError::Io {
-                path: canonical.clone(),
-                source,
-            })?;
-            let retained = metadata
-                .is_dir()
-                .then(|| daemon_owned.get(&file_identity(&metadata)))
-                .flatten();
-            if retained.is_none()
-                && !roots
-                    .values()
-                    .any(|candidate| canonical.starts_with(&candidate.canonical_path))
-            {
-                return Err(ScanError::SymlinkEscape {
-                    path: physical.to_path_buf(),
-                    target: canonical,
-                });
-            }
-        }
-        let file = File::open(physical).map_err(|source| ScanError::Io {
-            path: physical.to_path_buf(),
-            source,
-        })?;
-        let metadata = file.metadata().map_err(|source| ScanError::Io {
-            path: physical.to_path_buf(),
-            source,
-        })?;
-        let current_link_metadata =
-            fs::symlink_metadata(physical).map_err(|source| ScanError::Io {
-                path: physical.to_path_buf(),
-                source,
-            })?;
-        let current_symlink_identity = current_link_metadata
-            .file_type()
-            .is_symlink()
-            .then(|| file_identity(&current_link_metadata));
-        if current_symlink_identity != symlink_identity {
-            return Err(ScanError::FileIdentityChanged {
-                path: physical.to_path_buf(),
-            });
-        }
-        Ok(OpenedChild {
-            file,
-            daemon_owned: metadata
-                .is_dir()
-                .then(|| daemon_owned.get(&file_identity(&metadata)).cloned())
-                .flatten(),
-            metadata,
-            symlink_identity,
-        })
+        });
     }
+
+    Ok(OpenedChild {
+        file,
+        daemon_owned: metadata
+            .is_dir()
+            .then(|| daemon_owned.get(&canonical_path).cloned())
+            .flatten(),
+        metadata,
+        canonical_path,
+        identity,
+        symlink_identity,
+    })
 }
 
 fn record_daemon_owned_diagnostic(
@@ -1864,7 +1938,7 @@ fn record_daemon_owned_diagnostic(
     root_name: &str,
     relative_components: &[String],
     physical_path: &Path,
-    retained: &RetainedDaemonDirectory,
+    retained: &DaemonOwnedDirectory,
 ) {
     let normalized_path = relative_components.join("/");
     snapshot.diagnostics.insert(
@@ -1875,17 +1949,15 @@ fn record_daemon_owned_diagnostic(
             physical_path: physical_path.to_path_buf(),
             owned_path: retained.path.clone(),
             kind: retained.kind,
-            identity: retained.identity.into(),
         },
     );
 }
 
-fn daemon_owned_alias(path: &Path, retained: &RetainedDaemonDirectory) -> ScanError {
+fn daemon_owned_alias(path: &Path, retained: &DaemonOwnedDirectory) -> ScanError {
     ScanError::DaemonOwnedDirectoryAlias {
         path: path.to_path_buf(),
         owned_path: retained.path.clone(),
         kind: retained.kind,
-        identity: retained.identity.into(),
     }
 }
 
@@ -1897,17 +1969,10 @@ fn reject_daemon_owned_access(opened: &OpenedChild, path: &Path) -> Result<(), S
 }
 
 impl EntryGuard {
-    fn new(
-        parent: &DirectoryCapability,
-        name: &OsStr,
-        display_path: &Path,
-        opened: &OpenedChild,
-    ) -> Self {
+    fn new(display_path: &Path, opened: &OpenedChild) -> Self {
         Self {
-            parent: parent.clone(),
-            name: name.to_owned(),
             display_path: display_path.to_path_buf(),
-            target_identity: file_identity(&opened.metadata),
+            target_identity: opened.identity,
             symlink_identity: opened.symlink_identity,
         }
     }
@@ -1916,18 +1981,12 @@ impl EntryGuard {
 fn revalidate_entry_guards(
     guards: &[EntryGuard],
     roots: &BTreeMap<String, CanonicalRoot>,
-    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
+    daemon_owned: &BTreeMap<PathBuf, DaemonOwnedDirectory>,
 ) -> Result<(), ScanError> {
     for guard in guards {
-        let current = open_scanned_child(
-            &guard.parent,
-            &guard.name,
-            &guard.display_path,
-            roots,
-            daemon_owned,
-        )?;
+        let current = open_scanned_child(&guard.display_path, roots, daemon_owned)?;
         reject_daemon_owned_access(&current, &guard.display_path)?;
-        if file_identity(&current.metadata) != guard.target_identity
+        if current.identity != guard.target_identity
             || current.symlink_identity != guard.symlink_identity
         {
             return Err(ScanError::FileIdentityChanged {
@@ -1939,7 +1998,10 @@ fn revalidate_entry_guards(
 }
 
 fn read_opened_file(mut file: File, path: &Path, opened: &Metadata) -> Result<Vec<u8>, ScanError> {
-    let identity = file_identity(opened);
+    let identity = file_identity_from_file(&file, opened).map_err(|source| ScanError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let opened_modified = modified_nanos(opened);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -1951,7 +2013,10 @@ fn read_opened_file(mut file: File, path: &Path, opened: &Metadata) -> Result<Ve
         path: path.to_path_buf(),
         source,
     })?;
-    if file_identity(&after) != identity
+    if file_identity_from_file(&file, &after).map_err(|source| ScanError::Io {
+        path: path.to_path_buf(),
+        source,
+    })? != identity
         || opened.len() != bytes.len() as u64
         || after.len() != bytes.len() as u64
         || modified_nanos(&after) != opened_modified
@@ -1986,18 +2051,12 @@ fn canonicalize_roots(
                     path: root.path.clone(),
                 });
             }
-            let directory = DirectoryCapability::open_root(&canonical_path).map_err(|source| {
-                ScanError::Io {
-                    path: canonical_path.clone(),
-                    source,
-                }
-            })?;
-            Ok((root.clone(), canonical_path, directory))
+            Ok((root.clone(), canonical_path))
         })
         .collect::<Result<Vec<_>, ScanError>>()?;
 
     let mut roots = BTreeMap::new();
-    for (configured, canonical_path, directory) in canonical_paths {
+    for (configured, canonical_path) in canonical_paths {
         let name = configured.name.clone();
         if roots
             .insert(
@@ -2005,7 +2064,6 @@ fn canonicalize_roots(
                 CanonicalRoot {
                     configured,
                     canonical_path,
-                    directory,
                 },
             )
             .is_some()
@@ -2020,6 +2078,47 @@ fn canonicalize_roots(
 fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
     use std::os::unix::ffi::OsStrExt;
     distill_store::state::PlatformPathBytes::Unix(path.as_os_str().as_bytes().to_vec())
+}
+
+fn raw_relative_path(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    root_name: &str,
+    physical: &Path,
+) -> PlatformPathBytes {
+    let root = &roots[root_name];
+    let relative = physical
+        .strip_prefix(&root.canonical_path)
+        .or_else(|_| physical.strip_prefix(&root.configured.path))
+        .expect("scanner paths remain beneath their configured root");
+    platform_path_bytes(relative)
+}
+
+#[cfg(unix)]
+fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    match raw {
+        PlatformPathBytes::Unix(bytes) => Some(PathBuf::from(OsString::from_vec(bytes.clone()))),
+        PlatformPathBytes::Windows(_) => None,
+    }
+}
+
+#[cfg(windows)]
+fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    match raw {
+        PlatformPathBytes::Windows(units) => Some(PathBuf::from(OsString::from_wide(units))),
+        PlatformPathBytes::Unix(_) => None,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
+    match raw {
+        PlatformPathBytes::Unix(bytes) => {
+            Some(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        PlatformPathBytes::Windows(_) => None,
+    }
 }
 
 #[cfg(windows)]
@@ -2081,6 +2180,46 @@ fn normalize_component(component: &std::ffi::OsStr) -> Result<String, ScanError>
     Ok(normalized)
 }
 
+fn normalize_scanned_component(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    root_name: &str,
+    physical: &Path,
+    component: &OsStr,
+) -> Result<String, ScanError> {
+    normalize_component(component).map_err(|_| {
+        let failure = if component.to_str().is_none() {
+            #[cfg(unix)]
+            {
+                PhysicalPathFailureCode::InvalidUnixUtf8
+            }
+            #[cfg(windows)]
+            {
+                PhysicalPathFailureCode::UnpairedWindowsUtf16
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                PhysicalPathFailureCode::ForbiddenCharacter
+            }
+        } else {
+            let text = component.to_string_lossy();
+            if text.is_empty() {
+                PhysicalPathFailureCode::EmptyComponent
+            } else if text == "." {
+                PhysicalPathFailureCode::DotComponent
+            } else if text == ".." {
+                PhysicalPathFailureCode::ParentComponent
+            } else {
+                PhysicalPathFailureCode::ForbiddenCharacter
+            }
+        };
+        ScanError::InvalidPhysicalPath {
+            root_name: root_name.to_owned(),
+            raw_relative_path: raw_relative_path(roots, root_name, physical),
+            failure,
+        }
+    })
+}
+
 #[cfg(unix)]
 fn os_sort_key(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -2107,14 +2246,16 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
     }
 }
 
+fn file_identity_from_file(_file: &File, metadata: &Metadata) -> std::io::Result<FileIdentity> {
+    Ok(file_identity(metadata))
+}
+
 #[cfg(windows)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     use std::os::windows::fs::MetadataExt;
-    let mut file_id = [0u8; 16];
-    file_id[..8].copy_from_slice(&metadata.file_index().unwrap_or(0).to_le_bytes());
     FileIdentity::Windows {
         volume_serial: u64::from(metadata.volume_serial_number().unwrap_or(0)),
-        file_id,
+        file_index: metadata.file_index().unwrap_or(0),
     }
 }
 

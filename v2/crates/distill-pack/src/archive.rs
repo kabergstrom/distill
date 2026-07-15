@@ -72,6 +72,12 @@ pub(crate) struct ScannedArchive {
     pub objects: BTreeMap<EKey, ScannedObject>,
 }
 
+#[derive(Default)]
+struct EncodedObjectIndex {
+    locations: BTreeMap<EKey, ObjectLocation>,
+    kinds: BTreeMap<EKey, ArchiveObjectKind>,
+}
+
 #[derive(Debug)]
 pub enum ArchiveError {
     TooShort,
@@ -87,6 +93,7 @@ pub enum ArchiveError {
     EKey,
     Zstd(std::io::Error),
     DuplicateEKey,
+    CrossKindEKey(EKey),
     ExternalDictionary,
     MultipleFrames,
 }
@@ -112,7 +119,7 @@ pub fn encode_archive(
     out.extend_from_slice(&zstd_level.to_le_bytes());
 
     let mut encodings = BTreeMap::new();
-    let mut index = BTreeMap::new();
+    let mut objects = EncodedObjectIndex::default();
     let mut artifacts = artifacts.to_vec();
     artifacts.sort_by_key(|artifact| artifact.content_hash);
     for artifact in artifacts {
@@ -131,8 +138,8 @@ pub fn encode_archive(
                 ArchiveObjectKind::Structural,
                 raw.len() as u64,
                 &stored,
-                &mut index,
-            );
+                &mut objects,
+            )?;
         }
         for blob in artifact.blobs {
             let key = ekey(&blob);
@@ -144,8 +151,8 @@ pub fn encode_archive(
                 ArchiveObjectKind::Blob,
                 blob.len() as u64,
                 &blob,
-                &mut index,
-            );
+                &mut objects,
+            )?;
         }
         encodings.insert(artifact.content_hash, encoding);
     }
@@ -153,7 +160,7 @@ pub fn encode_archive(
     Ok(ArchiveBuild {
         bytes: out,
         encodings,
-        index,
+        index: objects.locations,
     })
 }
 
@@ -204,10 +211,13 @@ fn write_object(
     kind: ArchiveObjectKind,
     raw_len: u64,
     stored: &[u8],
-    index: &mut BTreeMap<EKey, ObjectLocation>,
-) {
-    if index.contains_key(&key) {
-        return;
+    objects: &mut EncodedObjectIndex,
+) -> Result<(), ArchiveError> {
+    if let Some(existing) = objects.kinds.get(&key) {
+        if *existing != kind {
+            return Err(ArchiveError::CrossKindEKey(key));
+        }
+        return Ok(());
     }
     out.push(match kind {
         ArchiveObjectKind::Structural => 0x01,
@@ -222,7 +232,7 @@ fn write_object(
     out.extend_from_slice(stored);
     let len = stored.len() as u64;
     pad16(out);
-    index.insert(
+    objects.locations.insert(
         key,
         ObjectLocation {
             generation,
@@ -230,6 +240,8 @@ fn write_object(
             len,
         },
     );
+    objects.kinds.insert(key, kind);
+    Ok(())
 }
 
 pub fn validate_archive(bytes: &[u8]) -> Result<(), ArchiveError> {
@@ -401,5 +413,23 @@ mod tests {
             decode_structural(&missing_size, raw.len() as u64),
             Err(ArchiveError::BadLength)
         ));
+    }
+
+    #[test]
+    fn encoder_rejects_one_ekey_used_as_both_structural_and_blob() {
+        let structural = b"structural payload".to_vec();
+        let frame = encode_structural(&structural, 3).unwrap();
+        let error = encode_archive(
+            0,
+            "test",
+            3,
+            &[ArtifactPayload {
+                content_hash: ContentHash([1; 32]),
+                structural,
+                blobs: vec![frame.clone()],
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ArchiveError::CrossKindEKey(key) if key == ekey(&frame)));
     }
 }

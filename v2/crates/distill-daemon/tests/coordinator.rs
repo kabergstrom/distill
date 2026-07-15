@@ -11,8 +11,8 @@ use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
-    AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest, Delta, DoctorRequest,
-    LongRunningOp, MetadataCall, MetadataNamespaceCall, PreparedOperationPublication, StreamEvent,
+    AuthoringProgressState, AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest,
+    Delta, DoctorRequest, LongRunningOp, MetadataCall, MetadataNamespaceCall, StreamEvent,
     TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
@@ -506,6 +506,60 @@ fn incremental_scan_poison_heals_when_observation_returns_to_last_good() {
 
 #[cfg(unix)]
 #[test]
+fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    assert_eq!(
+        coordinator.reconcile_full_scan().unwrap().version,
+        InputVersion(1)
+    );
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    let link = temp.path().join("assets/escape");
+    symlink(&outside, &link).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![link.clone()],
+            renames: Vec::new(),
+        })
+        .unwrap();
+
+    let unrelated = temp.path().join("assets/unrelated.txt");
+    std::fs::write(&unrelated, b"new observation").unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![unrelated],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert!(coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .version_poison()
+        .unwrap()
+        .is_some());
+
+    std::fs::remove_file(&link).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![link],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert!(coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .version_poison()
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn directory_alias_publishes_configuration_poison_without_aborting_the_version() {
     use std::os::unix::fs::symlink;
 
@@ -529,7 +583,7 @@ fn directory_alias_publishes_configuration_poison_without_aborting_the_version()
 
 #[cfg(unix)]
 #[test]
-fn retained_daemon_state_alias_is_diagnosed_and_never_scanned() {
+fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -596,16 +650,39 @@ fn retained_daemon_state_alias_is_diagnosed_and_never_scanned() {
     assert_eq!(coordinator.server().current_stamp().version, version);
 
     let base = coordinator.server().current_stamp().version;
-    let prepared = coordinator
-        .authoring_service()
-        .prepare_operation(base, &LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
-        .unwrap();
-    let PreparedOperationPublication::Deferred(operation) = prepared.publication else {
-        panic!("doctor verify must be deferred")
+    let hub = match coordinator
+        .server()
+        .root()
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+    {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        outcome => panic!("target connection failed: {outcome:?}"),
     };
-    let completed = operation.complete(base).unwrap();
-    assert!(completed
-        .terminal_error
-        .as_deref()
-        .is_some_and(|error| error.contains("daemon-owned-directory-alias")));
+    let mut cancelled = hub
+        .operation(base, LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
+        .success()
+        .unwrap();
+    assert_eq!(
+        cancelled.next().unwrap().state,
+        AuthoringProgressState::Started
+    );
+    assert!(cancelled.cancel());
+    assert_eq!(
+        cancelled.next().unwrap().state,
+        AuthoringProgressState::Cancelled
+    );
+    assert_eq!(coordinator.server().current_stamp().version, base);
+
+    let events = hub
+        .operation(base, LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
+        .success()
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].state, AuthoringProgressState::Started);
+    assert_eq!(events[1].state, AuthoringProgressState::Running);
+    assert_eq!(events[2].state, AuthoringProgressState::Failed);
+    assert!(std::str::from_utf8(&events[2].payload)
+        .unwrap()
+        .contains("daemon-owned-directory-alias"));
 }

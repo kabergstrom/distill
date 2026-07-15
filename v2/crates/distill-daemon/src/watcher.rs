@@ -354,7 +354,13 @@ impl WatcherThread {
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<Event>| match result {
                 Ok(event) => ingest_native(&callback_queue, &callback_coverage, event),
-                Err(_) => lock_queue(&callback_queue).force_rescan(),
+                // notify represents incomplete event delivery with an explicit
+                // Rescan flag on an Event.  Callback errors instead mean the
+                // backend can no longer prove coverage (watch loss, resource
+                // exhaustion, or I/O failure); a root scan cannot repair that
+                // native subscription.
+                Err(error) => lock_queue(&callback_queue)
+                    .fail(format!("native watcher coverage failed: {error}")),
             },
             Config::default().with_follow_symlinks(false),
         )?;

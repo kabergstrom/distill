@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_loader::{
-    AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, IoBasis, ManifestHash,
-    MemberFailure,
+    load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, IoBasis,
+    ManifestHash, MemberFailure,
 };
 
 fn id(n: u8) -> AssetUuid {
@@ -156,4 +156,26 @@ fn component_discovery_is_stack_safe_for_deep_closures() {
     assert!(
         matches!(&decisions[0], AdoptionDecision::Ready { members, .. } if members.len() == 20_000)
     );
+}
+
+#[test]
+fn load_cycle_reports_the_complete_path_and_is_stack_safe() {
+    let graph = BTreeMap::from([
+        (id(1), vec![id(2)]),
+        (id(2), vec![id(3)]),
+        (id(3), vec![id(1)]),
+    ]);
+    assert_eq!(load_cycles(&graph), vec![vec![id(1), id(2), id(3), id(1)]]);
+
+    let deep = (0..20_000u32)
+        .map(|index| {
+            let node = AssetUuid((index as u128).to_le_bytes());
+            let dependencies = (index + 1 < 20_000)
+                .then(|| AssetUuid(((index + 1) as u128).to_le_bytes()))
+                .into_iter()
+                .collect();
+            (node, dependencies)
+        })
+        .collect();
+    assert!(load_cycles(&deep).is_empty());
 }

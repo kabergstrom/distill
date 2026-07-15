@@ -24,7 +24,8 @@ use distill_wire::native::validate_native_descriptor;
 use distill_wire::plan::{compile_plans, CompiledPlans, PlanId};
 
 use crate::component::{
-    AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, MemberFailure,
+    load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
+    MemberFailure,
 };
 use crate::io::{
     FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ResolveResult,
@@ -100,6 +101,9 @@ pub enum LoaderDiagnostic {
     ComponentPoisoned {
         members: Vec<AssetUuid>,
         failures: Vec<(AssetUuid, MemberFailure)>,
+    },
+    LoadCycle {
+        cycle: Vec<AssetUuid>,
     },
     Storage {
         handle: HandleId,
@@ -1678,6 +1682,37 @@ impl<I: LoaderIO> Loader<I> {
         let held = self.held_uuids();
         let current = self.current_graph();
         let candidates = sweep
+            .candidates
+            .iter()
+            .map(|(uuid, candidate)| {
+                (
+                    *uuid,
+                    CandidateAsset {
+                        uuid: *uuid,
+                        basis: candidate.basis.clone(),
+                        load_deps: self.candidate_deps(candidate),
+                        outcome: self.candidate_outcome(*uuid, candidate),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let graph = candidates
+            .iter()
+            .map(|(uuid, candidate)| (*uuid, candidate.load_deps.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let cycles = load_cycles(&graph);
+        for cycle in cycles {
+            let failed = cycle[0];
+            self.fail_placeholder_candidate(
+                failed,
+                format!("strong-reference load cycle: {cycle:?}"),
+            );
+            self.diagnostics.push(LoaderDiagnostic::LoadCycle { cycle });
+        }
+        let candidates = self
+            .sweep
+            .as_ref()
+            .expect("cycle rejection retains the sweep")
             .candidates
             .iter()
             .map(|(uuid, candidate)| {

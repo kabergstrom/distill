@@ -501,6 +501,34 @@ fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
 }
 
 #[test]
+fn strong_reference_cycle_is_rejected_before_any_member_is_adopted() {
+    let token = ModuleEpochToken::new(40);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 40, &token);
+    let a_uuid = uuid(40);
+    let b_uuid = uuid(41);
+    let _a = loader.add_ref::<A>(a_uuid).unwrap();
+    let _b = loader.add_ref::<B>(b_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (a_hash, a_artifact) = artifact_with_edges::<A>(a_uuid, &[(b_uuid, B::TYPE_UUID)]);
+    let (b_hash, b_artifact) = artifact_with_edges::<B>(b_uuid, &[(a_uuid, A::TYPE_UUID)]);
+    resolve(&mut loader, a_uuid, a_hash);
+    resolve(&mut loader, b_uuid, b_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, a_hash, a_artifact);
+    fetched(&mut loader, b_hash, b_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert!(storage.updates.is_empty());
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::LoadCycle { cycle } if cycle == &vec![a_uuid, b_uuid, a_uuid]
+    )));
+}
+
+#[test]
 fn malformed_fetch_terminally_fails_its_candidate() {
     let token = ModuleEpochToken::new(31);
     let mut loader = Loader::new(mock_io());

@@ -59,10 +59,14 @@ impl BuildBackend for TypePolicyBackend {
 }
 
 fn fixture() -> Fixture {
-    fixture_with_policy(false)
+    fixture_with_policy_and_cycle(false, false)
 }
 
 fn fixture_with_policy(build_only: bool) -> Fixture {
+    fixture_with_policy_and_cycle(build_only, false)
+}
+
+fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
     let runtime_type = TypeUuid([21; 16]);
     let logical_hash = LogicalHash([31; 32]);
     let target_definition = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
@@ -82,7 +86,13 @@ fn fixture_with_policy(build_only: bool) -> Fixture {
         runtime_type,
         logical_hash,
         layout_hash,
-        Vec::new(),
+        cycle
+            .then_some(ServedLoadEdge {
+                asset: root,
+                expected_terminal: runtime_type,
+            })
+            .into_iter()
+            .collect(),
         Some(Arc::from(&b""[..])),
     );
     let root_row = artifact_row(
@@ -443,5 +453,24 @@ fn build_pack_rejects_build_only_terminal_types_from_the_pinned_policy() {
         ),
         Err(PackBuildError::BuildOnlyType { type_uuid })
             if type_uuid == TypeUuid([21; 16])
+    ));
+}
+
+#[test]
+fn build_pack_rejects_a_strong_reference_cycle_with_the_complete_path() {
+    let fixture = fixture_with_policy_and_cycle(false, true);
+    assert!(matches!(
+        build_pack(
+            &definition(fixture.root),
+            &PackBuildTarget {
+                name: "dev".into(),
+                definition_hash: TARGET_HASH,
+            },
+            "zstd-test",
+            &fixture.snapshot,
+            &fixture.hub,
+        ),
+        Err(PackBuildError::LoadCycle { cycle })
+            if cycle == vec![fixture.root, fixture.child, fixture.root]
     ));
 }

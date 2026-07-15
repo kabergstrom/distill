@@ -138,7 +138,7 @@ fn admitted_replacement_uses_the_portable_no_replace_state_machine() {
 }
 
 #[test]
-fn codegen_group_recovery_requires_retained_output_authority() {
+fn codegen_group_recovery_requires_validated_output_filesystem() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let output = temp.path().join("generated");

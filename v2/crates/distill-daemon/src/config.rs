@@ -624,16 +624,24 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
         }
     }
 
-    let scheduler = StoreConfig {
-        state_path: PathBuf::new(),
-        displaced_retention_days: raw.daemon.displaced_retention_days,
-        segment_size: 1,
-        cache_limit: 1,
-        parallelism: raw.pipeline.parallelism,
-        batch_reserved_workers: raw.pipeline.batch_reserved_workers,
-    };
-    if let Err(error) = scheduler.validate_scheduler() {
-        errors.push(DaemonConfigError::Scheduler(error));
+    // Staged validation is deliberately exhaustive.  The sealed StoreConfig
+    // API remains first-error, but configuration authority must retain every
+    // independently observable scheduler defect before canonical selection.
+    if raw.pipeline.parallelism == 0 {
+        errors.push(DaemonConfigError::Scheduler(
+            ConfigValidationError::ParallelismZero,
+        ));
+    }
+    let reservation_max = raw.pipeline.parallelism.saturating_sub(1).max(1);
+    if raw.pipeline.batch_reserved_workers == 0
+        || raw.pipeline.batch_reserved_workers > reservation_max
+    {
+        errors.push(DaemonConfigError::Scheduler(
+            ConfigValidationError::BatchReservationOutOfBounds {
+                got: raw.pipeline.batch_reserved_workers,
+                max: reservation_max,
+            },
+        ));
     }
     if !(1..=MAX_DEPENDENCY_DEPTH).contains(&raw.pipeline.max_dependency_depth) {
         errors.push(DaemonConfigError::Target(format!(
@@ -968,4 +976,70 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, DaemonConfigError> {
 
 fn nested_either_way(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_validation_retains_both_independent_scheduler_defects() {
+        let temp = tempfile::tempdir().unwrap();
+        let assets = temp.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let raw = RawConfig {
+            daemon: RawDaemon {
+                address: "127.0.0.1:0".to_owned(),
+                state_path: temp.path().join("state"),
+                displaced_retention_days: 7,
+            },
+            assets: RawAssets {
+                roots: BTreeMap::from([("main".to_owned(), assets)]),
+                schema_path: temp.path().join("schema.json"),
+                lineage_manifest: RawLineageDestination {
+                    root: "main".to_owned(),
+                    path: "schema/lineage.bundle".to_owned(),
+                },
+            },
+            modules: RawModules {
+                pipeline_dylib: temp.path().join("pipeline.so"),
+            },
+            targets: BTreeMap::from([(
+                "dev".to_owned(),
+                RawTarget {
+                    os: RawTargetOs::Macos,
+                    arch: RawTargetArch::Aarch64,
+                    apis: BTreeSet::from(["vulkan".to_owned()]),
+                    optimize: false,
+                    debug_info: true,
+                },
+            )]),
+            codegen: RawCodegen {
+                rs_mod_path: temp.path().join("generated"),
+                auto_codegen: false,
+            },
+            pipeline: RawPipeline {
+                parallelism: 0,
+                max_dependency_depth: 32,
+                batch_reserved_workers: 0,
+            },
+            cas: RawCas {
+                segment_size: "1MiB".to_owned(),
+                cache_limit: "8MiB".to_owned(),
+            },
+        };
+
+        let errors = validate_raw_candidate(&raw, temp.path());
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            DaemonConfigError::Scheduler(ConfigValidationError::ParallelismZero)
+        )));
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            DaemonConfigError::Scheduler(ConfigValidationError::BatchReservationOutOfBounds {
+                got: 0,
+                ..
+            })
+        )));
+    }
 }

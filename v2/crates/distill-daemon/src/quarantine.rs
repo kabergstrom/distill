@@ -215,16 +215,15 @@ impl QuarantineDriver {
         let mut outcomes = Vec::new();
         for intent in intents {
             let target = PathBuf::from(&intent.target_path);
-            let descriptor_relative = codegen_children.contains(&intent.intent_id);
-            if descriptor_relative && filesystem.is_none() {
+            let codegen_owned = codegen_children.contains(&intent.intent_id);
+            if codegen_owned && filesystem.is_none() {
                 return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
                     intent_id: intent.intent_id,
-                    detail: "codegen recovery requires its retained output-directory authority"
-                        .into(),
+                    detail: "codegen recovery requires its validated output filesystem".into(),
                 })));
             }
             if intent.pre_image_hash.is_none() {
-                let outcome = if descriptor_relative {
+                let outcome = if codegen_owned {
                     store.reconcile_journaled_creation_with_filesystem(
                         intent.intent_id,
                         filesystem.as_deref_mut().expect("checked above"),
@@ -253,7 +252,7 @@ impl QuarantineDriver {
                     })?
             };
             if intent.temp_path.is_empty() {
-                let outcome = if descriptor_relative {
+                let outcome = if codegen_owned {
                     store.reconcile_journaled_deletion_with_filesystem(
                         intent.intent_id,
                         quarantine,
@@ -264,7 +263,7 @@ impl QuarantineDriver {
                 };
                 outcomes.push((intent.intent_id, RecoveryOutcome::Deletion(outcome)));
             } else {
-                let outcome = if descriptor_relative {
+                let outcome = if codegen_owned {
                     store.publish_journaled_replacement_with_filesystem(
                         intent.intent_id,
                         quarantine,
@@ -312,8 +311,8 @@ impl QuarantineDriver {
         })
     }
 
-    /// Reconcile and publish codegen groups through the retained output
-    /// directory instead of reopening their journaled absolute pathnames.
+    /// Reconcile and publish codegen groups through the output filesystem,
+    /// which revalidates the configured canonical workspace before mutation.
     pub fn admit_codegen_publication<'a>(
         &'a self,
         store: &'a mut Store,

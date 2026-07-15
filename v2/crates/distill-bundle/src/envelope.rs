@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::bootstrap::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS,
-    IMPORT_RECORD_TYPE_UUID,
+    IMPORT_RECORD_TYPE_UUID, MIGRATION_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_core::lineage::{
@@ -147,6 +147,24 @@ pub(crate) fn inject_missing_schemas(
         };
         if !existing.contains(&hash.to_string()) {
             missing.entry(hash).or_insert_with(|| local_id.clone());
+        }
+        let is_migration = fields.get("type_uuid").and_then(|value| match value {
+            AuthoredValue::Str(value) => value.parse::<TypeUuid>().ok(),
+            _ => None,
+        }) == Some(MIGRATION_TYPE_UUID);
+        if !is_migration {
+            continue;
+        }
+        let Some(AuthoredValue::Object(data)) = fields.get("data") else {
+            continue;
+        };
+        for field in ["from_hash", "to_hash"] {
+            let Some(hash) = data.get(field).and_then(logical_hash_from_byte_array) else {
+                continue;
+            };
+            if !existing.contains(&hash.to_string()) {
+                missing.entry(hash).or_insert_with(|| local_id.clone());
+            }
         }
     }
     if missing.is_empty() {
@@ -345,13 +363,16 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         );
     }
 
-    // Schema-closure (§6): every referenced hash resolves within the file.
+    // Schema-closure (§6, §11): every entry schema and both endpoints of a
+    // closed MigrationV1 control resolve within the file.
     for (local_id, entry) in &assets {
-        if !schemas.contains_key(&entry.schema_hash) {
-            return Err(BundleError::MissingSchema {
-                local_id: local_id.clone(),
-                schema_hash: entry.schema_hash,
-            });
+        for schema_hash in schema_references(entry) {
+            if !schemas.contains_key(&schema_hash) {
+                return Err(BundleError::MissingSchema {
+                    local_id: local_id.clone(),
+                    schema_hash,
+                });
+            }
         }
         let schema = &schemas[&entry.schema_hash];
         validate_entry_lineage(local_id, format_version, entry, schema)?;
@@ -373,6 +394,42 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         schemas,
         assets,
     })
+}
+
+/// Exact schema hashes named by a bundle entry. Malformed Migration data is
+/// left to the bootstrap schema walk and closed decoder; well-shaped endpoint
+/// hashes participate in bundle closure even before daemon migration planning.
+pub(crate) fn schema_references(entry: &AssetEntry) -> Vec<LogicalHash> {
+    let mut hashes = vec![entry.schema_hash];
+    if entry.type_uuid == MIGRATION_TYPE_UUID {
+        if let AuthoredValue::Object(data) = &entry.data {
+            for field in ["from_hash", "to_hash"] {
+                if let Some(hash) = data.get(field).and_then(logical_hash_from_byte_array) {
+                    if !hashes.contains(&hash) {
+                        hashes.push(hash);
+                    }
+                }
+            }
+        }
+    }
+    hashes
+}
+
+fn logical_hash_from_byte_array(value: &AuthoredValue) -> Option<LogicalHash> {
+    let AuthoredValue::Array(values) = value else {
+        return None;
+    };
+    if values.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (output, value) in bytes.iter_mut().zip(values) {
+        let AuthoredValue::UInt(value) = value else {
+            return None;
+        };
+        *output = u8::try_from(*value).ok()?;
+    }
+    Some(LogicalHash(bytes))
 }
 
 /// The reserved `$` namespace (§6): only `$settings` and `$record`, at

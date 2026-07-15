@@ -151,6 +151,15 @@ impl ArtifactLeaseBackend for RecordingArtifactLeases {
     fn release_lease(&self, _holder: u64) {
         self.events.lock().unwrap().push("release");
     }
+
+    fn pin_pack_session(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
+        self.events.lock().unwrap().push("pack-pin");
+        Ok(())
+    }
+
+    fn release_pack_session(&self, _holder: u64) {
+        self.events.lock().unwrap().push("pack-release");
+    }
 }
 
 impl BuildBackend for DepthLimitedBuildBackend {
@@ -251,6 +260,73 @@ fn resolve_pins_before_build_release_and_snapshot_clones_share_one_lease() {
             .count(),
         1,
         "expiry and final drop release a shared lease only once"
+    );
+}
+
+#[test]
+fn pack_session_is_single_renewable_and_releases_its_distinct_pin_scope() {
+    let server = server_with(&[]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
+        events: Arc::clone(&events),
+    }));
+    server
+        .install_lease_policy(LeasePolicy {
+            ttl: Duration::from_millis(80),
+            max_snapshot_leases: 8,
+            max_connections: 8,
+        })
+        .unwrap();
+    let snapshot = snapshot(&connect(&server, &[]));
+    let session = snapshot.open_pack_session().success().unwrap();
+    assert!(matches!(
+        snapshot.open_pack_session(),
+        RpcResult::Failure(RpcFailure::ResourceLimit {
+            resource,
+            limit: 1
+        }) if resource == "pack sessions per snapshot"
+    ));
+    assert_eq!(session.pin(&[[7; 32]]), RpcResult::Success(()));
+
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(45));
+        assert_eq!(session.keep_alive(), RpcResult::Success(()));
+    }
+    assert_eq!(snapshot.version(), RpcResult::Success(InputVersion(0)));
+    drop(session);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "pack-release")
+            .count(),
+        1
+    );
+
+    let session = snapshot.open_pack_session().success().unwrap();
+    assert_eq!(session.pin(&[[8; 32]]), RpcResult::Success(()));
+    snapshot.expire_lease();
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "pack-release")
+            .count(),
+        2,
+        "snapshot expiry must clean up an abandoned pack-session pin"
+    );
+    drop(session);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "pack-release")
+            .count(),
+        2,
+        "scope drop after lease expiry must not release twice"
     );
 }
 
@@ -2064,6 +2140,45 @@ fn repeated_subscribe_unions_names_on_one_stream_and_unsubscribe_removes_them() 
         first_install.deltas.next(),
         Some(StreamEvent::Delta(Delta { assets, .. }))
             if assets == vec![(second, AssetDeltaState::Restored)]
+    ));
+}
+
+#[test]
+fn subscription_asset_and_path_sets_have_typed_cardinality_limits() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let assets = (0..MAX_SUBSCRIBED_ASSETS)
+        .map(|index| AssetUuid((index as u128).to_le_bytes()))
+        .collect();
+    assert!(matches!(
+        hub.subscribe(InputVersion(0), assets, Vec::new()),
+        RpcResult::Success(_)
+    ));
+    assert!(matches!(
+        hub.subscribe(
+            InputVersion(0),
+            vec![AssetUuid((MAX_SUBSCRIBED_ASSETS as u128).to_le_bytes())],
+            Vec::new(),
+        ),
+        RpcResult::Failure(RpcFailure::ResourceLimit { resource, limit })
+            if resource == "subscribed assets" && limit == MAX_SUBSCRIBED_ASSETS
+    ));
+
+    let paths = (0..MAX_SUBSCRIBED_PATHS)
+        .map(|index| format!("bounded/path-{index}"))
+        .collect();
+    assert!(matches!(
+        hub.subscribe(InputVersion(0), Vec::new(), paths),
+        RpcResult::Success(_)
+    ));
+    assert!(matches!(
+        hub.subscribe(
+            InputVersion(0),
+            Vec::new(),
+            vec!["bounded/overflow".to_owned()],
+        ),
+        RpcResult::Failure(RpcFailure::ResourceLimit { resource, limit })
+            if resource == "subscribed paths" && limit == MAX_SUBSCRIBED_PATHS
     ));
 }
 
