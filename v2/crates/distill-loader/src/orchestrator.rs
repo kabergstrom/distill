@@ -29,7 +29,7 @@ use crate::component::{
 };
 use crate::io::{
     FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ResolveResult,
-    RuntimeAttestation,
+    RuntimeTarget,
 };
 use crate::runtime::{
     AdoptionId, CompletionDisposition, HandleId, ManifestEntry, ManifestState, OutstandingPurpose,
@@ -52,9 +52,9 @@ pub enum LoadStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReattestationState {
+pub enum TargetBindingState {
     Required,
-    Attested,
+    Bound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +63,6 @@ pub enum RegistrationError {
     DuplicatePlaceholder(TypeUuid),
     PlaceholderTypeMismatch,
     InvalidDescriptor { type_uuid: TypeUuid, detail: String },
-    Attestation(crate::RuntimeAttestationError),
     Epoch(RuntimeEpochError),
 }
 
@@ -249,6 +248,7 @@ struct CandidateRecord {
     basis: IoBasis,
     resolve_issued: bool,
     expected_terminal_types: BTreeSet<TypeUuid>,
+    load_expectations: PlaceholderReferences,
     terminal: CandidateTerminal,
 }
 
@@ -311,8 +311,8 @@ pub struct Loader<I: LoaderIO> {
     diagnostics: Vec<LoaderDiagnostic>,
     next_handle: u64,
     next_adoption: u64,
-    attestation: ReattestationState,
-    registered_attestation: Option<RuntimeAttestation>,
+    target_binding: TargetBindingState,
+    registered_target: Option<RuntimeTarget>,
     draining: BTreeSet<GameModuleEpoch>,
 }
 
@@ -337,8 +337,8 @@ impl<I: LoaderIO> Loader<I> {
             diagnostics: Vec::new(),
             next_handle: 1,
             next_adoption: 1,
-            attestation: ReattestationState::Required,
-            registered_attestation: None,
+            target_binding: TargetBindingState::Required,
+            registered_target: None,
             draining: BTreeSet::new(),
         }
     }
@@ -351,8 +351,8 @@ impl<I: LoaderIO> Loader<I> {
         &mut self.io
     }
 
-    pub fn reattestation_state(&self) -> ReattestationState {
-        self.attestation
+    pub fn target_binding_state(&self) -> TargetBindingState {
+        self.target_binding
     }
 
     pub fn register_types(
@@ -392,9 +392,6 @@ impl<I: LoaderIO> Loader<I> {
                 detail: error.to_string(),
             })?;
         }
-        let attestation =
-            RuntimeAttestation::from_descriptors(epoch, target_definition_hash, descriptors)
-                .map_err(RegistrationError::Attestation)?;
         self.epochs
             .register(epoch, token.clone(), descriptors.len())
             .map_err(RegistrationError::Epoch)?;
@@ -408,8 +405,8 @@ impl<I: LoaderIO> Loader<I> {
                 },
             );
         }
-        self.registered_attestation = Some(attestation);
-        self.block_for_reattest();
+        self.registered_target = Some(RuntimeTarget::new(epoch, target_definition_hash));
+        self.block_for_target_binding();
         Ok(())
     }
 
@@ -637,7 +634,7 @@ impl<I: LoaderIO> Loader<I> {
             self.handle_event(event, storage)?;
         }
         self.drain_epochs(storage)?;
-        if self.attestation == ReattestationState::Required {
+        if self.target_binding == TargetBindingState::Required {
             return Ok(());
         }
         self.ensure_sweep()?;
@@ -672,7 +669,7 @@ impl<I: LoaderIO> Loader<I> {
         self.draining.insert(epoch);
         self.descriptors.retain(|_, record| record.epoch != epoch);
         self.placeholders.retain(|_, record| record.epoch != epoch);
-        self.block_for_reattest();
+        self.block_for_target_binding();
         Ok(())
     }
 
@@ -760,12 +757,12 @@ impl<I: LoaderIO> Loader<I> {
         Ok((id, lease))
     }
 
-    fn block_for_reattest(&mut self) {
-        self.attestation = ReattestationState::Required;
+    fn block_for_target_binding(&mut self) {
+        self.target_binding = TargetBindingState::Required;
         let _ = self.requests.reconnect();
         self.abandon_sweep();
-        if let Some(attestation) = self.registered_attestation.clone() {
-            self.io.reattest(attestation);
+        if let Some(target) = self.registered_target.clone() {
+            self.io.bind_target(target);
         }
     }
 
@@ -897,18 +894,6 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let basis = self.io.begin_sweep();
-        let descriptors = self
-            .descriptors
-            .values()
-            .map(|record| record.descriptor)
-            .collect::<Vec<_>>();
-        if let Err(error) = basis.load_policy().verify_descriptors(&descriptors) {
-            self.diagnostics.push(LoaderDiagnostic::Io(format!(
-                "load-policy attestation: {error:?}"
-            )));
-            self.block_for_reattest();
-            return Ok(());
-        }
         let mut candidates = BTreeMap::new();
         for uuid in self.held_uuids() {
             candidates.insert(
@@ -917,6 +902,7 @@ impl<I: LoaderIO> Loader<I> {
                     basis: basis.clone(),
                     resolve_issued: false,
                     expected_terminal_types: BTreeSet::new(),
+                    load_expectations: PlaceholderReferences::new(),
                     terminal: CandidateTerminal::Pending,
                 },
             );
@@ -1026,31 +1012,21 @@ impl<I: LoaderIO> Loader<I> {
                 self.detach_indirect_slots(storage, Some(&paths));
                 self.dirty.extend(self.held_uuids());
                 self.dirty_paths.extend(paths);
-                self.block_for_reattest();
+                self.block_for_target_binding();
             }
-            IoEvent::Reattested { attestation, basis } => {
-                if self.registered_attestation.as_ref() != Some(&attestation) {
+            IoEvent::TargetBound { target, basis: _ } => {
+                if self.registered_target.as_ref() != Some(&target) {
                     self.diagnostics.push(LoaderDiagnostic::Io(format!(
-                        "ignored stale runtime reattestation for epoch {:?}",
-                        attestation.epoch
+                        "ignored stale runtime target binding for epoch {:?}",
+                        target.epoch
                     )));
                     return Ok(());
                 }
-                let descriptors = self
-                    .descriptors
-                    .values()
-                    .map(|record| record.descriptor)
-                    .collect::<Vec<_>>();
-                match basis.load_policy().verify_descriptors(&descriptors) {
-                    Ok(()) => self.attestation = ReattestationState::Attested,
-                    Err(error) => self.diagnostics.push(LoaderDiagnostic::Io(format!(
-                        "reattested load-policy projection: {error:?}"
-                    ))),
-                }
+                self.target_binding = TargetBindingState::Bound;
             }
-            IoEvent::ReattestationFailed { message } => {
+            IoEvent::TargetRejected { message } => {
                 self.diagnostics.push(LoaderDiagnostic::Io(format!(
-                    "runtime reattestation failed: {message}"
+                    "runtime target binding failed: {message}"
                 )));
             }
             IoEvent::Delta { assets, paths, .. } => {
@@ -1319,6 +1295,7 @@ impl<I: LoaderIO> Loader<I> {
                             basis: sweep.basis.clone(),
                             resolve_issued: false,
                             expected_terminal_types: BTreeSet::new(),
+                            load_expectations: PlaceholderReferences::new(),
                             terminal: CandidateTerminal::Pending,
                         });
                     }
@@ -1379,6 +1356,29 @@ impl<I: LoaderIO> Loader<I> {
         }
         let type_uuid = parsed.terminal_type;
         let load_deps = parsed.load_deps.clone();
+        let edge_assets = artifact
+            .load_edges
+            .iter()
+            .map(|edge| edge.asset)
+            .collect::<Vec<_>>();
+        if artifact
+            .load_edges
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || edge_assets != load_deps
+        {
+            self.reject_fetched(
+                uuid,
+                &basis,
+                "direct typed load edges disagree with the artifact header".to_owned(),
+            );
+            return;
+        }
+        let load_expectations = artifact
+            .load_edges
+            .iter()
+            .map(|edge| (edge.asset, BTreeSet::from([edge.expected_terminal])))
+            .collect::<PlaceholderReferences>();
         if parsed.content_hash != content_hash {
             self.reject_fetched(
                 uuid,
@@ -1411,14 +1411,6 @@ impl<I: LoaderIO> Loader<I> {
                 uuid,
                 &basis,
                 format!("local descriptor marks {type_uuid} as build-only"),
-            );
-            return;
-        }
-        if let Err(error) = basis.load_policy().require_runtime(type_uuid) {
-            self.reject_fetched(
-                uuid,
-                &basis,
-                format!("load policy rejects {type_uuid}: {error:?}"),
             );
             return;
         }
@@ -1537,6 +1529,7 @@ impl<I: LoaderIO> Loader<I> {
         *candidate_type = Some(type_uuid);
         *candidate_deps = Some(load_deps.clone());
         values.extend(constructed);
+        candidate.load_expectations = load_expectations;
         self.fetched.push(FetchedInput {
             uuid,
             content_hash,
@@ -1689,14 +1682,10 @@ impl<I: LoaderIO> Loader<I> {
         let mut dependencies = PlaceholderReferences::new();
         for candidate in sweep.candidates.values() {
             match &candidate.terminal {
-                CandidateTerminal::Built {
-                    load_deps: Some(deps),
-                    ..
-                } => {
-                    for dependency in deps {
-                        dependencies.entry(*dependency).or_default();
-                    }
-                }
+                CandidateTerminal::Built { .. } => merge_placeholder_references(
+                    &mut dependencies,
+                    candidate.load_expectations.clone(),
+                ),
                 CandidateTerminal::Deleted {
                     strong_references, ..
                 } => merge_placeholder_references(&mut dependencies, strong_references.clone()),
@@ -1724,6 +1713,7 @@ impl<I: LoaderIO> Loader<I> {
                     basis: basis.clone(),
                     resolve_issued: false,
                     expected_terminal_types: BTreeSet::new(),
+                    load_expectations: PlaceholderReferences::new(),
                     terminal: CandidateTerminal::Pending,
                 });
             candidate
@@ -1757,7 +1747,6 @@ impl<I: LoaderIO> Loader<I> {
                     *uuid,
                     CandidateAsset {
                         uuid: *uuid,
-                        type_uuid: self.candidate_type(*uuid, candidate),
                         basis: candidate.basis.clone(),
                         load_deps: self.candidate_deps(candidate),
                         outcome: self.candidate_outcome(*uuid, candidate),
@@ -1828,31 +1817,6 @@ impl<I: LoaderIO> Loader<I> {
                     .map(|(uuid, _)| self.handles_for_uuid(*uuid))
             })
             .unwrap_or_default()
-    }
-
-    fn candidate_type(&self, uuid: AssetUuid, candidate: &CandidateRecord) -> TypeUuid {
-        match &candidate.terminal {
-            CandidateTerminal::Built {
-                type_uuid: Some(value),
-                ..
-            } => *value,
-            _ => candidate
-                .expected_terminal_types
-                .iter()
-                .next()
-                .copied()
-                .or_else(|| {
-                    self.handles_for_uuid(uuid).into_iter().find_map(|handle| {
-                        self.slots.get(&handle).and_then(|slot| {
-                            slot.current
-                                .as_ref()
-                                .map(|current| current.type_uuid)
-                                .or(slot.expected_type)
-                        })
-                    })
-                })
-                .unwrap_or(TypeUuid([0; 16])),
-        }
     }
 
     fn candidate_deps(&self, candidate: &CandidateRecord) -> Vec<AssetUuid> {
@@ -2174,7 +2138,7 @@ impl<I: LoaderIO> Loader<I> {
                         }
                     }
                 }
-                MemberFailure::Unresolved | MemberFailure::LoadPolicy(_) => {}
+                MemberFailure::Unresolved => {}
             }
         }
     }

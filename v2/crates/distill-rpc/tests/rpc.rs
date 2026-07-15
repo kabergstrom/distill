@@ -1,10 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use distill_core::attestation::{
-    AttestationError, ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
-    RegistryPathStep, SchemaNodeId,
-};
 use distill_core::id::BundleFileHash;
 use distill_json::AuthoredValue;
 use distill_rpc::*;
@@ -60,16 +56,7 @@ fn canonical_artifact(
         ArtifactPayload {
             structural: Arc::from(complete[..structural_len].to_vec()),
             blobs,
-            encoded_type,
-            terminal_type,
-            closure_rows: vec![ServedClosureRow {
-                asset,
-                content_hash: hash,
-                authored_type,
-                encoded_type,
-                terminal_type,
-                load_edges,
-            }],
+            load_edges,
         },
     )
 }
@@ -78,84 +65,12 @@ fn target_hash(byte: u8) -> TargetDefinitionHash {
     TargetDefinitionHash([byte; 32])
 }
 
-fn compiled(byte: u8, build_only: bool) -> CompiledTypeRow {
-    CompiledTypeRow::new(
-        type_id(byte),
-        LogicalHash([byte + 10; 32]),
-        [byte + 20; 32],
-        build_only,
-        RegistryExtrasV1::canonical(vec![
-            RegistryExtraRow {
-                node: SchemaNodeId(0),
-                path: vec![],
-                fact: RegistryExtraFact::BuildOnly(build_only),
-            },
-            RegistryExtraRow {
-                node: SchemaNodeId(0),
-                path: vec![RegistryPathStep::Field("ref".into())],
-                fact: RegistryExtraFact::Reference {
-                    strength: ReferenceStrength::Strong,
-                    target: type_id(byte + 30),
-                },
-            },
-        ])
-        .unwrap(),
-    )
-    .unwrap()
+fn target_with(definition_hash: u8, _policies: &[(u8, bool)]) -> TargetDefinition {
+    TargetDefinition::new("dev", target_hash(definition_hash))
 }
 
-fn policy(byte: u8, build_only: bool) -> LoadPolicyEntry {
-    LoadPolicyEntry {
-        type_uuid: type_id(byte),
-        build_only,
-    }
-}
-
-fn bootstrap_rows() -> Vec<CompiledTypeRow> {
-    distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
-        .unwrap()
-        .rows()
-        .to_vec()
-}
-
-fn boundary(policies: &[(u8, bool)]) -> (Vec<CompiledTypeRow>, Vec<LoadPolicyEntry>) {
-    let mut compiled_rows = policies
-        .iter()
-        .map(|(byte, build_only)| compiled(*byte, *build_only))
-        .collect::<Vec<_>>();
-    compiled_rows.extend(bootstrap_rows());
-    let mut policy_rows = policies
-        .iter()
-        .map(|(byte, build_only)| policy(*byte, *build_only))
-        .collect::<Vec<_>>();
-    policy_rows.extend(bootstrap_rows().into_iter().map(|row| LoadPolicyEntry {
-        type_uuid: row.type_uuid,
-        build_only: true,
-    }));
-    (compiled_rows, policy_rows)
-}
-
-fn target_with(definition_hash: u8, policies: &[(u8, bool)]) -> TargetDefinition {
-    let (compiled_rows, policy_rows) = boundary(policies);
-    TargetDefinition::canonical(
-        "dev",
-        target_hash(definition_hash),
-        compiled_rows,
-        policy_rows,
-    )
-    .unwrap()
-}
-
-fn request_for(definition_hash: u8, epoch: u64, policies: &[(u8, bool)]) -> ConnectRequest {
-    let (compiled_rows, policy_rows) = boundary(policies);
-    ConnectRequest::canonical(
-        GameModuleEpoch(epoch),
-        "dev",
-        target_hash(definition_hash),
-        compiled_rows,
-        policy_rows,
-    )
-    .unwrap()
+fn request_for(definition_hash: u8, _epoch: u64, _policies: &[(u8, bool)]) -> ConnectRequest {
+    ConnectRequest::new("dev", target_hash(definition_hash))
 }
 
 fn server_with(policies: &[(u8, bool)]) -> Server {
@@ -719,23 +634,6 @@ fn assert_reconnect<T: std::fmt::Debug>(result: RpcResult<T>, reason: ReconnectR
     ));
 }
 
-fn assert_expansion<T: std::fmt::Debug>(
-    result: RpcResult<T>,
-    snapshot: SnapshotStamp,
-    required: &[TypeUuid],
-) {
-    assert!(matches!(
-        result,
-        RpcResult::AttestationExpansionRequired(AttestationExpansionRequired {
-            snapshot: actual_snapshot,
-            closure_identity,
-            required: actual_required,
-        }) if actual_snapshot == snapshot
-            && closure_identity != [0; 32]
-            && actual_required == required
-    ));
-}
-
 fn authoring_entry(byte: u8, role: AuthoringEntryRole) -> AuthoringEntry {
     let schema_hash = node_hash(&SchemaNode::Blob).unwrap();
     AuthoringEntry {
@@ -1163,73 +1061,6 @@ fn unbound_metadata_bootstrap_survives_poison_and_has_no_runtime_surface() {
 }
 
 #[test]
-fn daemon_compiled_projection_fences_only_the_accepted_uuid_set() {
-    let server = server_with(&[(1, false)]);
-    let request = request_for(7, 1, &[(1, false)]);
-    let connected = match server.root().connect(request.clone()) {
-        ConnectOutcome::Connected(connected) => connected,
-        other => panic!("expected connect, got {other:?}"),
-    };
-    assert_eq!(connected.daemon_compiled_projection, request.dsca);
-    assert_eq!(
-        snapshot(&connected.hub).basis().daemon_compiled_projection,
-        request.dsca
-    );
-
-    server
-        .replace_target(target_with(7, &[(1, false), (2, false)]))
-        .unwrap();
-    assert!(matches!(connected.hub.snapshot(), RpcResult::Success(_)));
-
-    let (mut changed_rows, policies) = boundary(&[(1, false), (2, false)]);
-    changed_rows
-        .iter_mut()
-        .find(|row| row.type_uuid == type_id(1))
-        .unwrap()
-        .native_layout_digest = [99; 32];
-    let replacement =
-        TargetDefinition::canonical("dev", target_hash(7), changed_rows, policies).unwrap();
-    server.replace_target(replacement).unwrap();
-    assert_reconnect(
-        connected.hub.snapshot(),
-        ReconnectReason::CompiledAttestationChanged,
-    );
-}
-
-#[test]
-fn removing_an_accepted_daemon_type_returns_compiled_reconnect_without_panicking() {
-    let server = server_with(&[(1, false), (2, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let snapshot = snapshot(&hub);
-    let install = hub
-        .subscribe(InputVersion(0), vec![], vec![])
-        .success()
-        .unwrap();
-    install.deltas.next().unwrap();
-
-    server
-        .replace_target(target_with(7, &[(2, false)]))
-        .unwrap();
-    assert_reconnect(
-        snapshot.query(AssetQuery {
-            uuid: Some(asset_id(1)),
-            ..AssetQuery::default()
-        }),
-        ReconnectReason::CompiledAttestationChanged,
-    );
-    assert_reconnect(hub.snapshot(), ReconnectReason::CompiledAttestationChanged);
-    assert!(matches!(
-        install.deltas.next(),
-        Some(StreamEvent::Asset {
-            event: AssetEvent::ReconnectRequired {
-                reason: ReconnectReason::CompiledAttestationChanged
-            },
-            ..
-        })
-    ));
-}
-
-#[test]
 fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
     let server = server_with(&[(1, false), (2, false)]);
     let runtime = authoring_entry(1, AuthoringEntryRole::Runtime);
@@ -1263,9 +1094,7 @@ fn authoring_snapshot_pins_role_inclusive_metadata_without_runtime_escape() {
     let pinned = authoring_snapshot(&hub);
 
     assert_eq!(pinned.stamp(), stamp);
-    assert_eq!(pinned.basis().target_generation, 0);
-    assert_eq!(pinned.basis().policy_generation, 0);
-    assert_eq!(pinned.basis().attestation_generation, 0);
+    assert_eq!(pinned.basis().snapshot, stamp);
     assert_eq!(pinned.version(), RpcResult::Success(stamp.version));
     assert_eq!(
         pinned.query(AssetQuery {
@@ -1358,18 +1187,8 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
     let new = refreshed.inspect(first_entry.uuid).success().unwrap();
     assert_eq!(first.stamp(), first_stamp);
     assert_eq!(refreshed.stamp(), second_stamp);
-    assert_eq!(
-        refreshed.basis().target_generation,
-        first.basis().target_generation
-    );
-    assert_eq!(
-        refreshed.basis().policy_generation,
-        first.basis().policy_generation
-    );
-    assert_eq!(
-        refreshed.basis().attestation_generation,
-        first.basis().attestation_generation
-    );
+    assert_eq!(first.basis().snapshot, first_stamp);
+    assert_eq!(refreshed.basis().snapshot, second_stamp);
     assert!(
         matches!(old, AuthoringInspectResult::Inspection(value) if value.stamp == first_stamp && value.value == first_entry.value)
     );
@@ -1455,7 +1274,7 @@ fn reconnect_reason_vocabulary_is_shared_and_complete() {
     );
     assert_ne!(
         ReconnectReason::TargetDefinitionChanged,
-        ReconnectReason::LoadPolicyChanged
+        ReconnectReason::StoreInstanceChanged
     );
 }
 
@@ -1480,78 +1299,6 @@ fn staging_accepts_only_numeric_loopback_addresses() {
 }
 
 #[test]
-fn dsca_and_dslp_match_the_shared_typed_grammars() {
-    let compiled = vec![compiled(1, false), compiled(2, true)];
-    let policies = vec![policy(1, false), policy(2, true)];
-
-    let mut dslp = blake3::Hasher::new();
-    dslp.update(b"DSLP");
-    dslp.update(&[1]);
-    dslp.update(&2_u32.to_le_bytes());
-    for row in &policies {
-        dslp.update(&row.type_uuid.0);
-        dslp.update(&[u8::from(row.build_only)]);
-    }
-
-    assert_eq!(
-        CompiledTypeTable::canonical(compiled.clone())
-            .unwrap()
-            .digest,
-        distill_core::attestation::compute_compiled_attestation_digest(&compiled).unwrap()
-    );
-    assert_eq!(
-        compute_policy_digest(&policies).unwrap(),
-        *dslp.finalize().as_bytes()
-    );
-}
-
-#[test]
-fn canonical_attestations_reject_duplicates_and_different_registered_sets() {
-    assert!(matches!(
-        ConnectRequest::canonical(
-            GameModuleEpoch(1),
-            "dev",
-            target_hash(7),
-            vec![compiled(1, false), compiled(1, false)],
-            vec![policy(1, false), policy(1, false)],
-        ),
-        Err(AttestationShapeError::Compiled(
-            AttestationError::DuplicateType(_)
-        ))
-    ));
-    let (compiled_rows, _) = boundary(&[(1, false)]);
-    let (_, policy_rows) = boundary(&[(2, false)]);
-    assert!(matches!(
-        ConnectRequest::canonical(
-            GameModuleEpoch(1),
-            "dev",
-            target_hash(7),
-            compiled_rows,
-            policy_rows,
-        ),
-        Err(AttestationShapeError::RegisteredTypeSetMismatch { .. })
-    ));
-}
-
-#[test]
-fn connect_accepts_a_client_subset_and_binds_its_policy_to_every_basis() {
-    let server = server_with(&[(1, false), (2, true)]);
-    let hub = connect(&server, &[(1, false)]);
-    let snap = snapshot(&hub);
-    let (_, mut expected_policy) = boundary(&[(1, false)]);
-    expected_policy.sort_by_key(|row| row.type_uuid);
-
-    assert_eq!(snap.stamp().instance, StoreInstanceId([9; 16]));
-    assert_eq!(snap.basis().load_policy.rows, expected_policy);
-    assert_eq!(
-        snap.basis().load_policy.digest,
-        compute_policy_digest(&snap.basis().load_policy.rows).unwrap()
-    );
-    assert_eq!(snap.basis().target_generation, 0);
-    assert_eq!(snap.basis().policy_generation, 0);
-}
-
-#[test]
 fn connect_rejects_protocol_target_and_definition_mismatches() {
     let server = server_with(&[(1, false)]);
     let mut protocol = request_for(7, 1, &[(1, false)]);
@@ -1572,471 +1319,6 @@ fn connect_rejects_protocol_target_and_definition_mismatches() {
         server.root().connect(request_for(8, 1, &[(1, false)])),
         ConnectOutcome::Rejected(ConnectError::TargetDefinitionMismatch { .. })
     ));
-}
-
-#[test]
-fn connect_rejects_unsorted_forged_and_mismatched_compiled_attestations() {
-    let server = server_with(&[(1, false), (2, true)]);
-    let mut unsorted = request_for(7, 1, &[(1, false), (2, true)]);
-    unsorted.compiled_registry.reverse();
-    assert!(matches!(
-        server.root().connect(unsorted),
-        ConnectOutcome::Rejected(ConnectError::AttestationShape(
-            AttestationShapeError::Compiled(AttestationError::TypeRowsNotStrictlySorted)
-        ))
-    ));
-
-    let mut forged = request_for(7, 1, &[(1, false)]);
-    forged.dsca.0 = [55; 32];
-    assert!(matches!(
-        server.root().connect(forged),
-        ConnectOutcome::Rejected(ConnectError::CompiledRegistryAggregateMismatch {
-            observed,
-            ..
-        }) if observed == [55; 32]
-    ));
-
-    let mut mismatch = request_for(7, 1, &[(1, false)]);
-    mismatch.compiled_registry[0] = CompiledTypeRow::new(
-        type_id(1),
-        LogicalHash([11; 32]),
-        [99; 32],
-        false,
-        mismatch.compiled_registry[0].registry_extras.clone(),
-    )
-    .unwrap();
-    mismatch.dsca = CompiledTypeTable::canonical(mismatch.compiled_registry.clone())
-        .unwrap()
-        .digest;
-    assert!(matches!(
-        server.root().connect(mismatch),
-        ConnectOutcome::Rejected(ConnectError::LogicalHashMismatch { type_uuid, .. })
-            | ConnectOutcome::Rejected(ConnectError::NativeLayoutMismatch { type_uuid, .. })
-            | ConnectOutcome::Rejected(ConnectError::RegistryExtrasMismatch { type_uuid, .. })
-            if type_uuid == type_id(1)
-    ));
-
-    assert!(matches!(
-        server.root().connect(request_for(7, 1, &[(3, false)])),
-        ConnectOutcome::Rejected(ConnectError::MissingCompiledType { type_uuid })
-            if type_uuid == type_id(3)
-    ));
-}
-
-#[test]
-fn connect_rejects_forged_and_mismatched_load_policy_attestations() {
-    let server = server_with(&[(1, false)]);
-    let mut forged = request_for(7, 1, &[(1, false)]);
-    forged.policy_digest = [77; 32];
-    assert!(matches!(
-        server.root().connect(forged),
-        ConnectOutcome::Rejected(ConnectError::AttestationShape(
-            AttestationShapeError::PolicyDigestMismatch { .. }
-        ))
-    ));
-
-    assert!(matches!(
-        server.root().connect(request_for(7, 1, &[(1, true)])),
-        ConnectOutcome::Rejected(ConnectError::CompiledBuildOnlyMismatch { type_uuid, .. })
-            if type_uuid == type_id(1)
-    ));
-}
-
-#[test]
-fn connect_classifies_cross_projection_set_and_build_bit_differences_exactly() {
-    let server = server_with(&[(1, false)]);
-
-    let mut missing_policy = request_for(7, 1, &[(1, false)]);
-    missing_policy
-        .load_policy
-        .retain(|row| row.type_uuid != type_id(1));
-    missing_policy.policy_digest = compute_policy_digest(&missing_policy.load_policy).unwrap();
-    assert!(matches!(
-        server.root().connect(missing_policy),
-        ConnectOutcome::Rejected(ConnectError::MissingLoadPolicy { type_uuid })
-            if type_uuid == type_id(1)
-    ));
-
-    let mut missing_compiled = request_for(7, 1, &[(1, false)]);
-    missing_compiled
-        .compiled_registry
-        .retain(|row| row.type_uuid != type_id(1));
-    missing_compiled.dsca =
-        CompiledTypeTable::canonical(missing_compiled.compiled_registry.clone())
-            .unwrap()
-            .digest;
-    assert!(matches!(
-        server.root().connect(missing_compiled),
-        ConnectOutcome::Rejected(ConnectError::MissingCompiledType { type_uuid })
-            if type_uuid == type_id(1)
-    ));
-
-    let mut bit_mismatch = request_for(7, 1, &[(1, false)]);
-    bit_mismatch
-        .load_policy
-        .iter_mut()
-        .find(|row| row.type_uuid == type_id(1))
-        .unwrap()
-        .build_only = true;
-    bit_mismatch.policy_digest = compute_policy_digest(&bit_mismatch.load_policy).unwrap();
-    assert!(matches!(
-        server.root().connect(bit_mismatch),
-        ConnectOutcome::Rejected(ConnectError::LoadPolicyMismatch {
-            type_uuid,
-            expected: false,
-            got: true,
-        }) if type_uuid == type_id(1)
-    ));
-}
-
-#[test]
-fn equal_dsnl_cannot_hide_logical_reference_or_extras_drift() {
-    let server = server_with(&[(1, false)]);
-    let base = compiled(1, false);
-    let variants = [
-        CompiledTypeRow::new(
-            base.type_uuid,
-            LogicalHash([99; 32]),
-            base.native_layout_digest,
-            base.build_only,
-            base.registry_extras.clone(),
-        )
-        .unwrap(),
-        CompiledTypeRow::new(
-            base.type_uuid,
-            base.logical_hash,
-            base.native_layout_digest,
-            base.build_only,
-            RegistryExtrasV1::canonical(vec![
-                RegistryExtraRow {
-                    node: SchemaNodeId(0),
-                    path: vec![],
-                    fact: RegistryExtraFact::BuildOnly(false),
-                },
-                RegistryExtraRow {
-                    node: SchemaNodeId(0),
-                    path: vec![RegistryPathStep::Field("ref".into())],
-                    fact: RegistryExtraFact::Reference {
-                        strength: ReferenceStrength::Weak,
-                        target: type_id(42),
-                    },
-                },
-            ])
-            .unwrap(),
-        )
-        .unwrap(),
-        CompiledTypeRow::new(
-            base.type_uuid,
-            base.logical_hash,
-            base.native_layout_digest,
-            base.build_only,
-            RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-                node: SchemaNodeId(0),
-                path: vec![],
-                fact: RegistryExtraFact::BuildOnly(false),
-            }])
-            .unwrap(),
-        )
-        .unwrap(),
-    ];
-
-    for changed in variants {
-        assert_eq!(changed.native_layout_digest, base.native_layout_digest);
-        let mut request = request_for(7, 1, &[(1, false)]);
-        let runtime = request
-            .compiled_registry
-            .iter()
-            .position(|row| row.type_uuid == type_id(1))
-            .unwrap();
-        request.compiled_registry[runtime] = changed;
-        request.dsca = CompiledTypeTable::canonical(request.compiled_registry.clone())
-            .unwrap()
-            .digest;
-        assert!(matches!(
-            server.root().connect(request),
-            ConnectOutcome::Rejected(ConnectError::LogicalHashMismatch { type_uuid, .. })
-                | ConnectOutcome::Rejected(ConnectError::RegistryExtrasMismatch { type_uuid, .. })
-                if type_uuid == type_id(1)
-        ));
-    }
-}
-
-#[test]
-fn reattest_rechecks_the_entire_identity_and_requires_a_successor_epoch() {
-    let server = server_with(&[(1, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let old_snapshot = snapshot(&hub);
-
-    let same_epoch = ReattestRequest::from(request_for(7, 1, &[(1, false)]));
-    assert!(matches!(
-        hub.reattest(same_epoch),
-        RpcResult::Failure(RpcFailure::EpochNotSuccessor { .. })
-    ));
-
-    let bad_definition = ReattestRequest::from(request_for(8, 2, &[(1, false)]));
-    assert!(matches!(
-        hub.reattest(bad_definition),
-        RpcResult::Failure(RpcFailure::Attestation(
-            ConnectError::TargetDefinitionMismatch { .. }
-        ))
-    ));
-
-    assert_eq!(
-        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        RpcResult::Success(ReattestSuccess {
-            installed_attestation_generation: 1,
-            daemon_compiled_projection: request_for(7, 2, &[(1, false)]).dsca,
-            load_policy: Arc::new(LoadPolicyAttestation {
-                rows: request_for(7, 2, &[(1, false)]).load_policy,
-                digest: request_for(7, 2, &[(1, false)]).policy_digest,
-            }),
-            policy_generation: 0,
-        })
-    );
-    assert!(matches!(
-        old_snapshot.resolve(asset_id(1)),
-        RpcResult::Failure(RpcFailure::ClientEpochChanged {
-            snapshot: GameModuleEpoch(1),
-            current: GameModuleEpoch(2),
-        })
-    ));
-    assert!(matches!(old_snapshot.refresh(), RpcResult::Success(_)));
-}
-
-#[test]
-fn connect_and_reattest_share_stable_typed_attestation_failure_subjects() {
-    let type_uuid = type_id(1);
-    let cases = [
-        (
-            ConnectError::MissingCompiledType { type_uuid },
-            AttestationFailureCode::MissingType,
-            AttestationSubject::SpecificType {
-                type_uuid,
-                projection: AttestationProjection::CompiledRegistry,
-            },
-        ),
-        (
-            ConnectError::LogicalHashMismatch {
-                type_uuid,
-                expected: [1; 32],
-                observed: [2; 32],
-            },
-            AttestationFailureCode::LogicalHashMismatch,
-            AttestationSubject::SpecificType {
-                type_uuid,
-                projection: AttestationProjection::CompiledRegistry,
-            },
-        ),
-        (
-            ConnectError::MissingLoadPolicy { type_uuid },
-            AttestationFailureCode::MissingType,
-            AttestationSubject::SpecificType {
-                type_uuid,
-                projection: AttestationProjection::Policy,
-            },
-        ),
-        (
-            ConnectError::LoadPolicyMismatch {
-                type_uuid,
-                expected: false,
-                got: true,
-            },
-            AttestationFailureCode::BuildOnlyMismatch,
-            AttestationSubject::SpecificType {
-                type_uuid,
-                projection: AttestationProjection::Policy,
-            },
-        ),
-        (
-            ConnectError::TargetDefinitionMismatch {
-                expected: target_hash(7),
-                got: target_hash(8),
-            },
-            AttestationFailureCode::TargetDefinitionMismatch,
-            AttestationSubject::TargetDefinition,
-        ),
-        (
-            ConnectError::AttestationShape(AttestationShapeError::Compiled(
-                AttestationError::TrailingBytes,
-            )),
-            AttestationFailureCode::MalformedTable,
-            AttestationSubject::CompiledRegistryTable,
-        ),
-        (
-            ConnectError::AttestationShape(AttestationShapeError::Compiled(
-                AttestationError::CompiledDigestMismatch,
-            )),
-            AttestationFailureCode::CompiledRegistryAggregateMismatch,
-            AttestationSubject::CompiledRegistryAggregate,
-        ),
-        (
-            ConnectError::AttestationShape(AttestationShapeError::PolicyDigestMismatch {
-                expected: [1; 32],
-                got: [2; 32],
-            }),
-            AttestationFailureCode::PolicyProjectionMismatch,
-            AttestationSubject::PolicyProjection,
-        ),
-    ];
-    for (error, code, subject) in cases {
-        let failure = error.attestation_failure().unwrap();
-        assert_eq!(failure.code(), code);
-        assert_eq!(failure.subject(), &subject);
-        assert!(!failure.message().is_empty());
-    }
-    assert!(ConnectError::UnknownTarget {
-        target: "missing".into()
-    }
-    .attestation_failure()
-    .is_none());
-}
-
-#[test]
-fn connect_returns_all_basis_generations_and_reattest_is_generation_cas() {
-    let server = server_with(&[(1, false)]);
-    let connected = match server.root().connect(request_for(7, 1, &[(1, false)])) {
-        ConnectOutcome::Connected(connected) => connected,
-        other => panic!("expected connection, got {other:?}"),
-    };
-    assert_eq!(connected.instance, StoreInstanceId([9; 16]));
-    assert_eq!(connected.policy_generation, 0);
-    assert_eq!(connected.target_generation, 0);
-    assert_eq!(connected.attestation_generation, 0);
-    assert_eq!(
-        snapshot(&connected.hub).basis().attestation_generation,
-        connected.attestation_generation
-    );
-
-    let barrier = Arc::new(std::sync::Barrier::new(3));
-    let run = |epoch| {
-        let hub = connected.hub.clone();
-        let barrier = barrier.clone();
-        std::thread::spawn(move || {
-            let mut request = ReattestRequest::from(request_for(7, epoch, &[(1, false)]));
-            request.base_attestation_generation = 0;
-            request.successor_attestation_generation = 1;
-            barrier.wait();
-            hub.reattest(request)
-        })
-    };
-    let first = run(2);
-    let second = run(3);
-    barrier.wait();
-    let outcomes = [first.join().unwrap(), second.join().unwrap()];
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| matches!(
-                outcome,
-                RpcResult::Success(ReattestSuccess {
-                    installed_attestation_generation: 1,
-                    ..
-                })
-            ))
-            .count(),
-        1
-    );
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| matches!(
-                outcome,
-                RpcResult::Failure(RpcFailure::StaleAttestationBase {
-                    expected: 1,
-                    got: 0
-                })
-            ))
-            .count(),
-        1
-    );
-    assert_eq!(snapshot(&connected.hub).basis().attestation_generation, 1);
-
-    let mut successor = ReattestRequest::from(request_for(7, 4, &[(1, false)]));
-    successor.base_attestation_generation = 1;
-    successor.successor_attestation_generation = 2;
-    assert_eq!(
-        connected.hub.reattest(successor),
-        RpcResult::Success(ReattestSuccess {
-            installed_attestation_generation: 2,
-            daemon_compiled_projection: request_for(7, 4, &[(1, false)]).dsca,
-            load_policy: Arc::new(LoadPolicyAttestation {
-                rows: request_for(7, 4, &[(1, false)]).load_policy,
-                digest: request_for(7, 4, &[(1, false)]).policy_digest,
-            }),
-            policy_generation: 0,
-        })
-    );
-    assert_eq!(snapshot(&connected.hub).basis().attestation_generation, 2);
-}
-
-#[test]
-fn reattest_echo_rotates_the_basis_and_discards_old_generation_events() {
-    let server = server_with(&[(1, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let old_snapshot = snapshot(&hub);
-    let install = hub
-        .subscribe(InputVersion(0), vec![asset_id(1)], vec![])
-        .success()
-        .unwrap();
-    install.deltas.next().expect("initial install event");
-    server
-        .commit(Commit {
-            assets: vec![AssetMutation::Remove {
-                uuid: asset_id(1),
-                delta: AssetDeltaState::Changed,
-            }],
-            ..Commit::default()
-        })
-        .unwrap();
-
-    let success = hub
-        .reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)])))
-        .success()
-        .unwrap();
-    assert_eq!(success.installed_attestation_generation, 1);
-    assert_eq!(
-        snapshot(&hub).basis().attestation_generation,
-        success.installed_attestation_generation
-    );
-    assert!(matches!(
-        old_snapshot.resolve(asset_id(1)),
-        RpcResult::Failure(RpcFailure::ClientEpochChanged { .. })
-    ));
-    let replacement = install
-        .deltas
-        .next()
-        .expect("old queued delta is replaced by a successor-basis resync");
-    assert!(matches!(replacement, StreamEvent::ResyncRequired { .. }));
-    assert_eq!(
-        replacement.basis().attestation_generation,
-        success.installed_attestation_generation
-    );
-    assert!(install.deltas.next().is_none());
-}
-
-#[test]
-fn reattest_rejects_nonconsecutive_and_overflowing_generations_without_mutation() {
-    let server = server_with(&[(1, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let mut skipped = ReattestRequest::from(request_for(7, 2, &[(1, false)]));
-    skipped.successor_attestation_generation = 2;
-    assert_eq!(
-        hub.reattest(skipped),
-        RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
-            base: 0,
-            successor: 2,
-        })
-    );
-    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
-
-    let mut overflow = ReattestRequest::from(request_for(7, 2, &[(1, false)]));
-    overflow.base_attestation_generation = u64::MAX;
-    overflow.successor_attestation_generation = 0;
-    assert!(matches!(
-        hub.reattest(overflow),
-        RpcResult::Failure(RpcFailure::AttestationGenerationOverflow { base: u64::MAX })
-    ));
-    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
 }
 
 #[test]
@@ -2297,10 +1579,6 @@ fn configuration_poison_is_snapshot_pinned_and_typed_without_blocking_safe_reads
         RpcResult::Success(_)
     ));
     assert_eq!(
-        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        RpcResult::ConfigurationPoisoned(poison.clone())
-    );
-    assert_eq!(
         server.root().connect(request_for(7, 3, &[(1, false)])),
         ConnectOutcome::ConfigurationPoisoned(poison.clone())
     );
@@ -2423,10 +1701,6 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
     assert_eq!(
         hub.write(stamp.version, Vec::new()),
         RpcResult::Failure(unavailable.clone())
-    );
-    assert_eq!(
-        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        RpcResult::Failure(unavailable)
     );
     assert_eq!(
         server.root().connect(request_for(7, 3, &[(1, false)])),
@@ -2822,12 +2096,6 @@ fn target_definition_change_fences_every_target_bound_method_and_prompts_stream(
     assert_reconnect(hub.fetch_latest(content_hash(1)), reason);
     assert_reconnect(hub.subscribe(InputVersion(0), vec![], vec![]), reason);
     assert_reconnect(hub.unsubscribe(vec![], vec![]), reason);
-    assert_reconnect(
-        hub.reattest(ReattestRequest::from(request_for(8, 2, &[(1, false)]))),
-        reason,
-    );
-    assert_eq!(hub.attestation_generation(), 0);
-
     assert_reconnect(snap.version(), reason);
     assert_reconnect(snap.configuration(), reason);
 }
@@ -2965,9 +2233,9 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     let snapshot = snapshot(&hub);
     let authoring = authoring_snapshot(&hub);
     server
-        .replace_target(target_with(7, &[(2, false)]))
+        .replace_target(target_with(8, &[(2, false)]))
         .unwrap();
-    let reconnect = ReconnectReason::CompiledAttestationChanged;
+    let reconnect = ReconnectReason::TargetDefinitionChanged;
     assert_reconnect(hub.write(InputVersion(99), vec![]), reconnect);
     assert_reconnect(
         snapshot.query(AssetQuery {
@@ -3045,79 +2313,6 @@ fn missing_authoring_backend_is_typed_and_never_advances_the_input_version() {
         })
     );
     assert_eq!(server.current_stamp().version, InputVersion(0));
-}
-
-#[test]
-fn store_and_protocol_components_of_the_reattest_fence_never_mutate_generation() {
-    let server = server_with(&[(1, false)]);
-    let hub = connect(&server, &[(1, false)]);
-
-    server.replace_store_instance(StoreInstanceId([10; 16]));
-    assert_reconnect(
-        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        ReconnectReason::StoreInstanceChanged,
-    );
-    assert_eq!(hub.attestation_generation(), 0);
-    server.replace_store_instance(StoreInstanceId([9; 16]));
-    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
-
-    server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
-    assert_reconnect(
-        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, false)]))),
-        ReconnectReason::ProtocolEpochChanged,
-    );
-    assert_eq!(hub.attestation_generation(), 0);
-    server.replace_protocol_epoch(PROTOCOL_VERSION);
-    assert_eq!(snapshot(&hub).basis().attestation_generation, 0);
-}
-
-#[test]
-fn load_policy_change_has_its_own_fence_reason_and_target_reason_wins_if_both_change() {
-    let server = server_with(&[(1, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let snap = snapshot(&hub);
-    server.replace_target(target_with(7, &[(1, true)])).unwrap();
-    assert_reconnect(
-        snap.resolve(asset_id(1)),
-        ReconnectReason::LoadPolicyChanged,
-    );
-    assert_reconnect(
-        hub.reattest(ReattestRequest::from(request_for(7, 2, &[(1, true)]))),
-        ReconnectReason::LoadPolicyChanged,
-    );
-    assert_eq!(hub.attestation_generation(), 0);
-
-    let server = server_with(&[(1, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let snap = snapshot(&hub);
-    server.replace_target(target_with(8, &[(1, true)])).unwrap();
-    assert_reconnect(
-        snap.resolve(asset_id(1)),
-        ReconnectReason::TargetDefinitionChanged,
-    );
-}
-
-#[test]
-fn policy_generation_and_live_fence_ignore_daemon_rows_outside_the_hub_projection() {
-    let server = server_with(&[(1, false), (2, false)]);
-    let first = match server.root().connect(request_for(7, 1, &[(1, false)])) {
-        ConnectOutcome::Connected(connected) => connected,
-        other => panic!("expected subset connection, got {other:?}"),
-    };
-    let pinned = snapshot(&first.hub);
-    assert_eq!(first.policy_generation, 0);
-    server
-        .replace_target(target_with(7, &[(1, false), (2, true)]))
-        .unwrap();
-    assert_eq!(pinned.version(), RpcResult::Success(InputVersion(0)));
-    assert_eq!(pinned.basis().policy_generation, 0);
-
-    let fresh = match server.root().connect(request_for(7, 2, &[(1, false)])) {
-        ConnectOutcome::Connected(connected) => connected,
-        other => panic!("expected fresh subset connection, got {other:?}"),
-    };
-    assert_eq!(fresh.policy_generation, 0);
-    assert_eq!(snapshot(&fresh.hub).basis().policy_generation, 0);
 }
 
 #[test]
@@ -3259,156 +2454,6 @@ fn authoring_identity_validation_rejects_reserved_local_ids_and_noncanonical_tag
 }
 
 #[test]
-fn target_bound_data_coverage_never_serves_runtime_types_outside_the_accepted_set() {
-    let server = server_with(&[(1, false), (2, false)]);
-    let hub = connect(&server, &[(1, false)]);
-    let (dependency_hash, dependency_payload) = canonical_artifact(
-        asset_id(2),
-        type_id(2),
-        type_id(2),
-        type_id(2),
-        LayoutHash([42; 32]),
-        Vec::new(),
-        vec![4, 2],
-        Vec::new(),
-    );
-    let dependency_row = dependency_payload.closure_rows[0].clone();
-    server
-        .install_artifact(dependency_hash, dependency_payload)
-        .unwrap();
-    let (hash, mut payload) = canonical_artifact(
-        asset_id(1),
-        type_id(1),
-        type_id(1),
-        type_id(1),
-        LayoutHash([41; 32]),
-        vec![ServedLoadEdge {
-            asset: asset_id(2),
-            expected_terminal: type_id(2),
-        }],
-        vec![4, 1],
-        Vec::new(),
-    );
-    payload.closure_rows.push(dependency_row);
-    server.install_artifact(hash, payload.clone()).unwrap();
-    let mut entry = authoring_entry(1, AuthoringEntryRole::Runtime);
-    entry.terminal_type = type_id(1);
-    server
-        .commit(Commit {
-            assets: vec![set_asset(
-                entry.uuid,
-                StoredResolve::Built { content_hash: hash },
-                AssetDeltaState::Changed,
-            )],
-            authoring: vec![AuthoringMutation::Set(entry.clone())],
-            paths: vec![PathMutation::Set {
-                path: entry.normalized_path.clone(),
-                candidates: BTreeSet::from([entry.uuid]),
-            }],
-            ..Commit::default()
-        })
-        .unwrap();
-    let snap = snapshot(&hub);
-
-    assert!(matches!(
-        snap.query(AssetQuery {
-            terminal_type: Some(type_id(2)),
-            ..AssetQuery::default()
-        }),
-        RpcResult::Failure(RpcFailure::InvalidQuery { .. })
-    ));
-    assert!(matches!(hub.snapshot(), RpcResult::Success(_)));
-    assert_expansion(snap.entry(entry.uuid), snap.stamp(), &[type_id(2)]);
-    assert_expansion(snap.resolve(entry.uuid), snap.stamp(), &[type_id(2)]);
-    assert!(matches!(
-        snap.resolve_path(&entry.normalized_path),
-        RpcResult::Success(TerminalEvent {
-            value: PathResolveResult::Resolved(uuid),
-            ..
-        }) if uuid == entry.uuid
-    ));
-    assert_expansion(snap.fetch(hash), snap.stamp(), &[type_id(2)]);
-    assert_expansion(hub.fetch(&snap, hash), snap.stamp(), &[type_id(2)]);
-    assert_expansion(
-        hub.fetch_latest(hash),
-        server.current_stamp(),
-        &[type_id(2)],
-    );
-
-    let artifact_only_uuid = asset_id(42);
-    let (artifact_only_hash, artifact_only_payload) = canonical_artifact(
-        artifact_only_uuid,
-        type_id(2),
-        type_id(2),
-        type_id(2),
-        LayoutHash([43; 32]),
-        Vec::new(),
-        vec![4, 2],
-        Vec::new(),
-    );
-    server
-        .install_artifact(artifact_only_hash, artifact_only_payload)
-        .unwrap();
-    commit_one(
-        &server,
-        set_asset(
-            artifact_only_uuid,
-            StoredResolve::Built {
-                content_hash: artifact_only_hash,
-            },
-            AssetDeltaState::Changed,
-        ),
-    );
-    let latest = snapshot(&hub);
-    assert_expansion(
-        latest.resolve(artifact_only_uuid),
-        latest.stamp(),
-        &[type_id(2)],
-    );
-
-    let expanded_request = ReattestRequest::from(request_for(7, 1, &[(1, false), (2, false)]));
-    assert!(matches!(
-        hub.reattest(expanded_request),
-        RpcResult::Success(ReattestSuccess {
-            installed_attestation_generation: 1,
-            policy_generation: 1,
-            ..
-        })
-    ));
-    assert_eq!(
-        snap.fetch(hash),
-        RpcResult::Failure(RpcFailure::StaleAttestationBase {
-            expected: 1,
-            got: 0,
-        })
-    );
-    assert_eq!(
-        latest.resolve(artifact_only_uuid),
-        RpcResult::Failure(RpcFailure::StaleAttestationBase {
-            expected: 1,
-            got: 0,
-        })
-    );
-    let expanded = snapshot(&hub);
-    assert!(matches!(expanded.fetch(hash), RpcResult::Success(_)));
-    assert!(matches!(
-        expanded.resolve(artifact_only_uuid),
-        RpcResult::Success(TerminalEvent {
-            value: ResolveResult::Built { .. },
-            ..
-        })
-    ));
-
-    let metadata = server
-        .root()
-        .metadata(PROTOCOL_VERSION)
-        .connected()
-        .unwrap();
-    assert!(matches!(metadata.hub.fetch(hash), MetadataCall::Success(_)));
-    assert!(!payload.structural.is_empty());
-}
-
-#[test]
 fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
     let server = server_with(&[(1, false), (2, false)]);
     let hub = connect(&server, &[(1, false)]);
@@ -3475,7 +2520,7 @@ fn wire_tree_coverage_keeps_pinned_compatible_artifact_references() {
 }
 
 #[test]
-fn artifact_install_and_serving_authenticate_header_hash_and_complete_load_closure() {
+fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
     let server = server_with(&[(1, false), (2, false)]);
     let (hash, payload) = canonical_artifact(
         asset_id(1),
@@ -3490,18 +2535,8 @@ fn artifact_install_and_serving_authenticate_header_hash_and_complete_load_closu
         vec![1],
         Vec::new(),
     );
-    let mut forged_header = payload.clone();
-    forged_header.encoded_type = type_id(1);
-    forged_header.terminal_type = type_id(1);
-    forged_header.closure_rows[0].authored_type = type_id(1);
-    forged_header.closure_rows[0].encoded_type = type_id(1);
-    forged_header.closure_rows[0].terminal_type = type_id(1);
-    assert!(matches!(
-        server.install_artifact(hash, forged_header),
-        Err(AdminError::InvalidArtifact { .. })
-    ));
     let mut omitted_dep = payload.clone();
-    omitted_dep.closure_rows[0].load_edges.clear();
+    omitted_dep.load_edges.clear();
     assert!(matches!(
         server.install_artifact(hash, omitted_dep),
         Err(AdminError::InvalidArtifact { .. })
@@ -3521,10 +2556,16 @@ fn artifact_install_and_serving_authenticate_header_hash_and_complete_load_closu
         ),
     );
     let hub = connect(&server, &[(1, false), (2, false)]);
-    assert!(matches!(
-        snapshot(&hub).fetch(hash),
-        RpcResult::Failure(RpcFailure::InvalidQuery { .. })
-    ));
+    let RpcResult::Success(fetched) = snapshot(&hub).fetch(hash) else {
+        panic!("an authenticated artifact with unresolved direct edges must remain fetchable");
+    };
+    assert_eq!(
+        fetched.value.load_edges(),
+        &[ServedLoadEdge {
+            asset: asset_id(2),
+            expected_terminal: type_id(2),
+        }]
+    );
 }
 
 #[test]
@@ -3698,41 +2739,6 @@ fn lineage_repair_rejects_backend_publication_outside_the_repair_boundary() {
 }
 
 #[test]
-fn target_definition_construction_seals_bootstrap_authority_and_policy_shape() {
-    let server = server_with(&[(1, false)]);
-    let before = server.current_stamp();
-    let valid = target_with(8, &[(1, false)]);
-    let mut rows = valid.compiled_registry().to_vec();
-    let index = rows
-        .iter()
-        .position(|row| distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-        .unwrap();
-    let row = rows[index].clone();
-    rows[index] = CompiledTypeRow::new(
-        row.type_uuid,
-        row.logical_hash,
-        [77; 32],
-        row.build_only,
-        row.registry_extras,
-    )
-    .unwrap();
-    assert!(matches!(
-        TargetDefinition::canonical("dev", target_hash(8), rows, valid.load_policy().to_vec(),),
-        Err(AttestationShapeError::Bootstrap(_))
-    ));
-    assert_eq!(server.current_stamp(), before);
-    assert!(matches!(
-        TargetDefinition::canonical(
-            "dev",
-            target_hash(8),
-            valid.compiled_registry().to_vec(),
-            vec![policy(1, true)],
-        ),
-        Err(AttestationShapeError::RegisteredTypeSetMismatch { .. })
-    ));
-}
-
-#[test]
 fn content_hash_records_are_immutable() {
     let server = server_with(&[(1, false)]);
     let (hash, first) = canonical_artifact(
@@ -3750,10 +2756,10 @@ fn content_hash_records_are_immutable() {
     );
     assert_eq!(server.install_artifact(hash, first.clone()), Ok(()));
     assert_eq!(server.install_artifact(hash, first.clone()), Ok(()));
-    let mut different_closure = first;
-    different_closure.closure_rows[0].load_edges[0].expected_terminal = type_id(3);
+    let mut different_edges = first;
+    different_edges.load_edges[0].expected_terminal = type_id(3);
     assert_eq!(
-        server.install_artifact(hash, different_closure),
+        server.install_artifact(hash, different_edges),
         Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash })
     );
 }

@@ -4,16 +4,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use distill_core::attestation::{
-    BootstrapAuthorityMismatch, BundleFormatVersion, CompiledTypeTable,
-};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_loader::{
-    FetchedArtifact, IoBasis, IoEvent, LoadPolicyAttestation, LoadPolicyRow, LoaderIO,
-    ManifestHash, PathResolveResult, ReqId, ResolveResult,
-    RuntimeAttestation as LoaderRuntimeAttestation,
+    FetchedArtifact, IoBasis, IoEvent, LoaderIO, ManifestHash, PathResolveResult, ReqId,
+    ResolveResult, RuntimeTarget as LoaderRuntimeTarget,
 };
-use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::Blob;
@@ -22,18 +17,14 @@ use crate::archive::{
     decode_structural, scan_archive, ArchiveError, ArchiveObjectKind, EKey, ScannedArchive,
 };
 use crate::manifest::{
-    decode_manifest, manifest_hash, verify_artifact_metadata, verify_attestation,
-    verify_mounted_closure, ArtifactMetadata, ManifestError, PackManifest, PackTarget,
+    decode_manifest, manifest_hash, verify_artifact_metadata, ArtifactMetadata, ManifestError,
+    PackManifest,
 };
 
 #[derive(Debug, Clone)]
-pub struct RuntimeAttestation {
-    pub target: PackTarget,
+pub struct RuntimeTarget {
+    pub target: String,
     pub target_def_hash: [u8; 32],
-    pub compiled_types: CompiledTypeTable,
-    /// Sealed DSCI-keyed local format authority. It cannot be constructed from
-    /// either the pack projection or `compiled_types`.
-    pub bootstrap_authority: &'static ConsumerBootstrapAuthorityV1,
 }
 
 #[derive(Debug)]
@@ -45,14 +36,12 @@ pub enum MountError {
     Manifest(ManifestError),
     Archive(ArchiveError),
     TargetMismatch,
-    BootstrapAuthority(BootstrapAuthorityMismatch),
     MissingArchive(u32),
     DuplicateArchive(u32),
     ArchiveFileHash(u32),
     IndexMismatch(EKey),
     MissingObject(EKey),
     ObjectKind(EKey),
-    LoadPolicy,
     Artifact(ArtifactError),
     ContentHash(ContentHash),
     MissingEncoding(ContentHash),
@@ -84,8 +73,6 @@ pub struct PackfileIO {
     archives: BTreeMap<u32, MountedArchive>,
     basis: IoBasis,
     events: VecDeque<IoEvent>,
-    runtime_target: PackTarget,
-    bootstrap_authority: &'static ConsumerBootstrapAuthorityV1,
 }
 
 type ArchiveBacking = Arc<dyn AsRef<[u8]> + Send + Sync>;
@@ -124,7 +111,7 @@ impl PackfileIO {
     pub fn mount(
         manifest_bytes: &[u8],
         archive_files: Vec<Vec<u8>>,
-        runtime: &RuntimeAttestation,
+        runtime: &RuntimeTarget,
     ) -> Result<Self, MountError> {
         let archive_files = archive_files
             .into_iter()
@@ -139,7 +126,7 @@ impl PackfileIO {
     pub fn mount_files(
         manifest_path: &Path,
         archive_paths: &[PathBuf],
-        runtime: &RuntimeAttestation,
+        runtime: &RuntimeTarget,
     ) -> Result<Self, MountError> {
         let manifest = map_file(manifest_path)?;
         let archives = archive_paths
@@ -152,7 +139,7 @@ impl PackfileIO {
     fn mount_backings(
         manifest_bytes: &[u8],
         archive_files: Vec<ArchiveBacking>,
-        runtime: &RuntimeAttestation,
+        runtime: &RuntimeTarget,
     ) -> Result<Self, MountError> {
         let manifest = decode_manifest(manifest_bytes)?;
         Self::verify_runtime(&manifest, runtime)?;
@@ -190,57 +177,27 @@ impl PackfileIO {
                 return Err(MountError::UnreferencedEncoding(encoding.content_hash));
             }
         }
-        let mut artifact_metadata = Vec::with_capacity(manifest.assets.len());
-        for row in &manifest.assets {
-            let (_, metadata) = decode_fetched(&manifest, &archives, row.content_hash)?;
-            verify_artifact_metadata(row, &metadata)?;
-            artifact_metadata.push(metadata);
-        }
-        verify_mounted_closure(&manifest, &artifact_metadata)?;
-        let rows = manifest
-            .load_policy
-            .iter()
-            .map(|row| LoadPolicyRow {
-                type_uuid: row.type_uuid,
-                build_only: row.build_only,
-            })
-            .collect();
-        let load_policy =
-            Arc::new(LoadPolicyAttestation::from_rows(rows).map_err(|_| MountError::LoadPolicy)?);
         let basis = IoBasis::Pack {
             manifest: ManifestHash(manifest_hash(manifest_bytes)),
-            load_policy,
         };
         Ok(Self {
             manifest,
             archives,
             basis,
             events: VecDeque::new(),
-            runtime_target: runtime.target.clone(),
-            bootstrap_authority: runtime.bootstrap_authority,
         })
     }
 
-    pub fn reattest(&self, runtime: &RuntimeAttestation) -> Result<(), MountError> {
+    pub fn verify_target(&self, runtime: &RuntimeTarget) -> Result<(), MountError> {
         Self::verify_runtime(&self.manifest, runtime)
     }
 
-    fn verify_runtime(
-        manifest: &PackManifest,
-        runtime: &RuntimeAttestation,
-    ) -> Result<(), MountError> {
-        if manifest.target != runtime.target {
+    fn verify_runtime(manifest: &PackManifest, runtime: &RuntimeTarget) -> Result<(), MountError> {
+        if manifest.target.name != runtime.target
+            || manifest.target_def_hash != runtime.target_def_hash
+        {
             return Err(MountError::TargetMismatch);
         }
-        runtime
-            .bootstrap_authority
-            .validate_boundary_rows(&runtime.compiled_types.rows, BundleFormatVersion::V1)
-            .map_err(MountError::BootstrapAuthority)?;
-        runtime
-            .bootstrap_authority
-            .validate_boundary_rows(&manifest.compiled_types.rows, BundleFormatVersion::V1)
-            .map_err(MountError::BootstrapAuthority)?;
-        verify_attestation(manifest, &runtime.compiled_types, runtime.target_def_hash)?;
         Ok(())
     }
 
@@ -368,12 +325,23 @@ fn decode_fetched(
     }
     let metadata = ArtifactMetadata {
         asset_uuid: parts.asset_uuid,
-        authored_type: parts.authored_type,
-        encoded_type: parts.encoded_type,
         terminal_type: parts.terminal_type,
-        logical_hash: parts.logical_hash,
         load_deps: parts.load_deps.clone(),
     };
+    let row = manifest
+        .assets
+        .iter()
+        .find(|row| row.content_hash == content_hash)
+        .ok_or(MountError::MissingEncoding(content_hash))?;
+    verify_artifact_metadata(row, &metadata)?;
+    let load_edges = row
+        .load_deps
+        .iter()
+        .map(|edge| distill_rpc::ServedLoadEdge {
+            asset: edge.asset_uuid,
+            expected_terminal: edge.expected_terminal,
+        })
+        .collect();
     let blobs = blob_ranges
         .into_iter()
         .map(|(backing, offset, len)| Blob::new(backing, offset, len))
@@ -382,6 +350,7 @@ fn decode_fetched(
         FetchedArtifact {
             structural: Arc::from(structural),
             blobs,
+            load_edges,
             wire_layout: Arc::from(wire_layout),
         },
         metadata,
@@ -405,21 +374,16 @@ fn map_file(path: &Path) -> Result<Arc<memmap2::Mmap>, MountError> {
 }
 
 impl LoaderIO for PackfileIO {
-    fn reattest(&mut self, attestation: LoaderRuntimeAttestation) {
-        let runtime = RuntimeAttestation {
-            target: self.runtime_target.clone(),
-            target_def_hash: attestation.target_definition_hash,
-            compiled_types: attestation.compiled_types.clone(),
-            bootstrap_authority: self.bootstrap_authority,
-        };
-        match Self::verify_runtime(&self.manifest, &runtime) {
-            Ok(()) => self.events.push_back(IoEvent::Reattested {
-                attestation,
+    fn bind_target(&mut self, target: LoaderRuntimeTarget) {
+        if self.manifest.target_def_hash == target.target_definition_hash {
+            self.events.push_back(IoEvent::TargetBound {
+                target,
                 basis: self.basis.clone(),
-            }),
-            Err(error) => self.events.push_back(IoEvent::ReattestationFailed {
-                message: format!("pack runtime attestation: {error:?}"),
-            }),
+            });
+        } else {
+            self.events.push_back(IoEvent::TargetRejected {
+                message: "pack target-definition hash differs from the module target".into(),
+            });
         }
     }
 

@@ -6,22 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use distill_build::query::AssetQuery as BuildAssetQuery;
 use distill_build::trace::PackDefinitionControlValue;
 use distill_bundle::PathComponent;
-use distill_core::attestation::{CompiledTypeRow, CompiledTypeTable, RegistryExtrasV1};
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_pack::builder::{
     build_pack, build_publish_and_activate_pack, PackBuildError, PackBuildTarget,
 };
 use distill_pack::{
     archive_filename, manifest_filename, manifest_hash, read_current, PackTarget, PackfileIO,
-    RuntimeAttestation,
+    RuntimeTarget,
 };
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
-    AuthoringMutation, AuthoringValue, Commit, ConnectOutcome, ConnectRequest, GameModuleEpoch,
-    LoadPolicyEntry, PathMutation, ServedClosureRow, ServedLoadEdge, Server, StoreInstanceId,
-    StoredResolve, TargetDefinition, TargetDefinitionHash,
+    AuthoringMutation, AuthoringValue, Commit, ConnectOutcome, ConnectRequest, PathMutation,
+    ServedLoadEdge, Server, StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
 };
-use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -30,7 +27,7 @@ use distill_wire::wire::WireNode;
 const TARGET_HASH: [u8; 32] = [7; 32];
 
 struct Fixture {
-    compiled: CompiledTypeTable,
+    build_only_types: BTreeSet<TypeUuid>,
     hub: distill_rpc::Hub,
     snapshot: distill_rpc::Snapshot,
     root: AssetUuid,
@@ -45,33 +42,12 @@ fn fixture() -> Fixture {
 fn fixture_with_build_only(build_only: bool) -> Fixture {
     let runtime_type = TypeUuid([21; 16]);
     let logical_hash = LogicalHash([31; 32]);
-    let runtime_row = CompiledTypeRow::new(
-        runtime_type,
-        logical_hash,
-        [41; 32],
-        build_only,
-        RegistryExtrasV1::default(),
-    )
-    .unwrap();
-    let bootstrap = consumer_bootstrap_authority_v1().unwrap();
-    let mut rows = bootstrap.rows().to_vec();
-    rows.push(runtime_row);
-    let compiled = CompiledTypeTable::canonical(rows).unwrap();
-    let policy = compiled
-        .rows
-        .iter()
-        .map(|row| LoadPolicyEntry {
-            type_uuid: row.type_uuid,
-            build_only: row.build_only,
-        })
-        .collect::<Vec<_>>();
-    let target_definition = TargetDefinition::canonical(
-        "dev",
-        TargetDefinitionHash(TARGET_HASH),
-        compiled.rows.clone(),
-        policy.clone(),
-    )
-    .unwrap();
+    let build_only_types = if build_only {
+        BTreeSet::from([runtime_type])
+    } else {
+        BTreeSet::new()
+    };
+    let target_definition = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let server = Server::new(StoreInstanceId([9; 16]), vec![target_definition]).unwrap();
 
     let root = AssetUuid([1; 16]);
@@ -101,25 +77,8 @@ fn fixture_with_build_only(build_only: bool) -> Fixture {
         }],
         None,
     );
-    let root_closure = vec![root_row.1.clone(), child_row.1.clone()];
-    server
-        .install_artifact(
-            child_row.0,
-            ArtifactPayload {
-                closure_rows: vec![child_row.1.clone()],
-                ..child_row.2
-            },
-        )
-        .unwrap();
-    server
-        .install_artifact(
-            root_row.0,
-            ArtifactPayload {
-                closure_rows: root_closure,
-                ..root_row.2
-            },
-        )
-        .unwrap();
+    server.install_artifact(child_row.0, child_row.1).unwrap();
+    server.install_artifact(root_row.0, root_row.1).unwrap();
 
     server
         .commit(Commit {
@@ -157,31 +116,19 @@ fn fixture_with_build_only(build_only: bool) -> Fixture {
         })
         .unwrap();
 
-    let request = ConnectRequest::canonical(
-        GameModuleEpoch(1),
-        "dev",
-        TargetDefinitionHash(TARGET_HASH),
-        compiled.rows.clone(),
-        policy,
-    )
-    .unwrap();
+    let request = ConnectRequest::new("dev", TargetDefinitionHash(TARGET_HASH));
     let hub = match server.root().connect(request) {
         ConnectOutcome::Connected(connected) => connected.hub,
         other => panic!("connection failed: {other:?}"),
     };
     let snapshot = hub.snapshot().success().unwrap();
     Fixture {
-        compiled,
+        build_only_types,
         hub,
         snapshot,
         root,
         child,
-        target: PackTarget {
-            os: 1,
-            arch: 2,
-            apis: vec![3],
-            options: BTreeMap::new(),
-        },
+        target: PackTarget { name: "dev".into() },
     }
 }
 
@@ -192,11 +139,7 @@ fn artifact_row(
     layout_hash: distill_core::id::LayoutHash,
     load_edges: Vec<ServedLoadEdge>,
     blob: Option<Arc<[u8]>>,
-) -> (
-    distill_core::id::ContentHash,
-    ServedClosureRow,
-    ArtifactPayload,
-) {
+) -> (distill_core::id::ContentHash, ArtifactPayload) {
     let load_deps = load_edges.iter().map(|edge| edge.asset).collect::<Vec<_>>();
     let blob_inputs = blob
         .iter()
@@ -220,23 +163,12 @@ fn artifact_row(
     let parsed = distill_wire::artifact::parse_artifact(&complete).unwrap();
     let structural_len = complete.len() - parsed.blob_section.len();
     let hash = content_hash(&complete);
-    let row = ServedClosureRow {
-        asset,
-        content_hash: hash,
-        authored_type: runtime_type,
-        encoded_type: runtime_type,
-        terminal_type: runtime_type,
-        load_edges,
-    };
     (
         hash,
-        row,
         ArtifactPayload {
             structural: Arc::from(complete[..structural_len].to_vec()),
             blobs: blob.into_iter().collect(),
-            encoded_type: runtime_type,
-            terminal_type: runtime_type,
-            closure_rows: Vec::new(),
+            load_edges,
         },
     )
 }
@@ -280,10 +212,9 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
         &definition(fixture.root),
         &PackBuildTarget {
             name: "dev".into(),
-            manifest: fixture.target.clone(),
             definition_hash: TARGET_HASH,
         },
-        &fixture.compiled,
+        &fixture.build_only_types,
         "zstd-test",
         &fixture.snapshot,
         &fixture.hub,
@@ -305,11 +236,9 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
     PackfileIO::mount(
         &output.manifest_bytes,
         vec![output.archive_bytes],
-        &RuntimeAttestation {
-            target: fixture.target,
+        &RuntimeTarget {
+            target: fixture.target.name,
             target_def_hash: TARGET_HASH,
-            compiled_types: fixture.compiled,
-            bootstrap_authority: consumer_bootstrap_authority_v1().unwrap(),
         },
     )
     .unwrap();
@@ -333,10 +262,9 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
         &definition(fixture.root),
         &PackBuildTarget {
             name: "dev".into(),
-            manifest: fixture.target.clone(),
             definition_hash: TARGET_HASH,
         },
-        &fixture.compiled,
+        &fixture.build_only_types,
         "zstd-test",
         &fixture.snapshot,
         &fixture.hub,
@@ -358,11 +286,9 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
     PackfileIO::mount(
         &fs::read(directory.join(manifest_filename(manifest_hash))).unwrap(),
         vec![fs::read(directory.join(archive_filename(output.archive_file_hash))).unwrap()],
-        &RuntimeAttestation {
-            target: fixture.target,
+        &RuntimeTarget {
+            target: fixture.target.name,
             target_def_hash: TARGET_HASH,
-            compiled_types: fixture.compiled,
-            bootstrap_authority: consumer_bootstrap_authority_v1().unwrap(),
         },
     )
     .unwrap();
@@ -378,10 +304,9 @@ fn build_pack_rejects_an_empty_root_selection() {
             &definition(AssetUuid([99; 16])),
             &PackBuildTarget {
                 name: "dev".into(),
-                manifest: fixture.target,
                 definition_hash: TARGET_HASH,
             },
-            &fixture.compiled,
+            &fixture.build_only_types,
             "zstd-test",
             &fixture.snapshot,
             &fixture.hub,
@@ -398,10 +323,9 @@ fn build_pack_rejects_runtime_build_only_types() {
             &definition(fixture.root),
             &PackBuildTarget {
                 name: "dev".into(),
-                manifest: fixture.target,
                 definition_hash: TARGET_HASH,
             },
-            &fixture.compiled,
+            &fixture.build_only_types,
             "zstd-test",
             &fixture.snapshot,
             &fixture.hub,
@@ -420,10 +344,9 @@ fn build_pack_closes_roots_before_rpc_evaluation() {
             &definition,
             &PackBuildTarget {
                 name: "dev".into(),
-                manifest: fixture.target,
                 definition_hash: TARGET_HASH,
             },
-            &fixture.compiled,
+            &fixture.build_only_types,
             "zstd-test",
             &fixture.snapshot,
             &fixture.hub,

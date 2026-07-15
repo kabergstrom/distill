@@ -58,8 +58,7 @@ fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
 }
 
 fn target() -> TargetDefinition {
-    TargetDefinition::canonical("dev", TargetDefinitionHash([4; 32]), Vec::new(), Vec::new())
-        .unwrap()
+    TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
 }
 
 fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {

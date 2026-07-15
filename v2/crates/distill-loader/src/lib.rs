@@ -16,18 +16,18 @@ pub mod runtime;
 pub mod storage;
 
 pub use admission::{Admission, FetchAdmission};
-pub use basis::{IoBasis, LoadPolicyAttestation, LoadPolicyError, LoadPolicyRow, ManifestHash};
+pub use basis::{IoBasis, ManifestHash};
 pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError};
 pub use component::{
     AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, MemberFailure,
 };
 pub use io::{
     AssetDeltaState, DriftedInput, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult,
-    ReconnectReason, ReqId, ResolveResult, RuntimeAttestation, RuntimeAttestationError,
+    ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
 pub use orchestrator::{
     FetchedInput, Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, PreparedValue,
-    ReattestationState, RegistrationError,
+    RegistrationError, TargetBindingState,
 };
 pub use runtime::{
     AdoptionId, CompletionDisposition, ConnectionEpoch, HandleId, ManifestEntry, ManifestState,

@@ -7,7 +7,7 @@ use distill_bundle::crc32c;
 use distill_core::id::ContentHash;
 
 pub const PACK_MAGIC: [u8; 4] = *b"DPK1";
-pub const PACK_VERSION: u32 = 1;
+pub const PACK_VERSION: u32 = 2;
 pub const STRUCTURAL_CHUNK_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

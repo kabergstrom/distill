@@ -4,7 +4,6 @@
 //! official Rust bindings from `schema/distill_rpc.capnp`, and adapts them to a
 //! concrete single-threaded `capnp-rpc` system in [`capnp_transport`].
 
-mod attestation;
 mod bind;
 #[doc(hidden)]
 pub mod distill_rpc_capnp {
@@ -14,8 +13,8 @@ pub mod capnp_loader;
 pub mod capnp_transport;
 mod protocol;
 mod server;
+mod target;
 
-pub use attestation::{compute_policy_digest, AttestationShapeError, TargetDefinition};
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
 pub use server::{
@@ -23,3 +22,4 @@ pub use server::{
     CoordinatedCommitError, DeltaStream, Hub, LineageRepair, MetadataAuthoringSnapshot,
     MetadataHub, MetadataSnapshot, Root, Server, Snapshot,
 };
+pub use target::{TargetDefinition, TargetSetError};

@@ -1289,7 +1289,7 @@ pub enum CoordinatorInitError {
     Scan(ScanError),
     Repair(LineageRepairBackendInitError),
     Authoring(AuthoringServiceInitError),
-    Rpc(distill_rpc::AttestationShapeError),
+    Rpc(distill_rpc::TargetSetError),
     Module(String),
     ModuleIo(std::io::Error),
     Operational(String),
@@ -1323,8 +1323,8 @@ impl From<AuthoringServiceInitError> for CoordinatorInitError {
         Self::Authoring(error)
     }
 }
-impl From<distill_rpc::AttestationShapeError> for CoordinatorInitError {
-    fn from(error: distill_rpc::AttestationShapeError) -> Self {
+impl From<distill_rpc::TargetSetError> for CoordinatorInitError {
+    fn from(error: distill_rpc::TargetSetError) -> Self {
         Self::Rpc(error)
     }
 }

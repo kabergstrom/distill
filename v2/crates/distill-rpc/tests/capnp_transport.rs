@@ -2,9 +2,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use distill_core::attestation::{
-    CompiledTypeRow, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, SchemaNodeId,
-};
 use distill_core::id::BundleFileHash;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{
@@ -14,68 +11,16 @@ use distill_rpc::*;
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
 use tokio::task::LocalSet;
 
-fn compiled(definition: u8) -> CompiledTypeRow {
-    CompiledTypeRow::new(
-        TypeUuid([1; 16]),
-        LogicalHash([3; 32]),
-        [2; 32],
-        false,
-        RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-            node: SchemaNodeId(0),
-            path: vec![],
-            fact: RegistryExtraFact::ControlRole(if definition == 7 {
-                distill_core::attestation::ControlRole::Unrestricted
-            } else {
-                distill_core::attestation::ControlRole::AuthoringOnlyRequired
-            }),
-        }])
-        .unwrap(),
-    )
-    .unwrap()
-}
-
 fn target() -> TargetDefinition {
     target_with_definition(7)
 }
 
 fn target_with_definition(definition: u8) -> TargetDefinition {
-    let mut rows = vec![compiled(definition)];
-    rows.extend_from_slice(
-        distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
-            .unwrap()
-            .rows(),
-    );
-    let mut policies = vec![LoadPolicyEntry {
-        type_uuid: TypeUuid([1; 16]),
-        build_only: false,
-    }];
-    policies.extend(rows.iter().filter_map(|row| {
-        distill_core::attestation::is_bootstrap_control_type(row.type_uuid).then_some(
-            LoadPolicyEntry {
-                type_uuid: row.type_uuid,
-                build_only: true,
-            },
-        )
-    }));
-    TargetDefinition::canonical(
-        "dev",
-        TargetDefinitionHash([definition; 32]),
-        rows,
-        policies,
-    )
-    .unwrap()
+    TargetDefinition::new("dev", TargetDefinitionHash([definition; 32]))
 }
 
 fn request() -> ConnectRequest {
-    let target = target();
-    ConnectRequest::canonical(
-        GameModuleEpoch(1),
-        "dev",
-        TargetDefinitionHash([7; 32]),
-        target.compiled_registry().to_vec(),
-        target.load_policy().to_vec(),
-    )
-    .unwrap()
+    ConnectRequest::new("dev", TargetDefinitionHash([7; 32]))
 }
 
 fn server() -> Server {
@@ -109,22 +54,13 @@ fn canonical_artifact(
         ArtifactPayload {
             structural: complete.into(),
             blobs: Vec::new(),
-            encoded_type: type_uuid,
-            terminal_type: type_uuid,
-            closure_rows: vec![ServedClosureRow {
-                asset,
-                content_hash: hash,
-                authored_type: type_uuid,
-                encoded_type: type_uuid,
-                terminal_type: type_uuid,
-                load_edges: Vec::new(),
-            }],
+            load_edges: Vec::new(),
         },
     )
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn remote_loader_client_preserves_typed_calls_and_rotates_reattestation() {
+async fn remote_loader_client_preserves_typed_calls() {
     LocalSet::new()
         .run_until(async {
             let server = server();
@@ -165,7 +101,7 @@ async fn remote_loader_client_preserves_typed_calls_and_rotates_reattestation() 
             let server_task =
                 tokio::task::spawn_local(async move { server_listener.serve_one().await });
             let client = CapnpClient::connect_local(address).await.unwrap();
-            let mut hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
 
             let snapshot = match hub.snapshot().await.unwrap() {
                 RemoteCall::Success(snapshot) => snapshot,
@@ -224,27 +160,6 @@ async fn remote_loader_client_preserves_typed_calls_and_rotates_reattestation() 
                 subscription.next().await.unwrap(),
                 Some(StreamEvent::InitialDelta { .. })
             ));
-
-            let mut next = request();
-            next.epoch = GameModuleEpoch(2);
-            let reattest = ReattestRequest {
-                epoch: next.epoch,
-                base_attestation_generation: 0,
-                successor_attestation_generation: 1,
-                target_definition_hash: next.target_definition_hash,
-                compiled_registry: next.compiled_registry,
-                dsca: next.dsca,
-                load_policy: next.load_policy,
-                policy_digest: next.policy_digest,
-            };
-            assert!(matches!(
-                hub.reattest(&reattest).await.unwrap(),
-                RemoteCall::Success(ReattestSuccess {
-                    installed_attestation_generation: 1,
-                    ..
-                })
-            ));
-            assert_eq!(hub.attestation_generation(), 1);
 
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
@@ -341,41 +256,6 @@ impl BuildBackend for BlockingBuildBackend {
     }
 }
 
-fn write_reattest(
-    mut params: schema::hub::reattest_params::Builder<'_>,
-    epoch: u64,
-    base: u64,
-    successor: u64,
-) {
-    let next = request();
-    params.set_epoch(epoch);
-    params.set_base_attestation_generation(base);
-    params.set_successor_attestation_generation(successor);
-    params.set_target_def_hash(&next.target_definition_hash.0);
-    let mut rows = params
-        .reborrow()
-        .init_compiled_registry(next.compiled_registry.len() as u32);
-    for (index, row) in next.compiled_registry.iter().enumerate() {
-        let mut wire = rows.reborrow().get(index as u32);
-        wire.set_type_uuid(&row.type_uuid.0);
-        wire.set_logical_hash(&row.logical_hash.0);
-        wire.set_native_layout_digest(&row.native_layout_digest);
-        wire.set_build_only(row.build_only);
-        wire.set_registry_extras_digest(&row.registry_extras_digest.0);
-        wire.set_registry_extras(&row.registry_extras.encode().unwrap());
-    }
-    params.set_dsca_aggregate(&next.dsca.0);
-    let mut policies = params
-        .reborrow()
-        .init_load_policy(next.load_policy.len() as u32);
-    for (index, row) in next.load_policy.iter().enumerate() {
-        let mut wire = policies.reborrow().get(index as u32);
-        wire.set_type_uuid(&row.type_uuid.0);
-        wire.set_build_only(row.build_only);
-    }
-    params.set_policy_digest(&next.policy_digest);
-}
-
 #[test]
 fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     let source = include_str!("../schema/distill_rpc.capnp");
@@ -417,26 +297,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         assert!(body.contains("leaseFailure @3"), "{name} lease ordinal");
         assert!(body.contains("error @4"), "{name} error ordinal");
     }
-    let reattest = source
-        .split_once("struct ReattestResult {")
-        .expect("dedicated ReattestResult")
-        .1
-        .split_once("\n  }\n}")
-        .expect("terminated ReattestResult")
-        .0;
-    for arm in [
-        "success @0 :ReattestSuccess",
-        "attestationFailure @1 :AttestationFailure",
-        "staleAttestationBase @2 :StaleAttestationBase",
-        "attestationGenerationOverflow @3 :AttestationGenerationOverflow",
-        "reconnectRequired @4 :ReconnectRequired",
-        "configurationPoisoned @5 :ConfigurationPoison",
-        "leaseFailure @6 :LeaseFailure",
-        "error @7 :RpcError",
-    ] {
-        assert!(reattest.contains(arm), "missing reattest arm {arm}");
-    }
-    assert!(source.contains("-> (result :ReattestResult);"));
+    assert!(!source.contains("Reattest"));
 
     let inspect = source
         .split_once("struct AuthoringInspectCall {")
@@ -456,7 +317,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     ] {
         assert!(inspect.contains(arm), "missing authoring inspect arm {arm}");
     }
-    assert!(source.contains("authoringSnapshot @10 () -> (result :AuthoringSnapshotCall);"));
+    assert!(source.contains("authoringSnapshot @9 () -> (result :AuthoringSnapshotCall);"));
     assert!(source.contains("interface AuthoringSnapshot {"));
     assert!(source.contains("version @0 () -> (result :UInt64Call);"));
     assert!(source.contains("query @1 (query :AssetQuery) -> (result :UuidListCall);"));
@@ -730,9 +591,6 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                         "unexpected resolve error: {}",
                         error.get_message().unwrap().to_str().unwrap()
                     )
-                }
-                schema::resolve_call::Which::AttestationExpansionRequired(_) => {
-                    panic!("unexpected resolve attestation expansion")
                 }
                 _ => panic!("expected typed terminal role failure"),
             };
@@ -1118,50 +976,12 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 tokio::task::spawn_local(async move { server_listener.serve_one().await });
             let client = CapnpClient::connect_local(address).await.unwrap();
             let hub = match client.connect(&request()).await.unwrap() {
-                RemoteConnectOutcome::Connected {
-                    hub,
-                    instance,
-                    policy_generation,
-                    target_generation,
-                    attestation_generation,
-                    load_policy,
-                    daemon_compiled_projection,
-                } => {
+                RemoteConnectOutcome::Connected { hub, instance } => {
                     assert_eq!(instance, StoreInstanceId([9; 16]));
-                    assert_eq!(policy_generation, 0);
-                    assert_eq!(target_generation, 0);
-                    assert_eq!(attestation_generation, 0);
-                    assert_eq!(load_policy.rows, request().load_policy);
-                    assert_eq!(load_policy.digest, request().policy_digest);
-                    assert_eq!(daemon_compiled_projection, request().dsca);
                     hub
                 }
                 other => panic!("expected connected, got {other:?}"),
             };
-
-            // Reattestation carries and revalidates the same full typed rows,
-            // not a layout-only projection.
-            let mut reattest = hub.reattest_request();
-            write_reattest(reattest.get(), 2, 0, 1);
-            let reattested = reattest.send().promise.await.unwrap();
-            match reattested
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::reattest_result::Which::Success(success) => {
-                    let success = success.unwrap();
-                    assert_eq!(success.get_installed_attestation_generation(), 1);
-                    assert_eq!(
-                        success.get_daemon_compiled_projection().unwrap(),
-                        request().dsca.0
-                    );
-                }
-                _ => panic!("expected typed reattestation success"),
-            }
 
             let snapshot_response = hub.snapshot_request().send().promise.await.unwrap();
             let snapshot_result = snapshot_response.get().unwrap().get_result().unwrap();
@@ -1519,28 +1339,14 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
                 } if observed == PROTOCOL_VERSION + 1
             ));
 
-            let mut wrong_attestation = request();
-            wrong_attestation.target_definition_hash = TargetDefinitionHash([8; 32]);
+            let mut wrong_target = request();
+            wrong_target.target_definition_hash = TargetDefinitionHash([8; 32]);
             assert!(matches!(
-                client.connect(&wrong_attestation).await.unwrap(),
-                RemoteConnectOutcome::AttestationFailure(failure)
-                    if failure.code() == AttestationFailureCode::TargetDefinitionMismatch
-                        && *failure.subject() == AttestationSubject::TargetDefinition
-            ));
-
-            let mut wrong_type = request();
-            wrong_type.compiled_registry[0].logical_hash = LogicalHash([8; 32]);
-            wrong_type.dsca = CompiledTypeTable::canonical(wrong_type.compiled_registry.clone())
-                .unwrap()
-                .digest;
-            assert!(matches!(
-                client.connect(&wrong_type).await.unwrap(),
-                RemoteConnectOutcome::AttestationFailure(failure)
-                    if failure.code() == AttestationFailureCode::LogicalHashMismatch
-                        && *failure.subject() == AttestationSubject::SpecificType {
-                            type_uuid: TypeUuid([1; 16]),
-                            projection: AttestationProjection::CompiledRegistry,
-                        }
+                client.connect(&wrong_target).await.unwrap(),
+                RemoteConnectOutcome::TargetFailure(
+                    ConnectError::TargetDefinitionMismatch { expected, got }
+                ) if expected == TargetDefinitionHash([7; 32])
+                    && got == TargetDefinitionHash([8; 32])
             ));
 
             let mut malformed = client.root().connect_request();
@@ -1548,89 +1354,15 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
                 let mut params = malformed.get();
                 params.set_target("dev");
                 params.set_target_def_hash(&[7; 31]);
-                params.reborrow().init_compiled_registry(0);
-                params.set_dsca_aggregate(&[0; 32]);
-                params.reborrow().init_load_policy(0);
-                params.set_policy_digest(&[0; 32]);
                 params.set_protocol(PROTOCOL_VERSION);
-                params.set_game_module_epoch(1);
             }
             let malformed_response = malformed.send().promise.await.unwrap();
             let malformed_result = malformed_response.get().unwrap().get_result().unwrap();
             match malformed_result.which().unwrap() {
-                schema::connect_call::Which::AttestationFailure(failure) => {
-                    let failure = failure.unwrap();
-                    assert_eq!(
-                        failure.get_code().unwrap(),
-                        schema::AttestationFailureCode::MalformedField
-                    );
-                    let fixed = match failure.get_subject().unwrap().which().unwrap() {
-                        schema::attestation_subject::Which::FixedField(fixed) => fixed.unwrap(),
-                        _ => panic!("wrong fixed width must identify the field"),
-                    };
-                    assert!(matches!(
-                        fixed.which().unwrap(),
-                        schema::attestation_fixed_field_subject::Which::TargetDefHash(())
-                    ));
-                    let detail = match failure.get_payload().unwrap().which().unwrap() {
-                        schema::attestation_failure_payload::Which::MalformedField(detail) => {
-                            detail.unwrap()
-                        }
-                        _ => panic!("wrong fixed width must carry the observed bytes"),
-                    };
-                    assert_eq!(detail.get_expected_width(), 32);
-                    assert_eq!(detail.get_observed().unwrap(), &[7; 31]);
+                schema::connect_call::Which::Error(failure) => {
+                    assert_eq!(failure.unwrap().get_code(), 1002);
                 }
-                _ => panic!("wrong hash width must be rejected"),
-            }
-
-            let mut forged_extras = client.root().connect_request();
-            {
-                let valid = request();
-                let row = &valid.compiled_registry[0];
-                let mut params = forged_extras.get();
-                params.set_target("dev");
-                params.set_target_def_hash(&valid.target_definition_hash.0);
-                let mut rows = params.reborrow().init_compiled_registry(1);
-                let mut wire = rows.reborrow().get(0);
-                wire.set_type_uuid(&row.type_uuid.0);
-                wire.set_logical_hash(&row.logical_hash.0);
-                wire.set_native_layout_digest(&row.native_layout_digest);
-                wire.set_build_only(row.build_only);
-                wire.set_registry_extras_digest(&row.registry_extras_digest.0);
-                wire.set_registry_extras(&[2, 0, 0, 0, 0]);
-                params.set_dsca_aggregate(&valid.dsca.0);
-                let mut policies = params.reborrow().init_load_policy(1);
-                let mut policy = policies.reborrow().get(0);
-                policy.set_type_uuid(&valid.load_policy[0].type_uuid.0);
-                policy.set_build_only(false);
-                params.set_policy_digest(&valid.policy_digest);
-                params.set_protocol(PROTOCOL_VERSION);
-                params.set_game_module_epoch(1);
-            }
-            let forged_response = forged_extras.send().promise.await.unwrap();
-            let forged_result = forged_response.get().unwrap().get_result().unwrap();
-            match forged_result.which().unwrap() {
-                schema::connect_call::Which::AttestationFailure(failure) => {
-                    let failure = failure.unwrap();
-                    assert_eq!(
-                        failure.get_code().unwrap(),
-                        schema::AttestationFailureCode::MalformedTable
-                    );
-                    assert!(matches!(
-                        failure.get_subject().unwrap().which().unwrap(),
-                        schema::attestation_subject::Which::CompiledRegistryTable(())
-                    ));
-                    let detail = match failure.get_payload().unwrap().which().unwrap() {
-                        schema::attestation_failure_payload::Which::TableDetail(detail) => {
-                            detail.unwrap()
-                        }
-                        _ => panic!("malformed row must carry table detail"),
-                    };
-                    assert_eq!(detail.get_index(), 0);
-                    assert!(!detail.get_entry().unwrap().is_empty());
-                }
-                _ => panic!("unknown DSRE version must be a typed attestation rejection"),
+                _ => panic!("wrong target-definition hash width must be rejected"),
             }
 
             let hub = match client.connect(&request()).await.unwrap() {
@@ -1721,99 +1453,6 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
                     PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(observed)
                 ) if observed == required
             ));
-
-            drop(client);
-            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn concurrent_wire_reattests_cas_the_generation_without_late_overwrite() {
-    LocalSet::new()
-        .run_until(async {
-            let listener = Rc::new(
-                StagedListener::bind(server().root(), "127.0.0.1:0")
-                    .await
-                    .unwrap(),
-            );
-            let address = listener.local_addr().unwrap();
-            let server_listener = listener.clone();
-            let server_task =
-                tokio::task::spawn_local(async move { server_listener.serve_one().await });
-            let client = CapnpClient::connect_local(address).await.unwrap();
-            let hub = match client.connect(&request()).await.unwrap() {
-                RemoteConnectOutcome::Connected {
-                    hub,
-                    attestation_generation,
-                    ..
-                } => {
-                    assert_eq!(attestation_generation, 0);
-                    hub
-                }
-                other => panic!("expected connected, got {other:?}"),
-            };
-
-            let mut first = hub.reattest_request();
-            write_reattest(first.get(), 2, 0, 1);
-            let mut second = hub.reattest_request();
-            write_reattest(second.get(), 3, 0, 1);
-            let (first, second) = futures::join!(first.send().promise, second.send().promise);
-            let first = first.unwrap();
-            let second = second.unwrap();
-            let outcomes = [
-                first.get().unwrap().get_result().unwrap().which().unwrap(),
-                second.get().unwrap().get_result().unwrap().which().unwrap(),
-            ];
-            assert_eq!(
-                outcomes
-                    .iter()
-                    .filter(|outcome| match outcome {
-                        schema::reattest_result::Which::Success(success) =>
-                            success.as_ref().is_ok_and(|success| {
-                                success.get_installed_attestation_generation() == 1
-                            }),
-                        _ => false,
-                    })
-                    .count(),
-                1
-            );
-            assert_eq!(
-                outcomes
-                    .iter()
-                    .filter(|outcome| match outcome {
-                        schema::reattest_result::Which::StaleAttestationBase(stale) =>
-                            stale.as_ref().is_ok_and(|stale| {
-                                stale.get_code() == STALE_ATTESTATION_BASE_CODE
-                                    && stale.get_expected() == 1
-                                    && stale.get_observed() == 0
-                            }),
-                        _ => false,
-                    })
-                    .count(),
-                1
-            );
-
-            let mut successor = hub.reattest_request();
-            write_reattest(successor.get(), 4, 1, 2);
-            let successor = successor.send().promise.await.unwrap();
-            match successor
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::reattest_result::Which::Success(success) => {
-                    assert_eq!(success.unwrap().get_installed_attestation_generation(), 2)
-                }
-                _ => panic!("expected second typed reattestation success"),
-            }
 
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
@@ -2043,53 +1682,6 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 _ => panic!("expected wire tree bytes"),
             }
 
-            let expansion_node = distill_wire::wire::WireNode::Unit { offset: 8 };
-            let expansion_tree: Arc<[u8]> =
-                Arc::from(distill_wire::dswl::dswl_bytes(&expansion_node).unwrap());
-            let expansion_hash = distill_wire::dswl::dswl_hash(&expansion_node).unwrap();
-            server
-                .install_wire_tree(expansion_hash, expansion_tree)
-                .unwrap();
-            let expansion_asset = AssetUuid([2; 16]);
-            let (expansion_artifact_hash, expansion_artifact) =
-                canonical_artifact(expansion_asset, TypeUuid([2; 16]), expansion_hash, &[2]);
-            server
-                .install_artifact(expansion_artifact_hash, expansion_artifact)
-                .unwrap();
-            server
-                .commit(Commit {
-                    assets: vec![AssetMutation::Set {
-                        uuid: expansion_asset,
-                        resolution: StoredResolve::Built {
-                            content_hash: expansion_artifact_hash,
-                        },
-                        delta: AssetDeltaState::Changed,
-                    }],
-                    ..Commit::default()
-                })
-                .unwrap();
-            let mut expansion = hub.wire_tree_request();
-            expansion.get().set_layout_hash(&expansion_hash.0);
-            let expansion = expansion.send().promise.await.unwrap();
-            let challenge = match expansion
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::data_call::Which::AttestationExpansionRequired(challenge) => {
-                    challenge.unwrap()
-                }
-                _ => panic!("expected typed no-data attestation expansion"),
-            };
-            assert_eq!(challenge.get_closure_identity().unwrap().len(), 32);
-            assert_ne!(challenge.get_closure_identity().unwrap(), &[0; 32]);
-            let required = challenge.get_required_type_uuids().unwrap();
-            assert_eq!(required.len(), 1);
-            assert_eq!(required.get(0).unwrap(), &[2; 16]);
-
             server.replace_target(target_with_definition(8)).unwrap();
             let mut stale = hub.reimport_request();
             stale.get().set_base(u64::MAX);
@@ -2101,195 +1693,6 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                     schema::ReconnectReason::TargetDefinitionChanged
                 ),
                 _ => panic!("generation fence must precede malformed payload decoding"),
-            }
-
-            drop(client);
-            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn wire_reattest_has_typed_failure_subjects_generations_and_reconnect() {
-    LocalSet::new()
-        .run_until(async {
-            let server = server();
-            let listener = Rc::new(
-                StagedListener::bind(server.root(), "127.0.0.1:0")
-                    .await
-                    .unwrap(),
-            );
-            let address = listener.local_addr().unwrap();
-            let server_listener = listener.clone();
-            let server_task =
-                tokio::task::spawn_local(async move { server_listener.serve_one().await });
-            let client = CapnpClient::connect_local(address).await.unwrap();
-            let hub = match client.connect(&request()).await.unwrap() {
-                RemoteConnectOutcome::Connected { hub, .. } => hub,
-                other => panic!("expected connected, got {other:?}"),
-            };
-
-            let mut bad_target = hub.reattest_request();
-            {
-                let mut params = bad_target.get();
-                write_reattest(params.reborrow(), 2, 0, 1);
-                params.set_target_def_hash(&[8; 32]);
-            }
-            let response = bad_target.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            let failure = match result.which().unwrap() {
-                schema::reattest_result::Which::AttestationFailure(failure) => failure.unwrap(),
-                _ => panic!("target mismatch must use the attestation arm"),
-            };
-            assert_eq!(
-                failure.get_code().unwrap(),
-                schema::AttestationFailureCode::TargetDefinitionMismatch
-            );
-            let subject = failure.get_subject().unwrap();
-            match subject.which().unwrap() {
-                schema::attestation_subject::Which::TargetDefinition(()) => {}
-                _ => panic!("target mismatch must use the target-definition subject"),
-            };
-            let payload = failure.get_payload().unwrap();
-            let mismatch = match payload.which().unwrap() {
-                schema::attestation_failure_payload::Which::ExpectedObserved(mismatch) => {
-                    mismatch.unwrap()
-                }
-                _ => panic!("target mismatch must carry both digests"),
-            };
-            assert_eq!(mismatch.get_expected().unwrap(), &[7; 32]);
-            assert_eq!(mismatch.get_observed().unwrap(), &[8; 32]);
-
-            let mut duplicate_policy = hub.reattest_request();
-            {
-                let mut params = duplicate_policy.get();
-                write_reattest(params.reborrow(), 2, 0, 1);
-                let mut rows = params.reborrow().get_load_policy().unwrap();
-                rows.reborrow()
-                    .get(1)
-                    .set_type_uuid(&request().load_policy[0].type_uuid.0);
-            }
-            let response = duplicate_policy.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            let failure = match result.which().unwrap() {
-                schema::reattest_result::Which::AttestationFailure(failure) => failure.unwrap(),
-                _ => panic!("duplicate policy row must use the attestation arm"),
-            };
-            assert_eq!(
-                failure.get_code().unwrap(),
-                schema::AttestationFailureCode::DuplicateType
-            );
-            let subject = match failure.get_subject().unwrap().which().unwrap() {
-                schema::attestation_subject::Which::SpecificType(subject) => subject.unwrap(),
-                _ => panic!("duplicate policy row must identify the repeated type"),
-            };
-            assert_eq!(
-                subject.get_type_uuid().unwrap().get_bytes().unwrap(),
-                &request().load_policy[0].type_uuid.0
-            );
-            assert_eq!(
-                subject.get_projection().unwrap(),
-                schema::AttestationProjection::Policy
-            );
-            let detail = match failure.get_payload().unwrap().which().unwrap() {
-                schema::attestation_failure_payload::Which::TableDetail(detail) => detail.unwrap(),
-                _ => panic!("duplicate policy row must carry table detail"),
-            };
-            assert_eq!(detail.get_index(), 1);
-            assert_eq!(detail.get_entry().unwrap().len(), 17);
-
-            let mut malformed_policy = hub.reattest_request();
-            {
-                let mut params = malformed_policy.get();
-                write_reattest(params.reborrow(), 2, 0, 1);
-                params
-                    .reborrow()
-                    .get_load_policy()
-                    .unwrap()
-                    .get(0)
-                    .set_type_uuid(&[4; 15]);
-            }
-            let response = malformed_policy.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            let failure = match result.which().unwrap() {
-                schema::reattest_result::Which::AttestationFailure(failure) => failure.unwrap(),
-                _ => panic!("malformed policy UUID must use the attestation arm"),
-            };
-            assert_eq!(
-                failure.get_code().unwrap(),
-                schema::AttestationFailureCode::MalformedField
-            );
-            let fixed = match failure.get_subject().unwrap().which().unwrap() {
-                schema::attestation_subject::Which::FixedField(fixed) => fixed.unwrap(),
-                _ => panic!("malformed policy UUID must identify its row field"),
-            };
-            assert!(matches!(
-                fixed.which().unwrap(),
-                schema::attestation_fixed_field_subject::Which::PolicyTypeUuid(0)
-            ));
-            let malformed = match failure.get_payload().unwrap().which().unwrap() {
-                schema::attestation_failure_payload::Which::MalformedField(detail) => {
-                    detail.unwrap()
-                }
-                _ => panic!("malformed policy UUID must carry the observed bytes"),
-            };
-            assert_eq!(malformed.get_expected_width(), 16);
-            assert_eq!(malformed.get_observed().unwrap(), &[4; 15]);
-
-            let mut overflow = hub.reattest_request();
-            write_reattest(overflow.get(), 2, u64::MAX, 0);
-            let response = overflow.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            match result.which().unwrap() {
-                schema::reattest_result::Which::AttestationGenerationOverflow(overflow) => {
-                    let overflow = overflow.unwrap();
-                    assert_eq!(overflow.get_code(), ATTESTATION_GENERATION_OVERFLOW_CODE);
-                    assert_eq!(overflow.get_base(), u64::MAX);
-                }
-                _ => panic!("generation overflow must have its dedicated arm"),
-            }
-
-            // Overflow did not mutate: base zero remains installable.
-            let mut valid = hub.reattest_request();
-            write_reattest(valid.get(), 2, 0, 1);
-            let response = valid.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            match result.which().unwrap() {
-                schema::reattest_result::Which::Success(success) => {
-                    assert_eq!(success.unwrap().get_installed_attestation_generation(), 1)
-                }
-                _ => panic!("expected successor installation"),
-            }
-
-            let mut stale = hub.reattest_request();
-            write_reattest(stale.get(), 3, 0, 1);
-            let response = stale.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            match result.which().unwrap() {
-                schema::reattest_result::Which::StaleAttestationBase(stale) => {
-                    let stale = stale.unwrap();
-                    assert_eq!(stale.get_code(), STALE_ATTESTATION_BASE_CODE);
-                    assert_eq!(stale.get_expected(), 1);
-                    assert_eq!(stale.get_observed(), 0);
-                }
-                _ => panic!("stale base must have its dedicated arm"),
-            }
-
-            server.replace_target(target_with_definition(8)).unwrap();
-            let mut fenced = hub.reattest_request();
-            write_reattest(fenced.get(), 3, 1, 2);
-            let response = fenced.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            match result.which().unwrap() {
-                schema::reattest_result::Which::ReconnectRequired(reconnect) => assert_eq!(
-                    reconnect.unwrap().get_reason().unwrap(),
-                    schema::ReconnectReason::TargetDefinitionChanged
-                ),
-                _ => panic!("target drift must reconnect without installing"),
             }
 
             drop(client);
@@ -2529,45 +1932,19 @@ fn typed_pipeline_diagnostic_codecs_reject_empty_and_noncanonical_tables() {
 }
 
 #[test]
-fn rpc_basis_decoder_authenticates_complete_policy_and_projection_fields() {
-    let request = request();
-    let encode = |digest: [u8; 32]| {
-        let mut message = capnp::message::Builder::new_default();
-        {
-            let mut root = message.init_root::<schema::rpc_basis_value::Builder<'_>>();
-            let mut stamp = root.reborrow().init_stamp();
-            stamp.set_instance(&[9; 16]);
-            stamp.set_version(17);
-            let mut policies = root
-                .reborrow()
-                .init_load_policy(request.load_policy.len() as u32);
-            for (index, row) in request.load_policy.iter().enumerate() {
-                let mut policy = policies.reborrow().get(index as u32);
-                policy.set_type_uuid(&row.type_uuid.0);
-                policy.set_build_only(row.build_only);
-            }
-            root.set_policy_digest(&digest);
-            root.set_policy_generation(18);
-            root.set_target_generation(19);
-            root.set_attestation_generation(20);
-            root.set_daemon_compiled_projection(&request.dsca.0);
-        }
-        message
-    };
-    let valid = encode(request.policy_digest);
+fn rpc_basis_decoder_authenticates_the_adopted_snapshot_stamp() {
+    let mut valid = capnp::message::Builder::new_default();
+    {
+        let mut root = valid.init_root::<schema::rpc_basis_value::Builder<'_>>();
+        let mut stamp = root.reborrow().init_stamp();
+        stamp.set_instance(&[9; 16]);
+        stamp.set_version(17);
+    }
     let adopted = RpcBasis {
         snapshot: SnapshotStamp {
             instance: StoreInstanceId([9; 16]),
             version: InputVersion(17),
         },
-        load_policy: Arc::new(LoadPolicyAttestation {
-            rows: request.load_policy.clone(),
-            digest: request.policy_digest,
-        }),
-        policy_generation: 18,
-        target_generation: 19,
-        attestation_generation: 20,
-        daemon_compiled_projection: request.dsca,
     };
     let decoded = distill_rpc::capnp_transport::decode_rpc_basis(
         valid
@@ -2576,14 +1953,15 @@ fn rpc_basis_decoder_authenticates_complete_policy_and_projection_fields() {
         &adopted,
     )
     .unwrap();
-    assert_eq!(decoded.snapshot.version, InputVersion(17));
-    assert_eq!(decoded.load_policy.rows, request.load_policy);
-    assert_eq!(decoded.policy_generation, 18);
-    assert_eq!(decoded.target_generation, 19);
-    assert_eq!(decoded.attestation_generation, 20);
-    assert_eq!(decoded.daemon_compiled_projection, request.dsca);
+    assert_eq!(decoded, adopted);
 
-    let invalid = encode([0; 32]);
+    let mut invalid = capnp::message::Builder::new_default();
+    {
+        let mut root = invalid.init_root::<schema::rpc_basis_value::Builder<'_>>();
+        let mut stamp = root.reborrow().init_stamp();
+        stamp.set_instance(&[8; 16]);
+        stamp.set_version(17);
+    }
     assert!(distill_rpc::capnp_transport::decode_rpc_basis(
         invalid
             .get_root_as_reader::<schema::rpc_basis_value::Reader<'_>>()

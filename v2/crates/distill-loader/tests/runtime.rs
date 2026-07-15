@@ -1,23 +1,13 @@
-use std::sync::Arc;
-
-use distill_core::id::{ContentHash, TypeUuid};
+use distill_core::id::ContentHash;
 use distill_loader::runtime::ManifestTransitionError;
 use distill_loader::{
     AdoptionId, AssetDeltaState, CompletionDisposition, ConnectionEpoch, HandleId, IoBasis,
-    LoadPolicyAttestation, LoadPolicyRow, ManifestEntry, ManifestHash, ManifestState,
-    OutstandingPurpose, RequestOwner, RequestTracker,
+    ManifestEntry, ManifestHash, ManifestState, OutstandingPurpose, RequestOwner, RequestTracker,
 };
 
 fn basis(seed: u8) -> IoBasis {
     IoBasis::Pack {
         manifest: ManifestHash([seed; 32]),
-        load_policy: Arc::new(
-            LoadPolicyAttestation::from_rows(vec![LoadPolicyRow {
-                type_uuid: TypeUuid([1; 16]),
-                build_only: false,
-            }])
-            .unwrap(),
-        ),
     }
 }
 

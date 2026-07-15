@@ -2,18 +2,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use distill_core::attestation::{CompiledTypeRow, CompiledTypeTable, RegistryExtrasV1};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{
-    IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo, RpcIoConfig, RuntimeAttestation,
+    IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo, RpcIoConfig, RuntimeTarget,
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, GameModuleEpoch,
-    LoadPolicyEntry, PathMutation, ServedClosureRow, Server, StoreInstanceId, StoredResolve,
-    TargetDefinition, TargetDefinitionHash,
+    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, PathMutation, Server,
+    StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
 };
-use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::WireNode;
@@ -31,32 +28,7 @@ fn fixture() -> Fixture {
     let asset = AssetUuid([1; 16]);
     let type_uuid = TypeUuid([2; 16]);
     let logical_hash = LogicalHash([3; 32]);
-    let runtime_row = CompiledTypeRow::new(
-        type_uuid,
-        logical_hash,
-        [4; 32],
-        false,
-        RegistryExtrasV1::default(),
-    )
-    .unwrap();
-    let mut rows = consumer_bootstrap_authority_v1().unwrap().rows().to_vec();
-    rows.push(runtime_row);
-    let compiled = CompiledTypeTable::canonical(rows).unwrap();
-    let policy = compiled
-        .rows
-        .iter()
-        .map(|row| LoadPolicyEntry {
-            type_uuid: row.type_uuid,
-            build_only: row.build_only,
-        })
-        .collect::<Vec<_>>();
-    let target = TargetDefinition::canonical(
-        "dev",
-        TargetDefinitionHash(TARGET_HASH),
-        compiled.rows.clone(),
-        policy.clone(),
-    )
-    .unwrap();
+    let target = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let server = Server::new(StoreInstanceId([5; 16]), vec![target]).unwrap();
 
     let wire = WireNode::Unit { offset: 0 };
@@ -89,16 +61,7 @@ fn fixture() -> Fixture {
             ArtifactPayload {
                 structural: Arc::from(complete[..structural_len].to_vec()),
                 blobs: vec![Arc::from(blob)],
-                encoded_type: type_uuid,
-                terminal_type: type_uuid,
-                closure_rows: vec![ServedClosureRow {
-                    asset,
-                    content_hash: hash,
-                    authored_type: type_uuid,
-                    encoded_type: type_uuid,
-                    terminal_type: type_uuid,
-                    load_edges: Vec::new(),
-                }],
+                load_edges: Vec::new(),
             },
         )
         .unwrap();
@@ -117,14 +80,7 @@ fn fixture() -> Fixture {
         })
         .unwrap();
 
-    let request = ConnectRequest::canonical(
-        GameModuleEpoch(1),
-        "dev",
-        TargetDefinitionHash(TARGET_HASH),
-        compiled.rows,
-        policy,
-    )
-    .unwrap();
+    let request = ConnectRequest::new("dev", TargetDefinitionHash(TARGET_HASH));
     Fixture {
         server,
         request,
@@ -151,18 +107,16 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         tokio::task::LocalSet::new().block_on(&runtime, async move {
             let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
             address_tx.send(listener.local_addr().unwrap()).unwrap();
-            listener.serve_one().await.unwrap();
+            let first = listener.accept_one().await.unwrap();
+            let second = listener.accept_one().await.unwrap();
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
         });
     });
     let address = address_rx.recv().unwrap();
-    let initial_attestation = RuntimeAttestation {
-        epoch: distill_loader::GameModuleEpoch(request.epoch.0),
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
         target_definition_hash: request.target_definition_hash.0,
-        compiled_types: CompiledTypeTable::from_canonical(
-            request.compiled_registry.clone(),
-            request.dsca,
-        )
-        .unwrap(),
     };
     let spool = tempfile::tempdir().unwrap();
     let mut io = RpcIo::connect_with_config(
@@ -175,38 +129,16 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         },
     )
     .unwrap();
-    io.reattest(initial_attestation.clone());
+    io.bind_target(target.clone());
     assert!(matches!(
         poll_until(&mut io, 1).as_slice(),
-        [IoEvent::Reattested {
-            basis: IoBasis::Rpc {
-                attestation_generation: 0,
-                ..
-            },
-            ..
-        }]
-    ));
-    let mut successor = initial_attestation;
-    successor.epoch = distill_loader::GameModuleEpoch(2);
-    io.reattest(successor);
-    assert!(matches!(
-        poll_until(&mut io, 1).as_slice(),
-        [IoEvent::Reattested {
-            basis: IoBasis::Rpc {
-                attestation_generation: 1,
-                ..
-            },
-            ..
-        }]
+        [IoEvent::TargetBound {
+            target: bound,
+            basis: IoBasis::Rpc { .. },
+        }] if bound == &target
     ));
     let basis = io.begin_sweep();
-    assert!(matches!(
-        &basis,
-        IoBasis::Rpc {
-            attestation_generation: 1,
-            ..
-        }
-    ));
+    assert!(matches!(&basis, IoBasis::Rpc { .. }));
 
     io.fetch(ReqId(10), hash, &basis);
     io.fetch(ReqId(11), hash, &basis);

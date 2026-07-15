@@ -21,17 +21,16 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{
     AssetDeltaState, AssetEvent, AssetQuery, AssetUuid, AuthoringEntryRole, AuthoringInspectResult,
     AuthoringInspection, AuthoringSnapshot, BundleFileHash, BundleUuid, ChunkStream,
-    CompiledAttestationDigest, CompiledTypeRow, ConfigurationPoison, ConfigurationStatus,
-    ConnectOutcome, ConnectRequest, ContentHash, Delta, DeltaStream, DriftedInput, GameModuleEpoch,
-    Hub, InputVersion, LayoutHash, LineageManifestClaimant, LineageRepair,
-    LineageRepairConnectOutcome, LineageRepairDestination, LineageRepairInspectOutcome,
-    LineageRepairInspection, LineageRepairInvalid, LineageRepairInvalidCode,
-    LineageRepairMutationOutcome, LineageRepairStale, LineageRepairStaleCode, LineageRepairState,
-    LineageRepairUnavailable, LoadPolicyEntry, MetadataAuthoringSnapshot, MetadataCall,
-    MetadataConnectOutcome, MetadataDiagnostics, MetadataEntry, MetadataHub, MetadataNamespaceCall,
-    MetadataReconnectReason, MetadataSnapshot, OccupiedLineageDestinationKind, PathResolveFailure,
-    PathResolveResult, ProgressStream, PureMetadataEntry, PureMetadataQuery, ReattestRequest,
-    ReconnectReason, RegistryExtrasDigest, RegistryExtrasV1, ResolveResult, Root, RpcBasis,
+    ConfigurationPoison, ConfigurationStatus, ConnectError, ConnectOutcome, ConnectRequest,
+    ContentHash, Delta, DeltaStream, DriftedInput, Hub, InputVersion, LayoutHash,
+    LineageManifestClaimant, LineageRepair, LineageRepairConnectOutcome, LineageRepairDestination,
+    LineageRepairInspectOutcome, LineageRepairInspection, LineageRepairInvalid,
+    LineageRepairInvalidCode, LineageRepairMutationOutcome, LineageRepairStale,
+    LineageRepairStaleCode, LineageRepairState, LineageRepairUnavailable,
+    MetadataAuthoringSnapshot, MetadataCall, MetadataConnectOutcome, MetadataDiagnostics,
+    MetadataEntry, MetadataHub, MetadataNamespaceCall, MetadataReconnectReason, MetadataSnapshot,
+    OccupiedLineageDestinationKind, PathResolveFailure, PathResolveResult, ProgressStream,
+    PureMetadataEntry, PureMetadataQuery, ReconnectReason, ResolveResult, Root, RpcBasis,
     RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId, TagSelector,
     TargetDefinitionHash, TypeUuid, VersionPoison, VersionPoisonV1,
 };
@@ -42,9 +41,8 @@ const WIRE_INVALID_UUID: u16 = 1001;
 const WIRE_INVALID_HASH: u16 = 1002;
 const WIRE_INVALID_INSTANCE: u16 = 1003;
 const WIRE_INVALID_UTF8: u16 = 1004;
-const WIRE_INVALID_ATTESTATION: u16 = 1005;
+const WIRE_INVALID_VALUE: u16 = 1005;
 const RPC_FAILURE: u16 = 3000;
-const UNSUPPORTED_METHOD: u16 = 4000;
 
 #[derive(Debug)]
 pub enum TransportError {
@@ -194,13 +192,6 @@ impl CapnpClient {
         &self,
         request: &ConnectRequest,
     ) -> Result<RemoteConnectOutcome, capnp::Error> {
-        crate::attestation::validate_attestation_shape(
-            &request.compiled_registry,
-            request.dsca,
-            &request.load_policy,
-            request.policy_digest,
-        )
-        .map_err(|error| capnp::Error::failed(format!("invalid connect attestation: {error}")))?;
         let mut call = self.root.connect_request();
         write_connect_request(call.get(), request);
         let response = call.send().promise.await?;
@@ -225,15 +216,10 @@ pub enum RemoteConnectOutcome {
     Connected {
         hub: schema::hub::Client,
         instance: StoreInstanceId,
-        policy_generation: u64,
-        target_generation: u64,
-        attestation_generation: u64,
-        load_policy: std::sync::Arc<crate::LoadPolicyAttestation>,
-        daemon_compiled_projection: CompiledAttestationDigest,
     },
     ConfigurationPoisoned(ConfigurationPoison),
     PipelineUnavailable(crate::PipelineUnavailableDiagnostic),
-    AttestationFailure(crate::AttestationFailure),
+    TargetFailure(ConnectError),
     ProtocolFailure {
         expected: u32,
         observed: u32,
@@ -265,20 +251,9 @@ pub enum RemoteMetadataOutcome {
 impl fmt::Debug for RemoteConnectOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connected {
-                instance,
-                policy_generation,
-                target_generation,
-                attestation_generation,
-                daemon_compiled_projection,
-                ..
-            } => f
+            Self::Connected { instance, .. } => f
                 .debug_struct("Connected")
                 .field("instance", instance)
-                .field("policy_generation", policy_generation)
-                .field("target_generation", target_generation)
-                .field("attestation_generation", attestation_generation)
-                .field("daemon_compiled_projection", daemon_compiled_projection)
                 .finish_non_exhaustive(),
             Self::ConfigurationPoisoned(poison) => f
                 .debug_tuple("ConfigurationPoisoned")
@@ -288,9 +263,7 @@ impl fmt::Debug for RemoteConnectOutcome {
                 .debug_tuple("PipelineUnavailable")
                 .field(diagnostic)
                 .finish(),
-            Self::AttestationFailure(failure) => {
-                f.debug_tuple("AttestationFailure").field(failure).finish()
-            }
+            Self::TargetFailure(failure) => f.debug_tuple("TargetFailure").field(failure).finish(),
             Self::ProtocolFailure {
                 expected,
                 observed,
@@ -347,10 +320,6 @@ impl schema::root::Server for RootService {
                     write_wire_error(result.init_error(), &error);
                     return Ok(());
                 }
-                Err(DecodeError::Attestation(failure)) => {
-                    write_attestation_failure(result.init_attestation_failure(), &failure);
-                    return Ok(());
-                }
                 Err(DecodeError::Capnp(error)) => return Err(error),
             };
             match self.root.connect(request) {
@@ -360,17 +329,6 @@ impl schema::root::Server for RootService {
                         capnp_rpc::new_client(HubService { hub: connected.hub });
                     output.set_hub(hub);
                     output.set_instance(&connected.instance.0);
-                    output.set_policy_generation(connected.policy_generation);
-                    output.set_target_generation(connected.target_generation);
-                    output.set_attestation_generation(connected.attestation_generation);
-                    output.set_daemon_compiled_projection(&connected.daemon_compiled_projection.0);
-                    write_load_policy_rows(
-                        output
-                            .reborrow()
-                            .init_load_policy(connected.load_policy.rows.len() as u32),
-                        &connected.load_policy.rows,
-                    );
-                    output.set_policy_digest(&connected.load_policy.digest);
                 }
                 ConnectOutcome::ConfigurationPoisoned(poison) => {
                     write_poison(result.init_configuration_poisoned(), &poison);
@@ -667,7 +625,7 @@ impl schema::hub::Server for HubService {
                 Err(error) => {
                     write_error(
                         results.get().init_result().init_error(),
-                        WIRE_INVALID_ATTESTATION,
+                        WIRE_INVALID_VALUE,
                         &format!("invalid authoring operations: {error}"),
                     );
                     return Ok(());
@@ -702,7 +660,7 @@ impl schema::hub::Server for HubService {
                 Err(error) => {
                     write_error(
                         results.get().init_result().init_error(),
-                        WIRE_INVALID_ATTESTATION,
+                        WIRE_INVALID_VALUE,
                         &format!("invalid import request: {error}"),
                     );
                     return Ok(());
@@ -764,7 +722,7 @@ impl schema::hub::Server for HubService {
                 Err(error) => {
                     write_error(
                         results.get().init_result().init_error(),
-                        WIRE_INVALID_ATTESTATION,
+                        WIRE_INVALID_VALUE,
                         &format!("invalid long-running operation: {error}"),
                     );
                     return Ok(());
@@ -825,40 +783,6 @@ impl schema::hub::Server for HubService {
                 }
             };
             write_data_result(results.get().init_result(), self.hub.wire_tree(hash));
-            Ok(())
-        }
-    }
-
-    fn reattest(
-        self: capnp::capability::Rc<Self>,
-        params: schema::hub::ReattestParams,
-        mut results: schema::hub::ReattestResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            let reader = params.get()?;
-            let request = match decode_reattest_request(reader) {
-                Ok(request) => request,
-                Err(DecodeError::Wire(error)) => {
-                    write_wire_error(results.get().init_result().init_error(), &error);
-                    return Ok(());
-                }
-                Err(DecodeError::Attestation(failure)) => {
-                    write_attestation_failure(
-                        results.get().init_result().init_attestation_failure(),
-                        &failure,
-                    );
-                    return Ok(());
-                }
-                Err(DecodeError::Capnp(error)) => return Err(error),
-            };
-            write_reattest_result(results.get().init_result(), self.hub.reattest(request));
             Ok(())
         }
     }
@@ -1047,111 +971,6 @@ impl schema::snapshot::Server for SnapshotService {
                 return Ok(());
             }
             write_snapshot_result(results.get().init_result(), self.snapshot.refresh());
-            Ok(())
-        }
-    }
-
-    fn reserved5(
-        self: capnp::capability::Rc<Self>,
-        _params: schema::snapshot::Reserved5Params,
-        mut results: schema::snapshot::Reserved5Results,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            write_unsupported(
-                results.get().init_result().init_error(),
-                "Snapshot.reserved5",
-            );
-            Ok(())
-        }
-    }
-
-    fn reserved6(
-        self: capnp::capability::Rc<Self>,
-        _params: schema::snapshot::Reserved6Params,
-        mut results: schema::snapshot::Reserved6Results,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            write_unsupported(
-                results.get().init_result().init_error(),
-                "Snapshot.reserved6",
-            );
-            Ok(())
-        }
-    }
-
-    fn reserved7(
-        self: capnp::capability::Rc<Self>,
-        _params: schema::snapshot::Reserved7Params,
-        mut results: schema::snapshot::Reserved7Results,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            write_unsupported(
-                results.get().init_result().init_error(),
-                "Snapshot.reserved7",
-            );
-            Ok(())
-        }
-    }
-
-    fn reserved8(
-        self: capnp::capability::Rc<Self>,
-        _params: schema::snapshot::Reserved8Params,
-        mut results: schema::snapshot::Reserved8Results,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            write_unsupported(
-                results.get().init_result().init_error(),
-                "Snapshot.reserved8",
-            );
-            Ok(())
-        }
-    }
-
-    fn reserved9(
-        self: capnp::capability::Rc<Self>,
-        _params: schema::snapshot::Reserved9Params,
-        mut results: schema::snapshot::Reserved9Results,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.snapshot.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            write_unsupported(
-                results.get().init_result().init_error(),
-                "Snapshot.reserved9",
-            );
             Ok(())
         }
     }
@@ -1605,8 +1424,8 @@ struct WireFailure {
 impl From<capnp::Error> for WireFailure {
     fn from(error: capnp::Error) -> Self {
         Self {
-            code: WIRE_INVALID_ATTESTATION,
-            message: format!("wire field could not be read: {error}"),
+            code: WIRE_INVALID_VALUE,
+            message: error.to_string(),
         }
     }
 }
@@ -1614,7 +1433,6 @@ impl From<capnp::Error> for WireFailure {
 #[derive(Debug)]
 enum DecodeError {
     Wire(WireFailure),
-    Attestation(crate::AttestationFailure),
     Capnp(capnp::Error),
 }
 
@@ -1628,222 +1446,14 @@ fn decode_connect_request(
     reader: schema::root::connect_params::Reader<'_>,
 ) -> Result<ConnectRequest, DecodeError> {
     let target = decode_text(reader.get_target()?, "target").map_err(DecodeError::Wire)?;
-    let target_definition_hash = TargetDefinitionHash(decode_attestation_fixed(
-        reader.get_target_def_hash()?,
-        crate::AttestationFixedFieldSubject::TargetDefHash,
-        "targetDefHash",
-    )?);
-    let compiled_registry = decode_compiled(reader.get_compiled_registry()?)?;
-    let dsca = CompiledAttestationDigest(decode_attestation_fixed(
-        reader.get_dsca_aggregate()?,
-        crate::AttestationFixedFieldSubject::DscaAggregate,
-        "dscaAggregate",
-    )?);
-    let load_policy = decode_policies(reader.get_load_policy()?)?;
-    let policy_digest = decode_attestation_fixed(
-        reader.get_policy_digest()?,
-        crate::AttestationFixedFieldSubject::PolicyDigest,
-        "policyDigest",
-    )?;
+    let target_definition_hash = TargetDefinitionHash(
+        decode_hash(reader.get_target_def_hash()?, "targetDefHash").map_err(DecodeError::Wire)?,
+    );
     Ok(ConnectRequest {
-        epoch: GameModuleEpoch(reader.get_game_module_epoch()),
         target,
         target_definition_hash,
-        compiled_registry,
-        dsca,
-        load_policy,
-        policy_digest,
         protocol: reader.get_protocol(),
     })
-}
-
-fn decode_reattest_request(
-    reader: schema::hub::reattest_params::Reader<'_>,
-) -> Result<ReattestRequest, DecodeError> {
-    Ok(ReattestRequest {
-        epoch: GameModuleEpoch(reader.get_epoch()),
-        base_attestation_generation: reader.get_base_attestation_generation(),
-        successor_attestation_generation: reader.get_successor_attestation_generation(),
-        target_definition_hash: TargetDefinitionHash(decode_attestation_fixed(
-            reader.get_target_def_hash()?,
-            crate::AttestationFixedFieldSubject::TargetDefHash,
-            "targetDefHash",
-        )?),
-        compiled_registry: decode_compiled(reader.get_compiled_registry()?)?,
-        dsca: CompiledAttestationDigest(decode_attestation_fixed(
-            reader.get_dsca_aggregate()?,
-            crate::AttestationFixedFieldSubject::DscaAggregate,
-            "dscaAggregate",
-        )?),
-        load_policy: decode_policies(reader.get_load_policy()?)?,
-        policy_digest: decode_attestation_fixed(
-            reader.get_policy_digest()?,
-            crate::AttestationFixedFieldSubject::PolicyDigest,
-            "policyDigest",
-        )?,
-    })
-}
-
-fn decode_attestation_fixed<const N: usize>(
-    observed: &[u8],
-    subject: crate::AttestationFixedFieldSubject,
-    field: &str,
-) -> Result<[u8; N], DecodeError> {
-    observed.try_into().map_err(|_| {
-        DecodeError::Attestation(crate::AttestationFailure::malformed_field(
-            subject,
-            N as u32,
-            observed.to_vec(),
-            format!("{field} must be exactly {N} bytes"),
-        ))
-    })
-}
-
-fn decode_compiled(
-    rows: capnp::struct_list::Reader<'_, schema::compiled_type_entry::Owned>,
-) -> Result<Vec<CompiledTypeRow>, DecodeError> {
-    let mut decoded = Vec::with_capacity(rows.len() as usize);
-    let mut previous = None;
-    for (index, row) in rows.iter().enumerate() {
-        let received = encode_received_compiled_row(row)?;
-        let malformed = |message: String| {
-            DecodeError::Attestation(crate::AttestationFailure::malformed_table(
-                crate::AttestationProjection::CompiledRegistry,
-                index as u32,
-                received.clone(),
-                message,
-            ))
-        };
-        let raw_type_uuid = row.get_type_uuid()?;
-        let raw_logical_hash = row.get_logical_hash()?;
-        let raw_native_layout_digest = row.get_native_layout_digest()?;
-        let raw_registry_extras_digest = row.get_registry_extras_digest()?;
-        let type_uuid = decode_attestation_fixed(
-            raw_type_uuid,
-            crate::AttestationFixedFieldSubject::CompiledTypeUuid(index as u32),
-            &format!("compiledRegistry[{index}].typeUuid"),
-        )?;
-        let logical_hash = decode_attestation_fixed(
-            raw_logical_hash,
-            crate::AttestationFixedFieldSubject::CompiledLogicalHash(index as u32),
-            &format!("compiledRegistry[{index}].logicalHash"),
-        )?;
-        let native_layout_digest = decode_attestation_fixed(
-            raw_native_layout_digest,
-            crate::AttestationFixedFieldSubject::CompiledNativeLayoutDigest(index as u32),
-            &format!("compiledRegistry[{index}].nativeLayoutDigest"),
-        )?;
-        let registry_extras_digest = decode_attestation_fixed(
-            raw_registry_extras_digest,
-            crate::AttestationFixedFieldSubject::CompiledRegistryExtrasDigest(index as u32),
-            &format!("compiledRegistry[{index}].registryExtrasDigest"),
-        )?;
-        let registry_extras =
-            RegistryExtrasV1::decode(row.get_registry_extras()?).map_err(|error| {
-                malformed(format!(
-                    "compiledRegistry[{index}].registryExtras is invalid: {error}"
-                ))
-            })?;
-        let value = CompiledTypeRow {
-            type_uuid: TypeUuid(type_uuid),
-            logical_hash: crate::LogicalHash(logical_hash),
-            native_layout_digest,
-            build_only: row.get_build_only(),
-            registry_extras_digest: RegistryExtrasDigest(registry_extras_digest),
-            registry_extras,
-        };
-        value.validate().map_err(|error| {
-            malformed(format!("compiledRegistry[{index}] row is invalid: {error}"))
-        })?;
-        let canonical_entry = value
-            .encode()
-            .expect("a validated compiled row must encode canonically");
-        if previous == Some(value.type_uuid) {
-            return Err(DecodeError::Attestation(
-                crate::AttestationFailure::duplicate_type(
-                    value.type_uuid,
-                    crate::AttestationProjection::CompiledRegistry,
-                    index as u32,
-                    canonical_entry,
-                    format!("compiledRegistry[{index}] repeats a TypeUuid"),
-                ),
-            ));
-        }
-        if previous.is_some_and(|previous| previous > value.type_uuid) {
-            return Err(malformed(format!(
-                "compiledRegistry[{index}] is not strictly TypeUuid-sorted"
-            )));
-        }
-        previous = Some(value.type_uuid);
-        decoded.push(value);
-    }
-    Ok(decoded)
-}
-
-fn decode_policies(
-    rows: capnp::struct_list::Reader<'_, schema::load_policy_entry::Owned>,
-) -> Result<Vec<LoadPolicyEntry>, DecodeError> {
-    let mut decoded = Vec::with_capacity(rows.len() as usize);
-    let mut previous = None;
-    for (index, row) in rows.iter().enumerate() {
-        let raw_uuid = row.get_type_uuid()?;
-        let mut received = raw_uuid.to_vec();
-        received.push(u8::from(row.get_build_only()));
-        let malformed = |message: String| {
-            DecodeError::Attestation(crate::AttestationFailure::malformed_table(
-                crate::AttestationProjection::Policy,
-                index as u32,
-                received.clone(),
-                message,
-            ))
-        };
-        let value = LoadPolicyEntry {
-            type_uuid: TypeUuid(decode_attestation_fixed(
-                raw_uuid,
-                crate::AttestationFixedFieldSubject::PolicyTypeUuid(index as u32),
-                &format!("loadPolicy[{index}].typeUuid"),
-            )?),
-            build_only: row.get_build_only(),
-        };
-        if previous == Some(value.type_uuid) {
-            return Err(DecodeError::Attestation(
-                crate::AttestationFailure::duplicate_type(
-                    value.type_uuid,
-                    crate::AttestationProjection::Policy,
-                    index as u32,
-                    received,
-                    format!("loadPolicy[{index}] repeats a TypeUuid"),
-                ),
-            ));
-        }
-        if previous.is_some_and(|previous| previous > value.type_uuid) {
-            return Err(malformed(format!(
-                "loadPolicy[{index}] is not strictly TypeUuid-sorted"
-            )));
-        }
-        previous = Some(value.type_uuid);
-        decoded.push(value);
-    }
-    Ok(decoded)
-}
-
-fn encode_received_compiled_row(
-    row: schema::compiled_type_entry::Reader<'_>,
-) -> Result<Vec<u8>, capnp::Error> {
-    let fields = [
-        row.get_type_uuid()?,
-        row.get_logical_hash()?,
-        row.get_native_layout_digest()?,
-        row.get_registry_extras_digest()?,
-        row.get_registry_extras()?,
-    ];
-    let mut encoded = Vec::new();
-    for field in fields {
-        encoded.extend_from_slice(&(field.len() as u32).to_le_bytes());
-        encoded.extend_from_slice(field);
-    }
-    encoded.push(u8::from(row.get_build_only()));
-    Ok(encoded)
 }
 
 fn decode_uuid_list(
@@ -2104,7 +1714,7 @@ fn decode_pure_metadata_query(
         "q.normalizedPathPrefix",
     )?;
     let role = reader.get_role().map_err(|error| WireFailure {
-        code: WIRE_INVALID_ATTESTATION,
+        code: WIRE_INVALID_VALUE,
         message: format!("q.role is invalid: {error}"),
     })?;
 
@@ -2142,7 +1752,7 @@ fn decode_pure_metadata_query(
         None
     } else {
         return Err(WireFailure {
-            code: WIRE_INVALID_ATTESTATION,
+            code: WIRE_INVALID_VALUE,
             message: "q.role has non-default unused payload".to_owned(),
         });
     };
@@ -2223,7 +1833,7 @@ fn decode_optional_bool(
     reader: schema::optional_bool::Reader<'_>,
 ) -> Result<Option<bool>, WireFailure> {
     match reader.which().map_err(|error| WireFailure {
-        code: WIRE_INVALID_ATTESTATION,
+        code: WIRE_INVALID_VALUE,
         message: format!("query.authoringOnly selector is invalid: {error}"),
     })? {
         schema::optional_bool::Which::Absent(()) => Ok(None),
@@ -2310,49 +1920,7 @@ fn write_connect_request(
 ) {
     output.set_target(request.target.as_str());
     output.set_target_def_hash(&request.target_definition_hash.0);
-    {
-        let mut rows = output
-            .reborrow()
-            .init_compiled_registry(request.compiled_registry.len() as u32);
-        for (index, row) in request.compiled_registry.iter().enumerate() {
-            let mut item = rows.reborrow().get(index as u32);
-            item.set_type_uuid(&row.type_uuid.0);
-            item.set_logical_hash(&row.logical_hash.0);
-            item.set_native_layout_digest(&row.native_layout_digest);
-            item.set_build_only(row.build_only);
-            item.set_registry_extras_digest(&row.registry_extras_digest.0);
-            item.set_registry_extras(
-                &row.registry_extras
-                    .encode()
-                    .expect("validated ConnectRequest carries canonical DSRE"),
-            );
-        }
-    }
-    output.set_dsca_aggregate(&request.dsca.0);
-    {
-        let mut rows = output
-            .reborrow()
-            .init_load_policy(request.load_policy.len() as u32);
-        for (index, row) in request.load_policy.iter().enumerate() {
-            let mut item = rows.reborrow().get(index as u32);
-            item.set_type_uuid(&row.type_uuid.0);
-            item.set_build_only(row.build_only);
-        }
-    }
-    output.set_policy_digest(&request.policy_digest);
     output.set_protocol(request.protocol);
-    output.set_game_module_epoch(request.epoch.0);
-}
-
-fn write_load_policy_rows(
-    mut output: capnp::struct_list::Builder<'_, schema::load_policy_entry::Owned>,
-    rows: &[LoadPolicyEntry],
-) {
-    for (index, row) in rows.iter().enumerate() {
-        let mut item = output.reborrow().get(index as u32);
-        item.set_type_uuid(&row.type_uuid.0);
-        item.set_build_only(row.build_only);
-    }
 }
 
 fn decode_connect_response(
@@ -2368,46 +1936,9 @@ fn decode_connect_response(
             let connected = connected?;
             let instance = decode_instance(connected.get_instance()?, "instance")
                 .map_err(|error| capnp::Error::failed(error.message))?;
-            let rows = decode_policies(connected.get_load_policy()?).map_err(|error| {
-                capnp::Error::failed(format!("invalid server load policy: {error:?}"))
-            })?;
-            let digest = decode_hash(connected.get_policy_digest()?, "policyDigest")
-                .map_err(|error| capnp::Error::failed(error.message))?;
-            let expected = crate::compute_policy_digest(&rows).map_err(|error| {
-                capnp::Error::failed(format!("invalid server load policy: {error}"))
-            })?;
-            if digest != expected {
-                return Err(capnp::Error::failed(
-                    "server load policy digest does not authenticate its rows".to_owned(),
-                ));
-            }
-            if rows != request.load_policy || digest != request.policy_digest {
-                return Err(capnp::Error::failed(
-                    "server connect success does not cover the exact requested accepted set"
-                        .to_owned(),
-                ));
-            }
-            let daemon_compiled_projection = CompiledAttestationDigest(
-                decode_hash(
-                    connected.get_daemon_compiled_projection()?,
-                    "daemonCompiledProjection",
-                )
-                .map_err(|error| capnp::Error::failed(error.message))?,
-            );
-            if daemon_compiled_projection != request.dsca {
-                return Err(capnp::Error::failed(
-                    "server connect success compiled projection differs from requested A"
-                        .to_owned(),
-                ));
-            }
             Ok(RemoteConnectOutcome::Connected {
                 hub: connected.get_hub()?,
                 instance: StoreInstanceId(instance),
-                policy_generation: connected.get_policy_generation(),
-                target_generation: connected.get_target_generation(),
-                attestation_generation: connected.get_attestation_generation(),
-                load_policy: std::sync::Arc::new(crate::LoadPolicyAttestation { rows, digest }),
-                daemon_compiled_projection,
             })
         }
         Which::ConfigurationPoisoned(poison) => Ok(RemoteConnectOutcome::ConfigurationPoisoned(
@@ -2437,10 +1968,38 @@ fn decode_connect_response(
             };
             Ok(RemoteConnectOutcome::PipelineUnavailable(diagnostic))
         }
-        Which::AttestationFailure(failure) => {
-            let failure = read_attestation_failure(failure?)?;
-            validate_connect_failure_context(&failure, request)?;
-            Ok(RemoteConnectOutcome::AttestationFailure(failure))
+        Which::TargetFailure(failure) => {
+            let failure = failure?;
+            let failure = match failure.get_code()? {
+                schema::TargetFailureCode::UnknownTarget => {
+                    if !failure.get_expected()?.is_empty() || !failure.get_observed()?.is_empty() {
+                        return Err(capnp::Error::failed(
+                            "unknown-target failure must not carry hashes".to_owned(),
+                        ));
+                    }
+                    ConnectError::UnknownTarget {
+                        target: request.target.clone(),
+                    }
+                }
+                schema::TargetFailureCode::DefinitionMismatch => {
+                    let expected = TargetDefinitionHash(
+                        decode_hash(failure.get_expected()?, "targetFailure.expected")
+                            .map_err(|error| capnp::Error::failed(error.message))?,
+                    );
+                    let got = TargetDefinitionHash(
+                        decode_hash(failure.get_observed()?, "targetFailure.observed")
+                            .map_err(|error| capnp::Error::failed(error.message))?,
+                    );
+                    if got != request.target_definition_hash {
+                        return Err(capnp::Error::failed(
+                            "server definition mismatch does not describe the submitted hash"
+                                .to_owned(),
+                        ));
+                    }
+                    ConnectError::TargetDefinitionMismatch { expected, got }
+                }
+            };
+            Ok(RemoteConnectOutcome::TargetFailure(failure))
         }
         Which::ProtocolFailure(failure) => {
             let failure = failure?;
@@ -2566,261 +2125,6 @@ pub fn decode_authoring_inspection(
         },
         value: authored_value,
     })
-}
-
-pub(crate) fn read_attestation_failure(
-    failure: schema::attestation_failure::Reader<'_>,
-) -> Result<crate::AttestationFailure, capnp::Error> {
-    use schema::attestation_subject::Which;
-    let subject = failure.get_subject()?;
-    let subject = match subject
-        .which()
-        .map_err(|error| capnp::Error::failed(error.to_string()))?
-    {
-        Which::SpecificType(value) => {
-            let value = value?;
-            crate::AttestationSubject::SpecificType {
-                type_uuid: TypeUuid(
-                    decode_uuid(
-                        value.get_type_uuid()?.get_bytes()?,
-                        "attestationFailure.subject.specificType.typeUuid",
-                    )
-                    .map_err(|error| capnp::Error::failed(error.message))?,
-                ),
-                projection: match value.get_projection()? {
-                    schema::AttestationProjection::CompiledRegistry => {
-                        crate::AttestationProjection::CompiledRegistry
-                    }
-                    schema::AttestationProjection::Policy => crate::AttestationProjection::Policy,
-                },
-            }
-        }
-        Which::TargetDefinition(()) => crate::AttestationSubject::TargetDefinition,
-        Which::CompiledRegistryTable(()) => crate::AttestationSubject::CompiledRegistryTable,
-        Which::CompiledRegistryAggregate(()) => {
-            crate::AttestationSubject::CompiledRegistryAggregate
-        }
-        Which::PolicyProjection(()) => crate::AttestationSubject::PolicyProjection,
-        Which::BootstrapAuthority(()) => crate::AttestationSubject::BootstrapAuthority,
-        Which::FixedField(value) => {
-            use schema::attestation_fixed_field_subject::Which as FixedWhich;
-            let value = value?;
-            let fixed = match value
-                .which()
-                .map_err(|error| capnp::Error::failed(error.to_string()))?
-            {
-                FixedWhich::TargetDefHash(()) => crate::AttestationFixedFieldSubject::TargetDefHash,
-                FixedWhich::DscaAggregate(()) => crate::AttestationFixedFieldSubject::DscaAggregate,
-                FixedWhich::PolicyDigest(()) => crate::AttestationFixedFieldSubject::PolicyDigest,
-                FixedWhich::CompiledTypeUuid(index) => {
-                    crate::AttestationFixedFieldSubject::CompiledTypeUuid(index)
-                }
-                FixedWhich::CompiledLogicalHash(index) => {
-                    crate::AttestationFixedFieldSubject::CompiledLogicalHash(index)
-                }
-                FixedWhich::CompiledNativeLayoutDigest(index) => {
-                    crate::AttestationFixedFieldSubject::CompiledNativeLayoutDigest(index)
-                }
-                FixedWhich::CompiledRegistryExtrasDigest(index) => {
-                    crate::AttestationFixedFieldSubject::CompiledRegistryExtrasDigest(index)
-                }
-                FixedWhich::PolicyTypeUuid(index) => {
-                    crate::AttestationFixedFieldSubject::PolicyTypeUuid(index)
-                }
-            };
-            crate::AttestationSubject::FixedField(fixed)
-        }
-    };
-    let code = match failure.get_code()? {
-        schema::AttestationFailureCode::MalformedTable => {
-            crate::AttestationFailureCode::MalformedTable
-        }
-        schema::AttestationFailureCode::DuplicateType => {
-            crate::AttestationFailureCode::DuplicateType
-        }
-        schema::AttestationFailureCode::MissingType => crate::AttestationFailureCode::MissingType,
-        schema::AttestationFailureCode::LogicalHashMismatch => {
-            crate::AttestationFailureCode::LogicalHashMismatch
-        }
-        schema::AttestationFailureCode::NativeLayoutMismatch => {
-            crate::AttestationFailureCode::NativeLayoutMismatch
-        }
-        schema::AttestationFailureCode::BuildOnlyMismatch => {
-            crate::AttestationFailureCode::BuildOnlyMismatch
-        }
-        schema::AttestationFailureCode::RegistryExtrasMismatch => {
-            crate::AttestationFailureCode::RegistryExtrasMismatch
-        }
-        schema::AttestationFailureCode::CompiledRegistryAggregateMismatch => {
-            crate::AttestationFailureCode::CompiledRegistryAggregateMismatch
-        }
-        schema::AttestationFailureCode::TargetDefinitionMismatch => {
-            crate::AttestationFailureCode::TargetDefinitionMismatch
-        }
-        schema::AttestationFailureCode::PolicyProjectionMismatch => {
-            crate::AttestationFailureCode::PolicyProjectionMismatch
-        }
-        schema::AttestationFailureCode::BootstrapAuthorityMismatch => {
-            crate::AttestationFailureCode::BootstrapAuthorityMismatch
-        }
-        schema::AttestationFailureCode::MalformedField => {
-            crate::AttestationFailureCode::MalformedField
-        }
-    };
-    let payload = failure.get_payload()?;
-    let payload = match payload
-        .which()
-        .map_err(|error| capnp::Error::failed(error.to_string()))?
-    {
-        schema::attestation_failure_payload::Which::None(()) => {
-            crate::AttestationFailurePayload::None
-        }
-        schema::attestation_failure_payload::Which::ExpectedObserved(value) => {
-            let value = value?;
-            crate::AttestationFailurePayload::ExpectedObserved {
-                expected: value.get_expected()?.to_vec(),
-                observed: value.get_observed()?.to_vec(),
-            }
-        }
-        schema::attestation_failure_payload::Which::TableDetail(value) => {
-            let value = value?;
-            crate::AttestationFailurePayload::TableDetail {
-                index: value.get_index(),
-                entry: value.get_entry()?.to_vec(),
-            }
-        }
-        schema::attestation_failure_payload::Which::MalformedField(value) => {
-            let value = value?;
-            crate::AttestationFailurePayload::MalformedField {
-                expected_width: value.get_expected_width(),
-                observed: value.get_observed()?.to_vec(),
-            }
-        }
-    };
-    let message = decode_text(failure.get_message()?, "attestationFailure.message")
-        .map_err(|error| capnp::Error::failed(error.message))?;
-    crate::AttestationFailure::from_wire(code, subject, payload, message).ok_or_else(|| {
-        capnp::Error::failed("noncanonical attestation code/subject combination".to_owned())
-    })
-}
-
-fn validate_connect_failure_context(
-    failure: &crate::AttestationFailure,
-    request: &ConnectRequest,
-) -> Result<(), capnp::Error> {
-    use crate::{
-        AttestationFailureCode as Code, AttestationFailurePayload as Payload,
-        AttestationProjection as Projection, AttestationSubject as Subject,
-    };
-    let eo = match failure.payload() {
-        Payload::ExpectedObserved { observed, .. } => Some(observed.as_slice()),
-        _ => None,
-    };
-    let valid = match (failure.code(), failure.subject()) {
-        // CapnpClient emits a canonical request, so claims that its request
-        // was malformed or duplicated are necessarily an untrusted reply.
-        (Code::MalformedTable | Code::MalformedField | Code::DuplicateType, _) => false,
-        (Code::TargetDefinitionMismatch, Subject::TargetDefinition) => {
-            eo == Some(request.target_definition_hash.0.as_slice())
-        }
-        (Code::CompiledRegistryAggregateMismatch, Subject::CompiledRegistryAggregate) => {
-            eo == Some(request.dsca.0.as_slice())
-        }
-        (Code::PolicyProjectionMismatch, Subject::PolicyProjection) => {
-            eo == Some(request.policy_digest.as_slice())
-        }
-        (Code::BootstrapAuthorityMismatch, Subject::BootstrapAuthority) => {
-            let observed = encode_client_bootstrap_projection(&request.compiled_registry);
-            eo == Some(observed.as_slice())
-        }
-        (
-            code,
-            Subject::SpecificType {
-                type_uuid,
-                projection,
-            },
-        ) => match (code, projection) {
-            (Code::MissingType, Projection::CompiledRegistry) => request
-                .compiled_registry
-                .binary_search_by_key(type_uuid, |row| row.type_uuid)
-                .is_ok(),
-            (Code::MissingType, Projection::Policy) => request
-                .load_policy
-                .binary_search_by_key(type_uuid, |row| row.type_uuid)
-                .is_ok(),
-            (Code::LogicalHashMismatch, Projection::CompiledRegistry) => request
-                .compiled_registry
-                .iter()
-                .find(|row| row.type_uuid == *type_uuid)
-                .is_some_and(|row| eo == Some(row.logical_hash.0.as_slice())),
-            (Code::NativeLayoutMismatch, Projection::CompiledRegistry) => request
-                .compiled_registry
-                .iter()
-                .find(|row| row.type_uuid == *type_uuid)
-                .is_some_and(|row| eo == Some(row.native_layout_digest.as_slice())),
-            (Code::BuildOnlyMismatch, Projection::CompiledRegistry) => request
-                .compiled_registry
-                .iter()
-                .find(|row| row.type_uuid == *type_uuid)
-                .is_some_and(|row| eo == Some([u8::from(row.build_only)].as_slice())),
-            (Code::BuildOnlyMismatch, Projection::Policy) => request
-                .load_policy
-                .iter()
-                .find(|row| row.type_uuid == *type_uuid)
-                .is_some_and(|row| eo == Some([u8::from(row.build_only)].as_slice())),
-            (Code::RegistryExtrasMismatch, Projection::CompiledRegistry) => request
-                .compiled_registry
-                .iter()
-                .find(|row| row.type_uuid == *type_uuid)
-                .and_then(|row| row.registry_extras.encode().ok())
-                .is_some_and(|observed| eo == Some(observed.as_slice())),
-            _ => false,
-        },
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(capnp::Error::failed(
-            "server attestation failure does not describe the exact submitted request".to_owned(),
-        ))
-    }
-}
-
-pub(crate) fn validate_reattest_failure_context(
-    failure: &crate::AttestationFailure,
-    request: &ReattestRequest,
-) -> Result<(), capnp::Error> {
-    validate_connect_failure_context(
-        failure,
-        &ConnectRequest {
-            epoch: request.epoch,
-            target: String::new(),
-            target_definition_hash: request.target_definition_hash,
-            compiled_registry: request.compiled_registry.clone(),
-            dsca: request.dsca,
-            load_policy: request.load_policy.clone(),
-            policy_digest: request.policy_digest,
-            protocol: crate::PROTOCOL_VERSION,
-        },
-    )
-}
-
-fn encode_client_bootstrap_projection(rows: &[CompiledTypeRow]) -> Vec<u8> {
-    let rows = rows
-        .iter()
-        .filter(|row| distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-        .collect::<Vec<_>>();
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    for row in rows {
-        let row = row
-            .encode()
-            .expect("validated ConnectRequest carries encodable compiled rows");
-        encoded.extend_from_slice(&(row.len() as u32).to_le_bytes());
-        encoded.extend_from_slice(&row);
-    }
-    encoded
 }
 
 pub fn decode_configuration_poison(
@@ -3384,11 +2688,6 @@ fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: Rp
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on snapshot acquisition: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -3415,11 +2714,6 @@ fn write_authoring_snapshot_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on authoring snapshot: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -3821,11 +3115,6 @@ fn write_uuid_list_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on UUID query: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -3850,9 +3139,6 @@ fn write_target_entry_result(
         RpcResult::Success(entry) => write_metadata_entry(result.reborrow().init_success(), &entry),
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
-        }
-        RpcResult::AttestationExpansionRequired(expansion) => {
-            write_attestation_expansion(result.init_attestation_expansion_required(), &expansion)
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
@@ -3886,11 +3172,6 @@ fn write_authoring_inspect_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on authoring inspection: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -3966,11 +3247,6 @@ fn write_subscribe_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on subscription: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -3989,11 +3265,6 @@ fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcRes
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on void call: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -4017,11 +3288,6 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on integer call: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -4048,11 +3314,6 @@ fn write_bundle_uuid_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on authoring call: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -4082,11 +3343,6 @@ fn write_progress_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on operation: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -4107,9 +3363,6 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => {
-            write_attestation_expansion(result.init_attestation_expansion_required(), &expansion)
-        }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -4120,71 +3373,6 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
         ),
         RpcResult::Failure(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
-        }
-    }
-}
-
-fn write_reattest_result(
-    result: schema::reattest_result::Builder<'_>,
-    outcome: RpcResult<crate::ReattestSuccess>,
-) {
-    match outcome {
-        RpcResult::Success(success) => {
-            let mut output = result.init_success();
-            output.set_installed_attestation_generation(success.installed_attestation_generation);
-            output.set_daemon_compiled_projection(&success.daemon_compiled_projection.0);
-            output.set_policy_digest(&success.load_policy.digest);
-            output.set_policy_generation(success.policy_generation);
-            let mut rows = output.init_load_policy(success.load_policy.rows.len() as u32);
-            for (index, row) in success.load_policy.rows.iter().enumerate() {
-                let mut value = rows.reborrow().get(index as u32);
-                value.set_type_uuid(&row.type_uuid.0);
-                value.set_build_only(row.build_only);
-            }
-        }
-        RpcResult::ReconnectRequired { reason } => {
-            write_reconnect(result.init_reconnect_required(), reason)
-        }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected nested attestation expansion: {expansion:?}"),
-        ),
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
-        }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on reattestation: {poison}"),
-        ),
-        RpcResult::Failure(RpcFailure::Attestation(error)) => match error.attestation_failure() {
-            Some(failure) => write_attestation_failure(result.init_attestation_failure(), &failure),
-            None => write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}")),
-        },
-        RpcResult::Failure(RpcFailure::StaleAttestationBase { expected, got }) => {
-            let mut stale = result.init_stale_attestation_base();
-            stale.set_code(crate::STALE_ATTESTATION_BASE_CODE);
-            stale.set_expected(expected);
-            stale.set_observed(got);
-        }
-        RpcResult::Failure(RpcFailure::AttestationGenerationOverflow { base }) => {
-            let mut overflow = result.init_attestation_generation_overflow();
-            overflow.set_code(crate::ATTESTATION_GENERATION_OVERFLOW_CODE);
-            overflow.set_base(base);
-        }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
-        }
-        RpcResult::Failure(error) => {
-            let code = match error {
-                RpcFailure::InvalidAttestationSuccessor { .. } => {
-                    crate::INVALID_ATTESTATION_SUCCESSOR_CODE
-                }
-                RpcFailure::EpochNotSuccessor { .. } => crate::EPOCH_NOT_SUCCESSOR_CODE,
-                _ => RPC_FAILURE,
-            };
-            write_error(result.init_error(), code, &format!("{error:?}"));
         }
     }
 }
@@ -4222,9 +3410,6 @@ fn write_resolve_result(
         }
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
-        }
-        RpcResult::AttestationExpansionRequired(expansion) => {
-            write_attestation_expansion(result.init_attestation_expansion_required(), &expansion)
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
@@ -4264,11 +3449,6 @@ fn write_path_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on path lookup: {expansion:?}"),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
@@ -4293,6 +3473,15 @@ fn write_fetch_result(
             let mut output = result.init_success();
             write_rpc_basis(output.reborrow().init_basis(), &terminal.basis);
             output.set_total_bytes(terminal.value.total_bytes());
+            {
+                let edges = terminal.value.load_edges();
+                let mut wire = output.reborrow().init_load_edges(edges.len() as u32);
+                for (index, edge) in edges.iter().enumerate() {
+                    let mut value = wire.reborrow().get(index as u32);
+                    value.set_asset(&edge.asset.0);
+                    value.set_expected_terminal(&edge.expected_terminal.0);
+                }
+            }
             let client: schema::chunk_stream::Client = capnp_rpc::new_client(ChunkStreamService {
                 stream: Mutex::new(terminal.value),
             });
@@ -4300,9 +3489,6 @@ fn write_fetch_result(
         }
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
-        }
-        RpcResult::AttestationExpansionRequired(expansion) => {
-            write_attestation_expansion(result.init_attestation_expansion_required(), &expansion)
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
@@ -4417,11 +3603,6 @@ fn write_snapshot_configuration_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(output.init_reconnect_required(), reason)
         }
-        RpcResult::AttestationExpansionRequired(expansion) => write_error(
-            output.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected attestation expansion on configuration read: {expansion:?}"),
-        ),
         RpcResult::VersionPoisoned(poison) => write_error(
             output.init_error(),
             RPC_FAILURE,
@@ -4670,7 +3851,7 @@ fn decode_lineage_inspection(
         });
     }
     let unknown_union = |field: &str| WireFailure {
-        code: WIRE_INVALID_ATTESTATION,
+        code: WIRE_INVALID_VALUE,
         message: format!("{field} has an unknown union discriminant"),
     };
     let state = match input
@@ -4740,7 +3921,7 @@ fn decode_lineage_inspection(
             }
             if claimants.len() < 2 || claimants.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(WireFailure {
-                    code: WIRE_INVALID_ATTESTATION,
+                    code: WIRE_INVALID_VALUE,
                     message: "lineage duplicate claimants must contain at least two strict rows"
                         .to_owned(),
                 });
@@ -4772,31 +3953,8 @@ fn canonical_lineage_path(value: &str) -> bool {
             .all(|part| !matches!(part, "" | "." | "..") && part.nfc().eq(part.chars()))
 }
 
-fn write_attestation_expansion(
-    mut output: schema::attestation_expansion_required::Builder<'_>,
-    expansion: &crate::AttestationExpansionRequired,
-) {
-    write_stamp(output.reborrow().init_snapshot(), expansion.snapshot);
-    output.set_closure_identity(&expansion.closure_identity);
-    let mut required = output.init_required_type_uuids(expansion.required.len() as u32);
-    for (index, type_uuid) in expansion.required.iter().enumerate() {
-        required.set(index as u32, &type_uuid.0);
-    }
-}
-
 fn write_rpc_basis(mut output: schema::rpc_basis_value::Builder<'_>, basis: &RpcBasis) {
     write_stamp(output.reborrow().init_stamp(), basis.snapshot);
-    write_load_policy_rows(
-        output
-            .reborrow()
-            .init_load_policy(basis.load_policy.rows.len() as u32),
-        &basis.load_policy.rows,
-    );
-    output.set_policy_digest(&basis.load_policy.digest);
-    output.set_policy_generation(basis.policy_generation);
-    output.set_target_generation(basis.target_generation);
-    output.set_attestation_generation(basis.attestation_generation);
-    output.set_daemon_compiled_projection(&basis.daemon_compiled_projection.0);
 }
 
 pub fn decode_rpc_basis(
@@ -4804,17 +3962,6 @@ pub fn decode_rpc_basis(
     adopted: &RpcBasis,
 ) -> Result<RpcBasis, capnp::Error> {
     let stamp = input.get_stamp()?;
-    let rows = decode_policies(input.get_load_policy()?)
-        .map_err(|error| capnp::Error::failed(format!("invalid RPC basis policy: {error:?}")))?;
-    let digest = decode_hash(input.get_policy_digest()?, "basis.policyDigest")
-        .map_err(|error| capnp::Error::failed(error.message))?;
-    let expected = crate::compute_policy_digest(&rows)
-        .map_err(|error| capnp::Error::failed(format!("invalid RPC basis policy: {error}")))?;
-    if digest != expected {
-        return Err(capnp::Error::failed(
-            "RPC basis policy digest does not authenticate its rows".to_owned(),
-        ));
-    }
     let decoded = RpcBasis {
         snapshot: SnapshotStamp {
             instance: StoreInstanceId(
@@ -4823,17 +3970,6 @@ pub fn decode_rpc_basis(
             ),
             version: InputVersion(stamp.get_version()),
         },
-        load_policy: std::sync::Arc::new(crate::LoadPolicyAttestation { rows, digest }),
-        policy_generation: input.get_policy_generation(),
-        target_generation: input.get_target_generation(),
-        attestation_generation: input.get_attestation_generation(),
-        daemon_compiled_projection: CompiledAttestationDigest(
-            decode_hash(
-                input.get_daemon_compiled_projection()?,
-                "basis.daemonCompiledProjection",
-            )
-            .map_err(|error| capnp::Error::failed(error.message))?,
-        ),
     };
     if &decoded != adopted {
         return Err(capnp::Error::failed(
@@ -5108,140 +4244,30 @@ fn write_wire_error(output: schema::rpc_error::Builder<'_>, failure: &WireFailur
     write_error(output, failure.code, failure.message.as_str());
 }
 
-fn write_unsupported(output: schema::rpc_error::Builder<'_>, method: &str) {
-    write_error(
-        output,
-        UNSUPPORTED_METHOD,
-        &format!("{method} is outside the loader RPC state model"),
-    );
-}
-
 fn write_lease_failure(mut output: schema::lease_failure::Builder<'_>, message: &str) {
     output.set_code(1);
     output.set_message(message);
 }
 
 fn write_connect_error(mut result: schema::connect_call::Builder<'_>, error: &crate::ConnectError) {
-    if let crate::ConnectError::ProtocolMismatch { expected, got } = error {
-        let mut failure = result.reborrow().init_protocol_failure();
-        failure.set_expected(*expected);
-        failure.set_observed(*got);
-        failure.set_message(format!("{error:?}").as_str());
-        return;
-    }
-    match error.attestation_failure() {
-        Some(failure) => write_attestation_failure(result.init_attestation_failure(), &failure),
-        None => write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}")),
-    }
-}
-
-fn write_attestation_failure(
-    mut output: schema::attestation_failure::Builder<'_>,
-    failure: &crate::AttestationFailure,
-) {
-    output.set_code(match failure.code() {
-        crate::AttestationFailureCode::MalformedTable => {
-            schema::AttestationFailureCode::MalformedTable
+    match error {
+        crate::ConnectError::ProtocolMismatch { expected, got } => {
+            let mut failure = result.reborrow().init_protocol_failure();
+            failure.set_expected(*expected);
+            failure.set_observed(*got);
+            failure.set_message(format!("{error:?}").as_str());
         }
-        crate::AttestationFailureCode::DuplicateType => {
-            schema::AttestationFailureCode::DuplicateType
+        crate::ConnectError::UnknownTarget { .. } => {
+            let mut failure = result.reborrow().init_target_failure();
+            failure.set_code(schema::TargetFailureCode::UnknownTarget);
+            failure.set_expected(&[]);
+            failure.set_observed(&[]);
         }
-        crate::AttestationFailureCode::MissingType => schema::AttestationFailureCode::MissingType,
-        crate::AttestationFailureCode::LogicalHashMismatch => {
-            schema::AttestationFailureCode::LogicalHashMismatch
-        }
-        crate::AttestationFailureCode::NativeLayoutMismatch => {
-            schema::AttestationFailureCode::NativeLayoutMismatch
-        }
-        crate::AttestationFailureCode::BuildOnlyMismatch => {
-            schema::AttestationFailureCode::BuildOnlyMismatch
-        }
-        crate::AttestationFailureCode::RegistryExtrasMismatch => {
-            schema::AttestationFailureCode::RegistryExtrasMismatch
-        }
-        crate::AttestationFailureCode::CompiledRegistryAggregateMismatch => {
-            schema::AttestationFailureCode::CompiledRegistryAggregateMismatch
-        }
-        crate::AttestationFailureCode::TargetDefinitionMismatch => {
-            schema::AttestationFailureCode::TargetDefinitionMismatch
-        }
-        crate::AttestationFailureCode::PolicyProjectionMismatch => {
-            schema::AttestationFailureCode::PolicyProjectionMismatch
-        }
-        crate::AttestationFailureCode::BootstrapAuthorityMismatch => {
-            schema::AttestationFailureCode::BootstrapAuthorityMismatch
-        }
-        crate::AttestationFailureCode::MalformedField => {
-            schema::AttestationFailureCode::MalformedField
-        }
-    });
-    output.set_message(failure.message());
-    let mut subject = output.reborrow().init_subject();
-    match failure.subject() {
-        crate::AttestationSubject::SpecificType {
-            type_uuid,
-            projection,
-        } => {
-            let mut value = subject.init_specific_type();
-            value.reborrow().init_type_uuid().set_bytes(&type_uuid.0);
-            value.set_projection(match projection {
-                crate::AttestationProjection::CompiledRegistry => {
-                    schema::AttestationProjection::CompiledRegistry
-                }
-                crate::AttestationProjection::Policy => schema::AttestationProjection::Policy,
-            });
-        }
-        crate::AttestationSubject::TargetDefinition => subject.set_target_definition(()),
-        crate::AttestationSubject::CompiledRegistryTable => subject.set_compiled_registry_table(()),
-        crate::AttestationSubject::CompiledRegistryAggregate => {
-            subject.set_compiled_registry_aggregate(())
-        }
-        crate::AttestationSubject::PolicyProjection => subject.set_policy_projection(()),
-        crate::AttestationSubject::BootstrapAuthority => subject.set_bootstrap_authority(()),
-        crate::AttestationSubject::FixedField(fixed) => {
-            let mut value = subject.init_fixed_field();
-            match fixed {
-                crate::AttestationFixedFieldSubject::TargetDefHash => value.set_target_def_hash(()),
-                crate::AttestationFixedFieldSubject::DscaAggregate => value.set_dsca_aggregate(()),
-                crate::AttestationFixedFieldSubject::PolicyDigest => value.set_policy_digest(()),
-                crate::AttestationFixedFieldSubject::CompiledTypeUuid(index) => {
-                    value.set_compiled_type_uuid(*index)
-                }
-                crate::AttestationFixedFieldSubject::CompiledLogicalHash(index) => {
-                    value.set_compiled_logical_hash(*index)
-                }
-                crate::AttestationFixedFieldSubject::CompiledNativeLayoutDigest(index) => {
-                    value.set_compiled_native_layout_digest(*index)
-                }
-                crate::AttestationFixedFieldSubject::CompiledRegistryExtrasDigest(index) => {
-                    value.set_compiled_registry_extras_digest(*index)
-                }
-                crate::AttestationFixedFieldSubject::PolicyTypeUuid(index) => {
-                    value.set_policy_type_uuid(*index)
-                }
-            }
-        }
-    }
-    let mut payload = output.init_payload();
-    match failure.payload() {
-        crate::AttestationFailurePayload::None => payload.set_none(()),
-        crate::AttestationFailurePayload::ExpectedObserved { expected, observed } => {
-            let mut value = payload.init_expected_observed();
-            value.set_expected(expected);
-            value.set_observed(observed);
-        }
-        crate::AttestationFailurePayload::TableDetail { index, entry } => {
-            let mut value = payload.init_table_detail();
-            value.set_index(*index);
-            value.set_entry(entry);
-        }
-        crate::AttestationFailurePayload::MalformedField {
-            expected_width,
-            observed,
-        } => {
-            let mut value = payload.init_malformed_field();
-            value.set_expected_width(*expected_width);
-            value.set_observed(observed);
+        crate::ConnectError::TargetDefinitionMismatch { expected, got } => {
+            let mut failure = result.reborrow().init_target_failure();
+            failure.set_code(schema::TargetFailureCode::DefinitionMismatch);
+            failure.set_expected(&expected.0);
+            failure.set_observed(&got.0);
         }
     }
 }
@@ -5304,10 +4330,6 @@ fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
     match reason {
         ReconnectReason::TargetDefinitionChanged => {
             schema::ReconnectReason::TargetDefinitionChanged
-        }
-        ReconnectReason::LoadPolicyChanged => schema::ReconnectReason::LoadPolicyChanged,
-        ReconnectReason::CompiledAttestationChanged => {
-            schema::ReconnectReason::CompiledAttestationChanged
         }
         ReconnectReason::StoreInstanceChanged => schema::ReconnectReason::StoreInstanceChanged,
         ReconnectReason::ProtocolEpochChanged => schema::ReconnectReason::ProtocolEpochChanged,

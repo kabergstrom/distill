@@ -7,10 +7,11 @@ use distill_asset::{
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
-    LoadPolicyAttestation, LoadPolicyRow, LoadStatus, Loader, LoaderDiagnostic, LoaderError,
-    LoaderIO, ManifestHash, PathResolveResult, PendingState, PendingToken, PreparedValue,
-    ReattestationState, ReqId, ResolveResult, RuntimeAttestation, StorageError, UpdateResult,
+    LoadStatus, Loader, LoaderDiagnostic, LoaderError, LoaderIO, ManifestHash, PathResolveResult,
+    PendingState, PendingToken, PreparedValue, ReqId, ResolveResult, RuntimeTarget, StorageError,
+    TargetBindingState, UpdateResult,
 };
+use distill_rpc::ServedLoadEdge;
 use distill_store::state::{InputVersion, StoreInstanceId};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -87,7 +88,7 @@ unsafe impl AssetType for RefPlaceholder {
 
 #[derive(Debug, Clone)]
 enum Command {
-    Reattest,
+    BindTarget,
     Resolve(ReqId, AssetUuid, IoBasis),
     Fetch(ReqId, ContentHash, IoBasis),
     ResolvePath(ReqId, String, IoBasis),
@@ -150,10 +151,10 @@ impl MockIo {
 }
 
 impl LoaderIO for MockIo {
-    fn reattest(&mut self, attestation: RuntimeAttestation) {
-        self.commands.push(Command::Reattest);
-        self.events.push_back(IoEvent::Reattested {
-            attestation,
+    fn bind_target(&mut self, target: RuntimeTarget) {
+        self.commands.push(Command::BindTarget);
+        self.events.push_back(IoEvent::TargetBound {
+            target,
             basis: self.basis.clone(),
         });
     }
@@ -288,27 +289,8 @@ fn basis() -> IoBasis {
 }
 
 fn basis_with(manifest_byte: u8) -> IoBasis {
-    let rows = vec![
-        LoadPolicyRow {
-            type_uuid: A::TYPE_UUID,
-            build_only: false,
-        },
-        LoadPolicyRow {
-            type_uuid: B::TYPE_UUID,
-            build_only: false,
-        },
-        LoadPolicyRow {
-            type_uuid: RefPlaceholder::TYPE_UUID,
-            build_only: false,
-        },
-        LoadPolicyRow {
-            type_uuid: BuildOnly::TYPE_UUID,
-            build_only: true,
-        },
-    ];
     IoBasis::Pack {
         manifest: ManifestHash([manifest_byte; 32]),
-        load_policy: Arc::new(LoadPolicyAttestation::from_rows(rows).unwrap()),
     }
 }
 
@@ -341,8 +323,17 @@ fn artifact<T: AssetType>(
     asset_uuid: AssetUuid,
     deps: &[AssetUuid],
 ) -> (ContentHash, FetchedArtifact) {
+    assert!(deps.is_empty(), "use artifact_with_edges for dependencies");
+    artifact_with_edges::<T>(asset_uuid, &[])
+}
+
+fn artifact_with_edges<T: AssetType>(
+    asset_uuid: AssetUuid,
+    edges: &[(AssetUuid, TypeUuid)],
+) -> (ContentHash, FetchedArtifact) {
     let wire = unit_wire();
     let layout_hash = dswl_hash(&wire).unwrap();
+    let deps = edges.iter().map(|(uuid, _)| *uuid).collect::<Vec<_>>();
     let bytes = write_artifact(
         &ArtifactHeader {
             asset_uuid,
@@ -352,7 +343,7 @@ fn artifact<T: AssetType>(
             logical_hash: T::descriptor().logical_hash,
             layout_hash: LayoutHash(layout_hash.0),
         },
-        deps,
+        &deps,
         &[],
         &[],
         &[],
@@ -363,6 +354,13 @@ fn artifact<T: AssetType>(
         FetchedArtifact {
             structural: Arc::from(bytes),
             blobs: Vec::new(),
+            load_edges: edges
+                .iter()
+                .map(|(asset_uuid, expected_terminal)| ServedLoadEdge {
+                    asset: *asset_uuid,
+                    expected_terminal: *expected_terminal,
+                })
+                .collect(),
             wire_layout: Arc::from(dswl_bytes(&wire).unwrap()),
         },
     )
@@ -382,7 +380,7 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
             ],
         )
         .unwrap();
-    assert_eq!(loader.reattestation_state(), ReattestationState::Required);
+    assert_eq!(loader.target_binding_state(), TargetBindingState::Required);
 }
 
 fn resolve(loader: &mut Loader<MockIo>, asset_uuid: AssetUuid, hash: ContentHash) {
@@ -513,6 +511,7 @@ fn malformed_fetch_terminally_fails_its_candidate() {
         FetchedArtifact {
             structural: Arc::from([0_u8]),
             blobs: Vec::new(),
+            load_edges: Vec::new(),
             wire_layout: Arc::from([]),
         },
     );
@@ -597,7 +596,7 @@ fn pending_member_defers_the_whole_dependency_component() {
     storage.pending_handles.insert(b.id());
     loader.process(&mut storage).unwrap();
 
-    let (a_hash, a_artifact) = artifact::<A>(a_uuid, &[b_uuid]);
+    let (a_hash, a_artifact) = artifact_with_edges::<A>(a_uuid, &[(b_uuid, B::TYPE_UUID)]);
     let (b_hash, b_artifact) = artifact::<B>(b_uuid, &[]);
     resolve(&mut loader, a_uuid, a_hash);
     resolve(&mut loader, b_uuid, b_hash);
@@ -677,38 +676,6 @@ fn failed_pending_cancellation_poisons_and_prevents_module_unload() {
 }
 
 #[test]
-fn stale_reattestation_completion_cannot_unblock_the_registered_epoch() {
-    let token = ModuleEpochToken::new(31);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 31, &token);
-    let IoEvent::Reattested { attestation, basis } = loader.io_mut().events.pop_front().unwrap()
-    else {
-        panic!("registration must request typed reattestation");
-    };
-    let mut stale = attestation.clone();
-    stale.epoch = GameModuleEpoch(30);
-    loader.io_mut().push(IoEvent::Reattested {
-        attestation: stale,
-        basis: basis.clone(),
-    });
-    let mut storage = Storage::default();
-
-    loader.process(&mut storage).unwrap();
-
-    assert_eq!(loader.reattestation_state(), ReattestationState::Required);
-    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
-        diagnostic,
-        LoaderDiagnostic::Io(message) if message.contains("ignored stale runtime reattestation")
-    )));
-
-    loader
-        .io_mut()
-        .push(IoEvent::Reattested { attestation, basis });
-    loader.process(&mut storage).unwrap();
-    assert_eq!(loader.reattestation_state(), ReattestationState::Attested);
-}
-
-#[test]
 fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion() {
     let token = ModuleEpochToken::new(3);
     let mut loader = Loader::new(mock_io());
@@ -719,7 +686,7 @@ fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion()
     let (old_req, old_basis) = loader.io().path_for("textures/main");
 
     loader.io_mut().push(IoEvent::ReconnectRequired {
-        reason: distill_loader::ReconnectReason::LoadPolicyChanged,
+        reason: distill_loader::ReconnectReason::TargetDefinitionChanged,
     });
     loader.io_mut().push(IoEvent::PathResolved {
         req: old_req,
@@ -728,7 +695,7 @@ fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion()
         basis: old_basis,
     });
     loader.process(&mut storage).unwrap();
-    assert_eq!(loader.reattestation_state(), ReattestationState::Required);
+    assert_eq!(loader.target_binding_state(), TargetBindingState::Required);
     assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
 
     loader.process(&mut storage).unwrap();
@@ -867,7 +834,7 @@ fn path_rebind_unsubscribes_old_uuid_before_subscribing_new_uuid() {
 }
 
 #[test]
-fn protocol_epoch_reconnect_fences_old_resolve_and_requires_reattestation() {
+fn protocol_epoch_reconnect_fences_old_resolve_and_requires_target_binding() {
     let token = ModuleEpochToken::new(30);
     let mut loader = Loader::new(mock_io());
     register(&mut loader, 30, &token);
@@ -890,7 +857,7 @@ fn protocol_epoch_reconnect_fences_old_resolve_and_requires_reattestation() {
     });
     loader.process(&mut storage).unwrap();
 
-    assert_eq!(loader.reattestation_state(), ReattestationState::Required);
+    assert_eq!(loader.target_binding_state(), TargetBindingState::Required);
     assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
         diagnostic,
         LoaderDiagnostic::ReconnectRequired(distill_loader::ReconnectReason::ProtocolEpochChanged)

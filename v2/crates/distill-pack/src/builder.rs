@@ -1,4 +1,4 @@
-//! One-shot construction of a v1 pack from one pinned RPC snapshot.
+//! One-shot construction of a v2 pack from one pinned RPC snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -6,13 +6,10 @@ use std::path::Path;
 
 use distill_build::query::{AssetQuery as BuildAssetQuery, IntakeError};
 use distill_build::trace::PackDefinitionControlValue;
-use distill_core::attestation::{
-    is_bootstrap_control_type, AttestationError, CompiledTypeTable, BOOTSTRAP_CONTROL_TYPE_UUIDS,
-};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_rpc::{
-    ArtifactChunkKind, AttestationExpansionRequired, ConfigurationPoison, Hub, PathResolveResult,
-    ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
+    ArtifactChunkKind, ConfigurationPoison, Hub, PathResolveResult, ReconnectReason, ResolveResult,
+    RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 
@@ -20,14 +17,13 @@ use crate::activation::{activate, publish_archive, publish_manifest, PointerErro
 use crate::archive::{encode_archive, ArchiveError, ArtifactPayload};
 use crate::manifest::{
     canonicalize, encode_manifest, verify_mounted_closure, ArchiveRef, ArtifactMetadata,
-    EncodingRow, IndexRow, LoadPolicyRow, ManifestAssetRow, ManifestError, ManifestLoadEdge,
-    PackManifest, PackTarget, PathRow, WireTreeRow,
+    EncodingRow, IndexRow, ManifestAssetRow, ManifestError, ManifestLoadEdge, PackManifest,
+    PackTarget, PathRow, WireTreeRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackBuildTarget {
     pub name: String,
-    pub manifest: PackTarget,
     pub definition_hash: [u8; 32],
 }
 
@@ -54,7 +50,6 @@ pub enum PackBuildError {
         index: usize,
     },
     ReconnectRequired(ReconnectReason),
-    AttestationExpansionRequired(Box<AttestationExpansionRequired>),
     ConfigurationPoisoned(Box<ConfigurationPoison>),
     VersionPoisoned(Box<VersionPoison>),
     Rpc(Box<RpcFailure>),
@@ -74,11 +69,6 @@ pub enum PackBuildError {
         asset: AssetUuid,
     },
     InvalidWireTree(LayoutHash),
-    Compiled(AttestationError),
-    CompiledBasisMismatch,
-    MissingCompiledType(TypeUuid),
-    MissingLoadPolicy(TypeUuid),
-    LoadPolicyMismatch(TypeUuid),
     BuildOnlyType(TypeUuid),
     Path {
         path: String,
@@ -96,12 +86,6 @@ impl fmt::Display for PackBuildError {
 }
 
 impl std::error::Error for PackBuildError {}
-
-impl From<AttestationError> for PackBuildError {
-    fn from(value: AttestationError) -> Self {
-        Self::Compiled(value)
-    }
-}
 
 impl From<ArchiveError> for PackBuildError {
     fn from(value: ArchiveError) -> Self {
@@ -125,20 +109,18 @@ struct FetchedArtifact {
     content_hash: ContentHash,
     structural: Vec<u8>,
     blobs: Vec<Vec<u8>>,
-    authored_type: TypeUuid,
-    encoded_type: TypeUuid,
     terminal_type: TypeUuid,
-    logical_hash: distill_core::id::LogicalHash,
     layout_hash: LayoutHash,
     load_deps: Vec<AssetUuid>,
+    load_edges: Vec<distill_rpc::ServedLoadEdge>,
 }
 
-/// Build the single-archive v1 pack described by `definition` from exactly
+/// Build the single-archive v2 pack described by `definition` from exactly
 /// `snapshot`. Drift and every other non-built terminal result are fatal.
 pub fn build_pack(
     definition: &PackDefinitionControlValue,
     target: &PackBuildTarget,
-    compiled_registry: &CompiledTypeTable,
+    build_only_types: &BTreeSet<TypeUuid>,
     encoder_identity: &str,
     snapshot: &Snapshot,
     hub: &Hub,
@@ -152,11 +134,6 @@ pub fn build_pack(
     if definition.roots.is_empty() {
         return Err(PackBuildError::NoRoots);
     }
-    compiled_registry.validate()?;
-    if compiled_registry.digest != snapshot.basis().daemon_compiled_projection {
-        return Err(PackBuildError::CompiledBasisMismatch);
-    }
-
     let mut pending = BTreeSet::new();
     for (index, root) in definition.roots.iter().enumerate() {
         let root = root
@@ -186,6 +163,7 @@ pub fn build_pack(
             }
         };
         let chunks = terminal(snapshot, rpc_success(snapshot.fetch(content_hash))?)?;
+        let load_edges = chunks.load_edges().to_vec();
         let (structural, blobs) = collect_chunks(content_hash, chunks)?;
         let blob_parts = blobs.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let parsed = parse_artifact_parts(&structural, &blob_parts)
@@ -194,10 +172,23 @@ pub fn build_pack(
             return Err(PackBuildError::ArtifactIdentity { asset });
         }
         let load_deps = parsed.load_deps.clone();
-        let authored_type = parsed.authored_type;
-        let encoded_type = parsed.encoded_type;
+        if load_edges
+            .iter()
+            .map(|edge| edge.asset)
+            .ne(load_deps.iter().copied())
+        {
+            return Err(PackBuildError::ArtifactIdentity { asset });
+        }
+        for type_uuid in [
+            parsed.authored_type,
+            parsed.encoded_type,
+            parsed.terminal_type,
+        ] {
+            if build_only_types.contains(&type_uuid) {
+                return Err(PackBuildError::BuildOnlyType(type_uuid));
+            }
+        }
         let terminal_type = parsed.terminal_type;
-        let logical_hash = parsed.logical_hash;
         let layout_hash = parsed.layout_hash;
         drop(parsed);
         pending.extend(load_deps.iter().copied());
@@ -207,12 +198,10 @@ pub fn build_pack(
                 content_hash,
                 structural,
                 blobs,
-                authored_type,
-                encoded_type,
                 terminal_type,
-                logical_hash,
                 layout_hash,
                 load_deps,
+                load_edges,
             },
         );
     }
@@ -239,21 +228,13 @@ pub fn build_pack(
         .iter()
         .map(|(asset, artifact)| ManifestAssetRow {
             asset_uuid: *asset,
-            authored_type: artifact.authored_type,
-            terminal_type: artifact.terminal_type,
-            logical_hash: artifact.logical_hash,
             content_hash: artifact.content_hash,
             load_deps: artifact
-                .load_deps
+                .load_edges
                 .iter()
-                .map(|dependency| {
-                    let target = artifacts
-                        .get(dependency)
-                        .expect("the closure walk fetched every dependency");
-                    ManifestLoadEdge {
-                        asset_uuid: *dependency,
-                        expected_terminal: target.terminal_type,
-                    }
+                .map(|edge| ManifestLoadEdge {
+                    asset_uuid: edge.asset,
+                    expected_terminal: edge.expected_terminal,
                 })
                 .collect(),
         })
@@ -262,57 +243,10 @@ pub fn build_pack(
         .iter()
         .map(|(asset, artifact)| ArtifactMetadata {
             asset_uuid: *asset,
-            authored_type: artifact.authored_type,
-            encoded_type: artifact.encoded_type,
             terminal_type: artifact.terminal_type,
-            logical_hash: artifact.logical_hash,
             load_deps: artifact.load_deps.clone(),
         })
         .collect::<Vec<_>>();
-
-    let mut boundary = BOOTSTRAP_CONTROL_TYPE_UUIDS
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    for artifact in artifacts.values() {
-        boundary.extend([
-            artifact.authored_type,
-            artifact.encoded_type,
-            artifact.terminal_type,
-        ]);
-    }
-    for asset in &manifest_assets {
-        boundary.extend(asset.load_deps.iter().map(|edge| edge.expected_terminal));
-    }
-    let mut compiled_rows = Vec::with_capacity(boundary.len());
-    let mut load_policy = Vec::with_capacity(boundary.len());
-    for type_uuid in boundary {
-        let compiled = compiled_registry
-            .rows
-            .binary_search_by_key(&type_uuid, |row| row.type_uuid)
-            .ok()
-            .map(|index| compiled_registry.rows[index].clone())
-            .ok_or(PackBuildError::MissingCompiledType(type_uuid))?;
-        let policy = snapshot
-            .basis()
-            .load_policy
-            .rows
-            .binary_search_by_key(&type_uuid, |row| row.type_uuid)
-            .ok()
-            .map(|index| snapshot.basis().load_policy.rows[index])
-            .ok_or(PackBuildError::MissingLoadPolicy(type_uuid))?;
-        if compiled.build_only != policy.build_only {
-            return Err(PackBuildError::LoadPolicyMismatch(type_uuid));
-        }
-        if policy.build_only && !is_bootstrap_control_type(type_uuid) {
-            return Err(PackBuildError::BuildOnlyType(type_uuid));
-        }
-        compiled_rows.push(compiled);
-        load_policy.push(LoadPolicyRow {
-            type_uuid,
-            build_only: policy.build_only,
-        });
-    }
-    let compiled_types = CompiledTypeTable::canonical(compiled_rows)?;
 
     let paths = if definition.include_path_table {
         Some(build_paths(snapshot, artifacts.keys().copied())?)
@@ -334,10 +268,10 @@ pub fn build_pack(
     )?;
     let archive_file_hash = *blake3::hash(&archive.bytes).as_bytes();
     let manifest = canonicalize(PackManifest {
-        target: target.manifest.clone(),
+        target: PackTarget {
+            name: target.name.clone(),
+        },
         target_def_hash: target.definition_hash,
-        compiled_types,
-        load_policy,
         archives: vec![ArchiveRef {
             generation: 0,
             file_hash: archive_file_hash,
@@ -373,7 +307,7 @@ pub fn build_pack(
     })
 }
 
-/// Build, durably publish, and activate one v1 pack in the required order.
+/// Build, durably publish, and activate one v2 pack in the required order.
 /// The destination directory must already exist. If publication fails before
 /// activation, the old `pack.current` remains authoritative.
 #[allow(clippy::too_many_arguments)]
@@ -381,7 +315,7 @@ pub fn build_publish_and_activate_pack(
     directory: &Path,
     definition: &PackDefinitionControlValue,
     target: &PackBuildTarget,
-    compiled_registry: &CompiledTypeTable,
+    build_only_types: &BTreeSet<TypeUuid>,
     encoder_identity: &str,
     snapshot: &Snapshot,
     hub: &Hub,
@@ -389,7 +323,7 @@ pub fn build_publish_and_activate_pack(
     let output = build_pack(
         definition,
         target,
-        compiled_registry,
+        build_only_types,
         encoder_identity,
         snapshot,
         hub,
@@ -423,9 +357,6 @@ fn rpc_success<T>(result: RpcResult<T>) -> Result<T, PackBuildError> {
     match result {
         RpcResult::Success(value) => Ok(value),
         RpcResult::ReconnectRequired { reason } => Err(PackBuildError::ReconnectRequired(reason)),
-        RpcResult::AttestationExpansionRequired(expansion) => Err(
-            PackBuildError::AttestationExpansionRequired(Box::new(expansion)),
-        ),
         RpcResult::ConfigurationPoisoned(poison) => {
             Err(PackBuildError::ConfigurationPoisoned(Box::new(poison)))
         }

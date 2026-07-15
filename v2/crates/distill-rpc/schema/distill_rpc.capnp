@@ -3,20 +3,6 @@
 # Wire-shaped declaration of the §17 surface. Fixed-size Data fields are
 # length-checked by the Rust transport adapter (UUID=16, hashes=32, instance=16).
 
-struct CompiledTypeEntry {
-  typeUuid @0 :Data;
-  logicalHash @1 :Data;
-  nativeLayoutDigest @2 :Data;
-  buildOnly @3 :Bool;
-  registryExtrasDigest @4 :Data;
-  registryExtras @5 :Data;
-}
-
-struct LoadPolicyEntry {
-  typeUuid @0 :Data;
-  buildOnly @1 :Bool;
-}
-
 struct SnapshotStamp {
   instance @0 :Data;
   version @1 :UInt64;
@@ -24,12 +10,6 @@ struct SnapshotStamp {
 
 struct RpcBasisValue {
   stamp @0 :SnapshotStamp;
-  loadPolicy @1 :List(LoadPolicyEntry);
-  policyDigest @2 :Data;
-  policyGeneration @3 :UInt64;
-  targetGeneration @4 :UInt64;
-  attestationGeneration @5 :UInt64;
-  daemonCompiledProjection @6 :Data;
 }
 
 struct ConfigurationPoison {
@@ -42,10 +22,8 @@ struct ConfigurationPoison {
 
 enum ReconnectReason {
   targetDefinitionChanged @0;
-  loadPolicyChanged @1;
-  storeInstanceChanged @2;
-  protocolEpochChanged @3;
-  compiledAttestationChanged @4;
+  storeInstanceChanged @1;
+  protocolEpochChanged @2;
 }
 
 struct ReconnectRequired {
@@ -62,135 +40,27 @@ struct RpcError {
   message @1 :Text;
 }
 
-enum AttestationFailureCode {
-  malformedTable @0;
-  duplicateType @1;
-  missingType @2;
-  logicalHashMismatch @3;
-  nativeLayoutMismatch @4;
-  buildOnlyMismatch @5;
-  registryExtrasMismatch @6;
-  compiledRegistryAggregateMismatch @7;
-  targetDefinitionMismatch @8;
-  policyProjectionMismatch @9;
-  bootstrapAuthorityMismatch @10;
-  malformedField @11;
-}
-
-enum AttestationProjection {
-  compiledRegistry @0;
-  policy @1;
-}
-
-struct TypeAttestationSubject {
-  typeUuid @0 :Uuid;
-  projection @1 :AttestationProjection;
-}
-
-struct ExpectedObserved {
-  expected @0 :Data;
-  observed @1 :Data;
-}
-
-struct AttestationTableDetail {
-  index @0 :UInt32;
-  entry @1 :Data;
-}
-
-struct MalformedFieldDetail {
-  expectedWidth @0 :UInt32;
-  observed @1 :Data;
-}
-
-struct AttestationFailurePayload {
-  union {
-    none @0 :Void;
-    expectedObserved @1 :ExpectedObserved;
-    tableDetail @2 :AttestationTableDetail;
-    malformedField @3 :MalformedFieldDetail;
-  }
-}
-
-struct AttestationFixedFieldSubject {
-  union {
-    targetDefHash @0 :Void;
-    dscaAggregate @1 :Void;
-    policyDigest @2 :Void;
-    compiledTypeUuid @3 :UInt32;
-    compiledLogicalHash @4 :UInt32;
-    compiledNativeLayoutDigest @5 :UInt32;
-    compiledRegistryExtrasDigest @6 :UInt32;
-    policyTypeUuid @7 :UInt32;
-  }
-}
-
-struct AttestationSubject {
-  union {
-    specificType @0 :TypeAttestationSubject;
-    targetDefinition @1 :Void;
-    compiledRegistryTable @2 :Void;
-    compiledRegistryAggregate @3 :Void;
-    policyProjection @4 :Void;
-    bootstrapAuthority @5 :Void;
-    fixedField @6 :AttestationFixedFieldSubject;
-  }
-}
-
-struct AttestationFailure {
-  code @0 :AttestationFailureCode;
-  subject @1 :AttestationSubject;
-  payload @2 :AttestationFailurePayload;
-  message @3 :Text;
-}
-
-struct ReattestSuccess {
-  installedAttestationGeneration @0 :UInt64;
-  daemonCompiledProjection @1 :Data;
-  loadPolicy @2 :List(LoadPolicyEntry);
-  policyDigest @3 :Data;
-  policyGeneration @4 :UInt64;
-}
-
-struct AttestationExpansionRequired {
-  snapshot @0 :SnapshotStamp;
-  closureIdentity @1 :Data;
-  requiredTypeUuids @2 :List(Data);
-}
-
-struct StaleAttestationBase {
-  code @0 :UInt16;
-  expected @1 :UInt64;
-  observed @2 :UInt64;
-}
-
-struct AttestationGenerationOverflow {
-  code @0 :UInt16;
-  base @1 :UInt64;
-}
-
-struct ReattestResult {
-  union {
-    success @0 :ReattestSuccess;
-    attestationFailure @1 :AttestationFailure;
-    staleAttestationBase @2 :StaleAttestationBase;
-    attestationGenerationOverflow @3 :AttestationGenerationOverflow;
-    reconnectRequired @4 :ReconnectRequired;
-    configurationPoisoned @5 :ConfigurationPoison;
-    leaseFailure @6 :LeaseFailure;
-    error @7 :RpcError;
-  }
-}
-
 struct ProtocolFailure {
   expected @0 :UInt32;
   observed @1 :UInt32;
   message @2 :Text;
 }
 
+enum TargetFailureCode {
+  unknownTarget @0;
+  definitionMismatch @1;
+}
+
+struct TargetFailure {
+  code @0 :TargetFailureCode;
+  expected @1 :Data;
+  observed @2 :Data;
+}
+
 struct ConnectCall {
   union {
     success @0 :ConnectSuccess;
-    attestationFailure @1 :AttestationFailure;
+    targetFailure @1 :TargetFailure;
     configurationPoisoned @2 :ConfigurationPoison;
     protocolFailure @3 :ProtocolFailure;
     error @4 :RpcError;
@@ -209,12 +79,6 @@ struct PipelineUnavailableDiagnostic {
 struct ConnectSuccess {
   hub @0 :Hub;
   instance @1 :Data;
-  policyGeneration @2 :UInt64;
-  targetGeneration @3 :UInt64;
-  attestationGeneration @4 :UInt64;
-  daemonCompiledProjection @5 :Data;
-  loadPolicy @6 :List(LoadPolicyEntry);
-  policyDigest @7 :Data;
 }
 
 struct MetadataConnectResult {
@@ -437,7 +301,6 @@ struct DataCall {
     configurationPoisoned @2 :ConfigurationPoison;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
-    attestationExpansionRequired @5 :AttestationExpansionRequired;
   }
 }
 
@@ -849,7 +712,6 @@ struct EntryMetaCall {
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
     versionPoisoned @5 :VersionPoison;
-    attestationExpansionRequired @6 :AttestationExpansionRequired;
   }
 }
 
@@ -881,7 +743,6 @@ struct ResolveCall {
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
     versionPoisoned @5 :VersionPoison;
-    attestationExpansionRequired @6 :AttestationExpansionRequired;
   }
 }
 
@@ -924,6 +785,12 @@ struct TerminalFetch {
   basis @0 :RpcBasisValue;
   chunks @1 :ChunkStream;
   totalBytes @2 :UInt64;
+  loadEdges @3 :List(ServedLoadEdge);
+}
+
+struct ServedLoadEdge {
+  asset @0 :Data;
+  expectedTerminal @1 :Data;
 }
 
 struct ChunkStreamCall {
@@ -933,7 +800,6 @@ struct ChunkStreamCall {
     configurationPoisoned @2 :ConfigurationPoison;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
-    attestationExpansionRequired @5 :AttestationExpansionRequired;
   }
 }
 
@@ -1070,10 +936,7 @@ interface LineageRepair {
 }
 
 interface Root {
-  connect @0 (target :Text, targetDefHash :Data,
-              compiledRegistry :List(CompiledTypeEntry), dscaAggregate :Data,
-              loadPolicy :List(LoadPolicyEntry), policyDigest :Data,
-              protocol :UInt32, gameModuleEpoch :UInt64)
+  connect @0 (target :Text, targetDefHash :Data, protocol :UInt32)
           -> (result :ConnectCall);
   metadata @1 (protocol :UInt32) -> (result :MetadataConnectResult);
   lineageRepair @2 (protocol :UInt32) -> (result :LineageRepairConnectResult);
@@ -1112,16 +975,9 @@ interface Hub {
   operation @5 (base :UInt64, operation :LongRunningOp) -> (result :ProgressCall);
   fetch @6 (hash :Data) -> (result :ChunkStreamCall);
   wireTree @7 (layoutHash :Data) -> (result :DataCall);
-  reattest @8 (epoch :UInt64,
-               baseAttestationGeneration :UInt64,
-               successorAttestationGeneration :UInt64,
-               targetDefHash :Data,
-               compiledRegistry :List(CompiledTypeEntry), dscaAggregate :Data,
-               loadPolicy :List(LoadPolicyEntry), policyDigest :Data)
-           -> (result :ReattestResult);
-  unsubscribe @9 (assets :List(Data), paths :List(Text))
+  unsubscribe @8 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
-  authoringSnapshot @10 () -> (result :AuthoringSnapshotCall);
+  authoringSnapshot @9 () -> (result :AuthoringSnapshotCall);
 }
 
 interface Snapshot {
@@ -1130,13 +986,8 @@ interface Snapshot {
   entry @2 (uuid :Data) -> (result :EntryMetaCall);
   resolve @3 (uuid :Data) -> (result :ResolveCall);
   refresh @4 () -> (result :SnapshotCall);
-  reserved5 @5 () -> (result :VoidCall);
-  reserved6 @6 () -> (result :VoidCall);
-  reserved7 @7 () -> (result :VoidCall);
-  reserved8 @8 () -> (result :VoidCall);
-  reserved9 @9 () -> (result :VoidCall);
-  resolvePath @10 (path :Text) -> (result :PathResolveCall);
-  configuration @11 () -> (result :VoidCall);
+  resolvePath @5 (path :Text) -> (result :PathResolveCall);
+  configuration @6 () -> (result :VoidCall);
 }
 
 interface AuthoringSnapshot {

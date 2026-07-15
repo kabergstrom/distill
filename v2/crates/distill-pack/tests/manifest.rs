@@ -1,493 +1,162 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use distill_core::attestation::{
-    BootstrapControlSpecV1, CompiledTypeRow, CompiledTypeTable, RegistryExtraFact,
-    RegistryExtraRow, RegistryExtrasV1, SchemaNodeId, BOOTSTRAP_CONTROL_COUNT,
-};
-use distill_core::id::{AssetUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use distill_pack::activation::{manifest_filename, publish_manifest, PointerError};
+use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_pack::archive::{EKey, ObjectLocation};
 use distill_pack::manifest::*;
 
 fn sample() -> PackManifest {
-    let asset = AssetUuid([1; 16]);
-    let content = ContentHash([2; 32]);
-    let layout = LayoutHash([3; 32]);
-    let key = EKey([4; 32]);
-    let type_uuid = TypeUuid([6; 16]);
-    let logical_hash = LogicalHash([12; 32]);
-    let compiled = CompiledTypeRow::new(
-        type_uuid,
-        logical_hash,
-        [7; 32],
-        false,
-        RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-            node: SchemaNodeId(0),
-            path: vec![],
-            fact: RegistryExtraFact::BuildOnly(false),
-        }])
-        .unwrap(),
-    )
-    .unwrap();
-    let mut compiled_rows = bootstrap_rows();
-    compiled_rows.push(compiled);
-    let mut load_policy = compiled_rows
-        .iter()
-        .map(|row| LoadPolicyRow {
-            type_uuid: row.type_uuid,
-            build_only: row.build_only,
-        })
-        .collect::<Vec<_>>();
-    load_policy.sort_by_key(|row| row.type_uuid);
     PackManifest {
-        target: PackTarget {
-            os: 1,
-            arch: 2,
-            apis: vec![3, 1],
-            options: BTreeMap::from([("quality".into(), "high".into())]),
-        },
+        target: PackTarget { name: "dev".into() },
         target_def_hash: [5; 32],
-        compiled_types: CompiledTypeTable::canonical(compiled_rows).unwrap(),
-        load_policy,
         archives: vec![ArchiveRef {
-            generation: 9,
+            generation: 7,
             file_hash: [8; 32],
         }],
-        assets: vec![ManifestAssetRow {
-            asset_uuid: asset,
-            authored_type: type_uuid,
-            terminal_type: type_uuid,
-            logical_hash,
-            content_hash: content,
-            load_deps: vec![],
-        }],
+        assets: vec![
+            ManifestAssetRow {
+                asset_uuid: AssetUuid([1; 16]),
+                content_hash: ContentHash([11; 32]),
+                load_deps: vec![ManifestLoadEdge {
+                    asset_uuid: AssetUuid([2; 16]),
+                    expected_terminal: TypeUuid([22; 16]),
+                }],
+            },
+            ManifestAssetRow {
+                asset_uuid: AssetUuid([2; 16]),
+                content_hash: ContentHash([12; 32]),
+                load_deps: Vec::new(),
+            },
+        ],
         encodings: vec![EncodingRow {
-            content_hash: content,
-            blocks: vec![key],
-            blobs: vec![],
+            content_hash: ContentHash([11; 32]),
+            blocks: vec![EKey([31; 32])],
+            blobs: vec![EKey([32; 32])],
         }],
         index: vec![IndexRow {
-            ekey: key,
+            ekey: EKey([31; 32]),
             location: ObjectLocation {
-                generation: 9,
+                generation: 7,
                 offset: 64,
-                len: 17,
+                len: 32,
             },
         }],
         wire_trees: vec![WireTreeRow {
-            layout_hash: layout,
+            layout_hash: LayoutHash([41; 32]),
             bytes: vec![1, 2, 3],
         }],
         paths: Some(vec![PathRow {
-            path: "textures/a.bundle".into(),
-            asset_uuid: asset,
+            path: "assets/root.bundle".into(),
+            asset_uuid: AssetUuid([1; 16]),
         }]),
     }
 }
 
-fn bootstrap_rows() -> Vec<CompiledTypeRow> {
-    BootstrapControlSpecV1::embedded()
-        .unwrap()
-        .0
-        .iter()
-        .map(|row| {
-            CompiledTypeRow::new(
-                row.type_uuid,
-                row.logical_hash,
-                [row.symbol as u8; 32],
-                true,
-                row.registry_extras.clone(),
-            )
-            .unwrap()
-        })
-        .collect()
-}
-
 #[test]
-fn manifest_roundtrips_byte_identically_with_all_five_tables() {
-    let manifest = sample();
-    let bytes = encode_manifest(&manifest).unwrap();
-    let parsed = decode_manifest(&bytes).unwrap();
-    assert_eq!(parsed, canonicalize(manifest).unwrap());
-    assert_eq!(encode_manifest(&parsed).unwrap(), bytes);
-    assert_eq!(manifest_hash(&bytes), manifest_hash(&bytes));
-}
-
-#[test]
-fn manifest_header_places_direct_compiled_rows_before_load_policy() {
+fn manifest_v2_roundtrips_byte_identically_with_all_tables() {
     let manifest = canonicalize(sample()).unwrap();
     let bytes = encode_manifest(&manifest).unwrap();
-    let mut cursor = 8;
-    let target_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-    cursor += 4 + target_len + 32;
+    let decoded = decode_manifest(&bytes).unwrap();
 
-    assert_eq!(
-        u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()),
-        (BOOTSTRAP_CONTROL_COUNT + 1) as u32
-    );
-    cursor += 4;
-    for row in &manifest.compiled_types.rows {
-        let compiled_row = row.encode().unwrap();
-        assert_eq!(
-            &bytes[cursor..cursor + compiled_row.len()],
-            compiled_row.as_slice(),
-            "compiled row must begin directly with TypeUuid, without an outer row length"
-        );
-        cursor += compiled_row.len();
-    }
-    assert_eq!(
-        &bytes[cursor..cursor + 32],
-        &manifest.compiled_types.digest.0
-    );
-    cursor += 32;
-    assert_eq!(
-        u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()),
-        (BOOTSTRAP_CONTROL_COUNT + 1) as u32,
-        "load-policy count must follow DSCA"
-    );
-    cursor += 4;
-    assert_eq!(
-        &bytes[cursor..cursor + 16],
-        &manifest.load_policy[0].type_uuid.0
-    );
-    assert_eq!(bytes[cursor + 16], 0);
-}
-
-#[test]
-fn hash_named_manifest_publication_is_idempotent_and_never_replaces_bytes() {
-    let dir = std::env::temp_dir().join(format!(
-        "distill-pack-manifest-publish-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&dir).unwrap();
-    let bytes = encode_manifest(&sample()).unwrap();
-    let hash = publish_manifest(&dir, &bytes).unwrap();
-    let expected = manifest_filename(hash);
-    assert_eq!(fs::read(dir.join(&expected)).unwrap(), bytes);
-
-    publish_manifest(&dir, &bytes).unwrap();
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-
-    fs::remove_file(dir.join(&expected)).unwrap();
-    fs::write(dir.join(&expected), b"different immutable bytes").unwrap();
-    assert!(matches!(
-        publish_manifest(&dir, &bytes),
-        Err(PointerError::ImmutableConflict(_))
-    ));
-    fs::remove_dir_all(dir).unwrap();
+    assert_eq!(decoded, manifest);
+    assert_eq!(encode_manifest(&decoded).unwrap(), bytes);
 }
 
 #[test]
 fn optional_path_table_is_directory_membership() {
-    let mut manifest = sample();
-    manifest.paths = None;
-    let bytes = encode_manifest(&manifest).unwrap();
-    assert!(decode_manifest(&bytes).unwrap().paths.is_none());
+    let with_paths = encode_manifest(&sample()).unwrap();
+    let mut without = sample();
+    without.paths = None;
+    let without_paths = encode_manifest(&without).unwrap();
+
+    assert!(decode_manifest(&with_paths).unwrap().paths.is_some());
+    assert!(decode_manifest(&without_paths).unwrap().paths.is_none());
 }
 
 #[test]
-fn path_rows_are_nfc_canonicalized_before_sorting_and_encoding() {
+fn paths_are_nfc_normalized_before_sorting() {
     let mut manifest = sample();
     manifest.paths = Some(vec![PathRow {
         path: "te\u{301}xtures/a.bundle".into(),
         asset_uuid: AssetUuid([1; 16]),
     }]);
 
-    let canonical = canonicalize(manifest.clone()).unwrap();
-    assert_eq!(canonical.paths.unwrap()[0].path, "t\u{e9}xtures/a.bundle");
-    assert_eq!(
-        decode_manifest(&encode_manifest(&manifest).unwrap())
-            .unwrap()
-            .paths
-            .unwrap()[0]
-            .path,
-        "t\u{e9}xtures/a.bundle"
-    );
-
-    manifest.paths = Some(vec![
-        PathRow {
-            path: "te\u{301}xtures/a.bundle".into(),
-            asset_uuid: AssetUuid([1; 16]),
-        },
-        PathRow {
-            path: "t\u{e9}xtures/a.bundle".into(),
-            asset_uuid: AssetUuid([2; 16]),
-        },
-    ]);
-    assert!(matches!(
-        canonicalize(manifest),
-        Err(ManifestError::Duplicate)
-    ));
+    let decoded = decode_manifest(&encode_manifest(&manifest).unwrap()).unwrap();
+    assert_eq!(decoded.paths.unwrap()[0].path, "t\u{e9}xtures/a.bundle");
 }
 
 #[test]
-fn manifest_rejects_corruption_truncation_and_invalid_policy_bits() {
+fn manifest_rejects_corruption_and_truncation() {
     let bytes = encode_manifest(&sample()).unwrap();
-    for len in 0..bytes.len() {
-        assert!(
-            decode_manifest(&bytes[..len]).is_err(),
-            "accepted truncation {len}"
-        );
-    }
-    let mut bad = bytes.clone();
-    bad[0] ^= 1;
     assert!(matches!(
-        decode_manifest(&bad),
+        decode_manifest(&bytes[..bytes.len() - 1]),
+        Err(ManifestError::FileHash)
+    ));
+
+    let mut corrupt = bytes;
+    corrupt[8] ^= 1;
+    assert!(matches!(
+        decode_manifest(&corrupt),
         Err(ManifestError::FileHash)
     ));
 }
 
 #[test]
-fn artifact_header_crosscheck_is_bidirectional_and_exact() {
-    let row = &sample().assets[0];
-    let header = ArtifactMetadata {
-        asset_uuid: row.asset_uuid,
-        authored_type: row.authored_type,
-        encoded_type: row.terminal_type,
-        terminal_type: row.terminal_type,
-        logical_hash: row.logical_hash,
-        load_deps: row.load_deps.iter().map(|edge| edge.asset_uuid).collect(),
-    };
-    assert!(verify_artifact_metadata(row, &header).is_ok());
-    let mut wrong = header;
-    wrong.load_deps.push(AssetUuid([13; 16]));
-    assert!(verify_artifact_metadata(row, &wrong).is_err());
-}
-
-#[test]
-fn attestation_requires_pack_projection_coverage_but_allows_runtime_superset() {
-    let manifest = canonicalize(sample()).unwrap();
-    let extra = CompiledTypeRow::new(
-        TypeUuid([99; 16]),
-        LogicalHash([1; 32]),
-        [1; 32],
-        true,
-        RegistryExtrasV1::default(),
-    )
-    .unwrap();
-    let runtime = CompiledTypeTable::canonical(
-        manifest
-            .compiled_types
-            .rows
-            .iter()
-            .cloned()
-            .chain([extra])
-            .collect(),
-    )
-    .unwrap();
-    assert!(verify_attestation(&manifest, &runtime, [5; 32]).is_ok());
-    assert!(verify_attestation(
-        &manifest,
-        &CompiledTypeTable::canonical(vec![]).unwrap(),
-        [5; 32]
-    )
-    .is_err());
-    assert!(verify_attestation(&manifest, &runtime, [0; 32]).is_err());
-}
-
-#[test]
-fn manifest_rejects_forged_unsorted_incomplete_and_semantically_stale_rows() {
-    let mut forged = sample();
-    let runtime_index = forged
-        .compiled_types
-        .rows
-        .iter()
-        .position(|row| row.type_uuid == forged.assets[0].terminal_type)
-        .unwrap();
-    forged.compiled_types.rows[runtime_index]
-        .registry_extras_digest
-        .0[0] ^= 1;
-    assert!(matches!(
-        encode_manifest(&forged),
-        Err(ManifestError::CompiledAttestation(
-            distill_core::attestation::AttestationError::ExtrasDigestMismatch
-        ))
-    ));
-
-    let mut duplicate = sample();
-    let repeated = duplicate.compiled_types.rows[0].clone();
-    duplicate.compiled_types.rows.insert(1, repeated);
-    assert!(matches!(
-        encode_manifest(&duplicate),
-        Err(ManifestError::CompiledAttestation(
-            distill_core::attestation::AttestationError::DuplicateType(_)
-        ))
-    ));
-
-    let mut incomplete = sample();
-    incomplete.load_policy.clear();
-    assert_eq!(
-        encode_manifest(&incomplete),
-        Err(ManifestError::CompiledCoverage)
-    );
-
-    let manifest = canonicalize(sample()).unwrap();
-    let pack_row = manifest
-        .compiled_types
-        .rows
-        .iter()
-        .find(|row| row.type_uuid == manifest.assets[0].terminal_type)
-        .unwrap();
-    let stale = CompiledTypeRow::new(
-        pack_row.type_uuid,
-        LogicalHash([99; 32]),
-        pack_row.native_layout_digest,
-        pack_row.build_only,
-        pack_row.registry_extras.clone(),
-    )
-    .unwrap();
-    let stale_runtime = CompiledTypeTable::canonical(
-        manifest
-            .compiled_types
-            .rows
-            .iter()
-            .filter(|row| row.type_uuid != pack_row.type_uuid)
-            .cloned()
-            .chain([stale])
-            .collect(),
-    )
-    .unwrap();
-    assert_eq!(
-        verify_attestation(&manifest, &stale_runtime, manifest.target_def_hash),
-        Err(ManifestError::CompiledMismatch(pack_row.type_uuid))
-    );
-}
-
-#[test]
-fn manifest_requires_bootstrap_and_all_manifest_visible_boundary_types() {
-    let mut manifest = sample();
-    let missing_bootstrap = manifest
-        .compiled_types
-        .rows
-        .iter()
-        .find(|row| row.build_only)
-        .unwrap()
-        .type_uuid;
-    manifest
-        .compiled_types
-        .rows
-        .retain(|row| row.type_uuid != missing_bootstrap);
-    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
-    manifest
-        .load_policy
-        .retain(|row| row.type_uuid != missing_bootstrap);
-    assert!(matches!(
-        encode_manifest(&manifest),
-        Err(ManifestError::BootstrapAuthority(
-            distill_core::attestation::BootstrapAuthorityMismatch::Missing(_)
-        ))
-    ));
-
-    let mut manifest = sample();
-    let type_uuid = TypeUuid([99; 16]);
-    let extra = CompiledTypeRow::new(
-        type_uuid,
-        LogicalHash([99; 32]),
-        [99; 32],
-        false,
-        RegistryExtrasV1::default(),
-    )
-    .unwrap();
-    manifest.compiled_types.rows.push(extra);
-    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
-    manifest.load_policy.push(LoadPolicyRow {
-        type_uuid,
-        build_only: false,
-    });
-
-    assert!(encode_manifest(&manifest).is_ok());
+fn artifact_header_crosscheck_authenticates_identity_and_dependency_assets() {
+    let manifest = sample();
     let row = &manifest.assets[0];
-    let mut metadata = ArtifactMetadata {
+    let metadata = ArtifactMetadata {
         asset_uuid: row.asset_uuid,
-        authored_type: row.authored_type,
-        encoded_type: type_uuid,
-        terminal_type: row.terminal_type,
-        logical_hash: row.logical_hash,
-        load_deps: Vec::new(),
+        terminal_type: TypeUuid([21; 16]),
+        load_deps: vec![AssetUuid([2; 16])],
     };
-    assert!(verify_mounted_closure(
-        &canonicalize(manifest.clone()).unwrap(),
-        &[metadata.clone()]
-    )
-    .is_ok());
-    metadata.encoded_type = row.terminal_type;
+    assert!(verify_artifact_metadata(row, &metadata).is_ok());
+
+    let mut wrong = metadata;
+    wrong.load_deps.clear();
     assert_eq!(
-        verify_mounted_closure(&canonicalize(manifest).unwrap(), &[metadata]),
-        Err(ManifestError::CompiledCoverage)
+        verify_artifact_metadata(row, &wrong),
+        Err(ManifestError::MetadataMismatch)
     );
 }
 
 #[test]
-fn bootstrap_rows_are_boundary_only_and_cannot_enter_the_asset_closure() {
+fn manifest_rejects_missing_dependency_assets() {
     let mut manifest = sample();
-    let bootstrap = manifest
-        .compiled_types
-        .rows
-        .iter()
-        .find(|row| row.build_only)
-        .unwrap()
-        .clone();
-    manifest.assets[0].authored_type = bootstrap.type_uuid;
+    manifest.assets.pop();
+
     assert_eq!(
-        encode_manifest(&manifest),
-        Err(ManifestError::CompiledCoverage)
+        canonicalize(manifest),
+        Err(ManifestError::MissingDependency(AssetUuid([2; 16])))
     );
 }
 
 #[test]
-fn manifest_rejects_load_dependencies_absent_from_the_asset_table() {
+fn mounted_closure_rejects_typed_edge_terminal_mismatch() {
+    let manifest = canonicalize(sample()).unwrap();
+    let metadata = vec![
+        ArtifactMetadata {
+            asset_uuid: AssetUuid([1; 16]),
+            terminal_type: TypeUuid([21; 16]),
+            load_deps: vec![AssetUuid([2; 16])],
+        },
+        ArtifactMetadata {
+            asset_uuid: AssetUuid([2; 16]),
+            terminal_type: TypeUuid([99; 16]),
+            load_deps: Vec::new(),
+        },
+    ];
+
+    assert_eq!(
+        verify_mounted_closure(&manifest, &metadata),
+        Err(ManifestError::DependencyTypeMismatch(TypeUuid([22; 16])))
+    );
+}
+
+#[test]
+fn duplicate_dependency_assets_are_rejected_even_with_different_types() {
     let mut manifest = sample();
-    let missing = AssetUuid([13; 16]);
-    let expected_terminal = manifest.assets[0].terminal_type;
     manifest.assets[0].load_deps.push(ManifestLoadEdge {
-        asset_uuid: missing,
-        expected_terminal,
+        asset_uuid: AssetUuid([2; 16]),
+        expected_terminal: TypeUuid([23; 16]),
     });
 
-    assert_eq!(
-        encode_manifest(&manifest),
-        Err(ManifestError::MissingDependency(missing))
-    );
-}
-
-#[test]
-fn manifest_rejects_a_typed_edge_that_disagrees_with_its_target() {
-    let mut manifest = sample();
-    let target = manifest.assets[0].clone();
-    let target_uuid = AssetUuid([13; 16]);
-    let wrong_terminal = TypeUuid([99; 16]);
-    manifest.assets.push(ManifestAssetRow {
-        asset_uuid: target_uuid,
-        ..target
-    });
-    manifest.assets[0].load_deps.push(ManifestLoadEdge {
-        asset_uuid: target_uuid,
-        expected_terminal: wrong_terminal,
-    });
-    manifest.compiled_types.rows.push(
-        CompiledTypeRow::new(
-            wrong_terminal,
-            LogicalHash([99; 32]),
-            [99; 32],
-            false,
-            RegistryExtrasV1::default(),
-        )
-        .unwrap(),
-    );
-    manifest.compiled_types = CompiledTypeTable::canonical(manifest.compiled_types.rows).unwrap();
-    manifest.load_policy.push(LoadPolicyRow {
-        type_uuid: wrong_terminal,
-        build_only: false,
-    });
-
-    assert_eq!(
-        encode_manifest(&manifest),
-        Err(ManifestError::CompiledMismatch(wrong_terminal))
-    );
+    assert_eq!(canonicalize(manifest), Err(ManifestError::Duplicate));
 }

@@ -108,8 +108,7 @@ fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) 
 }
 
 fn target() -> TargetDefinition {
-    TargetDefinition::canonical("dev", TargetDefinitionHash([4; 32]), Vec::new(), Vec::new())
-        .unwrap()
+    TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
 }
 
 fn object<const N: usize>(fields: [(&str, AuthoredValue); N]) -> AuthoredValue {

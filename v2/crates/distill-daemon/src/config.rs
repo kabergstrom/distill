@@ -388,8 +388,7 @@ impl DaemonConfig {
             .iter()
             .map(|(name, target)| {
                 let definition_hash = TargetDefinitionHash(target_definition_hash(target, &[]));
-                TargetDefinition::canonical(name, definition_hash, Vec::new(), Vec::new())
-                    .map_err(|error| DaemonConfigError::Target(format!("{name}: {error}")))
+                Ok(TargetDefinition::new(name, definition_hash))
             })
             .collect()
     }

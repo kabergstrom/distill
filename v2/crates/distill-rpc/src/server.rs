@@ -9,7 +9,6 @@ use unicode_normalization::UnicodeNormalization;
 use distill_json::AuthoredValue;
 use distill_schema::ngp_schema::{verify_snapshot, PrimitiveKind, SchemaNode};
 
-use crate::attestation::validate_attestation_shape;
 use crate::*;
 
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -168,8 +167,6 @@ pub struct Snapshot {
     server: Server,
     connection: Arc<Mutex<ConnectionState>>,
     connection_id: u64,
-    epoch: GameModuleEpoch,
-    attestation_generation: u64,
     view: Arc<VersionView>,
     basis: RpcBasis,
     lease: Arc<ArtifactLease>,
@@ -180,8 +177,6 @@ pub struct AuthoringSnapshot {
     server: Server,
     connection: Arc<Mutex<ConnectionState>>,
     connection_id: u64,
-    epoch: GameModuleEpoch,
-    attestation_generation: u64,
     view: Arc<VersionView>,
     basis: RpcBasis,
     lease_alive: Arc<AtomicBool>,
@@ -316,7 +311,6 @@ impl fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Snapshot")
             .field("connection_id", &self.connection_id)
-            .field("epoch", &self.epoch)
             .field("stamp", &self.basis.snapshot)
             .finish()
     }
@@ -326,7 +320,6 @@ impl fmt::Debug for AuthoringSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthoringSnapshot")
             .field("connection_id", &self.connection_id)
-            .field("epoch", &self.epoch)
             .field("stamp", &self.basis.snapshot)
             .finish()
     }
@@ -446,69 +439,19 @@ enum VersionResolve {
 struct TargetRuntime {
     definition: TargetDefinition,
     target_generation: u64,
-    /// Full daemon-table generation used only as a reattestation validation /
-    /// installation CAS fence. Live Hub generations are projection-sensitive.
-    policy_authority_generation: u64,
-    compiled_table_generation: u64,
 }
 
 struct ConnectionState {
     id: u64,
     target: String,
     target_generation: u64,
-    policy_generation: u64,
-    attestation_generation: u64,
     store_instance: StoreInstanceId,
     protocol_epoch: u32,
-    epoch: GameModuleEpoch,
-    load_policy: Arc<LoadPolicyAttestation>,
-    accepted_compiled_rows: Vec<CompiledTypeRow>,
-    accepted_type_uuids: BTreeSet<TypeUuid>,
-    daemon_compiled_projection: CompiledAttestationDigest,
     subscribed_assets: BTreeSet<AssetUuid>,
     subscribed_paths: BTreeSet<String>,
     queue: VecDeque<StreamEvent>,
     stream_installed: bool,
     notify: Arc<Notify>,
-}
-
-/// Complete connection fence captured with the attestation validation
-/// snapshot and compared again immediately before installation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReattestationFence {
-    attestation_generation: u64,
-    target_generation: u64,
-    policy_generation: u64,
-    store_instance: StoreInstanceId,
-    protocol_epoch: u32,
-    daemon_compiled_table_generation: u64,
-    daemon_policy_authority_generation: u64,
-    epoch: GameModuleEpoch,
-    accepted_compiled_rows: Vec<CompiledTypeRow>,
-    load_policy: Arc<LoadPolicyAttestation>,
-    daemon_compiled_projection: CompiledAttestationDigest,
-}
-
-impl ReattestationFence {
-    fn capture(
-        connection: &ConnectionState,
-        daemon_compiled_table_generation: u64,
-        daemon_policy_authority_generation: u64,
-    ) -> Self {
-        Self {
-            attestation_generation: connection.attestation_generation,
-            target_generation: connection.target_generation,
-            policy_generation: connection.policy_generation,
-            store_instance: connection.store_instance,
-            protocol_epoch: connection.protocol_epoch,
-            daemon_compiled_table_generation,
-            daemon_policy_authority_generation,
-            epoch: connection.epoch,
-            accepted_compiled_rows: connection.accepted_compiled_rows.clone(),
-            load_policy: connection.load_policy.clone(),
-            daemon_compiled_projection: connection.daemon_compiled_projection,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -522,7 +465,7 @@ impl Server {
     pub fn new(
         instance: StoreInstanceId,
         targets: Vec<TargetDefinition>,
-    ) -> Result<Self, AttestationShapeError> {
+    ) -> Result<Self, TargetSetError> {
         Self::new_with_authoring_backend(instance, targets, Arc::new(UnavailableAuthoringBackend))
     }
 
@@ -530,7 +473,7 @@ impl Server {
         instance: StoreInstanceId,
         targets: Vec<TargetDefinition>,
         authoring_backend: Arc<dyn AuthoringBackend>,
-    ) -> Result<Self, AttestationShapeError> {
+    ) -> Result<Self, TargetSetError> {
         Self::new_at_version_with_authoring_backend(
             instance,
             InputVersion(0),
@@ -548,15 +491,9 @@ impl Server {
         version: InputVersion,
         targets: Vec<TargetDefinition>,
         authoring_backend: Arc<dyn AuthoringBackend>,
-    ) -> Result<Self, AttestationShapeError> {
+    ) -> Result<Self, TargetSetError> {
         let mut target_map = BTreeMap::new();
         for target in targets {
-            validate_attestation_shape(
-                target.compiled_registry(),
-                target.dsca(),
-                target.load_policy(),
-                target.policy_digest(),
-            )?;
             let name = target.name().to_owned();
             if target_map
                 .insert(
@@ -564,13 +501,11 @@ impl Server {
                     TargetRuntime {
                         definition: target,
                         target_generation: 0,
-                        policy_authority_generation: 0,
-                        compiled_table_generation: 0,
                     },
                 )
                 .is_some()
             {
-                return Err(AttestationShapeError::DuplicateTarget { target: name });
+                return Err(TargetSetError::DuplicateTarget { target: name });
             }
         }
         let stamp = SnapshotStamp { instance, version };
@@ -741,54 +676,21 @@ impl Server {
                 ),
             });
         }
-        if payload.encoded_type != parsed.encoded_type
-            || payload.terminal_type != parsed.terminal_type
-        {
+        if payload.load_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(AdminError::InvalidArtifact {
-                detail: "payload header types do not match the authenticated DSTL header"
-                    .to_owned(),
+                detail: "direct typed load edges must be strictly sorted and unique".to_owned(),
             });
         }
-        let required_runtime_types = validate_served_closure(&payload.closure_rows, true)?;
-        let root_index = payload
-            .closure_rows
-            .binary_search_by_key(&parsed.asset_uuid, |row| row.asset)
-            .map_err(|_| AdminError::InvalidArtifact {
-                detail: "served closure omits the authenticated artifact root asset".to_owned(),
-            })?;
-        let root = &payload.closure_rows[root_index];
-        if root.content_hash != hash
-            || root.authored_type != parsed.authored_type
-            || root.encoded_type != parsed.encoded_type
-            || root.terminal_type != parsed.terminal_type
-        {
-            return Err(AdminError::InvalidArtifact {
-                detail: "served closure root does not match the authenticated DSTL identity/header"
-                    .to_owned(),
-            });
-        }
-        let closure_deps = root
+        let edge_assets = payload
             .load_edges
             .iter()
             .map(|edge| edge.asset)
             .collect::<Vec<_>>();
-        if closure_deps != parsed.load_deps {
+        if edge_assets != parsed.load_deps {
             return Err(AdminError::InvalidArtifact {
-                detail: "served closure root load edges do not match authenticated DSTL load_deps"
+                detail: "direct typed load edges do not match authenticated DSTL load_deps"
                     .to_owned(),
             });
-        }
-        let header_types = BTreeSet::from([
-            parsed.authored_type,
-            parsed.encoded_type,
-            parsed.terminal_type,
-        ]);
-        let missing = header_types
-            .difference(&required_runtime_types)
-            .copied()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(AdminError::IncompleteArtifactTypeCoverage { missing });
         }
         let layout_hash = parsed.layout_hash;
         let asset_uuid = parsed.asset_uuid;
@@ -963,17 +865,10 @@ impl Server {
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
         let mut replacement_map = BTreeMap::new();
         for replacement in replacements {
-            validate_attestation_shape(
-                replacement.compiled_registry(),
-                replacement.dsca(),
-                replacement.load_policy(),
-                replacement.policy_digest(),
-            )
-            .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
             let name = replacement.name().to_owned();
             if replacement_map.insert(name.clone(), replacement).is_some() {
                 return Err(CoordinatedCommitError::Publication(
-                    AttestationShapeError::DuplicateTarget { target: name }.to_string(),
+                    TargetSetError::DuplicateTarget { target: name }.to_string(),
                 ));
             }
         }
@@ -1005,21 +900,12 @@ impl Server {
         }
     }
 
-    /// Replace a staged target. Any target-definition/layout change advances
-    /// the target generation; policy projection changes advance its separate
-    /// generation. The input version advances once for the combined commit.
+    /// Replace a staged target definition and fence every bound Hub.
     pub fn replace_target(
         &self,
         replacement: TargetDefinition,
     ) -> Result<SnapshotStamp, AdminError> {
         let mut state = self.lock();
-        validate_attestation_shape(
-            replacement.compiled_registry(),
-            replacement.dsca(),
-            replacement.load_policy(),
-            replacement.policy_digest(),
-        )
-        .map_err(AdminError::InvalidTargetAttestation)?;
         let name = replacement.name().to_owned();
         let runtime = state
             .targets
@@ -1028,48 +914,17 @@ impl Server {
                 target: name.clone(),
             })?;
         let target_changed = runtime.definition.definition_hash() != replacement.definition_hash();
-        let compiled_changed =
-            runtime.definition.compiled_registry() != replacement.compiled_registry();
-        let policy_changed = runtime.definition.load_policy() != replacement.load_policy()
-            || runtime.definition.policy_digest() != replacement.policy_digest();
-        if !target_changed && !policy_changed && !compiled_changed {
+        if !target_changed {
             return Ok(stamp(&state));
         }
-        if target_changed {
-            runtime.target_generation = runtime
-                .target_generation
-                .checked_add(1)
-                .expect("target generation exhausted");
-        }
-        if policy_changed {
-            runtime.policy_authority_generation = runtime
-                .policy_authority_generation
-                .checked_add(1)
-                .expect("policy authority generation exhausted");
-        }
-        if compiled_changed {
-            runtime.compiled_table_generation = runtime
-                .compiled_table_generation
-                .checked_add(1)
-                .expect("compiled table generation exhausted");
-        }
+        runtime.target_generation = runtime
+            .target_generation
+            .checked_add(1)
+            .expect("target generation exhausted");
         runtime.definition = replacement;
 
         advance_empty_version(&mut state);
-        if target_changed {
-            notify_reconnect(&mut state, &name, ReconnectReason::TargetDefinitionChanged);
-        } else {
-            if policy_changed {
-                notify_projection_reconnect(&mut state, &name, ReconnectReason::LoadPolicyChanged);
-            }
-            if compiled_changed {
-                notify_projection_reconnect(
-                    &mut state,
-                    &name,
-                    ReconnectReason::CompiledAttestationChanged,
-                );
-            }
-        }
+        notify_reconnect(&mut state, &name, ReconnectReason::TargetDefinitionChanged);
         Ok(stamp(&state))
     }
 
@@ -1222,38 +1077,13 @@ impl Root {
                 })
             }
         };
-        let policy = match validate_complete_attestation(
-            &runtime.definition,
-            request.target_definition_hash,
-            &request.compiled_registry,
-            request.dsca,
-            &request.load_policy,
-            request.policy_digest,
-        ) {
-            Ok(policy) => policy,
-            Err(error) => return ConnectOutcome::Rejected(error),
-        };
+        if runtime.definition.definition_hash() != request.target_definition_hash {
+            return ConnectOutcome::Rejected(ConnectError::TargetDefinitionMismatch {
+                expected: runtime.definition.definition_hash(),
+                got: request.target_definition_hash,
+            });
+        }
         let target_generation = runtime.target_generation;
-        // Policy generations belong to one Hub's accepted projection. A
-        // fresh Hub starts at zero regardless of changes elsewhere in the
-        // daemon's full policy table; reattestation advances it only when
-        // that Hub's accepted-set projection changes.
-        let policy_generation = 0;
-        let accepted_type_uuids = request
-            .compiled_registry
-            .iter()
-            .filter(|row| !distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-            .map(|row| row.type_uuid)
-            .collect::<BTreeSet<_>>();
-        let daemon_compiled_projection = match daemon_projection_digest(
-            runtime.definition.compiled_registry(),
-            &accepted_type_uuids,
-        ) {
-            Ok(digest) => digest,
-            Err(error) => {
-                return ConnectOutcome::Rejected(projection_connect_error(error));
-            }
-        };
         let current_view = state
             .views
             .get(&state.current)
@@ -1289,15 +1119,8 @@ impl Root {
             id,
             target: request.target,
             target_generation,
-            policy_generation,
-            attestation_generation: 0,
             store_instance: state.instance,
             protocol_epoch: state.protocol_epoch,
-            epoch: request.epoch,
-            load_policy: policy.clone(),
-            accepted_compiled_rows: request.compiled_registry,
-            accepted_type_uuids,
-            daemon_compiled_projection,
             subscribed_assets: BTreeSet::new(),
             subscribed_paths: BTreeSet::new(),
             queue: VecDeque::new(),
@@ -1311,11 +1134,6 @@ impl Root {
                 connection,
             },
             instance: state.instance,
-            policy_generation,
-            target_generation,
-            attestation_generation: 0,
-            load_policy: policy,
-            daemon_compiled_projection,
         })
     }
 }
@@ -1763,9 +1581,6 @@ impl MetadataHub {
         let Some(payload) = state.artifacts.get(&hash) else {
             return MetadataCall::Error(RpcFailure::ArtifactNotFound { hash });
         };
-        if let Err(error) = verified_artifact_closure(&state, hash) {
-            return MetadataCall::Error(error);
-        }
         MetadataCall::Success(chunk_payload(&payload.payload, state.chunk_size))
     }
 }
@@ -1981,12 +1796,6 @@ impl MetadataAuthoringSnapshot {
 impl Hub {
     pub fn connection_id(&self) -> u64 {
         lock_connection(&self.connection).id
-    }
-
-    /// The installed generation, exposed for loader basis rotation and
-    /// diagnostics. Mutation is possible only through successful reattest.
-    pub fn attestation_generation(&self) -> u64 {
-        lock_connection(&self.connection).attestation_generation
     }
 
     /// Cheap transport gate used before decoding target-bound request
@@ -2234,78 +2043,6 @@ impl Hub {
         let Some(tree) = state.wire_trees.get(&hash) else {
             return RpcResult::Failure(RpcFailure::WireTreeNotFound { hash });
         };
-        let current_view = state
-            .views
-            .get(&state.current)
-            .expect("current view must exist");
-        let mut referencing_hashes = current_view
-            .assets
-            .values()
-            .filter_map(|resolution| match resolution {
-                VersionResolve::Built { content_hash } => state
-                    .artifacts
-                    .get(content_hash)
-                    .is_some_and(|artifact| artifact.layout_hash == hash)
-                    .then_some(*content_hash),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if referencing_hashes.is_empty() {
-            let historical = state
-                .artifacts
-                .iter()
-                .filter_map(|(content_hash, artifact)| {
-                    (artifact.layout_hash == hash).then_some(*content_hash)
-                })
-                .collect::<BTreeSet<_>>();
-            if historical.is_empty() {
-                return RpcResult::Failure(RpcFailure::WireTreeNotFound { hash });
-            }
-            for content_hash in &historical {
-                let (required, _) = match verified_artifact_closure(&state, *content_hash) {
-                    Ok(verified) => verified,
-                    Err(error) => return RpcResult::Failure(error),
-                };
-                if required.is_subset(&connection.accepted_type_uuids) {
-                    return RpcResult::Success(tree.bytes.clone());
-                }
-            }
-            referencing_hashes.insert(
-                *historical
-                    .first()
-                    .expect("nonempty historical reference set was checked"),
-            );
-        }
-        let mut closure_by_asset = BTreeMap::new();
-        for content_hash in referencing_hashes {
-            let (_, rows) = match verified_artifact_closure(&state, content_hash) {
-                Ok(verified) => verified,
-                Err(error) => return RpcResult::Failure(error),
-            };
-            for row in rows {
-                if closure_by_asset
-                    .insert(row.asset, row.clone())
-                    .is_some_and(|previous| previous != row)
-                {
-                    return RpcResult::Failure(RpcFailure::InvalidQuery {
-                        detail: "current wire-tree references contain conflicting closure rows for one asset"
-                            .to_owned(),
-                    });
-                }
-            }
-        }
-        let closure_rows = closure_by_asset.into_values().collect::<Vec<_>>();
-        let required_runtime_types = served_closure_types(&closure_rows);
-        if let Some(expansion) = attestation_expansion(
-            stamp(&state),
-            4,
-            &hash.0,
-            &required_runtime_types,
-            &connection.accepted_type_uuids,
-            closure_rows,
-        ) {
-            return RpcResult::AttestationExpansionRequired(expansion);
-        }
         RpcResult::Success(tree.bytes.clone())
     }
 
@@ -2342,20 +2079,6 @@ impl Hub {
             Some(payload) => payload,
             None => return RpcResult::Failure(RpcFailure::ArtifactNotFound { hash }),
         };
-        let (required_runtime_types, closure_rows) = match verified_artifact_closure(&state, hash) {
-            Ok(verified) => verified,
-            Err(error) => return RpcResult::Failure(error),
-        };
-        if let Some(expansion) = attestation_expansion(
-            stamp(&state),
-            3,
-            &hash.0,
-            &required_runtime_types,
-            &connection.accepted_type_uuids,
-            closure_rows,
-        ) {
-            return RpcResult::AttestationExpansionRequired(expansion);
-        }
         let current = stamp(&state);
         RpcResult::Success(TerminalEvent {
             basis: basis_for(&connection, current),
@@ -2464,205 +2187,6 @@ impl Hub {
         }
         RpcResult::Success(())
     }
-
-    pub fn reattest(&self, request: ReattestRequest) -> RpcResult<ReattestSuccess> {
-        let state = self.server.lock();
-        let mut connection = lock_connection(&self.connection);
-        if let Some(reason) = generation_fence(&state, &connection) {
-            return RpcResult::ReconnectRequired { reason };
-        }
-        let runtime = state
-            .targets
-            .get(&connection.target)
-            .expect("connected target must exist");
-        let validation_fence = ReattestationFence::capture(
-            &connection,
-            runtime.compiled_table_generation,
-            runtime.policy_authority_generation,
-        );
-        let current_view = state
-            .views
-            .get(&state.current)
-            .expect("current view must exist");
-        if let ConfigurationStatus::Poisoned(poison) = &current_view.configuration {
-            return RpcResult::ConfigurationPoisoned(poison.clone());
-        }
-        if let Some(error) = pipeline_failure(current_view) {
-            return RpcResult::Failure(error);
-        }
-        let expected_successor = match request.base_attestation_generation.checked_add(1) {
-            Some(successor) => successor,
-            None => {
-                return RpcResult::Failure(RpcFailure::AttestationGenerationOverflow {
-                    base: request.base_attestation_generation,
-                })
-            }
-        };
-        if request.successor_attestation_generation != expected_successor {
-            return RpcResult::Failure(RpcFailure::InvalidAttestationSuccessor {
-                base: request.base_attestation_generation,
-                successor: request.successor_attestation_generation,
-            });
-        }
-        if request.base_attestation_generation != connection.attestation_generation {
-            return RpcResult::Failure(RpcFailure::StaleAttestationBase {
-                expected: connection.attestation_generation,
-                got: request.base_attestation_generation,
-            });
-        }
-        let proposed_type_uuids = request
-            .compiled_registry
-            .iter()
-            .filter(|row| !distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-            .map(|row| row.type_uuid)
-            .collect::<BTreeSet<_>>();
-        let same_epoch_expansion = request.epoch == connection.epoch
-            && connection
-                .accepted_type_uuids
-                .is_subset(&proposed_type_uuids)
-            && connection.accepted_type_uuids.len() < proposed_type_uuids.len()
-            && connection.accepted_compiled_rows.iter().all(|bound| {
-                request
-                    .compiled_registry
-                    .binary_search_by_key(&bound.type_uuid, |row| row.type_uuid)
-                    .is_ok_and(|index| request.compiled_registry[index] == *bound)
-            });
-        if request.epoch < connection.epoch
-            || (request.epoch == connection.epoch && !same_epoch_expansion)
-        {
-            return RpcResult::Failure(RpcFailure::EpochNotSuccessor {
-                previous: connection.epoch,
-                proposed: request.epoch,
-            });
-        }
-        let policy = match validate_complete_attestation(
-            &runtime.definition,
-            request.target_definition_hash,
-            &request.compiled_registry,
-            request.dsca,
-            &request.load_policy,
-            request.policy_digest,
-        ) {
-            Ok(policy) => policy,
-            Err(error) => return RpcResult::Failure(RpcFailure::Attestation(error)),
-        };
-        let accepted_type_uuids = proposed_type_uuids;
-        let daemon_compiled_projection = match daemon_projection_digest(
-            runtime.definition.compiled_registry(),
-            &accepted_type_uuids,
-        ) {
-            Ok(digest) => digest,
-            Err(error) => {
-                return RpcResult::Failure(RpcFailure::Attestation(projection_connect_error(
-                    error,
-                )));
-            }
-        };
-        let successor_policy_generation = if *policy != *connection.load_policy {
-            match connection.policy_generation.checked_add(1) {
-                Some(generation) => generation,
-                None => {
-                    return RpcResult::Failure(RpcFailure::PolicyGenerationOverflow {
-                        base: connection.policy_generation,
-                    })
-                }
-            }
-        } else {
-            connection.policy_generation
-        };
-
-        // Validation and installation currently share the server lock, but
-        // the complete tuple is still compared explicitly. This preserves
-        // the CAS contract if validation later moves off-lock.
-        if let Some(reason) = generation_fence(&state, &connection) {
-            return RpcResult::ReconnectRequired { reason };
-        }
-        let install_runtime = state
-            .targets
-            .get(&connection.target)
-            .expect("connected target must exist");
-        let install_fence = ReattestationFence::capture(
-            &connection,
-            install_runtime.compiled_table_generation,
-            install_runtime.policy_authority_generation,
-        );
-        if install_fence.store_instance != validation_fence.store_instance {
-            return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::StoreInstanceChanged,
-            };
-        }
-        if install_fence.protocol_epoch != validation_fence.protocol_epoch {
-            return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::ProtocolEpochChanged,
-            };
-        }
-        if install_fence.target_generation != validation_fence.target_generation {
-            return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::TargetDefinitionChanged,
-            };
-        }
-        if install_fence.policy_generation != validation_fence.policy_generation {
-            return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::LoadPolicyChanged,
-            };
-        }
-        if install_fence.daemon_policy_authority_generation
-            != validation_fence.daemon_policy_authority_generation
-        {
-            return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::LoadPolicyChanged,
-            };
-        }
-        if install_fence.daemon_compiled_table_generation
-            != validation_fence.daemon_compiled_table_generation
-        {
-            return RpcResult::ReconnectRequired {
-                reason: ReconnectReason::CompiledAttestationChanged,
-            };
-        }
-        if install_fence.attestation_generation != validation_fence.attestation_generation {
-            return RpcResult::Failure(RpcFailure::StaleAttestationBase {
-                expected: install_fence.attestation_generation,
-                got: request.base_attestation_generation,
-            });
-        }
-        if install_fence.epoch != validation_fence.epoch
-            || install_fence.accepted_compiled_rows != validation_fence.accepted_compiled_rows
-            || install_fence.load_policy != validation_fence.load_policy
-            || install_fence.daemon_compiled_projection
-                != validation_fence.daemon_compiled_projection
-        {
-            return RpcResult::Failure(RpcFailure::StaleAttestationBase {
-                expected: install_fence.attestation_generation,
-                got: request.base_attestation_generation,
-            });
-        }
-
-        connection.epoch = request.epoch;
-        connection.load_policy = policy;
-        connection.policy_generation = successor_policy_generation;
-        connection.accepted_compiled_rows = request.compiled_registry;
-        connection.accepted_type_uuids = accepted_type_uuids;
-        connection.daemon_compiled_projection = daemon_compiled_projection;
-        connection.attestation_generation = request.successor_attestation_generation;
-        if connection.stream_installed {
-            connection.queue.clear();
-            let basis = basis_for(&connection, stamp(&state));
-            enqueue_event(
-                &mut connection,
-                StreamEvent::ResyncRequired {
-                    basis,
-                    oldest_available: state.current,
-                },
-            );
-        }
-        RpcResult::Success(ReattestSuccess {
-            installed_attestation_generation: request.successor_attestation_generation,
-            daemon_compiled_projection,
-            load_policy: connection.load_policy.clone(),
-            policy_generation: successor_policy_generation,
-        })
-    }
 }
 
 impl Snapshot {
@@ -2736,15 +2260,6 @@ impl Snapshot {
         if let Err(detail) = validate_asset_query(&query, false) {
             return RpcResult::Failure(RpcFailure::InvalidQuery { detail });
         }
-        if query
-            .terminal_type
-            .is_some_and(|type_uuid| !connection.accepted_type_uuids.contains(&type_uuid))
-        {
-            return RpcResult::Failure(RpcFailure::InvalidQuery {
-                detail: "terminal type selector is outside this Hub's accepted attestation set"
-                    .to_owned(),
-            });
-        }
         if let Some(error) = tag_query_poison(&self.view, &query, AuthoringEntryRole::Runtime) {
             return RpcResult::Failure(error);
         }
@@ -2772,20 +2287,6 @@ impl Snapshot {
         };
         if entry.role != AuthoringEntryRole::Runtime {
             return RpcResult::Failure(RpcFailure::AssetNotFound { uuid });
-        }
-        let (required, closure_rows) = match served_rows_for_entry(&state, &self.view, entry) {
-            Ok(verified) => verified,
-            Err(error) => return RpcResult::Failure(error),
-        };
-        if let Some(expansion) = attestation_expansion(
-            self.basis.snapshot,
-            1,
-            &uuid.0,
-            &required,
-            &connection.accepted_type_uuids,
-            closure_rows,
-        ) {
-            return RpcResult::AttestationExpansionRequired(expansion);
         }
         RpcResult::Success(metadata_entry(entry))
     }
@@ -2944,71 +2445,6 @@ impl Snapshot {
                     BuildResolution::Drifted(input) => VersionResolve::Drifted { input },
                 })
             });
-            let (required, closure_rows) = if let Some(VersionResolve::Built { content_hash }) =
-                &resolution
-            {
-                match verified_artifact_closure(&state, *content_hash) {
-                    Ok((mut required, rows)) => {
-                        if let Some(output) = &derived {
-                            let Some(root) = rows.iter().find(|row| row.asset == uuid) else {
-                                return RpcResult::Failure(RpcFailure::InvalidQuery {
-                                    detail:
-                                        "built artifact closure omits the requested derived output"
-                                            .to_owned(),
-                                });
-                            };
-                            if root.authored_type != output.terminal_type
-                                || root.encoded_type != output.terminal_type
-                                || root.terminal_type != output.terminal_type
-                            {
-                                return RpcResult::Failure(RpcFailure::InvalidQuery {
-                                    detail: "derived-output declaration does not match the authenticated artifact closure"
-                                        .to_owned(),
-                                });
-                            }
-                            required.insert(output.terminal_type);
-                        } else if let Some(entry) = &runtime_entry {
-                            let Some(root) = rows.iter().find(|row| row.asset == entry.uuid) else {
-                                return RpcResult::Failure(RpcFailure::InvalidQuery {
-                                    detail:
-                                        "built artifact closure omits its runtime metadata asset"
-                                            .to_owned(),
-                                });
-                            };
-                            if root.authored_type != entry.type_uuid
-                                || root.terminal_type != entry.terminal_type
-                            {
-                                return RpcResult::Failure(RpcFailure::InvalidQuery {
-                                        detail: "runtime metadata types do not match the authenticated artifact closure"
-                                            .to_owned(),
-                                    });
-                            }
-                            required.extend([entry.type_uuid, entry.terminal_type]);
-                        }
-                        (required, rows)
-                    }
-                    Err(error) => return RpcResult::Failure(error),
-                }
-            } else if let Some(output) = &derived {
-                (BTreeSet::from([output.terminal_type]), Vec::new())
-            } else if let Some(entry) = &runtime_entry {
-                match served_rows_for_entry(&state, &self.view, entry) {
-                    Ok(verified) => verified,
-                    Err(error) => return RpcResult::Failure(error),
-                }
-            } else {
-                (BTreeSet::new(), Vec::new())
-            };
-            if let Some(expansion) = attestation_expansion(
-                self.basis.snapshot,
-                2,
-                &uuid.0,
-                &required,
-                &connection.accepted_type_uuids,
-                closure_rows,
-            ) {
-                return RpcResult::AttestationExpansionRequired(expansion);
-            }
             let value = match resolution {
                 Some(VersionResolve::Built { content_hash }) => {
                     let Some(_) = state.artifacts.get(&content_hash) else {
@@ -3076,20 +2512,6 @@ impl Snapshot {
             Some(payload) => payload,
             None => return RpcResult::Failure(RpcFailure::ArtifactNotFound { hash }),
         };
-        let (required_runtime_types, closure_rows) = match verified_artifact_closure(&state, hash) {
-            Ok(verified) => verified,
-            Err(error) => return RpcResult::Failure(error),
-        };
-        if let Some(expansion) = attestation_expansion(
-            self.basis.snapshot,
-            3,
-            &hash.0,
-            &required_runtime_types,
-            &connection.accepted_type_uuids,
-            closure_rows,
-        ) {
-            return RpcResult::AttestationExpansionRequired(expansion);
-        }
         RpcResult::Success(TerminalEvent {
             basis: self.basis.clone(),
             value: chunk_payload(&payload.payload, state.chunk_size),
@@ -3103,18 +2525,6 @@ impl Snapshot {
     ) -> Option<RpcResult<T>> {
         if let Some(reason) = generation_fence(state, connection) {
             return Some(RpcResult::ReconnectRequired { reason });
-        }
-        if connection.epoch != self.epoch {
-            return Some(RpcResult::Failure(RpcFailure::ClientEpochChanged {
-                snapshot: self.epoch,
-                current: connection.epoch,
-            }));
-        }
-        if connection.attestation_generation != self.attestation_generation {
-            return Some(RpcResult::Failure(RpcFailure::StaleAttestationBase {
-                expected: connection.attestation_generation,
-                got: self.attestation_generation,
-            }));
         }
         if !self.lease.alive() {
             return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
@@ -3237,18 +2647,6 @@ impl AuthoringSnapshot {
         if let Some(reason) = generation_fence(state, connection) {
             return Some(RpcResult::ReconnectRequired { reason });
         }
-        if connection.epoch != self.epoch {
-            return Some(RpcResult::Failure(RpcFailure::ClientEpochChanged {
-                snapshot: self.epoch,
-                current: connection.epoch,
-            }));
-        }
-        if connection.attestation_generation != self.attestation_generation {
-            return Some(RpcResult::Failure(RpcFailure::StaleAttestationBase {
-                expected: connection.attestation_generation,
-                got: self.attestation_generation,
-            }));
-        }
         if !self.lease_alive.load(Ordering::Acquire) {
             return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
         }
@@ -3279,204 +2677,6 @@ impl DeltaStream {
     }
 }
 
-fn validate_complete_attestation(
-    target: &TargetDefinition,
-    target_hash: TargetDefinitionHash,
-    compiled_rows: &[CompiledTypeRow],
-    dsca: CompiledAttestationDigest,
-    policy_rows: &[LoadPolicyEntry],
-    policy_digest: [u8; 32],
-) -> Result<Arc<LoadPolicyAttestation>, ConnectError> {
-    let expected_dsca =
-        distill_core::attestation::compute_compiled_attestation_digest(compiled_rows)
-            .map_err(|error| ConnectError::AttestationShape(error.into()))?;
-    compute_policy_digest(policy_rows).map_err(ConnectError::AttestationShape)?;
-    validate_cross_projection_rows(compiled_rows, policy_rows)?;
-    if expected_dsca != dsca {
-        return Err(ConnectError::CompiledRegistryAggregateMismatch {
-            expected: expected_dsca.0,
-            observed: dsca.0,
-        });
-    }
-    validate_attestation_shape(compiled_rows, dsca, policy_rows, policy_digest)
-        .map_err(ConnectError::AttestationShape)?;
-    if target.definition_hash() != target_hash {
-        return Err(ConnectError::TargetDefinitionMismatch {
-            expected: target.definition_hash(),
-            got: target_hash,
-        });
-    }
-    let expected_bootstrap = target
-        .compiled_registry()
-        .iter()
-        .filter(|row| distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-        .cloned()
-        .collect::<Vec<_>>();
-    let observed_bootstrap = compiled_rows
-        .iter()
-        .filter(|row| distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-        .cloned()
-        .collect::<Vec<_>>();
-    if let Some(missing) = expected_bootstrap.iter().find(|expected| {
-        observed_bootstrap
-            .binary_search_by_key(&expected.type_uuid, |row| row.type_uuid)
-            .is_err()
-    }) {
-        return Err(ConnectError::MissingCompiledType {
-            type_uuid: missing.type_uuid,
-        });
-    }
-    if expected_bootstrap != observed_bootstrap {
-        return Err(ConnectError::BootstrapAuthorityMismatch {
-            expected: encode_compiled_rows(&expected_bootstrap),
-            observed: encode_compiled_rows(&observed_bootstrap),
-        });
-    }
-
-    if dsca != target.dsca() {
-        for client in compiled_rows {
-            let server = target
-                .compiled_registry()
-                .binary_search_by_key(&client.type_uuid, |row| row.type_uuid)
-                .ok()
-                .map(|index| &target.compiled_registry()[index]);
-            match server {
-                None => {
-                    return Err(ConnectError::MissingCompiledType {
-                        type_uuid: client.type_uuid,
-                    })
-                }
-                Some(server) => {
-                    if server.logical_hash != client.logical_hash {
-                        return Err(ConnectError::LogicalHashMismatch {
-                            type_uuid: client.type_uuid,
-                            expected: server.logical_hash.0,
-                            observed: client.logical_hash.0,
-                        });
-                    }
-                    if server.native_layout_digest != client.native_layout_digest {
-                        return Err(ConnectError::NativeLayoutMismatch {
-                            type_uuid: client.type_uuid,
-                            expected: server.native_layout_digest,
-                            observed: client.native_layout_digest,
-                        });
-                    }
-                    if server.build_only != client.build_only {
-                        return Err(ConnectError::CompiledBuildOnlyMismatch {
-                            type_uuid: client.type_uuid,
-                            expected: server.build_only,
-                            observed: client.build_only,
-                        });
-                    }
-                    if server.registry_extras != client.registry_extras
-                        || server.registry_extras_digest != client.registry_extras_digest
-                    {
-                        return Err(ConnectError::RegistryExtrasMismatch {
-                            type_uuid: client.type_uuid,
-                            expected: server
-                                .registry_extras
-                                .encode()
-                                .expect("validated daemon extras encode"),
-                            observed: client
-                                .registry_extras
-                                .encode()
-                                .expect("validated client extras encode"),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    let accepted_runtime_types = compiled_rows
-        .iter()
-        .filter(|row| !distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-        .map(|row| row.type_uuid)
-        .collect::<BTreeSet<_>>();
-    let server_policy = daemon_policy_projection(target.load_policy(), &accepted_runtime_types);
-    for (expected, observed) in server_policy.rows.iter().zip(policy_rows) {
-        if expected.type_uuid != observed.type_uuid {
-            return Err(ConnectError::MissingLoadPolicy {
-                type_uuid: observed.type_uuid,
-            });
-        }
-        if expected.build_only != observed.build_only {
-            return Err(ConnectError::LoadPolicyMismatch {
-                type_uuid: observed.type_uuid,
-                expected: expected.build_only,
-                got: observed.build_only,
-            });
-        }
-    }
-    if server_policy.rows.len() != policy_rows.len() {
-        let type_uuid = server_policy.rows.get(policy_rows.len()).map_or_else(
-            || policy_rows[server_policy.rows.len()].type_uuid,
-            |row| row.type_uuid,
-        );
-        return Err(ConnectError::MissingLoadPolicy { type_uuid });
-    }
-    Ok(Arc::new(server_policy))
-}
-
-fn validate_cross_projection_rows(
-    compiled_rows: &[CompiledTypeRow],
-    policy_rows: &[LoadPolicyEntry],
-) -> Result<(), ConnectError> {
-    let mut compiled = 0usize;
-    let mut policy = 0usize;
-    while compiled < compiled_rows.len() || policy < policy_rows.len() {
-        match (compiled_rows.get(compiled), policy_rows.get(policy)) {
-            (Some(compiled_row), Some(policy_row))
-                if compiled_row.type_uuid == policy_row.type_uuid =>
-            {
-                if compiled_row.build_only != policy_row.build_only {
-                    return Err(ConnectError::LoadPolicyMismatch {
-                        type_uuid: compiled_row.type_uuid,
-                        expected: compiled_row.build_only,
-                        got: policy_row.build_only,
-                    });
-                }
-                compiled += 1;
-                policy += 1;
-            }
-            (Some(compiled_row), Some(policy_row))
-                if compiled_row.type_uuid < policy_row.type_uuid =>
-            {
-                return Err(ConnectError::MissingLoadPolicy {
-                    type_uuid: compiled_row.type_uuid,
-                });
-            }
-            (Some(_), Some(policy_row)) => {
-                return Err(ConnectError::MissingCompiledType {
-                    type_uuid: policy_row.type_uuid,
-                });
-            }
-            (Some(compiled_row), None) => {
-                return Err(ConnectError::MissingLoadPolicy {
-                    type_uuid: compiled_row.type_uuid,
-                });
-            }
-            (None, Some(policy_row)) => {
-                return Err(ConnectError::MissingCompiledType {
-                    type_uuid: policy_row.type_uuid,
-                });
-            }
-            (None, None) => break,
-        }
-    }
-    Ok(())
-}
-
-fn encode_compiled_rows(rows: &[CompiledTypeRow]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    for row in rows {
-        let row = row.encode().expect("validated compiled row encodes");
-        bytes.extend_from_slice(&(row.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&row);
-    }
-    bytes
-}
-
 fn snapshot_from(
     server: &Server,
     state: &ServerState,
@@ -3492,8 +2692,6 @@ fn snapshot_from(
         server: server.clone(),
         connection: connection_arc,
         connection_id: connection.id,
-        epoch: connection.epoch,
-        attestation_generation: connection.attestation_generation,
         basis: basis_for(connection, view.stamp),
         view,
         lease: Arc::new(ArtifactLease {
@@ -3523,8 +2721,6 @@ fn authoring_snapshot_from(
         server: server.clone(),
         connection: connection_arc,
         connection_id: connection.id,
-        epoch: connection.epoch,
-        attestation_generation: connection.attestation_generation,
         basis: basis_for(connection, view.stamp),
         view,
         lease_alive: Arc::new(AtomicBool::new(true)),
@@ -3654,24 +2850,7 @@ fn generation_fence(state: &ServerState, connection: &ConnectionState) -> Option
     if target.target_generation != connection.target_generation {
         return Some(ReconnectReason::TargetDefinitionChanged);
     }
-    let compiled_projection = match daemon_projection_digest(
-        target.definition.compiled_registry(),
-        &connection.accepted_type_uuids,
-    ) {
-        Ok(digest) => digest,
-        Err(_) => return Some(ReconnectReason::CompiledAttestationChanged),
-    };
-    if daemon_policy_projection(
-        target.definition.load_policy(),
-        &connection.accepted_type_uuids,
-    ) != *connection.load_policy
-    {
-        Some(ReconnectReason::LoadPolicyChanged)
-    } else if compiled_projection != connection.daemon_compiled_projection {
-        Some(ReconnectReason::CompiledAttestationChanged)
-    } else {
-        None
-    }
+    None
 }
 
 fn metadata_fence(
@@ -3875,263 +3054,8 @@ fn metadata_basis(binding: &MetadataBinding, snapshot: SnapshotStamp) -> Metadat
     }
 }
 
-fn basis_for(connection: &ConnectionState, snapshot: SnapshotStamp) -> RpcBasis {
-    RpcBasis {
-        snapshot,
-        load_policy: connection.load_policy.clone(),
-        policy_generation: connection.policy_generation,
-        target_generation: connection.target_generation,
-        attestation_generation: connection.attestation_generation,
-        daemon_compiled_projection: connection.daemon_compiled_projection,
-    }
-}
-
-fn daemon_projection_digest(
-    daemon_rows: &[CompiledTypeRow],
-    accepted_type_uuids: &BTreeSet<TypeUuid>,
-) -> Result<CompiledAttestationDigest, distill_core::attestation::AttestationError> {
-    Ok(CompiledTypeTable::canonical(daemon_rows.to_vec())?
-        .project_with_bootstrap(accepted_type_uuids)?
-        .digest)
-}
-
-fn projection_connect_error(error: distill_core::attestation::AttestationError) -> ConnectError {
-    match error {
-        distill_core::attestation::AttestationError::ProjectionMissingType(type_uuid) => {
-            ConnectError::MissingCompiledType { type_uuid }
-        }
-        error => ConnectError::AttestationShape(error.into()),
-    }
-}
-
-fn daemon_policy_projection(
-    daemon_rows: &[LoadPolicyEntry],
-    accepted_type_uuids: &BTreeSet<TypeUuid>,
-) -> LoadPolicyAttestation {
-    let boundary = accepted_type_uuids
-        .iter()
-        .copied()
-        .chain(distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS)
-        .collect::<BTreeSet<_>>();
-    let rows = daemon_rows
-        .iter()
-        .filter(|row| boundary.contains(&row.type_uuid))
-        .copied()
-        .collect::<Vec<_>>();
-    let digest = compute_policy_digest(&rows)
-        .expect("validated daemon policy remains canonical after ordered projection");
-    LoadPolicyAttestation { rows, digest }
-}
-
-fn validate_served_closure(
-    rows: &[ServedClosureRow],
-    require_nonempty: bool,
-) -> Result<BTreeSet<TypeUuid>, AdminError> {
-    let invalid = |detail: &str| AdminError::InvalidServedClosure {
-        detail: detail.to_owned(),
-    };
-    if require_nonempty && rows.is_empty() {
-        return Err(invalid("artifact closure rows must not be empty"));
-    }
-    if rows.windows(2).any(|pair| pair[0].asset >= pair[1].asset) {
-        return Err(invalid(
-            "closure rows must be strictly raw-AssetUuid sorted and unique",
-        ));
-    }
-    for row in rows {
-        if row.load_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(invalid(
-                "closure load edges must be strictly sorted and unique",
-            ));
-        }
-    }
-    let required = served_closure_types(rows);
-    if required
-        .iter()
-        .any(|uuid| distill_core::attestation::is_bootstrap_control_type(*uuid))
-    {
-        return Err(invalid(
-            "served runtime closure must not use bootstrap-control types as runtime coverage",
-        ));
-    }
-    Ok(required)
-}
-
-fn served_closure_types(rows: &[ServedClosureRow]) -> BTreeSet<TypeUuid> {
-    let mut required = BTreeSet::new();
-    for row in rows {
-        required.extend([row.authored_type, row.encoded_type, row.terminal_type]);
-        required.extend(row.load_edges.iter().map(|edge| edge.expected_terminal));
-    }
-    required
-}
-
-fn served_rows_for_entry(
-    state: &ServerState,
-    view: &VersionView,
-    entry: &AuthoringEntry,
-) -> Result<(BTreeSet<TypeUuid>, Vec<ServedClosureRow>), RpcFailure> {
-    let content_hash = match view.assets.get(&entry.uuid) {
-        Some(VersionResolve::Built { content_hash }) => *content_hash,
-        _ => ContentHash([0; 32]),
-    };
-    if state.artifacts.contains_key(&content_hash) {
-        let (mut required, rows) = verified_artifact_closure(state, content_hash)?;
-        let Some(root) = rows.iter().find(|row| row.asset == entry.uuid) else {
-            return Err(RpcFailure::InvalidQuery {
-                detail: "built artifact closure omits its runtime metadata asset".to_owned(),
-            });
-        };
-        if root.authored_type != entry.type_uuid || root.terminal_type != entry.terminal_type {
-            return Err(RpcFailure::InvalidQuery {
-                detail: "runtime metadata types do not match the authenticated artifact closure"
-                    .to_owned(),
-            });
-        }
-        required.extend([entry.type_uuid, entry.terminal_type]);
-        return Ok((required, rows));
-    }
-    if matches!(
-        view.assets.get(&entry.uuid),
-        Some(VersionResolve::Built { .. })
-    ) {
-        return Err(RpcFailure::ArtifactNotFound { hash: content_hash });
-    }
-    let rows = vec![ServedClosureRow {
-        asset: entry.uuid,
-        content_hash,
-        authored_type: entry.type_uuid,
-        encoded_type: entry.type_uuid,
-        terminal_type: entry.terminal_type,
-        load_edges: Vec::new(),
-    }];
-    Ok((served_closure_types(&rows), rows))
-}
-
-fn verified_artifact_closure(
-    state: &ServerState,
-    root_hash: ContentHash,
-) -> Result<(BTreeSet<TypeUuid>, Vec<ServedClosureRow>), RpcFailure> {
-    let root_artifact = state
-        .artifacts
-        .get(&root_hash)
-        .ok_or(RpcFailure::ArtifactNotFound { hash: root_hash })?;
-    let rows = root_artifact.payload.closure_rows.clone();
-    let by_asset = rows
-        .iter()
-        .map(|row| (row.asset, row))
-        .collect::<BTreeMap<_, _>>();
-    let mut pending = vec![root_artifact.asset_uuid];
-    let mut visited = BTreeSet::new();
-    while let Some(asset) = pending.pop() {
-        if !visited.insert(asset) {
-            continue;
-        }
-        let row = by_asset
-            .get(&asset)
-            .copied()
-            .ok_or_else(|| RpcFailure::InvalidQuery {
-                detail: "authenticated artifact closure is missing a reachable asset row"
-                    .to_owned(),
-            })?;
-        let artifact =
-            state
-                .artifacts
-                .get(&row.content_hash)
-                .ok_or(RpcFailure::ArtifactNotFound {
-                    hash: row.content_hash,
-                })?;
-        if artifact.asset_uuid != row.asset {
-            return Err(RpcFailure::InvalidQuery {
-                detail:
-                    "artifact closure row asset does not match its ContentHash-authenticated header"
-                        .to_owned(),
-            });
-        }
-        let authenticated_root = artifact
-            .payload
-            .closure_rows
-            .binary_search_by_key(&artifact.asset_uuid, |candidate| candidate.asset)
-            .ok()
-            .map(|index| &artifact.payload.closure_rows[index])
-            .ok_or_else(|| RpcFailure::InvalidQuery {
-                detail: "installed artifact is missing its authenticated root closure row"
-                    .to_owned(),
-            })?;
-        if authenticated_root != row {
-            return Err(RpcFailure::InvalidQuery {
-                detail: "artifact closure row disagrees with the target artifact's authenticated header or load edges"
-                    .to_owned(),
-            });
-        }
-        for edge in &row.load_edges {
-            let dependency =
-                by_asset
-                    .get(&edge.asset)
-                    .copied()
-                    .ok_or_else(|| RpcFailure::InvalidQuery {
-                        detail: "artifact closure omits a typed load-dependency target".to_owned(),
-                    })?;
-            if dependency.terminal_type != edge.expected_terminal {
-                return Err(RpcFailure::InvalidQuery {
-                    detail: "typed load edge disagrees with its dependency terminal type"
-                        .to_owned(),
-                });
-            }
-            pending.push(edge.asset);
-        }
-    }
-    if visited.len() != rows.len() {
-        return Err(RpcFailure::InvalidQuery {
-            detail: "artifact closure contains unreachable rows".to_owned(),
-        });
-    }
-    Ok((served_closure_types(&rows), rows))
-}
-
-fn attestation_expansion(
-    snapshot: SnapshotStamp,
-    method_tag: u8,
-    request_subject: &[u8],
-    required_types: &BTreeSet<TypeUuid>,
-    accepted_types: &BTreeSet<TypeUuid>,
-    mut closure_rows: Vec<ServedClosureRow>,
-) -> Option<AttestationExpansionRequired> {
-    let required = required_types
-        .difference(accepted_types)
-        .copied()
-        .collect::<Vec<_>>();
-    if required.is_empty() {
-        return None;
-    }
-    closure_rows.sort();
-    closure_rows.dedup();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"DSAE");
-    hasher.update(&[1]);
-    hasher.update(&snapshot.instance.0);
-    hasher.update(&snapshot.version.0.to_le_bytes());
-    hasher.update(&[method_tag]);
-    hasher.update(&(request_subject.len() as u32).to_le_bytes());
-    hasher.update(request_subject);
-    hasher.update(&(closure_rows.len() as u32).to_le_bytes());
-    for row in closure_rows {
-        hasher.update(&row.asset.0);
-        hasher.update(&row.content_hash.0);
-        hasher.update(&row.authored_type.0);
-        hasher.update(&row.encoded_type.0);
-        hasher.update(&row.terminal_type.0);
-        hasher.update(&(row.load_edges.len() as u32).to_le_bytes());
-        for edge in row.load_edges {
-            hasher.update(&edge.asset.0);
-            hasher.update(&edge.expected_terminal.0);
-        }
-    }
-    Some(AttestationExpansionRequired {
-        snapshot,
-        closure_identity: *hasher.finalize().as_bytes(),
-        required,
-    })
+fn basis_for(_connection: &ConnectionState, snapshot: SnapshotStamp) -> RpcBasis {
+    RpcBasis { snapshot }
 }
 
 fn inspect_authoring(
@@ -4236,46 +3160,21 @@ fn install_target_set(state: &mut ServerState, replacements: BTreeMap<String, Ta
         let runtime = if let Some(mut runtime) = prior.remove(&name) {
             let target_changed =
                 runtime.definition.definition_hash() != definition.definition_hash();
-            let policy_changed = runtime.definition.load_policy() != definition.load_policy()
-                || runtime.definition.policy_digest() != definition.policy_digest();
-            let compiled_changed =
-                runtime.definition.compiled_registry() != definition.compiled_registry();
             if target_changed {
                 runtime.target_generation = runtime
                     .target_generation
                     .checked_add(1)
                     .expect("target generation exhausted");
             }
-            if policy_changed {
-                runtime.policy_authority_generation = runtime
-                    .policy_authority_generation
-                    .checked_add(1)
-                    .expect("policy authority generation exhausted");
-            }
-            if compiled_changed {
-                runtime.compiled_table_generation = runtime
-                    .compiled_table_generation
-                    .checked_add(1)
-                    .expect("compiled table generation exhausted");
-            }
             runtime.definition = definition;
             if target_changed {
                 reconnect.push((name.clone(), ReconnectReason::TargetDefinitionChanged));
-            } else {
-                if policy_changed {
-                    reconnect.push((name.clone(), ReconnectReason::LoadPolicyChanged));
-                }
-                if compiled_changed {
-                    reconnect.push((name.clone(), ReconnectReason::CompiledAttestationChanged));
-                }
             }
             runtime
         } else {
             TargetRuntime {
                 definition,
                 target_generation: 0,
-                policy_authority_generation: 0,
-                compiled_table_generation: 0,
             }
         };
         installed.insert(name, runtime);
@@ -4287,15 +3186,7 @@ fn install_target_set(state: &mut ServerState, replacements: BTreeMap<String, Ta
     );
     state.targets = installed;
     for (name, reason) in reconnect {
-        match reason {
-            ReconnectReason::TargetDefinitionChanged => notify_reconnect(state, &name, reason),
-            ReconnectReason::LoadPolicyChanged | ReconnectReason::CompiledAttestationChanged => {
-                notify_projection_reconnect(state, &name, reason)
-            }
-            ReconnectReason::StoreInstanceChanged | ReconnectReason::ProtocolEpochChanged => {
-                unreachable!("target-set replacement cannot produce a global reconnect")
-            }
-        }
+        notify_reconnect(state, &name, reason);
     }
 }
 
@@ -4304,24 +3195,6 @@ fn notify_reconnect(state: &mut ServerState, target: &str, reason: ReconnectReas
     for connection in live_connections(state) {
         let mut connection = lock_connection(&connection);
         if connection.target != target {
-            continue;
-        }
-        let basis = basis_for(&connection, current);
-        enqueue_event(
-            &mut connection,
-            StreamEvent::Asset {
-                basis,
-                event: AssetEvent::ReconnectRequired { reason },
-            },
-        );
-    }
-}
-
-fn notify_projection_reconnect(state: &mut ServerState, target: &str, reason: ReconnectReason) {
-    let current = stamp(state);
-    for connection in live_connections(state) {
-        let mut connection = lock_connection(&connection);
-        if connection.target != target || generation_fence(state, &connection) != Some(reason) {
             continue;
         }
         let basis = basis_for(&connection, current);
@@ -5217,6 +4090,7 @@ fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
         section: 0,
         offset: 0,
         total_bytes,
+        load_edges: payload.load_edges.clone(),
     }
 }
 

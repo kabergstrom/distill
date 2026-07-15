@@ -38,7 +38,7 @@ use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactLeaseBackend, ArtifactPayload,
     AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication, BuildBackend,
     BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree, BuildWorkClass, Commit,
-    DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow, ServedLoadEdge,
+    DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedLoadEdge,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
 use distill_store::artifacts::PinKind;
@@ -556,8 +556,8 @@ struct LoadedAsset {
 
 #[derive(Clone)]
 struct NodePublication {
-    primary: ServedClosureRow,
-    outputs: BTreeMap<String, ServedClosureRow>,
+    primary: BuildOutputRow,
+    outputs: BTreeMap<String, BuildOutputRow>,
     artifacts: BTreeMap<ContentHash, BuildArtifactPublication>,
     wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
@@ -935,8 +935,8 @@ fn build_process_artifact(
     Ok(ProcessArtifact {
         asset,
         content_hash: selected.content_hash,
-        encoded_type: artifact.payload.encoded_type,
-        terminal_type: artifact.payload.terminal_type,
+        encoded_type: selected.encoded_type,
+        terminal_type: selected.terminal_type,
         structural: Arc::clone(&artifact.payload.structural),
         blobs: artifact.payload.blobs.clone(),
     })
@@ -1525,14 +1525,23 @@ struct PendingArtifact {
     content_hash: ContentHash,
     structural: Arc<[u8]>,
     blobs: Vec<Arc<[u8]>>,
+    load_edges: Vec<ServedLoadEdge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuildOutputRow {
+    asset: AssetUuid,
+    content_hash: ContentHash,
+    authored_type: TypeUuid,
     encoded_type: TypeUuid,
     terminal_type: TypeUuid,
+    load_edges: Vec<ServedLoadEdge>,
 }
 
 struct PendingNodePublication {
     asset: AssetUuid,
     local_assets: BTreeSet<AssetUuid>,
-    rows: BTreeMap<String, ServedClosureRow>,
+    rows: BTreeMap<String, BuildOutputRow>,
     pending: Vec<PendingArtifact>,
     wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
@@ -2260,7 +2269,7 @@ fn prepare_outputs(
         .iter()
         .map(|output| output.asset)
         .collect::<BTreeSet<_>>();
-    let mut rows = BTreeMap::<String, ServedClosureRow>::new();
+    let mut rows = BTreeMap::<String, BuildOutputRow>::new();
     let mut pending = Vec::with_capacity(outputs.len());
     let mut wire_trees = BTreeMap::new();
     for output in &outputs {
@@ -2293,7 +2302,7 @@ fn prepare_outputs(
         let content_hash = ContentHash(*blake3::hash(&output.bytes).as_bytes());
         rows.insert(
             output.output_key.clone(),
-            ServedClosureRow {
+            BuildOutputRow {
                 asset: output.asset,
                 content_hash,
                 authored_type: output.authored_type,
@@ -2306,8 +2315,11 @@ fn prepare_outputs(
             content_hash,
             structural: Arc::from(output.bytes[..structural_len].to_vec()),
             blobs,
-            encoded_type: output.encoded_type,
-            terminal_type: output.terminal_type,
+            load_edges: rows
+                .get(&output.output_key)
+                .expect("row was inserted immediately above")
+                .load_edges
+                .clone(),
         });
     }
 
@@ -2353,30 +2365,17 @@ fn assemble_pending(
         mut wire_trees,
     } = pending_node;
 
-    let mut closure = BTreeMap::new();
-    for row in rows.values() {
-        merge_closure_row(&mut closure, row.clone())?;
-    }
     let mut artifacts = BTreeMap::new();
     for row in rows.values() {
         for edge in &row.load_edges {
             if local_assets.contains(&edge.asset) {
                 continue;
             }
-            let (dependency, selected) = dependency_from_memo(context, edge.asset)?;
-            merge_closure_row(&mut closure, selected.clone())?;
-            let selected_artifact = dependency
-                .artifacts
-                .get(&selected.content_hash)
-                .expect("selected dependency row has an artifact");
-            for nested in &selected_artifact.payload.closure_rows {
-                merge_closure_row(&mut closure, nested.clone())?;
-            }
+            let (dependency, _) = dependency_from_memo(context, edge.asset)?;
             merge_artifacts(&mut artifacts, dependency.artifacts)?;
             merge_wire_trees(&mut wire_trees, dependency.wire_trees)?;
         }
     }
-    let closure_rows = closure.into_values().collect::<Vec<_>>();
     for artifact in pending {
         artifacts.insert(
             artifact.content_hash,
@@ -2385,9 +2384,7 @@ fn assemble_pending(
                 payload: ArtifactPayload {
                     structural: artifact.structural,
                     blobs: artifact.blobs,
-                    encoded_type: artifact.encoded_type,
-                    terminal_type: artifact.terminal_type,
-                    closure_rows: closure_rows.clone(),
+                    load_edges: artifact.load_edges,
                 },
             },
         );
@@ -2407,7 +2404,7 @@ fn assemble_pending(
 fn dependency_from_memo(
     context: &BuildContext,
     asset: AssetUuid,
-) -> Result<(NodePublication, ServedClosureRow), BuildError> {
+) -> Result<(NodePublication, BuildOutputRow), BuildError> {
     let derived = lock_build_store(context)?
         .resolve_child(asset)
         .map_err(BuildError::failed)?;
@@ -3551,23 +3548,6 @@ fn find_bundle_asset(bundle: &Bundle, asset: AssetUuid) -> Option<(&str, &AssetE
         .find_map(|(local_id, entry)| (entry.uuid == asset).then_some((local_id.as_str(), entry)))
 }
 
-fn merge_closure_row(
-    closure: &mut BTreeMap<AssetUuid, ServedClosureRow>,
-    row: ServedClosureRow,
-) -> Result<(), BuildError> {
-    if let Some(existing) = closure.get(&row.asset) {
-        if existing != &row {
-            return Err(BuildError::Failed(format!(
-                "dependency closure disagrees for asset {}",
-                row.asset
-            )));
-        }
-    } else {
-        closure.insert(row.asset, row);
-    }
-    Ok(())
-}
-
 fn merge_artifacts(
     target: &mut BTreeMap<ContentHash, BuildArtifactPublication>,
     source: BTreeMap<ContentHash, BuildArtifactPublication>,
@@ -4110,8 +4090,8 @@ mod tests {
     use distill_core::lineage::AcceptedSchemaEpoch;
     use distill_json::AuthoredValue;
     use distill_rpc::{
-        AuthoringEntry, AuthoringEntryRole, AuthoringValue, Commit, InputVersion, LoadPolicyEntry,
-        TargetDefinition, TargetDefinitionHash,
+        AuthoringEntry, AuthoringEntryRole, AuthoringValue, Commit, InputVersion, TargetDefinition,
+        TargetDefinitionHash,
     };
     use distill_schema::bootstrap_builtins_v1::{
         AcceptedSchemaEpochV1, AuthoredValueV1, FieldPathV1, LineageStampV1, MigrationKindV1,
@@ -4416,18 +4396,7 @@ mod tests {
     }
 
     fn rpc_target(hash: TargetDefinitionHash) -> TargetDefinition {
-        let rows = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
-            .unwrap()
-            .rows()
-            .to_vec();
-        let policy = rows
-            .iter()
-            .map(|row| LoadPolicyEntry {
-                type_uuid: row.type_uuid,
-                build_only: row.build_only,
-            })
-            .collect();
-        TargetDefinition::canonical("dev", hash, rows, policy).unwrap()
+        TargetDefinition::new("dev", hash)
     }
 
     fn custom_write_migration_bundle(
@@ -5139,8 +5108,17 @@ mod tests {
                     == child
             })
             .expect("declared extra artifact is published");
-        assert_eq!(extra.payload.encoded_type, EXTRA);
-        assert_eq!(extra.payload.terminal_type, EXTRA);
+        let blobs = extra
+            .payload
+            .blobs
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        let parsed_extra =
+            distill_wire::artifact::parse_artifact_parts(&extra.payload.structural, &blobs)
+                .unwrap();
+        assert_eq!(parsed_extra.encoded_type, EXTRA);
+        assert_eq!(parsed_extra.terminal_type, EXTRA);
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);

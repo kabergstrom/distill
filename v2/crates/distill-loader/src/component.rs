@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, ContentHash};
 
-use crate::basis::{IoBasis, LoadPolicyError};
+use crate::basis::IoBasis;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CandidateOutcome {
@@ -24,7 +24,6 @@ pub enum CandidateOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateAsset {
     pub uuid: AssetUuid,
-    pub type_uuid: TypeUuid,
     pub basis: IoBasis,
     pub load_deps: Vec<AssetUuid>,
     pub outcome: CandidateOutcome,
@@ -36,7 +35,6 @@ pub enum MemberFailure {
     Failed(String),
     Missing,
     DeletedWithoutPlaceholder,
-    LoadPolicy(LoadPolicyError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,14 +149,6 @@ fn decide(
             failures.push((*uuid, MemberFailure::Unresolved));
             continue;
         };
-        if let Err(error) = candidate
-            .basis
-            .load_policy()
-            .require_runtime(candidate.type_uuid)
-        {
-            failures.push((*uuid, MemberFailure::LoadPolicy(error)));
-            continue;
-        }
         let failure = match &candidate.outcome {
             CandidateOutcome::Ready { .. }
             | CandidateOutcome::Deleted {

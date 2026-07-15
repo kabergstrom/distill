@@ -2,20 +2,18 @@
 
 use std::sync::Arc;
 
-use distill_core::attestation::CompiledAttestationDigest;
-use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 use crate::capnp_transport::{
-    decode_configuration_poison, decode_rpc_basis, decode_version_poison, read_attestation_failure,
-    schema, validate_reattest_failure_context, RemoteConnectOutcome,
+    decode_configuration_poison, decode_rpc_basis, decode_version_poison, schema,
+    RemoteConnectOutcome,
 };
 use crate::{
-    compute_policy_digest, ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent,
-    AttestationExpansionRequired, AttestationFailure, AuthoringEntryRole, ConfigurationPoison,
-    Delta, DriftedInput, LoadPolicyAttestation, LoadPolicyEntry, PathResolveFailure,
-    PathResolveResult, ReattestRequest, ReattestSuccess, ReconnectReason, ResolveResult, RpcBasis,
-    StreamEvent, TerminalEvent, VersionPoison,
+    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AuthoringEntryRole,
+    ConfigurationPoison, Delta, DriftedInput, PathResolveFailure, PathResolveResult,
+    ReconnectReason, ResolveResult, RpcBasis, ServedLoadEdge, StreamEvent, TerminalEvent,
+    VersionPoison,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,10 +26,6 @@ pub struct RemoteError {
 pub enum RemoteCall<T> {
     Success(T),
     ReconnectRequired(ReconnectReason),
-    AttestationExpansionRequired(AttestationExpansionRequired),
-    AttestationFailure(AttestationFailure),
-    StaleAttestationBase { expected: u64, observed: u64 },
-    AttestationGenerationOverflow { base: u64 },
     ConfigurationPoisoned(ConfigurationPoison),
     VersionPoisoned(VersionPoison),
     LeaseFailure(RemoteError),
@@ -65,34 +59,17 @@ impl std::fmt::Debug for RemoteHub {
 impl RemoteHub {
     pub fn connected(outcome: RemoteConnectOutcome) -> Result<Self, Box<RemoteConnectOutcome>> {
         match outcome {
-            RemoteConnectOutcome::Connected {
-                hub,
-                instance,
-                policy_generation,
-                target_generation,
-                attestation_generation,
-                load_policy,
-                daemon_compiled_projection,
-            } => Ok(Self {
+            RemoteConnectOutcome::Connected { hub, instance } => Ok(Self {
                 client: hub,
                 basis: RpcBasis {
                     snapshot: SnapshotStamp {
                         instance,
                         version: InputVersion(0),
                     },
-                    load_policy,
-                    policy_generation,
-                    target_generation,
-                    attestation_generation,
-                    daemon_compiled_projection,
                 },
             }),
             other => Err(Box::new(other)),
         }
-    }
-
-    pub fn attestation_generation(&self) -> u64 {
-        self.basis.attestation_generation
     }
 
     pub async fn snapshot(&self) -> Result<RemoteCall<RemoteSnapshot>, capnp::Error> {
@@ -129,19 +106,32 @@ impl RemoteHub {
             schema::chunk_stream_call::Which::Success(value) => {
                 let value = value?;
                 let basis = decode_connection_basis(value.get_basis()?, &self.basis)?;
+                let mut load_edges = Vec::with_capacity(value.get_load_edges()?.len() as usize);
+                for edge in value.get_load_edges()?.iter() {
+                    load_edges.push(ServedLoadEdge {
+                        asset: AssetUuid(fixed::<16>(edge.get_asset()?, "fetch.loadEdge.asset")?),
+                        expected_terminal: distill_core::id::TypeUuid(fixed::<16>(
+                            edge.get_expected_terminal()?,
+                            "fetch.loadEdge.expectedTerminal",
+                        )?),
+                    });
+                }
+                if load_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(capnp::Error::failed(
+                        "fetch load edges are not strictly sorted".into(),
+                    ));
+                }
                 Ok(RemoteCall::Success(TerminalEvent {
                     basis,
                     value: RemoteChunkStream {
                         client: value.get_chunks()?,
                         total_bytes: value.get_total_bytes(),
+                        load_edges,
                     },
                 }))
             }
             schema::chunk_stream_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
-            ),
-            schema::chunk_stream_call::Which::AttestationExpansionRequired(value) => Ok(
-                RemoteCall::AttestationExpansionRequired(decode_expansion(value?)?),
             ),
             schema::chunk_stream_call::Which::ConfigurationPoisoned(value) => Ok(
                 RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
@@ -169,9 +159,6 @@ impl RemoteHub {
             }
             schema::data_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
-            ),
-            schema::data_call::Which::AttestationExpansionRequired(value) => Ok(
-                RemoteCall::AttestationExpansionRequired(decode_expansion(value?)?),
             ),
             schema::data_call::Which::ConfigurationPoisoned(value) => Ok(
                 RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
@@ -261,117 +248,6 @@ impl RemoteHub {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
             }
             schema::void_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
-        }
-    }
-
-    pub async fn reattest(
-        &mut self,
-        reattest: &ReattestRequest,
-    ) -> Result<RemoteCall<ReattestSuccess>, capnp::Error> {
-        validate_reattest_request(reattest)?;
-        if reattest.base_attestation_generation != self.basis.attestation_generation {
-            return Err(capnp::Error::failed(
-                "reattest base differs from the adopted remote Hub generation".into(),
-            ));
-        }
-        let mut request = self.client.reattest_request();
-        write_reattest(request.get(), reattest);
-        let response = request.send().promise.await?;
-        let result = response.get()?.get_result()?;
-        match result.which()? {
-            schema::reattest_result::Which::Success(value) => {
-                let value = value?;
-                let installed = value.get_installed_attestation_generation();
-                if installed != reattest.successor_attestation_generation {
-                    return Err(capnp::Error::failed(
-                        "reattest success returned an unexpected generation".into(),
-                    ));
-                }
-                let rows = decode_policy_rows(value.get_load_policy()?)?;
-                let digest = fixed::<32>(value.get_policy_digest()?, "reattest.policyDigest")?;
-                if compute_policy_digest(&rows)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?
-                    != digest
-                    || rows != reattest.load_policy
-                    || digest != reattest.policy_digest
-                {
-                    return Err(capnp::Error::failed(
-                        "reattest policy response does not authenticate the proposed set".into(),
-                    ));
-                }
-                let daemon_compiled_projection = CompiledAttestationDigest(fixed::<32>(
-                    value.get_daemon_compiled_projection()?,
-                    "reattest.daemonCompiledProjection",
-                )?);
-                if daemon_compiled_projection != reattest.dsca {
-                    return Err(capnp::Error::failed(
-                        "reattest compiled projection differs from the proposed set".into(),
-                    ));
-                }
-                let expected_policy_generation = if rows == self.basis.load_policy.rows {
-                    self.basis.policy_generation
-                } else {
-                    self.basis.policy_generation.checked_add(1).ok_or_else(|| {
-                        capnp::Error::failed("local policy generation overflow".into())
-                    })?
-                };
-                if value.get_policy_generation() != expected_policy_generation {
-                    return Err(capnp::Error::failed(
-                        "reattest success returned an unexpected policy generation".into(),
-                    ));
-                }
-                let success = ReattestSuccess {
-                    installed_attestation_generation: installed,
-                    daemon_compiled_projection,
-                    load_policy: Arc::new(LoadPolicyAttestation { rows, digest }),
-                    policy_generation: value.get_policy_generation(),
-                };
-                self.basis.attestation_generation = installed;
-                self.basis.daemon_compiled_projection = daemon_compiled_projection;
-                self.basis.load_policy = Arc::clone(&success.load_policy);
-                self.basis.policy_generation = success.policy_generation;
-                Ok(RemoteCall::Success(success))
-            }
-            schema::reattest_result::Which::AttestationFailure(value) => {
-                let failure = read_attestation_failure(value?)?;
-                validate_reattest_failure_context(&failure, reattest)?;
-                Ok(RemoteCall::AttestationFailure(failure))
-            }
-            schema::reattest_result::Which::StaleAttestationBase(value) => {
-                let value = value?;
-                if value.get_code() != crate::STALE_ATTESTATION_BASE_CODE {
-                    return Err(capnp::Error::failed(
-                        "invalid stale-attestation-base code".into(),
-                    ));
-                }
-                Ok(RemoteCall::StaleAttestationBase {
-                    expected: value.get_expected(),
-                    observed: value.get_observed(),
-                })
-            }
-            schema::reattest_result::Which::AttestationGenerationOverflow(value) => {
-                let value = value?;
-                if value.get_code() != crate::ATTESTATION_GENERATION_OVERFLOW_CODE {
-                    return Err(capnp::Error::failed(
-                        "invalid attestation-generation-overflow code".into(),
-                    ));
-                }
-                Ok(RemoteCall::AttestationGenerationOverflow {
-                    base: value.get_base(),
-                })
-            }
-            schema::reattest_result::Which::ReconnectRequired(value) => Ok(
-                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
-            ),
-            schema::reattest_result::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
-            ),
-            schema::reattest_result::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
-            schema::reattest_result::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
-            }
         }
     }
 }
@@ -465,9 +341,6 @@ impl RemoteSnapshot {
             schema::resolve_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::resolve_call::Which::AttestationExpansionRequired(value) => Ok(
-                RemoteCall::AttestationExpansionRequired(decode_expansion(value?)?),
-            ),
             schema::resolve_call::Which::ConfigurationPoisoned(value) => Ok(
                 RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
             ),
@@ -523,6 +396,7 @@ impl RemoteSnapshot {
 pub struct RemoteChunkStream {
     client: schema::chunk_stream::Client,
     total_bytes: u64,
+    load_edges: Vec<ServedLoadEdge>,
 }
 
 impl std::fmt::Debug for RemoteChunkStream {
@@ -536,6 +410,10 @@ impl std::fmt::Debug for RemoteChunkStream {
 impl RemoteChunkStream {
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    pub fn load_edges(&self) -> &[ServedLoadEdge] {
+        &self.load_edges
     }
 
     pub async fn next_chunk(&mut self) -> Result<Option<ArtifactChunk>, capnp::Error> {
@@ -736,93 +614,6 @@ fn decode_connection_basis(
     decode_rpc_basis(input, &expected)
 }
 
-fn decode_expansion(
-    value: schema::attestation_expansion_required::Reader<'_>,
-) -> Result<AttestationExpansionRequired, capnp::Error> {
-    let required = value.get_required_type_uuids()?;
-    let mut types = Vec::with_capacity(required.len() as usize);
-    for value in required.iter() {
-        types.push(TypeUuid(fixed::<16>(value?, "expansion.required")?));
-    }
-    if types.is_empty() || types.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(capnp::Error::failed(
-            "attestation expansion set is not canonical".into(),
-        ));
-    }
-    Ok(AttestationExpansionRequired {
-        snapshot: decode_stamp(value.get_snapshot()?)?,
-        closure_identity: fixed::<32>(value.get_closure_identity()?, "expansion.closureIdentity")?,
-        required: types,
-    })
-}
-
-fn validate_reattest_request(request: &ReattestRequest) -> Result<(), capnp::Error> {
-    crate::attestation::validate_attestation_shape(
-        &request.compiled_registry,
-        request.dsca,
-        &request.load_policy,
-        request.policy_digest,
-    )
-    .map_err(|error| capnp::Error::failed(format!("invalid reattestation: {error}")))
-}
-
-fn write_reattest(
-    mut output: schema::hub::reattest_params::Builder<'_>,
-    request: &ReattestRequest,
-) {
-    output.set_epoch(request.epoch.0);
-    output.set_base_attestation_generation(request.base_attestation_generation);
-    output.set_successor_attestation_generation(request.successor_attestation_generation);
-    output.set_target_def_hash(&request.target_definition_hash.0);
-    let mut compiled = output
-        .reborrow()
-        .init_compiled_registry(request.compiled_registry.len() as u32);
-    for (index, row) in request.compiled_registry.iter().enumerate() {
-        let mut wire = compiled.reborrow().get(index as u32);
-        wire.set_type_uuid(&row.type_uuid.0);
-        wire.set_logical_hash(&row.logical_hash.0);
-        wire.set_native_layout_digest(&row.native_layout_digest);
-        wire.set_build_only(row.build_only);
-        wire.set_registry_extras_digest(&row.registry_extras_digest.0);
-        wire.set_registry_extras(
-            &row.registry_extras
-                .encode()
-                .expect("validated reattestation carries canonical extras"),
-        );
-    }
-    output.set_dsca_aggregate(&request.dsca.0);
-    let mut policies = output
-        .reborrow()
-        .init_load_policy(request.load_policy.len() as u32);
-    for (index, row) in request.load_policy.iter().enumerate() {
-        let mut wire = policies.reborrow().get(index as u32);
-        wire.set_type_uuid(&row.type_uuid.0);
-        wire.set_build_only(row.build_only);
-    }
-    output.set_policy_digest(&request.policy_digest);
-}
-
-fn decode_policy_rows(
-    values: capnp::struct_list::Reader<'_, schema::load_policy_entry::Owned>,
-) -> Result<Vec<LoadPolicyEntry>, capnp::Error> {
-    let mut rows = Vec::with_capacity(values.len() as usize);
-    for value in values.iter() {
-        rows.push(LoadPolicyEntry {
-            type_uuid: TypeUuid(fixed::<16>(value.get_type_uuid()?, "policy.typeUuid")?),
-            build_only: value.get_build_only(),
-        });
-    }
-    if rows
-        .windows(2)
-        .any(|pair| pair[0].type_uuid >= pair[1].type_uuid)
-    {
-        return Err(capnp::Error::failed(
-            "load-policy rows are not strictly TypeUuid-sorted".into(),
-        ));
-    }
-    Ok(rows)
-}
-
 fn decode_stamp(value: schema::snapshot_stamp::Reader<'_>) -> Result<SnapshotStamp, capnp::Error> {
     Ok(SnapshotStamp {
         instance: StoreInstanceId(fixed::<16>(value.get_instance()?, "stamp.instance")?),
@@ -834,10 +625,6 @@ fn decode_reconnect(value: schema::ReconnectReason) -> ReconnectReason {
     match value {
         schema::ReconnectReason::TargetDefinitionChanged => {
             ReconnectReason::TargetDefinitionChanged
-        }
-        schema::ReconnectReason::LoadPolicyChanged => ReconnectReason::LoadPolicyChanged,
-        schema::ReconnectReason::CompiledAttestationChanged => {
-            ReconnectReason::CompiledAttestationChanged
         }
         schema::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         schema::ReconnectReason::ProtocolEpochChanged => ReconnectReason::ProtocolEpochChanged,

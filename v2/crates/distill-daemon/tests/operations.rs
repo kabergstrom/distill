@@ -61,8 +61,7 @@ fn bundle(
 }
 
 fn target() -> TargetDefinition {
-    TargetDefinition::canonical("dev", TargetDefinitionHash([8; 32]), Vec::new(), Vec::new())
-        .unwrap()
+    TargetDefinition::new("dev", TargetDefinitionHash([8; 32]))
 }
 
 fn complete(

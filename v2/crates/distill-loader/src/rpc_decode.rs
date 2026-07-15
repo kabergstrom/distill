@@ -8,31 +8,13 @@ use distill_rpc::RpcBasis;
 use distill_wire::artifact::parse_artifact_parts;
 use distill_wire::exec::Blob;
 
-use crate::basis::{IoBasis, LoadPolicyAttestation, LoadPolicyError, LoadPolicyRow};
+use crate::basis::IoBasis;
 use crate::io::FetchedArtifact;
 
-pub(crate) fn io_basis(basis: &RpcBasis) -> Result<IoBasis, LoadPolicyError> {
-    let rows = basis
-        .load_policy
-        .rows
-        .iter()
-        .map(|row| LoadPolicyRow {
-            type_uuid: row.type_uuid,
-            build_only: row.build_only,
-        })
-        .collect();
-    let load_policy = Arc::new(LoadPolicyAttestation::try_from_parts(
-        rows,
-        basis.load_policy.digest,
-    )?);
-    Ok(IoBasis::Rpc {
+pub(crate) fn io_basis(basis: &RpcBasis) -> IoBasis {
+    IoBasis::Rpc {
         snapshot: basis.snapshot,
-        load_policy,
-        daemon_compiled_projection: basis.daemon_compiled_projection,
-        policy_generation: basis.policy_generation,
-        target_generation: basis.target_generation,
-        attestation_generation: basis.attestation_generation,
-    })
+    }
 }
 
 pub(crate) fn artifact_layout_hash(
@@ -82,6 +64,7 @@ pub(crate) fn fetched_artifact(
     layout_hash: LayoutHash,
     structural: Vec<u8>,
     raw_blobs: Vec<Vec<u8>>,
+    load_edges: Vec<distill_rpc::ServedLoadEdge>,
     wire_layout: Arc<[u8]>,
 ) -> Result<FetchedArtifact, String> {
     verify_wire_layout(layout_hash, &wire_layout)?;
@@ -96,6 +79,7 @@ pub(crate) fn fetched_artifact(
     Ok(FetchedArtifact {
         structural: Arc::from(structural),
         blobs,
+        load_edges,
         wire_layout,
     })
 }
@@ -105,6 +89,7 @@ pub(crate) fn fetched_artifact_backed(
     backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
     structural: Range<usize>,
     blob_ranges: Vec<Range<usize>>,
+    load_edges: Vec<distill_rpc::ServedLoadEdge>,
     wire_layout: Arc<[u8]>,
 ) -> Result<FetchedArtifact, String> {
     verify_wire_layout(layout_hash, &wire_layout)?;
@@ -123,6 +108,7 @@ pub(crate) fn fetched_artifact_backed(
     Ok(FetchedArtifact {
         structural: Arc::from(structural_bytes),
         blobs,
+        load_edges,
         wire_layout,
     })
 }

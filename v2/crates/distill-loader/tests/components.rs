@@ -1,36 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, ContentHash};
 use distill_loader::{
-    AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, IoBasis,
-    LoadPolicyAttestation, LoadPolicyRow, ManifestHash, MemberFailure,
+    AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner, IoBasis, ManifestHash,
+    MemberFailure,
 };
 
 fn id(n: u8) -> AssetUuid {
     AssetUuid([n; 16])
 }
-fn ty(n: u8) -> TypeUuid {
-    TypeUuid([n; 16])
-}
-
-fn basis(seed: u8, build_only: &[u8]) -> IoBasis {
-    let rows = (1..=9)
-        .map(|n| LoadPolicyRow {
-            type_uuid: ty(n),
-            build_only: build_only.contains(&n),
-        })
-        .collect();
+fn basis(seed: u8, _build_only: &[u8]) -> IoBasis {
     IoBasis::Pack {
         manifest: ManifestHash([seed; 32]),
-        load_policy: Arc::new(LoadPolicyAttestation::from_rows(rows).unwrap()),
     }
 }
 
 fn ready(uuid: u8, deps: &[u8], basis: &IoBasis) -> CandidateAsset {
     CandidateAsset {
         uuid: id(uuid),
-        type_uuid: ty(uuid),
         basis: basis.clone(),
         load_deps: deps.iter().copied().map(id).collect(),
         outcome: CandidateOutcome::Ready {
@@ -112,7 +99,7 @@ fn mixed_basis_component_is_reresolved_whole() {
 }
 
 #[test]
-fn build_only_and_deletion_policy_are_component_failures() {
+fn deletion_without_a_placeholder_is_a_component_failure() {
     let policy = basis(1, &[2]);
     let mut deleted = ready(3, &[], &policy);
     deleted.outcome = CandidateOutcome::Deleted {
@@ -126,8 +113,7 @@ fn build_only_and_deletion_policy_are_component_failures() {
     let decisions = ComponentPlanner::default().plan(&BTreeSet::from([id(1)]), &candidates);
     assert!(
         matches!(&decisions[0], AdoptionDecision::Poisoned { failures, .. }
-        if failures.iter().any(|(uuid, failure)| *uuid == id(2) && matches!(failure, MemberFailure::LoadPolicy(_)))
-        && failures.contains(&(id(3), MemberFailure::DeletedWithoutPlaceholder)))
+        if failures.contains(&(id(3), MemberFailure::DeletedWithoutPlaceholder)))
     );
 
     let clean = basis(2, &[]);
@@ -155,7 +141,6 @@ fn component_discovery_is_stack_safe_for_deep_closures() {
             uuid,
             CandidateAsset {
                 uuid,
-                type_uuid: ty(1),
                 basis: basis.clone(),
                 load_deps: if n + 1 == 20_000 { vec![] } else { vec![next] },
                 outcome: CandidateOutcome::Ready {
