@@ -1,4 +1,4 @@
-//! `#[asset]` generates the §4 runtime descriptor, §12 measured native
+//! `#[asset]` generates the §4 runtime descriptor, §12 live native
 //! tree and callback tables, deterministic encoder, logical hash walk,
 //! and structural default table for an asset record.
 

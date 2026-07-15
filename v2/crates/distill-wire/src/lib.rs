@@ -1,14 +1,12 @@
-//! Binary artifact format (§12): the DSTL container, wire-layout
-//! derivation, the DSNL/DSWL layout hashes, the measured native-layout
-//! tree, fixup-plan compilation, and the transactional fixup executor.
+//! Binary artifact format (§12): the DSTL container, wire-layout derivation
+//! and hashing, the live native-layout tree, fixup-plan compilation, and the
+//! transactional fixup executor.
 
 pub mod artifact;
 pub mod derive;
-pub mod dsnl;
 pub mod dswl;
 pub mod encode;
 pub mod exec;
-pub mod measured;
 pub mod native;
 pub mod plan;
 pub mod wire;

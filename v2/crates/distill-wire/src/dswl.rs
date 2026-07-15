@@ -19,17 +19,33 @@
 //! The grammar text (§12) pins struct's field count but leaves the enum
 //! variant count implicit; without a count the encoding would not be
 //! injective (a variant list could alias a following sibling), so the
-//! count is included exactly as DSNL's "variant count u32" does.
+//! count is included explicitly.
 
-use crate::dsnl::{nfc_of, put_str};
 use crate::native::{LayoutHashError, ScalarKind};
 use crate::wire::{SlotKind, WireEnumForm, WireField, WireNode, WireVariant};
 use distill_core::id::LayoutHash;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
-use unicode_normalization::is_nfc;
+use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 /// DSWL grammar version.
 pub const DSWL_VERSION: u8 = 1;
+
+pub(crate) fn nfc_of(value: &str) -> Cow<'_, str> {
+    if is_nfc(value) {
+        Cow::Borrowed(value)
+    } else {
+        Cow::Owned(value.nfc().collect())
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, value: &str) -> Result<(), LayoutHashError> {
+    let nfc = nfc_of(value);
+    let length = u32::try_from(nfc.len()).map_err(|_| LayoutHashError::NameTooLong)?;
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(nfc.as_bytes());
+    Ok(())
+}
 
 /// Serialize a wire tree to its pinned DSWL byte form.
 pub fn dswl_bytes(root: &WireNode) -> Result<Vec<u8>, LayoutHashError> {

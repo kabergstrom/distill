@@ -1,8 +1,6 @@
-//! The measured native layout tree and the generated-table vocabulary
-//! (§12) — declared exactly as the design pins them. `#[asset]` generates
-//! these as statics in every consuming binary; this crate declares the
-//! shapes, hashes the tree (DSNL), and compiles/executes fixup plans
-//! against it.
+//! The live native layout tree and generated-table vocabulary (§12).
+//! `#[asset]` generates these as statics in every consuming binary; this
+//! crate declares the shapes and compiles/executes fixup plans against them.
 
 /// Every primitive leaf the native tree can hold — the tree must describe
 /// the whole value, not just the validated corners. `Bool` and `Char` are
@@ -27,7 +25,7 @@ pub enum ScalarKind {
 }
 
 impl ScalarKind {
-    /// The DSNL/DSWL grammar id — declaration order, pinned.
+    /// The native/wire grammar id — declaration order, pinned.
     pub fn grammar_id(self) -> u8 {
         match self {
             ScalarKind::Bool => 0x00,
@@ -154,7 +152,7 @@ pub struct SkipWriterTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SkipDefaultId(pub u32);
 
-/// The measured native layout tree (§12), generated as statics by
+/// The live native layout tree (§12), generated as statics by
 /// #[asset] in every consuming binary: the native-side input to
 /// fixup-plan compilation and the tree the §5 digests hash. Offsets are
 /// frame-relative; skip slots appear with their writers (schema-invisible
@@ -247,8 +245,8 @@ pub enum NativeLayoutNode {
     /// The §4 Blob native form.
     Blob { offset: u32, size: u32, align: u32 },
     /// Skipped slots are schema-invisible but plan-visible: alignment is
-    /// measured like every slot's — the DSNL promise that skipped-slot
-    /// geometry is measured, not inferred.
+    /// measured like every slot's: skipped-slot geometry is measured, not
+    /// inferred.
     Skip {
         offset: u32,
         size: u32,
@@ -765,7 +763,7 @@ fn width_mask(size: u8) -> u128 {
     }
 }
 
-/// A struct field record (§12): the DSNL/DSWL physical order is (offset
+/// A struct field record (§12): the physical order is (offset
 /// ascending, declaration index ascending), and after wire repacking the
 /// declaration index is the only tie-break for equal offsets — native
 /// slice order alone cannot supply it.
@@ -821,7 +819,7 @@ pub enum NativeTagEncoding {
     Single,
 }
 
-/// Failures serializing a layout tree under the DSNL or DSWL grammar.
+/// Failures serializing a wire layout under the DSWL grammar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutHashError {
     /// A back-reference names a frame that is not on the expansion path.

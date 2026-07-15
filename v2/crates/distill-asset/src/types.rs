@@ -40,7 +40,7 @@ pub struct AssetRuntimeDescriptor {
     pub logical_hash: LogicalHash,
     /// The type's `#[asset(build_only)]` policy bit (§9), exposed so
     /// load-policy validation is uniform across IO bases (§13, §15,
-    /// §16). Deliberately absent from DSLH and DSNL (§5): policy is
+    /// §16). Deliberately absent from DSLH and DSWL (§5): policy is
     /// carried and compared, never hashed into layout identity.
     pub build_only: bool,
     /// The measured native layout tree (§12), table ids annotated in

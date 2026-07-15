@@ -97,11 +97,10 @@ annotations, reference/blob metadata, control roles, and build-only policy are
 read from the schema/descriptor that owns them; they are not duplicated into a
 generic registry-extras attestation grammar.
 
-Before the obsolete DSNL gate is removed, every live descriptor must be locally
-sound. In particular, generic `Option<T>` may not guess a niche layout; it must
-be constructed through a typed contained thunk (or be restricted to layouts
-the implementation can prove). This is a prerequisite ordering constraint,
-not a reason to retain cross-binary DSNL comparison.
+Every live descriptor must be locally sound. In particular, generic `Option<T>`
+uses a typed contained construction thunk and never guesses a niche layout.
+That local validation/construction boundary is what made removal of the
+cross-binary DSNL comparison safe.
 
 ## 2. Source-of-Truth Hierarchy
 

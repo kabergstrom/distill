@@ -18,7 +18,7 @@
 //! - Variant payload nodes' own `whole_drop` annotations are ignored: a
 //!   variant payload is not a standalone value; the enum's glue covers it.
 
-use crate::dsnl::nfc_of;
+use crate::dswl::nfc_of;
 use crate::native::{
     CtorId, DropId, NativeLayoutNode, NativeTagEncoding, NativeVariantTag, ScalarKind,
     SkipDefaultId,
