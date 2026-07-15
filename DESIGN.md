@@ -77,7 +77,7 @@ This invariant governs the whole design:
    TypeUuid has one `Active` manifest row, every `Active` row has one
    non-bootstrap compiled registry row, and each compiled DSLH equals that
    row's selected `current` digest. Every bootstrap-control row instead equals
-   its format-derived, CompilationIdentity-keyed expected row under the
+   its format-derived, LayoutIdentity-keyed expected row under the
    separate bootstrap-authority gate.
    No other exception exists. `Retired` rows preserve accepted history but are
    not active registry authority. A mismatch is `SchemaAcceptanceRequired`,
@@ -164,10 +164,14 @@ implementation carries the invariants — same rustc, same features on
 shared deps, clean unload — and a fix or hardening lands in both hosts
 at once; the code is never duplicated. There is no off-the-shelf host —
 this is bespoke code with known invariants, owned once. The
-same-rustc/same-features invariants are checked, not assumed: the module exports its own
-`CompilationIdentity` (§5) in its function table, and the daemon refuses at
-registration any module whose identity disagrees with the schema file's
-record. Loading never touches the artifact path directly: each epoch
+same-rustc host-interface invariant is checked, not assumed: the module exports
+its `ModuleAbiIdentity` (§3) and complete compiled-type rows/`DSCA` (§5) in its
+C-ABI prefix, and the daemon refuses registration unless the ABI identity
+matches the host and the rows exactly match the schema-derived expectation.
+No authored asset instance participates in candidate opening: the expected
+rows come entirely from the watched source-walk schema artifact, and authored
+bundles are examined only after a module epoch is ready. Loading never touches
+the artifact path directly: each epoch
 copies the dylib into daemon state, hashes the copy, and `dlopen`s the
 copy — the hashed bytes are exactly the loaded bytes, so a supervisor
 rebuild landing between hash and load can never run one build's code
@@ -296,7 +300,7 @@ invoked through `run_tool`, registered either as a complete hashed package
 directory or as an explicitly ambient toolchain (§9). (The daemon module
 host's own staged `dlopen` of the pipeline cdylib above is the hosting boundary,
 not pipeline code.) The system runtime (libc, libSystem)
-is acknowledged as part of `CompilationIdentity`'s (target, rustc) pair
+is acknowledged as part of `LayoutIdentity`'s (target, rustc) pair
 (§5) and outside the dylib hash; system-runtime drift is not tracked
 (§22).
 
@@ -309,23 +313,13 @@ The audited function table, and the registration API it is handed:
 pub struct PipelineModuleTable {
     /// Checked first — cross-ABI-stable, at a #[repr(C)] prefix.
     pub abi_version: u32,
-    /// Attestation (§5), and the bootstrap: the only call made before the
-    /// identity checks pass, so it is C-ABI — no Rust type crosses the
-    /// boundary until the same-rustc contract is *verified*, not assumed.
-    /// Writes the canonical CompilationIdentity + ModuleAbiIdentity
-    /// encodings (§5's record encoding) into the caller's buffer;
+    /// ABI bootstrap: one of the calls made before the identity checks pass,
+    /// so it is C-ABI — no Rust type crosses the boundary until the same-rustc
+    /// host-interface contract is *verified*, not assumed. Writes the canonical
+    /// ModuleAbiIdentity encoding into the caller's buffer;
     /// returns 0 with *len set, the required capacity if cap is too small,
     /// or <0 on error — a contained panic is a status, never an unwind.
     pub identity: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
-    /// The measured-layout attestation (§5): writes a sorted, length-framed
-    /// table of (TypeUuid, measured native-layout digest) covering every
-    /// asset type compiled into the module — same buffer/status protocol
-    /// as identity, C-ABI because it too runs pre-verification. Compared
-    /// against source-walk's layout table before register is ever called;
-    /// a missing, extra, or divergent type is a registration error naming
-    /// it. Without this export the §5 measured check would be a claim with
-    /// no API to carry it.
-    pub measured_layouts: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
     /// Complete compiled per-type semantic attestation (§5). Writes the
     /// canonical sorted `CompiledTypeRow` rows followed by their
     /// `DSCA` aggregate, using the same C-ABI buffer/status protocol. The
@@ -344,19 +338,15 @@ pub struct PipelineModuleTable {
 }
 
 /// Embedded in daemon and module alike at build; compared daemon-side at
-/// registration before any Rust-ABI use. Distinct from CompilationIdentity
-/// (§5), which covers asset layouts: this covers the host interface —
-/// what Registry, Outputs, and every by-value boundary type compile to,
-/// and whose allocations cross ownership at the boundary.
+/// registration before any Rust-ABI use. This covers only the host interface —
+/// what Registry, Outputs, and every by-value boundary type compile to, and
+/// whose allocations cross ownership at the boundary. Asset-type agreement is
+/// checked separately and directly by the compiled rows/DSCA below.
 pub struct ModuleAbiIdentity {
     pub rustc: String,                    // must equal the daemon's exactly
-    pub interface_fingerprint: [u8; 32],  // the resolved interface closure: the
-                                          // interface crate and its transitive
-                                          // deps — sources, (package, feature)
-                                          // set, lockfile-resolved versions,
-                                          // cfgs — computed identically by
-                                          // both builds (the §5 closure rule,
-                                          // applied to this boundary)
+    pub interface_fingerprint: [u8; 32],  // shared host-interface build
+                                          // fingerprint, computed identically
+                                          // by both workspace builds
     pub measured_interface: [u8; 32],     // measured layout digest (§5) over
                                           // the boundary types themselves —
                                           // Registry, Outputs, AuthoredValue,
@@ -484,7 +474,7 @@ pub struct BootstrapControlTableV1(pub [CompiledTypeRow; 5]);
 /// that literal resource and golden-generated outputs cannot advertise bundle
 /// format v1 or pass `Ready`. `distill-bootstrap-gen` v1's exact input record is
 /// `(algorithm:u8=1, spec_len:u32, the literal DSB bytes,
-/// compilation_identity_len:u32, canonical DSCI record,
+/// layout_identity_len:u32, canonical DSLI record,
 /// measured_layout_count:u32=5, measured layouts...)`. The measured rows are
 /// raw-TypeUuid sorted `(type_uuid:[u8;16], canonical DSNL native tree)` emitted
 /// by compiling the built-in Rust definitions that the same DSB schema
@@ -495,29 +485,29 @@ pub struct BootstrapControlTableV1(pub [CompiledTypeRow; 5]);
 /// are exhaustive: it has no other filesystem, environment, plugin, registry,
 /// or live-daemon input.
 
-/// Full rows are therefore explicitly CompilationIdentity-keyed, not claimed
+/// Full rows are therefore explicitly LayoutIdentity-keyed, not claimed
 /// to be one cross-target constant. Canonical output is
-/// `(bootstrap_table_version:u8=1, compilation_identity_len:u32,
-/// canonical DSCI record, row_count:u32=5, canonical CompiledTypeRows,
+/// `(bootstrap_table_version:u8=1, layout_identity_len:u32,
+/// canonical DSLI record, row_count:u32=5, canonical CompiledTypeRows,
 /// dsca:[u8;32])`. Its logical generated-resource name is
-/// `bootstrap/control-table-v1/<64 lowercase hex DSCI digest>.dsca`, where the
-/// key is `blake3("DSCI" || canonical CompilationIdentity record)`; the decoder
-/// requires that filename key, embedded DSCI record, recomputed DSCI digest,
-/// and consumer CompilationIdentity all agree before reading rows. Every
+/// `bootstrap/control-table-v1/<64 lowercase hex DSLI digest>.dsca`, where the
+/// key is `blake3("DSLI" || canonical LayoutIdentity record)`; the decoder
+/// requires that filename key, embedded DSLI record, recomputed DSLI digest,
+/// and consumer LayoutIdentity all agree before reading rows. Every
 /// source-walk, daemon, module, client, and pack-tool build embeds the keyed
-/// output for its exact CompilationIdentity and verifies its own generated
+/// output for its exact LayoutIdentity and verifies its own generated
 /// Rust measurements against it at build/open time. Thus target-specific DSNL
 /// is deterministic without pretending to be target-independent, while
 /// TypeUuid/DSLH/build_only/extras are fixed by bundle format. A consumer may
 /// not regenerate the table from a live Registry. CI compiles the generated
 /// built-ins, runs this derivation twice from the literal source path and same
-/// DSCI, and requires byte identity plus filename/record/row/DSCA
+/// DSLI, and requires byte identity plus filename/record/row/DSCA
 /// recomputation. Changing the DSB bytes, generator grammar, generated built-in
 /// representation, or any resulting row requires a new
 /// bundle/bootstrap-table version.
 
 /// Validation first compares the five rows with the embedded generator output
-/// for the candidate's exact CompilationIdentity and
+/// for the candidate's exact LayoutIdentity and
 /// rejects a missing, extra, or unequal row as BootstrapAuthorityMismatch.
 /// DSCA still covers these rows: no conforming compiled table or boundary
 /// projection may omit them. For a manifest/load closure `C`, the one exact
@@ -551,7 +541,7 @@ pub struct BootstrapControlTableV1(pub [CompiledTypeRow; 5]);
 /// or terminal type, so `build_only` on an authored `A -> B` asset cannot be
 /// laundered by shipping only B.
 /// Mount/connect first compare the five received rows with the local
-/// consumer's embedded, DSCI-keyed table under this independent gate, then
+/// consumer's embedded, DSLI-keyed table under this independent gate, then
 /// compare the requested runtime subset. Bootstrap rows attest format decode;
 /// they do not become artifact-closure members, pack roots, load dependencies,
 /// or runtime/policy-eligible asset types. The artifact runtime closure is
@@ -973,11 +963,11 @@ impl Deref for Blob { type Target = [u8]; }
 source-walk analyzes the asset-types crate and emits schema JSON (reusing
 `ngp-schema`'s `Schema`/`TypeDef`/`Field` model). The daemon watches this file
 and reloads on change. Staleness is detected the way newgameplus already
-does it: the schema embeds source hashes (`ngp-source-hash`; distill
-requires it strengthened from today's per-crate `DefaultHasher` combination
-to a stable hash that also covers cargo manifests, feature selection, and
-the target triple — a §22 work item); when they disagree with the workspace's current sources, the daemon
-keeps serving the last consistent registry, flags staleness, and pauses
+does it: the schema embeds source hashes (`ngp-source-hash`) as a hot-reload
+freshness trigger. They are deliberately not an ABI or safety attestation and
+do not attempt to reconstruct an exact Cargo dependency closure. When they
+disagree with the workspace's current sources, the daemon keeps serving the
+last consistent registry, flags staleness, and pauses
 schema-writing services (adoption, codegen, disk migration) until a fresh
 schema lands. The recorded schema lineage (§6, §11, §13) makes the lag safe
 for builds too: ancestry is checked against the durable manifest's explicit
@@ -985,57 +975,39 @@ parent links and current cursor. Data whose stamped cursor is not a proved
 forward ancestor of the registry cursor — including data ahead of a stale
 registry or on another accepted branch — refuses schema-dependent builds with
 a staleness error naming both hashes, rather than being automatically diffed
-backward into older semantics. The schema file also carries a **`CompilationIdentity`**
-record — exact target triple, rustc identity, enabled features and cfgs,
-manifest + lockfile hash, and the source-walk algorithm version — which is
-what the strict target gate (§12) compares against; emitting it is part of
-the same source-walk work item (today source-walk records only a backend
-feature, so the gate has nothing authoritative to check without this).
-Enforcement is split by role, with no side trusted implicitly. **Host
-check**: the pipeline module attests its own identity at registration (§3)
-and must match the schema file's record — daemon, module, and schema agree
-on the host toolchain. **Per-target check**: each target resolves to a
-bound identity (§18) that must match the identity of the layout table its
-artifacts are encoded against. The two sides tie through source
-fingerprint, never through triple equality — the schema file and every
-per-target layout table carry the same strengthened `ngp-source-hash` and
-algorithm version (the `source_fingerprint` and `algorithm_version`
-identity fields), proving one source-walk run over one source tree
-produced them all (a host module can never truthfully attest a foreign
-triple, and is never asked to). Until per-target layout emission lands
-(§22), the only layout table is the host's, so buildable targets
-degenerate to host-identity targets.
+backward into older semantics. Every physical layout table carries a small
+**`LayoutIdentity`** used only to select and bind the table: exact target
+triple, rustc identity, and source-walk extraction/layout algorithm version.
+It is not exported by the pipeline module and does not claim to enumerate the
+sources, features, cfgs, manifests, lock nodes, build-script inputs, or other
+causes that produced the layout.
+
+Agreement is checked at the semantic boundary instead. From the watched
+source-walk artifact, the daemon independently derives the complete expected
+sorted `CompiledTypeRow` table and its DSCA. An opened but unpublished module
+exports its independently macro-generated table through the C-ABI probe in
+§3. Candidate acceptance requires exact row and DSCA equality before any
+Rust-ABI registration call. No authored asset instance participates in either
+calculation. A feature, cfg, dependency, generated file, or compiler option
+matters exactly when it changes a type's UUID, logical schema, native layout,
+load policy, or registry extras; that consequence changes DSCA. Pipeline-only
+behavior is covered by the staged dylib hash, and host-interface compatibility
+is covered separately by `ModuleAbiIdentity`.
+
+Each target resolves to a bound `LayoutIdentity` (§18) that must match the
+layout table used to encode its artifacts. Actual output keys additionally
+bind their logical and DSWL layout hashes (§9), so a changed table cannot reuse
+old artifacts merely because it was produced by the same target/toolchain.
+Until per-target layout emission lands (§22), the only layout table is the
+host's, so buildable targets degenerate to host-identity targets.
 
 ```rust
-pub struct CompilationIdentity {
+pub struct LayoutIdentity {
     pub target_triple: String,          // exact, e.g. "aarch64-apple-darwin"
     pub rustc: String,                  // rustc -vV verbose version, commit hash included
-    pub source_fingerprint: [u8; 32],   // strengthened ngp-source-hash over the layout
-                                        // closure's sources (§22 work item) — the tie
-                                        // between schema record, module attestation,
-                                        // and every per-target layout table
-    pub features: BTreeSet<(String, String)>,  // (package, feature) — qualified, and
-                                        // scoped to the layout closure (below);
-                                        // identically named features never alias
-    pub cfgs: BTreeSet<String>,         // cfg atoms that can affect layout
-    pub manifest_lock_hash: [u8; 32],   // blake3 over the layout closure's manifests
-                                        // + its resolved Cargo.lock nodes — pipeline-
-                                        // only deps stay outside identity (§9's
-                                        // dylib hash covers them)
     pub algorithm_version: u32,         // source-walk extraction + layout algorithm
 }
 ```
-
-Feature identity is scoped to the **layout closure**: the asset-types
-crate and its transitive dependencies — every package that can define or
-affect the layout of a type reachable from `#[asset]` structs, computed
-from cargo metadata at extraction and again at module build. Comparing
-the full workspace feature set would reject every valid module (a
-pipeline build naturally enables pipeline-only features source-walk never
-sees); comparing less than the closure could miss a layout-changing
-feature. Pipeline-only dependencies are deliberately outside identity —
-their code identity is the dylib hash's job (§9). `source_fingerprint`
-covers the same closure's sources.
 
 Identity records hash and compare by a **canonical record encoding**,
 normative here: fields in declaration order; integers LE fixed-width;
@@ -1043,8 +1015,8 @@ normative here: fields in declaration order; integers LE fixed-width;
 deduplicated, and encoded as `u32` count + elements; sequences as `u32`
 count + elements; `Option` as a `u8` presence marker + payload; enums as
 a `u8` discriminant in declaration order + payload; domain-prefixed and
-versioned — `blake3("DSCI" ‖ version:u8 ‖ fields)` for
-`CompilationIdentity`, `blake3("DSMA" ‖ version:u8 ‖ fields)` for
+versioned — `blake3("DSLI" ‖ version:u8 ‖ fields)` for
+`LayoutIdentity`, `blake3("DSMA" ‖ version:u8 ‖ fields)` for
 `ModuleAbiIdentity` (distinct meanings never share a domain — the two
 records answer different questions and must never alias), `blake3("DSTG" ‖
 version:u8 ‖ fields)` for the target-definition hash (§18). Two builds
@@ -1062,8 +1034,8 @@ spec defect, since that is how two meanings come to share bytes:
 
 | Domain | Hashes |
 |---|---|
-| `"DSCI"` | `CompilationIdentity` records (§5) |
-| `"DSMA"` | `ModuleAbiIdentity` records (§3, §5) — the host-interface identity, never sharing `CompilationIdentity`'s domain |
+| `"DSLI"` | `LayoutIdentity` records (§5) |
+| `"DSMA"` | `ModuleAbiIdentity` records (§3, §5) — the host-interface identity, never sharing `LayoutIdentity`'s domain |
 | `"DSTG"` | target-definition hash (§18) |
 | `"DSTS"` | candidate target-set identity — normalized target names paired with their DSTG hashes (§5, §13, §18) |
 | `"DSTA"` | tag-annotation epoch — canonical compiled `#[asset(tag)]` facts, independent of logical schema identity (§5, §10) |
@@ -1252,8 +1224,8 @@ pub enum DscpV1 { // tag is the ConfigurationPoisonCode value
     MissingLineageManifest,
     DuplicateLineageManifest { claimants: Vec<LineageManifestClaimant> },
     UnsupportedTargetIdentity { target: String,
-                                expected: CompilationIdentity,
-                                observed: CompilationIdentity },
+                                expected: LayoutIdentity,
+                                observed: LayoutIdentity },
     DuplicateTargetName { normalized_name: String },
     ConfigurationSourceUnavailable {
         path: ConfigurationSourcePathBytes,
@@ -1366,7 +1338,7 @@ The candidate target-set digest has one equally exact construction:
 by the NFC-normalized target-name bytes and encoded as `(name:str,
 target_definition_hash:[u8;32])`; duplicate normalized names are rejected.
 The target-definition hash is the row's recomputed DSTG (§18), so bound
-CompilationIdentity is included transitively. Candidate staging, acceptance
+LayoutIdentity is included transitively. Candidate staging, acceptance
 request decoding, and the committing coordinator independently recompute DSTS
 and never trust a supplied opaque target-set hash.
 
@@ -1535,7 +1507,7 @@ pub struct FieldAttrs {
                                       // map from this bit
 }
 pub struct SchemaLayouts {            // physical: measured, per identity
-    pub identity: CompilationIdentity,
+    pub identity: LayoutIdentity,
     pub layouts: Vec<TypeLayout>,     // parallel to types, by SchemaTypeId
 }
 pub struct TypeLayout {
@@ -1554,7 +1526,7 @@ pub struct FieldLayout { pub offset: Option<u64>, pub field_size: Option<u64> }
 ```
 
 `Schema::merge` dedups **logical** records and attaches layout tables per
-`CompilationIdentity`. Today's merge keeps one fused `TypeDef` on a
+`LayoutIdentity`. Today's merge keeps one fused `TypeDef` on a
 nominal-key hit, silently discarding the other side's layout numbers if
 the walks ran under different compilers — under the split that collision
 is an explicit error, not a silent winner. Existing layout consumers (the
@@ -4373,7 +4345,7 @@ Migration endpoint for a Retired type publishes typed
 Reactivation requires candidate inclusion and selects exactly that candidate
 row's digest, reusing or appending history under the normal forward/rollback
 rules; it may admit waiting bytes only atomically with the Active transition.
-`Ready` separately validates DSCI-keyed bootstrap authority rows, then
+`Ready` separately validates DSLI-keyed bootstrap authority rows, then
 compares the candidate's remaining set exactly with Active rows; Retired rows remain
 verifiable authority but are excluded from that set.
 
@@ -5626,7 +5598,7 @@ pub struct StagedPipelineEpoch { /* identity, library, token, arena, map, target
 
 pub enum PipelineState {
     /// Invariant: every §3 bootstrap-control row passed its separate
-    /// format-derived, DSCI-keyed authority gate; for every other
+    /// format-derived, DSLI-keyed authority gate; for every other
     /// CompiledTypeRow in this epoch, exactly
     /// one Active manifest type row exists and row.logical_hash equals the
     /// digest at its current cursor; the manifest has no extra Active row.
@@ -6837,7 +6809,7 @@ Content-addressed, patch-friendly (CASC-inspired):
   PackfileIO verifies all of it at
   mount: the pack's target must match the runtime's declared target,
   the exact five bootstrap rows must match the local consumer's embedded
-  DSCI-keyed table under §3's independent gate, and **every complete runtime
+  DSLI-keyed table under §3's independent gate, and **every complete runtime
   row in the pack's closure table must be present and
   byte/field-equal in the game's registered set** — a missing or mismatched type is a mount
   error naming the type; types the game registers beyond the pack are
@@ -7157,7 +7129,7 @@ together with sorted load-policy rows and `"DSLP"` over exactly the same `A`.
 The server requires both submitted row lists to have exactly the keys of `A`,
 verifies every compiled and policy row field-for-field against one pinned
 daemon table, and recomputes both aggregates. It independently verifies all five bootstrap
-rows against its own embedded DSCI-keyed table and requires the client to have
+rows against its own embedded DSLI-keyed table and requires the client to have
 embedded and sent the matching rows; they are not runtime closure/policy
 eligibility. The Hub stores `A`, with DSCA
 recomputed from the daemon table projected onto that accepted superset,
@@ -7254,7 +7226,7 @@ interface Root {               # the bootstrap capability
                                # AND sorted (TypeUuid, build_only) rows over
                                # exactly A plus recomputed "DSLP".
                                # Bootstrap rows first match each
-                               # local consumer's embedded DSCI-keyed table;
+                               # local consumer's embedded DSLI-keyed table;
                                # every client runtime row must be present and
                                # field-equal in the
                                # daemon's pinned compiled table for the target —
@@ -7397,7 +7369,7 @@ struct PipelineUnavailableDiagnostic { union {
 # RegistryExtras EO(rows) contains canonical RegistryExtrasV1 bytes, not DSRE
 # digests; each side recomputes DSRE. Aggregate/policy EO(32) values are DSCA/
 # DSLP respectively. Bootstrap EO(rows) is the complete canonical five-row
-# DSCI-keyed BootstrapControlTable bytes (§3). Connect and reattest share this matrix and
+# DSLI-keyed BootstrapControlTable bytes (§3). Connect and reattest share this matrix and
 # reject every unlisted code/subject/payload tuple, an incorrect MF expected
 # width, unknown
 # union arm/code, noncanonical row table, or digest that does not recompute.
@@ -7630,15 +7602,10 @@ struct PlatformFileIdentity { union {
 struct ConfigurationDirectoryAliasSide {
   normalizedPath @0 :Text; identity @1 :PlatformFileIdentity;
 }
-struct ConfigurationFeature { package @0 :Text; feature @1 :Text; }
-struct ConfigurationCompilationIdentity {
+struct ConfigurationLayoutIdentity {
   targetTriple @0 :Text;
   rustc @1 :Text;
-  sourceFingerprint @2 :Data;  # exactly 32 bytes
-  features @3 :List(ConfigurationFeature); # strict (package, feature) order
-  cfgs @4 :List(Text);         # strict canonical byte order
-  manifestLockHash @5 :Data;   # exactly 32 bytes
-  algorithmVersion @6 :UInt32;
+  algorithmVersion @2 :UInt32;
 }
 struct DscpMalformedConfiguration { fileHash @0 :Data; } # exactly 32 bytes
 struct DscpNonLoopbackAddress { address @0 :Text; }
@@ -7661,8 +7628,8 @@ struct DscpDuplicateLineageManifest {
 }
 struct DscpUnsupportedTargetIdentity {
   target @0 :Text;
-  expected @1 :ConfigurationCompilationIdentity;
-  observed @2 :ConfigurationCompilationIdentity;
+  expected @1 :ConfigurationLayoutIdentity;
+  observed @2 :ConfigurationLayoutIdentity;
 }
 struct DscpDuplicateTargetName { normalizedName @0 :Text; }
 enum ConfigurationSourceFailureValue {
@@ -8405,7 +8372,7 @@ physical names inside one root that collapse to one normalized path publish
 claimants before any file row is chosen.
 
 A `[targets]` entry names cook parameters; the daemon resolves each entry
-to a **bound `CompilationIdentity`** (§5) — for host-identity targets the
+to a **bound `LayoutIdentity`** (§5) — for host-identity targets the
 schema file's record, for cross targets the per-target layout table's own
 record once emission lands (§22). The bound identity is part of the
 target-definition hash (§9), so artifacts cooked under one toolchain
@@ -8540,7 +8507,7 @@ pub enum TargetOs    { Macos, Windows, Linux }
 pub enum TargetArch  { Aarch64, X86_64 }
 pub enum GraphicsApi { Metal, Vulkan, Dx12, Gles2, Gles3 }
 // target-definition hash (§9) = blake3("DSTG" ‖ version ‖ canonical Target
-// ‖ bound CompilationIdentity) — §5's record encoding, never the config name
+// ‖ bound LayoutIdentity) — §5's record encoding, never the config name
 // candidate target-set hash = DSTS v1 (§5): target-name-sorted
 // (NFC normalized name, recomputed DSTG) rows; normalized-name duplicates
 // reject. Candidate/request/commit each recompute it and never trust bytes.
@@ -8897,7 +8864,7 @@ ordinary §10 dependency kinds.
   only validators are additive. Debug keys share the 1–255-byte output-key
   bound, checked at result binding (§9).
 - **Schema code is shared, refactored in place** (§5, §19): ngp-schema
-  splits logical records from per-`CompilationIdentity` layout tables
+  splits logical records from per-`LayoutIdentity` layout tables
   (surfacing today's silent layout overwrite in `merge`), gains type
   UUIDs, the attribute channel, `I128`, and `TagEncoding` extensions; the
   logical-hash walk and the snapshot codec live in ngp-schema, hashing
@@ -8925,16 +8892,15 @@ ordinary §10 dependency kinds.
   derived-output commits verify against the precomputed index —
   collisions checked, never trusted to probability.
 - **Module ABI & staging** (§3, §9): a C-ABI identity bootstrap
-  (serialized bytes, status codes — the only call before the checks
-  pass) fronts a Rust-ABI table gated by **two** identities:
-  `ModuleAbiIdentity` (rustc, the resolved interface *closure* —
-  sources, features, dep versions — a measured digest over the boundary
-  types themselves, panic strategy, system-allocator contract — the
-  daemon's own record vs the module's, since asset-layout identity says
+  (serialized bytes, status codes — one of the calls before the checks
+  pass) fronts a Rust-ABI table gated by `ModuleAbiIdentity` (rustc, the
+  shared host-interface build fingerprint, a measured digest over the
+  boundary types themselves, panic strategy, system-allocator contract —
+  the daemon's own record vs the module's, since asset-layout identity says
   nothing about the host interface, whose types cross by value with
-  cross-boundary ownership) and the §5 pair; the per-type measured
-  layouts cross through the C-ABI `measured_layouts` export, checked
-  before `register` is ever called.
+  cross-boundary ownership). A second C-ABI probe carries the complete
+  compiled rows/DSCA; its DSNL field makes the old separate
+  `measured_layouts` probe redundant, so that probe does not exist.
   Panics are contained inside the
   module by generated wrappers — every generated fn-pointer table
   (defaults, skip-writers, ctors, `MigrationFn`) holds catch_unwind
@@ -8965,25 +8931,15 @@ ordinary §10 dependency kinds.
   Epoch rotation is an input event: snapshots pin their `PipelineEpoch`,
   and a drained epoch surfaces as `Drifted(Dylib)`, never a silent
   re-pair with newer code.
-- **CompilationIdentity** (§5, §12): the schema file records triple, rustc
-  identity, a `source_fingerprint` (strengthened `ngp-source-hash` over
-  the layout closure), (package, feature)-qualified features scoped to
-  that same closure — the asset-types crate's transitive deps, so
-  pipeline-only features neither reject valid modules nor enter
-  identity — cfgs, manifest+lockfile hash, and algorithm version;
-  enforcement is split by role — module attestation must match the schema
-  record (host check, §3), each target's bound identity must match its
-  encoding layout table (§18), and schema ↔ layout tables tie by the
-  shared fingerprint fields — so the same-rustc invariant is checked
-  without a host module ever attesting a foreign triple. Identity fields
-  gate *declared* inputs; the **measured layout digest** (actual native
-  offsets/tags of every asset type, hashed under the `"DSNL"`
-  native-layout grammar (§12), generated
-  into every consuming binary) is the authoritative backstop — compared
-  at registration, keying fixup plans (§12) and pack mounts (§16) — so
-  build-script or compiler-flag holes in declared identity cannot
-  produce silent miswrites. All identity records hash by the normative
-  canonical record encoding (`"DSCI"`/`"DSMA"`/`"DSTG"`, §5), and the same
+- **LayoutIdentity + semantic attestation** (§5, §12): a layout table records
+  only target triple, rustc identity, and source-walk algorithm version under
+  `"DSLI"`; it selects/binds a physical table and is not a reconstructed Cargo
+  dependency closure. Module acceptance instead compares the independently
+  derived complete CompiledTypeRow/DSCA tables, whose rows directly cover
+  TypeUuid, DSLH, DSNL, build-only policy, and RegistryExtras. Pipeline-only
+  behavior remains covered by the dylib hash and host-interface safety by
+  ModuleAbiIdentity. All identity records hash by the normative
+  canonical record encoding (`"DSLI"`/`"DSMA"`/`"DSTG"`, §5), and the same
   encoding serializes every hashed composite — static-input keys (`"DSSI"`,
   the CAS record key is the digest, §13), traces (`"DSTR"`), queries,
   output tables — so `‖` formulas can never repartition
@@ -9123,7 +9079,7 @@ ordinary §10 dependency kinds.
   `Registry`, `DefaultTable`, `ModuleAbiIdentity`, and `PipelineEpoch`
   (§3), identity newtypes,
   `AssetRef`/`WeakAssetRef`/`Blob`
-  native forms, and `AssetRuntimeDescriptor` (§4), `CompilationIdentity` and the schema AST (§5), the
+  native forms, and `AssetRuntimeDescriptor` (§4), `LayoutIdentity` and the schema AST (§5), the
   bundle/`AuthoredValue` data model (§6), importer/processor/validator
   traits with their contexts (§8, §9), `ImportRecord`/`FileDep` (§8),
   `StaticInputs`/`TraceOp` (§9), `AssetQuery`/`FileQuery` (§10, §8),
@@ -9700,7 +9656,7 @@ ordinary §10 dependency kinds.
   dependency must instead execute out of process as a registered §9 tool. The
   daemon does not parse the pipeline image or reproduce platform-loader
   resolution; static linkage is enforced by the pipeline build. The system
-  runtime is acknowledged as part of CompilationIdentity's (target,
+  runtime is acknowledged as part of LayoutIdentity's (target,
   rustc) and outside the dylib hash — the residual: system-runtime
   drift is not tracked. (Refined in R22: the staged-library alternative
   is withdrawn. Pipeline runtime `dlopen` is banned and no library-open
@@ -10858,6 +10814,26 @@ ordinary §10 dependency kinds.
   loader policy. The pipeline build/CI owns that linkage check.
 <!-- R32_LEDGER_END -->
 
+<!-- R33_LEDGER_BEGIN count=4 -->
+- **Semantic attestation replaces reconstructed layout closures** (§§3, 5,
+  12, 18): the exact Cargo feature/cfg/source/manifest/lock dependency closure
+  is removed. Source-walk and the candidate module independently produce the
+  complete CompiledTypeRow table, and exact row/DSCA equality checks the
+  consequences that matter directly.
+- **LayoutIdentity is a table selector, not module attestation** (§§3, 5, 18):
+  it contains only target triple, rustc identity, and source-walk algorithm
+  version under DSLI. The module does not export or compare it;
+  ModuleAbiIdentity gates the Rust host interface, while target binding and
+  per-output logical/DSWL hashes prevent layout reuse under the wrong table.
+- **One compiled-type probe carries the complete asset attestation** (§§3, 5):
+  an opened, unpublished candidate exports its independently generated rows and
+  DSCA through C ABI before registration. Because every row already contains
+  DSNL, the separate measured-layout probe and duplicate comparison are removed.
+- **Source hashes are freshness hints** (§5): `ngp-source-hash` continues to
+  trigger New Game Plus/schema hot reload but is not strengthened into a Cargo
+  graph identity and is not trusted as an ABI, target, or safety gate.
+<!-- R33_LEDGER_END -->
+
 ### Open — remaining
 
 **Authenticated remote transport.** The RPC endpoint is loopback-only by
@@ -10867,14 +10843,14 @@ loosened bind. Until that lands there is no supported remote access.
 
 **Per-target layout table emission from source-walk.** It
 **blocks cross-target artifact encoding**: until it lands, a target is
-buildable only if its compilation identity (triple, features, toolchain)
+buildable only if its layout identity (triple, toolchain, algorithm)
 equals the schema's (§12) — the daemon refuses others rather than assuming
 layout equality — and the §18 non-host target example is illustrative.
 source-walk today emits
 one schema for one cargo target, with hardcoded 64-bit pointer and
 container layouts; the work is real and scoped, and it gates shipping to a
 second platform — not phase 1. The *representation* is settled (§5's
-`SchemaLayouts` per `CompilationIdentity`); what remains is the emission
+`SchemaLayouts` per `LayoutIdentity`); what remains is the emission
 work itself.
 
 ### Accepted risks (validate early)
@@ -10884,14 +10860,13 @@ work itself.
   registration on any divergence, naming the type. Spike early on
   generics and exotic enums in P1 all the same — the check converts
   silent corruption into loud refusal, not into correctness.
-- The module host's same-rustc/same-features invariant (carried by the
+- The module host's same-rustc host-interface invariant (carried by the
   shared module-host crate factored out of newgameplus's
   `module_state.rs`, consumed by engine and daemon alike; there is no
   off-the-shelf host).
-- `ngp-source-hash` must be strengthened (stable hash; cover manifests,
-  features, target triple) and source-walk must emit the
-  `CompilationIdentity` record (§5) before schema staleness detection and
-  the strict target gate are trustworthy.
+- `ngp-source-hash` remains a hot-reload freshness trigger, not an ABI or
+  safety gate; correctness comes from ModuleAbiIdentity plus the independently
+  derived compiled rows/DSCA comparison.
 
 ### Deferred by decision
 

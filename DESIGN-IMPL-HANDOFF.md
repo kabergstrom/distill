@@ -30,6 +30,20 @@ the §22 ledger, relaunch the next round.
 All schema code is shared in `ngp-schema` (in the newgameplus repo); the v2
 crates path-depend on it rather than forking schema types.
 
+**D. Accepted semantic-attestation simplification (2026-07-15):**
+The exact Rust layout dependency closure is deliberately removed. Do not add
+Cargo-metadata traversal for feature/cfg/source/manifest/lock closure identity.
+`LayoutIdentity` is only `(target_triple, rustc, algorithm_version)`; the
+pipeline module does not attest it. Candidate acceptance compares the complete
+source-walk-derived and independently module-generated `CompiledTypeRow` tables
+and their DSCA aggregates, while `ModuleAbiIdentity` alone gates the Rust host
+interface. `ngp-source-hash` remains a hot-reload freshness trigger. The DSCA
+check happens after staging/`dlopen` of an unpublished candidate but before
+Rust-ABI registration or publication. Because DSCA rows contain DSNL, there is
+no separate measured-layout module probe. This is recorded as DESIGN.md R33
+and supersedes older handoff/review language about completing a host
+`CompilationIdentity` closure.
+
 **Memory constraints (from `MEMORY.md`):**
 - Use `nix run nixpkgs#cargo -- <cmd>` for all v2 cargo commands (plain `cargo`
   is not on PATH).
