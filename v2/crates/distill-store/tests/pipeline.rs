@@ -1063,19 +1063,10 @@ fn reactivation_appends_a_genuinely_new_candidate_digest() {
 }
 
 #[test]
-fn forged_dsts_is_rejected_at_publish_and_again_at_schema_commit() {
+fn noncanonical_target_rows_are_rejected_and_exact_rows_fence_schema_commit() {
     {
         let (_d, mut store) = store();
         project_empty(&mut store);
-        let (mut forged, compiled_types) = raw_epoch(24, &[]);
-        forged.target_set.digest.0[0] ^= 1;
-        let err = ValidatedPipelineEpoch::validate(
-            forged,
-            &compiled_types,
-            consumer_bootstrap_authority_v1().unwrap(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, StoreError::InvalidTargetSet(_)));
         let (mut forged_rows, compiled_types) = raw_epoch(24, &[]);
         forged_rows.target_set.rows[0].name = "targe\u{301}t-24".into();
         let err = ValidatedPipelineEpoch::validate(
@@ -1111,7 +1102,7 @@ fn forged_dsts_is_rejected_at_publish_and_again_at_schema_commit() {
     let err = store2
         .input_transaction(|txn| txn.accept_schema_candidate(&candidate, &base, &proposed, T, h(2)))
         .unwrap_err();
-    assert!(matches!(err, StoreError::InvalidTargetSet(_)));
+    assert!(matches!(err, StoreError::StaleSchemaCandidate { .. }));
     assert_eq!(store2.input_version(), before);
     assert_eq!(store2.lineage_current(T).unwrap(), Some(h(1)));
 }

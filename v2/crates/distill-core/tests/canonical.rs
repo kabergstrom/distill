@@ -7,7 +7,7 @@
 
 use distill_core::canonical::{
     domain_digest, CanonicalEncoder, DSCA, DSCI, DSCP, DSCT, DSLF, DSLP, DSPP, DSRE, DSSI, DSSL,
-    DSTA, DSTG, DSTR, DSTS, DSVP,
+    DSTA, DSTG, DSTR, DSVP,
 };
 
 fn enc(f: impl FnOnce(&mut CanonicalEncoder)) -> Vec<u8> {
@@ -149,7 +149,7 @@ fn domain_digests_are_domain_and_version_separated() {
 #[test]
 fn all_domains_are_distinct() {
     let ds = [
-        DSCI, DSTG, DSTS, DSTA, DSSI, DSTR, DSSL, DSLP, DSCA, DSRE, DSLF, DSCP, DSVP, DSPP, DSCT,
+        DSCI, DSTG, DSTA, DSSI, DSTR, DSSL, DSLP, DSCA, DSRE, DSLF, DSCP, DSVP, DSPP, DSCT,
     ];
     for (i, a) in ds.iter().enumerate() {
         for b in &ds[i + 1..] {
@@ -164,6 +164,5 @@ fn all_domains_are_distinct() {
     assert_eq!(&DSRE, b"DSRE");
     assert_eq!(&DSLF, b"DSLF");
     assert_eq!(&DSCP, b"DSCP");
-    assert_eq!(&DSTS, b"DSTS");
     assert_eq!(&DSTA, b"DSTA");
 }

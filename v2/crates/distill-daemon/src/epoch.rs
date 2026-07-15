@@ -19,7 +19,6 @@ pub use distill_core::attestation::{
     CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
 };
 use distill_core::id::TypeUuid;
-pub use distill_core::target_set::TargetSetHash;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 pub use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1 as HostBootstrapAuthorityV1;
 use distill_schema::ngp_schema::CompilationIdentity;
@@ -848,7 +847,6 @@ struct EpochInner {
     staged: StagedModule,
     token: ModuleEpochToken,
     targets: Vec<TargetDefinition>,
-    target_set_hash: TargetSetHash,
     registration: RegistrationSet,
     tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     accepting: AtomicBool,
@@ -898,7 +896,6 @@ impl PipelineEpoch {
                     fingerprint: row.target_definition_hash,
                 })
                 .collect(),
-            target_set_hash: target_set.digest,
             registration,
             tools,
             accepting: AtomicBool::new(true),
@@ -937,10 +934,6 @@ impl PipelineEpoch {
 
     pub fn targets(&self) -> &[TargetDefinition] {
         &self.0.targets
-    }
-
-    pub fn target_set_hash(&self) -> TargetSetHash {
-        self.0.target_set_hash
     }
 
     pub fn registrations(&self) -> &RegistrationSet {
@@ -1997,9 +1990,18 @@ pub(crate) fn stored_pipeline_epoch(
             .collect(),
     )
     .map_err(StoreError::InvalidTargetSet)?;
-    if target_set.digest != prepared.target_set_hash() {
+    if target_set.rows
+        != prepared
+            .targets()
+            .iter()
+            .map(|target| TargetSetRow {
+                name: target.name.clone(),
+                target_definition_hash: target.fingerprint,
+            })
+            .collect::<Vec<_>>()
+    {
         return Err(StoreError::InvalidPipelineEpoch {
-            detail: "prepared module target set differs from its retained DSTS",
+            detail: "prepared module target rows are not canonical",
         });
     }
     let policy = requirements

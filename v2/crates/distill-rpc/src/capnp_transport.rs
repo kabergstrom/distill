@@ -3271,13 +3271,23 @@ pub fn decode_schema_acceptance_required(
                 )
                 .map_err(|error| capnp::Error::failed(error.message))?,
             ),
-            target_set_hash: distill_core::target_set::TargetSetHash(
-                decode_hash(
-                    candidate.get_target_set_hash()?,
-                    "schemaAcceptance.targetSetHash",
-                )
-                .map_err(|error| capnp::Error::failed(error.message))?,
-            ),
+            target_set: {
+                let rows = candidate.get_target_rows()?;
+                let mut decoded = Vec::with_capacity(rows.len() as usize);
+                for row in rows {
+                    decoded.push(distill_core::target_set::TargetSetRow {
+                        name: row.get_name()?.to_str()?.to_owned(),
+                        target_definition_hash: decode_hash(
+                            row.get_target_definition_hash()?,
+                            "schemaAcceptance.targetDefinitionHash",
+                        )
+                        .map_err(|error| capnp::Error::failed(error.message))?,
+                    });
+                }
+                distill_core::target_set::CanonicalTargetSet::from_canonical(decoded).map_err(
+                    |error| capnp::Error::failed(format!("invalid target rows: {error}")),
+                )?
+            },
         },
         mismatches,
     })
@@ -3579,7 +3589,14 @@ fn write_schema_acceptance_required(
     let mut candidate = output.reborrow().init_candidate();
     candidate.set_dylib_hash(&diagnostic.candidate.dylib_hash);
     candidate.set_compiled_types(&diagnostic.candidate.compiled_types.0);
-    candidate.set_target_set_hash(&diagnostic.candidate.target_set_hash.0);
+    let mut targets = candidate
+        .reborrow()
+        .init_target_rows(diagnostic.candidate.target_set.rows.len() as u32);
+    for (index, target) in diagnostic.candidate.target_set.rows.iter().enumerate() {
+        let mut row = targets.reborrow().get(index as u32);
+        row.set_name(&target.name);
+        row.set_target_definition_hash(&target.target_definition_hash);
+    }
     let mut mismatches = output.init_mismatches(diagnostic.mismatches.len() as u32);
     for (index, mismatch) in diagnostic.mismatches.iter().enumerate() {
         let mut row = mismatches.reborrow().get(index as u32);

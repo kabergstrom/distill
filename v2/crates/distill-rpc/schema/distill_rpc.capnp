@@ -688,7 +688,12 @@ struct SchemaManifestBasis {
 struct PipelineCandidateIdentity {
   dylibHash @0 :Data;
   compiledTypes @1 :Data;
-  targetSetHash @2 :Data;
+  targetRows @2 :List(PipelineTargetRow);
+}
+
+struct PipelineTargetRow {
+  name @0 :Text;
+  targetDefinitionHash @1 :Data;
 }
 
 struct SchemaRegistryMismatch {

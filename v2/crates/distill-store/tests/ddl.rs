@@ -278,7 +278,6 @@ fn pipeline_state_row_shape() {
             "dylib_hash",
             "load_policy_digest",
             "compiled_types",
-            "target_set_hash",
             "input_version",
             "poison_code",
             "poison_origin",
@@ -287,7 +286,6 @@ fn pipeline_state_row_shape() {
             "poison_message",
             "acceptance_candidate_dylib_hash",
             "acceptance_candidate_compiled_types",
-            "acceptance_candidate_target_set_hash",
             "acceptance_manifest_hash"
         ]
     );

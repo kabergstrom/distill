@@ -390,7 +390,7 @@ fn candidate_open_failure_publishes_poison_and_next_good_candidate_heals() {
 }
 
 #[test]
-fn candidate_target_set_is_normalized_sorted_hashed_and_retained() {
+fn candidate_target_set_is_normalized_sorted_and_retained() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 19);
@@ -437,7 +437,18 @@ fn candidate_target_set_is_normalized_sorted_hashed_and_retained() {
         .publish_candidate(&source, candidate, &mut loader)
         .unwrap();
 
-    assert_eq!(epoch.target_set_hash(), expected.digest);
+    assert_eq!(
+        epoch
+            .targets()
+            .iter()
+            .map(|target| (target.name.as_str(), target.fingerprint))
+            .collect::<Vec<_>>(),
+        expected
+            .rows
+            .iter()
+            .map(|target| (target.name.as_str(), target.target_definition_hash))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         epoch
             .targets()

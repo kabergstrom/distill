@@ -24,7 +24,7 @@ use std::sync::Arc;
 use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetHash};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetError};
 use ngp_schema::identity::CompilationIdentity;
 
 /// Advanced by watcher batches + authoring ops — module/schema artifact
@@ -115,8 +115,8 @@ pub struct PipelineEpoch {
     /// staged-candidate identity used by explicit schema commands.
     pub compiled_types: CompiledAttestationDigest,
     /// Complete canonical target-definition set used to construct the
-    /// candidate pipeline map. The store independently recomputes DSTS from
-    /// these rows before publishing and before every schema command.
+    /// candidate pipeline map. The store validates and compares these exact
+    /// canonical rows before publishing and before every schema command.
     pub target_set: CanonicalTargetSet,
     /// The candidate's complete compiled registry projection. `Ready`
     /// requires exact key/value equality with the authoritative lineage
@@ -130,27 +130,24 @@ pub struct PipelineEpoch {
 /// Store-side identity of a candidate whose compiled schema projection is
 /// awaiting explicit acceptance or rollback. The staged dylib binds the
 /// registration/code identity, DSCA binds the complete compiled type table,
-/// and the target-set hash prevents a candidate built for different targets
-/// from consuming the pending command.
+/// and the exact canonical target rows prevent a candidate built for different
+/// targets from consuming the pending command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineCandidateIdentity {
     pub dylib_hash: [u8; 32],
     pub compiled_types: CompiledAttestationDigest,
-    pub target_set_hash: TargetSetHash,
+    pub target_set: CanonicalTargetSet,
 }
 
 impl TryFrom<&PipelineEpoch> for PipelineCandidateIdentity {
     type Error = TargetSetError;
 
     fn try_from(epoch: &PipelineEpoch) -> Result<Self, Self::Error> {
-        let target_set = CanonicalTargetSet::from_canonical(
-            epoch.target_set.rows.clone(),
-            epoch.target_set.digest,
-        )?;
+        let target_set = CanonicalTargetSet::from_canonical(epoch.target_set.rows.clone())?;
         Ok(Self {
             dylib_hash: epoch.dylib_hash,
             compiled_types: epoch.compiled_types,
-            target_set_hash: target_set.digest,
+            target_set,
         })
     }
 }

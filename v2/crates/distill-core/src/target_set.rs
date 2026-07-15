@@ -1,10 +1,8 @@
-//! Canonical candidate target-set identity (§5, §13, §18).
+//! Canonical candidate target rows (§5, §13, §18).
 
 use std::fmt;
 
 use unicode_normalization::UnicodeNormalization;
-
-use crate::canonical::{domain_digest, DSTS};
 
 /// One target-definition identity included in a staged pipeline candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,27 +11,16 @@ pub struct TargetSetRow {
     pub target_definition_hash: [u8; 32],
 }
 
-/// The recomputed DSTS commitment to the candidate's complete target set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TargetSetHash(pub [u8; 32]);
-
-/// A canonical, NFC-normalized, name-sorted target set and its DSTS digest.
+/// A canonical, NFC-normalized, name-sorted target set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalTargetSet {
     pub rows: Vec<TargetSetRow>,
-    pub digest: TargetSetHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetSetError {
-    DuplicateTarget {
-        normalized_name: String,
-    },
+    DuplicateTarget { normalized_name: String },
     RowsNotCanonical,
-    DigestMismatch {
-        expected: TargetSetHash,
-        got: TargetSetHash,
-    },
     TooManyTargets,
 }
 
@@ -47,7 +34,7 @@ impl std::error::Error for TargetSetError {}
 
 impl CanonicalTargetSet {
     /// Normalize names to NFC, sort by normalized UTF-8 bytes, reject
-    /// duplicates, and recompute `blake3("DSTS" || 1 || rows)`.
+    /// duplicates, and retain the exact canonical rows.
     pub fn canonical(mut rows: Vec<TargetSetRow>) -> Result<Self, TargetSetError> {
         if rows.len() > u32::MAX as usize {
             return Err(TargetSetError::TooManyTargets);
@@ -64,37 +51,16 @@ impl CanonicalTargetSet {
                 normalized_name: pair[0].name.clone(),
             });
         }
-        let digest = compute_target_set_hash(&rows)?;
-        Ok(Self { rows, digest })
+        Ok(Self { rows })
     }
 
-    /// Verify a caller-provided canonical row table and digest without
-    /// accepting sorting or normalization as proof of canonicality.
-    pub fn from_canonical(
-        rows: Vec<TargetSetRow>,
-        digest: TargetSetHash,
-    ) -> Result<Self, TargetSetError> {
+    /// Verify caller-provided rows without accepting sorting or normalization
+    /// as proof of canonicality.
+    pub fn from_canonical(rows: Vec<TargetSetRow>) -> Result<Self, TargetSetError> {
         let canonical = Self::canonical(rows.clone())?;
         if canonical.rows != rows {
             return Err(TargetSetError::RowsNotCanonical);
         }
-        if canonical.digest != digest {
-            return Err(TargetSetError::DigestMismatch {
-                expected: canonical.digest,
-                got: digest,
-            });
-        }
-        Ok(Self { rows, digest })
+        Ok(Self { rows })
     }
-}
-
-pub fn compute_target_set_hash(rows: &[TargetSetRow]) -> Result<TargetSetHash, TargetSetError> {
-    let count = u32::try_from(rows.len()).map_err(|_| TargetSetError::TooManyTargets)?;
-    Ok(TargetSetHash(domain_digest(DSTS, 1, |encoder| {
-        encoder.u32(count);
-        for row in rows {
-            encoder.str(&row.name);
-            encoder.raw(&row.target_definition_hash);
-        }
-    })))
 }

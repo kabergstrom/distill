@@ -14,7 +14,7 @@ use distill_core::attestation::{
 };
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 pub use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
-use distill_core::target_set::{CanonicalTargetSet, TargetSetHash, TargetSetRow};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_core::tool::{
     ToolCwdPolicy, ToolExecutionIdentityV2, ToolPackageFile, ToolSourceIdentityV2,
 };
@@ -725,19 +725,17 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, load_policy_digest, compiled_types,
-                 target_set_hash, input_version,
+                 input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
                  acceptance_candidate_compiled_types,
-                 acceptance_candidate_target_set_hash,
                  acceptance_manifest_hash
-             ) VALUES (0, ?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL,
-                       NULL, NULL, NULL, NULL)
+             ) VALUES (0, ?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                dylib_hash = excluded.dylib_hash,
                load_policy_digest = excluded.load_policy_digest,
                compiled_types = excluded.compiled_types,
-               target_set_hash = excluded.target_set_hash,
                input_version = excluded.input_version,
                poison_code = NULL,
                poison_origin = NULL,
@@ -746,13 +744,11 @@ impl InputTxn<'_> {
                poison_message = NULL,
                acceptance_candidate_dylib_hash = NULL,
                acceptance_candidate_compiled_types = NULL,
-               acceptance_candidate_target_set_hash = NULL,
                acceptance_manifest_hash = NULL",
             rusqlite::params![
                 epoch.dylib_hash.as_slice(),
                 epoch.load_policy_digest.as_slice(),
                 epoch.compiled_types.0.as_slice(),
-                epoch.target_set.digest.0.as_slice(),
                 self.version().0 as i64,
             ],
         )?;
@@ -789,14 +785,13 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, load_policy_digest, compiled_types,
-                 target_set_hash, input_version,
+                 input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
                  acceptance_candidate_compiled_types,
-                 acceptance_candidate_target_set_hash,
                  acceptance_manifest_hash
-             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, NULL,
-                       ?2, ?3, ?4, ?5)
+             ) VALUES (0, NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, NULL,
+                       ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                input_version = excluded.input_version,
                poison_code = NULL,
@@ -807,14 +802,11 @@ impl InputTxn<'_> {
                acceptance_candidate_dylib_hash = excluded.acceptance_candidate_dylib_hash,
                acceptance_candidate_compiled_types =
                    excluded.acceptance_candidate_compiled_types,
-               acceptance_candidate_target_set_hash =
-                   excluded.acceptance_candidate_target_set_hash,
                acceptance_manifest_hash = excluded.acceptance_manifest_hash",
             rusqlite::params![
                 self.version().0 as i64,
                 epoch.dylib_hash.as_slice(),
                 epoch.compiled_types.0.as_slice(),
-                epoch.target_set.digest.0.as_slice(),
                 manifest.manifest_hash.0.as_slice(),
             ],
         )?;
@@ -847,14 +839,13 @@ impl InputTxn<'_> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, load_policy_digest, compiled_types,
-                 target_set_hash, input_version,
+                 input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
                  acceptance_candidate_compiled_types,
-                 acceptance_candidate_target_set_hash,
                  acceptance_manifest_hash
-             ) VALUES (0, NULL, NULL, NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6,
-                       NULL, NULL, NULL, NULL)
+             ) VALUES (0, NULL, NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6,
+                       NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                input_version = excluded.input_version,
                poison_code = excluded.poison_code,
@@ -864,7 +855,6 @@ impl InputTxn<'_> {
                poison_message = excluded.poison_message,
                acceptance_candidate_dylib_hash = NULL,
                acceptance_candidate_compiled_types = NULL,
-               acceptance_candidate_target_set_hash = NULL,
                acceptance_manifest_hash = NULL",
             rusqlite::params![
                 self.version().0 as i64,
@@ -1405,8 +1395,7 @@ impl InputTxn<'_> {
             .ok_or(StoreError::LineageMutationRequiresCandidate)?;
         if actual_candidate != expected_candidate
             || load_schema_registry(&self.txn, true)? != candidate.schema_registry
-            || load_target_set(&self.txn, true, expected_candidate.target_set_hash)?
-                != candidate.target_set
+            || load_target_set(&self.txn, true)? != candidate.target_set
         {
             return Err(StoreError::StaleSchemaCandidate {
                 expected: Box::new(expected_candidate),
@@ -1751,7 +1740,7 @@ fn load_schema_registry(
 }
 
 fn validate_target_set(target_set: &CanonicalTargetSet) -> Result<(), StoreError> {
-    CanonicalTargetSet::from_canonical(target_set.rows.clone(), target_set.digest)
+    CanonicalTargetSet::from_canonical(target_set.rows.clone())
         .map(|_| ())
         .map_err(StoreError::InvalidTargetSet)
 }
@@ -1786,7 +1775,6 @@ fn replace_target_set(
 fn load_target_set(
     conn: &rusqlite::Connection,
     candidate: bool,
-    digest: TargetSetHash,
 ) -> Result<CanonicalTargetSet, StoreError> {
     let table = if candidate {
         "pipeline_candidate_target_set"
@@ -1807,42 +1795,35 @@ fn load_target_set(
             target_definition_hash: exact_blob32(target_definition_hash, "target-definition hash")?,
         });
     }
-    CanonicalTargetSet::from_canonical(target_rows, digest).map_err(StoreError::InvalidTargetSet)
+    CanonicalTargetSet::from_canonical(target_rows).map_err(StoreError::InvalidTargetSet)
 }
 
 fn pending_candidate_identity(
     conn: &rusqlite::Connection,
 ) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
-    type CandidateRow = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+    type CandidateRow = (Option<Vec<u8>>, Option<Vec<u8>>);
     let row: Option<CandidateRow> = conn
         .query_row(
             "SELECT acceptance_candidate_dylib_hash,
-                    acceptance_candidate_compiled_types,
-                    acceptance_candidate_target_set_hash
+                    acceptance_candidate_compiled_types
              FROM pipeline_state WHERE id = 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some((dylib, compiled_types, target_set_hash)) = row else {
+    let Some((dylib, compiled_types)) = row else {
         return Ok(None);
     };
-    match (dylib, compiled_types, target_set_hash) {
-        (None, None, None) => Ok(None),
-        (Some(dylib), Some(compiled_types), Some(target_set_hash)) => {
-            Ok(Some(PipelineCandidateIdentity {
-                dylib_hash: exact_blob32(dylib, "candidate dylib hash")?,
-                compiled_types: CompiledAttestationDigest(exact_blob32(
-                    compiled_types,
-                    "candidate compiled-type attestation",
-                )?),
-                target_set_hash: {
-                    let digest =
-                        TargetSetHash(exact_blob32(target_set_hash, "candidate target-set hash")?);
-                    load_target_set(conn, true, digest)?.digest
-                },
-            }))
-        }
+    match (dylib, compiled_types) {
+        (None, None) => Ok(None),
+        (Some(dylib), Some(compiled_types)) => Ok(Some(PipelineCandidateIdentity {
+            dylib_hash: exact_blob32(dylib, "candidate dylib hash")?,
+            compiled_types: CompiledAttestationDigest(exact_blob32(
+                compiled_types,
+                "candidate compiled-type attestation",
+            )?),
+            target_set: load_target_set(conn, true)?,
+        })),
         _ => Err(invalid_manifest(
             None,
             "pipeline candidate identity columns are incomplete",
@@ -2204,7 +2185,6 @@ impl Store {
             Option<Vec<u8>>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
-            Option<Vec<u8>>,
             Option<i64>,
             Option<i64>,
             Option<i64>,
@@ -2213,17 +2193,15 @@ impl Store {
             Option<Vec<u8>>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
-            Option<Vec<u8>>,
         );
         let row: Option<StateRow> = self
             .conn
             .query_row(
                 "SELECT dylib_hash, load_policy_digest, compiled_types,
-                        target_set_hash, poison_code, poison_origin, poison_cleanup,
+                        poison_code, poison_origin, poison_cleanup,
                         poison_identity, poison_message,
                         acceptance_candidate_dylib_hash,
                         acceptance_candidate_compiled_types,
-                        acceptance_candidate_target_set_hash,
                         acceptance_manifest_hash
                  FROM pipeline_state WHERE id = 0",
                 [],
@@ -2240,8 +2218,6 @@ impl Store {
                         r.get(8)?,
                         r.get(9)?,
                         r.get(10)?,
-                        r.get(11)?,
-                        r.get(12)?,
                     ))
                 },
             )
@@ -2250,7 +2226,6 @@ impl Store {
             dylib,
             lpd,
             compiled_types,
-            target_set_hash,
             poison_code,
             poison_origin,
             poison_cleanup,
@@ -2258,15 +2233,14 @@ impl Store {
             poison_message,
             candidate_dylib,
             candidate_compiled_types,
-            candidate_target_set,
             stored_manifest_hash,
         )) = row
         else {
             return Ok(None);
         };
 
-        let epoch = match (dylib, lpd, compiled_types, target_set_hash) {
-            (Some(dylib), Some(lpd), Some(compiled_types), Some(target_set_hash)) => {
+        let epoch = match (dylib, lpd, compiled_types) {
+            (Some(dylib), Some(lpd), Some(compiled_types)) => {
                 let mut stmt = self
                     .conn
                     .prepare("SELECT kind, reg_id, version FROM registrations")?;
@@ -2290,18 +2264,12 @@ impl Store {
                         compiled_types,
                         "published compiled-type attestation",
                     )?),
-                    target_set: {
-                        let digest = TargetSetHash(exact_blob32(
-                            target_set_hash,
-                            "published target-set hash",
-                        )?);
-                        load_target_set(&self.conn, false, digest)?
-                    },
+                    target_set: load_target_set(&self.conn, false)?,
                     schema_registry: load_schema_registry(&self.conn, false)?,
                     registrations,
                 }))
             }
-            (None, None, None, None) => None,
+            (None, None, None) => None,
             _ => {
                 return Err(invalid_manifest(
                     None,
@@ -2312,7 +2280,6 @@ impl Store {
 
         let has_candidate = candidate_dylib.is_some()
             || candidate_compiled_types.is_some()
-            || candidate_target_set.is_some()
             || stored_manifest_hash.is_some();
         let poison = match (
             poison_code,

@@ -128,7 +128,7 @@ pub enum StoreError {
         detail: String,
     },
     /// Target-set rows/digest were forged or non-canonical. The store
-    /// recomputes DSTS at every publication and schema command.
+    /// validates exact canonical rows at every publication and schema command.
     InvalidTargetSet(distill_core::target_set::TargetSetError),
     /// A proposed ToolEpoch identity was incomplete or noncanonical.
     InvalidToolIdentity(distill_core::tool::ToolIdentityError),
@@ -370,7 +370,7 @@ impl fmt::Display for StoreError {
                 write!(f, "schema authority transition for {type_uuid} is invalid: {detail}")
             }
             StoreError::InvalidTargetSet(error) => {
-                write!(f, "candidate target set fails DSTS verification: {error}")
+                write!(f, "candidate target rows are invalid: {error}")
             }
             StoreError::InvalidToolIdentity(error) => {
                 write!(f, "tool execution identity is invalid: {error}")

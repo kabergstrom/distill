@@ -1688,7 +1688,8 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
                 candidate: PipelineCandidateIdentity {
                     dylib_hash: [42; 32],
                     compiled_types: CompiledAttestationDigest([43; 32]),
-                    target_set_hash: distill_core::target_set::TargetSetHash([44; 32]),
+                    target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![])
+                        .unwrap(),
                 },
                 mismatches: vec![SchemaRegistryMismatch {
                     type_uuid: TypeUuid([1; 16]),
@@ -2451,7 +2452,7 @@ fn typed_pipeline_diagnostic_codecs_reject_empty_and_noncanonical_tables() {
         let mut candidate = root.reborrow().init_candidate();
         candidate.set_dylib_hash(&[4; 32]);
         candidate.set_compiled_types(&[5; 32]);
-        candidate.set_target_set_hash(&[6; 32]);
+        candidate.init_target_rows(0);
         let mut mismatch = root.init_mismatches(1).get(0);
         mismatch.reborrow().init_type_uuid().set_bytes(&[7; 16]);
         mismatch.set_candidate(&[8; 32]);

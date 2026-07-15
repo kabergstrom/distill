@@ -1,4 +1,3 @@
-use distill_core::canonical::DSTS;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetError, TargetSetRow};
 
 fn row(name: &str, byte: u8) -> TargetSetRow {
@@ -9,22 +8,10 @@ fn row(name: &str, byte: u8) -> TargetSetRow {
 }
 
 #[test]
-fn target_set_is_nfc_normalized_name_sorted_and_domain_separated() {
+fn target_set_is_nfc_normalized_and_name_sorted() {
     let set = CanonicalTargetSet::canonical(vec![row("b", 2), row("e\u{301}", 1)]).unwrap();
     assert_eq!(set.rows[0].name, "b");
     assert_eq!(set.rows[1].name, "é");
-
-    let mut expected = blake3::Hasher::new();
-    expected.update(&DSTS);
-    expected.update(&[1]);
-    expected.update(&2_u32.to_le_bytes());
-    expected.update(&1_u32.to_le_bytes());
-    expected.update(b"b");
-    expected.update(&[2; 32]);
-    expected.update(&2_u32.to_le_bytes());
-    expected.update("é".as_bytes());
-    expected.update(&[1; 32]);
-    assert_eq!(set.digest.0, *expected.finalize().as_bytes());
 }
 
 #[test]

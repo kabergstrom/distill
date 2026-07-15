@@ -993,7 +993,8 @@ fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_versio
                     candidate: PipelineCandidateIdentity {
                         dylib_hash: [42; 32],
                         compiled_types: CompiledAttestationDigest([43; 32]),
-                        target_set_hash: distill_core::target_set::TargetSetHash([44; 32]),
+                        target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![])
+                            .unwrap(),
                     },
                     mismatches: vec![SchemaRegistryMismatch {
                         type_uuid: type_id(1),
@@ -2321,7 +2322,7 @@ fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
         candidate: PipelineCandidateIdentity {
             dylib_hash: [42; 32],
             compiled_types: CompiledAttestationDigest([43; 32]),
-            target_set_hash: distill_core::target_set::TargetSetHash([44; 32]),
+            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
         },
         mismatches: vec![SchemaRegistryMismatch {
             type_uuid: type_id(1),
@@ -2475,7 +2476,7 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
         candidate: PipelineCandidateIdentity {
             dylib_hash: [4; 32],
             compiled_types: CompiledAttestationDigest([5; 32]),
-            target_set_hash: distill_core::target_set::TargetSetHash([6; 32]),
+            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
         },
         mismatches: vec![],
     });
