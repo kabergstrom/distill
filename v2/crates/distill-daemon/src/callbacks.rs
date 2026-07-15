@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use distill_asset::CallbackPanic;
 use distill_build::codegen::{CodegenFailure, GeneratedFile};
+use distill_build::dslf::OutputBindingFailureV1;
 use distill_build::outputs::OutputDecls;
 use distill_build::pipeline::{Target, TargetSelector};
 use distill_build::query::{AssetQuery, IntakeError};
@@ -181,10 +182,22 @@ impl Diagnostics {
 /// Neutral processor result. Generated typed adapters lower their values to
 /// `AuthoredValue`; the daemon validates the closed declaration and performs
 /// the canonical wire encoding before publication.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessorProduct {
+    pub type_uuid: TypeUuid,
+    pub value: AuthoredValue,
+}
+
+impl ProcessorProduct {
+    pub fn new(type_uuid: TypeUuid, value: AuthoredValue) -> Self {
+        Self { type_uuid, value }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProcessorProducts {
-    pub primary: Option<AuthoredValue>,
-    pub extras: BTreeMap<String, AuthoredValue>,
+    pub primary: Option<ProcessorProduct>,
+    pub extras: BTreeMap<String, ProcessorProduct>,
     pub debug: BTreeMap<String, Vec<u8>>,
 }
 
@@ -404,6 +417,7 @@ pub enum CallbackInvokeError<E> {
     Missing,
     Unavailable(String),
     HostRejected(String),
+    OutputBinding(OutputBindingFailureV1),
     Panicked,
     Rejected(E),
 }
@@ -414,6 +428,9 @@ impl<E: std::fmt::Display> std::fmt::Display for CallbackInvokeError<E> {
             Self::Missing => formatter.write_str("callback is not registered"),
             Self::Unavailable(detail) => formatter.write_str(detail),
             Self::HostRejected(detail) => formatter.write_str(detail),
+            Self::OutputBinding(failure) => {
+                write!(formatter, "invalid processor output binding: {failure:?}")
+            }
             Self::Panicked => formatter.write_str("callback panicked"),
             Self::Rejected(error) => write!(formatter, "callback rejected: {error}"),
         }
@@ -529,6 +546,11 @@ impl AuthoringImporter for EpochAuthoringImporter {
             }
             Err(CallbackInvokeError::HostRejected(detail)) => {
                 Err(AuthoringImporterError::PipelineUnavailable(detail))
+            }
+            Err(CallbackInvokeError::OutputBinding(failure)) => {
+                Err(AuthoringImporterError::PipelineUnavailable(format!(
+                    "unexpected importer output-binding failure: {failure:?}"
+                )))
             }
             Err(CallbackInvokeError::Panicked) => Err(AuthoringImporterError::PipelineUnavailable(
                 "the importer callback panicked and poisoned its pipeline epoch".to_owned(),

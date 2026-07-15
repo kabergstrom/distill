@@ -1051,29 +1051,74 @@ impl PipelineEpoch {
         };
         match unsafe { call(pointer, input, context) } {
             Ok(Ok(output)) => {
-                let missing_primary = output.primary.is_none();
                 let actual_extras = output.extras.keys().cloned().collect::<BTreeSet<_>>();
-                let expected_extras = descriptor
+                let Some(primary) = &output.primary else {
+                    return Err(CallbackInvokeError::OutputBinding(
+                        distill_build::dslf::OutputBindingFailureV1::MissingPrimary,
+                    ));
+                };
+                if primary.type_uuid != descriptor.outputs.primary {
+                    return Err(CallbackInvokeError::OutputBinding(
+                        distill_build::dslf::OutputBindingFailureV1::TypeMismatch {
+                            slot: distill_build::dslf::OutputBindingSlotV1::Primary,
+                            expected_type: descriptor.outputs.primary,
+                            observed_type: primary.type_uuid,
+                        },
+                    ));
+                }
+                if let Some((output_key, expected_type)) = descriptor
                     .outputs
                     .extras
-                    .keys()
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                let invalid_debug =
-                    output.debug.keys().any(
+                    .iter()
+                    .find(|(key, _)| !actual_extras.contains(*key))
+                {
+                    return Err(CallbackInvokeError::OutputBinding(
+                        distill_build::dslf::OutputBindingFailureV1::MissingExtra {
+                            output_key: output_key.clone(),
+                            expected_type: *expected_type,
+                        },
+                    ));
+                }
+                if let Some((output_key, product)) = output
+                    .extras
+                    .iter()
+                    .find(|(key, _)| !descriptor.outputs.extras.contains_key(*key))
+                {
+                    return Err(CallbackInvokeError::OutputBinding(
+                        distill_build::dslf::OutputBindingFailureV1::UndeclaredExtra {
+                            output_key: output_key.clone(),
+                            observed_type: product.type_uuid,
+                        },
+                    ));
+                }
+                if let Some((output_key, product)) = output.extras.iter().find(|(key, product)| {
+                    descriptor.outputs.extras.get(*key) != Some(&product.type_uuid)
+                }) {
+                    return Err(CallbackInvokeError::OutputBinding(
+                        distill_build::dslf::OutputBindingFailureV1::TypeMismatch {
+                            slot: distill_build::dslf::OutputBindingSlotV1::Extra {
+                                output_key: output_key.clone(),
+                            },
+                            expected_type: descriptor.outputs.extras[output_key],
+                            observed_type: product.type_uuid,
+                        },
+                    ));
+                }
+                if let Some(debug_key) =
+                    output.debug.keys().find(
                         |key| match distill_build::query::normalize_identifier(key) {
-                            Ok(normalized) => normalized != *key,
+                            Ok(normalized) => normalized.as_str() != key.as_str(),
                             Err(_) => true,
                         },
-                    );
-                if missing_primary || actual_extras != expected_extras || invalid_debug {
-                    Err(CallbackInvokeError::HostRejected(format!(
-                        "processor {:?} did not bind its closed primary/extras/debug declaration",
-                        descriptor.id
-                    )))
-                } else {
-                    Ok(output)
+                    )
+                {
+                    return Err(CallbackInvokeError::OutputBinding(
+                        distill_build::dslf::OutputBindingFailureV1::InvalidOutputKey {
+                            output_key: debug_key.clone(),
+                        },
+                    ));
                 }
+                Ok(output)
             }
             Ok(Err(error)) if error.code == 0 => Err(CallbackInvokeError::HostRejected(
                 "processor failure code zero is reserved".to_owned(),
@@ -1551,6 +1596,17 @@ impl ModuleHost {
             ));
         }
 
+        if let Err(error) =
+            validate_registered_schema_types(&registration_arena, &requirements.schema_registry)
+        {
+            let cleanup = discard_candidate(module, registration_arena);
+            return Err(candidate_poison_with_cleanup(
+                PipelinePoisonCode::CandidateRegistration,
+                error,
+                cleanup,
+            ));
+        }
+
         let tools = match resolve_tool_epoch(registration_arena.tool_descriptors()) {
             Ok(tools) => tools,
             Err(error) => {
@@ -1732,6 +1788,63 @@ impl ModuleHost {
             self.retired.push(epoch);
         }
     }
+}
+
+fn validate_registered_schema_types(
+    arena: &CandidateRegistrationArena,
+    registry: &BTreeMap<TypeUuid, distill_core::id::LogicalHash>,
+) -> Result<(), String> {
+    let mut bound = Vec::<(String, TypeUuid)>::new();
+    let mut cursor = arena.head;
+    while let Some(node) = cursor {
+        // SAFETY: linked candidate nodes remain owned by `arena` until this
+        // validation completes or candidate cleanup begins.
+        let node = unsafe { node.as_ref() };
+        match &node.callback {
+            CallbackHandle::Importer { descriptor, .. } => bound.push((
+                format!("importer {:?} settings", descriptor.id),
+                descriptor.settings_type_uuid,
+            )),
+            CallbackHandle::Processor { descriptor, .. } => {
+                bound.push((
+                    format!("processor {:?} input", descriptor.id),
+                    descriptor.input,
+                ));
+                bound.push((
+                    format!("processor {:?} primary output", descriptor.id),
+                    descriptor.outputs.primary,
+                ));
+                bound.extend(descriptor.outputs.extras.iter().map(|(key, type_uuid)| {
+                    (
+                        format!("processor {:?} extra output {key:?}", descriptor.id),
+                        *type_uuid,
+                    )
+                }));
+            }
+            CallbackHandle::Validator { descriptor, .. } => bound.push((
+                format!("validator {:?} asset", descriptor.id),
+                descriptor.asset_type,
+            )),
+            CallbackHandle::Defaults { descriptor, .. } => {
+                bound.push(("default materializer".to_owned(), descriptor.type_uuid))
+            }
+            CallbackHandle::None
+            | CallbackHandle::Codegen { .. }
+            | CallbackHandle::Migration { .. }
+            | CallbackHandle::Tool(_) => {}
+        }
+        cursor = node.next;
+    }
+    bound.sort_unstable();
+    if let Some((surface, type_uuid)) = bound
+        .into_iter()
+        .find(|(_, type_uuid)| !registry.contains_key(type_uuid))
+    {
+        return Err(format!(
+            "{surface} binds schema-unknown type UUID {type_uuid}"
+        ));
+    }
+    Ok(())
 }
 
 fn candidate_poison_with_cleanup(
@@ -2372,7 +2485,7 @@ mod callback_tests {
         CodegenAsset, CodegenContextError, CodegenDescriptor, DiagnosticSeverity,
         MigrationFunctionError, PipelineCodegen, PipelineCodegenContext, PipelineDefaults,
         PipelineImporter, PipelineProcessContext, PipelineProcessor, PipelineValidator,
-        ProcessorProducts, ToolRegistration, ToolSource,
+        ProcessorProduct, ProcessorProducts, ToolRegistration, ToolSource,
     };
     use crate::importer::{AuthoringImportContext, AuthoringImporterError};
     use distill_build::codegen::{CodegenFailure, GeneratedFile};
@@ -2463,9 +2576,21 @@ mod callback_tests {
             _context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, crate::callbacks::ProcessorError> {
             Ok(ProcessorProducts {
-                primary: Some(input),
+                primary: Some(ProcessorProduct::new(TypeUuid([3; 16]), input)),
                 ..ProcessorProducts::default()
             })
+        }
+    }
+
+    struct MissingPrimary;
+
+    impl PipelineProcessor for MissingPrimary {
+        fn process(
+            &self,
+            _input: distill_json::AuthoredValue,
+            _context: &mut dyn PipelineProcessContext,
+        ) -> Result<ProcessorProducts, crate::callbacks::ProcessorError> {
+            Ok(ProcessorProducts::default())
         }
     }
 
@@ -2480,6 +2605,33 @@ mod callback_tests {
         ) -> Result<ToolOutput, ToolRunError> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn processor_output_shape_failures_remain_typed_at_the_epoch_boundary() {
+        let epoch = processor_test_epoch(
+            "desktop",
+            [1; 32],
+            ProcessorDescriptor {
+                id: "broken".into(),
+                version: 1,
+                input: TypeUuid([2; 16]),
+                selector: TargetSelector::new(None, None).unwrap(),
+                outputs: OutputDecls::new(TypeUuid([3; 16]), vec![]).unwrap(),
+            },
+            MissingPrimary,
+        );
+
+        assert!(matches!(
+            epoch.invoke_processor(
+                "broken",
+                distill_json::AuthoredValue::UInt(1),
+                &mut ProcessContext,
+            ),
+            Err(CallbackInvokeError::OutputBinding(
+                distill_build::dslf::OutputBindingFailureV1::MissingPrimary
+            ))
+        ));
     }
 
     struct Validator;
@@ -2633,6 +2785,23 @@ mod callback_tests {
             .into_result()
             .unwrap();
 
+        let complete_registry = BTreeMap::from([
+            (TypeUuid([1; 16]), distill_core::id::LogicalHash([1; 32])),
+            (TypeUuid([2; 16]), distill_core::id::LogicalHash([2; 32])),
+            (TypeUuid([3; 16]), distill_core::id::LogicalHash([3; 32])),
+        ]);
+        validate_registered_schema_types(&arena, &complete_registry).unwrap();
+        let error = validate_registered_schema_types(
+            &arena,
+            &BTreeMap::from([
+                (TypeUuid([1; 16]), distill_core::id::LogicalHash([1; 32])),
+                (TypeUuid([2; 16]), distill_core::id::LogicalHash([2; 32])),
+            ]),
+        )
+        .unwrap_err();
+        assert!(error.contains("primary output"));
+        assert!(error.contains(&TypeUuid([3; 16]).to_string()));
+
         let registration = arena.registration_set(BTreeSet::from(["desktop".into()]));
         let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
             name: "desktop".into(),
@@ -2674,8 +2843,8 @@ mod callback_tests {
             )
             .unwrap();
         assert_eq!(
-            processed.primary,
-            Some(distill_json::AuthoredValue::UInt(12))
+            processed.primary.map(|product| product.value),
+            Some(distill_json::AuthoredValue::UInt(12)),
         );
         let diagnostics = epoch
             .invoke_validators(TypeUuid([2; 16]), &distill_json::AuthoredValue::Null)

@@ -3,8 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
-use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec, EncodedArtifact};
-use distill_build::dslf::{DslfV1, LocalFailureClass, MigrationPlanFailureV1};
+use distill_build::artifact_encode::{
+    encode_artifact_value, ArtifactEncodeError, ArtifactValueSpec, EncodedArtifact,
+};
+use distill_build::dslf::{
+    ArtifactEncodingFailureV1, DslfV1, LocalFailureClass, MigrationPlanFailureV1,
+    OutputBindingFailureV1, OutputBindingSlotV1,
+};
 use distill_build::keys::{
     build_import_digest, static_inputs_canonical_bytes, static_inputs_digest, AppliedMigration,
     AutomaticMigration, BuildImportInputs, OutputHash, StaticInputs,
@@ -51,7 +56,8 @@ use distill_store::cas::record::{
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::RegisteredTool;
 use distill_store::{Store, StoreError};
-use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
+use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERSION};
+use distill_wire::encode::EncodeError;
 
 use crate::callbacks::{
     CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
@@ -216,7 +222,7 @@ impl BuildBackend for CoordinatorBuildBackend {
                 Err(RpcFailure::BuildDepthExceeded { limit, chain })
             }
             Err(BuildError::Failed(error)) => Ok(BuildBackendOutcome::Failed { error }),
-            Err(BuildError::Migration { message, .. }) => {
+            Err(BuildError::Deterministic { message, .. }) => {
                 Ok(BuildBackendOutcome::Failed { error: message })
             }
             Err(BuildError::Infrastructure(error)) => {
@@ -314,7 +320,7 @@ enum BuildError {
     Drifted(DriftedInput),
     DepthExceeded { limit: usize, chain: Vec<AssetUuid> },
     Failed(String),
-    Migration { message: String, facts: Box<DslfV1> },
+    Deterministic { message: String, facts: Box<DslfV1> },
     Infrastructure(String),
 }
 
@@ -327,11 +333,15 @@ impl BuildError {
         Self::Infrastructure(format!("{error:?}"))
     }
 
-    fn migration(message: impl Into<String>, facts: DslfV1) -> Self {
-        Self::Migration {
+    fn deterministic(message: impl Into<String>, facts: DslfV1) -> Self {
+        Self::Deterministic {
             message: message.into(),
             facts: Box::new(facts),
         }
+    }
+
+    fn migration(message: impl Into<String>, facts: DslfV1) -> Self {
+        Self::deterministic(message, facts)
     }
 }
 
@@ -1783,15 +1793,15 @@ fn execute_processor_stage_flight(
         let products = match outcome {
             Ok(products) => products,
             Err(CallbackInvokeError::Rejected(error)) => {
+                let facts = DslfV1::Processor {
+                    asset: loaded.entry.uuid,
+                    processor_id: stage.registration.id.clone(),
+                    processor_version: stage.registration.version,
+                    stage: stage.index,
+                    build_error_code: error.code,
+                };
                 if cacheable {
-                    commit_processor_failure(
-                        context,
-                        loaded,
-                        stage,
-                        static_inputs,
-                        &trace,
-                        error.code,
-                    )?;
+                    commit_processor_failure(context, loaded, static_inputs, &trace, Some(&facts))?;
                 }
                 return Ok(SharedStageOutcome::Rejected {
                     basis: context.basis,
@@ -1801,6 +1811,23 @@ fn execute_processor_stage_flight(
                     message: error.message,
                     trace,
                 });
+            }
+            Err(CallbackInvokeError::OutputBinding(failure)) => {
+                let facts = DslfV1::OutputBinding {
+                    asset: loaded.entry.uuid,
+                    processor_id: stage.registration.id.clone(),
+                    processor_version: stage.registration.version,
+                    stage: stage.index,
+                    failure,
+                };
+                if cacheable {
+                    commit_processor_failure(context, loaded, static_inputs, &trace, Some(&facts))?;
+                }
+                return Ok(shared_stage_failure(
+                    context.basis,
+                    BuildError::deterministic("processor output binding failed", facts),
+                    trace,
+                ));
             }
             Err(error) => return Err(BuildError::failed(error)),
         };
@@ -1817,7 +1844,16 @@ fn execute_processor_stage_flight(
         let encoded =
             match encode_processor_products(context, loaded, chain, stage, &products, &mut trace) {
                 Ok(encoded) => encoded,
-                Err(error) => return Ok(shared_stage_failure(context.basis, error, trace)),
+                Err(error) => {
+                    let facts = match &error {
+                        BuildError::Deterministic { facts, .. } => Some(facts.as_ref()),
+                        _ => None,
+                    };
+                    if cacheable && (trace.last().is_some_and(TraceOp::failed) || facts.is_some()) {
+                        commit_processor_failure(context, loaded, static_inputs, &trace, facts)?;
+                    }
+                    return Ok(shared_stage_failure(context.basis, error, trace));
+                }
             };
         if cacheable {
             if let Some((cached_outputs, cached_debug)) = cached {
@@ -1859,7 +1895,7 @@ fn shared_stage_failure(
     trace: Vec<TraceOp>,
 ) -> SharedStageOutcome {
     match error {
-        error @ (BuildError::Failed(_) | BuildError::Migration { .. }) => {
+        error @ (BuildError::Failed(_) | BuildError::Deterministic { .. }) => {
             SharedStageOutcome::Failed {
                 basis,
                 error,
@@ -1877,7 +1913,13 @@ fn joined_stage_outcome_matches(
     let Some(trace) = outcome.trace() else {
         return Ok(outcome.basis() == context.basis);
     };
-    preload_trace_reads(context, trace)?;
+    if let Err(error) = preload_trace_reads(context, trace) {
+        return if cache_candidate_miss(&error) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
     let source = capture_trace_source(context)?;
     Ok(revalidate(trace, &source))
 }
@@ -1898,9 +1940,12 @@ fn apply_shared_stage_outcome(
                     &products.debug,
                 )?;
             }
-            let next = products.primary.ok_or_else(|| {
-                BuildError::Infrastructure("shared processor result omitted its primary".into())
-            })?;
+            let next = products
+                .primary
+                .map(|product| product.value)
+                .ok_or_else(|| {
+                    BuildError::Infrastructure("shared processor result omitted its primary".into())
+                })?;
             Ok((next, encoded))
         }
         SharedStageOutcome::Rejected {
@@ -2087,10 +2132,29 @@ fn preload_persisted_reads(
         persisted_candidate_traces(&mut store, key_kind, static_key, asset)
             .map_err(BuildError::infrastructure)?
     };
+    // Candidates are newest-first. Materialize only until one complete trace
+    // revalidates; a stale candidate's now-unavailable successful read is a
+    // cache miss, never authority to fail the current build.
     for trace in &traces {
-        preload_trace_reads(context, trace)?;
+        match preload_trace_reads(context, trace) {
+            Ok(()) => {
+                let source = capture_trace_source(context)?;
+                if revalidate(trace, &source) {
+                    break;
+                }
+            }
+            Err(error) if cache_candidate_miss(&error) => continue,
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
+}
+
+fn cache_candidate_miss(error: &BuildError) -> bool {
+    matches!(
+        error,
+        BuildError::DepthExceeded { .. } | BuildError::Failed(_) | BuildError::Deterministic { .. }
+    )
 }
 
 fn preload_trace_reads(context: &mut BuildContext, trace: &[TraceOp]) -> Result<(), BuildError> {
@@ -2155,13 +2219,14 @@ fn encode_processor_products(
         products
             .primary
             .as_ref()
+            .map(|product| &product.value)
             .expect("epoch validates processor primary"),
     ));
     values.extend(
         products
             .extras
             .iter()
-            .map(|(key, value)| (key.clone(), value)),
+            .map(|(key, product)| (key.clone(), &product.value)),
     );
     let mut outputs = Vec::with_capacity(values.len());
     for (output_key, value) in values {
@@ -2197,7 +2262,32 @@ fn encode_processor_products(
             },
             &mut resolver,
         )
-        .map_err(BuildError::failed)?;
+        .map_err(|error| {
+            let message = error.to_string();
+            match artifact_encoding_failure(&error) {
+                Some(failure) => BuildError::deterministic(
+                    message,
+                    DslfV1::OutputBinding {
+                        asset: loaded.entry.uuid,
+                        processor_id: stage.registration.id.clone(),
+                        processor_version: stage.registration.version,
+                        stage: stage.index,
+                        failure: OutputBindingFailureV1::EncodeRejected {
+                            slot: if output_key.is_empty() {
+                                OutputBindingSlotV1::Primary
+                            } else {
+                                OutputBindingSlotV1::Extra {
+                                    output_key: output_key.clone(),
+                                }
+                            },
+                            encoded_type,
+                            failure,
+                        },
+                    },
+                ),
+                None => BuildError::Failed(message),
+            }
+        })?;
         outputs.push(EncodedNodeOutput {
             output_key,
             asset,
@@ -2275,28 +2365,11 @@ fn commit_processor_stage(
 fn commit_processor_failure(
     context: &mut BuildContext,
     loaded: &LoadedAsset,
-    stage: &PipelineStage,
     static_inputs: &StaticInputs,
     trace: &[TraceOp],
-    build_error_code: u32,
+    facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
-    let cause = if trace.last().is_some_and(TraceOp::failed) {
-        StoreFailureCause::Op
-    } else {
-        let detail = DslfV1::Processor {
-            asset: loaded.entry.uuid,
-            processor_id: stage.registration.id.clone(),
-            processor_version: stage.registration.version,
-            stage: stage.index,
-            build_error_code,
-        }
-        .digest()
-        .map_err(BuildError::failed)?;
-        StoreFailureCause::Local(StoreFailureFingerprint::Local {
-            class: StoreLocalFailureClass::Processor,
-            detail,
-        })
-    };
+    let cause = build_failure_cause(trace, facts)?;
     lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
@@ -2308,6 +2381,38 @@ fn commit_processor_failure(
         })
         .map_err(BuildError::infrastructure)?;
     Ok(())
+}
+
+fn build_failure_cause(
+    trace: &[TraceOp],
+    facts: Option<&DslfV1>,
+) -> Result<StoreFailureCause, BuildError> {
+    if trace.last().is_some_and(TraceOp::failed) {
+        return Ok(StoreFailureCause::Op);
+    }
+    let facts = facts.ok_or_else(|| {
+        BuildError::Infrastructure(
+            "build failure is neither trace-caused nor locally fingerprinted".to_owned(),
+        )
+    })?;
+    let detail = facts.digest().map_err(BuildError::failed)?;
+    Ok(StoreFailureCause::Local(StoreFailureFingerprint::Local {
+        class: store_local_failure_class(facts.class()),
+        detail,
+    }))
+}
+
+fn store_local_failure_class(class: LocalFailureClass) -> StoreLocalFailureClass {
+    match class {
+        LocalFailureClass::Validator => StoreLocalFailureClass::Validator,
+        LocalFailureClass::MigrationPlan => StoreLocalFailureClass::MigrationPlan,
+        LocalFailureClass::Processor => StoreLocalFailureClass::Processor,
+        LocalFailureClass::MigrationFunction => StoreLocalFailureClass::MigrationFunction,
+        LocalFailureClass::OutputBinding => StoreLocalFailureClass::OutputBinding,
+        LocalFailureClass::Importer => StoreLocalFailureClass::Importer,
+        LocalFailureClass::ImportIntake => StoreLocalFailureClass::ImportIntake,
+        LocalFailureClass::ArtifactEncoding => StoreLocalFailureClass::ArtifactEncoding,
+    }
 }
 
 fn output_type_set(output: &EncodedNodeOutput) -> Vec<TypeUuid> {
@@ -2835,35 +2940,73 @@ fn field_path_from_display(path: &str) -> FieldPath {
     )
 }
 
-fn commit_migration_failure(
+fn artifact_encoding_failure(error: &ArtifactEncodeError) -> Option<ArtifactEncodingFailureV1> {
+    match error {
+        ArtifactEncodeError::Value(
+            EncodeError::DuplicateOrderedValue { path } | EncodeError::DuplicateBlobPath { path },
+        ) => Some(ArtifactEncodingFailureV1::NonCanonicalOrder {
+            path: field_path_from_display(path),
+        }),
+        ArtifactEncodeError::Value(
+            EncodeError::InvalidScalar { path, .. } | EncodeError::KeyNotEncodable { path },
+        ) => Some(ArtifactEncodingFailureV1::InvalidScalar {
+            path: field_path_from_display(path),
+        }),
+        ArtifactEncodeError::Value(
+            EncodeError::InvalidWireShape { .. }
+            | EncodeError::MissingWireField { .. }
+            | EncodeError::MissingWireVariant { .. }
+            | EncodeError::BackRefMismatch { .. },
+        ) => Some(ArtifactEncodingFailureV1::LayoutUnavailable),
+        ArtifactEncodeError::Artifact(ArtifactError::VarLenTooLarge { var_len }) => {
+            Some(ArtifactEncodingFailureV1::SizeLimit {
+                limit: u32::MAX as u64,
+                observed: *var_len,
+            })
+        }
+        ArtifactEncodeError::Artifact(ArtifactError::CountExceedsU32 { count, .. }) => {
+            Some(ArtifactEncodingFailureV1::SizeLimit {
+                limit: u32::MAX as u64,
+                observed: *count,
+            })
+        }
+        ArtifactEncodeError::Artifact(ArtifactError::DuplicateBlobPath { path }) => {
+            Some(ArtifactEncodingFailureV1::NonCanonicalOrder {
+                path: field_path_from_display(path),
+            })
+        }
+        // The v1 DSLF grammar has no exact fact payload for these failures.
+        // Keep them deterministic but non-memoized rather than inventing an
+        // observation or collapsing distinct failures into a false fact.
+        ArtifactEncodeError::Value(
+            EncodeError::Shape { .. }
+            | EncodeError::InvalidReference { .. }
+            | EncodeError::Bounds { .. }
+            | EncodeError::DepthExceeded,
+        )
+        | ArtifactEncodeError::Artifact(
+            ArtifactError::BadMagic
+            | ArtifactError::UnsupportedVersion { .. }
+            | ArtifactError::Truncated { .. }
+            | ArtifactError::TrailingBytes { .. }
+            | ArtifactError::Overflow
+            | ArtifactError::DepsNotCanonical { .. }
+            | ArtifactError::NonzeroPadding { .. }
+            | ArtifactError::BlobTableInvalid { .. }
+            | ArtifactError::BlobCountMismatch { .. }
+            | ArtifactError::BlobLengthMismatch { .. },
+        ) => None,
+    }
+}
+
+fn commit_build_import_failure(
     context: &mut BuildContext,
     loaded: &LoadedAsset,
     key: [u8; 32],
     trace: &[TraceOp],
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
-    let cause = if trace.last().is_some_and(TraceOp::failed) {
-        StoreFailureCause::Op
-    } else {
-        let facts = facts.ok_or_else(|| {
-            BuildError::Infrastructure(
-                "migration failure is neither trace-caused nor locally fingerprinted".to_owned(),
-            )
-        })?;
-        let detail = facts.digest().map_err(BuildError::failed)?;
-        StoreFailureCause::Local(StoreFailureFingerprint::Local {
-            class: match facts.class() {
-                LocalFailureClass::MigrationPlan => StoreLocalFailureClass::MigrationPlan,
-                LocalFailureClass::MigrationFunction => StoreLocalFailureClass::MigrationFunction,
-                class => {
-                    return Err(BuildError::Infrastructure(format!(
-                        "invalid build-import migration failure class {class:?}"
-                    )))
-                }
-            },
-            detail,
-        })
-    };
+    let cause = build_failure_cause(trace, facts)?;
     lock_build_store(context)?
         .commit_build(BuildCommit {
             key_kind: KeyKind::BuildImport,
@@ -3364,11 +3507,11 @@ fn encode_or_hydrate(
             Ok(value) => value,
             Err(error) => {
                 let facts = match &error {
-                    BuildError::Migration { facts, .. } => Some(facts.as_ref()),
+                    BuildError::Deterministic { facts, .. } => Some(facts.as_ref()),
                     _ => None,
                 };
                 if trace.last().is_some_and(TraceOp::failed) || facts.is_some() {
-                    commit_migration_failure(context, loaded, key, &trace, facts)?;
+                    commit_build_import_failure(context, loaded, key, &trace, facts)?;
                 }
                 return Err(error);
             }
@@ -3429,7 +3572,7 @@ fn encode_or_hydrate(
             &mut trace,
         )
     };
-    let encoded = encode_artifact_value(
+    let encoded = match encode_artifact_value(
         ArtifactValueSpec {
             asset_uuid: loaded.entry.uuid,
             authored_type: loaded.entry.type_uuid,
@@ -3442,8 +3585,24 @@ fn encode_or_hydrate(
             value: &current_value,
         },
         &mut resolver,
-    )
-    .map_err(BuildError::failed)?;
+    ) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            let message = error.to_string();
+            let facts = artifact_encoding_failure(&error).map(|failure| DslfV1::ArtifactEncoding {
+                asset: loaded.entry.uuid,
+                encoded_type: loaded.entry.type_uuid,
+                failure,
+            });
+            if trace.last().is_some_and(TraceOp::failed) || facts.is_some() {
+                commit_build_import_failure(context, loaded, key, &trace, facts.as_ref())?;
+            }
+            return Err(match facts {
+                Some(facts) => BuildError::deterministic(message, facts),
+                None => BuildError::Failed(message),
+            });
+        }
+    };
     let EncodedArtifact {
         bytes, references, ..
     } = encoded;
@@ -4165,7 +4324,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::callbacks::{
-        PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProducts,
+        PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProduct,
+        ProcessorProducts,
     };
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
@@ -4258,6 +4418,38 @@ mod tests {
         let state = table.state.lock().unwrap();
         assert!(state.flights.is_empty());
         assert!(state.wait_for.is_empty());
+    }
+
+    #[test]
+    fn artifact_encoding_failures_are_memoized_only_with_exact_dslf_facts() {
+        assert_eq!(
+            artifact_encoding_failure(&ArtifactEncodeError::Value(
+                EncodeError::DuplicateOrderedValue {
+                    path: "$.items".to_owned(),
+                },
+            )),
+            Some(ArtifactEncodingFailureV1::NonCanonicalOrder {
+                path: FieldPath::of(&["items"]),
+            })
+        );
+        assert_eq!(
+            artifact_encoding_failure(&ArtifactEncodeError::Artifact(
+                ArtifactError::VarLenTooLarge {
+                    var_len: u32::MAX as u64 + 1,
+                },
+            )),
+            Some(ArtifactEncodingFailureV1::SizeLimit {
+                limit: u32::MAX as u64,
+                observed: u32::MAX as u64 + 1,
+            })
+        );
+        assert_eq!(
+            artifact_encoding_failure(&ArtifactEncodeError::Value(EncodeError::Shape {
+                path: "$.value".to_owned(),
+                expected: "record",
+            })),
+            None
+        );
     }
 
     #[test]
@@ -4726,7 +4918,7 @@ mod tests {
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(ProcessorProducts {
-                primary: Some(input),
+                primary: Some(ProcessorProduct::new(TERMINAL, input)),
                 extras: BTreeMap::new(),
                 debug: BTreeMap::new(),
             })
@@ -4774,8 +4966,11 @@ mod tests {
                 assert_eq!(resolved.content_hash, read.content_hash);
             }
             Ok(ProcessorProducts {
-                primary: Some(input.clone()),
-                extras: BTreeMap::from([("metadata".to_owned(), input)]),
+                primary: Some(ProcessorProduct::new(TERMINAL, input.clone())),
+                extras: BTreeMap::from([(
+                    "metadata".to_owned(),
+                    ProcessorProduct::new(EXTRA, input),
+                )]),
                 debug: BTreeMap::new(),
             })
         }
