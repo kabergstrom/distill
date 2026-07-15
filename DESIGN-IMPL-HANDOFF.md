@@ -1,8 +1,8 @@
 # Distill v2 — Implementation Handoff
 
-_Written 2026-07-13, mid-project, on hitting a hard multi-day account limit
-(resets Jul 18 20:00 Europe/Stockholm). This document is a cold-start spec for
-resuming the work. Nothing is committed to git; all state is working-tree only._
+_Written 2026-07-13 and updated through 2026-07-15. This is the cold-start
+implementation checklist; the git history is the authority for completed
+milestones and the working tree should normally be clean between them._
 
 ---
 
@@ -30,19 +30,18 @@ the §22 ledger, relaunch the next round.
 All schema code is shared in `ngp-schema` (in the newgameplus repo); the v2
 crates path-depend on it rather than forking schema types.
 
-**D. Accepted semantic-attestation simplification (2026-07-15):**
-The exact Rust layout dependency closure is deliberately removed. Do not add
-Cargo-metadata traversal for feature/cfg/source/manifest/lock closure identity.
-`LayoutIdentity` is only `(target_triple, rustc, algorithm_version)`; the
-pipeline module does not attest it. Candidate acceptance compares the complete
-source-walk-derived and independently module-generated `CompiledTypeRow` tables
-and their DSCA aggregates, while `ModuleAbiIdentity` alone gates the Rust host
-interface. `ngp-source-hash` remains a hot-reload freshness trigger. The DSCA
-check happens after staging/`dlopen` of an unpublished candidate but before
-Rust-ABI registration or publication. Because DSCA rows contain DSNL, there is
-no separate measured-layout module probe. This is recorded as DESIGN.md R33
-and supersedes older handoff/review language about completing a host
-`CompilationIdentity` closure.
+**D. Accepted minimal compatibility model (2026-07-15):**
+R34 supersedes the intermediate R33 design. Do not add Cargo-closure identity,
+candidate compiled-type/DSCA probes, cross-binary DSNL gates, RegistryExtras,
+DSLP, accepted runtime type sets, DSAE expansion, target-native bootstrap rows,
+in-place reattestation, or DSTS. The pipeline candidate is paired with the
+watched schema through New Game Plus's shared source identity before Rust-ABI
+registration; `ModuleAbiIdentity` separately gates the host interface. Runtime
+compatibility is checked per authenticated artifact by terminal TypeUuid/DSLH
+and successful DSWL plan compilation against the live descriptor. Module epoch
+changes reconnect/resubscribe. Exact canonical target rows replace DSTS while
+per-target DSTG remains. Fix the generic `Option<T>` descriptor before removing
+the currently compensating DSNL gates.
 
 **Memory constraints (from `MEMORY.md`):**
 - Use `nix run nixpkgs#cargo -- <cmd>` for all v2 cargo commands (plain `cargo`
@@ -50,7 +49,8 @@ and supersedes older handoff/review language about completing a host
 - For newgameplus engine builds: `cd /Users/karl/Projects/newgameplus && nix
   develop --command cargo ...` (the flake provides cmake for joltc-sys).
 - **Do NOT add `Co-Authored-By` lines to commits.**
-- **Do not commit** — the user has not asked. All work stays in the working tree.
+- Commit coherent milestones as they pass their focused verification; the user
+  explicitly requested incremental commits. Do not add `Co-Authored-By` lines.
 
 ---
 

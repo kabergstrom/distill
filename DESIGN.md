@@ -43,6 +43,62 @@ foundations — not an incremental improvement of the old implementation.
   like shader text, where edit-to-reload matters.
 - Arbitrary code predicates in asset queries (see §10).
 
+### Normative compatibility model (R34)
+
+This section is the current authority for module/schema pairing and runtime
+asset compatibility. It supersedes every older clause in this document that
+requires `CompiledTypeRow`, `DSCA`, `DSLP`, `DSRE`, `RegistryExtrasV1`, a
+target-native bootstrap table, an accepted runtime type set, attestation
+expansion, or in-place Hub reattestation. Those names remain only in the
+historical review ledger until the implementation-removal milestone deletes
+their codecs and protocol fields.
+
+There are three independent boundaries:
+
+1. **Pipeline module opening.** The staged module's New Game Plus source
+   identity must equal the source identity recorded for that module crate in
+   the watched schema. The check uses the shared `ngp-source-hash` export/read
+   implementation also used by New Game Plus. `ModuleAbiIdentity` separately
+   gates the Rust host interface before the first Rust-ABI call. Candidate
+   opening does not compare native asset layouts or export a compiled-type
+   table: pipeline values cross into the daemon as the neutral reflection /
+   authored-value stream and are encoded from the paired schema.
+2. **Runtime artifact loading.** The authenticated artifact header's terminal
+   `TypeUuid` and `LogicalHash` must equal the selected live runtime descriptor;
+   `build_only` is rejected from that local descriptor. The artifact's DSWL
+   bytes must hash to its `LayoutHash`, and the loader must successfully compile
+   a fixup plan from that producer wire tree to the exact live
+   `NativeLayoutNode`. Execution uses the size, alignment, ctor, drop, and skip
+   tables from that same descriptor. Different producer and consumer native
+   layouts are supported; DSNL equality is neither required nor sufficient.
+3. **Target selection.** `DSTG` remains the compact commitment to one complete
+   target definition and crosses RPC/build/pack boundaries. A candidate target
+   set is stored and compared as its canonical sorted `(name, DSTG)` rows;
+   `DSTS`, a second digest stored beside those rows, adds no authority and is
+   removed.
+
+RPC validates each fetched artifact at the load boundary above. A module epoch
+change invalidates the connection; clients reconnect and resubscribe instead of
+mutating an existing Hub with `reattest`. Packs carry their target/DSTG,
+artifact content hashes, authenticated artifact bytes, wire trees, and typed
+dependency edges; mount/load applies the same live-descriptor checks. Pack
+construction enforces build-only policy, and runtime loading independently
+rejects a local build-only descriptor. There is no DSCA/DSLP projection at
+either boundary.
+
+The bundle-format bootstrap remains one checked-in logical control spec with
+exactly five TypeUuids and schemas. It is validated by the bundle decoder and
+does not have per-target native rows or a consumer bootstrap brand. Tag
+annotations, reference/blob metadata, control roles, and build-only policy are
+read from the schema/descriptor that owns them; they are not duplicated into a
+generic registry-extras attestation grammar.
+
+Before the obsolete DSNL gate is removed, every live descriptor must be locally
+sound. In particular, generic `Option<T>` may not guess a niche layout; it must
+be constructed through a typed contained thunk (or be restricted to layouts
+the implementation can prove). This is a prerequisite ordering constraint,
+not a reason to retain cross-binary DSNL comparison.
+
 ## 2. Source-of-Truth Hierarchy
 
 This invariant governs the whole design:
@@ -72,13 +128,12 @@ This invariant governs the whole design:
    hard-stops until its accepted history is restored through the explicit
    repair/acceptance controls.
    Authority and executable code meet only by exact equality over **active**
-   authority plus the closed bundle-format bootstrap exception (§3): a
+   logical authority plus the closed bundle-format bootstrap exception (§3): a
    `Ready(PipelineEpoch)` exists iff every non-bootstrap compiled registry
    TypeUuid has one `Active` manifest row, every `Active` row has one
    non-bootstrap compiled registry row, and each compiled DSLH equals that
    row's selected `current` digest. Every bootstrap-control row instead equals
-   its format-derived, LayoutIdentity-keyed expected row under the
-   separate bootstrap-authority gate.
+   its format-derived logical row under the separate bootstrap-authority gate.
    No other exception exists. `Retired` rows preserve accepted history but are
    not active registry authority. A mismatch is `SchemaAcceptanceRequired`,
    never an implicit forward step or implicit retirement/reactivation.
@@ -165,9 +220,10 @@ shared deps, clean unload — and a fix or hardening lands in both hosts
 at once; the code is never duplicated. There is no off-the-shelf host —
 this is bespoke code with known invariants, owned once. The
 same-rustc host-interface invariant is checked, not assumed: the module exports
-its `ModuleAbiIdentity` (§3) and complete compiled-type rows/`DSCA` (§5) in its
+its `ModuleAbiIdentity` (§3) and shared New Game Plus source identity in its
 C-ABI prefix, and the daemon refuses registration unless the ABI identity
-matches the host and the rows exactly match the schema-derived expectation.
+matches the host and the source identity exactly matches the watched schema's
+entry for that module crate.
 No authored asset instance participates in candidate opening: the expected
 rows come entirely from the watched source-walk schema artifact, and authored
 bundles are examined only after a module epoch is ready. Loading never touches
@@ -320,12 +376,10 @@ pub struct PipelineModuleTable {
     /// returns 0 with *len set, the required capacity if cap is too small,
     /// or <0 on error — a contained panic is a status, never an unwind.
     pub identity: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
-    /// Complete compiled per-type semantic attestation (§5). Writes the
-    /// canonical sorted `CompiledTypeRow` rows followed by their
-    /// `DSCA` aggregate, using the same C-ABI buffer/status protocol. The
-    /// host compares this table with source-walk's expected projection
-    /// before `register` and repeats the comparison for every reload.
-    pub compiled_types: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
+    /// New Game Plus source identity for this module crate, using the shared
+    /// C-ABI export/read protocol. The host compares it with the watched
+    /// schema before `register`.
+    pub source_identity: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
     /// Everything below is Rust-ABI under the now-checked same-rustc
     /// contract (the module_state.rs pattern). Every exported fn is a
     /// generated wrapper: panics are caught inside the module and returned
@@ -340,8 +394,9 @@ pub struct PipelineModuleTable {
 /// Embedded in daemon and module alike at build; compared daemon-side at
 /// registration before any Rust-ABI use. This covers only the host interface —
 /// what Registry, Outputs, and every by-value boundary type compile to, and
-/// whose allocations cross ownership at the boundary. Asset-type agreement is
-/// checked separately and directly by the compiled rows/DSCA below.
+/// whose allocations cross ownership at the boundary. Asset data does not
+/// cross here in native form; runtime compatibility is checked while loading
+/// each authenticated artifact against its live descriptor.
 pub struct ModuleAbiIdentity {
     pub rustc: String,                    // must equal the daemon's exactly
     pub interface_fingerprint: [u8; 32],  // shared host-interface build
@@ -982,17 +1037,14 @@ It is not exported by the pipeline module and does not claim to enumerate the
 sources, features, cfgs, manifests, lock nodes, build-script inputs, or other
 causes that produced the layout.
 
-Agreement is checked at the semantic boundary instead. From the watched
-source-walk artifact, the daemon independently derives the complete expected
-sorted `CompiledTypeRow` table and its DSCA. An opened but unpublished module
-exports its independently macro-generated table through the C-ABI probe in
-§3. Candidate acceptance requires exact row and DSCA equality before any
-Rust-ABI registration call. No authored asset instance participates in either
-calculation. A feature, cfg, dependency, generated file, or compiler option
-matters exactly when it changes a type's UUID, logical schema, native layout,
-load policy, or registry extras; that consequence changes DSCA. Pipeline-only
-behavior is covered by the staged dylib hash, and host-interface compatibility
-is covered separately by `ModuleAbiIdentity`.
+Agreement is checked at the boundary that consumes it. An opened but
+unpublished pipeline module exports the same New Game Plus source identity
+that source-walk records in the schema. Candidate acceptance requires equality
+before any Rust-ABI registration call; the staged dylib hash identifies
+pipeline behavior and `ModuleAbiIdentity` separately covers the host interface.
+Runtime consumers do not need the pipeline module's native layout: each
+authenticated artifact carries its terminal `TypeUuid`, `LogicalHash`, and
+DSWL tree, and the loader compiles that tree against its own live descriptor.
 
 Each target resolves to a bound `LayoutIdentity` (§18) that must match the
 layout table used to encode its artifacts. Actual output keys additionally
@@ -1333,14 +1385,12 @@ processor returns. Callback panics and transient infrastructure failures stay
 outside DSLF because they poison or do not memoize; another deterministic
 local producer requires a class and exact v1 arm before it may memoize.
 
-The candidate target-set digest has one equally exact construction:
-`DSTS v1 = blake3("DSTS" || 0x01 || count:u32 || rows...)`, with rows sorted
-by the NFC-normalized target-name bytes and encoded as `(name:str,
-target_definition_hash:[u8;32])`; duplicate normalized names are rejected.
-The target-definition hash is the row's recomputed DSTG (§18), so bound
-LayoutIdentity is included transitively. Candidate staging, acceptance
-request decoding, and the committing coordinator independently recompute DSTS
-and never trust a supplied opaque target-set hash.
+Candidate target sets are canonical rows, not a digest plus rows. Names are
+NFC-normalized, rows sort by name bytes, duplicate normalized names reject,
+and each row is `(name:str, target_definition_hash:[u8;32])` with a recomputed
+DSTG (§18). Candidate staging, schema acceptance, and commit compare the exact
+rows transactionally. `DSTS` is removed because persisting or transmitting a
+hash beside the complete rows adds no stale-work or atomicity guarantee.
 
 The tag-annotation epoch is also a closed grammar, derived rather than
 supplied. `DSTA v1 = blake3("DSTA" || 0x01 || type_count:u32 || types...)`.
@@ -10833,6 +10883,31 @@ ordinary §10 dependency kinds.
   trigger New Game Plus/schema hot reload but is not strengthened into a Cargo
   graph identity and is not trusted as an ABI, target, or safety gate.
 <!-- R33_LEDGER_END -->
+
+<!-- R34_LEDGER_BEGIN count=6 -->
+- **Shared source identity pairs pipeline module and schema** (§§3, 5): the
+  daemon uses New Game Plus's shared source export/read implementation before
+  Rust registration. This replaces R33's candidate compiled-type probe; source
+  identity is a pairing check, while `ModuleAbiIdentity` remains the host-ABI
+  check.
+- **Runtime compatibility is artifact-local** (§§12, 15–17): authenticated
+  terminal TypeUuid/DSLH plus successful DSWL-to-live-descriptor plan
+  compilation are the compatibility boundary. Cross-binary DSNL equality is
+  removed after local descriptors are made sound.
+- **Compiled registry attestation is removed** (§§3, 5, 15–17):
+  `CompiledTypeRow`, DSCA, RegistryExtras/DSRE, DSLP, accepted-set projections,
+  DSAE expansion, and target-native bootstrap rows duplicate facts already
+  owned by schemas, artifacts, descriptors, or the bundle decoder.
+- **Module changes reconnect rather than reattest** (§§15, 17): a module epoch
+  change invalidates Hubs; clients reconnect and resubscribe. The in-place
+  reattestation CAS/generation protocol has no remaining state to mutate.
+- **Canonical target rows replace DSTS** (§§5, 13, 18): exact normalized
+  `(name, DSTG)` rows are stored and compared transactionally. DSTG remains the
+  necessary cross-process identity for one selected target; DSTS is deleted.
+- **Unsafe simplification has an ordering gate** (§§4, 12): generic
+  `Option<T>` cannot fabricate a niche descriptor. A typed construction path
+  or a proven restriction lands before removal of the compensating DSNL gate.
+<!-- R34_LEDGER_END -->
 
 ### Open — remaining
 
