@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use distill_schema::{ProjectSchemaAuthority, SchemaAuthorityError};
 use distill_store::state::{
@@ -22,6 +22,7 @@ use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePa
 
 const WATCH_CAPACITY: usize = 65_536;
 const DEBOUNCE: Duration = Duration::from_millis(40);
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub struct DaemonProcess {
     coordinator: Arc<DaemonCoordinator>,
@@ -78,6 +79,7 @@ impl DaemonProcess {
             WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue), DEBOUNCE)?;
         coordinator.reconcile_startup(&watcher_queue)?;
         reconcile_imports(&coordinator)?;
+        coordinator.sweep_displaced_retention(unix_seconds())?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let last_background_error = Arc::new(Mutex::new(None));
@@ -219,6 +221,7 @@ fn spawn_coordinator_loop(
     thread::Builder::new()
         .name("distill-coordinator".to_owned())
         .spawn(move || {
+            let mut next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
             while !stop.load(Ordering::Acquire) {
                 thread::sleep(DEBOUNCE);
                 let action = {
@@ -241,7 +244,15 @@ fn spawn_coordinator_loop(
                             .and_then(|_| reconcile_imports(&coordinator)),
                     });
                 let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
-                let result = result.and(poison_result);
+                let retention_result = if Instant::now() >= next_retention_sweep {
+                    next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
+                    coordinator
+                        .sweep_displaced_retention(unix_seconds())
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                let result = result.and(poison_result).and(retention_result);
                 let _ = coordinator.reap_retired_pipeline_epochs();
                 match result {
                     Err(error) => {
@@ -257,6 +268,14 @@ fn spawn_coordinator_loop(
             }
         })
         .expect("failed to start distill coordinator thread")
+}
+
+fn unix_seconds() -> i64 {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    i64::try_from(seconds).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

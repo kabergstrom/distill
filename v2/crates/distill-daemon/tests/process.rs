@@ -2,11 +2,14 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use distill_core::id::ContentHash;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
+use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
 use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
 use distill_schema::ngp_schema::{Schema, SchemaLayouts};
 use distill_store::state::{ConfigurationState, DscpV1, PipelineState};
+use distill_store::Store;
 
 fn config_source(temp: &tempfile::TempDir) -> String {
     let assets = temp.path().join("assets");
@@ -120,6 +123,40 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
         !temp.path().join("generated").exists(),
         "disabled codegen must not create its output directory"
     );
+    drop(process);
+}
+
+#[test]
+fn startup_runs_the_journaled_displacement_retention_sweep() {
+    let temp = tempfile::tempdir().unwrap();
+    let _ = config(&temp);
+    let config_path = temp.path().join("distill.toml");
+    let source = std::fs::read_to_string(&config_path).unwrap().replace(
+        "address = \"127.0.0.1:0\"",
+        "address = \"127.0.0.1:0\"\ndisplaced_retention_days = 0",
+    );
+    std::fs::write(&config_path, source).unwrap();
+    let config = DaemonConfig::load(&config_path).unwrap();
+    let assets = temp.path().join("assets");
+    let quarantine = assets.join(".distill-displaced");
+    let target = assets.join("old.asset");
+    std::fs::write(&target, b"old").unwrap();
+    let retained = {
+        let mut store = Store::open(config.store_config()).unwrap();
+        let driver = QuarantineDriver::new([QuarantineRoot::new(&assets, &quarantine)]).unwrap();
+        driver
+            .journaled_delete(
+                &mut store,
+                &target,
+                ContentHash(*blake3::hash(b"old").as_bytes()),
+            )
+            .unwrap()
+    };
+    std::thread::sleep(Duration::from_millis(1_100));
+
+    let process = DaemonProcess::start(config).unwrap();
+
+    assert!(!retained.exists());
     drop(process);
 }
 

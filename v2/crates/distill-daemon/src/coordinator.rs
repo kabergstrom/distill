@@ -503,6 +503,14 @@ impl DaemonCoordinator {
         Ok(())
     }
 
+    /// Run §14's journaled displaced-inode retention sweep using the current
+    /// operational-live retention window.
+    pub fn sweep_displaced_retention(&self, now_secs: i64) -> Result<usize, CoordinatorError> {
+        lock_store(&self.store)
+            .sweep_displaced(now_secs)
+            .map_err(|error| CoordinatorError::Maintenance(error.to_string()))
+    }
+
     fn configuration_poison(&self) -> Option<ConfigurationPoison> {
         self.configuration_poison
             .lock()
@@ -1340,6 +1348,7 @@ pub enum CoordinatorError {
     InvalidManifest(String),
     Coordinated(CoordinatedCommitError),
     RuntimePipeline(String),
+    Maintenance(String),
 }
 
 impl std::fmt::Display for CoordinatorError {
