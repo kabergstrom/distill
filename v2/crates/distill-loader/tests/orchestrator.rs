@@ -23,6 +23,9 @@ struct A;
 #[distill_asset::asset(uuid = "42112233-4455-6677-8899-aabbccddeeff")]
 struct B;
 
+#[distill_asset::asset(uuid = "43112233-4455-6677-8899-aabbccddeeff", build_only)]
+struct BuildOnly;
+
 const PLACEHOLDER_TYPE: TypeUuid = TypeUuid([0x43; 16]);
 
 struct RefPlaceholder {
@@ -299,6 +302,10 @@ fn basis_with(manifest_byte: u8) -> IoBasis {
             type_uuid: RefPlaceholder::TYPE_UUID,
             build_only: false,
         },
+        LoadPolicyRow {
+            type_uuid: BuildOnly::TYPE_UUID,
+            build_only: true,
+        },
     ];
     IoBasis::Pack {
         manifest: ManifestHash([manifest_byte; 32]),
@@ -372,6 +379,7 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
                 A::descriptor(),
                 B::descriptor(),
                 RefPlaceholder::descriptor(),
+                BuildOnly::descriptor(),
             ],
         )
         .unwrap();
@@ -519,6 +527,29 @@ fn malformed_fetch_terminally_fails_its_candidate() {
         diagnostic,
         LoaderDiagnostic::ComponentPoisoned { failures, .. }
             if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("artifact"))
+    )));
+}
+
+#[test]
+fn local_build_only_descriptor_rejects_runtime_artifact() {
+    let token = ModuleEpochToken::new(35);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 35, &token);
+    let asset_uuid = uuid(35);
+    let _handle = loader.add_ref::<BuildOnly>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (hash, artifact) = artifact::<BuildOnly>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::Artifact(message)
+            if message.contains("local descriptor marks") && message.contains("build-only")
     )));
 }
 

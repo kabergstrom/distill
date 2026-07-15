@@ -22,7 +22,6 @@ pub struct RuntimeAttestation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAttestationError {
-    Bootstrap(String),
     Compiled(distill_core::attestation::AttestationError),
     Rpc(distill_rpc::AttestationShapeError),
 }
@@ -41,14 +40,10 @@ impl RuntimeAttestation {
         target_definition_hash: [u8; 32],
         descriptors: &[&'static distill_asset::AssetRuntimeDescriptor],
     ) -> Result<Self, RuntimeAttestationError> {
-        let bootstrap = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
-            .map_err(|error| RuntimeAttestationError::Bootstrap(error.to_string()))?;
-        let mut rows = bootstrap.rows().to_vec();
-        rows.extend(
-            descriptors
-                .iter()
-                .map(|descriptor| (*descriptor.compiled_type).clone()),
-        );
+        let rows = descriptors
+            .iter()
+            .map(|descriptor| (*descriptor.compiled_type).clone())
+            .collect();
         let compiled_types =
             CompiledTypeTable::canonical(rows).map_err(RuntimeAttestationError::Compiled)?;
         Ok(Self {

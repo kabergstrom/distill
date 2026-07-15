@@ -1406,6 +1406,14 @@ impl<I: LoaderIO> Loader<I> {
             );
             return;
         }
+        if descriptor.descriptor.build_only {
+            self.reject_fetched(
+                uuid,
+                &basis,
+                format!("local descriptor marks {type_uuid} as build-only"),
+            );
+            return;
+        }
         if let Err(error) = basis.load_policy().require_runtime(type_uuid) {
             self.reject_fetched(
                 uuid,

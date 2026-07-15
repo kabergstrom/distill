@@ -376,10 +376,6 @@ pub struct PipelineModuleTable {
     /// returns 0 with *len set, the required capacity if cap is too small,
     /// or <0 on error — a contained panic is a status, never an unwind.
     pub identity: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
-    /// New Game Plus source identity for this module crate, using the shared
-    /// C-ABI export/read protocol. The host compares it with the watched
-    /// schema before `register`.
-    pub source_identity: unsafe extern "C" fn(buf: *mut u8, cap: u32, len: *mut u32) -> i32,
     /// Everything below is Rust-ABI under the now-checked same-rustc
     /// contract (the module_state.rs pattern). Every exported fn is a
     /// generated wrapper: panics are caught inside the module and returned
@@ -783,6 +779,14 @@ pub struct HpBarConfig {
     pub cached_mesh: Option<GpuMeshHandle>,
 }
 ```
+
+Source identity is not another function-table entry. The module emits New Game
+Plus's existing four data symbols—`__NGP_SOURCE_HASH_PTR`,
+`__NGP_SOURCE_HASH_LEN`, `__NGP_CRATE_NAME_PTR`, and
+`__NGP_CRATE_NAME_LEN`—through the focused `NgpSourceIdentity` derive. The
+daemon reads them through `ngp-module-host::read_source_identity`, exactly as
+New Game Plus does, and compares the copied `(crate_name, source_hash)` with the
+watched schema before calling `register`.
 
 | Attribute | Scope | Meaning |
 |-----------|-------|---------|
