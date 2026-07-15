@@ -20,7 +20,6 @@ use crate::watcher::{WatcherQueue, WatcherThread};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
-const WATCH_CAPACITY: usize = 65_536;
 const DEBOUNCE: Duration = Duration::from_millis(40);
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -73,7 +72,7 @@ impl DaemonProcess {
             config.codegen.auto_codegen,
         )
         .map_err(DaemonProcessError::Codegen)?;
-        let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new(WATCH_CAPACITY)));
+        let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new()));
         let watcher =
             WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue), DEBOUNCE)?;
         coordinator.reconcile_startup(&watcher_queue)?;
@@ -223,25 +222,16 @@ fn spawn_coordinator_loop(
             let mut next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
             while !stop.load(Ordering::Acquire) {
                 thread::sleep(DEBOUNCE);
-                let action = {
-                    let mut watcher = lock(&watcher);
-                    if watcher.take_live_overflow() {
-                        WatchAction::FullRescan
-                    } else {
-                        WatchAction::Events(watcher.take_live_batch())
-                    }
-                };
-                let result = config_watch
-                    .reconcile(&coordinator)
-                    .and_then(|()| match action {
-                        WatchAction::FullRescan => coordinator
+                let dirty = lock(&watcher).take_live_dirty();
+                let result = config_watch.reconcile(&coordinator).and_then(|()| {
+                    if dirty {
+                        coordinator
                             .reconcile_full_scan()
-                            .and_then(|_| reconcile_imports(&coordinator)),
-                        WatchAction::Events(events) if events.is_empty() => Ok(()),
-                        WatchAction::Events(events) => coordinator
-                            .apply_watcher_batch(events)
-                            .and_then(|_| reconcile_imports(&coordinator)),
-                    });
+                            .and_then(|_| reconcile_imports(&coordinator))
+                    } else {
+                        Ok(())
+                    }
+                });
                 let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
                 let retention_result = if Instant::now() >= next_retention_sweep {
                     next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
@@ -256,7 +246,7 @@ fn spawn_coordinator_loop(
                 match result {
                     Err(error) => {
                         *lock(&last_error) = Some(error.to_string());
-                        lock(&watcher).force_overflow();
+                        lock(&watcher).mark_dirty();
                     }
                     Ok(()) => {
                         if let Err(error) = codegen.run(&coordinator) {
@@ -588,11 +578,6 @@ fn reconcile_imports(coordinator: &DaemonCoordinator) -> Result<(), CoordinatorE
         .and_then(|_| coordinator.reconcile_watched_imports());
     let poison = coordinator.sync_runtime_pipeline_poison().map(|_| ());
     reconcile.and(poison)
-}
-
-enum WatchAction {
-    FullRescan,
-    Events(Vec<crate::coordinator::WatcherPathEvent>),
 }
 
 fn spawn_rpc_loop(

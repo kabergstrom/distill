@@ -1,83 +1,31 @@
-use distill_daemon::coordinator::WatcherPathEvent;
 use std::sync::Mutex;
 
 use distill_daemon::scanner::{AssetRoot, RootedScanner};
-use distill_daemon::watcher::{GenerationReplay, PollingWatchSource, WatcherQueue};
+use distill_daemon::watcher::{PollingWatchSource, WatcherQueue};
 
-fn event(path: &str) -> WatcherPathEvent {
-    WatcherPathEvent {
-        root: "main".to_owned(),
-        path: path.to_owned(),
-        exists: true,
-    }
+#[test]
+fn event_during_scan_stays_dirty_until_the_scan_finishes() {
+    let mut queue = WatcherQueue::new();
+    queue.arm_scan();
+    queue.mark_dirty();
+
+    assert!(!queue.take_live_dirty());
+    assert!(queue.finish_scan());
+    assert!(!queue.take_live_dirty());
 }
 
 #[test]
-fn scan_generation_replays_the_sorted_union_of_events_arriving_during_scan() {
-    let mut queue = WatcherQueue::new(16);
-    let generation = queue.arm_scan().unwrap();
-    queue.push(event("z.bundle")).unwrap();
-    queue.push(event("a.bundle")).unwrap();
-    queue.push(event("z.bundle")).unwrap();
+fn live_events_collapse_to_one_sticky_invalidation() {
+    let mut queue = WatcherQueue::new();
+    queue.mark_dirty();
+    queue.mark_dirty();
 
-    assert_eq!(
-        queue.finish_scan(generation).unwrap(),
-        GenerationReplay::Events(vec![event("a.bundle"), event("z.bundle")])
-    );
-    assert!(queue.take_live_batch().is_empty());
+    assert!(queue.take_live_dirty());
+    assert!(!queue.take_live_dirty());
 }
 
 #[test]
-fn overflow_during_scan_requires_a_full_rescan_and_discards_partial_events() {
-    let mut queue = WatcherQueue::new(2);
-    let generation = queue.arm_scan().unwrap();
-    queue.push(event("a")).unwrap();
-    queue.push(event("b")).unwrap();
-    queue.push(event("c")).unwrap();
-
-    assert_eq!(
-        queue.finish_scan(generation).unwrap(),
-        GenerationReplay::FullRescan
-    );
-    assert!(queue.take_live_batch().is_empty());
-}
-
-#[test]
-fn stale_generation_cannot_finish_or_consume_a_new_scan() {
-    let mut queue = WatcherQueue::new(8);
-    let first = queue.arm_scan().unwrap();
-    queue.finish_scan(first).unwrap();
-    let second = queue.arm_scan().unwrap();
-    assert_ne!(first, second);
-    assert!(queue.finish_scan(first).is_err());
-    queue.push(event("fresh")).unwrap();
-    assert_eq!(
-        queue.finish_scan(second).unwrap(),
-        GenerationReplay::Events(vec![event("fresh")])
-    );
-}
-
-#[test]
-fn live_batches_collapse_atomic_save_chains_to_the_last_path_state() {
-    let mut queue = WatcherQueue::new(8);
-    queue
-        .push(WatcherPathEvent {
-            root: "main".to_owned(),
-            path: "asset.bundle".to_owned(),
-            exists: false,
-        })
-        .unwrap();
-    queue.push(event("asset.bundle")).unwrap();
-    queue.push(event("other.bundle")).unwrap();
-
-    assert_eq!(
-        queue.take_live_batch(),
-        vec![event("asset.bundle"), event("other.bundle")]
-    );
-}
-
-#[test]
-fn portable_watch_source_detects_create_update_and_delete_from_the_rooted_scanner() {
+fn portable_watch_source_detects_create_update_and_delete() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");
     std::fs::create_dir(&root).unwrap();
@@ -88,37 +36,24 @@ fn portable_watch_source_detects_create_update_and_delete_from_the_rooted_scanne
     )])
     .unwrap();
     let mut source = PollingWatchSource::arm(scanner).unwrap();
-    let queue = Mutex::new(WatcherQueue::new(16));
+    let queue = Mutex::new(WatcherQueue::new());
     let path = root.join("source.txt");
 
     std::fs::write(&path, b"first").unwrap();
     assert_eq!(source.poll_once(&queue).unwrap(), 1);
-    assert_eq!(
-        queue.lock().unwrap().take_live_batch(),
-        vec![event("source.txt")]
-    );
+    assert!(queue.lock().unwrap().take_live_dirty());
 
     std::fs::write(&path, b"second").unwrap();
     assert_eq!(source.poll_once(&queue).unwrap(), 1);
-    assert_eq!(
-        queue.lock().unwrap().take_live_batch(),
-        vec![event("source.txt")]
-    );
+    assert!(queue.lock().unwrap().take_live_dirty());
 
     std::fs::remove_file(path).unwrap();
     assert_eq!(source.poll_once(&queue).unwrap(), 1);
-    assert_eq!(
-        queue.lock().unwrap().take_live_batch(),
-        vec![WatcherPathEvent {
-            root: "main".to_owned(),
-            path: "source.txt".to_owned(),
-            exists: false,
-        }]
-    );
+    assert!(queue.lock().unwrap().take_live_dirty());
 }
 
 #[test]
-fn published_root_replacement_resets_watcher_basis_without_duplicate_events() {
+fn published_root_replacement_resets_watcher_basis_without_invalidation() {
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first");
     let second = temp.path().join("second");
@@ -133,7 +68,7 @@ fn published_root_replacement_resets_watcher_basis_without_duplicate_events() {
     )])
     .unwrap();
     let mut source = PollingWatchSource::arm(scanner.clone()).unwrap();
-    let queue = Mutex::new(WatcherQueue::new(16));
+    let queue = Mutex::new(WatcherQueue::new());
 
     scanner
         .replace_roots([AssetRoot::new(
@@ -143,12 +78,9 @@ fn published_root_replacement_resets_watcher_basis_without_duplicate_events() {
         )])
         .unwrap();
     assert_eq!(source.poll_once(&queue).unwrap(), 0);
-    assert!(queue.lock().unwrap().take_live_batch().is_empty());
+    assert!(!queue.lock().unwrap().take_live_dirty());
 
     std::fs::write(second.join("later.txt"), b"later").unwrap();
     assert_eq!(source.poll_once(&queue).unwrap(), 1);
-    assert_eq!(
-        queue.lock().unwrap().take_live_batch(),
-        vec![event("later.txt")]
-    );
+    assert!(queue.lock().unwrap().take_live_dirty());
 }

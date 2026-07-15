@@ -4,7 +4,7 @@ use std::sync::Arc;
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
-use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination, WatcherPathEvent};
+use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination};
 use distill_daemon::scanner::AssetRoot;
 use distill_json::AuthoredValue;
 use distill_rpc::{
@@ -146,7 +146,7 @@ fn full_scan_publishes_one_store_and_rpc_version_with_missing_lineage_repair_bas
 }
 
 #[test]
-fn watcher_union_reconciles_an_offline_delete_in_exactly_one_version() {
+fn watcher_trigger_reconciles_an_offline_delete_in_exactly_one_version() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle, asset) = ordinary_bundle();
     let coordinator = coordinator(&temp);
@@ -155,20 +155,7 @@ fn watcher_union_reconciles_an_offline_delete_in_exactly_one_version() {
     coordinator.reconcile_full_scan().unwrap();
 
     std::fs::remove_file(path).unwrap();
-    let stamp = coordinator
-        .apply_watcher_batch([
-            WatcherPathEvent {
-                root: "main".to_owned(),
-                path: "ordinary.bundle".to_owned(),
-                exists: false,
-            },
-            WatcherPathEvent {
-                root: "main".to_owned(),
-                path: "ordinary.bundle".to_owned(),
-                exists: false,
-            },
-        ])
-        .unwrap();
+    let stamp = coordinator.reconcile_full_scan().unwrap();
     assert_eq!(stamp.version, InputVersion(2));
 
     let store = coordinator.store();

@@ -1,10 +1,9 @@
-//! Lossless watcher-generation and debounce queue.
+//! Sticky watcher invalidation for complete namespace rescans.
 //!
-//! The platform watcher is armed before startup traversal. Every event that
-//! arrives while the scan is in flight remains tagged with that scan
-//! generation and is replayed after its transaction commits. A bounded queue
-//! never drops an event silently: overflow converts the generation into an
-//! explicit full-rescan request.
+//! The platform watcher is armed before startup traversal. Any event arriving
+//! during a scan leaves the queue dirty, forcing another fully armed scan after
+//! the current transaction commits. Paths are deliberately not queued because
+//! the coordinator never trusts or consumes a partial path set.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,137 +11,44 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::coordinator::WatcherPathEvent;
 use crate::scanner::{RootedScanner, ScanError, ScannedFile, ScannedFileKind};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScanGeneration(u64);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GenerationReplay {
-    Events(Vec<WatcherPathEvent>),
-    FullRescan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatcherQueueError {
-    ScanAlreadyArmed,
-    NoScanArmed,
-    StaleGeneration,
-    GenerationExhausted,
-}
-
-impl std::fmt::Display for WatcherQueueError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "watcher queue: {self:?}")
-    }
-}
-
-impl std::error::Error for WatcherQueueError {}
-
-/// Queue capacity counts distinct `(root, path)` keys. Repeated atomic-save
-/// transitions replace the prior state for that path and therefore cannot
-/// manufacture overflow by themselves.
+#[derive(Default)]
 pub struct WatcherQueue {
-    capacity: usize,
-    next_generation: u64,
-    scanning: Option<ScanGeneration>,
-    overflowed: bool,
-    pending: BTreeMap<(String, String), bool>,
+    scanning: bool,
+    dirty: bool,
 }
 
 impl WatcherQueue {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            next_generation: 1,
-            scanning: None,
-            overflowed: false,
-            pending: BTreeMap::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Begin a scan generation without discarding events already queued by an
-    /// armed watcher. Those events are part of the scan/event union too.
-    pub fn arm_scan(&mut self) -> Result<ScanGeneration, WatcherQueueError> {
-        if self.scanning.is_some() {
-            return Err(WatcherQueueError::ScanAlreadyArmed);
-        }
-        let generation = ScanGeneration(self.next_generation);
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(WatcherQueueError::GenerationExhausted)?;
-        self.scanning = Some(generation);
-        Ok(generation)
+    /// Begin a scan without clearing an invalidation already observed by the
+    /// armed watcher.
+    pub fn arm_scan(&mut self) {
+        assert!(!self.scanning, "watcher scan already armed");
+        self.scanning = true;
     }
 
-    pub fn push(&mut self, event: WatcherPathEvent) -> Result<(), WatcherQueueError> {
-        if self.overflowed {
-            return Ok(());
-        }
-        self.pending.insert((event.root, event.path), event.exists);
-        if self.pending.len() > self.capacity {
-            self.pending.clear();
-            self.overflowed = true;
-        }
-        Ok(())
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
-    pub fn finish_scan(
-        &mut self,
-        generation: ScanGeneration,
-    ) -> Result<GenerationReplay, WatcherQueueError> {
-        match self.scanning {
-            None => return Err(WatcherQueueError::NoScanArmed),
-            Some(current) if current != generation => {
-                return Err(WatcherQueueError::StaleGeneration)
-            }
-            Some(_) => {}
-        }
-        self.scanning = None;
-        if std::mem::take(&mut self.overflowed) {
-            self.pending.clear();
-            return Ok(GenerationReplay::FullRescan);
-        }
-        Ok(GenerationReplay::Events(self.drain()))
+    /// Finish the current scan and consume whether another scan is required.
+    pub fn finish_scan(&mut self) -> bool {
+        assert!(self.scanning, "no watcher scan armed");
+        self.scanning = false;
+        std::mem::take(&mut self.dirty)
     }
 
-    /// Consume one debounced live batch. During a scan, only
-    /// `finish_scan(generation)` may consume the generation-tagged union.
-    pub fn take_live_batch(&mut self) -> Vec<WatcherPathEvent> {
-        if self.scanning.is_some() || self.overflowed {
-            return Vec::new();
-        }
-        self.drain()
-    }
-
-    pub fn live_overflowed(&self) -> bool {
-        self.scanning.is_none() && self.overflowed
-    }
-
-    pub fn take_live_overflow(&mut self) -> bool {
-        if !self.live_overflowed() {
+    /// Consume one debounced live invalidation. A scan in flight owns the bit
+    /// until `finish_scan` so no event can be lost between traversal and commit.
+    pub fn take_live_dirty(&mut self) -> bool {
+        if self.scanning {
             return false;
         }
-        self.overflowed = false;
-        self.pending.clear();
-        true
-    }
-
-    /// Platform watcher backends call this when their native queue overflows
-    /// or an observation pass becomes incomplete. The coordinator responds
-    /// only with a complete, newly armed rescan.
-    pub fn force_overflow(&mut self) {
-        self.pending.clear();
-        self.overflowed = true;
-    }
-
-    fn drain(&mut self) -> Vec<WatcherPathEvent> {
-        std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|((root, path), exists)| WatcherPathEvent { root, path, exists })
-            .collect()
+        std::mem::take(&mut self.dirty)
     }
 }
 
@@ -203,44 +109,25 @@ impl PollingWatchSource {
             Err(error) => {
                 let detail = error.to_string();
                 if self.last_failure.as_ref() != Some(&detail) {
-                    lock_queue(queue).force_overflow();
+                    lock_queue(queue).mark_dirty();
                     self.last_failure = Some(detail);
                 }
                 return Err(error);
             }
         };
         let healed = self.last_failure.take().is_some();
-        let mut changed = Vec::new();
-        for ((root, path), state) in &current {
-            if self.observed.get(&(root.clone(), path.clone())) != Some(state) {
-                changed.push(WatcherPathEvent {
-                    root: root.clone(),
-                    path: path.clone(),
-                    exists: true,
-                });
-            }
-        }
-        for (root, path) in self.observed.keys() {
-            if !current.contains_key(&(root.clone(), path.clone())) {
-                changed.push(WatcherPathEvent {
-                    root: root.clone(),
-                    path: path.clone(),
-                    exists: false,
-                });
-            }
-        }
-        changed.sort();
-        let count = changed.len();
-        {
-            let mut queue = lock_queue(queue);
-            if healed {
-                queue.force_overflow();
-            }
-            for event in changed {
-                // Queue insertion is infallible outside generation exhaustion;
-                // overflow is represented as state, never as dropped input.
-                let _ = queue.push(event);
-            }
+        let updated = current
+            .iter()
+            .filter(|(path, state)| self.observed.get(*path) != Some(*state))
+            .count();
+        let deleted = self
+            .observed
+            .keys()
+            .filter(|path| !current.contains_key(*path))
+            .count();
+        let count = updated + deleted;
+        if healed || count != 0 {
+            lock_queue(queue).mark_dirty();
         }
         self.observed = current;
         Ok(count)

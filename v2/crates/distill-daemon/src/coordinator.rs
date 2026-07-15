@@ -54,7 +54,7 @@ use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
 use crate::scheduler::{Scheduler, SchedulerConfig, WorkClass};
-use crate::watcher::{GenerationReplay, WatcherQueue, WatcherQueueError};
+use crate::watcher::WatcherQueue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageDestination {
@@ -957,9 +957,7 @@ impl DaemonCoordinator {
         lock_pipeline(&self.pipeline).host.reap_retired()
     }
 
-    /// Reconcile one complete scan. A watcher generation is armed before the
-    /// caller starts this method; queued events are unioned through
-    /// [`Self::apply_watcher_batch`] after this transaction.
+    /// Reconcile one complete identity-checked namespace scan.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         match self.scanner.scan() {
             Ok(scan) => self.publish_scan(scan),
@@ -967,25 +965,18 @@ impl DaemonCoordinator {
         }
     }
 
-    /// Arm a watcher generation before traversal, publish the startup scan,
-    /// then replay the exact event union. Overflow repeats a fully armed scan;
-    /// it can never degrade into a partial event set.
+    /// Arm the watcher before traversal and repeat while any event arrives
+    /// during a scan. This closes the traversal/commit lost-wakeup window
+    /// without treating platform event paths as namespace authority.
     pub fn reconcile_startup(
         &self,
         watcher: &Mutex<WatcherQueue>,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let mut stamp;
         loop {
-            let generation = lock_watcher(watcher).arm_scan()?;
-            stamp = self.reconcile_full_scan()?;
-            match lock_watcher(watcher).finish_scan(generation)? {
-                GenerationReplay::Events(events) => {
-                    if !events.is_empty() {
-                        stamp = self.apply_watcher_batch(events)?;
-                    }
-                    return Ok(stamp);
-                }
-                GenerationReplay::FullRescan => continue,
+            lock_watcher(watcher).arm_scan();
+            let stamp = self.reconcile_full_scan()?;
+            if !lock_watcher(watcher).finish_scan() {
+                return Ok(stamp);
             }
         }
     }
@@ -1095,24 +1086,6 @@ impl DaemonCoordinator {
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)
-    }
-
-    /// Reconcile a watcher batch as one durable input event. Event paths are a
-    /// trigger/union, never trusted as a complete namespace; the identity-
-    /// checked scan supplies current bytes and the single coordinated commit
-    /// consumes the change without an empty queue-only version in front of it.
-    pub fn apply_watcher_batch(
-        &self,
-        events: impl IntoIterator<Item = WatcherPathEvent>,
-    ) -> Result<SnapshotStamp, CoordinatorError> {
-        let mut events = events.into_iter().collect::<Vec<_>>();
-        events.sort();
-        events.dedup();
-        if events.is_empty() {
-            return Ok(self.server.current_stamp());
-        }
-        let scan = self.scanner.scan()?;
-        self.publish_scan(scan)
     }
 
     /// Rerun watched imports whose complete outcome-bearing basis drifted.
@@ -1279,13 +1252,6 @@ fn platform_identity(identity: ObservedFileIdentity) -> PlatformFileIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WatcherPathEvent {
-    pub root: String,
-    pub path: String,
-    pub exists: bool,
-}
-
 #[derive(Debug)]
 pub enum CoordinatorInitError {
     Store(StoreError),
@@ -1335,7 +1301,6 @@ impl From<distill_rpc::TargetSetError> for CoordinatorInitError {
 #[derive(Debug)]
 pub enum CoordinatorError {
     Scan(ScanError),
-    Watcher(WatcherQueueError),
     InvalidManifest(String),
     Coordinated(CoordinatedCommitError),
     RuntimePipeline(String),
@@ -1353,12 +1318,6 @@ impl std::error::Error for CoordinatorError {}
 impl From<ScanError> for CoordinatorError {
     fn from(error: ScanError) -> Self {
         Self::Scan(error)
-    }
-}
-
-impl From<WatcherQueueError> for CoordinatorError {
-    fn from(error: WatcherQueueError) -> Self {
-        Self::Watcher(error)
     }
 }
 
