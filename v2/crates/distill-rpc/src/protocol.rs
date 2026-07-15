@@ -1651,8 +1651,15 @@ pub trait AuthoringBackend: Send + Sync {
 /// Snapshot-pinned request issued when runtime resolution reaches a drifted
 /// asset. Implementations must build only from `entry` and inputs resolved at
 /// `basis`; a newer daemon input version is drift, not an implicit rebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildWorkClass {
+    Interactive,
+    Batch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildRequest {
+    pub work_class: BuildWorkClass,
     pub basis: SnapshotStamp,
     pub target: String,
     pub target_definition: TargetDefinitionHash,

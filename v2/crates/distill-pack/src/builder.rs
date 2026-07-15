@@ -175,7 +175,7 @@ pub fn build_pack(
         if artifacts.contains_key(&asset) {
             continue;
         }
-        let resolved = terminal(snapshot, rpc_success(snapshot.resolve(asset))?)?;
+        let resolved = terminal(snapshot, rpc_success(snapshot.resolve_batch(asset))?)?;
         let content_hash = match resolved {
             ResolveResult::Built { content_hash } => content_hash,
             result => {

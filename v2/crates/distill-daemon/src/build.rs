@@ -37,7 +37,7 @@ use distill_migrate::{
 use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactPayload, AssetReferenceQuery,
     AuthoringMutation, BuildArtifactPublication, BuildBackend, BuildBackendOutcome,
-    BuildPublication, BuildRequest, BuildWireTree, Commit, DriftedInput,
+    BuildPublication, BuildRequest, BuildWireTree, BuildWorkClass, Commit, DriftedInput,
     PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow, ServedLoadEdge,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
@@ -114,12 +114,15 @@ impl BuildBackend for CoordinatorBuildBackend {
                     operation: "build coordinator stopped".to_owned(),
                 })?;
         let flights = Arc::clone(&self.flights);
-        let (result, poison) =
-            coordinator.run_scheduled_cooperative(WorkClass::Interactive, |job| {
-                let result = build_with_runtime(&coordinator, request, flights, job);
-                let poison = coordinator.sync_runtime_pipeline_poison();
-                (result, poison)
-            });
+        let class = match request.work_class {
+            BuildWorkClass::Interactive => WorkClass::Interactive,
+            BuildWorkClass::Batch => WorkClass::Batch,
+        };
+        let (result, poison) = coordinator.run_scheduled_cooperative(class, |job| {
+            let result = build_with_runtime(&coordinator, request, flights, job);
+            let poison = coordinator.sync_runtime_pipeline_poison();
+            (result, poison)
+        });
         match poison {
             Ok(Some(poison)) => {
                 return Err(RpcFailure::PipelineUnavailable(Box::new(
@@ -4659,6 +4662,7 @@ mod tests {
         assert!(indexed.dylib_hash.is_some());
         assert!(indexed.poison.is_none());
         let mut request = BuildRequest {
+            work_class: BuildWorkClass::Interactive,
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
             target_definition: target_hash,
@@ -4927,6 +4931,7 @@ mod tests {
             },
         ));
         let request = BuildRequest {
+            work_class: BuildWorkClass::Interactive,
             basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
             target_definition: target_hash,

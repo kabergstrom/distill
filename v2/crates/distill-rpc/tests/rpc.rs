@@ -302,6 +302,37 @@ fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outpu
 }
 
 #[test]
+fn batch_resolve_marks_lazy_build_work_as_batch() {
+    let server = server_with(&[(1, false)]);
+    let backend = Arc::new(RecordingBuildBackend::default());
+    server.install_build_backend(backend.clone());
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    server
+        .commit(Commit {
+            assets: vec![set_asset(
+                entry.uuid,
+                StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                AssetDeltaState::Changed,
+            )],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let snapshot = snapshot(&connect(&server, &[(1, false)]));
+
+    assert!(matches!(
+        snapshot.resolve_batch(entry.uuid),
+        RpcResult::Success(_)
+    ));
+    assert_eq!(
+        backend.requests.lock().unwrap()[0].work_class,
+        BuildWorkClass::Batch
+    );
+}
+
+#[test]
 fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() {
     let server = server_with(&[(1, false), (2, false)]);
     let backend = Arc::new(RecordingBuildBackend::default());
