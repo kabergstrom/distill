@@ -244,13 +244,23 @@ fn checked_native_range(
         .map_err(|_| integrity(format!("{operation} native offset does not fit usize")))
 }
 
-fn align_up(v: u32, align: u32) -> u32 {
+fn align_up(v: u32, align: u32) -> Option<u32> {
     let a = align.max(1);
     let rem = v % a;
     if rem == 0 {
-        v
+        Some(v)
     } else {
-        v + (a - rem)
+        v.checked_add(a - rem)
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::align_up;
+
+    #[test]
+    fn align_up_rejects_overflow() {
+        assert_eq!(align_up(u32::MAX, 8), None);
     }
 }
 
@@ -698,7 +708,9 @@ impl<'a> Executor<'a> {
         let entry = self.ctor(ctor)?;
         let (off, len) = read_varref(wire, wire_slot)?;
         let m = self.meta(elem);
-        let stride = m.wire_stride();
+        let stride = m
+            .wire_stride()
+            .ok_or_else(|| integrity("sequence wire stride overflows"))?;
         let region = self.var_range(off, stride as u64 * len as u64, m.wire_align)?;
         self.charge()?;
         let mut cursor = (entry.begin)(dst.add(native as usize), len)
@@ -761,9 +773,14 @@ impl<'a> Executor<'a> {
         let (off, len) = read_varref(wire, wire_slot)?;
         let km = self.meta(key);
         let vm = self.meta(value);
-        let value_off = align_up(km.wire_size, vm.wire_align);
+        let value_off = align_up(km.wire_size, vm.wire_align)
+            .ok_or_else(|| integrity("map value offset overflows"))?;
         let pair_align = km.wire_align.max(vm.wire_align);
-        let stride = align_up(value_off + vm.wire_size, pair_align);
+        let pair_size = value_off
+            .checked_add(vm.wire_size)
+            .ok_or_else(|| integrity("map pair size overflows"))?;
+        let stride = align_up(pair_size, pair_align)
+            .ok_or_else(|| integrity("map pair stride overflows"))?;
         let region = self.var_range(off, stride as u64 * len as u64, pair_align)?;
         self.charge()?;
         let mut cursor = (entry.begin)(dst.add(native as usize), len)

@@ -342,6 +342,7 @@ impl Store {
         create_dir(state_path)?;
         create_dir(&state_path.join("cas"))?;
         create_dir(&state_path.join("tools"))?;
+        crate::pipeline::cleanup_staged_tool_temps(state_path)?;
 
         let db_path = state_path.join("meta.sqlite");
         let conn = Connection::open(&db_path)?;

@@ -33,6 +33,25 @@ fn instance_id_persists_across_reopen() {
 }
 
 #[test]
+fn reopen_removes_orphaned_tool_stage_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cfg(&dir);
+    drop(Store::open(config.clone()).unwrap());
+
+    let objects = config.state_path.join("tools/objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    let orphan = objects.join(".stage-abandoned");
+    let immutable = objects.join("tool-object");
+    std::fs::write(&orphan, b"partial").unwrap();
+    std::fs::write(&immutable, b"complete").unwrap();
+
+    drop(Store::open(config).unwrap());
+
+    assert!(!orphan.exists());
+    assert_eq!(std::fs::read(immutable).unwrap(), b"complete");
+}
+
+#[test]
 fn recreate_re_mints_the_instance_id_and_resets_versions() {
     // §13: re-minted whenever daemon state is rebuilt from scratch —
     // InputVersion counters restart after state loss, so the id must

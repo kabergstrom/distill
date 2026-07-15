@@ -153,6 +153,52 @@ fn hex_hash(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub(crate) fn cleanup_staged_tool_temps(state_path: &std::path::Path) -> Result<(), StoreError> {
+    let objects = state_path.join("tools/objects");
+    let entries = match std::fs::read_dir(&objects) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(StoreError::Io {
+                path: objects,
+                source,
+            })
+        }
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| StoreError::Io {
+            path: objects.clone(),
+            source,
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|source| StoreError::Io {
+                path: entry.path(),
+                source,
+            })?
+            .is_file()
+            || !entry.file_name().to_string_lossy().starts_with(".stage-")
+        {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed = true,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: entry.path(),
+                    source,
+                })
+            }
+        }
+    }
+    if removed {
+        crate::cas::manifest::fsync_dir(&objects)?;
+    }
+    Ok(())
+}
+
 fn stage_immutable_file(
     key: &str,
     path: &std::path::Path,

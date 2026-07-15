@@ -174,14 +174,31 @@ pub struct PlanMeta {
 
 impl PlanMeta {
     /// Element stride in the variable section: size rounded to alignment.
-    pub fn wire_stride(&self) -> u32 {
+    pub fn wire_stride(&self) -> Option<u32> {
         let a = self.wire_align.max(1);
         let rem = self.wire_size % a;
         if rem == 0 {
-            self.wire_size
+            Some(self.wire_size)
         } else {
-            self.wire_size + (a - rem)
+            self.wire_size.checked_add(a - rem)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlanMeta;
+
+    #[test]
+    fn wire_stride_rejects_alignment_overflow() {
+        let meta = PlanMeta {
+            wire_size: u32::MAX,
+            wire_align: 8,
+            native_size: 0,
+            native_align: 1,
+        };
+
+        assert_eq!(meta.wire_stride(), None);
     }
 }
 
