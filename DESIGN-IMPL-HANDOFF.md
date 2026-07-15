@@ -43,7 +43,10 @@ changes reconnect/resubscribe. Exact canonical target rows replace DSTS while
 per-target DSTG remains. DSFT is also removed: there is no cross-epoch plan
 cache, and any future epoch-local cache uses `(TypeUuid, LayoutHash)`. Generic
 `Option<T>` now uses typed contained construction, and the obsolete DSNL gates
-and schema-derived measured-native mirror have been deleted.
+and schema-derived measured-native mirror have been deleted. `source-walk`
+alone observes workspace sources and emits schema artifacts; the daemon watches
+the emitted schema/module files and compares their shared source identity, but
+does not crawl the workspace or maintain an independent source-staleness mode.
 
 **E. Restored incremental watcher contract (2026-07-15):**
 R35 supersedes the temporary sticky-full-scan watcher simplification. Preserve

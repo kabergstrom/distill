@@ -1027,20 +1027,21 @@ impl Deref for Blob { type Target = [u8]; }
 
 source-walk analyzes the asset-types crate and emits schema JSON (reusing
 `ngp-schema`'s `Schema`/`TypeDef`/`Field` model). The daemon watches this file
-and reloads on change. Staleness is detected the way newgameplus already
-does it: the schema embeds source hashes (`ngp-source-hash`) as a hot-reload
-freshness trigger. They are deliberately not an ABI or safety attestation and
-do not attempt to reconstruct an exact Cargo dependency closure. When they
-disagree with the workspace's current sources, the daemon keeps serving the
-last consistent registry, flags staleness, and pauses
-schema-writing services (adoption, codegen, disk migration) until a fresh
-schema lands. The recorded schema lineage (§6, §11, §13) makes the lag safe
-for builds too: ancestry is checked against the durable manifest's explicit
-parent links and current cursor. Data whose stamped cursor is not a proved
-forward ancestor of the registry cursor — including data ahead of a stale
-registry or on another accepted branch — refuses schema-dependent builds with
-a staleness error naming both hashes, rather than being automatically diffed
-backward into older semantics. Every physical layout table carries a small
+and reloads on change. `source-walk` owns workspace-source observation and
+emits the schema artifact atomically; the daemon neither crawls the Cargo
+workspace nor independently recomputes source freshness. The schema's shared
+New Game Plus source identity (`ngp-source-hash`) pairs that emitted artifact
+with the pipeline module compiled from the same source state. An edited source
+tree that has not produced a new schema or module artifact is not a daemon
+input, and an independently emitted schema/module mismatch rejects only that
+candidate while the last accepted epoch remains pinned by existing snapshots.
+The source identity is deliberately not an ABI or safety attestation and does
+not reconstruct a Cargo dependency closure. The recorded schema lineage (§6,
+§11, §13) remains the authority for authored-data ancestry: data whose stamped
+cursor is not a proved forward ancestor of the registry cursor refuses
+schema-dependent builds with a staleness error naming both hashes, rather than
+being automatically diffed backward into older semantics. Every physical
+layout table carries a small
 **`LayoutIdentity`** used only to select and bind the table: exact target
 triple, rustc identity, and source-walk extraction/layout algorithm version.
 It is not exported by the pipeline module and does not claim to enumerate the
@@ -5463,9 +5464,8 @@ to `PipelineState::Poisoned`, fences new jobs and loads, makes drain
 permanently incomplete, and prevents `dlclose` forever (a deliberate
 library leak). A later successful candidate may serve new snapshots but
 cannot heal or unload the poisoned old epoch. (§5's
-*staleness* flag — a valid registry lagging its workspace sources — is a
-different, non-poisoned state: the last consistent registry keeps
-serving and schema-writing services pause.) **Pinning the epoch pins module residency**:
+schema/module source-identity mismatch is an ordinary unpublished-candidate
+failure, not a second live-registry state.) **Pinning the epoch pins module residency**:
 `PipelineEpoch` holds module-owned trait objects and function pointers,
 so `dlclose` of the retired module is gated on the epoch `Arc`'s strong
 count reaching zero — every snapshot clone, job context, and RPC
@@ -9154,8 +9154,10 @@ ordinary §10 dependency kinds.
   run as long-running operations, never silently.
 - **Lazy migration** (§11): migration executes inside build import; disk
   migration is an explicit command only.
-- **Stale schema** (§5): `ngp-source-hash` staleness detection; serve the
-  last consistent registry, pause schema-writing services.
+- **Schema/module pairing** (§§3, 5): `source-walk` owns workspace observation;
+  the daemon watches its emitted schema and module artifacts and accepts only
+  a shared `ngp-source-hash` identity match. It does not crawl the workspace or
+  maintain a separate source-staleness mode.
 - **Concurrent writes** (§17, §14): version-preconditioned, rejected on
   mismatch; per-file publication is swap-verify-or-swap-back (atomic
   exchange, verify the displaced bytes, restore on conflict) under one
@@ -10922,9 +10924,10 @@ ordinary §10 dependency kinds.
   an opened, unpublished candidate exports its independently generated rows and
   DSCA through C ABI before registration. Because every row already contains
   DSNL, the separate measured-layout probe and duplicate comparison are removed.
-- **Source hashes are freshness hints** (§5): `ngp-source-hash` continues to
-  trigger New Game Plus/schema hot reload but is not strengthened into a Cargo
-  graph identity and is not trusted as an ABI, target, or safety gate.
+- **Source hashes pair emitted artifacts** (§5): `ngp-source-hash` continues to
+  drive New Game Plus's schema/module production and pairs those artifacts at
+  candidate acceptance, but the daemon does not independently watch workspace
+  sources. It is not a Cargo graph identity or an ABI, target, or safety gate.
 <!-- R33_LEDGER_END -->
 
 <!-- R34_LEDGER_BEGIN count=6 -->
@@ -10984,18 +10987,19 @@ work itself.
 
 ### Accepted risks (validate early)
 
-- source-walk layout fidelity vs. actual rustc `repr(Rust)` layout — now
-  *checked*, not assumed: the measured layout digest (§5) fails
-  registration on any divergence, naming the type. Spike early on
-  generics and exotic enums in P1 all the same — the check converts
-  silent corruption into loud refusal, not into correctness.
+- source-walk layout fidelity vs. actual rustc `repr(Rust)` layout: validate
+  the emitted DSWL tables early against compiler-derived fixtures for generics
+  and exotic enums. Runtime consumers still require a successful plan against
+  their compiler-generated live descriptor, but that does not independently
+  attest the producer table used during encoding.
 - The module host's same-rustc host-interface invariant (carried by the
   shared module-host crate factored out of newgameplus's
   `module_state.rs`, consumed by engine and daemon alike; there is no
   off-the-shelf host).
-- `ngp-source-hash` remains a hot-reload freshness trigger, not an ABI or
-  safety gate; correctness comes from ModuleAbiIdentity plus the independently
-  derived compiled rows/DSCA comparison.
+- `ngp-source-hash` pairs emitted schema and pipeline-module artifacts at
+  candidate acceptance; it is not an ABI or safety gate. `ModuleAbiIdentity`
+  separately gates the Rust host interface, and runtime compatibility remains
+  artifact-local (§3's R34 model).
 
 ### Deferred by decision
 
