@@ -1803,7 +1803,11 @@ pub struct ArtifactChunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkStream {
-    pub(crate) chunks: std::collections::VecDeque<ArtifactChunk>,
+    pub(crate) structural: Arc<[u8]>,
+    pub(crate) blobs: Vec<Arc<[u8]>>,
+    pub(crate) chunk_size: usize,
+    pub(crate) section: usize,
+    pub(crate) offset: usize,
     pub(crate) total_bytes: u64,
 }
 
@@ -1879,11 +1883,45 @@ impl Iterator for ProgressStream {
 
 impl ChunkStream {
     pub fn next_chunk(&mut self) -> Option<ArtifactChunk> {
-        self.chunks.pop_front()
+        if self.section > self.blobs.len() {
+            return None;
+        }
+        let (kind, bytes) = if self.section == 0 {
+            (ArtifactChunkKind::Structural, self.structural.as_ref())
+        } else {
+            (
+                ArtifactChunkKind::Blob {
+                    index: (self.section - 1) as u32,
+                },
+                self.blobs[self.section - 1].as_ref(),
+            )
+        };
+        if bytes.is_empty() {
+            self.section += 1;
+            self.offset = 0;
+            return Some(ArtifactChunk {
+                kind,
+                offset: 0,
+                bytes: Arc::from([]),
+            });
+        }
+        let start = self.offset;
+        let end = start.saturating_add(self.chunk_size).min(bytes.len());
+        let chunk = Arc::from(&bytes[start..end]);
+        self.offset = end;
+        if end == bytes.len() {
+            self.section += 1;
+            self.offset = 0;
+        }
+        Some(ArtifactChunk {
+            kind,
+            offset: start as u64,
+            bytes: chunk,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.section > self.blobs.len()
     }
 }
 

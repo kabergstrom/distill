@@ -5145,7 +5145,6 @@ fn path_glob_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
-    let mut chunks = VecDeque::new();
     let total_bytes = payload
         .blobs
         .iter()
@@ -5153,48 +5152,13 @@ fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
             total.checked_add(blob.len() as u64)
         })
         .expect("one process cannot hold more artifact bytes than u64");
-    push_chunks(
-        &mut chunks,
-        ArtifactChunkKind::Structural,
-        &payload.structural,
-        chunk_size,
-    );
-    for (index, blob) in payload.blobs.iter().enumerate() {
-        push_chunks(
-            &mut chunks,
-            ArtifactChunkKind::Blob {
-                index: index as u32,
-            },
-            blob,
-            chunk_size,
-        );
-    }
     ChunkStream {
-        chunks,
+        structural: Arc::clone(&payload.structural),
+        blobs: payload.blobs.clone(),
+        chunk_size,
+        section: 0,
+        offset: 0,
         total_bytes,
-    }
-}
-
-fn push_chunks(
-    out: &mut VecDeque<ArtifactChunk>,
-    kind: ArtifactChunkKind,
-    bytes: &[u8],
-    chunk_size: usize,
-) {
-    if bytes.is_empty() {
-        out.push_back(ArtifactChunk {
-            kind,
-            offset: 0,
-            bytes: Arc::from([]),
-        });
-        return;
-    }
-    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
-        out.push_back(ArtifactChunk {
-            kind: kind.clone(),
-            offset: (index * chunk_size) as u64,
-            bytes: Arc::from(chunk),
-        });
     }
 }
 

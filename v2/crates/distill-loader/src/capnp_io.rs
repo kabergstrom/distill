@@ -33,6 +33,9 @@ use crate::IoBasis;
 
 const DEFAULT_FETCH_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
+const COMMAND_CHANNEL_CAPACITY: usize = 256;
+const COMPLETION_CHANNEL_CAPACITY: usize = 256;
+const IN_FLIGHT_REQUEST_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
@@ -67,9 +70,10 @@ impl std::fmt::Display for RpcIoInitError {
 impl std::error::Error for RpcIoInitError {}
 
 pub struct RpcIo {
-    commands: mpsc::UnboundedSender<Command>,
-    events: sync_mpsc::Receiver<IoEvent>,
+    commands: mpsc::Sender<Command>,
+    events: mpsc::Receiver<Completion>,
     pending: Vec<IoEvent>,
+    delivered_fetches: Vec<FetchPermit>,
     basis: IoBasis,
     thread: Option<JoinHandle<()>>,
 }
@@ -84,8 +88,8 @@ impl RpcIo {
         request: ConnectRequest,
         config: RpcIoConfig,
     ) -> Result<Self, RpcIoInitError> {
-        let (commands, command_rx) = mpsc::unbounded_channel();
-        let (event_tx, events) = sync_mpsc::channel();
+        let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (event_tx, events) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
         let (init_tx, init_rx) = sync_mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("distill-rpc-io".into())
@@ -108,13 +112,14 @@ impl RpcIo {
             commands,
             events,
             pending: Vec::new(),
+            delivered_fetches: Vec::new(),
             basis,
             thread: Some(thread),
         })
     }
 
     fn send(&mut self, command: Command) {
-        if self.commands.send(command).is_err() {
+        if self.commands.blocking_send(command).is_err() {
             self.pending.push(IoEvent::ConnectionError {
                 message: "RPC IO thread is unavailable".into(),
             });
@@ -124,7 +129,10 @@ impl RpcIo {
 
 impl Drop for RpcIo {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Shutdown);
+        for permit in std::mem::take(&mut self.delivered_fetches) {
+            let _ = self.commands.blocking_send(Command::ReleaseFetch(permit));
+        }
+        let _ = self.commands.blocking_send(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -138,7 +146,11 @@ impl LoaderIO for RpcIo {
 
     fn begin_sweep(&mut self) -> IoBasis {
         let (reply, receive) = sync_mpsc::sync_channel(1);
-        if self.commands.send(Command::BeginSweep { reply }).is_err() {
+        if self
+            .commands
+            .blocking_send(Command::BeginSweep { reply })
+            .is_err()
+        {
             self.pending.push(IoEvent::ConnectionError {
                 message: "RPC IO thread is unavailable".into(),
             });
@@ -200,8 +212,34 @@ impl LoaderIO for RpcIo {
     }
 
     fn poll(&mut self) -> Vec<IoEvent> {
-        self.pending.extend(self.events.try_iter());
+        for permit in std::mem::take(&mut self.delivered_fetches) {
+            self.send(Command::ReleaseFetch(permit));
+        }
+        while let Ok(completion) = self.events.try_recv() {
+            if let Some(permit) = completion.fetch_permit {
+                self.delivered_fetches.push(permit);
+            }
+            self.pending.push(completion.event);
+        }
         std::mem::take(&mut self.pending)
+    }
+}
+
+struct Completion {
+    event: IoEvent,
+    fetch_permit: Option<FetchPermit>,
+}
+
+async fn send_event(events: &mpsc::Sender<Completion>, event: IoEvent) -> bool {
+    events.send(Completion::event(event)).await.is_ok()
+}
+
+impl Completion {
+    fn event(event: IoEvent) -> Self {
+        Self {
+            event,
+            fetch_permit: None,
+        }
     }
 }
 
@@ -229,6 +267,7 @@ enum Command {
     UnsubscribeAsset(AssetUuid),
     SubscribePath(String),
     UnsubscribePath(String),
+    ReleaseFetch(FetchPermit),
     Shutdown,
 }
 
@@ -236,8 +275,8 @@ fn run_thread(
     address: SocketAddr,
     request: ConnectRequest,
     config: RpcIoConfig,
-    commands: mpsc::UnboundedReceiver<Command>,
-    events: sync_mpsc::Sender<IoEvent>,
+    commands: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Completion>,
     init: sync_mpsc::SyncSender<Result<IoBasis, RpcIoInitError>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -324,6 +363,9 @@ fn run_thread(
                 config.spool_threshold,
             ))),
             fetch_wake: Rc::new(Notify::new()),
+            request_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                IN_FLIGHT_REQUEST_LIMIT,
+            )),
             spool_directory: config.spool_directory,
         }
         .run()
@@ -338,12 +380,13 @@ struct Driver {
     hub: RemoteHub,
     snapshot: RemoteSnapshot,
     accepted: RuntimeAttestation,
-    commands: mpsc::UnboundedReceiver<Command>,
-    events: sync_mpsc::Sender<IoEvent>,
+    commands: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Completion>,
     subscriptions: Rc<RefCell<Subscriptions>>,
     delta_task: Option<tokio::task::JoinHandle<()>>,
     fetch_admission: Rc<RefCell<FetchAdmission>>,
     fetch_wake: Rc<Notify>,
+    request_slots: std::sync::Arc<tokio::sync::Semaphore>,
     spool_directory: Option<PathBuf>,
 }
 
@@ -375,21 +418,29 @@ impl Driver {
                         match io_basis(self.snapshot.basis()) {
                             Ok(basis) => Some(basis),
                             Err(error) => {
-                                let _ = self.events.send(IoEvent::ConnectionError {
-                                    message: format!("invalid RPC load policy: {error:?}"),
-                                });
+                                let _ = send_event(
+                                    &self.events,
+                                    IoEvent::ConnectionError {
+                                        message: format!("invalid RPC load policy: {error:?}"),
+                                    },
+                                )
+                                .await;
                                 None
                             }
                         }
                     }
                     Ok(call) => {
-                        let _ = self.events.send(connection_event(call));
+                        let _ = send_event(&self.events, connection_event(call)).await;
                         None
                     }
                     Err(error) => {
-                        let _ = self.events.send(IoEvent::ConnectionError {
-                            message: error.to_string(),
-                        });
+                        let _ = send_event(
+                            &self.events,
+                            IoEvent::ConnectionError {
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
                         None
                     }
                 };
@@ -397,16 +448,25 @@ impl Driver {
             }
             Command::Resolve { req, uuid, basis } => {
                 if !self.basis_matches(&basis) {
-                    let _ = self
-                        .events
-                        .send(request_error(req, basis, "stale RPC basis".into()));
+                    let _ = send_event(
+                        &self.events,
+                        request_error(req, basis, "stale RPC basis".into()),
+                    )
+                    .await;
                     return true;
                 }
+                let Ok(request_slot) = std::sync::Arc::clone(&self.request_slots)
+                    .acquire_owned()
+                    .await
+                else {
+                    return false;
+                };
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 tokio::task::spawn_local(async move {
+                    let _request_slot = request_slot;
                     let event = resolve_event(snapshot, req, uuid, basis).await;
-                    let _ = events.send(event);
+                    let _ = send_event(&events, event).await;
                 });
             }
             Command::Fetch {
@@ -415,18 +475,27 @@ impl Driver {
                 basis,
             } => {
                 if !self.basis_matches(&basis) {
-                    let _ = self
-                        .events
-                        .send(request_error(req, basis, "stale RPC basis".into()));
+                    let _ = send_event(
+                        &self.events,
+                        request_error(req, basis, "stale RPC basis".into()),
+                    )
+                    .await;
                     return true;
                 }
+                let Ok(request_slot) = std::sync::Arc::clone(&self.request_slots)
+                    .acquire_owned()
+                    .await
+                else {
+                    return false;
+                };
                 let hub = self.hub.clone();
                 let events = self.events.clone();
                 let admission = Rc::clone(&self.fetch_admission);
                 let wake = Rc::clone(&self.fetch_wake);
                 let spool_directory = self.spool_directory.clone();
                 tokio::task::spawn_local(async move {
-                    let event = fetch_event(
+                    let _request_slot = request_slot;
+                    let completion = fetch_event(
                         hub,
                         req,
                         content_hash,
@@ -436,21 +505,30 @@ impl Driver {
                         spool_directory,
                     )
                     .await;
-                    let _ = events.send(event);
+                    let _ = events.send(completion).await;
                 });
             }
             Command::ResolvePath { req, path, basis } => {
                 if !self.basis_matches(&basis) {
-                    let _ = self
-                        .events
-                        .send(request_error(req, basis, "stale RPC basis".into()));
+                    let _ = send_event(
+                        &self.events,
+                        request_error(req, basis, "stale RPC basis".into()),
+                    )
+                    .await;
                     return true;
                 }
+                let Ok(request_slot) = std::sync::Arc::clone(&self.request_slots)
+                    .acquire_owned()
+                    .await
+                else {
+                    return false;
+                };
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 tokio::task::spawn_local(async move {
+                    let _request_slot = request_slot;
                     let event = path_event(snapshot, req, path, basis).await;
-                    let _ = events.send(event);
+                    let _ = send_event(&events, event).await;
                 });
             }
             Command::SubscribeAsset(uuid) => {
@@ -477,6 +555,10 @@ impl Driver {
                     self.unsubscribe(Vec::new(), vec![path]).await;
                 }
             }
+            Command::ReleaseFetch(permit) => {
+                let _ = self.fetch_admission.borrow_mut().release(permit);
+                self.fetch_wake.notify_waiters();
+            }
             Command::Shutdown => return false,
         }
         true
@@ -490,7 +572,7 @@ impl Driver {
         let request = match reattest_request(&self.hub, &attestation) {
             Ok(request) => request,
             Err(message) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed { message });
+                let _ = send_event(&self.events, IoEvent::ReattestationFailed { message }).await;
                 return;
             }
         };
@@ -501,14 +583,22 @@ impl Driver {
             }
             Ok(RemoteCall::ReconnectRequired(_)) => self.reconnect(attestation).await,
             Ok(call) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: remote_message(call),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: remote_message(call),
+                    },
+                )
+                .await;
             }
             Err(error) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -517,49 +607,69 @@ impl Driver {
         let request = match connect_request(&self.target, &attestation) {
             Ok(request) => request,
             Err(message) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed { message });
+                let _ = send_event(&self.events, IoEvent::ReattestationFailed { message }).await;
                 return;
             }
         };
         let client = match CapnpClient::connect_local(self.address).await {
             Ok(client) => client,
             Err(error) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
                 return;
             }
         };
         let outcome = match client.connect(&request).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
                 return;
             }
         };
         let hub = match RemoteHub::connected(outcome) {
             Ok(hub) => hub,
             Err(outcome) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: format!("RPC reconnection rejected: {outcome:?}"),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: format!("RPC reconnection rejected: {outcome:?}"),
+                    },
+                )
+                .await;
                 return;
             }
         };
         let snapshot = match hub.snapshot().await {
             Ok(RemoteCall::Success(snapshot)) => snapshot,
             Ok(call) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: remote_message(call),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: remote_message(call),
+                    },
+                )
+                .await;
                 return;
             }
             Err(error) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
                 return;
             }
         };
@@ -571,7 +681,7 @@ impl Driver {
         self.snapshot = snapshot;
         self.accepted = attestation;
         self.restart_subscription().await;
-        self.publish_reattested();
+        self.publish_reattested().await;
     }
 
     async fn refresh_snapshot_and_publish(&mut self) {
@@ -579,33 +689,49 @@ impl Driver {
             Ok(RemoteCall::Success(snapshot)) => {
                 self.snapshot = snapshot;
                 self.restart_subscription().await;
-                self.publish_reattested();
+                self.publish_reattested().await;
             }
             Ok(call) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: remote_message(call),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: remote_message(call),
+                    },
+                )
+                .await;
             }
             Err(error) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
             }
         }
     }
 
-    fn publish_reattested(&self) {
+    async fn publish_reattested(&self) {
         match io_basis(self.snapshot.basis()) {
             Ok(basis) => {
-                let _ = self.events.send(IoEvent::Reattested {
-                    attestation: self.accepted.clone(),
-                    basis,
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::Reattested {
+                        attestation: self.accepted.clone(),
+                        basis,
+                    },
+                )
+                .await;
             }
             Err(error) => {
-                let _ = self.events.send(IoEvent::ReattestationFailed {
-                    message: format!("invalid reattested load policy: {error:?}"),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ReattestationFailed {
+                        message: format!("invalid reattested load policy: {error:?}"),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -644,22 +770,29 @@ impl Driver {
                         loop {
                             match subscription.next().await {
                                 Ok(Some(event)) => {
-                                    let subscriptions = subscriptions.borrow();
-                                    for event in stream_events(
-                                        event,
-                                        &subscriptions.assets,
-                                        &subscriptions.paths,
-                                    ) {
-                                        if events.send(event).is_err() {
+                                    let filtered = {
+                                        let subscriptions = subscriptions.borrow();
+                                        stream_events(
+                                            event,
+                                            &subscriptions.assets,
+                                            &subscriptions.paths,
+                                        )
+                                    };
+                                    for event in filtered {
+                                        if !send_event(&events, event).await {
                                             return;
                                         }
                                     }
                                 }
                                 Ok(None) => return,
                                 Err(error) => {
-                                    let _ = events.send(IoEvent::ConnectionError {
-                                        message: error.to_string(),
-                                    });
+                                    let _ = send_event(
+                                        &events,
+                                        IoEvent::ConnectionError {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await;
                                     return;
                                 }
                             }
@@ -668,12 +801,16 @@ impl Driver {
                 }
             }
             Ok(call) => {
-                let _ = self.events.send(connection_event(call));
+                let _ = send_event(&self.events, connection_event(call)).await;
             }
             Err(error) => {
-                let _ = self.events.send(IoEvent::ConnectionError {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ConnectionError {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -682,12 +819,16 @@ impl Driver {
         match self.hub.unsubscribe(assets, paths).await {
             Ok(RemoteCall::Success(())) => {}
             Ok(call) => {
-                let _ = self.events.send(connection_event(call));
+                let _ = send_event(&self.events, connection_event(call)).await;
             }
             Err(error) => {
-                let _ = self.events.send(IoEvent::ConnectionError {
-                    message: error.to_string(),
-                });
+                let _ = send_event(
+                    &self.events,
+                    IoEvent::ConnectionError {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -774,31 +915,37 @@ async fn fetch_event(
     admission: Rc<RefCell<FetchAdmission>>,
     wake: Rc<Notify>,
     spool_directory: Option<PathBuf>,
-) -> IoEvent {
+) -> Completion {
     let mut terminal = match hub.fetch(content_hash).await {
         Ok(RemoteCall::Success(terminal)) => terminal,
-        Ok(call) => return remote_request_event(call, req, request_basis),
-        Err(error) => return request_error(req, request_basis, error.to_string()),
+        Ok(call) => return Completion::event(remote_request_event(call, req, request_basis)),
+        Err(error) => {
+            return Completion::event(request_error(req, request_basis, error.to_string()))
+        }
     };
     let basis = match io_basis(&terminal.basis) {
         Ok(basis) => basis,
         Err(error) => {
-            return request_error(req, request_basis, format!("invalid RPC basis: {error:?}"))
+            return Completion::event(request_error(
+                req,
+                request_basis,
+                format!("invalid RPC basis: {error:?}"),
+            ))
         }
     };
     let total_bytes = match usize::try_from(terminal.value.total_bytes()) {
         Ok(total_bytes) => total_bytes,
         Err(_) => {
-            return request_error(
+            return Completion::event(request_error(
                 req,
                 request_basis,
                 "fetched artifact is too large for this client".into(),
-            )
+            ))
         }
     };
     let permit = match acquire_fetch(admission, wake, total_bytes).await {
         Ok(permit) => permit,
-        Err(error) => return request_error(req, request_basis, error),
+        Err(error) => return Completion::event(request_error(req, request_basis, error)),
     };
     let payload = match permit.storage {
         FetchStorage::Memory => match collect_remote_chunks(&mut terminal.value).await {
@@ -807,42 +954,51 @@ async fn fetch_event(
                     total.checked_add(blob.len())
                 });
                 if observed != Some(total_bytes) {
-                    return request_error(
+                    return Completion::event(request_error(
                         req,
                         request_basis,
                         "artifact stream length differs from its authenticated total".into(),
-                    );
+                    ));
                 }
                 FetchPayload::Memory { structural, blobs }
             }
-            Err(error) => return request_error(req, request_basis, error),
+            Err(error) => {
+                return Completion::event(request_error(req, request_basis, error));
+            }
         },
         FetchStorage::Spool => {
             match spool_remote_chunks(&mut terminal.value, total_bytes, spool_directory.as_deref())
                 .await
             {
                 Ok(payload) => payload,
-                Err(error) => return request_error(req, request_basis, error),
+                Err(error) => {
+                    return Completion::event(request_error(req, request_basis, error));
+                }
             }
         }
     };
     let layout_hash = match payload.layout_hash(content_hash) {
         Ok(layout_hash) => layout_hash,
-        Err(error) => return request_error(req, request_basis, error),
+        Err(error) => return Completion::event(request_error(req, request_basis, error)),
     };
     let wire_layout = match hub.wire_tree(layout_hash).await {
         Ok(RemoteCall::Success(bytes)) => bytes,
-        Ok(call) => return remote_request_event(call, req, request_basis),
-        Err(error) => return request_error(req, request_basis, error.to_string()),
+        Ok(call) => return Completion::event(remote_request_event(call, req, request_basis)),
+        Err(error) => {
+            return Completion::event(request_error(req, request_basis, error.to_string()))
+        }
     };
     match payload.finish(layout_hash, wire_layout) {
-        Ok(artifact) => IoEvent::Fetched {
-            req,
-            content_hash,
-            artifact,
-            basis,
+        Ok(artifact) => Completion {
+            event: IoEvent::Fetched {
+                req,
+                content_hash,
+                artifact,
+                basis,
+            },
+            fetch_permit: Some(permit.into_permit()),
         },
-        Err(error) => request_error(req, request_basis, error),
+        Err(error) => Completion::event(request_error(req, request_basis, error)),
     }
 }
 
@@ -895,6 +1051,14 @@ impl Drop for FetchAdmissionGuard {
             let _ = self.admission.borrow_mut().release(permit);
             self.wake.notify_waiters();
         }
+    }
+}
+
+impl FetchAdmissionGuard {
+    fn into_permit(mut self) -> FetchPermit {
+        self.permit
+            .take()
+            .expect("an admitted fetch guard always owns its permit")
     }
 }
 

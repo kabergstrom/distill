@@ -208,6 +208,23 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         }
     ));
 
+    io.fetch(ReqId(10), hash, &basis);
+    io.fetch(ReqId(11), hash, &basis);
+    std::thread::sleep(Duration::from_millis(100));
+    let first_fetch = io.poll();
+    assert_eq!(
+        first_fetch
+            .iter()
+            .filter(|event| matches!(event, IoEvent::Fetched { .. }))
+            .count(),
+        1,
+        "the first queued payload must retain its exclusive permit until consumed"
+    );
+    drop(first_fetch);
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::Fetched { .. })));
+
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);
     io.resolve_path(ReqId(3), "assets/a.bundle", &basis);
