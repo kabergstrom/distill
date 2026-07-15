@@ -16,9 +16,9 @@ use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use crate::activation::{activate, publish_archive, publish_manifest, PointerError};
 use crate::archive::{encode_archive, ArchiveError, ArtifactPayload};
 use crate::manifest::{
-    canonicalize, encode_manifest, verify_mounted_closure, ArchiveRef, ArtifactMetadata,
-    EncodingRow, IndexRow, ManifestAssetRow, ManifestError, ManifestLoadEdge, PackManifest,
-    PackTarget, PathRow, WireTreeRow,
+    canonicalize, encode_manifest, verify_expected_terminals, ArchiveRef, EncodingRow, IndexRow,
+    ManifestAssetRow, ManifestError, ManifestLoadEdge, PackManifest, PackTarget, PathRow,
+    WireTreeRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +111,6 @@ struct FetchedArtifact {
     blobs: Vec<Vec<u8>>,
     terminal_type: TypeUuid,
     layout_hash: LayoutHash,
-    load_deps: Vec<AssetUuid>,
     load_edges: Vec<distill_rpc::ServedLoadEdge>,
 }
 
@@ -200,7 +199,6 @@ pub fn build_pack(
                 blobs,
                 terminal_type,
                 layout_hash,
-                load_deps,
                 load_edges,
             },
         );
@@ -239,14 +237,10 @@ pub fn build_pack(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let metadata = artifacts
+    let terminal_types = artifacts
         .iter()
-        .map(|(asset, artifact)| ArtifactMetadata {
-            asset_uuid: *asset,
-            terminal_type: artifact.terminal_type,
-            load_deps: artifact.load_deps.clone(),
-        })
-        .collect::<Vec<_>>();
+        .map(|(asset, artifact)| (*asset, artifact.terminal_type))
+        .collect::<BTreeMap<_, _>>();
 
     let paths = if definition.include_path_table {
         Some(build_paths(snapshot, artifacts.keys().copied())?)
@@ -297,7 +291,7 @@ pub fn build_pack(
         wire_trees,
         paths,
     })?;
-    verify_mounted_closure(&manifest, &metadata)?;
+    verify_expected_terminals(&manifest, &terminal_types)?;
     let manifest_bytes = encode_manifest(&manifest)?;
     Ok(PackBuildOutput {
         manifest,

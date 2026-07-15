@@ -11,8 +11,8 @@ use distill_pack::builder::{
     build_pack, build_publish_and_activate_pack, PackBuildError, PackBuildTarget,
 };
 use distill_pack::{
-    archive_filename, manifest_filename, manifest_hash, read_current, PackTarget, PackfileIO,
-    RuntimeTarget,
+    activate, archive_filename, manifest_filename, manifest_hash, publish_archive,
+    publish_manifest, read_current, PackTarget, PackfileIO, RuntimeTarget,
 };
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
@@ -233,9 +233,12 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
         *blake3::hash(&output.archive_bytes).as_bytes()
     );
 
-    PackfileIO::mount(
-        &output.manifest_bytes,
-        vec![output.archive_bytes],
+    let directory = tempfile::tempdir().unwrap();
+    publish_archive(directory.path(), &output.archive_bytes).unwrap();
+    let mounted_manifest = publish_manifest(directory.path(), &output.manifest_bytes).unwrap();
+    activate(directory.path(), mounted_manifest).unwrap();
+    PackfileIO::mount_current(
+        directory.path(),
         &RuntimeTarget {
             target: fixture.target.name,
             target_def_hash: TARGET_HASH,
@@ -283,9 +286,8 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
     );
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
 
-    PackfileIO::mount(
-        &fs::read(directory.join(manifest_filename(manifest_hash))).unwrap(),
-        vec![fs::read(directory.join(archive_filename(output.archive_file_hash))).unwrap()],
+    PackfileIO::mount_current(
+        &directory,
         &RuntimeTarget {
             target: fixture.target.name,
             target_def_hash: TARGET_HASH,

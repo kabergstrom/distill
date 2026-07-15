@@ -78,7 +78,7 @@ pub fn archive_filename(file_hash: [u8; 32]) -> String {
 /// link creation is atomic and no-replace on the same filesystem. An existing
 /// equal file is idempotent; different bytes under the same name are fatal.
 pub fn publish_archive(directory: &Path, bytes: &[u8]) -> Result<[u8; 32], PointerError> {
-    crate::archive::decode_archive(bytes).map_err(|_| PointerError::InvalidPack)?;
+    crate::archive::validate_archive(bytes).map_err(|_| PointerError::InvalidPack)?;
     let hash = *blake3::hash(bytes).as_bytes();
     publish_immutable(directory, &archive_filename(hash), bytes)?;
     Ok(hash)

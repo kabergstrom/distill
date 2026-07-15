@@ -1,6 +1,6 @@
 //! DPK1 manifest file and its five authenticated tables (§16).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 
@@ -466,23 +466,6 @@ fn string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{decode_paths, ManifestError};
-
-    #[test]
-    fn decoder_rejects_noncanonical_path_bytes() {
-        let path = "te\u{301}xtures/a.bundle";
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(path.as_bytes());
-        bytes.extend_from_slice(&[1; 16]);
-
-        assert!(matches!(decode_paths(&bytes), Err(ManifestError::BadPath)));
-    }
-}
-
 pub fn manifest_hash(bytes: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"DSPM");
@@ -491,22 +474,17 @@ pub fn manifest_hash(bytes: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactMetadata {
-    pub asset_uuid: AssetUuid,
-    pub terminal_type: TypeUuid,
-    pub load_deps: Vec<AssetUuid>,
-}
-pub fn verify_artifact_metadata(
+pub fn verify_artifact_header(
     row: &ManifestAssetRow,
-    header: &ArtifactMetadata,
+    asset_uuid: AssetUuid,
+    load_deps: &[AssetUuid],
 ) -> Result<(), ManifestError> {
-    if row.asset_uuid == header.asset_uuid
+    if row.asset_uuid == asset_uuid
         && row
             .load_deps
             .iter()
             .map(|edge| edge.asset_uuid)
-            .eq(header.load_deps.iter().copied())
+            .eq(load_deps.iter().copied())
     {
         Ok(())
     } else {
@@ -529,28 +507,24 @@ fn verify_manifest_closure(manifest: &PackManifest) -> Result<(), ManifestError>
     Ok(())
 }
 
-/// Verify ContentHash-authenticated artifact headers against manifest direct
-/// edges and confirm every expected terminal type against the dependency's
-/// authenticated artifact header.
-pub fn verify_mounted_closure(
+/// Confirm each manifest edge's expected type against the terminal types of
+/// the ContentHash-authenticated artifacts selected for the pack.
+pub fn verify_expected_terminals(
     manifest: &PackManifest,
-    artifacts: &[ArtifactMetadata],
+    terminal_types: &BTreeMap<AssetUuid, TypeUuid>,
 ) -> Result<(), ManifestError> {
-    if artifacts.len() != manifest.assets.len() {
+    if terminal_types.len() != manifest.assets.len() {
         return Err(ManifestError::MetadataMismatch);
     }
     for row in &manifest.assets {
-        let metadata = artifacts
-            .iter()
-            .find(|metadata| metadata.asset_uuid == row.asset_uuid)
+        terminal_types
+            .get(&row.asset_uuid)
             .ok_or(ManifestError::MetadataMismatch)?;
-        verify_artifact_metadata(row, metadata)?;
         for edge in &row.load_deps {
-            let dependency = artifacts
-                .iter()
-                .find(|candidate| candidate.asset_uuid == edge.asset_uuid)
+            let dependency_type = terminal_types
+                .get(&edge.asset_uuid)
                 .ok_or(ManifestError::MissingDependency(edge.asset_uuid))?;
-            if dependency.terminal_type != edge.expected_terminal {
+            if *dependency_type != edge.expected_terminal {
                 return Err(ManifestError::DependencyTypeMismatch(
                     edge.expected_terminal,
                 ));
@@ -594,5 +568,22 @@ impl<'a> Reader<'a> {
         Ok(std::str::from_utf8(self.take(n)?)
             .map_err(|_| ManifestError::Utf8)?
             .to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_paths, ManifestError};
+
+    #[test]
+    fn decoder_rejects_noncanonical_path_bytes() {
+        let path = "te\u{301}xtures/a.bundle";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&[1; 16]);
+
+        assert!(matches!(decode_paths(&bytes), Err(ManifestError::BadPath)));
     }
 }

@@ -9,7 +9,10 @@ use distill_pack::manifest::{
     encode_manifest, ArchiveRef, EncodingRow, IndexRow, ManifestAssetRow, PackManifest, PackTarget,
     PathRow, WireTreeRow,
 };
-use distill_pack::{MountError, PackfileIO, RuntimeTarget};
+use distill_pack::{
+    activate, archive_filename, manifest_filename, manifest_hash, MountError, PackfileIO,
+    RuntimeTarget,
+};
 use distill_wire::artifact::{
     content_hash, parse_artifact, write_artifact, ArtifactHeader, ARTIFACT_MAGIC,
 };
@@ -115,10 +118,44 @@ fn fixture(
     )
 }
 
+fn mount_pack(
+    manifest: &[u8],
+    archive: &[u8],
+    runtime: &RuntimeTarget,
+) -> Result<PackfileIO, MountError> {
+    let archive_hash = distill_pack::manifest::decode_manifest(manifest)
+        .unwrap()
+        .archives[0]
+        .file_hash;
+    mount_pack_as(manifest, archive_hash, archive, runtime)
+}
+
+fn mount_pack_as(
+    manifest: &[u8],
+    archive_hash: [u8; 32],
+    archive: &[u8],
+    runtime: &RuntimeTarget,
+) -> Result<PackfileIO, MountError> {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_hash = manifest_hash(manifest);
+    std::fs::write(
+        directory.path().join(manifest_filename(manifest_hash)),
+        manifest,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join(archive_filename(archive_hash)),
+        archive,
+    )
+    .unwrap();
+    activate(directory.path(), manifest_hash).unwrap();
+    PackfileIO::mount_current(directory.path(), runtime)
+}
+
 #[test]
 fn resolves_fetches_and_paths_under_one_manifest_basis() {
     let (manifest, archive, runtime, asset_uuid, content_hash) = fixture(true);
-    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
     io.resolve(ReqId(1), asset_uuid, &basis);
     io.fetch(ReqId(2), content_hash, &basis);
@@ -142,14 +179,9 @@ fn resolves_fetches_and_paths_under_one_manifest_basis() {
 }
 
 #[test]
-fn file_mount_keeps_blob_ranges_alive_after_io_drops() {
+fn current_mount_keeps_blob_ranges_alive_after_io_drops() {
     let (manifest, archive, runtime, _, content_hash) = fixture(true);
-    let directory = tempfile::tempdir().unwrap();
-    let manifest_path = directory.path().join("pack.manifest");
-    let archive_path = directory.path().join("pack-7.dpk");
-    std::fs::write(&manifest_path, manifest).unwrap();
-    std::fs::write(&archive_path, archive).unwrap();
-    let mut io = PackfileIO::mount_files(&manifest_path, &[archive_path], &runtime).unwrap();
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
     io.fetch(ReqId(1), content_hash, &basis);
     let Some(IoEvent::Fetched { artifact, .. }) = io.poll().pop() else {
@@ -163,7 +195,7 @@ fn file_mount_keeps_blob_ranges_alive_after_io_drops() {
 #[test]
 fn target_binding_checks_only_the_module_target_definition_hash() {
     let (manifest, archive, runtime, _, _) = fixture(true);
-    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let target = LoaderRuntimeTarget::new(GameModuleEpoch(1), [4; 32]);
     io.bind_target(target.clone());
     assert!(
@@ -181,7 +213,7 @@ fn target_binding_checks_only_the_module_target_definition_hash() {
 #[test]
 fn absent_path_table_is_loudly_unsupported() {
     let (manifest, archive, runtime, _, _) = fixture(false);
-    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
     io.resolve_path(ReqId(1), "assets/a.bundle", &basis);
     assert!(matches!(
@@ -198,8 +230,8 @@ fn path_queries_are_normalized_before_lookup() {
     let (manifest, archive, runtime, asset_uuid, _) = fixture(true);
     let mut decoded = distill_pack::manifest::decode_manifest(&manifest).unwrap();
     decoded.paths.as_mut().unwrap()[0].path = "t\u{e9}xtures/a.bundle".into();
-    let mut io =
-        PackfileIO::mount(&encode_manifest(&decoded).unwrap(), vec![archive], &runtime).unwrap();
+    let manifest = encode_manifest(&decoded).unwrap();
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
     io.resolve_path(ReqId(1), "te\u{301}xtures/a.bundle", &basis);
 
@@ -213,7 +245,7 @@ fn mount_refuses_wrong_runtime_or_archive_identity() {
     let (manifest, archive, mut runtime, _, _) = fixture(true);
     runtime.target_def_hash = [0; 32];
     assert!(matches!(
-        PackfileIO::mount(&manifest, vec![archive.clone()], &runtime),
+        mount_pack(&manifest, &archive, &runtime),
         Err(MountError::TargetMismatch)
     ));
 
@@ -221,7 +253,7 @@ fn mount_refuses_wrong_runtime_or_archive_identity() {
     let mut bad_archive = archive;
     bad_archive[10] ^= 1;
     assert!(matches!(
-        PackfileIO::mount(&manifest, vec![bad_archive], &runtime),
+        mount_pack(&manifest, &bad_archive, &runtime),
         Err(MountError::Archive(_))
     ));
 }
@@ -231,9 +263,11 @@ fn internal_archive_trailer_is_not_the_archive_file_hash() {
     let (manifest, archive, runtime, _, _) = fixture(true);
     let mut decoded = distill_pack::manifest::decode_manifest(&manifest).unwrap();
     decoded.archives[0].file_hash = archive[archive.len() - 32..].try_into().unwrap();
+    let archive_hash = decoded.archives[0].file_hash;
+    let manifest = encode_manifest(&decoded).unwrap();
 
     assert!(matches!(
-        PackfileIO::mount(&encode_manifest(&decoded).unwrap(), vec![archive], &runtime),
+        mount_pack_as(&manifest, archive_hash, &archive, &runtime),
         Err(MountError::ArchiveFileHash(7))
     ));
 }
@@ -241,7 +275,7 @@ fn internal_archive_trailer_is_not_the_archive_file_hash() {
 #[test]
 fn stale_pack_basis_cannot_read() {
     let (manifest, archive, runtime, asset_uuid, _) = fixture(true);
-    let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let stale = IoBasis::Pack {
         manifest: distill_loader::ManifestHash([0; 32]),
     };

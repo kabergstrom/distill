@@ -54,22 +54,6 @@ pub enum ArchiveObjectKind {
     Blob,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedObject {
-    pub kind: ArchiveObjectKind,
-    pub stored: Vec<u8>,
-    pub raw: Vec<u8>,
-    pub location: ObjectLocation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedArchive {
-    pub generation: u32,
-    pub encoder: String,
-    pub zstd_level: i32,
-    pub objects: BTreeMap<EKey, DecodedObject>,
-}
-
 /// Validated archive metadata without retaining any payload copy. PackfileIO
 /// keeps this beside an mmap and decodes structural frames on demand; blob
 /// extents remain ranges of the mapping.
@@ -231,37 +215,8 @@ fn write_object(
     );
 }
 
-pub fn decode_archive(bytes: &[u8]) -> Result<DecodedArchive, ArchiveError> {
-    let scanned = scan_archive(bytes)?;
-    let mut objects = BTreeMap::new();
-    for (key, object) in scanned.objects {
-        let offset =
-            usize::try_from(object.location.offset).map_err(|_| ArchiveError::BadLength)?;
-        let len = usize::try_from(object.location.len).map_err(|_| ArchiveError::BadLength)?;
-        let stored = bytes
-            .get(offset..offset.checked_add(len).ok_or(ArchiveError::BadLength)?)
-            .ok_or(ArchiveError::Truncated)?
-            .to_vec();
-        let raw = match object.kind {
-            ArchiveObjectKind::Structural => decode_structural(&stored)?,
-            ArchiveObjectKind::Blob => stored.clone(),
-        };
-        objects.insert(
-            key,
-            DecodedObject {
-                kind: object.kind,
-                stored,
-                raw,
-                location: object.location,
-            },
-        );
-    }
-    Ok(DecodedArchive {
-        generation: scanned.generation,
-        encoder: scanned.encoder,
-        zstd_level: scanned.zstd_level,
-        objects,
-    })
+pub fn validate_archive(bytes: &[u8]) -> Result<(), ArchiveError> {
+    scan_archive(bytes).map(|_| ())
 }
 
 pub(crate) fn scan_archive(bytes: &[u8]) -> Result<ScannedArchive, ArchiveError> {

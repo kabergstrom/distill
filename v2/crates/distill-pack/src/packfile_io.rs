@@ -13,12 +13,12 @@ use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::Blob;
 
+use crate::activation::{archive_filename, manifest_filename, read_current, PointerError};
 use crate::archive::{
     decode_structural, scan_archive, ArchiveError, ArchiveObjectKind, EKey, ScannedArchive,
 };
 use crate::manifest::{
-    decode_manifest, manifest_hash, verify_artifact_metadata, ArtifactMetadata, ManifestError,
-    PackManifest,
+    decode_manifest, manifest_hash, verify_artifact_header, ManifestError, PackManifest,
 };
 
 #[derive(Debug, Clone)]
@@ -29,11 +29,13 @@ pub struct RuntimeTarget {
 
 #[derive(Debug)]
 pub enum MountError {
+    Pointer(PointerError),
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
     Manifest(ManifestError),
+    ManifestFileHash,
     Archive(ArchiveError),
     TargetMismatch,
     MissingArchive(u32),
@@ -53,6 +55,12 @@ pub enum MountError {
 impl From<ManifestError> for MountError {
     fn from(value: ManifestError) -> Self {
         Self::Manifest(value)
+    }
+}
+
+impl From<PointerError> for MountError {
+    fn from(value: PointerError) -> Self {
+        Self::Pointer(value)
     }
 }
 
@@ -108,40 +116,36 @@ impl MountedArchive {
 }
 
 impl PackfileIO {
-    pub fn mount(
-        manifest_bytes: &[u8],
-        archive_files: Vec<Vec<u8>>,
-        runtime: &RuntimeTarget,
-    ) -> Result<Self, MountError> {
-        let archive_files = archive_files
-            .into_iter()
-            .map(|bytes| Arc::new(bytes) as ArchiveBacking)
-            .collect();
-        Self::mount_backings(manifest_bytes, archive_files, runtime)
-    }
-
-    /// Mount immutable shipping files. Archive mappings remain alive through
-    /// every returned [`Blob`], so uncompressed blob extents are borrowed
-    /// directly rather than copied into the loader heap.
-    pub fn mount_files(
-        manifest_path: &Path,
-        archive_paths: &[PathBuf],
-        runtime: &RuntimeTarget,
-    ) -> Result<Self, MountError> {
-        let manifest = map_file(manifest_path)?;
-        let archives = archive_paths
+    /// Mount the pack selected by `pack.current`. The pointer authenticates
+    /// the exact manifest name; that manifest in turn selects every immutable
+    /// hash-named archive. Archive mappings remain alive through returned
+    /// [`Blob`] values, so blob extents are borrowed without copying.
+    pub fn mount_current(directory: &Path, runtime: &RuntimeTarget) -> Result<Self, MountError> {
+        let expected_manifest_hash = read_current(directory)?;
+        let manifest_path = directory.join(manifest_filename(expected_manifest_hash));
+        let manifest = map_file(&manifest_path)?;
+        let manifest_bytes = manifest.as_ref();
+        if manifest_hash(manifest_bytes) != expected_manifest_hash {
+            return Err(MountError::ManifestFileHash);
+        }
+        let manifest = decode_manifest(manifest_bytes)?;
+        let archives = manifest
+            .archives
             .iter()
-            .map(|path| map_file(path).map(|mapping| mapping as ArchiveBacking))
+            .map(|archive| {
+                map_file(&directory.join(archive_filename(archive.file_hash)))
+                    .map(|mapping| mapping as ArchiveBacking)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::mount_backings(manifest.as_ref(), archives, runtime)
+        Self::mount_backings(manifest, expected_manifest_hash, archives, runtime)
     }
 
     fn mount_backings(
-        manifest_bytes: &[u8],
+        manifest: PackManifest,
+        manifest_hash: [u8; 32],
         archive_files: Vec<ArchiveBacking>,
         runtime: &RuntimeTarget,
     ) -> Result<Self, MountError> {
-        let manifest = decode_manifest(manifest_bytes)?;
         Self::verify_runtime(&manifest, runtime)?;
 
         let mut archives = BTreeMap::new();
@@ -178,7 +182,7 @@ impl PackfileIO {
             }
         }
         let basis = IoBasis::Pack {
-            manifest: ManifestHash(manifest_hash(manifest_bytes)),
+            manifest: ManifestHash(manifest_hash),
         };
         Ok(Self {
             manifest,
@@ -257,7 +261,7 @@ fn decode_fetched(
     manifest: &PackManifest,
     archives: &BTreeMap<u32, MountedArchive>,
     content_hash: ContentHash,
-) -> Result<(FetchedArtifact, ArtifactMetadata), MountError> {
+) -> Result<FetchedArtifact, MountError> {
     let encoding_index = manifest
         .encodings
         .binary_search_by_key(&content_hash, |row| row.content_hash)
@@ -323,17 +327,12 @@ fn decode_fetched(
     if dswl_hash(&wire).map_err(|_| MountError::WireTree(parts.layout_hash))? != parts.layout_hash {
         return Err(MountError::WireTree(parts.layout_hash));
     }
-    let metadata = ArtifactMetadata {
-        asset_uuid: parts.asset_uuid,
-        terminal_type: parts.terminal_type,
-        load_deps: parts.load_deps.clone(),
-    };
     let row = manifest
         .assets
         .iter()
         .find(|row| row.content_hash == content_hash)
         .ok_or(MountError::MissingEncoding(content_hash))?;
-    verify_artifact_metadata(row, &metadata)?;
+    verify_artifact_header(row, parts.asset_uuid, &parts.load_deps)?;
     let load_edges = row
         .load_deps
         .iter()
@@ -346,15 +345,12 @@ fn decode_fetched(
         .into_iter()
         .map(|(backing, offset, len)| Blob::new(backing, offset, len))
         .collect();
-    Ok((
-        FetchedArtifact {
-            structural: Arc::from(structural),
-            blobs,
-            load_edges,
-            wire_layout: Arc::from(wire_layout),
-        },
-        metadata,
-    ))
+    Ok(FetchedArtifact {
+        structural: Arc::from(structural),
+        blobs,
+        load_edges,
+        wire_layout: Arc::from(wire_layout),
+    })
 }
 
 fn map_file(path: &Path) -> Result<Arc<memmap2::Mmap>, MountError> {
@@ -426,8 +422,7 @@ impl LoaderIO for PackfileIO {
             });
             return;
         }
-        let result = decode_fetched(&self.manifest, &self.archives, content_hash)
-            .map(|(artifact, _)| artifact);
+        let result = decode_fetched(&self.manifest, &self.archives, content_hash);
         match result {
             Ok(artifact) => self.events.push_back(IoEvent::Fetched {
                 req,

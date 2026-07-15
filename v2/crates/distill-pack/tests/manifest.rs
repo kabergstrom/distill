@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_pack::archive::{EKey, ObjectLocation};
 use distill_pack::manifest::*;
@@ -102,17 +104,10 @@ fn manifest_rejects_corruption_and_truncation() {
 fn artifact_header_crosscheck_authenticates_identity_and_dependency_assets() {
     let manifest = sample();
     let row = &manifest.assets[0];
-    let metadata = ArtifactMetadata {
-        asset_uuid: row.asset_uuid,
-        terminal_type: TypeUuid([21; 16]),
-        load_deps: vec![AssetUuid([2; 16])],
-    };
-    assert!(verify_artifact_metadata(row, &metadata).is_ok());
+    assert!(verify_artifact_header(row, row.asset_uuid, &[AssetUuid([2; 16])]).is_ok());
 
-    let mut wrong = metadata;
-    wrong.load_deps.clear();
     assert_eq!(
-        verify_artifact_metadata(row, &wrong),
+        verify_artifact_header(row, row.asset_uuid, &[]),
         Err(ManifestError::MetadataMismatch)
     );
 }
@@ -131,21 +126,13 @@ fn manifest_rejects_missing_dependency_assets() {
 #[test]
 fn mounted_closure_rejects_typed_edge_terminal_mismatch() {
     let manifest = canonicalize(sample()).unwrap();
-    let metadata = vec![
-        ArtifactMetadata {
-            asset_uuid: AssetUuid([1; 16]),
-            terminal_type: TypeUuid([21; 16]),
-            load_deps: vec![AssetUuid([2; 16])],
-        },
-        ArtifactMetadata {
-            asset_uuid: AssetUuid([2; 16]),
-            terminal_type: TypeUuid([99; 16]),
-            load_deps: Vec::new(),
-        },
-    ];
+    let terminal_types = BTreeMap::from([
+        (AssetUuid([1; 16]), TypeUuid([21; 16])),
+        (AssetUuid([2; 16]), TypeUuid([99; 16])),
+    ]);
 
     assert_eq!(
-        verify_mounted_closure(&manifest, &metadata),
+        verify_expected_terminals(&manifest, &terminal_types),
         Err(ManifestError::DependencyTypeMismatch(TypeUuid([22; 16])))
     );
 }

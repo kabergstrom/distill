@@ -14,21 +14,27 @@ fn structural_bytes_use_fixed_chunks_and_blobs_remain_contiguous() {
     let encoding = &built.encodings[&ContentHash([1; 32])];
     assert_eq!(encoding.blocks.len(), 2);
     assert_eq!(encoding.blobs.len(), 1);
-    let decoded = decode_archive(&built.bytes).unwrap();
     let blocks: Vec<_> = encoding
         .blocks
         .iter()
-        .map(|key| decoded.objects[key].raw.clone())
+        .map(|key| {
+            let location = built.index[key];
+            zstd::stream::decode_all(
+                &built.bytes[location.offset as usize..(location.offset + location.len) as usize],
+            )
+            .unwrap()
+        })
         .collect();
     assert_eq!(
         [blocks[0].as_slice(), blocks[1].as_slice()].concat(),
         structural
     );
-    assert_eq!(decoded.objects[&encoding.blobs[0]].raw, blob);
+    let location = built.index[&encoding.blobs[0]];
     assert_eq!(
-        decoded.objects[&encoding.blobs[0]].kind,
-        ArchiveObjectKind::Blob
+        &built.bytes[location.offset as usize..(location.offset + location.len) as usize],
+        blob
     );
+    validate_archive(&built.bytes).unwrap();
 }
 
 #[test]
@@ -58,13 +64,16 @@ fn archive_rejects_bad_trailer_crc_ekey_and_truncation() {
     let built = encode_archive(1, "test", 1, &[payload]).unwrap();
     for len in 0..built.bytes.len() {
         assert!(
-            decode_archive(&built.bytes[..len]).is_err(),
+            validate_archive(&built.bytes[..len]).is_err(),
             "accepted truncation {len}"
         );
     }
     let mut bad = built.bytes.clone();
     bad[0] ^= 1;
-    assert!(matches!(decode_archive(&bad), Err(ArchiveError::FileHash)));
+    assert!(matches!(
+        validate_archive(&bad),
+        Err(ArchiveError::FileHash)
+    ));
 
     let key = built.encodings[&ContentHash([3; 32])].blocks[0];
     let loc = built.index[&key];
@@ -72,7 +81,7 @@ fn archive_rejects_bad_trailer_crc_ekey_and_truncation() {
     bad[loc.offset as usize] ^= 1;
     resign(&mut bad);
     assert!(matches!(
-        decode_archive(&bad),
+        validate_archive(&bad),
         Err(ArchiveError::Crc) | Err(ArchiveError::EKey)
     ));
 }
