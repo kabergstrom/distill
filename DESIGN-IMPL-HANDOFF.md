@@ -45,6 +45,17 @@ cache, and any future epoch-local cache uses `(TypeUuid, LayoutHash)`. Generic
 `Option<T>` now uses typed contained construction, and the obsolete DSNL gates
 and schema-derived measured-native mirror have been deleted.
 
+**E. Restored incremental watcher contract (2026-07-15):**
+R35 supersedes the temporary sticky-full-scan watcher simplification. Preserve
+native affected paths and ordered rename pairs. Startup performs the complete
+scan with the watcher already armed and incrementally replays events retained
+during traversal. Normal live edits re-observe only affected files/subtrees;
+they must never scan or hash unrelated tree state. Complete post-startup scans
+are limited to configured-root replacement, explicit verification, or native
+overflow/incomplete-observation recovery. The existing `dirty_files` and
+`rename_events` tables are required implementation surfaces, not deletion
+candidates.
+
 **Memory constraints (from `MEMORY.md`):**
 - Use `nix run nixpkgs#cargo -- <cmd>` for all v2 cargo commands (plain `cargo`
   is not on PATH).

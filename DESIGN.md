@@ -5190,8 +5190,8 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | Table | Contents |
 |-------|----------|
 | `files` | **(root id, normalized root-relative path)** → mtime, size, kind, content hash — last-known tree state. Physical tracking is per root: multiple roots form one *logical* namespace (§18), and a single-path key could hold only one of two same-path observations, silently choosing a root. The logical path index derives as a multimap with three states — `Missing`, `Unique(root)`, `Ambiguous(roots)` — and ambiguity is representable, not pre-collapsed |
-| `dirty_files` | pending-work queue (root id, path, exists/deleted), consumed transactionally |
-| `rename_events` | ordered rename log from the watcher, consumed transactionally |
+| `dirty_files` | pending incremental work (root id, path, exists/deleted), enqueued atomically with the corresponding `files` mutation and later cleared atomically with the downstream work it triggers |
+| `rename_events` | ordered live-rename log from the watcher, consumed transactionally before the batch is acknowledged |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags |
 | `path_index` | path/primary resolution index |
@@ -5807,16 +5807,31 @@ One writer, many snapshot readers:
 
 Modeled on v1's `FileTracker`, whose behavior is carried over:
 
-- **Watcher → batched transactions.** FS events set one sticky invalidation;
-  updates are debounced (~40ms), then the coordinator performs one complete
-  identity-checked scan and publishes it as a single transaction. Event paths
-  are never namespace authority and therefore are not queued or replayed.
+- **Watcher → incremental batched transactions.** Native OS events retain their
+  affected physical paths and ordered rename pairs, debounce for ~40ms, and
+  publish one transaction after descriptor-relative re-observation. Event
+  metadata is never trusted as namespace authority: a file create/write/remove
+  re-observes exactly that path, a directory create or rename-to enumerates only
+  that subtree (closing the recursive-watch installation race), and a directory
+  remove or rename-from deletes only that stored prefix. Unrelated roots,
+  directories, files, and bundle bytes are neither enumerated nor rehashed.
+  Coalescing may replace repeated final-state events for one path, but it must
+  preserve the ordered rename chain needed for live identity and dependency
+  updates.
+- **Incremental-workload invariant.** After a successful startup scan, ordinary
+  filesystem activity never invokes the complete-root scanner. Complete scans
+  are restricted to process startup, an accepted configured-root replacement,
+  explicit `doctor verify`, and recovery after the native backend explicitly
+  reports overflow or incomplete observation. Overflow recovery is exceptional;
+  treating every ordinary event as an overflow/full-rescan request is
+  nonconforming.
 - **Startup reconciliation.** Watchers arm **before** the scan begins,
-  never after: an event arriving during a scan leaves the watcher state dirty,
-  and finishing that transaction consumes the bit only by immediately
-  beginning another fully armed scan. This sticky rescan rule means no change
-  can fall between a path's scan visit and watcher activation without retaining
-  generation numbers or a partial event set. The full scan runs while the DB holds the
+  never after. Events arriving during traversal remain in that startup
+  generation and are replayed through the incremental path after the full-scan
+  transaction commits; they cannot be consumed by the live loop first. Only a
+  native overflow/incomplete-observation signal discards that partial event set
+  and repeats a fully armed scan. This scan/event union means no change can fall
+  between a path's scan visit and watcher activation. The full scan runs while the DB holds the
   previous session's state; at scan end, DB-known files absent from the scan
   become synthesized deletes, files outside watched roots are purged, and
   changed mtime/size/kind marks dirty. Metadata equality is trusted
@@ -5859,8 +5874,9 @@ v2 improvements over v1's tracker:
 - **Content hashes, not just mtime/size,** gate import work, so touch-without-
   change is cheap.
 - **Edge cases are specified:** native watcher overflow or an incomplete
-  observation sets the same sticky full-rescan invalidation; editor atomic-save
-  rename chains collapse into one invalidation; symlinks
+  observation discards the incomplete path batch and schedules one fully armed
+  recovery scan; editor atomic-save rename chains coalesce to incremental final
+  states while preserving their ordered rename pairs; symlinks
   escaping the asset roots are errors; startup reconciliation
   content-hashes files per the watermark rule above — equal metadata is
   trusted only strictly below the previous session's clean watermark.
@@ -9541,10 +9557,12 @@ ordinary §10 dependency kinds.
   refreshed version, and early cutoff makes unchanged members one
   round-trip, not one rebuild; the swap commits only when every member
   succeeded at the single refreshed snapshot.
-- **Watchers arm before the scan, and metadata trust has a watermark**
-  (§13, §14): startup arms watchers first, and an event observed during a scan
-  leaves one sticky invalidation that forces another fully armed scan after the
-  current commit — no change falls between a path's scan visit and watcher activation;
+- **Watchers arm before the scan, live workloads stay incremental, and metadata
+  trust has a watermark** (§13, §14): startup arms watchers first and retains
+  every event observed during traversal for incremental replay after the scan
+  commit; only native overflow/incomplete coverage repeats the scan. Ordinary
+  post-startup events re-observe affected paths/subtrees and never scan unrelated
+  tree state — no change falls between a path's scan visit and watcher activation;
   equal-metadata files are trusted only strictly below the previous
   session's durably recorded clean watermark, else rehashed — offline
   same-metadata replacement cannot stay stale indefinitely.
@@ -10921,6 +10939,17 @@ ordinary §10 dependency kinds.
   `Option<T>` cannot fabricate a niche descriptor. A typed construction path
   or a proven restriction lands before removal of the compensating DSNL gate.
 <!-- R34_LEDGER_END -->
+
+<!-- R35_LEDGER_BEGIN count=1 -->
+- **Native watcher batches preserve incremental workloads** (§§13–14, 19):
+  R35 corrects the over-simplified sticky-full-scan model. Startup still arms
+  the watcher before its complete reconciliation, but events retain affected
+  paths and ordered rename pairs and are replayed by descriptor-relative
+  path/subtree observation. Normal live activity never scans or rehashes
+  unrelated tree state; a complete scan after startup is reserved for root-set
+  replacement, explicit verification, or an admitted native overflow/
+  incomplete-observation recovery.
+<!-- R35_LEDGER_END -->
 
 ### Open — remaining
 
