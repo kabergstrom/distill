@@ -5807,14 +5807,16 @@ One writer, many snapshot readers:
 
 Modeled on v1's `FileTracker`, whose behavior is carried over:
 
-- **Watcher → batched transactions.** FS events accumulate into single
-  transactions; updates are debounced (~40ms) before notifying downstream.
+- **Watcher → batched transactions.** FS events set one sticky invalidation;
+  updates are debounced (~40ms), then the coordinator performs one complete
+  identity-checked scan and publishes it as a single transaction. Event paths
+  are never namespace authority and therefore are not queued or replayed.
 - **Startup reconciliation.** Watchers arm **before** the scan begins,
-  never after: events arriving during the scan queue under an explicit
-  **scan generation** and replay after the scan's transaction commits —
-  replay marks affected paths dirty even if the scan already visited
-  them (union semantics) — so no change can fall between a path's scan
-  visit and watcher activation. The full scan runs while the DB holds the
+  never after: an event arriving during a scan leaves the watcher state dirty,
+  and finishing that transaction consumes the bit only by immediately
+  beginning another fully armed scan. This sticky rescan rule means no change
+  can fall between a path's scan visit and watcher activation without retaining
+  generation numbers or a partial event set. The full scan runs while the DB holds the
   previous session's state; at scan end, DB-known files absent from the scan
   become synthesized deletes, files outside watched roots are purged, and
   changed mtime/size/kind marks dirty. Metadata equality is trusted
@@ -5856,8 +5858,9 @@ v2 improvements over v1's tracker:
   silently pointing at stale targets.
 - **Content hashes, not just mtime/size,** gate import work, so touch-without-
   change is cheap.
-- **Edge cases are specified:** watcher queue overflow triggers a full
-  rescan; editor atomic-save rename chains collapse into updates; symlinks
+- **Edge cases are specified:** native watcher overflow or an incomplete
+  observation sets the same sticky full-rescan invalidation; editor atomic-save
+  rename chains collapse into one invalidation; symlinks
   escaping the asset roots are errors; startup reconciliation
   content-hashes files per the watermark rule above — equal metadata is
   trusted only strictly below the previous session's clean watermark.
@@ -9539,9 +9542,9 @@ ordinary §10 dependency kinds.
   round-trip, not one rebuild; the swap commits only when every member
   succeeded at the single refreshed snapshot.
 - **Watchers arm before the scan, and metadata trust has a watermark**
-  (§13, §14): startup arms watchers first, queues events under an
-  explicit scan generation, and replays them after the scan commits —
-  no change falls between a path's scan visit and watcher activation;
+  (§13, §14): startup arms watchers first, and an event observed during a scan
+  leaves one sticky invalidation that forces another fully armed scan after the
+  current commit — no change falls between a path's scan visit and watcher activation;
   equal-metadata files are trusted only strictly below the previous
   session's durably recorded clean watermark, else rehashed — offline
   same-metadata replacement cannot stay stale indefinitely.
