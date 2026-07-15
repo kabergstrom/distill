@@ -1110,8 +1110,7 @@ impl AuthoringService {
             .lock()
             .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
         let source = snapshot
-            .bundles
-            .iter()
+            .bundle_rows()
             .find(|source| source.root_name == root && source.normalized_path == meta.path)
             .ok_or_else(|| invalid("durable bundle is missing from the published scan snapshot"))?;
         if ContentHash(source.file_hash.0) != meta.content_hash {
@@ -1271,8 +1270,7 @@ impl ImportBackend for RootedImportBackend<'_> {
     fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass> {
         let rows = self.rows();
         let matches = rows
-            .files
-            .iter()
+            .file_rows()
             .filter(|file| file.normalized_path == path && file.content_hash.is_some())
             .collect::<Vec<_>>();
         let [file] = matches.as_slice() else {
@@ -1299,8 +1297,7 @@ impl ImportBackend for RootedImportBackend<'_> {
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass> {
         let rows = self.rows();
         let roots = rows
-            .files
-            .iter()
+            .file_rows()
             .filter(|file| file.normalized_path == path)
             .map(|file| file.root_name.as_str())
             .collect::<BTreeSet<_>>();
@@ -1322,7 +1319,7 @@ impl ImportBackend for RootedImportBackend<'_> {
             .map_err(|_| RawFileFailureClass::OtherStable)?;
         let rows = self.rows();
         let mut results = Vec::new();
-        for file in &rows.files {
+        for file in rows.file_rows() {
             if !matches!(file.kind, ScannedFileKind::File | ScannedFileKind::Symlink) {
                 continue;
             }

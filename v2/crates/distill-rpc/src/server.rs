@@ -3341,8 +3341,42 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
     if let Some(derived_outputs) = commit.derived_outputs {
         view.derived_outputs = derived_outputs;
     }
+    for mutation in commit.derived_output_mutations {
+        match mutation {
+            DerivedOutputMutation::Set { child, entry } => {
+                view.derived_outputs.insert(child, entry);
+            }
+            DerivedOutputMutation::Remove { child } => {
+                view.derived_outputs.remove(&child);
+            }
+        }
+    }
     if let Some(tag_poisons) = commit.tag_poisons {
         view.tag_poisons = tag_poisons;
+    }
+    for mutation in commit.tag_poison_mutations {
+        match mutation {
+            TagPoisonMutation::Set { asset, bundle } => {
+                view.tag_poisons.insert(asset, bundle);
+            }
+            TagPoisonMutation::Remove { asset } => {
+                view.tag_poisons.remove(&asset);
+            }
+        }
+    }
+    for mutation in commit.tag_projection_mutations {
+        match mutation {
+            TagProjectionMutation::Set { asset, tags } => {
+                if let Some(entry) = view.authoring.get_mut(&asset) {
+                    entry.tags = tags;
+                }
+            }
+            TagProjectionMutation::Remove { asset } => {
+                if let Some(entry) = view.authoring.get_mut(&asset) {
+                    entry.tags.clear();
+                }
+            }
+        }
     }
     if let Some(configuration) = commit.configuration {
         view.configuration = configuration;
@@ -3413,6 +3447,30 @@ fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
             }
         }
     }
+    let mut derived_children = BTreeSet::new();
+    for mutation in &commit.derived_output_mutations {
+        let (child, entry) = match mutation {
+            DerivedOutputMutation::Set { child, entry } => (*child, Some(entry)),
+            DerivedOutputMutation::Remove { child } => (*child, None),
+        };
+        if !derived_children.insert(child) {
+            return Err(AdminError::InvalidAuthoringIdentity {
+                uuid: child,
+                detail: "duplicate derived-output mutation".to_owned(),
+            });
+        }
+        if entry.is_some_and(|entry| {
+            child != AssetUuid::v5(entry.parent, &entry.output_key)
+                || entry.output_key.is_empty()
+                || !valid_identifier(&entry.output_key)
+        }) {
+            return Err(AdminError::InvalidAuthoringIdentity {
+                uuid: child,
+                detail: "derived output does not match its canonical parent/key identity"
+                    .to_owned(),
+            });
+        }
+    }
     if let Some(tag_projection) = &commit.tag_projection {
         for (uuid, tags) in tag_projection {
             if tags.iter().any(|(tag, value)| {
@@ -3426,6 +3484,44 @@ fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
                     detail: "tag projection contains a noncanonical name or value".to_owned(),
                 });
             }
+        }
+    }
+    let mut tag_assets = BTreeSet::new();
+    for mutation in &commit.tag_projection_mutations {
+        let (asset, tags) = match mutation {
+            TagProjectionMutation::Set { asset, tags } => (*asset, Some(tags)),
+            TagProjectionMutation::Remove { asset } => (*asset, None),
+        };
+        if !tag_assets.insert(asset) {
+            return Err(AdminError::InvalidAuthoringIdentity {
+                uuid: asset,
+                detail: "duplicate tag-projection mutation".to_owned(),
+            });
+        }
+        if tags.is_some_and(|tags| {
+            tags.iter().any(|(tag, value)| {
+                !valid_identifier(tag)
+                    || value
+                        .as_deref()
+                        .is_some_and(|value| !valid_identifier(value))
+            })
+        }) {
+            return Err(AdminError::InvalidAuthoringIdentity {
+                uuid: asset,
+                detail: "tag projection contains a noncanonical name or value".to_owned(),
+            });
+        }
+    }
+    let mut poison_assets = BTreeSet::new();
+    for mutation in &commit.tag_poison_mutations {
+        let asset = match mutation {
+            TagPoisonMutation::Set { asset, .. } | TagPoisonMutation::Remove { asset } => *asset,
+        };
+        if !poison_assets.insert(asset) {
+            return Err(AdminError::InvalidAuthoringIdentity {
+                uuid: asset,
+                detail: "duplicate tag-poison mutation".to_owned(),
+            });
         }
     }
     let mut assets = BTreeSet::new();

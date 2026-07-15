@@ -63,8 +63,7 @@ fn full_scan_reports_raw_files_and_keeps_malformed_bundle_candidates() {
 
     let scan = scanner.scan().unwrap();
     assert_eq!(
-        scan.files
-            .iter()
+        scan.file_rows()
             .map(|file| (file.normalized_path.as_str(), file.kind))
             .collect::<Vec<_>>(),
         [
@@ -75,11 +74,10 @@ fn full_scan_reports_raw_files_and_keeps_malformed_bundle_candidates() {
         ]
     );
     assert_eq!(scan.bundles.len(), 2);
-    assert!(scan.bundles[0].parsed.is_err());
-    assert!(scan.bundles[1].parsed.is_ok());
+    assert!(scan.bundle_rows().next().unwrap().parsed.is_err());
+    assert!(scan.bundle_rows().nth(1).unwrap().parsed.is_ok());
     assert!(scan
-        .files
-        .iter()
+        .file_rows()
         .filter(|file| file.kind == ScannedFileKind::File)
         .all(|file| file.content_hash.is_some()));
 }
@@ -105,19 +103,16 @@ fn incremental_scan_reobserves_only_named_paths() {
 
     assert_eq!(partial.files.len(), 2);
     assert!(partial
-        .files
-        .iter()
+        .file_rows()
         .any(|file| file.normalized_path == "unrelated.txt"));
     assert_ne!(
         partial
-            .files
-            .iter()
+            .file_rows()
             .find(|file| file.normalized_path == "changed.txt")
             .unwrap()
             .content_hash,
         baseline
-            .files
-            .iter()
+            .file_rows()
             .find(|file| file.normalized_path == "changed.txt")
             .unwrap()
             .content_hash
@@ -129,8 +124,7 @@ fn incremental_scan_reobserves_only_named_paths() {
         .unwrap();
     assert_eq!(healed.files.len(), 1);
     assert!(!healed
-        .files
-        .iter()
+        .file_rows()
         .any(|file| file.normalized_path == "unrelated.txt"));
 }
 
@@ -153,8 +147,7 @@ fn incremental_directory_create_enumerates_only_that_subtree() {
 
     assert_eq!(
         updated
-            .files
-            .iter()
+            .file_rows()
             .map(|file| file.normalized_path.as_str())
             .collect::<Vec<_>>(),
         ["new", "new/nested", "new/nested/source.txt", "stable.txt"]
@@ -241,7 +234,7 @@ fn replacement_roots_are_shared_by_existing_scanner_clones() {
 
     let scan = watcher_view.scan().unwrap();
     assert_eq!(scan.files.len(), 1);
-    assert_eq!(scan.files[0].normalized_path, "new.txt");
+    assert_eq!(scan.file_rows().next().unwrap().normalized_path, "new.txt");
     assert_eq!(
         watcher_view.physical_path("main", "new.txt").unwrap(),
         second.join("new.txt")
@@ -295,8 +288,7 @@ fn in_root_file_symlinks_are_identity_checked_and_reported() {
 
     let scan = scanner.scan().unwrap();
     let alias = scan
-        .files
-        .iter()
+        .file_rows()
         .find(|file| file.normalized_path == "alias.txt")
         .unwrap();
     assert_eq!(alias.kind, ScannedFileKind::Symlink);
@@ -360,16 +352,14 @@ fn incremental_target_edit_reobserves_file_symlink_alias() {
         *blake3::hash(b"second").as_bytes(),
     ));
     assert_eq!(
-        next.files
-            .iter()
+        next.file_rows()
             .find(|file| file.normalized_path == "source.txt")
             .unwrap()
             .content_hash,
         expected
     );
     assert_eq!(
-        next.files
-            .iter()
+        next.file_rows()
             .find(|file| file.normalized_path == "alias.txt")
             .unwrap()
             .content_hash,

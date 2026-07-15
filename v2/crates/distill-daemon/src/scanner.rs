@@ -188,10 +188,21 @@ pub struct ScannedBundle {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanSnapshot {
-    pub files: Vec<ScannedFile>,
-    pub bundles: Vec<ScannedBundle>,
+    pub files: BTreeMap<(String, String), ScannedFile>,
+    pub bundles: BTreeMap<(String, String), Arc<ScannedBundle>>,
     directory_identities: BTreeMap<(String, String), DirectoryObservation>,
+    directory_by_identity: BTreeMap<FileIdentity, (String, String, PathBuf)>,
     symlink_aliases: BTreeMap<(String, String), PathBuf>,
+    aliases_by_target: BTreeMap<PathBuf, BTreeSet<(String, String)>>,
+}
+
+/// The complete observation replacing a bounded set of logical path prefixes.
+/// Applying a delta touches only keys below those prefixes; unrelated snapshot
+/// rows and parsed bundle bytes are neither cloned nor enumerated.
+#[derive(Debug, Clone)]
+pub struct ScanDelta {
+    affected: Vec<(String, String)>,
+    observed: ScanSnapshot,
 }
 
 impl ScanSnapshot {
@@ -202,8 +213,8 @@ impl ScanSnapshot {
             && self.bundles.len() == other.bundles.len()
             && self
                 .bundles
-                .iter()
-                .zip(&other.bundles)
+                .values()
+                .zip(other.bundles.values())
                 .all(|(left, right)| {
                     left.root_name == right.root_name
                         && left.normalized_path == right.normalized_path
@@ -217,9 +228,104 @@ impl ScanSnapshot {
             })
             && self.symlink_aliases == other.symlink_aliases
     }
+
+    pub fn file_rows(&self) -> impl Iterator<Item = &ScannedFile> {
+        self.files.values()
+    }
+
+    pub fn bundle_rows(&self) -> impl Iterator<Item = &ScannedBundle> {
+        self.bundles.values().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn bundle_entries(
+        &self,
+    ) -> impl Iterator<Item = (&(String, String), &Arc<ScannedBundle>)> {
+        self.bundles.iter()
+    }
+
+    pub fn apply_delta(&mut self, delta: ScanDelta) {
+        for affected in &delta.affected {
+            remove_matching(&mut self.files, affected);
+            remove_matching(&mut self.bundles, affected);
+            let removed_directories = matching_keys(&self.directory_identities, affected);
+            for key in removed_directories {
+                if let Some(observation) = self.directory_identities.remove(&key) {
+                    self.directory_by_identity.remove(&observation.identity);
+                }
+            }
+            let removed_aliases = matching_keys(&self.symlink_aliases, affected);
+            for key in removed_aliases {
+                if let Some(target) = self.symlink_aliases.remove(&key) {
+                    remove_reverse_alias(&mut self.aliases_by_target, &target, &key);
+                }
+            }
+        }
+        self.files.extend(delta.observed.files);
+        self.bundles.extend(delta.observed.bundles);
+        for (key, observation) in delta.observed.directory_identities {
+            self.directory_by_identity.insert(
+                observation.identity,
+                (
+                    key.0.clone(),
+                    key.1.clone(),
+                    observation.physical_path.clone(),
+                ),
+            );
+            self.directory_identities.insert(key, observation);
+        }
+        for (key, target) in delta.observed.symlink_aliases {
+            self.aliases_by_target
+                .entry(target.clone())
+                .or_default()
+                .insert(key.clone());
+            self.symlink_aliases.insert(key, target);
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+impl ScanDelta {
+    pub fn affected_prefixes(&self) -> &[(String, String)] {
+        &self.affected
+    }
+
+    pub fn observed_files(&self) -> impl Iterator<Item = &ScannedFile> {
+        self.observed.files.values()
+    }
+
+    pub(crate) fn observed_file_entries(
+        &self,
+    ) -> impl Iterator<Item = (&(String, String), &ScannedFile)> {
+        self.observed.files.iter()
+    }
+
+    pub fn observed_bundles(&self) -> impl Iterator<Item = &ScannedBundle> {
+        self.observed.bundles.values().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn observed_bundle_entries(
+        &self,
+    ) -> impl Iterator<Item = (&(String, String), &Arc<ScannedBundle>)> {
+        self.observed.bundles.iter()
+    }
+
+    pub fn is_same_observation(&self, baseline: &ScanSnapshot) -> bool {
+        self.affected.iter().all(|affected| {
+            matching_values(&baseline.files, affected)
+                .eq(matching_values(&self.observed.files, affected))
+                && matching_bundle_observations(&baseline.bundles, affected).eq(
+                    matching_bundle_observations(&self.observed.bundles, affected),
+                )
+                && matching_values(&baseline.directory_identities, affected).eq(matching_values(
+                    &self.observed.directory_identities,
+                    affected,
+                ))
+                && matching_values(&baseline.symlink_aliases, affected)
+                    .eq(matching_values(&self.observed.symlink_aliases, affected))
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectoryObservation {
     identity: FileIdentity,
     physical_path: PathBuf,
@@ -450,17 +556,17 @@ impl RootedScanner {
 
     pub fn lineage_claimants(&self) -> Result<Vec<LineageManifestClaimant>, ScanError> {
         let mut claimants = Vec::new();
-        for bundle in self.scan()?.bundles {
-            let Ok(parsed) = bundle.parsed else {
+        for bundle in self.scan()?.bundles.into_values() {
+            let Ok(parsed) = &bundle.parsed else {
                 continue;
             };
-            for (local_id, entry) in parsed.assets {
+            for (local_id, entry) in &parsed.assets {
                 if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
                     claimants.push(LineageManifestClaimant {
                         root_name: bundle.root_name.clone(),
                         normalized_path: bundle.normalized_path.clone(),
                         bundle: parsed.uuid,
-                        local_id,
+                        local_id: local_id.clone(),
                         asset: entry.uuid,
                         file_hash: bundle.file_hash,
                     });
@@ -495,11 +601,11 @@ impl RootedScanner {
     /// Re-observe only native-event paths and directory subtrees, merging the
     /// result into the last complete snapshot without touching unrelated disk
     /// state. `Ok(None)` means every event path was outside configured roots.
-    pub fn scan_incremental(
+    pub fn scan_incremental_delta(
         &self,
         baseline: &ScanSnapshot,
         event_paths: &[PathBuf],
-    ) -> Result<Option<ScanSnapshot>, ScanError> {
+    ) -> Result<Option<ScanDelta>, ScanError> {
         let roots = self.validated_root_snapshot()?;
         let mut affected = BTreeSet::<(String, String)>::new();
         for event_path in event_paths {
@@ -508,10 +614,8 @@ impl RootedScanner {
                 for component in path.split('/').filter(|component| !component.is_empty()) {
                     canonical_event.push(component);
                 }
-                for (alias, target) in &baseline.symlink_aliases {
-                    if target == &canonical_event || target.starts_with(&canonical_event) {
-                        affected.insert(alias.clone());
-                    }
+                for alias in aliases_affected_by(&baseline.aliases_by_target, &canonical_event) {
+                    affected.insert(alias);
                 }
                 affected.insert((root, path));
             }
@@ -520,27 +624,35 @@ impl RootedScanner {
             return Ok(None);
         }
         let affected = collapse_affected(affected);
-        let mut next = baseline.clone();
+        let mut observed = ScanSnapshot::default();
         for (root, path) in &affected {
-            next.files
-                .retain(|file| !path_matches(root, path, &file.root_name, &file.normalized_path));
-            next.bundles.retain(|bundle| {
-                !path_matches(root, path, &bundle.root_name, &bundle.normalized_path)
-            });
-            next.directory_identities
-                .retain(|(key_root, key_path), _| !path_matches(root, path, key_root, key_path));
-            next.symlink_aliases
-                .retain(|(key_root, key_path), _| !path_matches(root, path, key_root, key_path));
-            if let Some(observed) = scan_logical_path(&roots, root, path)? {
-                next.files.extend(observed.files);
-                next.bundles.extend(observed.bundles);
-                next.directory_identities
-                    .extend(observed.directory_identities);
-                next.symlink_aliases.extend(observed.symlink_aliases);
+            if let Some(partial) = scan_logical_path(&roots, root, path)? {
+                observed.files.extend(partial.files);
+                observed.bundles.extend(partial.bundles);
+                observed
+                    .directory_identities
+                    .extend(partial.directory_identities);
+                observed.symlink_aliases.extend(partial.symlink_aliases);
             }
         }
-        sort_snapshot(&mut next);
-        validate_directory_aliases(&next)?;
+        rebuild_reverse_indexes(&mut observed)?;
+        validate_incremental_directory_aliases(baseline, &affected, &observed)?;
+        Ok(Some(ScanDelta { affected, observed }))
+    }
+
+    /// Convenience path for callers that require a standalone snapshot. Live
+    /// watcher reconciliation uses `scan_incremental_delta` and applies only
+    /// the committed delta in place.
+    pub fn scan_incremental(
+        &self,
+        baseline: &ScanSnapshot,
+        event_paths: &[PathBuf],
+    ) -> Result<Option<ScanSnapshot>, ScanError> {
+        let Some(delta) = self.scan_incremental_delta(baseline, event_paths)? else {
+            return Ok(None);
+        };
+        let mut next = baseline.clone();
+        next.apply_delta(delta);
         Ok(Some(next))
     }
 
@@ -661,14 +773,17 @@ fn scan_pending(
             },
         );
         if !pending.relative_components.is_empty() {
-            snapshot.files.push(ScannedFile {
+            let file = ScannedFile {
                 root_name: pending.root_name.clone(),
                 normalized_path: normalized_directory,
                 kind: ScannedFileKind::Directory,
                 modified_nanos: modified_nanos(&metadata),
                 size: metadata.len(),
                 content_hash: None,
-            });
+            };
+            snapshot
+                .files
+                .insert((file.root_name.clone(), file.normalized_path.clone()), file);
         }
 
         let mut entries = read_directory_names(&pending.directory, &pending.physical_path)?;
@@ -718,8 +833,7 @@ fn scan_pending(
             }
         }
     }
-    sort_snapshot(&mut snapshot);
-    validate_directory_aliases(&snapshot)?;
+    rebuild_reverse_indexes(&mut snapshot)?;
     Ok(snapshot)
 }
 
@@ -740,7 +854,7 @@ fn observe_opened_file(
     revalidate_entry_guards(parent_guards, roots)?;
     revalidate_entry_guards(std::slice::from_ref(&guard), roots)?;
     let normalized_path = relative.join("/");
-    snapshot.files.push(ScannedFile {
+    let file = ScannedFile {
         root_name: root_name.to_owned(),
         normalized_path: normalized_path.clone(),
         kind: if is_symlink {
@@ -751,7 +865,10 @@ fn observe_opened_file(
         modified_nanos: modified_nanos(&metadata),
         size: metadata.len(),
         content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
-    });
+    };
+    snapshot
+        .files
+        .insert((file.root_name.clone(), file.normalized_path.clone()), file);
     if is_symlink {
         let target = fs::canonicalize(&physical).map_err(|source| ScanError::Io {
             path: physical.clone(),
@@ -766,13 +883,16 @@ fn observe_opened_file(
         .and_then(|extension| extension.to_str())
         == Some("bundle")
     {
-        snapshot.bundles.push(ScannedBundle {
+        let bundle = ScannedBundle {
             root_name: root_name.to_owned(),
-            normalized_path,
+            normalized_path: normalized_path.clone(),
             file_hash: BundleFileHash::of_observed_bytes(&bytes),
             parsed: distill_bundle::parse_bundle(&bytes),
             bytes,
-        });
+        };
+        snapshot
+            .bundles
+            .insert((root_name.to_owned(), normalized_path), Arc::new(bundle));
     }
     Ok(())
 }
@@ -831,7 +951,7 @@ fn scan_logical_path(
                 &entry_guards,
                 guard,
             )?;
-            sort_snapshot(&mut snapshot);
+            rebuild_reverse_indexes(&mut snapshot)?;
             return Ok(Some(snapshot));
         }
         if !opened.metadata.is_dir() {
@@ -906,19 +1026,111 @@ fn path_matches(root: &str, prefix: &str, candidate_root: &str, candidate: &str)
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
-fn sort_snapshot(snapshot: &mut ScanSnapshot) {
-    snapshot.files.sort_by(|left, right| {
-        (&left.root_name, &left.normalized_path).cmp(&(&right.root_name, &right.normalized_path))
-    });
-    snapshot.bundles.sort_by(|left, right| {
-        (&left.root_name, &left.normalized_path).cmp(&(&right.root_name, &right.normalized_path))
-    });
+fn key_matches(prefix: &(String, String), candidate: &(String, String)) -> bool {
+    path_matches(&prefix.0, &prefix.1, &candidate.0, &candidate.1)
 }
 
-fn validate_directory_aliases(snapshot: &ScanSnapshot) -> Result<(), ScanError> {
-    let mut identities = BTreeMap::<FileIdentity, (String, String, PathBuf)>::new();
+fn matching_values<'a, V>(
+    map: &'a BTreeMap<(String, String), V>,
+    prefix: &(String, String),
+) -> impl Iterator<Item = &'a V> {
+    let start = prefix.clone();
+    let prefix = prefix.clone();
+    map.range(start..)
+        .take_while(move |(key, _)| key_matches(&prefix, key))
+        .map(|(_, value)| value)
+}
+
+fn matching_keys<V>(
+    map: &BTreeMap<(String, String), V>,
+    prefix: &(String, String),
+) -> Vec<(String, String)> {
+    let start = prefix.clone();
+    map.range(start..)
+        .take_while(|(key, _)| key_matches(prefix, key))
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn remove_matching<V>(map: &mut BTreeMap<(String, String), V>, prefix: &(String, String)) {
+    for key in matching_keys(map, prefix) {
+        map.remove(&key);
+    }
+}
+
+fn matching_bundle_observations<'a>(
+    map: &'a BTreeMap<(String, String), Arc<ScannedBundle>>,
+    prefix: &(String, String),
+) -> impl Iterator<Item = (&'a str, &'a str, BundleFileHash)> {
+    matching_values(map, prefix).map(|bundle| {
+        (
+            bundle.root_name.as_str(),
+            bundle.normalized_path.as_str(),
+            bundle.file_hash,
+        )
+    })
+}
+
+fn aliases_affected_by(
+    aliases: &BTreeMap<PathBuf, BTreeSet<(String, String)>>,
+    event: &Path,
+) -> Vec<(String, String)> {
+    aliases
+        .range(event.to_path_buf()..)
+        .take_while(|(target, _)| target.starts_with(event))
+        .flat_map(|(_, aliases)| aliases.iter().cloned())
+        .collect()
+}
+
+fn remove_reverse_alias(
+    aliases: &mut BTreeMap<PathBuf, BTreeSet<(String, String)>>,
+    target: &Path,
+    alias: &(String, String),
+) {
+    let empty = aliases.get_mut(target).is_some_and(|entries| {
+        entries.remove(alias);
+        entries.is_empty()
+    });
+    if empty {
+        aliases.remove(target);
+    }
+}
+
+fn validate_incremental_directory_aliases(
+    baseline: &ScanSnapshot,
+    affected: &[(String, String)],
+    observed: &ScanSnapshot,
+) -> Result<(), ScanError> {
+    for ((root, path), observation) in &observed.directory_identities {
+        let Some((first_root, first_path, first)) =
+            baseline.directory_by_identity.get(&observation.identity)
+        else {
+            continue;
+        };
+        let first_key = (first_root.clone(), first_path.clone());
+        if affected
+            .iter()
+            .any(|prefix| key_matches(prefix, &first_key))
+        {
+            continue;
+        }
+        if first_root != root || first_path != path {
+            return Err(ScanError::DirectoryAlias {
+                first_root: first_root.clone(),
+                first: first.clone(),
+                second_root: root.clone(),
+                second: observation.physical_path.clone(),
+                identity: observation.identity.into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_reverse_indexes(snapshot: &mut ScanSnapshot) -> Result<(), ScanError> {
+    snapshot.directory_by_identity.clear();
     for ((root, path), observed) in &snapshot.directory_identities {
-        if let Some((first_root, first_path, first)) = identities.insert(
+        if let Some((first_root, first_path, first)) = snapshot.directory_by_identity.insert(
             observed.identity,
             (root.clone(), path.clone(), observed.physical_path.clone()),
         ) {
@@ -932,6 +1144,14 @@ fn validate_directory_aliases(snapshot: &ScanSnapshot) -> Result<(), ScanError> 
                 });
             }
         }
+    }
+    snapshot.aliases_by_target.clear();
+    for (alias, target) in &snapshot.symlink_aliases {
+        snapshot
+            .aliases_by_target
+            .entry(target.clone())
+            .or_default()
+            .insert(alias.clone());
     }
     Ok(())
 }

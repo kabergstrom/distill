@@ -718,6 +718,19 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Current logical candidates for one normalized path. Ordinary watcher
+    /// publications use this bounded lookup instead of enumerating the whole
+    /// path index.
+    pub fn path_assets(&self, path: &str) -> Result<BTreeSet<AssetUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT asset_uuid FROM path_index WHERE path = ?1 ORDER BY asset_uuid")?;
+        let rows = statement.query_map([path], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Raw deterministic asset identity set, including poisoned skeleton rows.
     /// Startup reconciliation uses it only to remove identities absent from a
     /// healed full scan; it does not expose skeleton metadata.

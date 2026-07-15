@@ -781,6 +781,27 @@ impl crate::db::InputTxn<'_> {
 }
 
 impl Store {
+    /// Raw bounded lookup used while preparing an unpublished successor.
+    pub fn derived_output_row(
+        &self,
+        child: AssetUuid,
+    ) -> Result<Option<(AssetUuid, String)>, StoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT parent_uuid, output_key FROM derived_outputs WHERE child_uuid = ?1",
+                [child.0.as_slice()],
+                |row| {
+                    Ok((
+                        AssetUuid(crate::bundles::blob16(row.get::<_, Vec<u8>>(0)?)),
+                        row.get::<_, String>(1)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     pub fn all_derived_outputs(&self) -> Result<Vec<(AssetUuid, AssetUuid, String)>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT child_uuid, parent_uuid, output_key FROM derived_outputs ORDER BY child_uuid",

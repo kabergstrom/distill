@@ -38,7 +38,8 @@ use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactLeaseBackend, ArtifactPayload,
     AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication, BuildBackend,
     BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree, BuildWorkClass, Commit,
-    DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedLoadEdge,
+    DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedLoadEdge, TagPoisonMutation,
+    TagProjectionMutation,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
 use distill_store::artifacts::PinKind;
@@ -67,6 +68,7 @@ const MIGRATION_PLANNER_VERSION: u32 = 1;
 pub(crate) struct PublishedTagIndex {
     tags: BTreeMap<AssetUuid, BTreeMap<String, Option<String>>>,
     poisons: BTreeMap<AssetUuid, BundleUuid>,
+    removed: BTreeSet<AssetUuid>,
 }
 
 impl PublishedTagIndex {
@@ -78,6 +80,7 @@ impl PublishedTagIndex {
                 .map(|asset| (asset, BTreeMap::new()))
                 .collect(),
             poisons: assets.clone(),
+            removed: BTreeSet::new(),
         }
     }
 
@@ -89,6 +92,45 @@ impl PublishedTagIndex {
         }
         commit.tag_projection = Some(self.tags);
         commit.tag_poisons = Some(self.poisons);
+    }
+
+    pub(crate) fn apply_incremental(self, commit: &mut Commit) {
+        for mutation in &mut commit.authoring {
+            if let AuthoringMutation::Set(entry) = mutation {
+                if let Some(tags) = self.tags.get(&entry.uuid) {
+                    entry.tags = tags.clone();
+                }
+            }
+        }
+        for (asset, tags) in self.tags {
+            commit
+                .tag_projection_mutations
+                .push(TagProjectionMutation::Set { asset, tags });
+        }
+        for asset in &self.removed {
+            commit
+                .tag_projection_mutations
+                .push(TagProjectionMutation::Remove { asset: *asset });
+        }
+        let affected = commit
+            .tag_projection_mutations
+            .iter()
+            .map(|mutation| match mutation {
+                TagProjectionMutation::Set { asset, .. }
+                | TagProjectionMutation::Remove { asset } => *asset,
+            })
+            .collect::<BTreeSet<_>>();
+        for asset in affected {
+            match self.poisons.get(&asset) {
+                Some(bundle) => commit.tag_poison_mutations.push(TagPoisonMutation::Set {
+                    asset,
+                    bundle: *bundle,
+                }),
+                None => commit
+                    .tag_poison_mutations
+                    .push(TagPoisonMutation::Remove { asset }),
+            }
+        }
     }
 }
 
@@ -1091,8 +1133,43 @@ pub(crate) fn refine_published_tag_index(
         pipeline,
         targets,
         max_depth,
+        None,
     )
     .unwrap_or_else(|_| PublishedTagIndex::conservatively_poisoned(fallback_assets))
+}
+
+/// Reindex only identities whose authored rows changed in the same input
+/// publication. Deleted identities become bounded removals; unrelated tag
+/// rows and cached traces are not enumerated.
+pub(crate) fn refine_published_tag_index_incremental(
+    store_handle: Arc<Mutex<Store>>,
+    scanner: RootedScanner,
+    authority: Arc<ProjectSchemaAuthority>,
+    pipeline: PipelineSnapshot,
+    targets: &BTreeMap<String, Target>,
+    max_depth: usize,
+    affected: &BTreeMap<AssetUuid, Option<BundleUuid>>,
+) -> PublishedTagIndex {
+    let current = affected
+        .iter()
+        .filter_map(|(asset, bundle)| bundle.map(|bundle| (*asset, bundle)))
+        .collect::<BTreeMap<_, _>>();
+    let assets = current.keys().copied().collect::<Vec<_>>();
+    let mut indexed = try_refine_published_tag_index(
+        store_handle,
+        scanner,
+        authority,
+        pipeline,
+        targets,
+        max_depth,
+        Some(assets),
+    )
+    .unwrap_or_else(|_| PublishedTagIndex::conservatively_poisoned(&current));
+    indexed.removed = affected
+        .iter()
+        .filter_map(|(asset, bundle)| bundle.is_none().then_some(*asset))
+        .collect();
+    indexed
 }
 
 fn try_refine_published_tag_index(
@@ -1102,6 +1179,7 @@ fn try_refine_published_tag_index(
     pipeline: PipelineSnapshot,
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
+    requested_assets: Option<Vec<AssetUuid>>,
 ) -> Result<PublishedTagIndex, String> {
     let tag_epoch = authority.source_hash();
     let (store_instance, basis, assets, tools, execution_root) = {
@@ -1111,9 +1189,12 @@ fn try_refine_published_tag_index(
         (
             store.instance_id(),
             store.input_version(),
-            store
-                .all_asset_ids()
-                .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
+            match requested_assets {
+                Some(assets) => assets,
+                None => store
+                    .all_asset_ids()
+                    .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
+            },
             PinnedToolEpoch::capture(&store, store.input_version())
                 .map_err(|error| format!("pin tag-index tools: {error:?}"))?,
             store.state_path().join("tag-index-runs"),
@@ -1266,7 +1347,11 @@ fn try_refine_published_tag_index(
         .map_err(|_| "durable store mutex is poisoned".to_owned())?
         .refine_unpublished_tag_index(basis, &updates)
         .map_err(|error| format!("publish tag index: {error}"))?;
-    Ok(PublishedTagIndex { tags, poisons })
+    Ok(PublishedTagIndex {
+        tags,
+        poisons,
+        removed: BTreeSet::new(),
+    })
 }
 
 fn index_one_tag_entry(
