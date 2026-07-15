@@ -203,3 +203,68 @@ fn symlinked_directory_cannot_escape_configured_roots() {
         Err(ScanError::SymlinkEscape { .. })
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn in_root_file_symlinks_are_identity_checked_and_reported() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("source.txt"), b"trusted").unwrap();
+    symlink("source.txt", root.join("alias.txt")).unwrap();
+    let scanner = scanner(&temp);
+
+    let scan = scanner.scan().unwrap();
+    let alias = scan
+        .files
+        .iter()
+        .find(|file| file.normalized_path == "alias.txt")
+        .unwrap();
+    assert_eq!(alias.kind, ScannedFileKind::Symlink);
+    assert_eq!(
+        alias.content_hash,
+        Some(distill_core::id::ContentHash(
+            *blake3::hash(b"trusted").as_bytes()
+        ))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_root_capability_cannot_be_redirected_by_path_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    let retained = temp.path().join("retained-assets");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("source.txt"), b"trusted").unwrap();
+    std::fs::write(outside.join("source.txt"), b"redirected").unwrap();
+    let scanner = scanner(&temp);
+
+    std::fs::rename(&root, &retained).unwrap();
+    symlink(&outside, &root).unwrap();
+
+    assert_eq!(
+        scanner
+            .read_identity_checked(&root.join("source.txt"))
+            .unwrap(),
+        b"trusted"
+    );
+    let scan = scanner.scan().unwrap();
+    let source = scan
+        .files
+        .iter()
+        .find(|file| file.normalized_path == "source.txt")
+        .unwrap();
+    assert_eq!(
+        source.content_hash,
+        Some(distill_core::id::ContentHash(
+            *blake3::hash(b"trusted").as_bytes()
+        ))
+    );
+}

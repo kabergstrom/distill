@@ -6,6 +6,9 @@
 //! identity opened for reading still names the path after the read.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -134,6 +137,15 @@ struct CanonicalRoot {
     configured: AssetRoot,
     canonical_path: PathBuf,
     quarantine_identity: Option<FileIdentity>,
+    directory: DirectoryCapability,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryCapability {
+    #[cfg(unix)]
+    file: Arc<File>,
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -184,8 +196,26 @@ pub struct ScanSnapshot {
 struct PendingDirectory {
     root_name: String,
     physical_path: PathBuf,
+    directory: DirectoryCapability,
     relative_components: Vec<String>,
     ancestry: BTreeSet<FileIdentity>,
+    entry_guards: Vec<EntryGuard>,
+}
+
+#[derive(Debug, Clone)]
+struct EntryGuard {
+    parent: DirectoryCapability,
+    name: std::ffi::OsString,
+    display_path: PathBuf,
+    target_identity: FileIdentity,
+    symlink_identity: Option<FileIdentity>,
+}
+
+#[derive(Debug)]
+struct OpenedChild {
+    file: File,
+    metadata: Metadata,
+    symlink_identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -388,8 +418,10 @@ impl RootedScanner {
             .map(|root| PendingDirectory {
                 root_name: root.configured.name.clone(),
                 physical_path: root.configured.path.clone(),
+                directory: root.directory.clone(),
                 relative_components: Vec::new(),
                 ancestry: BTreeSet::new(),
+                entry_guards: Vec::new(),
             })
             .collect::<Vec<_>>();
         let mut identities = BTreeMap::<FileIdentity, (String, PathBuf)>::new();
@@ -397,11 +429,8 @@ impl RootedScanner {
 
         while let Some(pending) = stack.pop() {
             let root = &roots[&pending.root_name];
-            let metadata =
-                fs::metadata(&pending.physical_path).map_err(|source| ScanError::Io {
-                    path: pending.physical_path.clone(),
-                    source,
-                })?;
+            revalidate_entry_guards(&pending.entry_guards, &roots)?;
+            let metadata = directory_metadata(&pending.directory, &pending.physical_path)?;
             if !metadata.is_dir() {
                 return Err(ScanError::NonRegularFile {
                     path: pending.physical_path,
@@ -448,83 +477,44 @@ impl RootedScanner {
                 }
             }
 
-            let mut entries = fs::read_dir(&pending.physical_path)
-                .map_err(|source| ScanError::Io {
-                    path: pending.physical_path.clone(),
-                    source,
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|source| ScanError::Io {
-                    path: pending.physical_path.clone(),
-                    source,
-                })?;
-            entries.sort_by_key(|entry| os_sort_key(&entry.file_name()));
-            let after = fs::metadata(&pending.physical_path).map_err(|source| ScanError::Io {
-                path: pending.physical_path.clone(),
-                source,
-            })?;
+            let mut entries = read_directory_names(&pending.directory, &pending.physical_path)?;
+            entries.sort_by_key(|entry| os_sort_key(entry));
+            let after = directory_metadata(&pending.directory, &pending.physical_path)?;
             if file_identity(&after) != identity {
                 return Err(ScanError::FileIdentityChanged {
                     path: pending.physical_path,
                 });
             }
+            revalidate_entry_guards(&pending.entry_guards, &roots)?;
 
             for entry in entries.into_iter().rev() {
-                let component = normalize_component(&entry.file_name())?;
+                let component = normalize_component(&entry)?;
                 let mut relative = pending.relative_components.clone();
                 relative.push(component);
-                let physical = entry.path();
-                let link_metadata =
-                    fs::symlink_metadata(&physical).map_err(|source| ScanError::Io {
-                        path: physical.clone(),
-                        source,
-                    })?;
-                let metadata = fs::metadata(&physical).map_err(|source| ScanError::Io {
-                    path: physical.clone(),
-                    source,
-                })?;
-                let is_symlink = link_metadata.file_type().is_symlink();
-                if is_symlink {
-                    let canonical =
-                        fs::canonicalize(&physical).map_err(|source| ScanError::Io {
-                            path: physical.clone(),
-                            source,
-                        })?;
-                    if !roots
-                        .values()
-                        .any(|candidate| canonical.starts_with(&candidate.canonical_path))
-                    {
-                        return Err(ScanError::SymlinkEscape {
-                            path: physical,
-                            target: canonical,
-                        });
-                    }
-                }
-                if metadata.is_dir() {
-                    let canonical =
-                        fs::canonicalize(&physical).map_err(|source| ScanError::Io {
-                            path: physical.clone(),
-                            source,
-                        })?;
-                    if !roots
-                        .values()
-                        .any(|candidate| canonical.starts_with(&candidate.canonical_path))
-                    {
-                        return Err(ScanError::SymlinkEscape {
-                            path: physical,
-                            target: canonical,
-                        });
-                    }
+                let physical = pending.physical_path.join(&entry);
+                let opened = open_scanned_child(&pending.directory, &entry, &physical, &roots)?;
+                let guard = EntryGuard::new(&pending.directory, &entry, &physical, &opened);
+                if opened.metadata.is_dir() {
                     let mut ancestry = pending.ancestry.clone();
                     ancestry.insert(identity);
+                    let mut entry_guards = pending.entry_guards.clone();
+                    entry_guards.push(guard);
+                    let directory =
+                        DirectoryCapability::from_open_directory(opened.file, &physical);
                     stack.push(PendingDirectory {
                         root_name: pending.root_name.clone(),
                         physical_path: physical,
+                        directory,
                         relative_components: relative,
                         ancestry,
+                        entry_guards,
                     });
-                } else if metadata.is_file() {
-                    let bytes = self.read_identity_checked(&physical)?;
+                } else if opened.metadata.is_file() {
+                    let metadata = opened.metadata;
+                    let is_symlink = opened.symlink_identity.is_some();
+                    let bytes = read_opened_file(opened.file, &physical, &metadata)?;
+                    revalidate_entry_guards(&pending.entry_guards, &roots)?;
+                    revalidate_entry_guards(std::slice::from_ref(&guard), &roots)?;
                     let normalized_path = relative.join("/");
                     snapshot.files.push(ScannedFile {
                         root_name: pending.root_name.clone(),
@@ -568,37 +558,453 @@ impl RootedScanner {
     }
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
-        let mut file = File::open(path).map_err(|source| ScanError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let opened = file.metadata().map_err(|source| ScanError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if !opened.is_file() {
+        let roots = self.root_snapshot();
+        let Some(root) = roots
+            .values()
+            .filter_map(|root| {
+                path.strip_prefix(&root.configured.path)
+                    .ok()
+                    .map(|relative| (root, relative))
+            })
+            .max_by_key(|(root, _)| root.configured.path.components().count())
+        else {
+            return Err(ScanError::InvalidLogicalPath(
+                path.to_string_lossy().into_owned(),
+            ));
+        };
+        let components = root
+            .1
+            .components()
+            .map(|component| component.as_os_str().to_owned())
+            .collect::<Vec<_>>();
+        if components.is_empty() {
             return Err(ScanError::NonRegularFile {
                 path: path.to_path_buf(),
             });
         }
-        let identity = file_identity(&opened);
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|source| ScanError::Io {
+        let mut directory = root.0.directory.clone();
+        let mut display = root.0.configured.path.clone();
+        let mut entry_guards = Vec::new();
+        for (index, component) in components.iter().enumerate() {
+            display.push(component);
+            let opened = open_scanned_child(&directory, component, &display, &roots)?;
+            let guard = EntryGuard::new(&directory, component, &display, &opened);
+            if index + 1 == components.len() {
+                if !opened.metadata.is_file() {
+                    return Err(ScanError::NonRegularFile { path: display });
+                }
+                let bytes = read_opened_file(opened.file, path, &opened.metadata)?;
+                entry_guards.push(guard);
+                revalidate_entry_guards(&entry_guards, &roots)?;
+                return Ok(bytes);
+            }
+            if !opened.metadata.is_dir() {
+                return Err(ScanError::NonRegularFile { path: display });
+            }
+            entry_guards.push(guard);
+            directory = DirectoryCapability::from_open_directory(opened.file, &display);
+        }
+        unreachable!("nonempty component walk returns at its final component")
+    }
+}
+
+impl DirectoryCapability {
+    fn open_root(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(path)?;
+            Ok(Self {
+                file: Arc::new(file),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
                 path: path.to_path_buf(),
+            })
+        }
+    }
+
+    fn from_open_directory(file: File, _path: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                file: Arc::new(file),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(file);
+            Self {
+                path: _path.to_path_buf(),
+            }
+        }
+    }
+}
+
+fn directory_metadata(
+    directory: &DirectoryCapability,
+    display_path: &Path,
+) -> Result<Metadata, ScanError> {
+    #[cfg(unix)]
+    {
+        directory.file.metadata().map_err(|source| ScanError::Io {
+            path: display_path.to_path_buf(),
+            source,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(&directory.path).map_err(|source| ScanError::Io {
+            path: display_path.to_path_buf(),
+            source,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn read_directory_names(
+    directory: &DirectoryCapability,
+    display_path: &Path,
+) -> Result<Vec<OsString>, ScanError> {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::ffi::OsStringExt;
+
+    struct Dir(*mut libc::DIR);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            // SAFETY: fdopendir returned this sole owned DIR pointer.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    // `dup` would share the retained descriptor's directory offset, causing
+    // later or concurrent scans to start wherever an earlier scan stopped.
+    // Opening `.` relative to the retained capability creates a fresh open
+    // file description for this enumeration without consulting a pathname.
+    let descriptor = open_at(directory, OsStr::new("."), false)
+        .map_err(|source| ScanError::Io {
+            path: display_path.to_path_buf(),
+            source,
+        })?
+        .into_raw_fd();
+    // SAFETY: fdopendir consumes the independently owned descriptor.
+    let pointer = unsafe { libc::fdopendir(descriptor) };
+    if pointer.is_null() {
+        let source = std::io::Error::last_os_error();
+        // SAFETY: fdopendir did not consume the descriptor on failure.
+        unsafe { libc::close(descriptor) };
+        return Err(ScanError::Io {
+            path: display_path.to_path_buf(),
+            source,
+        });
+    }
+    let directory = Dir(pointer);
+    let mut names = Vec::new();
+    loop {
+        set_errno(0);
+        // SAFETY: the DIR remains live for this call; each returned entry is
+        // copied before the next readdir invocation.
+        let entry = unsafe { libc::readdir(directory.0) };
+        if entry.is_null() {
+            let error = errno();
+            if error != 0 {
+                return Err(ScanError::Io {
+                    path: display_path.to_path_buf(),
+                    source: std::io::Error::from_raw_os_error(error),
+                });
+            }
+            break;
+        }
+        // SAFETY: POSIX dirent names are NUL terminated within d_name.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(not(unix))]
+fn read_directory_names(
+    directory: &DirectoryCapability,
+    display_path: &Path,
+) -> Result<Vec<std::ffi::OsString>, ScanError> {
+    fs::read_dir(&directory.path)
+        .map_err(|source| ScanError::Io {
+            path: display_path.to_path_buf(),
+            source,
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|source| ScanError::Io {
+                    path: display_path.to_path_buf(),
+                    source,
+                })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn set_errno(value: libc::c_int) {
+    // SAFETY: errno is thread-local and this function is used immediately
+    // around readdir on the same thread.
+    unsafe { *errno_pointer() = value };
+}
+
+#[cfg(unix)]
+fn errno() -> libc::c_int {
+    // SAFETY: errno_pointer returns this thread's live errno cell.
+    unsafe { *errno_pointer() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errno_pointer() -> *mut libc::c_int {
+    // SAFETY: delegated to the C runtime's thread-local errno accessor.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+unsafe fn errno_pointer() -> *mut libc::c_int {
+    // SAFETY: delegated to the C runtime's thread-local errno accessor.
+    unsafe { libc::__error() }
+}
+
+#[cfg(unix)]
+fn child_symlink_identity(
+    directory: &DirectoryCapability,
+    name: &OsStr,
+) -> std::io::Result<Option<FileIdentity>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
+    // SAFETY: zeroed stat is an out parameter for fstatat; the directory
+    // descriptor and C string remain live for the call.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        libc::fstatat(
+            directory.file.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(
+        ((stat.st_mode & libc::S_IFMT) == libc::S_IFLNK).then_some(FileIdentity::Unix {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn open_at(directory: &DirectoryCapability, name: &OsStr, follow: bool) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    // SAFETY: openat receives a live directory descriptor and C string; on
+    // success the returned descriptor is transferred exactly once to File.
+    let descriptor = unsafe { libc::openat(directory.file.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn open_scanned_child(
+    directory: &DirectoryCapability,
+    name: &std::ffi::OsStr,
+    physical: &Path,
+    roots: &BTreeMap<String, CanonicalRoot>,
+) -> Result<OpenedChild, ScanError> {
+    #[cfg(unix)]
+    {
+        let symlink_identity =
+            child_symlink_identity(directory, name).map_err(|source| ScanError::Io {
+                path: physical.to_path_buf(),
                 source,
             })?;
-        let current = fs::metadata(path).map_err(|source| ScanError::Io {
+        let is_symlink = symlink_identity.is_some();
+        let expected = if is_symlink {
+            let canonical = fs::canonicalize(physical).map_err(|source| ScanError::Io {
+                path: physical.to_path_buf(),
+                source,
+            })?;
+            if !roots
+                .values()
+                .any(|candidate| canonical.starts_with(&candidate.canonical_path))
+            {
+                return Err(ScanError::SymlinkEscape {
+                    path: physical.to_path_buf(),
+                    target: canonical,
+                });
+            }
+            Some(fs::metadata(&canonical).map_err(|source| ScanError::Io {
+                path: canonical,
+                source,
+            })?)
+        } else {
+            None
+        };
+        let file = open_at(directory, name, is_symlink).map_err(|source| ScanError::Io {
+            path: physical.to_path_buf(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| ScanError::Io {
+            path: physical.to_path_buf(),
+            source,
+        })?;
+        let current_symlink_identity =
+            child_symlink_identity(directory, name).map_err(|source| ScanError::Io {
+                path: physical.to_path_buf(),
+                source,
+            })?;
+        if current_symlink_identity != symlink_identity
+            || expected.as_ref().is_some_and(|expected| {
+                file_identity(expected) != file_identity(&metadata)
+                    || expected.is_dir() != metadata.is_dir()
+                    || expected.is_file() != metadata.is_file()
+            })
+        {
+            return Err(ScanError::FileIdentityChanged {
+                path: physical.to_path_buf(),
+            });
+        }
+        Ok(OpenedChild {
+            file,
+            metadata,
+            symlink_identity,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let link_metadata = fs::symlink_metadata(physical).map_err(|source| ScanError::Io {
+            path: physical.to_path_buf(),
+            source,
+        })?;
+        let symlink_identity = link_metadata
+            .file_type()
+            .is_symlink()
+            .then(|| file_identity(&link_metadata));
+        let is_symlink = symlink_identity.is_some();
+        if is_symlink {
+            let canonical = fs::canonicalize(physical).map_err(|source| ScanError::Io {
+                path: physical.to_path_buf(),
+                source,
+            })?;
+            if !roots
+                .values()
+                .any(|candidate| canonical.starts_with(&candidate.canonical_path))
+            {
+                return Err(ScanError::SymlinkEscape {
+                    path: physical.to_path_buf(),
+                    target: canonical,
+                });
+            }
+        }
+        let file = File::open(physical).map_err(|source| ScanError::Io {
+            path: physical.to_path_buf(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| ScanError::Io {
+            path: physical.to_path_buf(),
+            source,
+        })?;
+        let current_link_metadata =
+            fs::symlink_metadata(physical).map_err(|source| ScanError::Io {
+                path: physical.to_path_buf(),
+                source,
+            })?;
+        let current_symlink_identity = current_link_metadata
+            .file_type()
+            .is_symlink()
+            .then(|| file_identity(&current_link_metadata));
+        if current_symlink_identity != symlink_identity {
+            return Err(ScanError::FileIdentityChanged {
+                path: physical.to_path_buf(),
+            });
+        }
+        Ok(OpenedChild {
+            file,
+            metadata,
+            symlink_identity,
+        })
+    }
+}
+
+impl EntryGuard {
+    fn new(
+        parent: &DirectoryCapability,
+        name: &OsStr,
+        display_path: &Path,
+        opened: &OpenedChild,
+    ) -> Self {
+        Self {
+            parent: parent.clone(),
+            name: name.to_owned(),
+            display_path: display_path.to_path_buf(),
+            target_identity: file_identity(&opened.metadata),
+            symlink_identity: opened.symlink_identity,
+        }
+    }
+}
+
+fn revalidate_entry_guards(
+    guards: &[EntryGuard],
+    roots: &BTreeMap<String, CanonicalRoot>,
+) -> Result<(), ScanError> {
+    for guard in guards {
+        let current = open_scanned_child(&guard.parent, &guard.name, &guard.display_path, roots)?;
+        if file_identity(&current.metadata) != guard.target_identity
+            || current.symlink_identity != guard.symlink_identity
+        {
+            return Err(ScanError::FileIdentityChanged {
+                path: guard.display_path.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_opened_file(mut file: File, path: &Path, opened: &Metadata) -> Result<Vec<u8>, ScanError> {
+    let identity = file_identity(opened);
+    let opened_modified = modified_nanos(opened);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| ScanError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        if file_identity(&current) != identity || current.len() != bytes.len() as u64 {
-            return Err(ScanError::FileIdentityChanged {
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(bytes)
+    let after = file.metadata().map_err(|source| ScanError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if file_identity(&after) != identity
+        || opened.len() != bytes.len() as u64
+        || after.len() != bytes.len() as u64
+        || modified_nanos(&after) != opened_modified
+    {
+        return Err(ScanError::FileIdentityChanged {
+            path: path.to_path_buf(),
+        });
     }
+    Ok(bytes)
 }
 
 fn canonicalize_roots(
@@ -639,12 +1045,18 @@ fn canonicalize_roots(
                     })
                 }
             };
-            Ok((root.clone(), canonical_path, quarantine_identity))
+            let directory = DirectoryCapability::open_root(&canonical_path).map_err(|source| {
+                ScanError::Io {
+                    path: canonical_path.clone(),
+                    source,
+                }
+            })?;
+            Ok((root.clone(), canonical_path, quarantine_identity, directory))
         })
         .collect::<Result<Vec<_>, ScanError>>()?;
 
     let mut roots = BTreeMap::new();
-    for (configured, canonical_path, quarantine_identity) in canonical_paths {
+    for (configured, canonical_path, quarantine_identity, directory) in canonical_paths {
         let name = configured.name.clone();
         if roots
             .insert(
@@ -653,6 +1065,7 @@ fn canonicalize_roots(
                     configured,
                     canonical_path,
                     quarantine_identity,
+                    directory,
                 },
             )
             .is_some()
