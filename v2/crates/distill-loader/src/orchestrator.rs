@@ -640,25 +640,6 @@ impl<I: LoaderIO> Loader<I> {
                 }
             }
         }
-        let stored = self
-            .slots
-            .iter()
-            .filter_map(|(handle, slot)| {
-                slot.current
-                    .as_ref()
-                    .filter(|current| current.epoch == epoch)
-                    .map(|current| StoredAdoption {
-                        type_uuid: current.type_uuid,
-                        handle: *handle,
-                        adoption: current.adoption,
-                    })
-            })
-            .collect::<Vec<_>>();
-        for adoption in stored {
-            self.epochs
-                .record_adoption(epoch, adoption)
-                .map_err(LoaderError::RuntimeEpoch)?;
-        }
         self.epochs
             .begin_module_drain(epoch)
             .map_err(LoaderError::RuntimeEpoch)?;
@@ -778,6 +759,20 @@ impl<I: LoaderIO> Loader<I> {
             .filter(|(_, slot)| slot.internal_lease.is_none() && slot.lease.upgrade().is_none())
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
+        let released_set = released.iter().copied().collect::<BTreeSet<_>>();
+        let mut pending_index = 0;
+        while pending_index < self.pending.len() {
+            if self.pending[pending_index]
+                .updates
+                .iter()
+                .any(|update| released_set.contains(&update.handle))
+            {
+                let pending = self.pending.remove(pending_index);
+                self.rollback_updates(storage, pending.adoption, &pending.updates);
+            } else {
+                pending_index += 1;
+            }
+        }
         for id in released {
             if let Some(placeholder) = self.injected_placeholders.remove(&id) {
                 let _ = placeholder.value.destroy();
@@ -792,11 +787,16 @@ impl<I: LoaderIO> Loader<I> {
                     }
                 }
                 if let Some(current) = slot.current {
-                    if storage
-                        .free(current.type_uuid, id, current.adoption)
-                        .is_err()
-                    {
-                        self.poison_epoch(current.epoch);
+                    let stored = StoredAdoption {
+                        type_uuid: current.type_uuid,
+                        handle: id,
+                        adoption: current.adoption,
+                    };
+                    match storage.free(current.type_uuid, id, current.adoption) {
+                        Ok(()) => {
+                            let _ = self.epochs.release_adoption(current.epoch, stored);
+                        }
+                        Err(_) => self.poison_epoch(current.epoch),
                     }
                 }
                 self.direct_slots.retain(|_, value| *value != id);
@@ -1807,11 +1807,23 @@ impl<I: LoaderIO> Loader<I> {
                             .remove(&handle)
                             .expect("component readiness checked every handle value");
                         let epoch = self.ensure_descriptor(*type_uuid)?.epoch;
+                        let stored = StoredAdoption {
+                            type_uuid: *type_uuid,
+                            handle,
+                            adoption,
+                        };
+                        if let Err(error) = self.epochs.record_adoption(epoch, stored) {
+                            let _ = value.destroy();
+                            return Err(LoaderError::RuntimeEpoch(error));
+                        }
                         let token = match storage.update(*type_uuid, handle, value, adoption) {
                             Ok(UpdateResult::Ready) => None,
                             Ok(UpdateResult::Pending(token)) => Some(token),
                             Err(error) => {
                                 self.observe_storage_error(&error, epoch);
+                                if matches!(error, StorageError::Engine(_)) {
+                                    let _ = self.epochs.release_adoption(epoch, stored);
+                                }
                                 self.rollback_updates(storage, adoption, &updates);
                                 self.diagnostics
                                     .push(LoaderDiagnostic::Storage { handle, error });
@@ -1845,11 +1857,23 @@ impl<I: LoaderIO> Loader<I> {
                             .map(|current| current.type_uuid)
                             .expect("placeholder applies only to a prior live value");
                         let epoch = self.ensure_descriptor(type_uuid)?.epoch;
+                        let stored = StoredAdoption {
+                            type_uuid,
+                            handle,
+                            adoption,
+                        };
+                        if let Err(error) = self.epochs.record_adoption(epoch, stored) {
+                            let _ = value.destroy();
+                            return Err(LoaderError::RuntimeEpoch(error));
+                        }
                         let token = match storage.update(type_uuid, handle, value, adoption) {
                             Ok(UpdateResult::Ready) => None,
                             Ok(UpdateResult::Pending(token)) => Some(token),
                             Err(error) => {
                                 self.observe_storage_error(&error, epoch);
+                                if matches!(error, StorageError::Engine(_)) {
+                                    let _ = self.epochs.release_adoption(epoch, stored);
+                                }
                                 self.rollback_updates(storage, adoption, &updates);
                                 self.diagnostics
                                     .push(LoaderDiagnostic::Storage { handle, error });
@@ -1929,11 +1953,16 @@ impl<I: LoaderIO> Loader<I> {
                 .get_mut(&update.handle)
                 .and_then(|slot| slot.current.take());
             if let Some(old) = old {
-                if storage
-                    .free(old.type_uuid, update.handle, old.adoption)
-                    .is_err()
-                {
-                    self.poison_epoch(old.epoch);
+                let stored = StoredAdoption {
+                    type_uuid: old.type_uuid,
+                    handle: update.handle,
+                    adoption: old.adoption,
+                };
+                match storage.free(old.type_uuid, update.handle, old.adoption) {
+                    Ok(()) => {
+                        let _ = self.epochs.release_adoption(old.epoch, stored);
+                    }
+                    Err(_) => self.poison_epoch(old.epoch),
                 }
             }
             if let Some(slot) = self.slots.get_mut(&update.handle) {
@@ -1968,11 +1997,16 @@ impl<I: LoaderIO> Loader<I> {
         updates: &[PendingUpdate],
     ) {
         for update in updates {
-            if storage
-                .free(update.type_uuid, update.handle, adoption)
-                .is_err()
-            {
-                self.poison_epoch(update.owner_epoch);
+            let stored = StoredAdoption {
+                type_uuid: update.type_uuid,
+                handle: update.handle,
+                adoption,
+            };
+            match storage.free(update.type_uuid, update.handle, adoption) {
+                Ok(()) => {
+                    let _ = self.epochs.release_adoption(update.owner_epoch, stored);
+                }
+                Err(_) => self.poison_epoch(update.owner_epoch),
             }
         }
     }
@@ -2071,6 +2105,7 @@ impl<I: LoaderIO> Loader<I> {
     }
 
     fn poison_epoch(&mut self, epoch: GameModuleEpoch) {
+        let _ = self.epochs.poison_callback(epoch);
         if let Some(record) = self
             .descriptors
             .values()
@@ -2093,6 +2128,19 @@ impl<I: LoaderIO> Loader<I> {
     fn drain_epochs(&mut self, storage: &mut dyn AssetStorage) -> Result<(), LoaderError> {
         let epochs = self.draining.iter().copied().collect::<Vec<_>>();
         for epoch in epochs {
+            let mut index = 0;
+            while index < self.pending.len() {
+                if self.pending[index]
+                    .updates
+                    .iter()
+                    .any(|update| update.owner_epoch == epoch)
+                {
+                    let pending = self.pending.remove(index);
+                    self.rollback_updates(storage, pending.adoption, &pending.updates);
+                } else {
+                    index += 1;
+                }
+            }
             let result = self.epochs.drain(epoch, storage);
             for slot in self.slots.values_mut() {
                 if slot

@@ -207,8 +207,10 @@ struct Storage {
     pending_handles: BTreeSet<HandleId>,
     pending_ready: bool,
     tokens: BTreeMap<PendingToken, (HandleId, AdoptionId)>,
+    polls: usize,
     next_token: u64,
     fail_update: Option<(HandleId, GameModuleEpoch)>,
+    fail_free: BTreeSet<HandleId>,
 }
 
 impl AssetStorage for Storage {
@@ -241,6 +243,7 @@ impl AssetStorage for Storage {
     }
 
     fn poll(&mut self, _token: PendingToken) -> PendingState {
+        self.polls += 1;
         if self.pending_ready {
             PendingState::Ready
         } else {
@@ -263,6 +266,11 @@ impl AssetStorage for Storage {
         handle: HandleId,
         adoption: AdoptionId,
     ) -> Result<(), CallbackPanic> {
+        if self.fail_free.contains(&handle) {
+            return Err(CallbackPanic);
+        }
+        self.tokens
+            .retain(|_, pending| *pending != (handle, adoption));
         if let Some(value) = self.values.remove(&(handle, adoption)) {
             value.destroy()?;
         }
@@ -576,6 +584,67 @@ fn pending_member_defers_the_whole_dependency_component() {
     assert_eq!(storage.commits.len(), 2);
     assert_eq!(loader.status(&a), LoadStatus::Loaded);
     assert_eq!(loader.status(&b), LoadStatus::Loaded);
+}
+
+#[test]
+fn module_drain_cancels_pending_storage_before_reporting_complete() {
+    let token = ModuleEpochToken::new(42);
+    let epoch = GameModuleEpoch(42);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 42, &token);
+    let asset_uuid = uuid(42);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    storage.pending_handles.insert(handle.id());
+    loader.process(&mut storage).unwrap();
+
+    let (hash, artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.values.len(), 1);
+    assert_eq!(storage.tokens.len(), 1);
+
+    loader.begin_module_drain(epoch).unwrap();
+    assert!(!loader.drain_complete(epoch));
+
+    loader.process(&mut storage).unwrap();
+    assert!(loader.drain_complete(epoch));
+    assert!(storage.values.is_empty());
+    assert!(storage.tokens.is_empty());
+
+    let polls_after_cancel = storage.polls;
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.polls, polls_after_cancel);
+}
+
+#[test]
+fn failed_pending_cancellation_poisons_and_prevents_module_unload() {
+    let token = ModuleEpochToken::new(43);
+    let epoch = GameModuleEpoch(43);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 43, &token);
+    let asset_uuid = uuid(43);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    storage.pending_handles.insert(handle.id());
+    loader.process(&mut storage).unwrap();
+
+    let (hash, artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, artifact);
+    loader.process(&mut storage).unwrap();
+    storage.fail_free.insert(handle.id());
+
+    loader.begin_module_drain(epoch).unwrap();
+    loader.process(&mut storage).unwrap();
+
+    assert!(token.is_poisoned());
+    assert!(!loader.drain_complete(epoch));
+    assert_eq!(storage.values.len(), 1);
+    assert_eq!(storage.tokens.len(), 1);
 }
 
 #[test]

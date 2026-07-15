@@ -142,6 +142,21 @@ impl RuntimeEpochs {
         Ok(())
     }
 
+    /// Forget an adoption only after storage confirms that its value has
+    /// been freed (or an update failed without retaining it). During drain,
+    /// a failed free deliberately leaves the row present forever.
+    pub fn release_adoption(
+        &mut self,
+        epoch: GameModuleEpoch,
+        adoption: StoredAdoption,
+    ) -> Result<bool, RuntimeEpochError> {
+        let record = self
+            .records
+            .get_mut(&epoch)
+            .ok_or(RuntimeEpochError::UnknownEpoch(epoch))?;
+        Ok(record.stored.remove(&adoption))
+    }
+
     pub fn record_placeholder(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
         self.resource(epoch, |record| record.placeholders += 1)
     }
@@ -247,5 +262,16 @@ impl RuntimeEpochs {
         self.records
             .get(&epoch)
             .is_some_and(|record| record.token.is_poisoned())
+    }
+
+    pub fn poison_callback(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
+        let record = self
+            .records
+            .get_mut(&epoch)
+            .ok_or(RuntimeEpochError::UnknownEpoch(epoch))?;
+        record
+            .token
+            .poison_with(ModuleEpochPoisonCause::CallbackPanic);
+        Ok(())
     }
 }
