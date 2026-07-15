@@ -1,25 +1,21 @@
 //! §13 consistency-contract state machinery: version counters, the
 //! snapshot stamp (RPC-side realization of `IoBasis::Rpc`, §15), the
-//! `PipelineState` valid/invalid operation classification, and the
-//! load-policy digest.
+//! `PipelineState` valid/invalid operation classification.
 
 use std::sync::Arc;
 
-use distill_core::attestation::{bootstrap_control_logical_registry_v1, CompiledAttestationDigest};
-use distill_core::id::TypeUuid;
+use distill_core::attestation::bootstrap_control_logical_registry_v1;
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
-    load_policy_digest, CleanupDisposition, ConfigurationEpoch, ConfigurationPoison,
-    ConfigurationState, DscpV1, InputVersion, MemoSeq, OperationKind, PipelineEpoch,
-    PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin, PipelineState, Registration,
-    RegistrationKind, SnapshotStamp, StoreInstanceId,
+    CleanupDisposition, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, DscpV1,
+    InputVersion, MemoSeq, OperationKind, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
+    PipelinePoisonOrigin, PipelineState, Registration, RegistrationKind, SnapshotStamp,
+    StoreInstanceId,
 };
 
 fn epoch() -> Arc<PipelineEpoch> {
     Arc::new(PipelineEpoch {
         dylib_hash: [7u8; 32],
-        load_policy_digest: [9u8; 32],
-        compiled_types: CompiledAttestationDigest([10u8; 32]),
         target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
         schema_registry: bootstrap_control_logical_registry_v1().unwrap(),
         registrations: vec![Registration {
@@ -187,7 +183,7 @@ fn ready_state_supplies_the_epoch_to_pipeline_ops() {
         .check(OperationKind::Build)
         .expect("ready state permits builds")
         .expect("pipeline ops receive the epoch");
-    assert_eq!(got.load_policy_digest, [9u8; 32]);
+    assert_eq!(got.dylib_hash, [7u8; 32]);
     // Pure ops are also valid, without an epoch requirement.
     assert!(state.check(OperationKind::CasRead).is_ok());
 }
@@ -243,53 +239,4 @@ fn ready_configuration_supplies_its_snapshot_pinned_epoch() {
         .expect("configuration-dependent operations consume the epoch");
     assert_eq!(got.generation, 7);
     assert!(state.check(OperationKind::CasRead).unwrap().is_none());
-}
-
-// ---- load-policy digest ----
-
-fn t(n: u8) -> TypeUuid {
-    TypeUuid([n; 16])
-}
-
-#[test]
-fn load_policy_digest_is_order_independent() {
-    // §13: "blake3 over the sorted (type_uuid, build_only) pairs".
-    let a = load_policy_digest(&[(t(1), false), (t(2), true)]);
-    let b = load_policy_digest(&[(t(2), true), (t(1), false)]);
-    assert_eq!(a, b);
-}
-
-#[test]
-fn load_policy_digest_bytes_are_pinned_under_the_dslp_domain() {
-    // §13 pins the construction: blake3("DSLP" ‖ version:u8 ‖ count:u32 ‖
-    // (type_uuid:16 ‖ build_only:u8)*) over the sorted pairs — §5's
-    // domain table registers "DSLP", so the digest can never alias
-    // another meaning.
-    let mut pre_image = Vec::new();
-    pre_image.extend_from_slice(b"DSLP");
-    pre_image.push(1); // version
-    pre_image.extend_from_slice(&2u32.to_le_bytes());
-    pre_image.extend_from_slice(&[1u8; 16]);
-    pre_image.push(0);
-    pre_image.extend_from_slice(&[2u8; 16]);
-    pre_image.push(1);
-    let expected = *blake3::hash(&pre_image).as_bytes();
-    // Unsorted input: the encoding sorts by uuid bytes.
-    assert_eq!(load_policy_digest(&[(t(2), true), (t(1), false)]), expected);
-}
-
-#[test]
-fn load_policy_digest_sees_a_flipped_bit() {
-    let a = load_policy_digest(&[(t(1), false), (t(2), true)]);
-    let b = load_policy_digest(&[(t(1), false), (t(2), false)]);
-    assert_ne!(a, b, "toggling build_only must publish a new digest");
-}
-
-#[test]
-fn load_policy_digest_sees_membership() {
-    let a = load_policy_digest(&[(t(1), false)]);
-    let b = load_policy_digest(&[(t(1), false), (t(2), false)]);
-    assert_ne!(a, b);
-    let empty = load_policy_digest(&[]);
-    assert_ne!(a, empty);
 }

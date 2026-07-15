@@ -247,11 +247,8 @@ impl DaemonCoordinator {
             targets,
             backend.clone(),
         )?;
-        let bootstrap = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
-            .map_err(|error| CoordinatorInitError::Module(error.to_string()))?;
         let pipeline = CoordinatedPipelineRuntime {
-            host: ModuleHost::new_with_bootstrap_authority(module_state_path, bootstrap)
-                .map_err(CoordinatorInitError::ModuleIo)?,
+            host: ModuleHost::new(module_state_path).map_err(CoordinatorInitError::ModuleIo)?,
             loader: DynamicPipelineModuleLoader,
             pending: None,
         };
@@ -597,10 +594,10 @@ impl DaemonCoordinator {
             host.prepare_candidate(&pipeline_source, &mut requirements, loader)
         };
         let authored_types = requirements
-            .compiled_types
-            .rows
-            .iter()
-            .map(|row| row.type_uuid)
+            .schema_registry
+            .keys()
+            .copied()
+            .filter(|type_uuid| !distill_core::attestation::is_bootstrap_control_type(*type_uuid))
             .collect::<Vec<_>>();
         let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
             Ok(prepared) => {

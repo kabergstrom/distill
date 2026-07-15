@@ -12,8 +12,8 @@
 //! the module host, outside this crate. The store-side contract needs the
 //! epoch's *identity*: the pipeline dylib content hash (an input-hash
 //! input wherever pipeline code runs), the importer/processor
-//! registrations and versions, and the load-policy digest — exactly the
-//! `pipeline_state` row (§13). That is what [`PipelineEpoch`] here
+//! registrations and versions, the exact logical schema map, and canonical
+//! target rows — exactly the `pipeline_state` row (§13). That is what [`PipelineEpoch`] here
 //! carries; residency is still expressed the spec's way (`Arc`), so pin
 //! counting composes when the module host wraps it.
 
@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-use distill_core::attestation::CompiledAttestationDigest;
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetError};
@@ -107,13 +106,6 @@ pub struct PipelineEpoch {
     /// The pipeline dylib content hash — an input-hash input wherever
     /// pipeline code runs (§9, §13).
     pub dylib_hash: [u8; 32],
-    /// blake3 over the sorted `(type_uuid, build_only)` pairs of the
-    /// current registry (§9, §13) — input-versioned change tracking for
-    /// the deliberately unhashed `build_only` bit (§5).
-    pub load_policy_digest: [u8; 32],
-    /// Aggregate over the complete compiled type rows. This is part of the
-    /// staged-candidate identity used by explicit schema commands.
-    pub compiled_types: CompiledAttestationDigest,
     /// Complete canonical target-definition set used to construct the
     /// candidate pipeline map. The store validates and compares these exact
     /// canonical rows before publishing and before every schema command.
@@ -127,15 +119,13 @@ pub struct PipelineEpoch {
     pub registrations: Vec<Registration>,
 }
 
-/// Store-side identity of a candidate whose compiled schema projection is
-/// awaiting explicit acceptance or rollback. The staged dylib binds the
-/// registration/code identity, DSCA binds the complete compiled type table,
-/// and the exact canonical target rows prevent a candidate built for different
-/// targets from consuming the pending command.
+/// Store-side identity of a candidate whose logical schema projection is
+/// awaiting explicit acceptance or rollback. The staged dylib and exact
+/// canonical target rows prevent a different candidate from consuming the
+/// pending command; its exact logical map is stored separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineCandidateIdentity {
     pub dylib_hash: [u8; 32],
-    pub compiled_types: CompiledAttestationDigest,
     pub target_set: CanonicalTargetSet,
 }
 
@@ -146,7 +136,6 @@ impl TryFrom<&PipelineEpoch> for PipelineCandidateIdentity {
         let target_set = CanonicalTargetSet::from_canonical(epoch.target_set.rows.clone())?;
         Ok(Self {
             dylib_hash: epoch.dylib_hash,
-            compiled_types: epoch.compiled_types,
             target_set,
         })
     }
@@ -2172,22 +2161,4 @@ impl OperationKind {
             | OperationKind::TargetBoundRpc => true,
         }
     }
-}
-
-/// The **load-policy digest** (§9, §13): `blake3("DSLP" ‖ version:u8 ‖
-/// count:u32 ‖ (type_uuid:16 ‖ build_only:u8)*)` over the sorted
-/// `(type_uuid, build_only)` pairs of the current registry — §5's
-/// canonical set encoding (fixed 16-byte uuid ‖ bool byte, sorted by
-/// encoded bytes — uuid order — and deduplicated) under the `"DSLP"`
-/// domain from §5's table (packs carry the same grammar projected onto
-/// their closure, §16). `build_only` is deliberately unhashed in the
-/// logical schema (§5 — toggling policy must not mint migrations), so
-/// this digest is its change tracking.
-pub fn load_policy_digest(pairs: &[(TypeUuid, bool)]) -> [u8; 32] {
-    distill_core::canonical::domain_digest(distill_core::canonical::DSLP, 1, |e| {
-        e.set(pairs.iter(), |e, (uuid, build_only)| {
-            e.raw(&uuid.0);
-            e.bool(*build_only);
-        });
-    })
 }

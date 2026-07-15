@@ -687,7 +687,7 @@ struct SchemaManifestBasis {
 
 struct PipelineCandidateIdentity {
   dylibHash @0 :Data;
-  compiledTypes @1 :Data;
+  reservedCompiledTypes @1 :Void;
   targetRows @2 :List(PipelineTargetRow);
 }
 

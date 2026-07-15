@@ -16,8 +16,8 @@ use serde::Deserialize;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 use crate::coordinator::LineageDestination;
-use crate::epoch::{CandidateRequirements, MeasuredLayout, TargetDefinition as PipelineTarget};
-use crate::module_loader::host_module_identity;
+use crate::epoch::{CandidateRequirements, TargetDefinition as PipelineTarget};
+use crate::module_loader::host_module_abi_identity;
 use crate::scanner::AssetRoot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +408,7 @@ impl DaemonConfig {
         &self,
         compiled: &CompiledTypeTable,
         identity: &CompilationIdentity,
+        source_hashes: &BTreeMap<String, String>,
     ) -> Result<CandidateRequirements, DaemonConfigError> {
         let rpc_targets = self.target_definitions(compiled, identity)?;
         let targets = rpc_targets
@@ -417,18 +418,14 @@ impl DaemonConfig {
                 fingerprint: target.definition_hash().0,
             })
             .collect();
-        let measured_layouts = compiled
-            .rows
-            .iter()
-            .map(|row| MeasuredLayout {
-                type_id: type_uuid_hex(row.type_uuid.0),
-                digest: row.native_layout_digest,
-            })
-            .collect();
         Ok(CandidateRequirements {
-            identity: host_module_identity(identity.clone()),
-            measured_layouts,
-            compiled_types: compiled.clone(),
+            module_abi: host_module_abi_identity(),
+            source_hashes: source_hashes.clone(),
+            schema_registry: compiled
+                .rows
+                .iter()
+                .map(|row| (row.type_uuid, row.logical_hash))
+                .collect(),
             targets,
         })
     }
@@ -549,15 +546,6 @@ fn owned_path_kind(role: &str) -> OwnedPathKind {
         "codegen.rs_mod_path" => OwnedPathKind::CodegenOutput,
         _ => OwnedPathKind::ImportDestination,
     }
-}
-
-fn type_uuid_hex(bytes: [u8; 16]) -> String {
-    let mut result = String::with_capacity(32);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut result, "{byte:02x}").expect("writing to String is infallible");
-    }
-    result
 }
 
 fn normalize_targets(

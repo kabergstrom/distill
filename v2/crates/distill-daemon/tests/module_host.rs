@@ -4,24 +4,20 @@ use std::sync::{Arc, Mutex};
 
 use distill_asset::{ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken};
 use distill_core::attestation::{
+    bootstrap_control_logical_registry_v1, CompiledTypeRow as CompiledTypeAttestation,
     ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, RegistryPathStep,
-    SchemaNodeId, BOOTSTRAP_CONTROL_TYPE_UUIDS,
+    SchemaNodeId,
 };
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
     CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements,
-    CompiledAttestationDigest, CompiledTypeAttestation, CompiledTypeTable, DurableModuleHost,
-    DurablePublishError, EpochWorkError, HostBootstrapAuthorityV1, HostCallbackBoundary,
-    HostCallbackSurface, LoadedPipelineModule, MeasuredLayout, ModuleAbiIdentity, ModuleCallError,
-    ModuleEpochPin, ModuleHost, ModuleIdentity, PipelineModuleLoader, PipelinePoisonCode,
-    PipelinePoisonOrigin, Registration, RegistrationDisposition, RegistrationKind,
-    RegistrationResource, RegistrationSet, StagedModule, TargetDefinition, UnloadOutcome,
+    DurableModuleHost, DurablePublishError, EpochWorkError, HostCallbackBoundary,
+    HostCallbackSurface, LoadedPipelineModule, ModuleAbiIdentity, ModuleCallError, ModuleEpochPin,
+    ModuleHost, PipelineModuleLoader, PipelinePoisonCode, PipelinePoisonOrigin, Registration,
+    RegistrationDisposition, RegistrationKind, RegistrationResource, RegistrationSet, StagedModule,
+    TargetDefinition, UnloadOutcome,
 };
-use distill_schema::bootstrap_gen_v1::{
-    consumer_bootstrap_authority_v1, consumer_compilation_identity_v1,
-};
-use distill_schema::ngp_schema::CompilationIdentity;
 use distill_store::pipeline::{
     AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
     VerifiedSchemaLineageManifest,
@@ -85,9 +81,8 @@ unsafe fn cleanup_test_registration(pointer: *mut u8) -> Result<(), ModuleCallEr
 }
 
 struct FakeModule {
-    identity: ModuleIdentity,
-    layouts: Vec<MeasuredLayout>,
-    compiled_types: CompiledTypeTable,
+    source_identity: ngp_module_host::ModuleSourceIdentity,
+    module_abi: ModuleAbiIdentity,
     registration: RegistrationSet,
     calls: Arc<Mutex<Calls>>,
     cleanup_behaviors: Vec<CleanupBehavior>,
@@ -101,16 +96,14 @@ struct FakeModule {
 }
 
 impl LoadedPipelineModule for FakeModule {
-    fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError> {
-        Ok(self.identity.clone())
+    fn source_identity(
+        &mut self,
+    ) -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError> {
+        Ok(self.source_identity.clone())
     }
 
-    fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError> {
-        Ok(self.layouts.clone())
-    }
-
-    fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError> {
-        Ok(self.compiled_types.clone())
+    fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError> {
+        Ok(self.module_abi.clone())
     }
 
     fn register(
@@ -210,29 +203,25 @@ impl PipelineModuleLoader for FakeLoader {
     }
 }
 
-fn identity(tag: u8) -> ModuleIdentity {
-    ModuleIdentity {
-        compilation: compilation_identity(),
-        module_abi: ModuleAbiIdentity {
-            rustc: format!("rustc-{tag}"),
-            interface_fingerprint: [tag; 32],
-            measured_interface: [tag; 32],
-            panic_strategy: "unwind".into(),
-            allocator: "system".into(),
-        },
+fn module_abi(tag: u8) -> ModuleAbiIdentity {
+    ModuleAbiIdentity {
+        rustc: format!("rustc-{tag}"),
+        interface_fingerprint: [tag; 32],
+        measured_interface: [tag; 32],
+        panic_strategy: "unwind".into(),
+        allocator: "system".into(),
     }
 }
 
-fn compilation_identity() -> CompilationIdentity {
-    consumer_compilation_identity_v1().clone()
-}
-
-fn bootstrap_authority() -> &'static HostBootstrapAuthorityV1 {
-    consumer_bootstrap_authority_v1().unwrap()
+fn source_identity(tag: u8) -> ngp_module_host::ModuleSourceIdentity {
+    ngp_module_host::ModuleSourceIdentity {
+        crate_name: "pipeline".to_owned(),
+        source_hash: format!("{tag:016x}"),
+    }
 }
 
 fn module_host(state_dir: impl AsRef<Path>) -> std::io::Result<ModuleHost> {
-    ModuleHost::new_with_bootstrap_authority(state_dir, bootstrap_authority())
+    ModuleHost::new(state_dir)
 }
 
 fn durable_module_host(
@@ -243,16 +232,15 @@ fn durable_module_host(
     let host = module_host(state_dir.join("modules")).unwrap();
     let mut store = Store::open(StoreConfig::new(state_dir.join("store"))).unwrap();
     let types = requirements
-        .compiled_types
-        .rows
+        .schema_registry
         .iter()
-        .filter(|row| !distill_core::attestation::is_bootstrap_control_type(row.type_uuid))
-        .map(|row| {
+        .filter(|(type_uuid, _)| !distill_core::attestation::is_bootstrap_control_type(**type_uuid))
+        .map(|(type_uuid, logical_hash)| {
             (
-                row.type_uuid,
+                *type_uuid,
                 AcceptedTypeLineage {
                     epochs: vec![AcceptedSchemaEpoch {
-                        digest: row.logical_hash,
+                        digest: *logical_hash,
                         forward_parent: None,
                     }],
                     current: 0,
@@ -275,15 +263,15 @@ fn durable_module_host(
 }
 
 fn requirements(tag: u8) -> CandidateRequirements {
-    let mut compiled_types = vec![compiled_type(tag)];
-    compiled_types.extend(bootstrap_types(tag));
+    let compiled = compiled_type(tag);
+    let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
+    schema_registry.insert(compiled.type_uuid, compiled.logical_hash);
     CandidateRequirements {
-        identity: identity(tag),
-        measured_layouts: vec![MeasuredLayout {
-            type_id: "asset".into(),
-            digest: [tag; 32],
-        }],
-        compiled_types: CompiledTypeTable::canonical(compiled_types).unwrap(),
+        module_abi: module_abi(tag),
+        source_hashes: [("pipeline".to_owned(), format!("{tag:016x}"))]
+            .into_iter()
+            .collect(),
+        schema_registry,
         targets: vec![TargetDefinition {
             name: "desktop".into(),
             fingerprint: [tag; 32],
@@ -291,15 +279,10 @@ fn requirements(tag: u8) -> CandidateRequirements {
     }
 }
 
-fn bootstrap_types(_tag: u8) -> Vec<CompiledTypeAttestation> {
-    bootstrap_authority().table().rows().to_vec()
-}
-
 fn fake_module(tag: u8, calls: Arc<Mutex<Calls>>) -> FakeModule {
     FakeModule {
-        identity: identity(tag),
-        layouts: requirements(tag).measured_layouts,
-        compiled_types: requirements(tag).compiled_types,
+        source_identity: source_identity(tag),
+        module_abi: module_abi(tag),
         registration: RegistrationSet {
             registrations: vec![Registration {
                 kind: RegistrationKind::Processor,
@@ -716,7 +699,7 @@ fn unload_error_or_panic_leaks_candidate_without_dlclose() {
         write_module(&source, 12);
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut module = fake_module(12, calls.clone());
-        module.identity = identity(99);
+        module.module_abi = module_abi(99);
         module.unload_panics = unload_panics;
         module.unload_error = (!unload_panics).then_some("unload refused");
         let mut loader = FakeLoader {
@@ -1014,279 +997,69 @@ fn clean_epoch_waits_for_snapshot_pin_then_unloads_and_closes() {
     assert_eq!(calls.dlclose, 1);
 }
 
-fn publish_with_compiled_types(
-    expected: CompiledTypeTable,
-    actual: CompiledTypeTable,
-) -> (distill_daemon::epoch::PipelinePoison, Arc<Mutex<Calls>>) {
+fn publish_with_module(
+    candidate: CandidateRequirements,
+    module: FakeModule,
+    calls: Arc<Mutex<Calls>>,
+) -> distill_daemon::epoch::PipelinePoison {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 7);
-    let calls = Arc::new(Mutex::new(Calls::default()));
-    let mut module = fake_module(7, calls.clone());
-    module.compiled_types = actual;
     let mut loader = FakeLoader {
         module: Some(module),
         open_error: None,
     };
-    let mut candidate = requirements(7);
-    candidate.compiled_types = expected;
     let mut host = module_host(temp.path().join("state")).unwrap();
     let poison = host
         .publish_candidate(&source, candidate, &mut loader)
         .unwrap_err();
-    (poison, calls)
+    assert_eq!(calls.lock().unwrap().register, 0);
+    poison
 }
 
 #[test]
-fn compiled_attestation_rejects_semantic_drift_before_register_when_dsnl_is_equal() {
-    let expected = requirements(7).compiled_types;
-    let base = &expected.rows[0];
-    let weak_extras = RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-        node: SchemaNodeId(0),
-        path: vec![RegistryPathStep::Field("reference".into())],
-        fact: RegistryExtraFact::Reference {
-            strength: ReferenceStrength::Weak,
-            target: TypeUuid([99; 16]),
-        },
-    }])
-    .unwrap();
-    for (field, changed) in [
-        (
-            "logical hash",
-            CompiledTypeAttestation::new(
-                base.type_uuid,
-                LogicalHash([91; 32]),
-                base.native_layout_digest,
-                base.build_only,
-                base.registry_extras.clone(),
-            )
-            .unwrap(),
-        ),
-        (
-            "build_only",
-            CompiledTypeAttestation::new(
-                base.type_uuid,
-                base.logical_hash,
-                base.native_layout_digest,
-                true,
-                base.registry_extras.clone(),
-            )
-            .unwrap(),
-        ),
-        (
-            "registry extras",
-            CompiledTypeAttestation::new(
-                base.type_uuid,
-                base.logical_hash,
-                base.native_layout_digest,
-                base.build_only,
-                weak_extras.clone(),
-            )
-            .unwrap(),
-        ),
-    ] {
-        let mut actual_rows = expected.rows.clone();
-        let index = actual_rows
-            .iter()
-            .position(|row| row.type_uuid == changed.type_uuid)
-            .unwrap();
-        actual_rows[index] = changed;
-        let actual = CompiledTypeTable::canonical(actual_rows).unwrap();
-        assert_eq!(
-            actual
-                .rows
-                .iter()
-                .find(|row| row.type_uuid == base.type_uuid)
-                .unwrap()
-                .native_layout_digest,
-            [7; 32]
-        );
-        let (poison, calls) = publish_with_compiled_types(expected.clone(), actual);
-        assert!(poison.message.contains(field), "{}", poison.message);
+fn missing_or_wrong_module_source_identity_is_rejected_before_abi_and_register() {
+    for missing in [false, true] {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut candidate = requirements(7);
+        let mut module = fake_module(7, calls.clone());
+        if missing {
+            candidate.source_hashes.clear();
+        } else {
+            module.source_identity.source_hash = "ffffffffffffffff".to_owned();
+        }
+        let poison = publish_with_module(candidate, module, calls);
         assert_poison_fields(
             &poison,
             PipelinePoisonCode::CandidateAttestation,
             PipelinePoisonOrigin::CandidateOpen,
             CandidateCleanupDisposition::CleanedAndClosed,
         );
-        assert_eq!(calls.lock().unwrap().register, 0);
+        assert!(
+            poison.message.contains("absent from the watched schema")
+                || poison.message.contains("source hash mismatch"),
+            "{}",
+            poison.message
+        );
     }
 }
 
 #[test]
-fn compiled_attestation_rejects_unsorted_and_duplicate_module_rows_before_register() {
-    let mut rows = vec![compiled_type(1), compiled_type(2)];
-    rows.extend(bootstrap_types(7));
-    let expected = CompiledTypeTable::canonical(rows).unwrap();
-
-    let mut unsorted = expected.clone();
-    unsorted.rows.swap(0, 1);
-    let (poison, calls) = publish_with_compiled_types(expected.clone(), unsorted);
-    assert!(
-        poison.message.contains("TypeRowsNotStrictlySorted"),
-        "{}",
-        poison.message
-    );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateAttestation,
-        PipelinePoisonOrigin::CandidateOpen,
-        CandidateCleanupDisposition::CleanedAndClosed,
-    );
-    assert_eq!(calls.lock().unwrap().register, 0);
-
-    let mut duplicate = expected.clone();
-    duplicate.rows[1] = duplicate.rows[0].clone();
-    let (poison, calls) = publish_with_compiled_types(expected, duplicate);
-    assert!(
-        poison.message.contains("DuplicateType"),
-        "{}",
-        poison.message
-    );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateAttestation,
-        PipelinePoisonOrigin::CandidateOpen,
-        CandidateCleanupDisposition::CleanedAndClosed,
-    );
-    assert_eq!(calls.lock().unwrap().register, 0);
-}
-
-#[test]
-fn candidate_cannot_reach_open_without_all_five_dsb_authority_rows() {
-    let mut expected = requirements(7).compiled_types;
-    expected
-        .rows
-        .retain(|row| row.type_uuid != BOOTSTRAP_CONTROL_TYPE_UUIDS[0]);
-    expected = CompiledTypeTable::canonical(expected.rows).unwrap();
-    let actual = expected.clone();
-    let (poison, calls) = publish_with_compiled_types(expected, actual);
-    assert!(
-        poison
-            .message
-            .contains("expected bootstrap-control authority invalid: Missing"),
-        "{}",
-        poison.message
-    );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateValidation,
-        PipelinePoisonOrigin::CandidateOpen,
-        CandidateCleanupDisposition::None,
-    );
-    assert_eq!(calls.lock().unwrap().register, 0);
-}
-
-#[test]
-fn equal_candidate_and_module_bootstrap_dsnl_forgery_fails_host_keyed_authority() {
-    let mut forged_rows = requirements(7).compiled_types.rows;
-    let bootstrap_uuid = BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
-    let row = forged_rows
-        .iter_mut()
-        .find(|row| row.type_uuid == bootstrap_uuid)
-        .unwrap();
-    row.native_layout_digest[0] ^= 1;
-    let forged = CompiledTypeTable::canonical(forged_rows).unwrap();
-    let (poison, calls) = publish_with_compiled_types(forged.clone(), forged);
-    assert!(
-        poison.message.contains("native_layout_digest"),
-        "{}",
-        poison.message
-    );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateValidation,
-        PipelinePoisonOrigin::CandidateOpen,
-        CandidateCleanupDisposition::None,
-    );
-    assert_eq!(calls.lock().unwrap().register, 0);
-}
-
-#[test]
-fn project_dsci_is_independent_of_the_sealed_bootstrap_row_authority() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("pipeline.dylib");
-    write_module(&source, 7);
+fn wrong_module_abi_is_rejected_before_register() {
     let calls = Arc::new(Mutex::new(Calls::default()));
-    let mut candidate = requirements(7);
-    candidate.identity.compilation.source_fingerprint = [0xa5; 32];
-    candidate.identity.compilation.manifest_lock_hash = [0x5a; 32];
-    let mut module = fake_module(7, calls);
-    module.identity = candidate.identity.clone();
-    let mut loader = FakeLoader {
-        module: Some(module),
-        open_error: None,
-    };
-    let mut host = module_host(temp.path().join("state")).unwrap();
-
-    let published = host.publish_candidate(&source, candidate, &mut loader);
-
-    assert!(published.is_ok(), "{published:?}");
-}
-
-#[test]
-fn host_without_decoded_keyed_bootstrap_authority_never_opens_a_candidate() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("pipeline.dylib");
-    write_module(&source, 7);
-    let calls = Arc::new(Mutex::new(Calls::default()));
-    let mut loader = FakeLoader {
-        module: Some(fake_module(7, calls.clone())),
-        open_error: None,
-    };
-    let mut host = ModuleHost::new(temp.path().join("state")).unwrap();
-    let poison = host
-        .publish_candidate(&source, requirements(7), &mut loader)
-        .unwrap_err();
-    assert!(poison.message.contains("no decoded, DSCI-keyed"));
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateValidation,
-        PipelinePoisonOrigin::CandidateOpen,
-        CandidateCleanupDisposition::None,
-    );
-    assert!(loader.module.is_some());
-    assert_eq!(calls.lock().unwrap().register, 0);
-}
-
-#[test]
-fn candidate_expectations_must_be_canonical_and_module_dsca_must_recompute() {
-    let mut rows = vec![compiled_type(1), compiled_type(2)];
-    rows.extend(bootstrap_types(7));
-    let canonical = CompiledTypeTable::canonical(rows).unwrap();
-    let mut unsorted_expected = canonical.clone();
-    unsorted_expected.rows.swap(0, 1);
-    let (poison, calls) = publish_with_compiled_types(unsorted_expected, canonical.clone());
-    assert!(
-        poison
-            .message
-            .contains("expected compiled-type table/DSCA invalid: TypeRowsNotStrictlySorted"),
-        "{}",
-        poison.message
-    );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateValidation,
-        PipelinePoisonOrigin::CandidateOpen,
-        CandidateCleanupDisposition::None,
-    );
-    assert_eq!(calls.lock().unwrap().register, 0);
-
-    let mut bad_digest = canonical.clone();
-    bad_digest.digest = CompiledAttestationDigest([255; 32]);
-    let (poison, calls) = publish_with_compiled_types(canonical, bad_digest);
-    assert!(
-        poison.message.contains("CompiledDigestMismatch"),
-        "{}",
-        poison.message
-    );
+    let candidate = requirements(7);
+    let mut module = fake_module(7, calls.clone());
+    module.module_abi = module_abi(8);
+    let poison = publish_with_module(candidate, module, calls);
     assert_poison_fields(
         &poison,
         PipelinePoisonCode::CandidateAttestation,
         PipelinePoisonOrigin::CandidateOpen,
         CandidateCleanupDisposition::CleanedAndClosed,
     );
-    assert_eq!(calls.lock().unwrap().register, 0);
+    assert!(poison
+        .message
+        .contains("host-interface ABI identity mismatch"));
 }
 
 #[test]

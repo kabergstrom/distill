@@ -36,12 +36,7 @@ pub enum StoreError {
     /// The checked-in DSB format authority could not be parsed. A binary
     /// built in this state cannot advertise bundle format v1 or reach Ready.
     InvalidBootstrapSpec(distill_core::attestation::BootstrapSpecError),
-    /// A full compiled table failed its canonical DSRE/DSCA validation.
-    InvalidCompiledAttestation(distill_core::attestation::AttestationError),
-    /// The sealed consumer bootstrap rows did not match the candidate table.
-    InvalidBootstrapAuthority(distill_core::attestation::BootstrapAuthorityMismatch),
-    /// A store-side epoch summary did not equal the independently validated
-    /// full compiled table from which it must be derived.
+    /// A store-side epoch has invalid identity or registration metadata.
     InvalidPipelineEpoch { detail: &'static str },
     /// A candidate omitted or changed one of the five format-owned logical
     /// control rows before active lineage equality was evaluated.
@@ -251,14 +246,8 @@ impl fmt::Display for StoreError {
             StoreError::InvalidBootstrapSpec(error) => {
                 write!(f, "bundle-format bootstrap authority is invalid: {error}")
             }
-            StoreError::InvalidCompiledAttestation(error) => {
-                write!(f, "compiled pipeline attestation is invalid: {error}")
-            }
-            StoreError::InvalidBootstrapAuthority(error) => {
-                write!(f, "compiled pipeline bootstrap authority is invalid: {error}")
-            }
             StoreError::InvalidPipelineEpoch { detail } => {
-                write!(f, "pipeline epoch summary is invalid: {detail}")
+                write!(f, "pipeline epoch is invalid: {detail}")
             }
             StoreError::InvalidBootstrapRegistry {
                 type_uuid,

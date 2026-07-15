@@ -3264,13 +3264,6 @@ pub fn decode_schema_acceptance_required(
         candidate: crate::PipelineCandidateIdentity {
             dylib_hash: decode_hash(candidate.get_dylib_hash()?, "schemaAcceptance.dylibHash")
                 .map_err(|error| capnp::Error::failed(error.message))?,
-            compiled_types: CompiledAttestationDigest(
-                decode_hash(
-                    candidate.get_compiled_types()?,
-                    "schemaAcceptance.compiledTypes",
-                )
-                .map_err(|error| capnp::Error::failed(error.message))?,
-            ),
             target_set: {
                 let rows = candidate.get_target_rows()?;
                 let mut decoded = Vec::with_capacity(rows.len() as usize);
@@ -3588,7 +3581,7 @@ fn write_schema_acceptance_required(
     }
     let mut candidate = output.reborrow().init_candidate();
     candidate.set_dylib_hash(&diagnostic.candidate.dylib_hash);
-    candidate.set_compiled_types(&diagnostic.candidate.compiled_types.0);
+    candidate.set_reserved_compiled_types(());
     let mut targets = candidate
         .reborrow()
         .init_target_rows(diagnostic.candidate.target_set.rows.len() as u32);

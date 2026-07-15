@@ -1,7 +1,10 @@
+use distill_core::attestation::CompiledTypeTable;
 use distill_daemon::config::{DaemonConfig, DaemonConfigError};
-use distill_schema::bootstrap_gen_v1::{
-    consumer_bootstrap_authority_v1, consumer_compilation_identity_v1,
-};
+use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
+
+fn compiled_table() -> CompiledTypeTable {
+    CompiledTypeTable::canonical(Vec::new()).unwrap()
+}
 
 fn valid_config(temp: &tempfile::TempDir) -> String {
     std::fs::create_dir_all(temp.path().join("assets")).unwrap();
@@ -57,11 +60,7 @@ fn parses_and_validates_the_complete_configuration_surface() {
     assert_eq!(config.assets.roots.len(), 1);
     assert_eq!(config.store_config().segment_size, 256 * 1024 * 1024);
     assert_eq!(config.store_config().cache_limit, 20 * 1024 * 1024 * 1024);
-    let table = consumer_bootstrap_authority_v1()
-        .unwrap()
-        .table()
-        .compiled_table()
-        .unwrap();
+    let table = compiled_table();
     let definitions = config
         .target_definitions(&table, consumer_compilation_identity_v1())
         .unwrap();
@@ -133,11 +132,7 @@ fn target_definition_hash_changes_for_a_bound_target_edit() {
         &valid_config(&temp).replace("optimize = false", "optimize = true"),
     )
     .unwrap();
-    let table = consumer_bootstrap_authority_v1()
-        .unwrap()
-        .table()
-        .compiled_table()
-        .unwrap();
+    let table = compiled_table();
     assert_ne!(
         a.target_definitions(&table, consumer_compilation_identity_v1())
             .unwrap()[0]
@@ -149,15 +144,11 @@ fn target_definition_hash_changes_for_a_bound_target_edit() {
 }
 
 #[test]
-fn target_and_module_requirements_bind_the_schema_artifact_identity() {
+fn targets_bind_layout_identity_while_module_requirements_bind_source_identity() {
     let temp = tempfile::tempdir().unwrap();
     let config =
         DaemonConfig::parse(temp.path().join("distill.toml"), &valid_config(&temp)).unwrap();
-    let table = consumer_bootstrap_authority_v1()
-        .unwrap()
-        .table()
-        .compiled_table()
-        .unwrap();
+    let table = compiled_table();
     let first = consumer_compilation_identity_v1().clone();
     let mut second = first.clone();
     second.algorithm_version += 1;
@@ -168,14 +159,19 @@ fn target_and_module_requirements_bind_the_schema_artifact_identity() {
         first_target[0].definition_hash(),
         second_target[0].definition_hash()
     );
+    let source_hashes =
+        std::collections::BTreeMap::from([("pipeline".to_owned(), "0123456789abcdef".to_owned())]);
+    let first_requirements = config
+        .candidate_requirements(&table, &first, &source_hashes)
+        .unwrap();
+    let second_requirements = config
+        .candidate_requirements(&table, &second, &source_hashes)
+        .unwrap();
     assert_eq!(
-        config
-            .candidate_requirements(&table, &second)
-            .unwrap()
-            .identity
-            .compilation,
-        second
+        first_requirements.module_abi,
+        second_requirements.module_abi
     );
+    assert_eq!(second_requirements.source_hashes, source_hashes);
 }
 
 #[test]
@@ -185,14 +181,14 @@ fn rejects_target_without_an_exact_schema_compilation_layout() {
         .replace("os = \"macos\"", "os = \"linux\"")
         .replace("arch = \"aarch64\"", "arch = \"x86_64\"");
     let config = DaemonConfig::parse(temp.path().join("distill.toml"), &source).unwrap();
-    let table = consumer_bootstrap_authority_v1()
-        .unwrap()
-        .table()
-        .compiled_table()
-        .unwrap();
+    let table = compiled_table();
 
     let error = config
-        .candidate_requirements(&table, consumer_compilation_identity_v1())
+        .candidate_requirements(
+            &table,
+            consumer_compilation_identity_v1(),
+            &std::collections::BTreeMap::new(),
+        )
         .unwrap_err();
 
     assert!(matches!(error, DaemonConfigError::Target(_)));

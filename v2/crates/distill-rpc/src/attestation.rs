@@ -2,10 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use distill_core::attestation::{
-    AttestationError, BootstrapAuthorityMismatch, BundleFormatVersion, CompiledAttestationDigest,
-    CompiledTypeRow, CompiledTypeTable,
+    AttestationError, BootstrapAuthorityMismatch, CompiledAttestationDigest, CompiledTypeRow,
+    CompiledTypeTable,
 };
-use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 
 use crate::{LoadPolicyEntry, TargetDefinitionHash, TypeUuid};
 
@@ -133,10 +132,6 @@ impl TargetDefinition {
         mut load_policy: Vec<LoadPolicyEntry>,
     ) -> Result<Self, AttestationShapeError> {
         let compiled = CompiledTypeTable::canonical(compiled_registry)?;
-        consumer_bootstrap_authority_v1()
-            .map_err(|error| AttestationShapeError::BootstrapAuthorityUnavailable(error.0))?
-            .validate_boundary_rows(&compiled.rows, BundleFormatVersion::V1)
-            .map_err(AttestationShapeError::Bootstrap)?;
         load_policy.sort_by_key(|row| row.type_uuid);
         ensure_same_type_set(&compiled.rows, &load_policy)?;
         let policy_digest = compute_policy_digest(&load_policy)?;

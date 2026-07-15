@@ -8,17 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
-use distill_core::attestation::{
-    bootstrap_control_logical_registry_v1, is_bootstrap_control_type, BundleFormatVersion,
-    CompiledAttestationDigest, CompiledTypeTable,
-};
+use distill_core::attestation::{bootstrap_control_logical_registry_v1, is_bootstrap_control_type};
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 pub use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_core::tool::{
     ToolCwdPolicy, ToolExecutionIdentityV2, ToolPackageFile, ToolSourceIdentityV2,
 };
-use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1;
 use rusqlite::OptionalExtension;
 use unicode_normalization::is_nfc;
 
@@ -470,52 +466,17 @@ fn verify_ambient_launcher(key: &str, path: &std::path::Path) -> Result<(), Stor
     verify_executable_mode(key, path, &metadata, true)
 }
 
-/// Sealed publication input tying the store summary to the independently
-/// validated full compiled table and the current consumer's unforgeable
-/// bootstrap authority. There is no raw publication path.
+/// Sealed publication input whose logical registry and exact target rows have
+/// been validated before publication. There is no raw publication path.
 #[derive(Debug, Clone)]
 pub struct ValidatedPipelineEpoch {
     epoch: PipelineEpoch,
 }
 
 impl ValidatedPipelineEpoch {
-    pub fn validate(
-        epoch: PipelineEpoch,
-        compiled_types: &CompiledTypeTable,
-        bootstrap_authority: &ConsumerBootstrapAuthorityV1,
-    ) -> Result<Self, StoreError> {
-        compiled_types
-            .validate()
-            .map_err(StoreError::InvalidCompiledAttestation)?;
-        bootstrap_authority
-            .validate_boundary_rows(&compiled_types.rows, BundleFormatVersion::V1)
-            .map_err(StoreError::InvalidBootstrapAuthority)?;
+    pub fn validate(epoch: PipelineEpoch) -> Result<Self, StoreError> {
         validate_target_set(&epoch.target_set)?;
-        if epoch.compiled_types != compiled_types.digest {
-            return Err(StoreError::InvalidPipelineEpoch {
-                detail: "DSCA summary does not match the full compiled table",
-            });
-        }
-        let schema_registry = compiled_types
-            .rows
-            .iter()
-            .map(|row| (row.type_uuid, row.logical_hash))
-            .collect::<BTreeMap<_, _>>();
-        if epoch.schema_registry != schema_registry {
-            return Err(StoreError::InvalidPipelineEpoch {
-                detail: "schema registry is not the full compiled-table projection",
-            });
-        }
-        let policy = compiled_types
-            .rows
-            .iter()
-            .map(|row| (row.type_uuid, row.build_only))
-            .collect::<Vec<_>>();
-        if epoch.load_policy_digest != crate::state::load_policy_digest(&policy) {
-            return Err(StoreError::InvalidPipelineEpoch {
-                detail: "load-policy digest is not derived from the full compiled table",
-            });
-        }
+        validate_bootstrap_schema_registry(&epoch.schema_registry)?;
         Ok(Self { epoch })
     }
 
@@ -724,18 +685,13 @@ impl InputTxn<'_> {
     fn publish_ready_pipeline_epoch(&mut self, epoch: &PipelineEpoch) -> Result<(), StoreError> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
-                 id, dylib_hash, load_policy_digest, compiled_types,
-                 input_version,
+                 id, dylib_hash, input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
-                 acceptance_candidate_compiled_types,
                  acceptance_manifest_hash
-             ) VALUES (0, ?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, NULL,
-                       NULL, NULL, NULL)
+             ) VALUES (0, ?1, ?2, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                dylib_hash = excluded.dylib_hash,
-               load_policy_digest = excluded.load_policy_digest,
-               compiled_types = excluded.compiled_types,
                input_version = excluded.input_version,
                poison_code = NULL,
                poison_origin = NULL,
@@ -743,14 +699,8 @@ impl InputTxn<'_> {
                poison_identity = NULL,
                poison_message = NULL,
                acceptance_candidate_dylib_hash = NULL,
-               acceptance_candidate_compiled_types = NULL,
                acceptance_manifest_hash = NULL",
-            rusqlite::params![
-                epoch.dylib_hash.as_slice(),
-                epoch.load_policy_digest.as_slice(),
-                epoch.compiled_types.0.as_slice(),
-                self.version().0 as i64,
-            ],
+            rusqlite::params![epoch.dylib_hash.as_slice(), self.version().0 as i64,],
         )?;
         self.txn.execute("DELETE FROM registrations", [])?;
         for reg in &epoch.registrations {
@@ -784,14 +734,11 @@ impl InputTxn<'_> {
     ) -> Result<(), StoreError> {
         self.txn.execute(
             "INSERT INTO pipeline_state(
-                 id, dylib_hash, load_policy_digest, compiled_types,
-                 input_version,
+                 id, dylib_hash, input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
-                 acceptance_candidate_compiled_types,
                  acceptance_manifest_hash
-             ) VALUES (0, NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, NULL,
-                       ?2, ?3, ?4)
+             ) VALUES (0, NULL, ?1, NULL, NULL, NULL, NULL, NULL, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
                input_version = excluded.input_version,
                poison_code = NULL,
@@ -800,13 +747,10 @@ impl InputTxn<'_> {
                poison_identity = NULL,
                poison_message = NULL,
                acceptance_candidate_dylib_hash = excluded.acceptance_candidate_dylib_hash,
-               acceptance_candidate_compiled_types =
-                   excluded.acceptance_candidate_compiled_types,
                acceptance_manifest_hash = excluded.acceptance_manifest_hash",
             rusqlite::params![
                 self.version().0 as i64,
                 epoch.dylib_hash.as_slice(),
-                epoch.compiled_types.0.as_slice(),
                 manifest.manifest_hash.0.as_slice(),
             ],
         )?;
@@ -838,14 +782,11 @@ impl InputTxn<'_> {
             .map_err(StoreError::InvalidPipelinePoison)?;
         self.txn.execute(
             "INSERT INTO pipeline_state(
-                 id, dylib_hash, load_policy_digest, compiled_types,
-                 input_version,
+                 id, dylib_hash, input_version,
                  poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
                  acceptance_candidate_dylib_hash,
-                 acceptance_candidate_compiled_types,
                  acceptance_manifest_hash
-             ) VALUES (0, NULL, NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6,
-                       NULL, NULL, NULL)
+             ) VALUES (0, NULL, ?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                input_version = excluded.input_version,
                poison_code = excluded.poison_code,
@@ -854,7 +795,6 @@ impl InputTxn<'_> {
                poison_identity = excluded.poison_identity,
                poison_message = excluded.poison_message,
                acceptance_candidate_dylib_hash = NULL,
-               acceptance_candidate_compiled_types = NULL,
                acceptance_manifest_hash = NULL",
             rusqlite::params![
                 self.version().0 as i64,
@@ -1801,33 +1741,22 @@ fn load_target_set(
 fn pending_candidate_identity(
     conn: &rusqlite::Connection,
 ) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
-    type CandidateRow = (Option<Vec<u8>>, Option<Vec<u8>>);
-    let row: Option<CandidateRow> = conn
+    let row: Option<Option<Vec<u8>>> = conn
         .query_row(
-            "SELECT acceptance_candidate_dylib_hash,
-                    acceptance_candidate_compiled_types
-             FROM pipeline_state WHERE id = 0",
+            "SELECT acceptance_candidate_dylib_hash FROM pipeline_state WHERE id = 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
-    let Some((dylib, compiled_types)) = row else {
+    let Some(dylib) = row else {
         return Ok(None);
     };
-    match (dylib, compiled_types) {
-        (None, None) => Ok(None),
-        (Some(dylib), Some(compiled_types)) => Ok(Some(PipelineCandidateIdentity {
+    match dylib {
+        None => Ok(None),
+        Some(dylib) => Ok(Some(PipelineCandidateIdentity {
             dylib_hash: exact_blob32(dylib, "candidate dylib hash")?,
-            compiled_types: CompiledAttestationDigest(exact_blob32(
-                compiled_types,
-                "candidate compiled-type attestation",
-            )?),
             target_set: load_target_set(conn, true)?,
         })),
-        _ => Err(invalid_manifest(
-            None,
-            "pipeline candidate identity columns are incomplete",
-        )),
     }
 }
 
@@ -2183,8 +2112,6 @@ impl Store {
     pub fn pipeline_state(&self) -> Result<Option<PipelineState>, StoreError> {
         type StateRow = (
             Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
             Option<i64>,
             Option<i64>,
             Option<i64>,
@@ -2192,16 +2119,13 @@ impl Store {
             Option<String>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
-            Option<Vec<u8>>,
         );
         let row: Option<StateRow> = self
             .conn
             .query_row(
-                "SELECT dylib_hash, load_policy_digest, compiled_types,
-                        poison_code, poison_origin, poison_cleanup,
+                "SELECT dylib_hash, poison_code, poison_origin, poison_cleanup,
                         poison_identity, poison_message,
                         acceptance_candidate_dylib_hash,
-                        acceptance_candidate_compiled_types,
                         acceptance_manifest_hash
                  FROM pipeline_state WHERE id = 0",
                 [],
@@ -2215,32 +2139,26 @@ impl Store {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
                     ))
                 },
             )
             .optional()?;
         let Some((
             dylib,
-            lpd,
-            compiled_types,
             poison_code,
             poison_origin,
             poison_cleanup,
             poison_identity,
             poison_message,
             candidate_dylib,
-            candidate_compiled_types,
             stored_manifest_hash,
         )) = row
         else {
             return Ok(None);
         };
 
-        let epoch = match (dylib, lpd, compiled_types) {
-            (Some(dylib), Some(lpd), Some(compiled_types)) => {
+        let epoch = match dylib {
+            Some(dylib) => {
                 let mut stmt = self
                     .conn
                     .prepare("SELECT kind, reg_id, version FROM registrations")?;
@@ -2259,28 +2177,15 @@ impl Store {
                     .collect::<Result<_, _>>()?;
                 Some(std::sync::Arc::new(PipelineEpoch {
                     dylib_hash: exact_blob32(dylib, "published pipeline dylib hash")?,
-                    load_policy_digest: exact_blob32(lpd, "published pipeline load-policy digest")?,
-                    compiled_types: CompiledAttestationDigest(exact_blob32(
-                        compiled_types,
-                        "published compiled-type attestation",
-                    )?),
                     target_set: load_target_set(&self.conn, false)?,
                     schema_registry: load_schema_registry(&self.conn, false)?,
                     registrations,
                 }))
             }
-            (None, None, None) => None,
-            _ => {
-                return Err(invalid_manifest(
-                    None,
-                    "published pipeline identity columns are incomplete",
-                ));
-            }
+            None => None,
         };
 
-        let has_candidate = candidate_dylib.is_some()
-            || candidate_compiled_types.is_some()
-            || stored_manifest_hash.is_some();
+        let has_candidate = candidate_dylib.is_some() || stored_manifest_hash.is_some();
         let poison = match (
             poison_code,
             poison_origin,

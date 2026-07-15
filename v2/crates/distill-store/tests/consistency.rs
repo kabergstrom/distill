@@ -3,14 +3,10 @@
 //! all-or-nothing, WAL readers only ever observe complete input
 //! versions, and the poison classifications compose.
 
-use distill_core::attestation::{
-    CompiledTypeRow, CompiledTypeTable, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
-    SchemaNodeId,
-};
+use distill_core::attestation::bootstrap_control_logical_registry_v1;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
 use distill_core::tool::ToolCwdPolicy;
-use distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
@@ -20,9 +16,8 @@ use distill_store::pipeline::{
 };
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
-    load_policy_digest, CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
-    PipelinePoisonOrigin, PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison,
-    VersionPoisonV1,
+    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+    PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -34,44 +29,17 @@ fn validated_epoch(
     dylib_hash: [u8; 32],
     custom: Option<(TypeUuid, LogicalHash)>,
 ) -> ValidatedPipelineEpoch {
-    let authority = consumer_bootstrap_authority_v1().unwrap();
-    let mut rows = authority.rows().to_vec();
+    let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
     if let Some((type_uuid, logical_hash)) = custom {
-        rows.push(
-            CompiledTypeRow::new(
-                type_uuid,
-                logical_hash,
-                [4; 32],
-                false,
-                RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-                    node: SchemaNodeId(0),
-                    path: vec![],
-                    fact: RegistryExtraFact::BuildOnly(false),
-                }])
-                .unwrap(),
-            )
-            .unwrap(),
-        );
+        schema_registry.insert(type_uuid, logical_hash);
     }
-    let table = CompiledTypeTable::canonical(rows).unwrap();
-    let policy = table
-        .rows
-        .iter()
-        .map(|row| (row.type_uuid, row.build_only))
-        .collect::<Vec<_>>();
     let epoch = PipelineEpoch {
         dylib_hash,
-        load_policy_digest: load_policy_digest(&policy),
-        compiled_types: table.digest,
         target_set: CanonicalTargetSet::canonical(vec![]).unwrap(),
-        schema_registry: table
-            .rows
-            .iter()
-            .map(|row| (row.type_uuid, row.logical_hash))
-            .collect(),
+        schema_registry,
         registrations: vec![],
     };
-    ValidatedPipelineEpoch::validate(epoch, &table, authority).unwrap()
+    ValidatedPipelineEpoch::validate(epoch).unwrap()
 }
 
 fn version_poison(message: &str) -> VersionPoison {

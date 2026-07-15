@@ -61,13 +61,6 @@ impl ConnectRequest {
     ) -> Result<Self, crate::AttestationShapeError> {
         load_policy.sort_by_key(|row| row.type_uuid);
         let compiled = CompiledTypeTable::canonical(compiled_registry)?;
-        distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
-            .map_err(|error| crate::AttestationShapeError::BootstrapAuthorityUnavailable(error.0))?
-            .validate_boundary_rows(
-                &compiled.rows,
-                distill_core::attestation::BundleFormatVersion::V1,
-            )
-            .map_err(crate::AttestationShapeError::Bootstrap)?;
         let policy_digest = crate::compute_policy_digest(&load_policy)?;
         crate::attestation::validate_attestation_shape(
             &compiled.rows,

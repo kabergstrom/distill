@@ -11,25 +11,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use distill_asset::{ModuleEpochPoisonCause, ModuleEpochToken};
-use distill_core::attestation::{
-    validate_bootstrap_authority, validate_bootstrap_logical_authority, BundleFormatVersion,
-};
-pub use distill_core::attestation::{
-    BootstrapAuthorityMismatch, CompiledAttestationDigest,
-    CompiledTypeRow as CompiledTypeAttestation, CompiledTypeTable,
-};
 use distill_core::id::TypeUuid;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
-pub use distill_schema::bootstrap_gen_v1::ConsumerBootstrapAuthorityV1 as HostBootstrapAuthorityV1;
-use distill_schema::ngp_schema::CompilationIdentity;
 use distill_store::pipeline::ValidatedPipelineEpoch;
-use distill_store::state::{
-    load_policy_digest, PipelineEpoch as StoredPipelineEpoch, PipelineState as StoredPipelineState,
-    Registration as StoredRegistration, RegistrationKind as StoredRegistrationKind,
-};
 pub use distill_store::state::{
     CleanupDisposition as CandidateCleanupDisposition, PipelinePoison, PipelinePoisonCode,
     PipelinePoisonOrigin,
+};
+use distill_store::state::{
+    PipelineEpoch as StoredPipelineEpoch, PipelineState as StoredPipelineState,
+    Registration as StoredRegistration, RegistrationKind as StoredRegistrationKind,
 };
 use distill_store::{Store, StoreError};
 
@@ -49,18 +40,6 @@ pub struct ModuleAbiIdentity {
     pub measured_interface: [u8; 32],
     pub panic_strategy: String,
     pub allocator: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleIdentity {
-    pub compilation: CompilationIdentity,
-    pub module_abi: ModuleAbiIdentity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MeasuredLayout {
-    pub type_id: String,
-    pub digest: [u8; 32],
 }
 
 /// Audited reverse-call surfaces. New host-owned callback tables must add a
@@ -741,9 +720,9 @@ impl Drop for CallbackIngressGuard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateRequirements {
-    pub identity: ModuleIdentity,
-    pub measured_layouts: Vec<MeasuredLayout>,
-    pub compiled_types: CompiledTypeTable,
+    pub module_abi: ModuleAbiIdentity,
+    pub source_hashes: BTreeMap<String, String>,
+    pub schema_registry: BTreeMap<TypeUuid, distill_core::id::LogicalHash>,
     pub targets: Vec<TargetDefinition>,
 }
 
@@ -795,9 +774,9 @@ impl std::error::Error for ModuleCallError {}
 /// calls must be C-ABI in a concrete loader; `register` is reached only after
 /// their values compare equal.
 pub trait LoadedPipelineModule: Send {
-    fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError>;
-    fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError>;
-    fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError>;
+    fn source_identity(&mut self)
+        -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError>;
+    fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError>;
     fn register(
         &mut self,
         targets: &[TargetDefinition],
@@ -1449,7 +1428,6 @@ pub enum UnloadOutcome {
 
 pub struct ModuleHost {
     state_dir: PathBuf,
-    bootstrap_authority: Option<&'static HostBootstrapAuthorityV1>,
     next_epoch_id: u64,
     published: Option<PublishedState>,
     retired: Vec<PipelineEpoch>,
@@ -1461,20 +1439,10 @@ impl ModuleHost {
         std::fs::create_dir_all(state_dir.join("modules"))?;
         Ok(Self {
             state_dir,
-            bootstrap_authority: None,
             next_epoch_id: 1,
             published: None,
             retired: Vec::new(),
         })
-    }
-
-    pub fn new_with_bootstrap_authority(
-        state_dir: impl AsRef<Path>,
-        bootstrap_authority: &'static HostBootstrapAuthorityV1,
-    ) -> std::io::Result<Self> {
-        let mut host = Self::new(state_dir)?;
-        host.bootstrap_authority = Some(bootstrap_authority);
-        Ok(host)
     }
 
     pub fn snapshot(&self) -> PipelineSnapshot {
@@ -1524,14 +1492,7 @@ impl ModuleHost {
         loader: &mut dyn PipelineModuleLoader,
     ) -> Result<PipelineEpoch, PipelinePoison> {
         let id = self.mint_epoch_id();
-        let Some(bootstrap_authority) = self.bootstrap_authority else {
-            return Err(candidate_poison_record(
-                PipelinePoisonCode::CandidateValidation,
-                "host has no decoded, DSCI-keyed bootstrap-control authority".to_owned(),
-                CandidateCleanupDisposition::None,
-            ));
-        };
-        let target_set = match validate_requirements(requirements, bootstrap_authority) {
+        let target_set = match validate_requirements(requirements) {
             Ok(target_set) => target_set,
             Err(error) => {
                 return Err(candidate_poison_record(
@@ -1568,12 +1529,8 @@ impl ModuleHost {
         let token = ModuleEpochToken::new(id);
         let mut registration_arena = CandidateRegistrationArena::new(token.clone());
 
-        let validation = validate_open_module(
-            module.as_mut(),
-            requirements,
-            bootstrap_authority,
-            &mut registration_arena,
-        );
+        let validation =
+            validate_open_module(module.as_mut(), requirements, &mut registration_arena);
         let registration = match validation {
             Ok(registration) => registration,
             Err(error) => {
@@ -2004,18 +1961,6 @@ pub(crate) fn stored_pipeline_epoch(
             detail: "prepared module target rows are not canonical",
         });
     }
-    let policy = requirements
-        .compiled_types
-        .rows
-        .iter()
-        .map(|row| (row.type_uuid, row.build_only))
-        .collect::<Vec<_>>();
-    let schema_registry = requirements
-        .compiled_types
-        .rows
-        .iter()
-        .map(|row| (row.type_uuid, row.logical_hash))
-        .collect::<BTreeMap<_, _>>();
     let registrations = prepared
         .registrations()
         .registrations
@@ -2039,57 +1984,22 @@ pub(crate) fn stored_pipeline_epoch(
         .collect();
     let epoch = StoredPipelineEpoch {
         dylib_hash: prepared.dylib_hash(),
-        load_policy_digest: load_policy_digest(&policy),
-        compiled_types: requirements.compiled_types.digest,
         target_set,
-        schema_registry,
+        schema_registry: requirements.schema_registry.clone(),
         registrations,
     };
-    let authority = consumer_authority()?;
-    ValidatedPipelineEpoch::validate(epoch, &requirements.compiled_types, authority)
-}
-
-fn consumer_authority() -> Result<&'static HostBootstrapAuthorityV1, StoreError> {
-    // Project DSCI comes from the watched source-walk table. Bootstrap
-    // authority is row authority, not a substitute project identity: exact
-    // bootstrap DSNL/DSLH/DSRE equality is checked below by the sealed brand.
-    distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1().map_err(|_| {
-        StoreError::InvalidPipelineEpoch {
-            detail: "consumer bootstrap authority resource is invalid",
-        }
-    })
+    ValidatedPipelineEpoch::validate(epoch)
 }
 
 fn validate_requirements(
     requirements: &mut CandidateRequirements,
-    bootstrap_authority: &HostBootstrapAuthorityV1,
 ) -> Result<CanonicalTargetSet, String> {
-    if requirements.identity.module_abi.panic_strategy != "unwind" {
+    if requirements.module_abi.panic_strategy != "unwind" {
         return Err("pipeline and daemon must both use panic = unwind".to_owned());
     }
-    if requirements.identity.module_abi.allocator != "system" {
+    if requirements.module_abi.allocator != "system" {
         return Err("pipeline and daemon must both use the system allocator".to_owned());
     }
-    requirements.measured_layouts.sort();
-    if requirements
-        .measured_layouts
-        .windows(2)
-        .any(|pair| pair[0].type_id == pair[1].type_id)
-    {
-        return Err("expected measured-layout table contains a duplicate type".to_owned());
-    }
-    validate_compiled_table(&requirements.compiled_types, "expected")?;
-    validate_bootstrap_logical_authority(
-        &requirements.compiled_types.rows,
-        BundleFormatVersion::V1,
-    )
-    .map_err(|error| format!("expected bootstrap-control authority invalid: {error}"))?;
-    validate_bootstrap_authority(
-        &requirements.compiled_types.rows,
-        bootstrap_authority.table(),
-        BundleFormatVersion::V1,
-    )
-    .map_err(|error| format!("expected bootstrap-control authority mismatch: {error}"))?;
     let canonical_targets = CanonicalTargetSet::canonical(
         requirements
             .targets
@@ -2115,50 +2025,28 @@ fn validate_requirements(
 fn validate_open_module(
     module: &mut dyn LoadedPipelineModule,
     requirements: &CandidateRequirements,
-    bootstrap_authority: &HostBootstrapAuthorityV1,
     registration_arena: &mut CandidateRegistrationArena,
 ) -> Result<RegistrationSet, CandidatePhaseError> {
-    let identity = boundary_call("identity", || module.identity())
+    let source = boundary_call("source_identity", || module.source_identity())
         .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
-    if identity != requirements.identity {
+    let Some(expected_source_hash) = requirements.source_hashes.get(&source.crate_name) else {
+        return Err(CandidatePhaseError::attestation(format!(
+            "module crate `{}` is absent from the watched schema",
+            source.crate_name
+        )));
+    };
+    if expected_source_hash != &source.source_hash {
+        return Err(CandidatePhaseError::attestation(format!(
+            "module source hash mismatch for crate `{}`",
+            source.crate_name
+        )));
+    }
+    let module_abi = boundary_call("module_abi", || module.module_abi())
+        .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
+    if module_abi != requirements.module_abi {
         return Err(CandidatePhaseError::attestation(
-            "module compilation/interface identity mismatch",
+            "module host-interface ABI identity mismatch",
         ));
-    }
-    let mut layouts = boundary_call("measured_layouts", || module.measured_layouts())
-        .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
-    layouts.sort();
-    if layouts != requirements.measured_layouts {
-        return Err(CandidatePhaseError::attestation(measured_layout_error(
-            &requirements.measured_layouts,
-            &layouts,
-        )));
-    }
-    let compiled_types = boundary_call("compiled_types", || module.compiled_types())
-        .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
-    validate_compiled_table(&compiled_types, "module").map_err(CandidatePhaseError::attestation)?;
-    validate_bootstrap_logical_authority(&compiled_types.rows, BundleFormatVersion::V1).map_err(
-        |error| {
-            CandidatePhaseError::attestation(format!(
-                "module bootstrap-control authority invalid: {error}"
-            ))
-        },
-    )?;
-    validate_bootstrap_authority(
-        &compiled_types.rows,
-        bootstrap_authority.table(),
-        BundleFormatVersion::V1,
-    )
-    .map_err(|error| {
-        CandidatePhaseError::attestation(format!(
-            "module bootstrap-control authority mismatch: {error}"
-        ))
-    })?;
-    if compiled_types != requirements.compiled_types {
-        return Err(CandidatePhaseError::attestation(compiled_type_error(
-            &requirements.compiled_types.rows,
-            &compiled_types.rows,
-        )));
     }
     let registration_result = boundary_call("register", || {
         module.register(&requirements.targets, registration_arena)
@@ -2195,72 +2083,6 @@ impl CandidatePhaseError {
             detail: detail.into(),
         }
     }
-}
-
-fn measured_layout_error(expected: &[MeasuredLayout], actual: &[MeasuredLayout]) -> String {
-    let expected = expected
-        .iter()
-        .map(|layout| (&layout.type_id, layout.digest))
-        .collect::<BTreeMap<_, _>>();
-    let actual = actual
-        .iter()
-        .map(|layout| (&layout.type_id, layout.digest))
-        .collect::<BTreeMap<_, _>>();
-    let differing = expected
-        .keys()
-        .chain(actual.keys())
-        .find(|type_id| expected.get(*type_id) != actual.get(*type_id));
-    match differing {
-        Some(type_id) => format!("measured layout mismatch for type `{type_id}`"),
-        None => "measured layout table mismatch".to_owned(),
-    }
-}
-
-fn validate_compiled_table(table: &CompiledTypeTable, role: &str) -> Result<(), String> {
-    table
-        .validate()
-        .map_err(|error| format!("{role} compiled-type table/DSCA invalid: {error}"))
-}
-
-fn compiled_type_error(
-    expected: &[CompiledTypeAttestation],
-    actual: &[CompiledTypeAttestation],
-) -> String {
-    let expected_by_type = expected
-        .iter()
-        .map(|row| (row.type_uuid, row))
-        .collect::<BTreeMap<_, _>>();
-    let actual_by_type = actual
-        .iter()
-        .map(|row| (row.type_uuid, row))
-        .collect::<BTreeMap<_, _>>();
-    let type_uuid = expected_by_type
-        .keys()
-        .chain(actual_by_type.keys())
-        .find(|type_uuid| expected_by_type.get(type_uuid) != actual_by_type.get(type_uuid));
-    let Some(type_uuid) = type_uuid else {
-        return "compiled-type attestation table mismatch".to_owned();
-    };
-    let (Some(expected), Some(actual)) = (
-        expected_by_type.get(type_uuid),
-        actual_by_type.get(type_uuid),
-    ) else {
-        return format!("compiled-type coverage mismatch for type `{type_uuid}`");
-    };
-    let field = if expected.logical_hash != actual.logical_hash {
-        "logical hash"
-    } else if expected.native_layout_digest != actual.native_layout_digest {
-        "native layout digest"
-    } else if expected.build_only != actual.build_only {
-        "build_only"
-    } else if expected.registry_extras_digest != actual.registry_extras_digest
-        || expected.registry_extras != actual.registry_extras
-    {
-        "registry extras"
-    } else {
-        "row"
-    };
-    format!("compiled-type {field} mismatch for type `{type_uuid}`")
 }
 
 fn validate_registration(
@@ -2461,16 +2283,14 @@ struct TestNoopModule;
 
 #[cfg(test)]
 impl LoadedPipelineModule for TestNoopModule {
-    fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError> {
-        Err(ModuleCallError::new("unused test module identity"))
+    fn source_identity(
+        &mut self,
+    ) -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError> {
+        Err(ModuleCallError::new("unused test module source identity"))
     }
 
-    fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError> {
-        Err(ModuleCallError::new("unused test module layouts"))
-    }
-
-    fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError> {
-        Err(ModuleCallError::new("unused test module types"))
+    fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError> {
+        Err(ModuleCallError::new("unused test module ABI"))
     }
 
     fn register(
@@ -2569,15 +2389,13 @@ mod callback_tests {
     struct NoopModule;
 
     impl LoadedPipelineModule for NoopModule {
-        fn identity(&mut self) -> Result<ModuleIdentity, ModuleCallError> {
+        fn source_identity(
+            &mut self,
+        ) -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError> {
             Err(ModuleCallError::new("unused"))
         }
 
-        fn measured_layouts(&mut self) -> Result<Vec<MeasuredLayout>, ModuleCallError> {
-            Err(ModuleCallError::new("unused"))
-        }
-
-        fn compiled_types(&mut self) -> Result<CompiledTypeTable, ModuleCallError> {
+        fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError> {
             Err(ModuleCallError::new("unused"))
         }
 

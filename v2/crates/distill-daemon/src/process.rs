@@ -402,7 +402,11 @@ impl ConfigWatch {
             Ok(authority) if input_changed => {
                 let authority = Arc::new(authority);
                 let requirements = candidate
-                    .candidate_requirements(authority.compiled_table(), authority.identity())
+                    .candidate_requirements(
+                        authority.compiled_table(),
+                        authority.identity(),
+                        &authority.schema().source_hashes,
+                    )
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
                 let targets = candidate
                     .target_definitions(authority.compiled_table(), authority.identity())
