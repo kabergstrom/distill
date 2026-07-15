@@ -1006,6 +1006,16 @@ pub trait ArtifactLeaseBackend: Send + Sync {
     fn release_lease(&self, holder: u64);
 }
 
+/// Payload storage seam. Production reads immutable artifact and DSWL bytes
+/// from the daemon CAS; the RPC server retains only authenticated identities
+/// and typed edge metadata needed to authorize a fetch.
+pub trait ArtifactPayloadBackend: Send + Sync {
+    fn store_artifact(&self, hash: ContentHash, payload: &ArtifactPayload) -> Result<(), String>;
+    fn load_artifact(&self, hash: ContentHash) -> Result<Option<ArtifactPayload>, String>;
+    fn store_wire_tree(&self, hash: LayoutHash, bytes: &[u8]) -> Result<(), String>;
+    fn load_wire_tree(&self, hash: LayoutHash) -> Result<Option<Arc<[u8]>>, String>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetReferenceQuery {
     Uuid(AssetUuid),

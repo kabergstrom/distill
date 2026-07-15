@@ -304,7 +304,8 @@ impl DaemonCoordinator {
     pub fn attach_build_backend(self: &Arc<Self>) {
         let backend = Arc::new(crate::build::CoordinatorBuildBackend::new(self));
         self.server.install_build_backend(backend.clone());
-        self.server.install_artifact_lease_backend(backend);
+        self.server.install_artifact_lease_backend(backend.clone());
+        self.server.install_artifact_payload_backend(backend);
         self.authoring.attach_tag_index_coordinator(self);
     }
 

@@ -21,6 +21,7 @@ pub struct Server {
     authoring_backend: Arc<dyn AuthoringBackend>,
     build_backend: Arc<RwLock<Arc<dyn BuildBackend>>>,
     lease_backend: Arc<RwLock<Arc<dyn ArtifactLeaseBackend>>>,
+    payload_backend: Arc<RwLock<Arc<dyn ArtifactPayloadBackend>>>,
     next_lease_id: Arc<AtomicU64>,
 }
 
@@ -30,12 +31,68 @@ struct UnavailableBuildBackend;
 
 struct InMemoryArtifactLeases;
 
+#[derive(Default)]
+struct InMemoryArtifactPayloads {
+    artifacts: Mutex<HashMap<ContentHash, ArtifactPayload>>,
+    wire_trees: Mutex<HashMap<LayoutHash, Arc<[u8]>>>,
+}
+
 impl ArtifactLeaseBackend for InMemoryArtifactLeases {
     fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
         Ok(())
     }
 
     fn release_lease(&self, _holder: u64) {}
+}
+
+impl ArtifactPayloadBackend for InMemoryArtifactPayloads {
+    fn store_artifact(&self, hash: ContentHash, payload: &ArtifactPayload) -> Result<(), String> {
+        let mut artifacts = self
+            .artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = artifacts.get(&hash) {
+            if existing != payload {
+                return Err("artifact hash already has a different payload".to_owned());
+            }
+            return Ok(());
+        }
+        artifacts.insert(hash, payload.clone());
+        Ok(())
+    }
+
+    fn load_artifact(&self, hash: ContentHash) -> Result<Option<ArtifactPayload>, String> {
+        Ok(self
+            .artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .cloned())
+    }
+
+    fn store_wire_tree(&self, hash: LayoutHash, bytes: &[u8]) -> Result<(), String> {
+        let mut wire_trees = self
+            .wire_trees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = wire_trees.get(&hash) {
+            if existing.as_ref() != bytes {
+                return Err("wire-tree hash already has different bytes".to_owned());
+            }
+            return Ok(());
+        }
+        wire_trees.insert(hash, Arc::from(bytes));
+        Ok(())
+    }
+
+    fn load_wire_tree(&self, hash: LayoutHash) -> Result<Option<Arc<[u8]>>, String> {
+        Ok(self
+            .wire_trees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .cloned())
+    }
 }
 
 impl BuildBackend for UnavailableBuildBackend {
@@ -421,15 +478,13 @@ struct VersionView {
 
 #[derive(Clone, PartialEq, Eq)]
 struct StoredArtifact {
-    payload: ArtifactPayload,
     asset_uuid: AssetUuid,
     layout_hash: LayoutHash,
+    load_edges: Vec<ServedLoadEdge>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct StoredWireTree {
-    bytes: Arc<[u8]>,
-}
+struct StoredWireTree;
 
 #[derive(Clone)]
 enum VersionResolve {
@@ -549,6 +604,7 @@ impl Server {
             authoring_backend,
             build_backend: Arc::new(RwLock::new(Arc::new(UnavailableBuildBackend))),
             lease_backend: Arc::new(RwLock::new(Arc::new(InMemoryArtifactLeases))),
+            payload_backend: Arc::new(RwLock::new(Arc::new(InMemoryArtifactPayloads::default()))),
             next_lease_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -567,6 +623,15 @@ impl Server {
     pub fn install_artifact_lease_backend(&self, backend: Arc<dyn ArtifactLeaseBackend>) {
         *self
             .lease_backend
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = backend;
+    }
+
+    /// Install the immutable daemon CAS reader before accepting runtime
+    /// snapshots. The server keeps only small authenticated metadata.
+    pub fn install_artifact_payload_backend(&self, backend: Arc<dyn ArtifactPayloadBackend>) {
+        *self
+            .payload_backend
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = backend;
     }
@@ -707,12 +772,29 @@ impl Server {
         let layout_hash = parsed.layout_hash;
         let asset_uuid = parsed.asset_uuid;
         drop(parsed);
-        let mut state = self.lock();
         let artifact = StoredArtifact {
-            payload,
             asset_uuid,
             layout_hash,
+            load_edges: payload.load_edges.clone(),
         };
+        {
+            let state = self.lock();
+            if let Some(existing) = state.artifacts.get(&hash) {
+                return if existing == &artifact {
+                    Ok(())
+                } else {
+                    Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash })
+                };
+            }
+        }
+        self.payload_backend
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .store_artifact(hash, &payload)
+            .map_err(|detail| AdminError::InvalidArtifact {
+                detail: format!("artifact payload backend rejected content: {detail}"),
+            })?;
+        let mut state = self.lock();
         if let Some(existing) = state.artifacts.get(&hash) {
             if existing != &artifact {
                 return Err(AdminError::ArtifactAlreadyExistsWithDifferentPayload { hash });
@@ -739,8 +821,21 @@ impl Server {
                 observed,
             });
         }
+        {
+            let state = self.lock();
+            if state.wire_trees.contains_key(&hash) {
+                return Ok(());
+            }
+        }
+        self.payload_backend
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .store_wire_tree(hash, &bytes)
+            .map_err(|detail| AdminError::InvalidWireTree {
+                detail: format!("wire-tree payload backend rejected content: {detail}"),
+            })?;
         let mut state = self.lock();
-        let tree = StoredWireTree { bytes };
+        let tree = StoredWireTree;
         if let Some(existing) = state.wire_trees.get(&hash) {
             if existing != &tree {
                 return Err(AdminError::WireTreeAlreadyExistsWithDifferentPayload { hash });
@@ -1591,10 +1686,15 @@ impl MetadataHub {
         if let Some(reason) = metadata_fence(&state, &self.binding) {
             return MetadataCall::ReconnectRequired { reason };
         }
-        let Some(payload) = state.artifacts.get(&hash) else {
+        let Some(metadata) = state.artifacts.get(&hash).cloned() else {
             return MetadataCall::Error(RpcFailure::ArtifactNotFound { hash });
         };
-        MetadataCall::Success(chunk_payload(&payload.payload, state.chunk_size))
+        let chunk_size = state.chunk_size;
+        drop(state);
+        match load_artifact_payload(&self.server, hash, &metadata) {
+            Ok(payload) => MetadataCall::Success(chunk_payload(&payload, chunk_size)),
+            Err(error) => MetadataCall::Error(error),
+        }
     }
 }
 
@@ -2053,10 +2153,15 @@ impl Hub {
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
-        let Some(tree) = state.wire_trees.get(&hash) else {
+        if !state.wire_trees.contains_key(&hash) {
             return RpcResult::Failure(RpcFailure::WireTreeNotFound { hash });
-        };
-        RpcResult::Success(tree.bytes.clone())
+        }
+        drop(connection);
+        drop(state);
+        match load_wire_tree(&self.server, hash) {
+            Ok(bytes) => RpcResult::Success(bytes),
+            Err(error) => RpcResult::Failure(error),
+        }
     }
 
     pub fn fetch(
@@ -2406,9 +2511,14 @@ impl Snapshot {
                         }
                     });
                     if let Ok(BuildResolution::Built(content_hash)) = &outcome {
-                        if let Err(error) = self.lease.pin(&[content_hash.0]) {
-                            outcome = Err(error);
-                        }
+                        let state = self.server.lock();
+                        outcome = match state.artifacts.get(content_hash) {
+                            Some(metadata) => pin_artifact(&self.lease, metadata, *content_hash)
+                                .map(|()| BuildResolution::Built(*content_hash)),
+                            None => Err(RpcFailure::ArtifactNotFound {
+                                hash: *content_hash,
+                            }),
+                        };
                     }
                     if let Err(error) = backend.build_finished(&request) {
                         outcome = Err(error);
@@ -2417,6 +2527,15 @@ impl Snapshot {
                     state.build_flights.remove(&key);
                     if let Some(error) = pipeline_failure(&self.view) {
                         outcome = Err(error);
+                    }
+                    if let Ok(BuildResolution::Built(content_hash)) = &outcome {
+                        outcome = match state.artifacts.get(content_hash) {
+                            Some(metadata) => pin_artifact(&self.lease, metadata, *content_hash)
+                                .map(|()| BuildResolution::Built(*content_hash)),
+                            None => Err(RpcFailure::ArtifactNotFound {
+                                hash: *content_hash,
+                            }),
+                        };
                     }
                     if key.basis == stamp(&state) {
                         if let Ok(resolution) = &outcome {
@@ -2442,12 +2561,12 @@ impl Snapshot {
             });
             let value = match resolution {
                 Some(VersionResolve::Built { content_hash }) => {
-                    let Some(_) = state.artifacts.get(&content_hash) else {
+                    let Some(metadata) = state.artifacts.get(&content_hash) else {
                         return RpcResult::Failure(RpcFailure::ArtifactNotFound {
                             hash: content_hash,
                         });
                     };
-                    if let Err(error) = self.lease.pin(&[content_hash.0]) {
+                    if let Err(error) = pin_artifact(&self.lease, metadata, content_hash) {
                         return RpcResult::Failure(error);
                     }
                     ResolveResult::Built { content_hash }
@@ -2503,14 +2622,23 @@ impl Snapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        let payload = match state.artifacts.get(&hash) {
+        let metadata = match state.artifacts.get(&hash).cloned() {
             Some(payload) => payload,
             None => return RpcResult::Failure(RpcFailure::ArtifactNotFound { hash }),
         };
-        RpcResult::Success(TerminalEvent {
-            basis: self.basis.clone(),
-            value: chunk_payload(&payload.payload, state.chunk_size),
-        })
+        if let Err(error) = pin_artifact(&self.lease, &metadata, hash) {
+            return RpcResult::Failure(error);
+        }
+        let chunk_size = state.chunk_size;
+        drop(connection);
+        drop(state);
+        match load_artifact_payload(&self.server, hash, &metadata) {
+            Ok(payload) => RpcResult::Success(TerminalEvent {
+                basis: self.basis.clone(),
+                value: chunk_payload(&payload, chunk_size),
+            }),
+            Err(error) => RpcResult::Failure(error),
+        }
     }
 
     fn preflight<T>(
@@ -4221,6 +4349,87 @@ fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
         total_bytes,
         load_edges: payload.load_edges.clone(),
     }
+}
+
+fn pin_artifact(
+    lease: &ArtifactLease,
+    metadata: &StoredArtifact,
+    hash: ContentHash,
+) -> Result<(), RpcFailure> {
+    lease.pin(&[hash.0, metadata.layout_hash.0])
+}
+
+fn load_artifact_payload(
+    server: &Server,
+    hash: ContentHash,
+    metadata: &StoredArtifact,
+) -> Result<ArtifactPayload, RpcFailure> {
+    let backend = server
+        .payload_backend
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let mut payload = backend
+        .load_artifact(hash)
+        .map_err(|detail| RpcFailure::AuthoringBackendUnavailable {
+            operation: format!("read artifact payload from CAS: {detail}"),
+        })?
+        .ok_or(RpcFailure::ArtifactNotFound { hash })?;
+    if !payload.load_edges.is_empty() && payload.load_edges != metadata.load_edges {
+        return Err(RpcFailure::InvalidQuery {
+            detail: "artifact payload backend returned inconsistent typed load edges".to_owned(),
+        });
+    }
+    payload.load_edges = metadata.load_edges.clone();
+    let blobs = payload.blobs.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+    let parsed = distill_wire::artifact::parse_artifact_parts(&payload.structural, &blobs)
+        .map_err(|error| RpcFailure::InvalidQuery {
+            detail: format!("artifact payload backend returned invalid DSTL: {error}"),
+        })?;
+    let edge_assets = payload
+        .load_edges
+        .iter()
+        .map(|edge| edge.asset)
+        .collect::<Vec<_>>();
+    if parsed.content_hash != hash
+        || parsed.asset_uuid != metadata.asset_uuid
+        || parsed.layout_hash != metadata.layout_hash
+        || edge_assets != parsed.load_deps
+    {
+        return Err(RpcFailure::InvalidQuery {
+            detail: "artifact payload backend returned bytes inconsistent with installed metadata"
+                .to_owned(),
+        });
+    }
+    Ok(payload)
+}
+
+fn load_wire_tree(server: &Server, hash: LayoutHash) -> Result<Arc<[u8]>, RpcFailure> {
+    let backend = server
+        .payload_backend
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let bytes = backend
+        .load_wire_tree(hash)
+        .map_err(|detail| RpcFailure::AuthoringBackendUnavailable {
+            operation: format!("read wire tree from CAS: {detail}"),
+        })?
+        .ok_or(RpcFailure::WireTreeNotFound { hash })?;
+    let wire =
+        distill_wire::dswl::decode_dswl(&bytes).map_err(|error| RpcFailure::InvalidQuery {
+            detail: format!("payload backend returned invalid DSWL: {error:?}"),
+        })?;
+    let observed =
+        distill_wire::dswl::dswl_hash(&wire).map_err(|error| RpcFailure::InvalidQuery {
+            detail: format!("cannot authenticate payload-backend DSWL: {error:?}"),
+        })?;
+    if observed != hash {
+        return Err(RpcFailure::InvalidQuery {
+            detail: "payload backend returned a wire tree under the wrong hash".to_owned(),
+        });
+    }
+    Ok(bytes)
 }
 
 fn lock_connection(connection: &Arc<Mutex<ConnectionState>>) -> MutexGuard<'_, ConnectionState> {
