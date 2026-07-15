@@ -29,7 +29,7 @@ use distill_store::journal::{
 use distill_store::Store;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
-use crate::coordinator::{publish_current_scan, LineageDestination};
+use crate::coordinator::{publish_incremental_paths, LineageDestination};
 use crate::lineage_repair::{unique_sibling, write_same_dir_temp};
 use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::QuarantineDriver;
@@ -44,6 +44,7 @@ impl AuthoringService {
         let runtime = OperationRuntime {
             store: Arc::clone(&self.store),
             scanner: self.scanner.clone(),
+            scan_snapshot: Arc::clone(&self.scan_snapshot),
             quarantine: self.quarantine_snapshot(),
             lineage_destination: self.lineage_destination_snapshot(),
             pipeline_projection: self.pipeline_projection(),
@@ -322,6 +323,7 @@ impl DefaultProvider for NoDefaults {
 struct OperationRuntime {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
+    scan_snapshot: Arc<Mutex<crate::scanner::ScanSnapshot>>,
     quarantine: QuarantineDriver,
     lineage_destination: LineageDestination,
     pipeline_projection: PipelineProjection,
@@ -429,8 +431,14 @@ impl OperationRuntime {
             .map_err(|error| error.to_string())?;
         drop(publication);
         drop(store);
-        let commit = publish_current_scan(
+        let changed_paths = files
+            .iter()
+            .map(|file| file.target.clone())
+            .collect::<Vec<_>>();
+        let commit = publish_incremental_paths(
             &self.scanner,
+            &self.scan_snapshot,
+            &changed_paths,
             &self.lineage_destination,
             &self.store,
             base,

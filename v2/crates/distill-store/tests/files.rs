@@ -235,6 +235,38 @@ fn rename_log_is_ordered_and_consumed_transactionally() {
     assert!(empty.is_empty(), "consumed");
 }
 
+#[test]
+fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
+    let (_directory, mut store) = store();
+    let (root, _) = store
+        .input_transaction(|transaction| {
+            let root = transaction.intern_root("main")?;
+            transaction.push_dirty(root, "old.bundle", false)?;
+            transaction.push_rename(root, "old.bundle", "new.bundle")?;
+            Ok(root)
+        })
+        .unwrap();
+    let observed = store.pending_file_work().unwrap();
+    assert_eq!(observed.dirty.len(), 1);
+    assert_eq!(observed.renames.len(), 1);
+
+    store
+        .input_transaction(|transaction| {
+            transaction.push_dirty(root, "later.bundle", true)?;
+            transaction.push_rename(root, "later.bundle", "last.bundle")
+        })
+        .unwrap();
+    let version = store.input_version();
+    store.acknowledge_file_work(&observed).unwrap();
+    assert_eq!(store.input_version(), version, "acknowledgement is memo-side");
+
+    let remaining = store.pending_file_work().unwrap();
+    assert_eq!(remaining.dirty.len(), 1);
+    assert_eq!(remaining.dirty[0].path, "later.bundle");
+    assert_eq!(remaining.renames.len(), 1);
+    assert_eq!(remaining.renames[0].to_path, "last.bundle");
+}
+
 // ---- clean watermark (§14) ----
 
 #[test]

@@ -28,7 +28,7 @@ use distill_rpc::{
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
-use distill_store::files::{FileKind, FileState};
+use distill_store::files::{DirtyEntry, FileKind, FileState, PendingFileWork};
 use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, ValidatedPipelineEpoch,
     VerifiedSchemaLineageManifest,
@@ -54,12 +54,19 @@ use crate::scanner::{
     AssetRoot, ObservedFileIdentity, RootedScanner, ScanError, ScanSnapshot, ScannedFileKind,
 };
 use crate::scheduler::{Scheduler, SchedulerConfig, WorkClass};
-use crate::watcher::WatcherQueue;
+use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageDestination {
     pub root: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogicalRename {
+    root_name: String,
+    from_path: String,
+    to_path: String,
 }
 
 pub(crate) struct ConfigurationCandidate {
@@ -75,6 +82,7 @@ pub(crate) struct ConfigurationCandidate {
 pub struct DaemonCoordinator {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
+    scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     server: Server,
     lineage_destination: RwLock<LineageDestination>,
     authoring: Arc<AuthoringService>,
@@ -232,10 +240,12 @@ impl DaemonCoordinator {
         }
         let store = Arc::new(Mutex::new(opened_store));
         let scanner = RootedScanner::new(roots.clone())?;
+        let scan_snapshot = Arc::new(Mutex::new(ScanSnapshot::default()));
         let backend = Arc::new(AuthoringService::new(
             Arc::clone(&store),
             roots,
             lineage_destination.clone(),
+            Arc::clone(&scan_snapshot),
         )?);
         let (instance, version) = {
             let store = lock_store(&store);
@@ -267,6 +277,7 @@ impl DaemonCoordinator {
         Ok(Self {
             store,
             scanner,
+            scan_snapshot,
             server,
             lineage_destination: RwLock::new(lineage_destination),
             authoring: backend,
@@ -538,7 +549,7 @@ impl DaemonCoordinator {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             current.replace(poison)
         };
-        match self.reconcile_full_scan() {
+        match self.publish_cached_scan() {
             Ok(stamp) => Ok(stamp),
             Err(error) => {
                 *self
@@ -556,7 +567,7 @@ impl DaemonCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        match self.reconcile_full_scan() {
+        match self.publish_cached_scan() {
             Ok(stamp) => Ok(stamp),
             Err(error) => {
                 *self
@@ -586,6 +597,7 @@ impl DaemonCoordinator {
             .prepare_filesystem_candidate(roots, lineage_destination)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let scan = filesystem.scanner().scan()?;
+        let installed_snapshot = scan.clone();
         let destination = filesystem.lineage_destination().clone();
         let candidate = ScanCandidate::build(filesystem.scanner(), &destination, scan, None)?;
         let mut runtime = lock_pipeline(&self.pipeline);
@@ -689,6 +701,7 @@ impl DaemonCoordinator {
                     .expect("configuration candidate installs once");
                 self.scanner.replace_from(filesystem.scanner());
                 authoring.install_filesystem_candidate(filesystem);
+                *lock_scan_snapshot(&self.scan_snapshot) = installed_snapshot;
                 *self
                     .lineage_destination
                     .write()
@@ -965,9 +978,9 @@ impl DaemonCoordinator {
         }
     }
 
-    /// Arm the watcher before traversal and repeat while any event arrives
-    /// during a scan. This closes the traversal/commit lost-wakeup window
-    /// without treating platform event paths as namespace authority.
+    /// Arm the watcher before startup/recovery traversal. Precise events are
+    /// replayed incrementally after the scan commits; only admitted overflow
+    /// repeats the complete scan.
     pub fn reconcile_startup(
         &self,
         watcher: &Mutex<WatcherQueue>,
@@ -975,19 +988,67 @@ impl DaemonCoordinator {
         loop {
             lock_watcher(watcher).arm_scan();
             let stamp = self.reconcile_full_scan()?;
-            if !lock_watcher(watcher).finish_scan() {
-                return Ok(stamp);
+            match lock_watcher(watcher).finish_scan() {
+                WatcherAction::None => return Ok(stamp),
+                WatcherAction::Batch(batch) => return self.reconcile_incremental(&batch),
+                WatcherAction::FullRescan => continue,
             }
         }
     }
 
+    /// Apply one native watcher batch by reopening only its affected paths or
+    /// directory subtrees and merging those observations into startup state.
+    pub fn reconcile_incremental(
+        &self,
+        batch: &WatcherBatch,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let baseline = lock_scan_snapshot(&self.scan_snapshot).clone();
+        match self.scanner.scan_incremental(&baseline, &batch.paths) {
+            Ok(None) => Ok(self.server.current_stamp()),
+            Ok(Some(scan)) if scan.same_observation(&baseline) => Ok(self.server.current_stamp()),
+            Ok(Some(scan)) => {
+                let mut renames = Vec::new();
+                for rename in &batch.renames {
+                    let from = self.scanner.event_path_key(&rename.from)?;
+                    let to = self.scanner.event_path_key(&rename.to)?;
+                    if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
+                        if from_root == to_root {
+                            renames.push(LogicalRename {
+                                root_name: from_root,
+                                from_path,
+                                to_path,
+                            });
+                        }
+                    }
+                }
+                self.publish_scan_with_renames(scan, &renames)
+            }
+            Err(error) => self.publish_scan_rejection(&error),
+        }
+    }
+
+    fn publish_cached_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
+        let scan = lock_scan_snapshot(&self.scan_snapshot).clone();
+        self.publish_scan(scan)
+    }
+
     fn publish_scan(&self, scan: ScanSnapshot) -> Result<SnapshotStamp, CoordinatorError> {
-        let candidate = ScanCandidate::build(
+        self.publish_scan_with_renames(scan, &[])
+    }
+
+    fn publish_scan_with_renames(
+        &self,
+        scan: ScanSnapshot,
+        renames: &[LogicalRename],
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let published_snapshot = scan.clone();
+        let mut candidate = ScanCandidate::build(
             &self.scanner,
             &self.lineage_destination(),
             scan,
             self.configuration_poison(),
         )?;
+        candidate.renames.extend_from_slice(renames);
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let projection = self.authoring.pipeline_projection();
@@ -1006,7 +1067,8 @@ impl DaemonCoordinator {
         let fallback_bundles = lock_store(&store)
             .all_asset_bundles()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server
+        let stamp = self
+            .server
             .coordinated_commit(base, || {
                 let mut commit =
                     publish_scan(&store, base, candidate, false, None, &projection, tag_epoch)
@@ -1025,7 +1087,9 @@ impl DaemonCoordinator {
                 }
                 Ok(commit)
             })
-            .map_err(CoordinatorError::Coordinated)
+            .map_err(CoordinatorError::Coordinated)?;
+        *lock_scan_snapshot(&self.scan_snapshot) = published_snapshot;
+        Ok(stamp)
     }
 
     fn publish_scan_rejection(&self, error: &ScanError) -> Result<SnapshotStamp, CoordinatorError> {
@@ -1096,6 +1160,26 @@ impl DaemonCoordinator {
             .authoring
             .watched_imports_needing_reimport()
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        self.reconcile_watched_import_bundles(pending)
+    }
+
+    /// Watcher-batch variant that revalidates only read sets capable of
+    /// observing one of the transactionally queued dirty paths.
+    pub fn reconcile_watched_imports_affected(
+        &self,
+        dirty: &[DirtyEntry],
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
+        let pending = self
+            .authoring
+            .watched_imports_affected_by(dirty)
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        self.reconcile_watched_import_bundles(pending)
+    }
+
+    fn reconcile_watched_import_bundles(
+        &self,
+        pending: Vec<BundleUuid>,
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let mut imported = Vec::with_capacity(pending.len());
         for bundle in pending {
             let base = self.server.current_stamp().version;
@@ -1114,6 +1198,18 @@ impl DaemonCoordinator {
             }
         }
         Ok(imported)
+    }
+
+    pub fn pending_file_work(&self) -> Result<PendingFileWork, CoordinatorError> {
+        lock_store(&self.store)
+            .pending_file_work()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
+    }
+
+    pub fn acknowledge_file_work(&self, work: &PendingFileWork) -> Result<(), CoordinatorError> {
+        lock_store(&self.store)
+            .acknowledge_file_work(work)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
     /// Discover and apply authored directory-import rules. Every generated
@@ -1323,6 +1419,7 @@ impl From<ScanError> for CoordinatorError {
 
 struct ScanCandidate {
     scan: ScanSnapshot,
+    renames: Vec<LogicalRename>,
     version_poison: Option<VersionPoison>,
     configuration: ConfigurationStatus,
     lineage_repair: Option<LineageRepairState>,
@@ -1469,6 +1566,7 @@ impl ScanCandidate {
 
         Ok(Self {
             scan,
+            renames: Vec::new(),
             version_poison,
             configuration,
             lineage_repair,
@@ -1543,6 +1641,53 @@ fn projected_derived_outputs(
     Ok((outputs, poison))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleSummary {
+    root_name: String,
+    path: String,
+    format_version: u32,
+    content_hash: ContentHash,
+    origin: Option<distill_store::bundles::DirectoryOrigin>,
+}
+
+impl BundleSummary {
+    fn rpc_equivalent(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.format_version == other.format_version
+            && self.content_hash == other.content_hash
+    }
+}
+
+fn candidate_bundle_summaries(
+    candidate: &ScanCandidate,
+) -> Result<BTreeMap<BundleUuid, BundleSummary>, StoreError> {
+    let mut summaries = BTreeMap::new();
+    for source in &candidate.scan.bundles {
+        let Ok(bundle) = &source.parsed else {
+            continue;
+        };
+        let origin = crate::importer::decoded_directory_origin(bundle).map_err(|error| {
+            StoreError::InvalidConfiguration {
+                error: format!(
+                    "invalid import record in {}: {error:?}",
+                    source.normalized_path
+                ),
+            }
+        })?;
+        summaries.insert(
+            bundle.uuid,
+            BundleSummary {
+                root_name: source.root_name.clone(),
+                path: source.normalized_path.clone(),
+                format_version: bundle.format_version,
+                content_hash: ContentHash(source.file_hash.0),
+                origin,
+            },
+        );
+    }
+    Ok(summaries)
+}
+
 fn publish_scan(
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
@@ -1574,8 +1719,47 @@ fn publish_scan(
     }
     let old_files = store.all_files()?;
     let old_bundles = store.all_bundles()?;
-    let old_assets = store.all_asset_ids()?;
+    let old_asset_bundles = store.all_asset_bundles()?;
     let old_paths = store.all_path_entries()?;
+    let mut old_bundle_summaries = BTreeMap::new();
+    for bundle in &old_bundles {
+        let root_name =
+            store
+                .root_name(bundle.root)?
+                .ok_or_else(|| StoreError::InvalidConfiguration {
+                    error: format!("bundle {} has an unknown root id", bundle.bundle),
+                })?;
+        old_bundle_summaries.insert(
+            bundle.bundle,
+            BundleSummary {
+                root_name,
+                path: bundle.path.clone(),
+                format_version: bundle.format_version,
+                content_hash: bundle.content_hash,
+                origin: bundle.origin.clone(),
+            },
+        );
+    }
+    let current_bundle_summaries = if candidate.version_poison.is_none() {
+        candidate_bundle_summaries(&candidate)?
+    } else {
+        BTreeMap::new()
+    };
+    let changed_bundles = current_bundle_summaries
+        .iter()
+        .filter_map(|(bundle, current)| {
+            (old_bundle_summaries.get(bundle) != Some(current)).then_some(*bundle)
+        })
+        .collect::<BTreeSet<_>>();
+    let rpc_changed_bundles = current_bundle_summaries
+        .iter()
+        .filter_map(|(bundle, current)| {
+            old_bundle_summaries
+                .get(bundle)
+                .is_none_or(|old| !current.rpc_equivalent(old))
+                .then_some(*bundle)
+        })
+        .collect::<BTreeSet<_>>();
     let mut generation = match store.configuration_state()? {
         ConfigurationState::Ready(epoch) => epoch.generation,
         ConfigurationState::Poisoned { last_good, .. } => {
@@ -1592,10 +1776,11 @@ fn publish_scan(
 
     let mut commit = rpc_commit(
         &candidate,
-        &old_assets,
+        &old_asset_bundles,
         &old_paths,
         projection,
         derived_outputs.clone(),
+        &rpc_changed_bundles,
     )?;
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
     store.input_transaction(|transaction| {
@@ -1612,8 +1797,8 @@ fn publish_scan(
             let changed = old_files.iter().find_map(|(old_root, path, old)| {
                 (*old_root == root && path == &file.normalized_path).then_some(old != &state)
             });
-            transaction.upsert_file(root, &file.normalized_path, &state)?;
             if changed.unwrap_or(true) {
+                transaction.upsert_file(root, &file.normalized_path, &state)?;
                 transaction.push_dirty(root, &file.normalized_path, true)?;
             }
         }
@@ -1660,30 +1845,31 @@ fn publish_scan(
         }
 
         if candidate.version_poison.is_none() {
-            for bundle in &old_bundles {
-                transaction.remove_bundle(bundle.bundle)?;
+            for bundle in old_bundle_summaries.keys() {
+                if !current_bundle_summaries.contains_key(bundle)
+                    || changed_bundles.contains(bundle)
+                {
+                    transaction.remove_bundle(*bundle)?;
+                }
             }
             for source in &candidate.scan.bundles {
                 let Ok(bundle) = &source.parsed else {
                     continue;
                 };
+                if !changed_bundles.contains(&bundle.uuid) {
+                    continue;
+                }
                 let root = *root_ids
                     .entry(source.root_name.clone())
                     .or_insert(transaction.intern_root(&source.root_name)?);
+                let summary = &current_bundle_summaries[&bundle.uuid];
                 transaction.upsert_bundle(&BundleMeta {
                     bundle: bundle.uuid,
                     root,
                     path: source.normalized_path.clone(),
                     format_version: bundle.format_version,
                     content_hash: ContentHash(source.file_hash.0),
-                    origin: crate::importer::decoded_directory_origin(bundle).map_err(|error| {
-                        StoreError::InvalidConfiguration {
-                            error: format!(
-                                "invalid import record in {}: {error:?}",
-                                source.normalized_path
-                            ),
-                        }
-                    })?,
+                    origin: summary.origin.clone(),
                 })?;
                 for (hash, schema) in &bundle.schemas {
                     let snapshot =
@@ -1715,6 +1901,12 @@ fn publish_scan(
                 }
             }
         }
+        for rename in &candidate.renames {
+            let root = *root_ids
+                .entry(rename.root_name.clone())
+                .or_insert(transaction.intern_root(&rename.root_name)?);
+            transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
+        }
         Ok(())
     })?;
     commit.pipeline = Some(next_pipeline);
@@ -1731,18 +1923,28 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
     }
 }
 
-/// Rescan the complete namespace and advance the durable projection from an
-/// authoring backend while the RPC server holds its publication lock.
-pub(crate) fn publish_current_scan(
+/// Reobserve authored paths and advance the durable projection while the RPC
+/// server holds its publication lock.
+#[allow(clippy::too_many_arguments)] // The authoring boundary passes each publication authority explicitly.
+pub(crate) fn publish_incremental_paths(
     scanner: &RootedScanner,
+    scan_snapshot: &Mutex<ScanSnapshot>,
+    paths: &[PathBuf],
     lineage_destination: &LineageDestination,
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
     projection: &PipelineProjection,
     coordinator: Option<&DaemonCoordinator>,
 ) -> Result<Commit, String> {
-    let scan = scanner.scan().map_err(|error| error.to_string())?;
-    let candidate = ScanCandidate::build(scanner, lineage_destination, scan, None)
+    let baseline = scan_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let scan = scanner
+        .scan_incremental(&baseline, paths)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "authored path is outside every configured root".to_owned())?;
+    let candidate = ScanCandidate::build(scanner, lineage_destination, scan.clone(), None)
         .map_err(|error| error.to_string())?;
     let authority = coordinator.and_then(DaemonCoordinator::schema_authority);
     let tag_epoch = authority
@@ -1770,6 +1972,9 @@ pub(crate) fn publish_current_scan(
         )
         .apply(&mut commit);
     }
+    *scan_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = scan;
     Ok(commit)
 }
 
@@ -1793,10 +1998,11 @@ fn commit_asset_bundles(
 
 fn rpc_commit(
     candidate: &ScanCandidate,
-    old_assets: &[AssetUuid],
+    old_asset_bundles: &BTreeMap<AssetUuid, BundleUuid>,
     old_paths: &[(String, distill_store::files::RootId, AssetUuid)],
     projection: &PipelineProjection,
     derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
+    changed_bundles: &BTreeSet<BundleUuid>,
 ) -> Result<Commit, StoreError> {
     let mut commit = Commit {
         configuration: Some(candidate.configuration.clone()),
@@ -1819,6 +2025,9 @@ fn rpc_commit(
         };
         for (local_id, entry) in &bundle.assets {
             current_assets.insert(entry.uuid);
+            if !changed_bundles.contains(&bundle.uuid) {
+                continue;
+            }
             commit.assets.push(AssetMutation::Set {
                 uuid: entry.uuid,
                 resolution: StoredResolve::Drifted {
@@ -1846,7 +2055,7 @@ fn rpc_commit(
                 .insert(bundle.assets[primary].uuid);
         }
     }
-    for asset in old_assets {
+    for asset in old_asset_bundles.keys() {
         if !current_assets.contains(asset) {
             commit.assets.push(AssetMutation::Set {
                 uuid: *asset,
@@ -1858,25 +2067,28 @@ fn rpc_commit(
                 .push(AuthoringMutation::Remove { uuid: *asset });
         }
     }
-    let old_path_names = old_paths
-        .iter()
-        .map(|(path, _, _)| path.clone())
-        .collect::<BTreeSet<_>>();
-    for (path, candidates) in paths {
-        commit.paths.push(PathMutation::Set { path, candidates });
+    let mut old_path_candidates = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
+    for (path, _, asset) in old_paths {
+        old_path_candidates
+            .entry(path.clone())
+            .or_default()
+            .insert(*asset);
     }
-    let current_path_names = commit
-        .paths
-        .iter()
-        .filter_map(|mutation| match mutation {
-            PathMutation::Set { path, .. } => Some(path.clone()),
-            PathMutation::Remove { .. } => None,
-        })
+    let path_names = old_path_candidates
+        .keys()
+        .chain(paths.keys())
+        .cloned()
         .collect::<BTreeSet<_>>();
-    for path in old_path_names.difference(&current_path_names) {
-        commit
-            .paths
-            .push(PathMutation::Remove { path: path.clone() });
+    for path in path_names {
+        match (old_path_candidates.get(&path), paths.get(&path)) {
+            (old, current) if old == current => {}
+            (_, Some(candidates)) => commit.paths.push(PathMutation::Set {
+                path,
+                candidates: candidates.clone(),
+            }),
+            (Some(_), None) => commit.paths.push(PathMutation::Remove { path }),
+            (None, None) => unreachable!("path name came from one projection"),
+        }
     }
     Ok(commit)
 }
@@ -2152,6 +2364,12 @@ fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
 
 fn lock_watcher(watcher: &Mutex<WatcherQueue>) -> MutexGuard<'_, WatcherQueue> {
     watcher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_scan_snapshot(snapshot: &Mutex<ScanSnapshot>) -> MutexGuard<'_, ScanSnapshot> {
+    snapshot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

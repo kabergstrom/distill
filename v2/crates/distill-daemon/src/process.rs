@@ -16,7 +16,7 @@ use distill_store::state::{
 use crate::codegen::CodegenService;
 use crate::config::{config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
-use crate::watcher::{WatcherQueue, WatcherThread};
+use crate::watcher::{WatcherAction, WatcherQueue, WatcherStartError, WatcherThread};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
@@ -73,10 +73,9 @@ impl DaemonProcess {
         )
         .map_err(DaemonProcessError::Codegen)?;
         let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new()));
-        let watcher =
-            WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue), DEBOUNCE)?;
+        let watcher = WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue))?;
         coordinator.reconcile_startup(&watcher_queue)?;
-        reconcile_imports(&coordinator)?;
+        reconcile_imports(&coordinator, true)?;
         coordinator.sweep_displaced_retention(unix_seconds())?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -164,7 +163,7 @@ pub enum DaemonProcessError {
     Config(DaemonConfigError),
     CoordinatorInit(CoordinatorInitError),
     Coordinator(CoordinatorError),
-    Watch(crate::scanner::ScanError),
+    Watch(WatcherStartError),
     SchemaRead {
         path: PathBuf,
         source: std::io::Error,
@@ -197,8 +196,8 @@ impl From<CoordinatorError> for DaemonProcessError {
         Self::Coordinator(error)
     }
 }
-impl From<crate::scanner::ScanError> for DaemonProcessError {
-    fn from(error: crate::scanner::ScanError) -> Self {
+impl From<WatcherStartError> for DaemonProcessError {
+    fn from(error: WatcherStartError) -> Self {
         Self::Watch(error)
     }
 }
@@ -222,16 +221,19 @@ fn spawn_coordinator_loop(
             let mut next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
             while !stop.load(Ordering::Acquire) {
                 thread::sleep(DEBOUNCE);
-                let dirty = lock(&watcher).take_live_dirty();
-                let result = config_watch.reconcile(&coordinator).and_then(|()| {
-                    if dirty {
-                        coordinator
-                            .reconcile_full_scan()
-                            .and_then(|_| reconcile_imports(&coordinator))
-                    } else {
-                        Ok(())
-                    }
-                });
+                let action = lock(&watcher).take_live_action();
+                let retry_action = action.clone();
+                let result = config_watch
+                    .reconcile(&coordinator)
+                    .and_then(|()| match action {
+                        WatcherAction::None => Ok(()),
+                        WatcherAction::Batch(batch) => coordinator
+                            .reconcile_incremental(&batch)
+                            .and_then(|_| reconcile_imports(&coordinator, false)),
+                        WatcherAction::FullRescan => coordinator
+                            .reconcile_startup(&watcher)
+                            .and_then(|_| reconcile_imports(&coordinator, true)),
+                    });
                 let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
                 let retention_result = if Instant::now() >= next_retention_sweep {
                     next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
@@ -246,7 +248,7 @@ fn spawn_coordinator_loop(
                 match result {
                     Err(error) => {
                         *lock(&last_error) = Some(error.to_string());
-                        lock(&watcher).mark_dirty();
+                        lock(&watcher).requeue_action(retry_action);
                     }
                     Ok(()) => {
                         if let Err(error) = codegen.run(&coordinator) {
@@ -572,10 +574,21 @@ fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
     ConfigurationSourcePath::Unix(path.to_string_lossy().as_bytes().to_vec())
 }
 
-fn reconcile_imports(coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
-    let reconcile = coordinator
-        .reconcile_directory_imports()
-        .and_then(|_| coordinator.reconcile_watched_imports());
+fn reconcile_imports(
+    coordinator: &DaemonCoordinator,
+    revalidate_all: bool,
+) -> Result<(), CoordinatorError> {
+    let work = coordinator.pending_file_work()?;
+    let reconcile = coordinator.reconcile_directory_imports().and_then(|_| {
+        if revalidate_all {
+            coordinator.reconcile_watched_imports()
+        } else {
+            coordinator.reconcile_watched_imports_affected(&work.dirty)
+        }
+    });
+    if reconcile.is_ok() {
+        coordinator.acknowledge_file_work(&work)?;
+    }
     let poison = coordinator.sync_runtime_pipeline_poison().map(|_| ());
     reconcile.and(poison)
 }

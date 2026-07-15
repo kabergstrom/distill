@@ -200,15 +200,20 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
     std::fs::write(&path, config_source(&temp)).unwrap();
     wait_until(
         || {
-            process.coordinator().server().current_stamp().version > poisoned
+            if let Some(error) = process.last_background_error() {
+                panic!("background reconciliation failed: {error}");
+            }
+            let version = process.coordinator().server().current_stamp().version;
+            let state = process
+                .coordinator()
+                .store()
+                .lock()
+                .unwrap()
+                .configuration_state()
+                .unwrap();
+            version > poisoned
                 && matches!(
-                    process
-                        .coordinator()
-                        .store()
-                        .lock()
-                        .unwrap()
-                        .configuration_state()
-                        .unwrap(),
+                    state,
                     ConfigurationState::Poisoned { reason, .. }
                         if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
                 )

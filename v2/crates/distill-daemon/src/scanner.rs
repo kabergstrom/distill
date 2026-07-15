@@ -190,6 +190,37 @@ pub struct ScannedBundle {
 pub struct ScanSnapshot {
     pub files: Vec<ScannedFile>,
     pub bundles: Vec<ScannedBundle>,
+    directory_identities: BTreeMap<(String, String), DirectoryObservation>,
+}
+
+impl ScanSnapshot {
+    /// Equality of filesystem authority, excluding parsed-object allocation
+    /// details. Used to suppress watcher echoes of daemon-authored writes.
+    pub fn same_observation(&self, other: &Self) -> bool {
+        self.files == other.files
+            && self.bundles.len() == other.bundles.len()
+            && self
+                .bundles
+                .iter()
+                .zip(&other.bundles)
+                .all(|(left, right)| {
+                    left.root_name == right.root_name
+                        && left.normalized_path == right.normalized_path
+                        && left.file_hash == right.file_hash
+                })
+            && self.directory_identities.len() == other.directory_identities.len()
+            && self.directory_identities.iter().all(|(key, left)| {
+                other.directory_identities.get(key).is_some_and(|right| {
+                    left.identity == right.identity && left.physical_path == right.physical_path
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryObservation {
+    identity: FileIdentity,
+    physical_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -285,15 +316,47 @@ impl RootedScanner {
     }
 
     pub(crate) fn replace_from(&self, replacement: &Self) {
-        *self
+        let replacement = replacement.root_snapshot();
+        let mut roots = self
             .roots
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement.root_snapshot();
-        self.revision.fetch_add(1, Ordering::AcqRel);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let watcher_roots_changed = roots.len() != replacement.len()
+            || roots.iter().any(|(name, current)| {
+                replacement.get(name).is_none_or(|next| {
+                    current.configured != next.configured
+                        || current.canonical_path != next.canonical_path
+                        || current.quarantine_identity != next.quarantine_identity
+                })
+            });
+        *roots = replacement;
+        if watcher_roots_changed {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    /// Canonical configured roots to hand to the native watcher. The watcher
+    /// never derives authority from these strings; every delivered path is
+    /// reopened through this scanner's retained directory capabilities.
+    pub(crate) fn watch_roots(&self) -> Vec<PathBuf> {
+        self.root_snapshot()
+            .values()
+            .map(|root| root.canonical_path.clone())
+            .collect()
+    }
+
+    /// Translate one native invalidation path to the canonical rooted key
+    /// used by the durable file tables. Native paths remain hints only; the
+    /// scanner still reopens the path before any state is published.
+    pub(crate) fn event_path_key(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(String, String)>, ScanError> {
+        event_key(&self.root_snapshot(), path)
     }
 
     pub fn physical_path(&self, root: &str, path: &str) -> Result<PathBuf, ScanError> {
@@ -408,153 +471,63 @@ impl RootedScanner {
     }
 
     /// Enumerate the complete raw namespace in deterministic `(root, path)`
-    /// order. Watchers arm outside this call; their generation-tagged event
-    /// union is applied by the coordinator after this candidate commits.
+    /// order. This is the startup/recovery path; ordinary live watcher batches
+    /// use incremental path/subtree observation instead.
     pub fn scan(&self) -> Result<ScanSnapshot, ScanError> {
         let roots = self.root_snapshot();
-        let mut stack = roots
+        let stack = roots
             .values()
             .rev()
             .map(|root| PendingDirectory {
                 root_name: root.configured.name.clone(),
-                physical_path: root.configured.path.clone(),
+                physical_path: root.canonical_path.clone(),
                 directory: root.directory.clone(),
                 relative_components: Vec::new(),
                 ancestry: BTreeSet::new(),
                 entry_guards: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let mut identities = BTreeMap::<FileIdentity, (String, PathBuf)>::new();
-        let mut snapshot = ScanSnapshot::default();
+        scan_pending(&roots, stack)
+    }
 
-        while let Some(pending) = stack.pop() {
-            let root = &roots[&pending.root_name];
-            revalidate_entry_guards(&pending.entry_guards, &roots)?;
-            let metadata = directory_metadata(&pending.directory, &pending.physical_path)?;
-            if !metadata.is_dir() {
-                return Err(ScanError::NonRegularFile {
-                    path: pending.physical_path,
-                });
-            }
-            let identity = file_identity(&metadata);
-            let live_quarantine_identity = fs::metadata(&root.configured.quarantine_dir)
-                .ok()
-                .filter(|metadata| metadata.is_dir())
-                .map(|metadata| file_identity(&metadata));
-            if pending.physical_path == root.configured.quarantine_dir
-                || root.quarantine_identity == Some(identity)
-                || live_quarantine_identity == Some(identity)
-            {
-                continue;
-            }
-            if pending.ancestry.contains(&identity) {
-                return Err(ScanError::DirectoryCycle {
-                    path: pending.physical_path,
-                });
-            }
-            if !pending.relative_components.is_empty() {
-                snapshot.files.push(ScannedFile {
-                    root_name: pending.root_name.clone(),
-                    normalized_path: pending.relative_components.join("/"),
-                    kind: ScannedFileKind::Directory,
-                    modified_nanos: modified_nanos(&metadata),
-                    size: metadata.len(),
-                    content_hash: None,
-                });
-            }
-            if let Some((first_root, first)) = identities.insert(
-                identity,
-                (pending.root_name.clone(), pending.physical_path.clone()),
-            ) {
-                if first_root != pending.root_name || first != pending.physical_path {
-                    return Err(ScanError::DirectoryAlias {
-                        first_root,
-                        first,
-                        second_root: pending.root_name,
-                        second: pending.physical_path,
-                        identity: identity.into(),
-                    });
-                }
-            }
-
-            let mut entries = read_directory_names(&pending.directory, &pending.physical_path)?;
-            entries.sort_by_key(|entry| os_sort_key(entry));
-            let after = directory_metadata(&pending.directory, &pending.physical_path)?;
-            if file_identity(&after) != identity {
-                return Err(ScanError::FileIdentityChanged {
-                    path: pending.physical_path,
-                });
-            }
-            revalidate_entry_guards(&pending.entry_guards, &roots)?;
-
-            for entry in entries.into_iter().rev() {
-                let component = normalize_component(&entry)?;
-                let mut relative = pending.relative_components.clone();
-                relative.push(component);
-                let physical = pending.physical_path.join(&entry);
-                let opened = open_scanned_child(&pending.directory, &entry, &physical, &roots)?;
-                let guard = EntryGuard::new(&pending.directory, &entry, &physical, &opened);
-                if opened.metadata.is_dir() {
-                    let mut ancestry = pending.ancestry.clone();
-                    ancestry.insert(identity);
-                    let mut entry_guards = pending.entry_guards.clone();
-                    entry_guards.push(guard);
-                    let directory =
-                        DirectoryCapability::from_open_directory(opened.file, &physical);
-                    stack.push(PendingDirectory {
-                        root_name: pending.root_name.clone(),
-                        physical_path: physical,
-                        directory,
-                        relative_components: relative,
-                        ancestry,
-                        entry_guards,
-                    });
-                } else if opened.metadata.is_file() {
-                    let metadata = opened.metadata;
-                    let is_symlink = opened.symlink_identity.is_some();
-                    let bytes = read_opened_file(opened.file, &physical, &metadata)?;
-                    revalidate_entry_guards(&pending.entry_guards, &roots)?;
-                    revalidate_entry_guards(std::slice::from_ref(&guard), &roots)?;
-                    let normalized_path = relative.join("/");
-                    snapshot.files.push(ScannedFile {
-                        root_name: pending.root_name.clone(),
-                        normalized_path: normalized_path.clone(),
-                        kind: if is_symlink {
-                            ScannedFileKind::Symlink
-                        } else {
-                            ScannedFileKind::File
-                        },
-                        modified_nanos: modified_nanos(&metadata),
-                        size: metadata.len(),
-                        content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
-                    });
-                    if physical
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        == Some("bundle")
-                    {
-                        snapshot.bundles.push(ScannedBundle {
-                            root_name: pending.root_name.clone(),
-                            normalized_path,
-                            file_hash: BundleFileHash::of_observed_bytes(&bytes),
-                            parsed: distill_bundle::parse_bundle(&bytes),
-                            bytes,
-                        });
-                    }
-                } else {
-                    return Err(ScanError::NonRegularFile { path: physical });
-                }
+    /// Re-observe only native-event paths and directory subtrees, merging the
+    /// result into the last complete snapshot without touching unrelated disk
+    /// state. `Ok(None)` means every event path was outside configured roots.
+    pub fn scan_incremental(
+        &self,
+        baseline: &ScanSnapshot,
+        event_paths: &[PathBuf],
+    ) -> Result<Option<ScanSnapshot>, ScanError> {
+        let roots = self.root_snapshot();
+        let mut affected = BTreeSet::<(String, String)>::new();
+        for event_path in event_paths {
+            if let Some((root, path)) = event_key(&roots, event_path)? {
+                affected.insert((root, path));
             }
         }
-        snapshot.files.sort_by(|left, right| {
-            (&left.root_name, &left.normalized_path)
-                .cmp(&(&right.root_name, &right.normalized_path))
-        });
-        snapshot.bundles.sort_by(|left, right| {
-            (&left.root_name, &left.normalized_path)
-                .cmp(&(&right.root_name, &right.normalized_path))
-        });
-        Ok(snapshot)
+        if affected.is_empty() {
+            return Ok(None);
+        }
+        let affected = collapse_affected(affected);
+        let mut next = baseline.clone();
+        for (root, path) in &affected {
+            next.files
+                .retain(|file| !path_matches(root, path, &file.root_name, &file.normalized_path));
+            next.bundles.retain(|bundle| {
+                !path_matches(root, path, &bundle.root_name, &bundle.normalized_path)
+            });
+            next.directory_identities
+                .retain(|(key_root, key_path), _| !path_matches(root, path, key_root, key_path));
+            if let Some(observed) = scan_logical_path(&roots, root, path)? {
+                next.files.extend(observed.files);
+                next.bundles.extend(observed.bundles);
+                next.directory_identities
+                    .extend(observed.directory_identities);
+            }
+        }
+        sort_snapshot(&mut next);
+        validate_directory_aliases(&next)?;
+        Ok(Some(next))
     }
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
@@ -606,6 +579,311 @@ impl RootedScanner {
         }
         unreachable!("nonempty component walk returns at its final component")
     }
+}
+
+fn scan_pending(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    mut stack: Vec<PendingDirectory>,
+) -> Result<ScanSnapshot, ScanError> {
+    let mut snapshot = ScanSnapshot::default();
+    while let Some(pending) = stack.pop() {
+        let root = &roots[&pending.root_name];
+        revalidate_entry_guards(&pending.entry_guards, roots)?;
+        let metadata = directory_metadata(&pending.directory, &pending.physical_path)?;
+        if !metadata.is_dir() {
+            return Err(ScanError::NonRegularFile {
+                path: pending.physical_path,
+            });
+        }
+        let identity = file_identity(&metadata);
+        let live_quarantine_identity = fs::metadata(&root.configured.quarantine_dir)
+            .ok()
+            .filter(|metadata| metadata.is_dir())
+            .map(|metadata| file_identity(&metadata));
+        if pending.physical_path == root.configured.quarantine_dir
+            || root.quarantine_identity == Some(identity)
+            || live_quarantine_identity == Some(identity)
+        {
+            continue;
+        }
+        if pending.ancestry.contains(&identity) {
+            return Err(ScanError::DirectoryCycle {
+                path: pending.physical_path,
+            });
+        }
+        let normalized_directory = pending.relative_components.join("/");
+        snapshot.directory_identities.insert(
+            (pending.root_name.clone(), normalized_directory.clone()),
+            DirectoryObservation {
+                identity,
+                physical_path: pending.physical_path.clone(),
+            },
+        );
+        if !pending.relative_components.is_empty() {
+            snapshot.files.push(ScannedFile {
+                root_name: pending.root_name.clone(),
+                normalized_path: normalized_directory,
+                kind: ScannedFileKind::Directory,
+                modified_nanos: modified_nanos(&metadata),
+                size: metadata.len(),
+                content_hash: None,
+            });
+        }
+
+        let mut entries = read_directory_names(&pending.directory, &pending.physical_path)?;
+        entries.sort_by_key(|entry| os_sort_key(entry));
+        let after = directory_metadata(&pending.directory, &pending.physical_path)?;
+        if file_identity(&after) != identity {
+            return Err(ScanError::FileIdentityChanged {
+                path: pending.physical_path,
+            });
+        }
+        revalidate_entry_guards(&pending.entry_guards, roots)?;
+
+        for entry in entries.into_iter().rev() {
+            let component = normalize_component(&entry)?;
+            let mut relative = pending.relative_components.clone();
+            relative.push(component);
+            let physical = pending.physical_path.join(&entry);
+            let opened = open_scanned_child(&pending.directory, &entry, &physical, roots)?;
+            let guard = EntryGuard::new(&pending.directory, &entry, &physical, &opened);
+            if opened.metadata.is_dir() {
+                let mut ancestry = pending.ancestry.clone();
+                ancestry.insert(identity);
+                let mut entry_guards = pending.entry_guards.clone();
+                entry_guards.push(guard);
+                let directory = DirectoryCapability::from_open_directory(opened.file, &physical);
+                stack.push(PendingDirectory {
+                    root_name: pending.root_name.clone(),
+                    physical_path: physical,
+                    directory,
+                    relative_components: relative,
+                    ancestry,
+                    entry_guards,
+                });
+            } else if opened.metadata.is_file() {
+                observe_opened_file(
+                    roots,
+                    &mut snapshot,
+                    &pending.root_name,
+                    relative,
+                    physical,
+                    opened,
+                    &pending.entry_guards,
+                    guard,
+                )?;
+            } else {
+                return Err(ScanError::NonRegularFile { path: physical });
+            }
+        }
+    }
+    sort_snapshot(&mut snapshot);
+    validate_directory_aliases(&snapshot)?;
+    Ok(snapshot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_opened_file(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    snapshot: &mut ScanSnapshot,
+    root_name: &str,
+    relative: Vec<String>,
+    physical: PathBuf,
+    opened: OpenedChild,
+    parent_guards: &[EntryGuard],
+    guard: EntryGuard,
+) -> Result<(), ScanError> {
+    let metadata = opened.metadata;
+    let is_symlink = opened.symlink_identity.is_some();
+    let bytes = read_opened_file(opened.file, &physical, &metadata)?;
+    revalidate_entry_guards(parent_guards, roots)?;
+    revalidate_entry_guards(std::slice::from_ref(&guard), roots)?;
+    let normalized_path = relative.join("/");
+    snapshot.files.push(ScannedFile {
+        root_name: root_name.to_owned(),
+        normalized_path: normalized_path.clone(),
+        kind: if is_symlink {
+            ScannedFileKind::Symlink
+        } else {
+            ScannedFileKind::File
+        },
+        modified_nanos: modified_nanos(&metadata),
+        size: metadata.len(),
+        content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+    });
+    if physical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("bundle")
+    {
+        snapshot.bundles.push(ScannedBundle {
+            root_name: root_name.to_owned(),
+            normalized_path,
+            file_hash: BundleFileHash::of_observed_bytes(&bytes),
+            parsed: distill_bundle::parse_bundle(&bytes),
+            bytes,
+        });
+    }
+    Ok(())
+}
+
+fn scan_logical_path(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    root_name: &str,
+    path: &str,
+) -> Result<Option<ScanSnapshot>, ScanError> {
+    let root = roots
+        .get(root_name)
+        .ok_or_else(|| ScanError::UnknownRoot(root_name.to_owned()))?;
+    if path.is_empty() {
+        return scan_pending(
+            roots,
+            vec![PendingDirectory {
+                root_name: root_name.to_owned(),
+                physical_path: root.canonical_path.clone(),
+                directory: root.directory.clone(),
+                relative_components: Vec::new(),
+                ancestry: BTreeSet::new(),
+                entry_guards: Vec::new(),
+            }],
+        )
+        .map(Some);
+    }
+
+    let components = validate_logical_path(path)?;
+    let mut directory = root.directory.clone();
+    let mut physical = root.canonical_path.clone();
+    let mut relative = Vec::new();
+    let mut entry_guards = Vec::new();
+    let mut ancestry = BTreeSet::new();
+    let mut parent_identity = file_identity(&directory_metadata(&directory, &physical)?);
+    for (index, component) in components.iter().enumerate() {
+        physical.push(component);
+        relative.push((*component).to_owned());
+        let opened = match open_scanned_child(&directory, component.as_ref(), &physical, roots) {
+            Ok(opened) => opened,
+            Err(ScanError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let guard = EntryGuard::new(&directory, component.as_ref(), &physical, &opened);
+        let final_component = index + 1 == components.len();
+        if final_component && opened.metadata.is_file() {
+            let mut snapshot = ScanSnapshot::default();
+            observe_opened_file(
+                roots,
+                &mut snapshot,
+                root_name,
+                relative,
+                physical,
+                opened,
+                &entry_guards,
+                guard,
+            )?;
+            sort_snapshot(&mut snapshot);
+            return Ok(Some(snapshot));
+        }
+        if !opened.metadata.is_dir() {
+            return Err(ScanError::NonRegularFile { path: physical });
+        }
+        ancestry.insert(parent_identity);
+        parent_identity = file_identity(&opened.metadata);
+        entry_guards.push(guard);
+        directory = DirectoryCapability::from_open_directory(opened.file, &physical);
+        if final_component {
+            return scan_pending(
+                roots,
+                vec![PendingDirectory {
+                    root_name: root_name.to_owned(),
+                    physical_path: physical,
+                    directory,
+                    relative_components: relative,
+                    ancestry,
+                    entry_guards,
+                }],
+            )
+            .map(Some);
+        }
+    }
+    unreachable!("a validated nonempty logical path has a final component")
+}
+
+fn event_key(
+    roots: &BTreeMap<String, CanonicalRoot>,
+    event_path: &Path,
+) -> Result<Option<(String, String)>, ScanError> {
+    let Some((root, relative)) = roots
+        .values()
+        .filter_map(|root| {
+            event_path
+                .strip_prefix(&root.canonical_path)
+                .or_else(|_| event_path.strip_prefix(&root.configured.path))
+                .ok()
+                .map(|relative| (root, relative))
+        })
+        .max_by_key(|(root, _)| root.canonical_path.components().count())
+    else {
+        return Ok(None);
+    };
+    let components = relative
+        .components()
+        .map(|component| normalize_component(component.as_os_str()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((root.configured.name.clone(), components.join("/"))))
+}
+
+fn collapse_affected(paths: BTreeSet<(String, String)>) -> Vec<(String, String)> {
+    let mut collapsed = Vec::<(String, String)>::new();
+    for (root, path) in paths {
+        if collapsed
+            .iter()
+            .any(|(prior_root, prior)| path_matches(prior_root, prior, &root, &path))
+        {
+            continue;
+        }
+        collapsed.push((root, path));
+    }
+    collapsed
+}
+
+fn path_matches(root: &str, prefix: &str, candidate_root: &str, candidate: &str) -> bool {
+    root == candidate_root
+        && (prefix.is_empty()
+            || candidate == prefix
+            || candidate
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+fn sort_snapshot(snapshot: &mut ScanSnapshot) {
+    snapshot.files.sort_by(|left, right| {
+        (&left.root_name, &left.normalized_path).cmp(&(&right.root_name, &right.normalized_path))
+    });
+    snapshot.bundles.sort_by(|left, right| {
+        (&left.root_name, &left.normalized_path).cmp(&(&right.root_name, &right.normalized_path))
+    });
+}
+
+fn validate_directory_aliases(snapshot: &ScanSnapshot) -> Result<(), ScanError> {
+    let mut identities = BTreeMap::<FileIdentity, (String, String, PathBuf)>::new();
+    for ((root, path), observed) in &snapshot.directory_identities {
+        if let Some((first_root, first_path, first)) = identities.insert(
+            observed.identity,
+            (root.clone(), path.clone(), observed.physical_path.clone()),
+        ) {
+            if first_root != *root || first_path != *path {
+                return Err(ScanError::DirectoryAlias {
+                    first_root,
+                    first,
+                    second_root: root.clone(),
+                    second: observed.physical_path.clone(),
+                    identity: observed.identity.into(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl DirectoryCapability {

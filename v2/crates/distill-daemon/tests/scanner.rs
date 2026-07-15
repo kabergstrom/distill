@@ -85,6 +85,83 @@ fn full_scan_reports_raw_files_and_keeps_malformed_bundle_candidates() {
 }
 
 #[test]
+fn incremental_scan_reobserves_only_named_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    let changed = root.join("changed.txt");
+    let unrelated = root.join("unrelated.txt");
+    std::fs::write(&changed, b"before").unwrap();
+    std::fs::write(&unrelated, b"retained").unwrap();
+    let scanner = scanner(&temp);
+    let baseline = scanner.scan().unwrap();
+
+    std::fs::write(&changed, b"after").unwrap();
+    std::fs::remove_file(&unrelated).unwrap();
+    let partial = scanner
+        .scan_incremental(&baseline, std::slice::from_ref(&changed))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(partial.files.len(), 2);
+    assert!(partial
+        .files
+        .iter()
+        .any(|file| file.normalized_path == "unrelated.txt"));
+    assert_ne!(
+        partial
+            .files
+            .iter()
+            .find(|file| file.normalized_path == "changed.txt")
+            .unwrap()
+            .content_hash,
+        baseline
+            .files
+            .iter()
+            .find(|file| file.normalized_path == "changed.txt")
+            .unwrap()
+            .content_hash
+    );
+
+    let healed = scanner
+        .scan_incremental(&partial, std::slice::from_ref(&unrelated))
+        .unwrap()
+        .unwrap();
+    assert_eq!(healed.files.len(), 1);
+    assert!(!healed
+        .files
+        .iter()
+        .any(|file| file.normalized_path == "unrelated.txt"));
+}
+
+#[test]
+fn incremental_directory_create_enumerates_only_that_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("stable.txt"), b"stable").unwrap();
+    let scanner = scanner(&temp);
+    let baseline = scanner.scan().unwrap();
+
+    let subtree = root.join("new");
+    std::fs::create_dir_all(subtree.join("nested")).unwrap();
+    std::fs::write(subtree.join("nested/source.txt"), b"source").unwrap();
+    let updated = scanner
+        .scan_incremental(&baseline, std::slice::from_ref(&subtree))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        updated
+            .files
+            .iter()
+            .map(|file| file.normalized_path.as_str())
+            .collect::<Vec<_>>(),
+        ["new", "new/nested", "new/nested/source.txt", "stable.txt"]
+    );
+}
+
+#[test]
 fn destination_basis_distinguishes_absent_opaque_and_exact_canonical_bundle() {
     let temp = tempfile::tempdir().unwrap();
     let scanner = scanner(&temp);

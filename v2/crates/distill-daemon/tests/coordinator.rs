@@ -2,15 +2,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
+use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination};
 use distill_daemon::scanner::AssetRoot;
+use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
-    AuthoringValue as RpcAuthoringValue, MetadataCall, MetadataNamespaceCall, TargetDefinition,
-    TargetDefinitionHash,
+    AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest, Delta, MetadataCall,
+    MetadataNamespaceCall, StreamEvent, TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
@@ -20,6 +22,14 @@ use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPois
 use distill_store::{Store, StoreConfig};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
+    ordinary_bundle_with(73, 72, 7)
+}
+
+fn ordinary_bundle_with(
+    bundle_byte: u8,
+    asset_byte: u8,
+    value: u64,
+) -> (Vec<u8>, BundleUuid, AssetUuid) {
     let type_uuid = TypeUuid([71; 16]);
     let schema = LogicalSchema {
         root: SchemaNode::Primitive(PrimitiveKind::U8),
@@ -29,8 +39,8 @@ fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
         digest: schema_hash,
         forward_parent: None,
     }];
-    let asset = AssetUuid([72; 16]);
-    let bundle = BundleUuid([73; 16]);
+    let asset = AssetUuid([asset_byte; 16]);
+    let bundle = BundleUuid([bundle_byte; 16]);
     let entry = AssetEntry {
         uuid: asset,
         type_uuid,
@@ -41,7 +51,7 @@ fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
             cursor: 0,
         }),
         authoring_only: false,
-        data: AuthoredValue::UInt(7),
+        data: AuthoredValue::UInt(value.into()),
     };
     (
         distill_bundle::write_bundle(&Bundle {
@@ -55,6 +65,128 @@ fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
         bundle,
         asset,
     )
+}
+
+fn bytes(value: &[u8]) -> AuthoredValue {
+    AuthoredValue::Array(
+        value
+            .iter()
+            .map(|byte| AuthoredValue::UInt((*byte).into()))
+            .collect(),
+    )
+}
+
+fn lineage_manifest_bundle(
+    type_uuid: TypeUuid,
+    schema_hash: distill_core::id::LogicalHash,
+) -> Vec<u8> {
+    let row = BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
+        .unwrap();
+    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    let data = AuthoredValue::Object(BTreeMap::from([(
+        "types".to_owned(),
+        AuthoredValue::Array(vec![AuthoredValue::Array(vec![
+            bytes(&type_uuid.0),
+            AuthoredValue::Object(BTreeMap::from([
+                (
+                    "authority".to_owned(),
+                    AuthoredValue::Object(BTreeMap::from([(
+                        "Active".to_owned(),
+                        AuthoredValue::Object(BTreeMap::new()),
+                    )])),
+                ),
+                ("current".to_owned(), AuthoredValue::UInt(0)),
+                (
+                    "epochs".to_owned(),
+                    AuthoredValue::Array(vec![AuthoredValue::Object(BTreeMap::from([
+                        ("digest".to_owned(), bytes(&schema_hash.0)),
+                        ("forward_parent".to_owned(), AuthoredValue::Null),
+                    ]))]),
+                ),
+            ])),
+        ])]),
+    )]));
+    distill_bundle::write_bundle(&Bundle {
+        format_version: 1,
+        uuid: BundleUuid([93; 16]),
+        primary: None,
+        schemas: BTreeMap::from([(row.logical_hash, schema)]),
+        assets: BTreeMap::from([(
+            "manifest".to_owned(),
+            AssetEntry {
+                uuid: AssetUuid([94; 16]),
+                type_uuid: row.type_uuid,
+                schema_hash: row.logical_hash,
+                lineage: EntryLineageV1::Bootstrap {
+                    bundle_format_version: 1,
+                },
+                authoring_only: true,
+                data,
+            },
+        )]),
+    })
+    .unwrap()
+}
+
+#[test]
+fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let (first_bytes, _, first_asset) = ordinary_bundle();
+    let (second_bytes, _, second_asset) = ordinary_bundle_with(83, 82, 8);
+    let first_path = temp.path().join("assets/first.bundle");
+    let second_path = temp.path().join("assets/second.bundle");
+    std::fs::create_dir_all(temp.path().join("assets")).unwrap();
+    std::fs::write(&first_path, first_bytes).unwrap();
+    std::fs::write(&second_path, second_bytes).unwrap();
+    let schema_hash = distill_bundle::parse_bundle(&std::fs::read(&first_path).unwrap())
+        .unwrap()
+        .assets["entry"]
+        .schema_hash;
+    std::fs::create_dir_all(temp.path().join("assets/schema")).unwrap();
+    std::fs::write(
+        temp.path().join("assets/schema/schema-lineage.bundle"),
+        lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash),
+    )
+    .unwrap();
+    let coordinator = coordinator(&temp);
+    let startup = coordinator.reconcile_full_scan().unwrap();
+
+    let hub = match coordinator
+        .server()
+        .root()
+        .connect(ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+    {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        outcome => panic!("target connection failed: {outcome:?}"),
+    };
+    let subscription = hub
+        .subscribe(startup.version, vec![first_asset, second_asset], vec![])
+        .success()
+        .unwrap();
+    assert!(matches!(
+        subscription.deltas.next(),
+        Some(StreamEvent::InitialDelta { .. })
+    ));
+
+    let mut edited = distill_bundle::parse_bundle(&std::fs::read(&first_path).unwrap()).unwrap();
+    edited.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
+    std::fs::write(&first_path, distill_bundle::write_bundle(&edited).unwrap()).unwrap();
+    let published = coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![first_path],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(published.version.0, startup.version.0 + 1);
+    assert!(matches!(
+        subscription.deltas.next(),
+        Some(StreamEvent::Delta(Delta { assets, .. }))
+            if assets == vec![(first_asset, distill_rpc::AssetDeltaState::Changed)]
+    ));
 }
 
 fn target() -> TargetDefinition {

@@ -2,8 +2,8 @@
 //!
 //! Direct CRUD is a filesystem publication, never an RPC-only projection:
 //! validate the exact store basis, mutate one canonical bundle, journal the
-//! inode transition, rescan the complete namespace, and return the commit for
-//! that same durable successor version.
+//! inode transition, reobserve only the authored paths, and return the commit
+//! for that same durable successor version.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -26,18 +26,19 @@ use distill_store::journal::{
 };
 use distill_store::Store;
 
-use crate::coordinator::{publish_current_scan, LineageDestination};
+use crate::coordinator::{publish_incremental_paths, LineageDestination};
 use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
     unique_sibling, write_same_dir_temp, LineageRepairBackend, LineageRepairBackendInitError,
 };
 use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::{QuarantineDriver, QuarantineError, QuarantineRoot};
-use crate::scanner::{AssetRoot, RootedScanner, ScanError};
+use crate::scanner::{AssetRoot, RootedScanner, ScanError, ScanSnapshot};
 
 pub struct AuthoringService {
     pub(crate) store: Arc<Mutex<Store>>,
     pub(crate) scanner: RootedScanner,
+    pub(crate) scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     roots: RwLock<Vec<AssetRoot>>,
     quarantine: RwLock<QuarantineDriver>,
     lineage_destination: RwLock<LineageDestination>,
@@ -71,6 +72,7 @@ impl AuthoringService {
         store: Arc<Mutex<Store>>,
         roots: Vec<AssetRoot>,
         lineage_destination: LineageDestination,
+        scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     ) -> Result<Self, AuthoringServiceInitError> {
         let scanner = RootedScanner::new(roots.clone())?;
         let quarantine = QuarantineDriver::new(
@@ -82,6 +84,7 @@ impl AuthoringService {
         Ok(Self {
             store,
             scanner,
+            scan_snapshot,
             roots: RwLock::new(roots),
             quarantine: RwLock::new(quarantine),
             lineage_destination: RwLock::new(lineage_destination),
@@ -338,8 +341,10 @@ impl AuthoringService {
         drop(publication);
         drop(store);
 
-        publish_current_scan(
+        publish_incremental_paths(
             &self.scanner,
+            &self.scan_snapshot,
+            std::slice::from_ref(&target),
             &self.lineage_destination_snapshot(),
             &self.store,
             base,

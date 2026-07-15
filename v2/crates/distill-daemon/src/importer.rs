@@ -6,7 +6,7 @@
 //! journaled publication.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use distill_build::import::{
     fold_import, DirectoryOrigin, FileDep, FoldRequest, IdentitySource, ImportBackend,
@@ -39,7 +39,7 @@ use distill_store::Store;
 use globset::Glob;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
-use crate::scanner::{RootedScanner, ScanError, ScannedFileKind};
+use crate::scanner::{RootedScanner, ScanError, ScanSnapshot, ScannedFileKind};
 
 pub trait AuthoringImporter: Send + Sync {
     fn id(&self) -> &str;
@@ -187,6 +187,23 @@ impl AuthoringService {
     /// reproduces under the current rooted filesystem and importer-capability
     /// projection. The caller reruns these under the single-writer RPC CAS.
     pub fn watched_imports_needing_reimport(&self) -> Result<Vec<BundleUuid>, RpcFailure> {
+        self.watched_imports_needing_reimport_inner(None)
+    }
+
+    /// Incremental watcher variant: read sets that cannot observe any dirty
+    /// logical path are left untouched, so an unrelated event never reopens or
+    /// rehashes their source files.
+    pub(crate) fn watched_imports_affected_by(
+        &self,
+        dirty: &[distill_store::files::DirtyEntry],
+    ) -> Result<Vec<BundleUuid>, RpcFailure> {
+        self.watched_imports_needing_reimport_inner(Some(dirty))
+    }
+
+    fn watched_imports_needing_reimport_inner(
+        &self,
+        dirty: Option<&[distill_store::files::DirtyEntry]>,
+    ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let store = self
             .store
             .lock()
@@ -194,14 +211,15 @@ impl AuthoringService {
         let capabilities = self.importer_capabilities()?;
         let mut pending = Vec::new();
         for meta in store.all_bundles().map_err(invalid)? {
-            let prior = match self.read_prior_import(&store, &meta) {
+            let prior = match self.read_prior_import_cached(&store, &meta) {
                 Ok(prior) => prior,
                 Err(_) => continue,
             };
             if !prior.model.record.watch {
                 continue;
             }
-            let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+            let mut backend =
+                RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
             let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
                 Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                     continue;
@@ -209,6 +227,9 @@ impl AuthoringService {
                 Some(failure) => decode_attempt_basis(&failure.basis)?,
                 None => prior.model.record.read_set.clone(),
             };
+            if dirty.is_some_and(|dirty| !read_set_intersects_dirty(&basis, dirty)) {
+                continue;
+            }
             if !revalidate_read_set(&basis, &mut backend) {
                 pending.push(meta.bundle);
             }
@@ -224,29 +245,15 @@ impl AuthoringService {
             .lock()
             .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
         let capabilities = self.importer_capabilities()?;
-        let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
         let mut all_rule_ids = BTreeMap::<[u8; 16], BundleUuid>::new();
         let mut active_origins = BTreeSet::<StoredDirectoryOrigin>::new();
         let mut tasks = Vec::new();
         let bundles = store.all_bundles().map_err(invalid)?;
 
         for meta in &bundles {
-            let root = store
-                .root_name(meta.root)
-                .map_err(invalid)?
-                .ok_or_else(|| invalid("bundle root identity is missing"))?;
-            let path = self
-                .scanner
-                .physical_path(&root, &meta.path)
-                .map_err(invalid)?;
-            let bytes = self.scanner.read_identity_checked(&path).map_err(invalid)?;
-            if ContentHash(*blake3::hash(&bytes).as_bytes()) != meta.content_hash {
-                return Err(invalid(format!(
-                    "directory-rules bundle {} changed since the durable version",
-                    meta.path
-                )));
-            }
-            let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+            let bundle = self.cached_bundle(&store, meta)?;
             for entry in bundle
                 .assets
                 .values()
@@ -339,7 +346,8 @@ impl AuthoringService {
         active_origins: &BTreeSet<StoredDirectoryOrigin>,
         capabilities: &BTreeMap<String, [u8; 32]>,
     ) -> Result<(), RpcFailure> {
-        let mut backend = RootedImportBackend::new(&self.scanner, capabilities);
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
         for meta in bundles {
             let Some(origin) = &meta.origin else {
                 continue;
@@ -347,7 +355,7 @@ impl AuthoringService {
             if active_origins.contains(origin) {
                 continue;
             }
-            let prior = self.read_prior_import(store, meta)?;
+            let prior = self.read_prior_import_cached(store, meta)?;
             let current_basis = prior
                 .model
                 .record
@@ -468,7 +476,7 @@ impl AuthoringService {
         let Some(meta) = destination.meta else {
             return Ok(true);
         };
-        let prior = self.read_prior_import(store, &meta)?;
+        let prior = self.read_prior_import_cached(store, &meta)?;
         let expected_origin = DirectoryOrigin {
             rules_bundle: task.rules_bundle,
             rule: task.rule.clone(),
@@ -487,7 +495,8 @@ impl AuthoringService {
         {
             return Ok(true);
         }
-        let mut backend = RootedImportBackend::new(&self.scanner, capabilities);
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
             Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                 return Ok(true);
@@ -527,7 +536,8 @@ impl AuthoringService {
         drop(store);
 
         let capabilities = self.importer_capabilities()?;
-        let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
         self.execute_import(
             base,
@@ -701,7 +711,8 @@ impl AuthoringService {
         let capabilities = self
             .importer_capabilities()
             .map_err(ImportExecutionError::unmemoized)?;
-        let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
         let mut context = ImportContext::new(&importer.id, sources.clone(), &mut backend)
             .map_err(invalid)
             .map_err(ImportExecutionError::unmemoized)?;
@@ -833,7 +844,8 @@ impl AuthoringService {
         let capabilities = self
             .importer_capabilities()
             .map_err(ImportExecutionError::unmemoized)?;
-        let mut recheck = RootedImportBackend::new(&self.scanner, &capabilities);
+        let mut recheck =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
         if !revalidate_read_set(&read_set, &mut recheck) {
             return Err(ImportExecutionError::unmemoized(invalid(
                 "import read-set changed before publication; the result was discarded",
@@ -918,7 +930,8 @@ impl AuthoringService {
         };
         let basis = encode_attempt_basis(read_set)?;
         let capabilities = self.importer_capabilities()?;
-        let mut backend = RootedImportBackend::new(&self.scanner, &capabilities);
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
         if !revalidate_read_set(read_set, &mut backend) {
             return Ok(false);
         }
@@ -1087,6 +1100,37 @@ impl AuthoringService {
         })
     }
 
+    fn cached_bundle(&self, store: &Store, meta: &BundleMeta) -> Result<Bundle, RpcFailure> {
+        let root = store
+            .root_name(meta.root)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("bundle root identity is missing"))?;
+        let snapshot = self
+            .scan_snapshot
+            .lock()
+            .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
+        let source = snapshot
+            .bundles
+            .iter()
+            .find(|source| source.root_name == root && source.normalized_path == meta.path)
+            .ok_or_else(|| invalid("durable bundle is missing from the published scan snapshot"))?;
+        if ContentHash(source.file_hash.0) != meta.content_hash {
+            return Err(invalid(
+                "published scan snapshot does not match durable bundle metadata",
+            ));
+        }
+        source.parsed.clone().map_err(invalid)
+    }
+
+    fn read_prior_import_cached(
+        &self,
+        store: &Store,
+        meta: &BundleMeta,
+    ) -> Result<PriorImport, RpcFailure> {
+        let bundle = self.cached_bundle(store, meta)?;
+        decode_prior_import(bundle)
+    }
+
     fn read_prior_import(
         &self,
         store: &Store,
@@ -1108,45 +1152,66 @@ impl AuthoringService {
             return Err(invalid("import destination changed since the durable base"));
         }
         let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
-        let settings = bundle
-            .assets
-            .get("$settings")
-            .ok_or_else(|| invalid("existing import bundle has no $settings entry"))?;
-        let record = bundle
-            .assets
-            .get("$record")
-            .ok_or_else(|| invalid("existing destination is not an imported bundle"))?;
-        if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
-            return Err(invalid("existing $record entry has the wrong type or role"));
-        }
-        let record = decode_import_record(&record.data)?;
-        let entries = bundle
-            .assets
-            .iter()
-            .filter(|(local_id, _)| !local_id.starts_with('$'))
-            .map(|(local_id, entry)| {
-                (
-                    local_id.clone(),
-                    ImportedEntry {
-                        uuid: entry.uuid,
-                        type_uuid: entry.type_uuid,
-                        value: entry.data.clone(),
-                    },
-                )
-            })
-            .collect();
-        Ok(PriorImport {
-            model: ImportedBundle {
-                bundle_uuid: bundle.uuid,
-                primary: bundle.primary.clone(),
-                entries,
-                settings: settings.data.clone(),
-                record,
-            },
-            settings_type_uuid: settings.type_uuid,
-            bundle,
-        })
+        decode_prior_import(bundle)
     }
+}
+
+fn decode_prior_import(bundle: Bundle) -> Result<PriorImport, RpcFailure> {
+    let settings = bundle
+        .assets
+        .get("$settings")
+        .ok_or_else(|| invalid("existing import bundle has no $settings entry"))?;
+    let record = bundle
+        .assets
+        .get("$record")
+        .ok_or_else(|| invalid("existing destination is not an imported bundle"))?;
+    if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
+        return Err(invalid("existing $record entry has the wrong type or role"));
+    }
+    let record = decode_import_record(&record.data)?;
+    let entries = bundle
+        .assets
+        .iter()
+        .filter(|(local_id, _)| !local_id.starts_with('$'))
+        .map(|(local_id, entry)| {
+            (
+                local_id.clone(),
+                ImportedEntry {
+                    uuid: entry.uuid,
+                    type_uuid: entry.type_uuid,
+                    value: entry.data.clone(),
+                },
+            )
+        })
+        .collect();
+    let settings_type_uuid = settings.type_uuid;
+    let settings = settings.data.clone();
+    Ok(PriorImport {
+        model: ImportedBundle {
+            bundle_uuid: bundle.uuid,
+            primary: bundle.primary.clone(),
+            entries,
+            settings,
+            record,
+        },
+        settings_type_uuid,
+        bundle,
+    })
+}
+
+fn read_set_intersects_dirty(
+    read_set: &[FileDep],
+    dirty: &[distill_store::files::DirtyEntry],
+) -> bool {
+    read_set.iter().any(|dependency| match dependency {
+        FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
+            dirty.iter().any(|entry| entry.path == *path)
+        }
+        FileDep::Listing { query, .. } => {
+            dirty.iter().any(|entry| query_matches(query, &entry.path))
+        }
+        FileDep::Capability { .. } => false,
+    })
 }
 
 struct TracedImportContext<'a, 'b> {
@@ -1177,25 +1242,34 @@ impl AuthoringImportContext for TracedImportContext<'_, '_> {
 
 struct RootedImportBackend<'a> {
     scanner: &'a RootedScanner,
+    rows: ScanSnapshot,
     capabilities: &'a BTreeMap<String, [u8; 32]>,
 }
 
 impl<'a> RootedImportBackend<'a> {
-    fn new(scanner: &'a RootedScanner, capabilities: &'a BTreeMap<String, [u8; 32]>) -> Self {
+    fn new(
+        scanner: &'a RootedScanner,
+        snapshot: &Mutex<ScanSnapshot>,
+        capabilities: &'a BTreeMap<String, [u8; 32]>,
+    ) -> Self {
         Self {
             scanner,
+            rows: snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             capabilities,
         }
     }
 
-    fn rows(&self) -> Result<crate::scanner::ScanSnapshot, RawFileFailureClass> {
-        self.scanner.scan().map_err(scan_failure)
+    fn rows(&self) -> &ScanSnapshot {
+        &self.rows
     }
 }
 
 impl ImportBackend for RootedImportBackend<'_> {
     fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass> {
-        let rows = self.rows()?;
+        let rows = self.rows();
         let matches = rows
             .files
             .iter()
@@ -1223,7 +1297,7 @@ impl ImportBackend for RootedImportBackend<'_> {
     }
 
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass> {
-        let rows = self.rows()?;
+        let rows = self.rows();
         let roots = rows
             .files
             .iter()
@@ -1246,9 +1320,9 @@ impl ImportBackend for RootedImportBackend<'_> {
             .map(|glob| Glob::new(glob).map(|glob| glob.compile_matcher()))
             .transpose()
             .map_err(|_| RawFileFailureClass::OtherStable)?;
-        let rows = self.rows()?;
+        let rows = self.rows();
         let mut results = Vec::new();
-        for file in rows.files {
+        for file in &rows.files {
             if !matches!(file.kind, ScannedFileKind::File | ScannedFileKind::Symlink) {
                 continue;
             }

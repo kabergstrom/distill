@@ -86,6 +86,21 @@ pub struct RenameEvent {
     pub to_path: String,
 }
 
+/// One stable snapshot of unacknowledged watcher work. A consumer may do
+/// fallible work without holding the store mutex, then acknowledge exactly
+/// this sequence prefix; rows appended meanwhile remain pending.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingFileWork {
+    pub dirty: Vec<DirtyEntry>,
+    pub renames: Vec<RenameEvent>,
+}
+
+impl PendingFileWork {
+    pub fn is_empty(&self) -> bool {
+        self.dirty.is_empty() && self.renames.is_empty()
+    }
+}
+
 impl InputTxn<'_> {
     /// Intern a root name to its process-local id, creating it if new.
     pub fn intern_root(&mut self, name: &str) -> Result<RootId, StoreError> {
@@ -210,6 +225,60 @@ impl InputTxn<'_> {
 }
 
 impl Store {
+    /// Snapshot all pending watcher work without consuming it. Downstream
+    /// processing can fail or race a later publication without losing rows.
+    pub fn pending_file_work(&self) -> Result<PendingFileWork, StoreError> {
+        let mut dirty = Vec::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT seq, root_id, path, exists_flag FROM dirty_files ORDER BY seq ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(DirtyEntry {
+                    seq: row.get(0)?,
+                    root: RootId(row.get(1)?),
+                    path: row.get(2)?,
+                    exists: row.get::<_, i64>(3)? != 0,
+                })
+            })?;
+            for row in rows {
+                dirty.push(row?);
+            }
+        }
+        let mut renames = Vec::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT seq, root_id, from_path, to_path FROM rename_events ORDER BY seq ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(RenameEvent {
+                    seq: row.get(0)?,
+                    root: RootId(row.get(1)?),
+                    from_path: row.get(2)?,
+                    to_path: row.get(3)?,
+                })
+            })?;
+            for row in rows {
+                renames.push(row?);
+            }
+        }
+        Ok(PendingFileWork { dirty, renames })
+    }
+
+    /// Acknowledge only the captured sequence prefixes, without advancing the
+    /// input version. New rows appended after `work` was observed survive.
+    pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<(), StoreError> {
+        let transaction = self.conn.transaction()?;
+        if let Some(last) = work.dirty.last() {
+            transaction.execute("DELETE FROM dirty_files WHERE seq <= ?1", [last.seq])?;
+        }
+        if let Some(last) = work.renames.last() {
+            transaction.execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Complete deterministic raw-tree projection used by startup
     /// reconciliation. Root ids remain process-local; callers cross the
     /// persistence boundary through [`Store::root_name`].

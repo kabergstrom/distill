@@ -1,22 +1,64 @@
-//! Sticky watcher invalidation for complete namespace rescans.
+//! Lossless native watcher batching for incremental reconciliation.
 //!
-//! The platform watcher is armed before startup traversal. Any event arriving
-//! during a scan leaves the queue dirty, forcing another fully armed scan after
-//! the current transaction commits. Paths are deliberately not queued because
-//! the coordinator never trusts or consumes a partial path set.
+//! Native paths are invalidation addresses, never namespace authority. The
+//! coordinator reopens every affected path through `RootedScanner`. Events
+//! arriving during startup remain owned by that scan until it commits; only a
+//! native overflow or incomplete event discards the batch and requests a full
+//! recovery scan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::scanner::{RootedScanner, ScanError, ScannedFile, ScannedFileKind};
+use notify::event::{ModifyKind, RenameMode};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-#[derive(Default)]
+use crate::scanner::RootedScanner;
+
+const DEFAULT_CAPACITY: usize = 65_536;
+const ROOT_RECONFIGURE_POLL: Duration = Duration::from_millis(40);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherRename {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatcherBatch {
+    pub paths: Vec<PathBuf>,
+    pub renames: Vec<WatcherRename>,
+}
+
+impl WatcherBatch {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.renames.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatcherAction {
+    None,
+    Batch(WatcherBatch),
+    FullRescan,
+}
+
 pub struct WatcherQueue {
+    capacity: usize,
     scanning: bool,
-    dirty: bool,
+    overflowed: bool,
+    paths: BTreeSet<PathBuf>,
+    renames: Vec<WatcherRename>,
+    rename_from: BTreeMap<usize, PathBuf>,
+}
+
+impl Default for WatcherQueue {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
 }
 
 impl WatcherQueue {
@@ -24,132 +66,161 @@ impl WatcherQueue {
         Self::default()
     }
 
-    /// Begin a scan without clearing an invalidation already observed by the
-    /// armed watcher.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            scanning: false,
+            overflowed: false,
+            paths: BTreeSet::new(),
+            renames: Vec::new(),
+            rename_from: BTreeMap::new(),
+        }
+    }
+
+    /// Begin startup/recovery traversal without clearing events already seen
+    /// by the synchronously armed native watcher.
     pub fn arm_scan(&mut self) {
         assert!(!self.scanning, "watcher scan already armed");
         self.scanning = true;
     }
 
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Finish the current scan and consume whether another scan is required.
-    pub fn finish_scan(&mut self) -> bool {
+    /// Finish a startup/recovery traversal. The live loop cannot consume this
+    /// batch while `scanning` is true.
+    pub fn finish_scan(&mut self) -> WatcherAction {
         assert!(self.scanning, "no watcher scan armed");
         self.scanning = false;
-        std::mem::take(&mut self.dirty)
+        self.take_action()
     }
 
-    /// Consume one debounced live invalidation. A scan in flight owns the bit
-    /// until `finish_scan` so no event can be lost between traversal and commit.
-    pub fn take_live_dirty(&mut self) -> bool {
+    pub fn take_live_action(&mut self) -> WatcherAction {
         if self.scanning {
-            return false;
-        }
-        std::mem::take(&mut self.dirty)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ObservedPath {
-    kind: ScannedFileKind,
-    modified_nanos: i64,
-    size: u64,
-    content_hash: Option<distill_core::id::ContentHash>,
-}
-
-impl From<&ScannedFile> for ObservedPath {
-    fn from(file: &ScannedFile) -> Self {
-        Self {
-            kind: file.kind,
-            modified_nanos: file.modified_nanos,
-            size: file.size,
-            content_hash: file.content_hash,
+            WatcherAction::None
+        } else {
+            self.take_action()
         }
     }
-}
 
-/// Portable watcher backend used by the daemon process. It observes the same
-/// identity-checked namespace as startup reconciliation, so polling is a
-/// correctness-preserving platform fallback rather than a second path parser.
-/// Native watcher adapters may feed the same [`WatcherQueue`].
-pub struct PollingWatchSource {
-    scanner: RootedScanner,
-    scanner_revision: u64,
-    observed: BTreeMap<(String, String), ObservedPath>,
-    last_failure: Option<String>,
-}
-
-impl PollingWatchSource {
-    /// The initial observation is synchronous: when this returns, the source
-    /// is armed. A caller can therefore start it before `reconcile_startup`
-    /// without a watcher-activation gap.
-    pub fn arm(scanner: RootedScanner) -> Result<Self, ScanError> {
-        let observed = observe(&scanner)?;
-        Ok(Self {
-            scanner_revision: scanner.revision(),
-            scanner,
-            observed,
-            last_failure: None,
-        })
+    /// Native overflow, an event without usable paths, or incomplete watcher
+    /// reconfiguration invalidates the whole event union.
+    pub fn force_rescan(&mut self) {
+        self.paths.clear();
+        self.renames.clear();
+        self.rename_from.clear();
+        self.overflowed = true;
     }
 
-    pub fn poll_once(&mut self, queue: &Mutex<WatcherQueue>) -> Result<usize, ScanError> {
-        let revision = self.scanner.revision();
-        if revision != self.scanner_revision {
-            self.observed = observe(&self.scanner)?;
-            self.scanner_revision = revision;
-            self.last_failure = None;
-            return Ok(0);
-        }
-        let current = match observe(&self.scanner) {
-            Ok(current) => current,
-            Err(error) => {
-                let detail = error.to_string();
-                if self.last_failure.as_ref() != Some(&detail) {
-                    lock_queue(queue).mark_dirty();
-                    self.last_failure = Some(detail);
+    pub fn requeue_action(&mut self, action: WatcherAction) {
+        match action {
+            WatcherAction::None => {}
+            WatcherAction::FullRescan => self.force_rescan(),
+            WatcherAction::Batch(batch) => {
+                self.paths.extend(batch.paths);
+                for rename in batch.renames {
+                    self.push_rename(rename.from, rename.to);
                 }
-                return Err(error);
+                self.check_capacity();
             }
-        };
-        let healed = self.last_failure.take().is_some();
-        let updated = current
-            .iter()
-            .filter(|(path, state)| self.observed.get(*path) != Some(*state))
-            .count();
-        let deleted = self
-            .observed
-            .keys()
-            .filter(|path| !current.contains_key(*path))
-            .count();
-        let count = updated + deleted;
-        if healed || count != 0 {
-            lock_queue(queue).mark_dirty();
         }
-        self.observed = current;
-        Ok(count)
+    }
+
+    /// Testable native-event ingestion. Access-only events are ignored;
+    /// imprecise mutation events without a path become recovery scans.
+    pub fn push_native(&mut self, event: Event) {
+        if event.need_rescan() {
+            self.force_rescan();
+            return;
+        }
+        if matches!(event.kind, EventKind::Access(_)) {
+            return;
+        }
+        if event.paths.is_empty() {
+            self.force_rescan();
+            return;
+        }
+
+        let tracker = event.tracker();
+        match event.kind {
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
+                self.push_rename(event.paths[0].clone(), event.paths[1].clone());
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                if let (Some(tracker), Some(path)) = (tracker, event.paths.first()) {
+                    self.rename_from.insert(tracker, path.clone());
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                if let (Some(tracker), Some(to)) = (tracker, event.paths.first()) {
+                    if let Some(from) = self.rename_from.remove(&tracker) {
+                        self.push_rename(from, to.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        for path in event.paths {
+            self.paths.insert(path);
+        }
+        self.check_capacity();
+    }
+
+    fn push_rename(&mut self, from: PathBuf, to: PathBuf) {
+        self.paths.insert(from.clone());
+        self.paths.insert(to.clone());
+        self.renames.push(WatcherRename { from, to });
+    }
+
+    fn check_capacity(&mut self) {
+        let retained = self.paths.len() + self.renames.len() + self.rename_from.len();
+        if retained > self.capacity {
+            self.force_rescan();
+        }
+    }
+
+    fn take_action(&mut self) -> WatcherAction {
+        if std::mem::take(&mut self.overflowed) {
+            self.paths.clear();
+            self.renames.clear();
+            self.rename_from.clear();
+            return WatcherAction::FullRescan;
+        }
+        let batch = WatcherBatch {
+            paths: std::mem::take(&mut self.paths).into_iter().collect(),
+            renames: std::mem::take(&mut self.renames),
+        };
+        self.rename_from.clear();
+        if batch.is_empty() {
+            WatcherAction::None
+        } else {
+            WatcherAction::Batch(batch)
+        }
     }
 }
 
-fn observe(scanner: &RootedScanner) -> Result<BTreeMap<(String, String), ObservedPath>, ScanError> {
-    Ok(scanner
-        .scan()?
-        .files
-        .into_iter()
-        .map(|file| {
-            (
-                (file.root_name.clone(), file.normalized_path.clone()),
-                ObservedPath::from(&file),
-            )
-        })
-        .collect())
+#[derive(Debug)]
+pub enum WatcherStartError {
+    Notify(notify::Error),
+    Thread(std::io::Error),
 }
 
-/// Owned watcher thread. Dropping it requests shutdown and joins the thread,
-/// so no observer can outlive the coordinator state it feeds.
+impl std::fmt::Display for WatcherStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Notify(error) => write!(formatter, "native watcher: {error}"),
+            Self::Thread(error) => write!(formatter, "native watcher thread: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WatcherStartError {}
+
+impl From<notify::Error> for WatcherStartError {
+    fn from(error: notify::Error) -> Self {
+        Self::Notify(error)
+    }
+}
+
+/// Owns the native watcher and its root-reconfiguration monitor. Initial roots
+/// are registered synchronously before `start` returns.
 pub struct WatcherThread {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -159,20 +230,55 @@ impl WatcherThread {
     pub fn start(
         scanner: RootedScanner,
         queue: Arc<Mutex<WatcherQueue>>,
-        debounce: Duration,
-    ) -> Result<Self, ScanError> {
-        let mut source = PollingWatchSource::arm(scanner)?;
+    ) -> Result<Self, WatcherStartError> {
+        let callback_queue = Arc::clone(&queue);
+        let mut watcher = RecommendedWatcher::new(
+            move |result: notify::Result<Event>| match result {
+                Ok(event) => lock_queue(&callback_queue).push_native(event),
+                Err(_) => lock_queue(&callback_queue).force_rescan(),
+            },
+            Config::default().with_follow_symlinks(false),
+        )?;
+        let mut watched = scanner.watch_roots().into_iter().collect::<BTreeSet<_>>();
+        for root in &watched {
+            watcher.watch(root, RecursiveMode::Recursive)?;
+        }
+        let mut revision = scanner.revision();
+
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("distill-watcher".to_owned())
             .spawn(move || {
+                let mut watcher = watcher;
                 while !thread_stop.load(Ordering::Acquire) {
-                    thread::sleep(debounce);
-                    let _ = source.poll_once(&queue);
+                    thread::sleep(ROOT_RECONFIGURE_POLL);
+                    let next_revision = scanner.revision();
+                    if next_revision == revision {
+                        continue;
+                    }
+                    let next = scanner.watch_roots().into_iter().collect::<BTreeSet<_>>();
+                    let mut complete = true;
+                    for root in next.difference(&watched) {
+                        if watcher.watch(root, RecursiveMode::Recursive).is_err() {
+                            complete = false;
+                        }
+                    }
+                    if !complete {
+                        lock_queue(&queue).force_rescan();
+                        continue;
+                    }
+                    for root in watched.difference(&next) {
+                        let _ = watcher.unwatch(root);
+                    }
+                    watched = next;
+                    revision = next_revision;
+                    // The candidate scan preceded watcher reconfiguration.
+                    // Force one armed catch-up scan to cover that bounded gap.
+                    lock_queue(&queue).force_rescan();
                 }
             })
-            .expect("failed to start distill watcher thread");
+            .map_err(WatcherStartError::Thread)?;
         Ok(Self {
             stop,
             thread: Some(thread),
