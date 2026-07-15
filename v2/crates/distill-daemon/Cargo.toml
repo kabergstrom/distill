@@ -19,6 +19,7 @@ distill-wire = { path = "../distill-wire" }
 globset = { workspace = true }
 libc = { workspace = true }
 ngp-module-host = { path = "../../../../newgameplus/ngp-module-host" }
+rayon = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.2"
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }

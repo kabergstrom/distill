@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock};
+
+use rayon::ThreadPool;
 
 use distill_build::pipeline::Target;
 use distill_bundle::{AssetEntry, Bundle};
@@ -86,13 +88,8 @@ pub struct DaemonCoordinator {
 
 struct OperationalRuntime {
     scheduler: Scheduler,
+    worker_pool: Arc<ThreadPool>,
     next_job_id: u64,
-}
-
-#[cfg(test)]
-struct ScheduledJobGuard<'a> {
-    coordinator: &'a DaemonCoordinator,
-    id: u64,
 }
 
 /// One admitted worker slot that can be released around a blocking join and
@@ -109,7 +106,10 @@ impl CooperativeJob {
         self.id
     }
 
-    pub(crate) fn park<R>(&self, wait: impl FnOnce() -> R) -> R {
+    pub(crate) fn park<R>(&self, wait: impl FnOnce() -> R + Send + 'static) -> R
+    where
+        R: Send + 'static,
+    {
         assert!(
             self.active.swap(false, Ordering::AcqRel),
             "a cooperative scheduler job can only park while active"
@@ -128,7 +128,31 @@ impl CooperativeJob {
             self.coordinator.operational_wake.notify_all();
         }
 
-        let result = wait();
+        // The join itself blocks on a lightweight waiter thread. This Rayon
+        // worker keeps stealing admitted jobs while the dependency owner
+        // runs, so releasing the logical slot also releases physical build
+        // capacity instead of merely changing a counter around a parked OS
+        // worker.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name(format!("distill-build-wait-{}", self.id))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wait));
+                let _ = sender.send(outcome);
+            })
+            .expect("create cooperative build waiter");
+        let result = loop {
+            match receiver.try_recv() {
+                Ok(Ok(result)) => break result,
+                Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("cooperative build waiter stopped without a result")
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    let _ = rayon::yield_now();
+                }
+            }
+        };
 
         let mut operational = self
             .coordinator
@@ -167,23 +191,6 @@ impl Drop for CooperativeJob {
             .scheduler
             .complete(self.id)
             .expect("admitted cooperative job remains active until its final handle drops");
-        operational.scheduler.admit();
-        self.coordinator.operational_wake.notify_all();
-    }
-}
-
-#[cfg(test)]
-impl Drop for ScheduledJobGuard<'_> {
-    fn drop(&mut self) {
-        let mut operational = self
-            .coordinator
-            .operational
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        operational
-            .scheduler
-            .complete(self.id)
-            .expect("admitted build remains active until its guard drops");
         operational.scheduler.admit();
         self.coordinator.operational_wake.notify_all();
     }
@@ -248,13 +255,16 @@ impl DaemonCoordinator {
             loader: DynamicPipelineModuleLoader,
             pending: None,
         };
+        let scheduler_config = SchedulerConfig {
+            parallelism: store_config.parallelism,
+            batch_reserved_workers: store_config.batch_reserved_workers,
+            max_dependency_depth,
+        };
         let operational = OperationalRuntime {
-            scheduler: Scheduler::new(SchedulerConfig {
-                parallelism: store_config.parallelism,
-                batch_reserved_workers: store_config.batch_reserved_workers,
-                max_dependency_depth,
-            })
-            .map_err(|error| CoordinatorInitError::Operational(error.to_string()))?,
+            scheduler: Scheduler::new(scheduler_config)
+                .map_err(|error| CoordinatorInitError::Operational(error.to_string()))?,
+            worker_pool: build_worker_pool(scheduler_config.parallelism)
+                .map_err(CoordinatorInitError::Operational)?,
             next_job_id: 1,
         };
         Ok(Self {
@@ -380,43 +390,14 @@ impl DaemonCoordinator {
             .config()
     }
 
-    #[cfg(test)]
-    pub(crate) fn run_scheduled<R>(&self, class: WorkClass, run: impl FnOnce() -> R) -> R {
-        let mut operational = self
-            .operational
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let id = operational.next_job_id;
-        operational.next_job_id = operational
-            .next_job_id
-            .checked_add(1)
-            .expect("scheduler job identity exhausted");
-        operational
-            .scheduler
-            .try_enqueue(id, class)
-            .expect("fresh scheduler job identity is unique");
-        operational.scheduler.admit();
-        self.operational_wake.notify_all();
-        while !operational.scheduler.is_active(id) {
-            operational = self
-                .operational_wake
-                .wait(operational)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        drop(operational);
-
-        let _guard = ScheduledJobGuard {
-            coordinator: self,
-            id,
-        };
-        run()
-    }
-
     pub(crate) fn run_scheduled_cooperative<R>(
         self: &Arc<Self>,
         class: WorkClass,
-        run: impl FnOnce(Arc<CooperativeJob>) -> R,
-    ) -> R {
+        run: impl FnOnce(Arc<CooperativeJob>) -> R + Send + 'static,
+    ) -> R
+    where
+        R: Send + 'static,
+    {
         let mut operational = self
             .operational
             .lock()
@@ -438,15 +419,26 @@ impl DaemonCoordinator {
                 .wait(operational)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        let worker_pool = Arc::clone(&operational.worker_pool);
         drop(operational);
 
-        let job = Arc::new(CooperativeJob {
-            coordinator: Arc::clone(self),
-            id,
-            class,
-            active: AtomicBool::new(true),
+        let coordinator = Arc::clone(self);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        worker_pool.spawn_fifo(move || {
+            let job = Arc::new(CooperativeJob {
+                coordinator,
+                id,
+                class,
+                active: AtomicBool::new(true),
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job)));
+            let _ = sender.send(outcome);
         });
-        run(job)
+        match receiver.recv() {
+            Ok(Ok(result)) => result,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("distill build worker stopped before returning job {id}"),
+        }
     }
 
     pub fn apply_operational_configuration(
@@ -462,6 +454,16 @@ impl DaemonCoordinator {
         scheduler
             .validate()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let replacement_pool = {
+            let operational = self
+                .operational
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (operational.scheduler.config().parallelism != scheduler.parallelism)
+                .then(|| build_worker_pool(scheduler.parallelism))
+                .transpose()
+                .map_err(CoordinatorError::InvalidManifest)?
+        };
         lock_store(&self.store)
             .apply_operational_config(store_config)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
@@ -473,6 +475,9 @@ impl DaemonCoordinator {
             .scheduler
             .reconfigure(scheduler)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        if let Some(worker_pool) = replacement_pool {
+            operational.worker_pool = worker_pool;
+        }
         operational.scheduler.admit();
         self.operational_wake.notify_all();
         Ok(())
@@ -2200,6 +2205,15 @@ fn lock_pipeline(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn build_worker_pool(parallelism: usize) -> Result<Arc<ThreadPool>, String> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(parallelism)
+        .thread_name(|index| format!("distill-build-{index}"))
+        .build()
+        .map(Arc::new)
+        .map_err(|error| format!("create {parallelism}-thread build pool: {error}"))
+}
+
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
@@ -2237,7 +2251,10 @@ mod scheduler_tests {
         let first = {
             let coordinator = Arc::clone(&coordinator);
             thread::spawn(move || {
-                coordinator.run_scheduled(WorkClass::Interactive, || {
+                coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |_| {
+                    assert!(thread::current()
+                        .name()
+                        .is_some_and(|name| name.starts_with("distill-build-")));
                     first_entered_tx.send(()).unwrap();
                     release_first_rx.recv().unwrap();
                 });
@@ -2249,7 +2266,10 @@ mod scheduler_tests {
         let second = {
             let coordinator = Arc::clone(&coordinator);
             thread::spawn(move || {
-                coordinator.run_scheduled(WorkClass::Interactive, || {
+                coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |_| {
+                    assert!(thread::current()
+                        .name()
+                        .is_some_and(|name| name.starts_with("distill-build-")));
                     second_entered_tx.send(()).unwrap();
                 });
             })
@@ -2296,8 +2316,8 @@ mod scheduler_tests {
         let first = {
             let coordinator = Arc::clone(&coordinator);
             thread::spawn(move || {
-                coordinator.run_scheduled_cooperative(WorkClass::Interactive, |job| {
-                    job.park(|| {
+                coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |job| {
+                    job.park(move || {
                         parked_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                     });
@@ -2311,7 +2331,7 @@ mod scheduler_tests {
         let second = {
             let coordinator = Arc::clone(&coordinator);
             thread::spawn(move || {
-                coordinator.run_scheduled(WorkClass::Interactive, || {
+                coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |_| {
                     second_tx.send(()).unwrap();
                 });
             })
@@ -2323,6 +2343,66 @@ mod scheduler_tests {
         resumed_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("the parked job reacquired a worker slot");
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn operational_resize_replaces_the_live_worker_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let assets = temp.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        let mut config = StoreConfig::new(temp.path().join("state"));
+        config.parallelism = 1;
+        config.batch_reserved_workers = 1;
+        let coordinator = Arc::new(
+            DaemonCoordinator::open(
+                config.clone(),
+                vec![AssetRoot::new(
+                    "main",
+                    &assets,
+                    assets.join(".distill-displaced"),
+                )],
+                LineageDestination {
+                    root: "main".to_owned(),
+                    path: "schema/lineage.bundle".to_owned(),
+                },
+                Vec::new(),
+                8,
+            )
+            .unwrap(),
+        );
+        config.parallelism = 2;
+        coordinator
+            .apply_operational_configuration(&config, 8)
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let (release_second_tx, release_second_rx) = mpsc::sync_channel(1);
+        let first = {
+            let coordinator = Arc::clone(&coordinator);
+            let entered_tx = entered_tx.clone();
+            thread::spawn(move || {
+                coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                });
+            })
+        };
+        let second = {
+            let coordinator = Arc::clone(&coordinator);
+            thread::spawn(move || {
+                coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_second_rx.recv().unwrap();
+                });
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_first_tx.send(()).unwrap();
+        release_second_tx.send(()).unwrap();
         first.join().unwrap();
         second.join().unwrap();
     }

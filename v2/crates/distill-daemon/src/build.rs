@@ -118,9 +118,11 @@ impl BuildBackend for CoordinatorBuildBackend {
             BuildWorkClass::Interactive => WorkClass::Interactive,
             BuildWorkClass::Batch => WorkClass::Batch,
         };
-        let (result, poison) = coordinator.run_scheduled_cooperative(class, |job| {
-            let result = build_with_runtime(&coordinator, request, flights, job);
-            let poison = coordinator.sync_runtime_pipeline_poison();
+        let request = request.clone();
+        let job_coordinator = Arc::clone(&coordinator);
+        let (result, poison) = coordinator.run_scheduled_cooperative(class, move |job| {
+            let result = build_with_runtime(&job_coordinator, &request, flights, job);
+            let poison = job_coordinator.sync_runtime_pipeline_poison();
             (result, poison)
         });
         match poison {
@@ -421,7 +423,8 @@ struct StageFlightWait {
 
 impl StageFlightWait {
     fn wait(self, job: &CooperativeJob) -> SharedStageOutcome {
-        let outcome = job.park(|| self.flight.wait());
+        let flight = Arc::clone(&self.flight);
+        let outcome = job.park(move || flight.wait());
         self.table.stop_waiting(self.waiter);
         outcome
     }
@@ -954,8 +957,10 @@ fn build(
     request: &BuildRequest,
 ) -> Result<BuildPublication, BuildError> {
     let flights = Arc::new(StageFlightTable::default());
-    coordinator.run_scheduled_cooperative(WorkClass::Interactive, |job| {
-        build_with_runtime(coordinator, request, flights, job)
+    let request = request.clone();
+    let job_coordinator = Arc::clone(coordinator);
+    coordinator.run_scheduled_cooperative(WorkClass::Interactive, move |job| {
+        build_with_runtime(&job_coordinator, &request, flights, job)
     })
 }
 
