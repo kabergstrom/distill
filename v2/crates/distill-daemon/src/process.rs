@@ -39,6 +39,14 @@ impl DaemonProcess {
     /// Start from the configured shared schema artifact. Production never
     /// substitutes the bootstrap-only table for `assets.schema_path`.
     pub fn start(config: DaemonConfig) -> Result<Self, DaemonProcessError> {
+        Self::start_internal(config, true)
+    }
+
+    pub(crate) fn start_for_pack(config: DaemonConfig) -> Result<Self, DaemonProcessError> {
+        Self::start_internal(config, false)
+    }
+
+    fn start_internal(config: DaemonConfig, serve_rpc: bool) -> Result<Self, DaemonProcessError> {
         let schema_bytes = std::fs::read(&config.assets.schema_path).map_err(|source| {
             DaemonProcessError::SchemaRead {
                 path: config.assets.schema_path.clone(),
@@ -46,12 +54,20 @@ impl DaemonProcess {
             }
         })?;
         let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
-        Self::start_with_authority(config, authority)
+        Self::start_with_authority_internal(config, authority, serve_rpc)
     }
 
     pub fn start_with_authority(
         config: DaemonConfig,
         authority: ProjectSchemaAuthority,
+    ) -> Result<Self, DaemonProcessError> {
+        Self::start_with_authority_internal(config, authority, true)
+    }
+
+    fn start_with_authority_internal(
+        config: DaemonConfig,
+        authority: ProjectSchemaAuthority,
+        serve_rpc: bool,
     ) -> Result<Self, DaemonProcessError> {
         let targets = config.target_definitions(authority.identity())?;
         let coordinator = Arc::new(DaemonCoordinator::open(
@@ -99,27 +115,32 @@ impl DaemonProcess {
             codegen,
         ));
 
-        let (address_tx, address_rx) = mpsc::sync_channel(1);
-        let rpc_thread = spawn_rpc_loop(
-            coordinator.server().root(),
-            config.daemon.address,
-            Arc::clone(&stop),
-            address_tx,
-        );
-        let rpc_address = match address_rx.recv() {
-            Ok(Ok(address)) => address,
-            Ok(Err(error)) => {
-                stop.store(true, Ordering::Release);
-                let _ = rpc_thread.join();
-                return Err(DaemonProcessError::Rpc(error));
-            }
-            Err(error) => {
-                stop.store(true, Ordering::Release);
-                let _ = rpc_thread.join();
-                return Err(DaemonProcessError::Rpc(format!(
-                    "RPC startup channel closed: {error}"
-                )));
-            }
+        let (rpc_address, rpc_thread) = if serve_rpc {
+            let (address_tx, address_rx) = mpsc::sync_channel(1);
+            let rpc_thread = spawn_rpc_loop(
+                coordinator.server().root(),
+                config.daemon.address,
+                Arc::clone(&stop),
+                address_tx,
+            );
+            let rpc_address = match address_rx.recv() {
+                Ok(Ok(address)) => address,
+                Ok(Err(error)) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = rpc_thread.join();
+                    return Err(DaemonProcessError::Rpc(error));
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = rpc_thread.join();
+                    return Err(DaemonProcessError::Rpc(format!(
+                        "RPC startup channel closed: {error}"
+                    )));
+                }
+            };
+            (rpc_address, Some(rpc_thread))
+        } else {
+            (config.daemon.address, None)
         };
 
         Ok(Self {
@@ -128,7 +149,7 @@ impl DaemonProcess {
             stop,
             watcher: Some(watcher),
             coordinator_thread,
-            rpc_thread: Some(rpc_thread),
+            rpc_thread,
             last_background_error,
         })
     }

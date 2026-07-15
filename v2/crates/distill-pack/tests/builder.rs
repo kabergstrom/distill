@@ -8,7 +8,8 @@ use distill_build::trace::PackDefinitionControlValue;
 use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_pack::builder::{
-    build_pack, build_publish_and_activate_pack, PackBuildError, PackBuildTarget,
+    build_pack, build_publish_and_activate_pack, decode_pack_definition, PackBuildError,
+    PackBuildTarget,
 };
 use distill_pack::{
     activate, archive_filename, manifest_filename, manifest_hash, publish_archive,
@@ -27,7 +28,6 @@ use distill_wire::wire::WireNode;
 const TARGET_HASH: [u8; 32] = [7; 32];
 
 struct Fixture {
-    build_only_types: BTreeSet<TypeUuid>,
     hub: distill_rpc::Hub,
     snapshot: distill_rpc::Snapshot,
     root: AssetUuid,
@@ -36,17 +36,8 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    fixture_with_build_only(false)
-}
-
-fn fixture_with_build_only(build_only: bool) -> Fixture {
     let runtime_type = TypeUuid([21; 16]);
     let logical_hash = LogicalHash([31; 32]);
-    let build_only_types = if build_only {
-        BTreeSet::from([runtime_type])
-    } else {
-        BTreeSet::new()
-    };
     let target_definition = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let server = Server::new(StoreInstanceId([9; 16]), vec![target_definition]).unwrap();
 
@@ -123,7 +114,6 @@ fn fixture_with_build_only(build_only: bool) -> Fixture {
     };
     let snapshot = hub.snapshot().success().unwrap();
     Fixture {
-        build_only_types,
         hub,
         snapshot,
         root,
@@ -205,6 +195,78 @@ fn definition(root: AssetUuid) -> PackDefinitionControlValue {
     }
 }
 
+fn byte_array(bytes: &[u8]) -> distill_json::AuthoredValue {
+    distill_json::AuthoredValue::Array(
+        bytes
+            .iter()
+            .map(|byte| distill_json::AuthoredValue::UInt(u128::from(*byte)))
+            .collect(),
+    )
+}
+
+fn pack_definition_authoring(root: AssetUuid) -> AuthoringValue {
+    use distill_json::AuthoredValue as Value;
+
+    let query = Value::Object(BTreeMap::from([
+        ("authored_type".to_owned(), Value::Null),
+        ("authoring_only".to_owned(), Value::Null),
+        ("bundle_path".to_owned(), Value::Null),
+        ("bundle_uuid".to_owned(), Value::Null),
+        ("local_id".to_owned(), Value::Null),
+        ("path_glob".to_owned(), Value::Null),
+        ("path_prefix".to_owned(), Value::Null),
+        ("tag".to_owned(), Value::Null),
+        ("terminal_type".to_owned(), Value::Null),
+        ("uuid".to_owned(), byte_array(&root.0)),
+    ]));
+    let value = Value::Object(BTreeMap::from([
+        ("include_path_table".to_owned(), Value::Bool(true)),
+        ("roots".to_owned(), Value::Array(vec![query])),
+        ("target".to_owned(), Value::Str("dev".to_owned())),
+        ("zstd_level".to_owned(), Value::Int(-2)),
+    ]));
+    AuthoringValue {
+        canonical_value: Arc::from(distill_json::write(&value).unwrap().into_bytes()),
+        blobs: Vec::new(),
+    }
+}
+
+#[test]
+fn decodes_the_sealed_pack_definition_authored_shape() {
+    let root = AssetUuid([42; 16]);
+    assert_eq!(
+        decode_pack_definition(&pack_definition_authoring(root)).unwrap(),
+        PackDefinitionControlValue {
+            roots: vec![BuildAssetQuery {
+                uuid: Some(root),
+                ..BuildAssetQuery::default()
+            }],
+            target: "dev".to_owned(),
+            zstd_level: -2,
+            include_path_table: true,
+        }
+    );
+}
+
+#[test]
+fn pack_definition_decoder_rejects_noncanonical_or_blob_backed_values() {
+    let mut noncanonical = pack_definition_authoring(AssetUuid([42; 16]));
+    let mut bytes = noncanonical.canonical_value.to_vec();
+    bytes.push(b' ');
+    noncanonical.canonical_value = Arc::from(bytes);
+    assert!(matches!(
+        decode_pack_definition(&noncanonical),
+        Err(PackBuildError::Definition(_))
+    ));
+
+    let mut blob_backed = pack_definition_authoring(AssetUuid([42; 16]));
+    blob_backed.blobs.push(Arc::from(&b"unexpected"[..]));
+    assert!(matches!(
+        decode_pack_definition(&blob_backed),
+        Err(PackBuildError::Definition(_))
+    ));
+}
+
 #[test]
 fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
     let fixture = fixture();
@@ -214,7 +276,6 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
             name: "dev".into(),
             definition_hash: TARGET_HASH,
         },
-        &fixture.build_only_types,
         "zstd-test",
         &fixture.snapshot,
         &fixture.hub,
@@ -267,7 +328,6 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
             name: "dev".into(),
             definition_hash: TARGET_HASH,
         },
-        &fixture.build_only_types,
         "zstd-test",
         &fixture.snapshot,
         &fixture.hub,
@@ -308,31 +368,11 @@ fn build_pack_rejects_an_empty_root_selection() {
                 name: "dev".into(),
                 definition_hash: TARGET_HASH,
             },
-            &fixture.build_only_types,
             "zstd-test",
             &fixture.snapshot,
             &fixture.hub,
         ),
         Err(PackBuildError::EmptyRoot { index: 0 })
-    ));
-}
-
-#[test]
-fn build_pack_rejects_runtime_build_only_types() {
-    let fixture = fixture_with_build_only(true);
-    assert!(matches!(
-        build_pack(
-            &definition(fixture.root),
-            &PackBuildTarget {
-                name: "dev".into(),
-                definition_hash: TARGET_HASH,
-            },
-            &fixture.build_only_types,
-            "zstd-test",
-            &fixture.snapshot,
-            &fixture.hub,
-        ),
-        Err(PackBuildError::BuildOnlyType(type_uuid)) if type_uuid == TypeUuid([21; 16])
     ));
 }
 
@@ -348,7 +388,6 @@ fn build_pack_closes_roots_before_rpc_evaluation() {
                 name: "dev".into(),
                 definition_hash: TARGET_HASH,
             },
-            &fixture.build_only_types,
             "zstd-test",
             &fixture.snapshot,
             &fixture.hub,

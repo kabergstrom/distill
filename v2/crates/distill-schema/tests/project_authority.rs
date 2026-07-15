@@ -192,6 +192,7 @@ fn schema_projection_produces_logical_registry_and_authenticated_wire() {
 
     let project = authority.project_type(PROJECT_UUID).unwrap();
     assert_eq!(project.schema_type, SchemaTypeId(0));
+    assert!(!project.build_only);
     assert_eq!(
         project.logical_schema,
         *authority.registry().current(PROJECT_UUID).unwrap().0
@@ -203,6 +204,14 @@ fn schema_projection_produces_logical_registry_and_authenticated_wire() {
     let decoded = decode_dswl(&project.dswl_bytes).unwrap();
     assert_eq!(dswl_hash(&decoded).unwrap(), project.layout_hash);
     assert_eq!(authority.project_types().len(), 1);
+}
+
+#[test]
+fn project_authority_preserves_build_only_policy() {
+    let mut schema = project_schema();
+    schema.types[0].attrs.build_only = true;
+    let authority = ProjectSchemaAuthority::from_schema(schema, [7; 32]).unwrap();
+    assert!(authority.project_type(PROJECT_UUID).unwrap().build_only);
 }
 
 #[test]

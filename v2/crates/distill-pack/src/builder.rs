@@ -4,12 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-use distill_build::query::{AssetQuery as BuildAssetQuery, IntakeError};
+use distill_build::query::{
+    AssetQuery as BuildAssetQuery, IntakeError, TagSelector as BuildTagSelector,
+};
 use distill_build::trace::PackDefinitionControlValue;
-use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
+use distill_json::AuthoredValue;
 use distill_rpc::{
-    ArtifactChunkKind, ConfigurationPoison, Hub, PathResolveResult, ReconnectReason, ResolveResult,
-    RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
+    ArtifactChunkKind, AuthoringValue, ConfigurationPoison, Hub, PathResolveResult,
+    ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 
@@ -37,6 +40,7 @@ pub struct PackBuildOutput {
 
 #[derive(Debug)]
 pub enum PackBuildError {
+    Definition(String),
     TargetMismatch {
         definition: String,
         requested: String,
@@ -69,7 +73,6 @@ pub enum PackBuildError {
         asset: AssetUuid,
     },
     InvalidWireTree(LayoutHash),
-    BuildOnlyType(TypeUuid),
     Path {
         path: String,
         result: PathResolveResult,
@@ -105,6 +108,229 @@ impl From<PointerError> for PackBuildError {
     }
 }
 
+/// Decode the sealed PackDefinition authored value carried by the metadata
+/// RPC. The daemon has already authenticated its bootstrap type/schema; this
+/// function still requires canonical JSON and the exact closed value shape.
+pub fn decode_pack_definition(
+    authored: &AuthoringValue,
+) -> Result<PackDefinitionControlValue, PackBuildError> {
+    if !authored.blobs.is_empty() {
+        return Err(definition_error("PackDefinition cannot contain blobs"));
+    }
+    let text = std::str::from_utf8(&authored.canonical_value)
+        .map_err(|error| definition_error(format!("PackDefinition is not UTF-8: {error}")))?;
+    let value = distill_json::parse(text)
+        .map_err(|error| definition_error(format!("PackDefinition JSON is invalid: {error}")))?;
+    if distill_json::write(&value)
+        .map_err(|error| definition_error(format!("PackDefinition is not writable: {error}")))?
+        .as_bytes()
+        != authored.canonical_value.as_ref()
+    {
+        return Err(definition_error("PackDefinition JSON is not canonical"));
+    }
+    decode_pack_definition_value(&value)
+}
+
+fn decode_pack_definition_value(
+    value: &AuthoredValue,
+) -> Result<PackDefinitionControlValue, PackBuildError> {
+    let fields = exact_object(
+        value,
+        "PackDefinition",
+        &["include_path_table", "roots", "target", "zstd_level"],
+    )?;
+    let roots = as_array(field(fields, "roots")?, "PackDefinition.roots")?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| decode_asset_query(value, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let zstd_level = i32::try_from(as_i128(
+        field(fields, "zstd_level")?,
+        "PackDefinition.zstd_level",
+    )?)
+    .map_err(|_| definition_error("PackDefinition.zstd_level is outside i32 range"))?;
+    Ok(PackDefinitionControlValue {
+        roots,
+        target: as_string(field(fields, "target")?, "PackDefinition.target")?.to_owned(),
+        zstd_level,
+        include_path_table: as_bool(
+            field(fields, "include_path_table")?,
+            "PackDefinition.include_path_table",
+        )?,
+    })
+}
+
+fn decode_asset_query(
+    value: &AuthoredValue,
+    index: usize,
+) -> Result<BuildAssetQuery, PackBuildError> {
+    let context = format!("PackDefinition.roots[{index}]");
+    let fields = exact_object(
+        value,
+        &context,
+        &[
+            "authored_type",
+            "authoring_only",
+            "bundle_path",
+            "bundle_uuid",
+            "local_id",
+            "path_glob",
+            "path_prefix",
+            "tag",
+            "terminal_type",
+            "uuid",
+        ],
+    )?;
+    Ok(BuildAssetQuery {
+        uuid: optional(field(fields, "uuid")?, |value| {
+            fixed_bytes(value, &format!("{context}.uuid")).map(AssetUuid)
+        })?,
+        bundle_path: optional(field(fields, "bundle_path")?, |value| {
+            as_string(value, &format!("{context}.bundle_path")).map(str::to_owned)
+        })?,
+        local_id: optional(field(fields, "local_id")?, |value| {
+            as_string(value, &format!("{context}.local_id")).map(str::to_owned)
+        })?,
+        bundle_uuid: optional(field(fields, "bundle_uuid")?, |value| {
+            fixed_bytes(value, &format!("{context}.bundle_uuid")).map(BundleUuid)
+        })?,
+        authored_type: optional(field(fields, "authored_type")?, |value| {
+            fixed_bytes(value, &format!("{context}.authored_type")).map(TypeUuid)
+        })?,
+        terminal_type: optional(field(fields, "terminal_type")?, |value| {
+            fixed_bytes(value, &format!("{context}.terminal_type")).map(TypeUuid)
+        })?,
+        tag: optional(field(fields, "tag")?, |value| {
+            decode_tag_selector(value, &format!("{context}.tag"))
+        })?,
+        path_prefix: optional(field(fields, "path_prefix")?, |value| {
+            as_string(value, &format!("{context}.path_prefix")).map(str::to_owned)
+        })?,
+        path_glob: optional(field(fields, "path_glob")?, |value| {
+            as_string(value, &format!("{context}.path_glob")).map(str::to_owned)
+        })?,
+        authoring_only: optional(field(fields, "authoring_only")?, |value| {
+            as_bool(value, &format!("{context}.authoring_only"))
+        })?,
+    })
+}
+
+fn decode_tag_selector(
+    value: &AuthoredValue,
+    context: &str,
+) -> Result<BuildTagSelector, PackBuildError> {
+    let fields = exact_object(value, context, &["tag", "value"])?;
+    Ok(BuildTagSelector {
+        tag: as_string(field(fields, "tag")?, &format!("{context}.tag"))?.to_owned(),
+        value: optional(field(fields, "value")?, |value| {
+            as_string(value, &format!("{context}.value")).map(str::to_owned)
+        })?,
+    })
+}
+
+fn definition_error(message: impl Into<String>) -> PackBuildError {
+    PackBuildError::Definition(message.into())
+}
+
+fn exact_object<'a>(
+    value: &'a AuthoredValue,
+    context: &str,
+    expected: &[&str],
+) -> Result<&'a BTreeMap<String, AuthoredValue>, PackBuildError> {
+    let AuthoredValue::Object(fields) = value else {
+        return Err(definition_error(format!("{context} must be an object")));
+    };
+    if fields.len() != expected.len() || expected.iter().any(|name| !fields.contains_key(*name)) {
+        return Err(definition_error(format!(
+            "{context} does not have the sealed field set"
+        )));
+    }
+    Ok(fields)
+}
+
+fn field<'a>(
+    fields: &'a BTreeMap<String, AuthoredValue>,
+    name: &str,
+) -> Result<&'a AuthoredValue, PackBuildError> {
+    fields
+        .get(name)
+        .ok_or_else(|| definition_error(format!("missing field {name:?}")))
+}
+
+fn as_array<'a>(
+    value: &'a AuthoredValue,
+    context: &str,
+) -> Result<&'a [AuthoredValue], PackBuildError> {
+    match value {
+        AuthoredValue::Array(values) => Ok(values),
+        _ => Err(definition_error(format!("{context} must be an array"))),
+    }
+}
+
+fn as_string<'a>(value: &'a AuthoredValue, context: &str) -> Result<&'a str, PackBuildError> {
+    match value {
+        AuthoredValue::Str(value) => Ok(value),
+        _ => Err(definition_error(format!("{context} must be text"))),
+    }
+}
+
+fn as_bool(value: &AuthoredValue, context: &str) -> Result<bool, PackBuildError> {
+    match value {
+        AuthoredValue::Bool(value) => Ok(*value),
+        _ => Err(definition_error(format!("{context} must be a boolean"))),
+    }
+}
+
+fn as_i128(value: &AuthoredValue, context: &str) -> Result<i128, PackBuildError> {
+    match value {
+        AuthoredValue::Int(value) => Ok(*value),
+        AuthoredValue::UInt(value) => i128::try_from(*value)
+            .map_err(|_| definition_error(format!("{context} is outside i128 range"))),
+        _ => Err(definition_error(format!("{context} must be an integer"))),
+    }
+}
+
+fn optional<T>(
+    value: &AuthoredValue,
+    decode: impl FnOnce(&AuthoredValue) -> Result<T, PackBuildError>,
+) -> Result<Option<T>, PackBuildError> {
+    match value {
+        AuthoredValue::Null => Ok(None),
+        value => decode(value).map(Some),
+    }
+}
+
+fn fixed_bytes<const N: usize>(
+    value: &AuthoredValue,
+    context: &str,
+) -> Result<[u8; N], PackBuildError> {
+    let values = as_array(value, context)?;
+    if values.len() != N {
+        return Err(definition_error(format!(
+            "{context} must contain exactly {N} bytes"
+        )));
+    }
+    let mut bytes = [0; N];
+    for (target, value) in bytes.iter_mut().zip(values) {
+        let AuthoredValue::UInt(value) = value else {
+            return Err(definition_error(format!(
+                "{context} contains a non-byte value"
+            )));
+        };
+        *target = u8::try_from(*value)
+            .map_err(|_| definition_error(format!("{context} contains an out-of-range byte")))?;
+    }
+    Ok(bytes)
+}
+
+pub fn encoder_identity() -> String {
+    format!(
+        "distill-pack/{},zstd/{}",
+        env!("CARGO_PKG_VERSION"),
+        zstd::zstd_safe::version_string()
+    )
+}
+
 struct FetchedArtifact {
     content_hash: ContentHash,
     structural: Vec<u8>,
@@ -119,7 +345,6 @@ struct FetchedArtifact {
 pub fn build_pack(
     definition: &PackDefinitionControlValue,
     target: &PackBuildTarget,
-    build_only_types: &BTreeSet<TypeUuid>,
     encoder_identity: &str,
     snapshot: &Snapshot,
     hub: &Hub,
@@ -177,15 +402,6 @@ pub fn build_pack(
             .ne(load_deps.iter().copied())
         {
             return Err(PackBuildError::ArtifactIdentity { asset });
-        }
-        for type_uuid in [
-            parsed.authored_type,
-            parsed.encoded_type,
-            parsed.terminal_type,
-        ] {
-            if build_only_types.contains(&type_uuid) {
-                return Err(PackBuildError::BuildOnlyType(type_uuid));
-            }
         }
         let terminal_type = parsed.terminal_type;
         let layout_hash = parsed.layout_hash;
@@ -309,19 +525,11 @@ pub fn build_publish_and_activate_pack(
     directory: &Path,
     definition: &PackDefinitionControlValue,
     target: &PackBuildTarget,
-    build_only_types: &BTreeSet<TypeUuid>,
     encoder_identity: &str,
     snapshot: &Snapshot,
     hub: &Hub,
 ) -> Result<PackBuildOutput, PackBuildError> {
-    let output = build_pack(
-        definition,
-        target,
-        build_only_types,
-        encoder_identity,
-        snapshot,
-        hub,
-    )?;
+    let output = build_pack(definition, target, encoder_identity, snapshot, hub)?;
     let archive_hash = publish_archive(directory, &output.archive_bytes)?;
     debug_assert_eq!(archive_hash, output.archive_file_hash);
     let manifest_hash = publish_manifest(directory, &output.manifest_bytes)?;

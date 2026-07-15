@@ -1662,6 +1662,7 @@ fn build_asset_inner(
         .registry
         .chain(loaded.entry.type_uuid, &context.target)
         .map_err(BuildError::failed)?;
+    validate_runtime_chain(&context.authority, &chain)?;
     let (bytes, references, current_value) = encode_or_hydrate(
         context,
         &loaded,
@@ -1685,6 +1686,30 @@ fn build_asset_inner(
         process_chain(context, &loaded, &project, &chain, imported, current_value)?
     };
     prepare_outputs(context, asset, outputs)
+}
+
+fn validate_runtime_chain(
+    authority: &ProjectSchemaAuthority,
+    chain: &PipelineChain,
+) -> Result<(), BuildError> {
+    let types = std::iter::once(chain.authored)
+        .chain(chain.stages.iter().flat_map(|stage| {
+            std::iter::once(stage.registration.outputs.primary)
+                .chain(stage.registration.outputs.extras.values().copied())
+        }))
+        .chain(std::iter::once(chain.terminal))
+        .chain(chain.extras.values().copied());
+    for type_uuid in types {
+        let project = authority.project_type(type_uuid).ok_or_else(|| {
+            BuildError::Failed(format!("runtime type {type_uuid} has no schema authority"))
+        })?;
+        if project.build_only {
+            return Err(BuildError::Failed(format!(
+                "build-only type {type_uuid} cannot enter a runtime build closure"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -4534,6 +4559,24 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn runtime_build_closures_reject_schema_authoritative_build_only_types() {
+        let normal = authority();
+        let mut schema = normal.schema().clone();
+        schema.types[0].attrs.build_only = true;
+        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 32]).unwrap();
+        let chain = PipelineChain {
+            authored: TYPE,
+            terminal: TYPE,
+            stages: Vec::new(),
+            extras: BTreeMap::new(),
+        };
+        assert!(matches!(
+            validate_runtime_chain(&build_only, &chain),
+            Err(BuildError::Failed(message)) if message.contains("build-only type")
+        ));
     }
 
     #[test]

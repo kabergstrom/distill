@@ -21,6 +21,7 @@ pub mod lineage_repair;
 mod migration_control;
 pub mod module_loader;
 mod operations;
+pub mod pack_command;
 mod pipeline_map;
 pub mod process;
 pub mod quarantine;

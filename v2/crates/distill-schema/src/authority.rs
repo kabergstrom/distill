@@ -33,6 +33,9 @@ pub struct ProjectSchemaAuthority {
 #[derive(Debug, Clone)]
 pub struct ProjectTypeAuthority {
     pub schema_type: SchemaTypeId,
+    /// Runtime load-closure policy from the shared schema. This is kept out
+    /// of logical hashes, but remains authoritative for daemon builds.
+    pub build_only: bool,
     pub logical_schema: ngp_schema::LogicalSchema,
     pub logical_hash: LogicalHash,
     pub wire: WireNode,
@@ -99,6 +102,7 @@ impl ProjectSchemaAuthority {
                 type_uuid,
                 ProjectTypeAuthority {
                     schema_type: ty.id,
+                    build_only: ty.attrs.build_only,
                     logical_schema: logical_schema.clone(),
                     logical_hash,
                     wire,
