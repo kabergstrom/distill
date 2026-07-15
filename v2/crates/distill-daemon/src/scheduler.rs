@@ -2,6 +2,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+pub const DEFAULT_DEPENDENCY_DEPTH: usize = 32;
+pub const MAX_DEPENDENCY_DEPTH: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkClass {
     Interactive,
@@ -27,8 +30,11 @@ impl SchedulerConfig {
                 max,
             });
         }
-        if self.max_dependency_depth == 0 {
-            return Err(SchedulerConfigError::DependencyDepthZero);
+        if !(1..=MAX_DEPENDENCY_DEPTH).contains(&self.max_dependency_depth) {
+            return Err(SchedulerConfigError::DependencyDepthOutOfBounds {
+                got: self.max_dependency_depth,
+                max: MAX_DEPENDENCY_DEPTH,
+            });
         }
         Ok(())
     }
@@ -38,7 +44,7 @@ impl SchedulerConfig {
 pub enum SchedulerConfigError {
     ParallelismZero,
     BatchReservationOutOfBounds { got: usize, max: usize },
-    DependencyDepthZero,
+    DependencyDepthOutOfBounds { got: usize, max: usize },
 }
 
 impl std::fmt::Display for SchedulerConfigError {
@@ -49,9 +55,10 @@ impl std::fmt::Display for SchedulerConfigError {
                 f,
                 "pipeline.batch_reserved_workers must be in 1..={max}, got {got}"
             ),
-            Self::DependencyDepthZero => {
-                f.write_str("pipeline.max_dependency_depth must be at least 1")
-            }
+            Self::DependencyDepthOutOfBounds { got, max } => write!(
+                f,
+                "pipeline.max_dependency_depth must be in 1..={max}, got {got}"
+            ),
         }
     }
 }

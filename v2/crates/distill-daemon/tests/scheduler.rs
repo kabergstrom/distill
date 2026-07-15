@@ -1,4 +1,6 @@
-use distill_daemon::scheduler::{Scheduler, SchedulerConfig, SchedulerConfigError, WorkClass};
+use distill_daemon::scheduler::{
+    Scheduler, SchedulerConfig, SchedulerConfigError, WorkClass, MAX_DEPENDENCY_DEPTH,
+};
 
 #[test]
 fn scheduler_configuration_enforces_worker_and_reservation_bounds() {
@@ -20,6 +22,31 @@ fn scheduler_configuration_enforces_worker_and_reservation_bounds() {
         invalid_reservation.validate(),
         Err(SchedulerConfigError::BatchReservationOutOfBounds { got: 4, max: 3 })
     );
+
+    for got in [0, MAX_DEPENDENCY_DEPTH + 1] {
+        let invalid_depth = SchedulerConfig {
+            parallelism: 4,
+            batch_reserved_workers: 1,
+            max_dependency_depth: got,
+        };
+        assert_eq!(
+            invalid_depth.validate(),
+            Err(SchedulerConfigError::DependencyDepthOutOfBounds {
+                got,
+                max: MAX_DEPENDENCY_DEPTH,
+            })
+        );
+    }
+
+    for max_dependency_depth in [1, MAX_DEPENDENCY_DEPTH] {
+        SchedulerConfig {
+            parallelism: 4,
+            batch_reserved_workers: 1,
+            max_dependency_depth,
+        }
+        .validate()
+        .unwrap();
+    }
 }
 
 #[test]

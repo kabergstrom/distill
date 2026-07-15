@@ -210,7 +210,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
             path: "schema/schema-lineage.bundle".into(),
         },
         vec![target()],
-        256,
+        64,
     )
     .unwrap();
     coordinator.reconcile_full_scan().unwrap();
@@ -443,7 +443,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
             path: "schema/schema-lineage.bundle".into(),
         },
         vec![target()],
-        256,
+        64,
     )
     .unwrap();
     coordinator.reconcile_full_scan().unwrap();

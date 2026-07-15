@@ -39,7 +39,7 @@ auto_codegen = true
 
 [pipeline]
 parallelism = 8
-max_dependency_depth = 256
+max_dependency_depth = 64
 batch_reserved_workers = 1
 
 [cas]
@@ -66,6 +66,10 @@ fn parses_and_validates_the_complete_configuration_surface() {
     let definitions = config.target_definitions(&test_layout_identity()).unwrap();
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].name(), "dev");
+
+    let without_depth = valid_config(&temp).replace("max_dependency_depth = 64\n", "");
+    let defaulted = DaemonConfig::parse(temp.path().join("distill.toml"), &without_depth).unwrap();
+    assert_eq!(defaulted.pipeline.max_dependency_depth, 32);
 }
 
 #[test]
@@ -92,6 +96,17 @@ fn rejects_unknown_keys_nonloopback_and_invalid_scheduler_bounds() {
         DaemonConfig::parse(temp.path().join("distill.toml"), &source),
         Err(DaemonConfigError::Scheduler(_))
     ));
+
+    for invalid in [0, 65] {
+        let source = valid_config(&temp).replace(
+            "max_dependency_depth = 64",
+            &format!("max_dependency_depth = {invalid}"),
+        );
+        assert!(matches!(
+            DaemonConfig::parse(temp.path().join("distill.toml"), &source),
+            Err(DaemonConfigError::Target(_))
+        ));
+    }
 }
 
 #[test]

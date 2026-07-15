@@ -2880,30 +2880,19 @@ rejections to `ArtifactEncodingFailureV1` rather than ad-hoc prose.
   collection inside one value (a package keyed by entry point) — and the
   derived namespace never depends on what any build produced.
 - **Reading other assets**: `ctx.read::<Skeleton>(ref)` returns another
-  asset's *built* artifact, recursively building it if stale — a pull-based
-  incremental build in the Salsa/Shake style. The recursion is
-  **cooperative and trampolined**: a stale, unclaimed descendant builds
-  inline on the calling worker — driven iteratively from an explicit
-  continuation stack, never by native recursion, so native stack depth
-  stays bounded (O(1) frames per job) however deep the authored chain —
-  and joining another job's in-flight build
-  never parks the worker while it holds its slot (§13's wait-for rule) —
-  a bounded pool cannot starve on an acyclic graph. A configured
-  **dependency-depth cap** (`max_dependency_depth`, §18) bounds the
-  logical chain: exceeding it errors the request back to its caller with
-  a named error listing
-  the chain from the root request to the offending edge. Depth
-  exhaustion is a **scheduler outcome, never a build failure record**:
-  it is not memoized, not trace-bearing, and never poisons — the cap is
-  measured from the root request while cache keys and traces carry no
-  ancestry, so memoizing it would let one deep caller's exhaustion
-  answer a shallow caller's valid request; a later request with budget
-  simply re-executes. The cap counts **live executed dependency frames
-  only** — a memoized result consumed from cache counts as one frame
-  (the consult), never its recorded subtree — a resource
-  policy like §12's recursion caps, distinct from stack safety, which
-  the trampoline provides independently of any cap value. Cycles are a
-  build error.
+  asset's built artifact, building it inline if stale. The processor callback
+  API is synchronous, so nested reads use ordinary native recursion on the
+  current build worker. Host-amplified nesting is therefore bounded by a
+  mandatory `max_dependency_depth` in `1..=64` (default 32), and build
+  workers use explicit 8 MiB stacks. Module callbacks must not place large
+  buffers on the native stack. Exceeding the cap returns a named chain error to
+  the request; it is never memoized, trace-bearing, or poisoning, so a later
+  shallower request can succeed. A cache consult counts as one live frame, not
+  its recorded subtree. The request-local visit set rejects cycles.
+  Concurrent identical requests may execute the same deterministic stage; they
+  never wait on one another, and their serialized CAS commits converge on the
+  same static-key/trace candidate.
+
 - **Path lookups**: `ctx.read_path::<T>("lighting/brdf.glsl")` resolves then
   reads, recording both a resolution dep and a content dep. Misses are
   recordable (negative deps) so include-search-path probing invalidates
@@ -2939,13 +2928,10 @@ rejections to `ArtifactEncodingFailureV1` rather than ad-hoc prose.
   the loader sweep and pack builds maintain a visit stack while expanding
   load deps, erroring on any cycle with its members named (v1's loader
   instead deadlocks on A↔B, and only waits for deps without verifying
-  versions). A visit stack is job-local, so it cannot see a cycle split
-  across two *concurrent* jobs: joins between in-flight builds consult
-  §13's global wait-for graph, which fails a cycle-closing join
-  immediately with the same members-named error — two simultaneous
-  top-level builds of mutually recursive assets get the cycle error,
-  never a deadlock. Intentionally cyclic data uses weak references, which resolve
-  after load and do not gate completion.
+  versions). Concurrent jobs never join or wait on one another; each expands
+  its own graph until its local visit stack names the cycle. Intentionally
+  cyclic data uses weak references, which resolve after load and do not gate
+  completion.
 
 The context those bullets describe:
 
@@ -3200,7 +3186,7 @@ content hash leaves every downstream trace valid.
 
 **Lookup uses the static-input key.** The full input hash contains the trace,
 which only execution discovers — it identifies a completed build but cannot
-be computed before one. Cache lookup and job coalescing therefore key on
+be computed before one. Cache lookup therefore keys on
 the **`StaticInputs` digest** (declared below) — **every static
 determinant of the
 full input hash** (output types come from the pipeline map, their hashes
@@ -3222,23 +3208,11 @@ Bucket growth is bounded by CAS eviction (§13), which retires candidates
 with their artifacts — a policy decision, distinct from correctness. Because statics live in the key and the trace
 is revalidated, a hit *implies* the full input hash matches: an output
 relayout, schema revision, or format bump can never reuse a stale
-artifact. The in-flight table (§13) is keyed by static-input key; when resolves
-pinned to **different snapshots** join one job, each waiter revalidates the
-completed trace against *its own* snapshot before accepting the result — a
-waiter whose snapshot resolves any trace entry differently re-executes at
-its own basis instead of adopting the joined result. **Failed outcomes
-coalesce under the same discipline, never more loosely**: a failed job's
-outcome is basis- and trace-bearing — the error, the basis snapshot,
-the discovered trace up to the failure, and its terminal `FailureCause`
-(a failing op's `Observed::Err`, or a `Local` fingerprint with no
-synthetic op invented) — and
-each waiter revalidates that partial trace against its own snapshot
-exactly as for success, so a waiter whose snapshot resolves the failing
-entry differently (snapshot M supplies the path whose absence failed
-snapshot N) re-executes at its own basis rather than adopting a false
-failure. An outcome with no coherent trace — an infrastructure error, a
-module crash — propagates only to waiters pinned to the originating
-snapshot; every other waiter re-executes.
+artifact. Concurrent requests do not share an in-memory flight: each validates
+durable candidates against its own snapshot and may execute duplicate pure
+work. The single-writer CAS commit path deduplicates identical candidates and
+preserves distinct valid trace buckets. This avoids cross-job blocking without
+changing cache authority.
 
 ```rust
 pub struct StaticInputs {
@@ -5414,33 +5388,13 @@ One writer, many snapshot readers:
   unpublishes — the last good artifact stays current, with the error
   surfaced — and deterministic failures commit **failure records** with
   their basis and partial trace (the CAS rules above), so an unchanged
-  basis answers from the record rather than rebuilding per client. An in-flight table
-  keyed by **static-input key** (§9) joins concurrent resolves into one job —
-  waiters pinned to different snapshots each revalidate the completed
-  trace against their own basis before accepting (§9), **failed outcomes
-  included**: failures carry their basis and partial trace and
-  revalidate per waiter; traceless infrastructure failures propagate
-  only within their originating snapshot (§9). Joining is
-  **non-parking discipline**: a worker whose job needs a descendant
-  build (`ctx.read`) never parks while holding its worker slot — an
-  unclaimed descendant executes inline on the joining worker
-  (cooperative execution, **trampolined**: driven iteratively from an
-  explicit continuation stack, never native recursion, so a deep
-  acyclic chain can never overflow the native stack — the configured
-  depth cap, §9/§18, errors over-deep chains back to their callers with
-  a named chained error first: a scheduler outcome, never a memoized
-  failure record, counting live executed frames only, a cache hit as
-  one), so a bounded pool cannot starve on an
-  acyclic graph (every worker parked awaiting queued children is
-  exactly the starvation a bounded synchronous pool otherwise admits).
-  The in-flight table also maintains a **global wait-for graph**:
-  joining an existing in-flight job records a wait edge carrying the
-  joiner's ancestry, and a join that would close a cycle fails
-  immediately with the cycle's members named (§9's load-DAG error),
-  never waits — two concurrent top-level builds of mutually recursive
-  assets each see the other's ancestry through the graph and get the
-  cycle error, where either job's local visit stack alone would wait
-  forever. The queue has
+  basis answers from the record rather than rebuilding per client.
+  Concurrent requests may perform duplicate deterministic work; no build job
+  waits on another build job. Synchronous `ctx.read` executes descendants
+  inline on the same worker, with request-local cycle detection and the
+  mandatory depth bound from §9. The pool configures 8 MiB worker stacks, and
+  callbacks must avoid large native-stack allocations. Results converge
+  through the serialized CAS commit path. The queue has
   two priorities, FIFO within each: interactive resolves ahead of batch work
   (pack builds, `doctor`) — with **bounded starvation**. Staging requires
   `parallelism >= 1` and
@@ -6822,9 +6776,9 @@ parallelism = 8
 # its caller with the chain named — a scheduler outcome, never memoized,
 # never a failure record; a later request with budget re-executes. The
 # cap counts live executed frames only (a cache hit counts as one — the
-# consult, not its recorded subtree). Policy only — stack safety comes
-# from the trampolined scheduler (§9, §13), independent of this value.
-max_dependency_depth = 256
+# consult, not its recorded subtree). Valid range 1..=64; synchronous
+# callback reads use native recursion on explicit 8 MiB build-worker stacks.
+max_dependency_depth = 32
 # Reserved batch capacity (§13): while batch-class work (pack builds,
 # doctor) is pending, this many worker slots are dedicated to the oldest
 # batch job — strict interactive priority elsewhere, bounded starvation.
@@ -6948,7 +6902,7 @@ ships; an unclassified key is a spec defect:
 | `modules.pipeline_dylib` | input-versioned epoch | module epoch rotation (§3) through the staged-candidate mechanism |
 | tool registrations (§3, §9) | input-versioned epoch | ToolEpoch (§13): a complete staged package or explicit ambient toolchain identity plus DSCT hash publishes at an input version |
 | `pipeline.parallelism` | operational-live | must remain ≥1; the pool resizes, re-clamps `batch_reserved_workers`, and lets already-active excess slots drain; no identity, key, or version implication |
-| `pipeline.max_dependency_depth` | operational-live | the next request runs under the new budget — safe because depth exhaustion is never memoized (§9) |
+| `pipeline.max_dependency_depth` | operational-live | must remain in `1..=64` (default 32); the next request runs under the new bound and depth exhaustion is never memoized (§9) |
 | `pipeline.batch_reserved_workers` | operational-live | staging requires `1 <= value <= max(1, parallelism - 1)`; live changes re-clamp at the next scheduling decision while active slots drain (§13) |
 | `cas.segment_size` | operational-live | applies to newly rolled segments only |
 | `cas.cache_limit` | operational-live | eviction policy shifts; the observability rules (§13) are unaffected |
@@ -9359,6 +9313,16 @@ ordinary §10 dependency kinds.
   replacement, explicit verification, or an admitted native overflow/
   incomplete-observation recovery.
 <!-- R35_LEDGER_END -->
+
+<!-- R36_LEDGER_BEGIN count=1 -->
+- **Synchronous build reads use bounded native recursion** (§§9, 13, 18): the
+  callback API cannot be honestly trampolined without becoming resumable.
+  Build workers therefore use explicit 8 MiB stacks, dependency depth is
+  constrained to `1..=64` (default 32), and callbacks avoid large stack
+  buffers. Concurrent identical stages may execute twice and converge in the
+  CAS; the DSSI flight table, cross-job wait graph, waiter threads, and
+  cooperative parking machinery are removed.
+<!-- R36_LEDGER_END -->
 
 ### Open — remaining
 

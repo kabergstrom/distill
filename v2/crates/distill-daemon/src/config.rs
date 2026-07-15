@@ -18,6 +18,7 @@ use crate::coordinator::LineageDestination;
 use crate::epoch::{CandidateRequirements, TargetDefinition as PipelineTarget};
 use crate::module_loader::host_module_abi_identity;
 use crate::scanner::AssetRoot;
+use crate::scheduler::{DEFAULT_DEPENDENCY_DEPTH, MAX_DEPENDENCY_DEPTH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -207,8 +208,13 @@ struct RawCodegen {
 #[serde(deny_unknown_fields)]
 struct RawPipeline {
     parallelism: usize,
+    #[serde(default = "default_dependency_depth")]
     max_dependency_depth: usize,
     batch_reserved_workers: usize,
+}
+
+const fn default_dependency_depth() -> usize {
+    DEFAULT_DEPENDENCY_DEPTH
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,10 +291,10 @@ impl DaemonConfig {
         scheduler
             .validate_scheduler()
             .map_err(DaemonConfigError::Scheduler)?;
-        if raw.pipeline.max_dependency_depth == 0 {
-            return Err(DaemonConfigError::Target(
-                "pipeline.max_dependency_depth must be at least 1".to_owned(),
-            ));
+        if !(1..=MAX_DEPENDENCY_DEPTH).contains(&raw.pipeline.max_dependency_depth) {
+            return Err(DaemonConfigError::Target(format!(
+                "pipeline.max_dependency_depth must be in 1..={MAX_DEPENDENCY_DEPTH}"
+            )));
         }
 
         let targets = normalize_targets(raw.targets)?;
