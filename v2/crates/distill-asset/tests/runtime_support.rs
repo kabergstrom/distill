@@ -128,16 +128,33 @@ fn placeholder_contains_panics_and_binds_minted_values_to_the_caller_epoch() {
 fn encode_panics_are_statuses() {
     struct PanicSink;
     impl EncodeSink for PanicSink {
-        fn flat(&mut self, _: &[u8]) {
+        fn flat(&mut self, _: &[u8]) -> Result<(), distill_asset::CallbackPanic> {
             panic!("sink")
         }
-        fn begin(&mut self, _: EncodeContainer, _: u32) {
+        fn begin(
+            &mut self,
+            _: EncodeContainer,
+            _: u32,
+        ) -> Result<(), distill_asset::CallbackPanic> {
             panic!("sink")
         }
-        fn push(&mut self) {}
-        fn finish(&mut self) {}
-        fn blob(&mut self, _: &[u8]) {}
-        fn reference(&mut self, _: bool, _: AssetUuid, _: TypeUuid) {}
+        fn push(&mut self) -> Result<(), distill_asset::CallbackPanic> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), distill_asset::CallbackPanic> {
+            Ok(())
+        }
+        fn blob(&mut self, _: &[u8]) -> Result<(), distill_asset::CallbackPanic> {
+            Ok(())
+        }
+        fn reference(
+            &mut self,
+            _: bool,
+            _: AssetUuid,
+            _: TypeUuid,
+        ) -> Result<(), distill_asset::CallbackPanic> {
+            Ok(())
+        }
     }
 
     let descriptor = <Plain as distill_asset::AssetType>::descriptor();

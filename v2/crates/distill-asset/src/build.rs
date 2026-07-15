@@ -225,7 +225,8 @@ unsafe fn encode<T: AssetReflect>(
     ptr: *const u8,
     sink: &mut dyn EncodeSink,
 ) -> Result<(), CallbackPanic> {
-    catch_unwind(AssertUnwindSafe(|| (&*ptr.cast::<T>()).encode(sink))).map_err(|_| CallbackPanic)
+    catch_unwind(AssertUnwindSafe(|| (&*ptr.cast::<T>()).encode(sink)))
+        .map_err(|_| CallbackPanic)?
 }
 
 pub fn checked_size<T>() -> u32 {

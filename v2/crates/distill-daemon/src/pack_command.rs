@@ -70,7 +70,7 @@ pub fn build_configured_pack(
     definition_asset: AssetUuid,
     destination: &Path,
 ) -> Result<PackBuildOutput, PackCommandError> {
-    let process = DaemonProcess::start_for_pack(config)?;
+    let process = DaemonProcess::start_for_pack(config, destination)?;
     build_pack_from_process(&process, definition_asset, destination)
 }
 

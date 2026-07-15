@@ -953,6 +953,22 @@ pub struct BuildRequest {
     pub drifted_input: DriftedInput,
 }
 
+/// Snapshot- and target-bound schema policy lookup used by offline pack
+/// construction. `build_only` is intentionally not part of DSLH, so the
+/// published project schema authority is the sole source of this fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTypePolicyRequest {
+    pub basis: SnapshotStamp,
+    pub target: String,
+    pub target_definition: TargetDefinitionHash,
+    pub type_uuid: TypeUuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeTypePolicy {
+    pub build_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildWireTree {
     pub layout_hash: LayoutHash,
@@ -988,6 +1004,15 @@ pub enum BuildBackendOutcome {
 /// implementations must not call back into the [`crate::Server`].
 pub trait BuildBackend: Send + Sync {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure>;
+
+    fn runtime_type_policy(
+        &self,
+        _request: &RuntimeTypePolicyRequest,
+    ) -> Result<RuntimeTypePolicy, RpcFailure> {
+        Err(RpcFailure::AuthoringBackendUnavailable {
+            operation: "runtime type-policy lookup".to_owned(),
+        })
+    }
 
     /// Notification that the server has either installed or rejected the
     /// publication returned by [`Self::build`]. A durable backend uses this

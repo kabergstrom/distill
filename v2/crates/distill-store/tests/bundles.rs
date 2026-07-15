@@ -13,7 +13,7 @@ use distill_store::state::{
     ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -399,13 +399,23 @@ fn schema_cache_roundtrips() {
     let (_d, mut store) = store();
     let hash = LogicalHash([5u8; 32]);
     store
-        .input_transaction(|txn| txn.put_schema(hash, "{\"kind\":\"struct\"}"))
+        .input_transaction(|txn| {
+            txn.put_schema(hash, "{\"kind\":\"struct\"}")?;
+            txn.put_schema(LogicalHash([4u8; 32]), "\"unit\"")
+        })
         .unwrap();
     assert_eq!(
         store.schema(hash).unwrap().as_deref(),
         Some("{\"kind\":\"struct\"}")
     );
     assert!(store.schema(LogicalHash([6u8; 32])).unwrap().is_none());
+    assert_eq!(
+        store.all_schemas().unwrap(),
+        vec![
+            (LogicalHash([4u8; 32]), "\"unit\"".to_owned()),
+            (hash, "{\"kind\":\"struct\"}".to_owned()),
+        ]
+    );
 }
 
 // ---- bundle-scoped poison rows (§7, §13) ----
@@ -455,6 +465,10 @@ fn poisoning_a_bundle_fails_resolves_against_its_uuids() {
         }
         other => panic!("expected BundlePoisoned, got {other:?}"),
     }
+    assert_eq!(
+        store.asset_ids_in_bundle(BundleUuid([1u8; 16])).unwrap(),
+        BTreeSet::from([AssetUuid([10u8; 16])])
+    );
 
     // Path resolution reaching into the poisoned bundle fails the same way.
     assert!(matches!(

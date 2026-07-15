@@ -12,7 +12,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 
 use distill_asset::{
-    AssetRuntimeDescriptor, AssetType, EncodeContainer, EncodeSink, ErasedValue,
+    AssetRuntimeDescriptor, AssetType, CallbackPanic, EncodeContainer, EncodeSink, ErasedValue,
     ModuleEpochPoisonCause, ModuleEpochToken, PlaceholderThunk,
 };
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
@@ -77,6 +77,7 @@ pub enum LoaderError {
     MissingDescriptor(TypeUuid),
     EpochFenced(GameModuleEpoch),
     OwnerEpochMismatch,
+    PlaceholderHostCallbackFailed(TypeUuid),
     PlaceholderVisitorFailed(TypeUuid),
     RuntimeEpoch(RuntimeEpochError),
     Artifact(String),
@@ -202,23 +203,111 @@ struct ReferenceOnlySink {
 }
 
 impl EncodeSink for ReferenceOnlySink {
-    fn flat(&mut self, _bytes: &[u8]) {}
+    fn flat(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
+        Ok(())
+    }
 
-    fn begin(&mut self, _kind: EncodeContainer, _len: u32) {}
+    fn begin(&mut self, _kind: EncodeContainer, _len: u32) -> Result<(), CallbackPanic> {
+        Ok(())
+    }
 
-    fn push(&mut self) {}
+    fn push(&mut self) -> Result<(), CallbackPanic> {
+        Ok(())
+    }
 
-    fn finish(&mut self) {}
+    fn finish(&mut self) -> Result<(), CallbackPanic> {
+        Ok(())
+    }
 
-    fn blob(&mut self, _bytes: &[u8]) {}
+    fn blob(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
+        Ok(())
+    }
 
-    fn reference(&mut self, strong: bool, target: AssetUuid, expected_terminal: TypeUuid) {
+    fn reference(
+        &mut self,
+        strong: bool,
+        target: AssetUuid,
+        expected_terminal: TypeUuid,
+    ) -> Result<(), CallbackPanic> {
         if strong {
             self.strong_references
                 .entry(target)
                 .or_default()
                 .insert(expected_terminal);
         }
+        Ok(())
+    }
+}
+
+/// Host-owned reverse-ABI adapter for generated encode visitors. Each sink
+/// entry catches a panic before returning through module code and latches the
+/// failure so a visitor cannot hide it by ignoring the returned status.
+struct ContainedEncodeSink<'a> {
+    inner: &'a mut dyn EncodeSink,
+    failed: bool,
+}
+
+impl<'a> ContainedEncodeSink<'a> {
+    fn new(inner: &'a mut dyn EncodeSink) -> Self {
+        Self {
+            inner,
+            failed: false,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn call(
+        &mut self,
+        callback: impl FnOnce(&mut dyn EncodeSink) -> Result<(), CallbackPanic>,
+    ) -> Result<(), CallbackPanic> {
+        if self.failed {
+            return Err(CallbackPanic);
+        }
+        match catch_unwind(AssertUnwindSafe(|| callback(self.inner))) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.failed = true;
+                Err(error)
+            }
+            Err(_) => {
+                self.failed = true;
+                Err(CallbackPanic)
+            }
+        }
+    }
+}
+
+impl EncodeSink for ContainedEncodeSink<'_> {
+    fn flat(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic> {
+        self.call(|sink| sink.flat(bytes))
+    }
+
+    fn begin(&mut self, kind: EncodeContainer, len: u32) -> Result<(), CallbackPanic> {
+        self.call(|sink| sink.begin(kind, len))
+    }
+
+    fn push(&mut self) -> Result<(), CallbackPanic> {
+        self.call(|sink| sink.push())
+    }
+
+    fn finish(&mut self) -> Result<(), CallbackPanic> {
+        self.call(|sink| sink.finish())
+    }
+
+    fn blob(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic> {
+        self.call(|sink| sink.blob(bytes))
+    }
+
+    fn reference(
+        &mut self,
+        strong: bool,
+        target: AssetUuid,
+        expected_terminal: TypeUuid,
+    ) -> Result<(), CallbackPanic> {
+        self.call(|sink| sink.reference(strong, target, expected_terminal))
     }
 }
 
@@ -550,11 +639,18 @@ impl<I: LoaderIO> Loader<I> {
         self.validate_value_owner(type_uuid, value)?;
         let descriptor = self.ensure_descriptor(type_uuid)?;
         let mut sink = ReferenceOnlySink::default();
-        // Safety: value ownership/type were checked against this descriptor;
-        // encode is the descriptor's generated no-unwind visitor.
-        let visited = catch_unwind(AssertUnwindSafe(|| unsafe {
-            (descriptor.descriptor.encode)(value.as_ptr(), &mut sink)
-        }));
+        let (visited, host_callback_failed) = {
+            let mut contained = ContainedEncodeSink::new(&mut sink);
+            // Safety: value ownership/type were checked against this descriptor;
+            // encode is the descriptor's generated no-unwind visitor.
+            let visited = catch_unwind(AssertUnwindSafe(|| unsafe {
+                (descriptor.descriptor.encode)(value.as_ptr(), &mut contained)
+            }));
+            (visited, contained.failed())
+        };
+        if host_callback_failed {
+            return Err(LoaderError::PlaceholderHostCallbackFailed(type_uuid));
+        }
         match visited {
             Ok(Ok(())) => Ok(sink.strong_references),
             Ok(Err(_)) | Err(_) => {
@@ -1270,7 +1366,7 @@ impl<I: LoaderIO> Loader<I> {
             );
             return;
         }
-        let wire = match decode_dswl(&artifact.wire_layout) {
+        let wire = match decode_dswl(artifact.wire_layout.as_bytes()) {
             Ok(wire) => wire,
             Err(error) => {
                 self.reject_fetched(
@@ -2211,4 +2307,61 @@ fn last_good_hash(state: &ManifestState) -> Option<ContentHash> {
 #[allow(dead_code)]
 fn _snapshot_for_failure(basis: &IoBasis) -> Option<SnapshotStamp> {
     basis.rpc_snapshot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PanickingEncodeSink;
+
+    impl EncodeSink for PanickingEncodeSink {
+        fn flat(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
+            panic!("flat panicked")
+        }
+
+        fn begin(&mut self, _kind: EncodeContainer, _len: u32) -> Result<(), CallbackPanic> {
+            panic!("begin panicked")
+        }
+
+        fn push(&mut self) -> Result<(), CallbackPanic> {
+            panic!("push panicked")
+        }
+
+        fn finish(&mut self) -> Result<(), CallbackPanic> {
+            panic!("finish panicked")
+        }
+
+        fn blob(&mut self, _bytes: &[u8]) -> Result<(), CallbackPanic> {
+            panic!("blob panicked")
+        }
+
+        fn reference(
+            &mut self,
+            _strong: bool,
+            _target: AssetUuid,
+            _expected_terminal: TypeUuid,
+        ) -> Result<(), CallbackPanic> {
+            panic!("reference panicked")
+        }
+    }
+
+    #[test]
+    fn contained_encode_sink_contains_every_host_callback_entry() {
+        fn assert_contained(
+            callback: impl FnOnce(&mut ContainedEncodeSink<'_>) -> Result<(), CallbackPanic>,
+        ) {
+            let mut inner = PanickingEncodeSink;
+            let mut sink = ContainedEncodeSink::new(&mut inner);
+            assert_eq!(callback(&mut sink), Err(CallbackPanic));
+            assert!(sink.failed());
+        }
+
+        assert_contained(|sink| sink.flat(&[1]));
+        assert_contained(|sink| sink.begin(EncodeContainer::Vec, 1));
+        assert_contained(|sink| sink.push());
+        assert_contained(|sink| sink.finish());
+        assert_contained(|sink| sink.blob(&[2]));
+        assert_contained(|sink| sink.reference(true, AssetUuid([3; 16]), TypeUuid([4; 16])));
+    }
 }

@@ -17,8 +17,10 @@ use distill_pack::{
 };
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
-    AuthoringMutation, AuthoringValue, Commit, ConnectOutcome, ConnectRequest, PathMutation,
-    ServedLoadEdge, Server, StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
+    AuthoringMutation, AuthoringValue, BuildBackend, BuildBackendOutcome, BuildRequest, Commit,
+    ConnectOutcome, ConnectRequest, PathMutation, RpcFailure, RuntimeTypePolicy,
+    RuntimeTypePolicyRequest, ServedLoadEdge, Server, StoreInstanceId, StoredResolve,
+    TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
@@ -35,11 +37,37 @@ struct Fixture {
     target: PackTarget,
 }
 
+struct TypePolicyBackend {
+    build_only: bool,
+}
+
+impl BuildBackend for TypePolicyBackend {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        Ok(BuildBackendOutcome::Drifted {
+            input: request.drifted_input.clone(),
+        })
+    }
+
+    fn runtime_type_policy(
+        &self,
+        _request: &RuntimeTypePolicyRequest,
+    ) -> Result<RuntimeTypePolicy, RpcFailure> {
+        Ok(RuntimeTypePolicy {
+            build_only: self.build_only,
+        })
+    }
+}
+
 fn fixture() -> Fixture {
+    fixture_with_policy(false)
+}
+
+fn fixture_with_policy(build_only: bool) -> Fixture {
     let runtime_type = TypeUuid([21; 16]);
     let logical_hash = LogicalHash([31; 32]);
     let target_definition = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let server = Server::new(StoreInstanceId([9; 16]), vec![target_definition]).unwrap();
+    server.install_build_backend(Arc::new(TypePolicyBackend { build_only }));
 
     let root = AssetUuid([1; 16]);
     let child = AssetUuid([2; 16]);
@@ -396,5 +424,24 @@ fn build_pack_closes_roots_before_rpc_evaluation() {
             index: 0,
             error: distill_build::query::IntakeError::AuthoringOnlyRestricted,
         })
+    ));
+}
+
+#[test]
+fn build_pack_rejects_build_only_terminal_types_from_the_pinned_policy() {
+    let fixture = fixture_with_policy(true);
+    assert!(matches!(
+        build_pack(
+            &definition(fixture.root),
+            &PackBuildTarget {
+                name: "dev".into(),
+                definition_hash: TARGET_HASH,
+            },
+            "zstd-test",
+            &fixture.snapshot,
+            &fixture.hub,
+        ),
+        Err(PackBuildError::BuildOnlyType { type_uuid })
+            if type_uuid == TypeUuid([21; 16])
     ));
 }

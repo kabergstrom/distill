@@ -25,7 +25,8 @@ use distill_store::state::{
 use distill_store::{Store, StoreError};
 
 use crate::callbacks::{
-    erase_callback, CallbackHandle, CallbackInvokeError, CodegenDescriptor, DefaultsDescriptor,
+    erase_callback, CallbackHandle, CallbackInvokeError, CodegenDescriptor,
+    ContainedCodegenContext, ContainedImportContext, ContainedProcessContext, DefaultsDescriptor,
     Diagnostics, ImporterDescriptor, InfallibleCallbackError, MigrationFunctionError,
     PipelineCodegen, PipelineCodegenContext, PipelineDefaults, PipelineImporter, PipelineMigration,
     PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorDescriptor,
@@ -48,7 +49,9 @@ pub struct ModuleAbiIdentity {
 pub enum HostCallbackSurface {
     Registry,
     EncodeSink,
+    AuthoringImportContext,
     ProcessContext,
+    CodegenContext,
 }
 
 impl HostCallbackSurface {
@@ -56,7 +59,9 @@ impl HostCallbackSurface {
         match self {
             Self::Registry => "Registry",
             Self::EncodeSink => "EncodeSink",
+            Self::AuthoringImportContext => "AuthoringImportContext",
             Self::ProcessContext => "ProcessContext",
+            Self::CodegenContext => "CodegenContext",
         }
     }
 }
@@ -1025,7 +1030,14 @@ impl PipelineEpoch {
         // SAFETY: the job pins the epoch and therefore the registration arena
         // and staged image for the complete call. The handle and allocation
         // were created by the same generic registration constructor.
-        match unsafe { call(pointer, context, settings) } {
+        let mut contained = ContainedImportContext::new(context);
+        let result = unsafe { call(pointer, &mut contained, settings) };
+        if contained.panicked() {
+            return Err(CallbackInvokeError::HostRejected(
+                "daemon import-context callback panicked".to_owned(),
+            ));
+        }
+        match result {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(error)) => Err(CallbackInvokeError::Rejected(error)),
             Err(_) => {
@@ -1049,7 +1061,14 @@ impl PipelineEpoch {
         else {
             return Err(CallbackInvokeError::Missing);
         };
-        match unsafe { call(pointer, input, context) } {
+        let mut contained = ContainedProcessContext::new(context);
+        let result = unsafe { call(pointer, input, &mut contained) };
+        if contained.panicked() {
+            return Err(CallbackInvokeError::HostRejected(
+                "daemon process-context callback panicked".to_owned(),
+            ));
+        }
+        match result {
             Ok(Ok(output)) => {
                 let actual_extras = output.extras.keys().cloned().collect::<BTreeSet<_>>();
                 let Some(primary) = &output.primary else {
@@ -1149,7 +1168,14 @@ impl PipelineEpoch {
             let CallbackHandle::Codegen { call, .. } = callback else {
                 unreachable!("codegen predicate returned another kind")
             };
-            match unsafe { call(pointer, context) } {
+            let mut contained = ContainedCodegenContext::new(context);
+            let result = unsafe { call(pointer, &mut contained) };
+            if contained.panicked() {
+                return Err(CallbackInvokeError::HostRejected(
+                    "daemon codegen-context callback panicked".to_owned(),
+                ));
+            }
+            match result {
                 Ok(Ok(mut generated)) => files.append(&mut generated),
                 Ok(Err(error)) => return Err(CallbackInvokeError::Rejected(error)),
                 Err(_) => {
@@ -2527,6 +2553,35 @@ mod callback_tests {
         fn dlclose(&mut self) {}
     }
 
+    fn callback_test_epoch(
+        configure: impl FnOnce(&mut CandidateRegistrationArena),
+    ) -> PipelineEpoch {
+        let token = ModuleEpochToken::new(9003);
+        let mut arena = CandidateRegistrationArena::new(token.clone());
+        configure(&mut arena);
+        let registration = arena.registration_set(BTreeSet::from(["desktop".to_owned()]));
+        let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
+            name: "desktop".to_owned(),
+            target_definition_hash: [1; 32],
+        }])
+        .unwrap();
+        PipelineEpoch::new(
+            9003,
+            StagedModule {
+                path: PathBuf::from("pipeline-test"),
+                content_hash: [9; 32],
+            },
+            token,
+            PreparedEpochRegistration {
+                target_set,
+                registration,
+                tools: BTreeMap::new(),
+                arena,
+            },
+            Box::new(NoopModule),
+        )
+    }
+
     struct Importer;
 
     impl PipelineImporter for Importer {
@@ -2565,6 +2620,80 @@ mod callback_tests {
         fn importer_capability(&mut self, _id: &str) -> Result<[u8; 32], ImportError> {
             unreachable!()
         }
+    }
+
+    struct ReadsImportContext;
+
+    impl PipelineImporter for ReadsImportContext {
+        fn import(
+            &self,
+            context: &mut dyn AuthoringImportContext,
+            _settings: &distill_json::AuthoredValue,
+        ) -> Result<ImportOutput, AuthoringImporterError> {
+            let _ = context.read("source.asset");
+            Ok(ImportOutput::new())
+        }
+    }
+
+    struct PanickingImportContext;
+
+    impl AuthoringImportContext for PanickingImportContext {
+        fn sources(&self) -> &[RootedPath] {
+            &[]
+        }
+
+        fn read(&mut self, _path: &str) -> Result<Vec<u8>, ImportError> {
+            panic!("daemon import read panicked")
+        }
+
+        fn probe(&mut self, _path: &str) -> Result<bool, ImportError> {
+            unreachable!()
+        }
+
+        fn enumerate(&mut self, _query: &FileQuery) -> Result<Vec<RootedPath>, ImportError> {
+            unreachable!()
+        }
+
+        fn importer_capability(&mut self, _id: &str) -> Result<[u8; 32], ImportError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn import_host_callback_panic_is_typed_without_poisoning_the_epoch() {
+        let epoch = callback_test_epoch(|arena| {
+            arena
+                .register_importer(
+                    ImporterDescriptor {
+                        id: "reads".into(),
+                        version: 1,
+                        settings_type_uuid: TypeUuid([1; 16]),
+                        settings_schema: LogicalSchema {
+                            root: SchemaNode::Unit,
+                        },
+                        default_settings: distill_json::AuthoredValue::Null,
+                    },
+                    ReadsImportContext,
+                )
+                .into_result()
+                .unwrap();
+        });
+
+        assert!(matches!(
+            epoch.invoke_importer(
+                "reads",
+                &mut PanickingImportContext,
+                &distill_json::AuthoredValue::Null,
+            ),
+            Err(CallbackInvokeError::HostRejected(detail))
+                if detail.contains("import-context")
+        ));
+        let status = epoch.status();
+        assert!(status.accepting_new_work);
+        assert!(!status.poisoned);
+
+        epoch.begin_drain();
+        assert!(unload_epoch(&epoch).is_ok());
     }
 
     struct Process;
@@ -2679,6 +2808,54 @@ mod callback_tests {
                 value: distill_json::AuthoredValue::UInt(17),
             }))
         }
+    }
+
+    struct ReadsCodegenContext;
+
+    impl PipelineCodegen for ReadsCodegenContext {
+        fn generate(
+            &self,
+            context: &mut dyn PipelineCodegenContext,
+        ) -> Result<Vec<GeneratedFile>, CodegenFailure> {
+            let _ = context.read(AssetUuid([7; 16]));
+            Ok(Vec::new())
+        }
+    }
+
+    struct PanickingCodegenContext;
+
+    impl PipelineCodegenContext for PanickingCodegenContext {
+        fn read(&mut self, _asset: AssetUuid) -> Result<Option<CodegenAsset>, CodegenContextError> {
+            panic!("daemon codegen read panicked")
+        }
+    }
+
+    #[test]
+    fn codegen_host_callback_panic_is_typed_without_poisoning_the_epoch() {
+        let epoch = callback_test_epoch(|arena| {
+            arena
+                .register_codegen(
+                    CodegenDescriptor {
+                        id: "reads".into(),
+                        version: 1,
+                    },
+                    ReadsCodegenContext,
+                )
+                .into_result()
+                .unwrap();
+        });
+
+        assert!(matches!(
+            epoch.invoke_codegens(&mut PanickingCodegenContext),
+            Err(CallbackInvokeError::HostRejected(detail))
+                if detail.contains("codegen-context")
+        ));
+        let status = epoch.status();
+        assert!(status.accepting_new_work);
+        assert!(!status.poisoned);
+
+        epoch.begin_drain();
+        assert!(unload_epoch(&epoch).is_ok());
     }
 
     struct Defaults;

@@ -119,6 +119,7 @@ pub enum PublicationGroupKind {
     Import = 4,
     DiskMigration = 5,
     Codegen = 6,
+    SchemaRepair = 7,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +259,7 @@ impl Store {
                 4 => PublicationGroupKind::Import,
                 5 => PublicationGroupKind::DiskMigration,
                 6 => PublicationGroupKind::Codegen,
+                7 => PublicationGroupKind::SchemaRepair,
                 _ => {
                     return Err(StoreError::BadIntent {
                         intent_id: group_id,

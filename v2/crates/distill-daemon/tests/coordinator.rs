@@ -6,20 +6,21 @@ use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination};
-use distill_daemon::scanner::AssetRoot;
+use distill_daemon::scanner::{AssetRoot, ScanDiagnostic};
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringInspectResult, AuthoringOp,
-    AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest, Delta, MetadataCall,
-    MetadataNamespaceCall, StreamEvent, TargetDefinition, TargetDefinitionHash,
+    AuthoringValue as RpcAuthoringValue, ConnectOutcome, ConnectRequest, Delta, DoctorRequest,
+    LongRunningOp, MetadataCall, MetadataNamespaceCall, PreparedOperationPublication, StreamEvent,
+    TargetDefinition, TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
-use distill_store::{Store, StoreConfig};
+use distill_store::{Store, StoreConfig, StoreError};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
     ordinary_bundle_with(73, 72, 7)
@@ -132,6 +133,15 @@ fn lineage_manifest_bundle(
     .unwrap()
 }
 
+fn add_unknown_envelope_key(bytes: &[u8]) -> Vec<u8> {
+    let mut value = distill_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
+    let AuthoredValue::Object(envelope) = &mut value else {
+        panic!("bundle envelope must be an object");
+    };
+    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
+    distill_json::write(&value).unwrap().into_bytes()
+}
+
 #[test]
 fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     let temp = tempfile::tempdir().unwrap();
@@ -187,6 +197,56 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
         Some(StreamEvent::Delta(Delta { assets, .. }))
             if assets == vec![(first_asset, distill_rpc::AssetDeltaState::Changed)]
     ));
+}
+
+#[test]
+fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(assets.join("schema")).unwrap();
+    let (ordinary, _, ordinary_asset) = ordinary_bundle();
+    std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
+    let schema_hash =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("ordinary.bundle")).unwrap())
+            .unwrap()
+            .assets["entry"]
+            .schema_hash;
+    let manifest = lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash);
+    let manifest_path = assets.join("schema/schema-lineage.bundle");
+    std::fs::write(&manifest_path, &manifest).unwrap();
+    let coordinator = coordinator(&temp);
+    coordinator.reconcile_full_scan().unwrap();
+
+    std::fs::write(&manifest_path, add_unknown_envelope_key(&manifest)).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![manifest_path.clone()],
+            renames: Vec::new(),
+        })
+        .unwrap();
+
+    {
+        let store = coordinator.store();
+        let store = store.lock().unwrap();
+        assert!(store.version_poison().unwrap().is_none());
+        assert!(matches!(
+            store.entry(AssetUuid([94; 16])).unwrap_err(),
+            StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([93; 16])
+        ));
+        assert!(store.entry(ordinary_asset).unwrap().is_some());
+    }
+
+    std::fs::write(&manifest_path, manifest).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![manifest_path],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    let store = coordinator.store();
+    let store = store.lock().unwrap();
+    assert!(store.version_poison().unwrap().is_none());
+    assert!(store.entry(AssetUuid([94; 16])).unwrap().is_some());
 }
 
 fn target() -> TargetDefinition {
@@ -465,4 +525,87 @@ fn directory_alias_publishes_configuration_poison_without_aborting_the_version()
         ConfigurationState::Poisoned { reason, .. }
             if matches!(reason.detail.as_ref(), DscpV1::DirectoryAlias { .. })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_daemon_state_alias_is_diagnosed_and_never_scanned() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(assets.join("schema")).unwrap();
+    let (ordinary, _, ordinary_asset) = ordinary_bundle();
+    let ordinary_path = assets.join("ordinary.bundle");
+    std::fs::write(&ordinary_path, ordinary).unwrap();
+    let schema_hash = distill_bundle::parse_bundle(&std::fs::read(&ordinary_path).unwrap())
+        .unwrap()
+        .assets["entry"]
+        .schema_hash;
+    std::fs::write(
+        assets.join("schema/schema-lineage.bundle"),
+        lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash),
+    )
+    .unwrap();
+    let coordinator = Arc::new(coordinator(&temp));
+    coordinator.attach_build_backend();
+    let alias = assets.join("daemon-state-alias");
+    symlink(temp.path().join(".distill"), &alias).unwrap();
+
+    coordinator.reconcile_full_scan().unwrap();
+    assert!(matches!(
+        coordinator.scan_diagnostics().as_slice(),
+        [ScanDiagnostic::DaemonOwnedDirectoryAlias {
+            root_name,
+            normalized_path,
+            ..
+        }] if root_name == "main" && normalized_path == "daemon-state-alias"
+    ));
+    let store = coordinator.store();
+    let store = store.lock().unwrap();
+    assert!(matches!(
+        store.configuration_state().unwrap(),
+        ConfigurationState::Ready(_)
+    ));
+    assert!(store.entry(ordinary_asset).unwrap().is_some());
+    assert!(store
+        .all_files()
+        .unwrap()
+        .iter()
+        .all(|(_, path, _)| !path.starts_with("daemon-state-alias")));
+    drop(store);
+    let version = coordinator.server().current_stamp().version;
+
+    std::fs::remove_file(&alias).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![alias.clone()],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert!(coordinator.scan_diagnostics().is_empty());
+    assert_eq!(coordinator.server().current_stamp().version, version);
+    symlink(temp.path().join(".distill"), &alias).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![alias],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(coordinator.scan_diagnostics().len(), 1);
+    assert_eq!(coordinator.server().current_stamp().version, version);
+
+    let base = coordinator.server().current_stamp().version;
+    let prepared = coordinator
+        .authoring_service()
+        .prepare_operation(base, &LongRunningOp::Doctor(DoctorRequest::Verify.encode()))
+        .unwrap();
+    let PreparedOperationPublication::Deferred(operation) = prepared.publication else {
+        panic!("doctor verify must be deferred")
+    };
+    let completed = operation.complete(base).unwrap();
+    assert!(completed
+        .terminal_error
+        .as_deref()
+        .is_some_and(|error| error.contains("daemon-owned-directory-alias")));
 }

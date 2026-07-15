@@ -85,6 +85,15 @@ fn paths_are_nfc_normalized_before_sorting() {
 }
 
 #[test]
+fn target_names_are_nfc_normalized_on_write() {
+    let mut manifest = sample();
+    manifest.target.name = "te\u{301}st".into();
+
+    let decoded = decode_manifest(&encode_manifest(&manifest).unwrap()).unwrap();
+    assert_eq!(decoded.target.name, "t\u{e9}st");
+}
+
+#[test]
 fn manifest_rejects_corruption_and_truncation() {
     let bytes = encode_manifest(&sample()).unwrap();
     assert!(matches!(

@@ -1,11 +1,15 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use distill_core::id::ContentHash;
+use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
+use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash};
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
+use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
 use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
 use distill_store::state::{ConfigurationState, DscpV1, PipelineState};
 use distill_store::Store;
@@ -82,6 +86,42 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
     std::fs::write(path, serde_json::to_vec(&schema).unwrap()).unwrap();
 }
 
+fn write_empty_lineage_manifest(temp: &tempfile::TempDir) {
+    let row = BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
+        .unwrap();
+    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    let bytes = distill_bundle::write_bundle(&Bundle {
+        format_version: 1,
+        uuid: BundleUuid([93; 16]),
+        primary: None,
+        schemas: BTreeMap::from([(row.logical_hash, schema)]),
+        assets: BTreeMap::from([(
+            "manifest".to_owned(),
+            AssetEntry {
+                uuid: AssetUuid([94; 16]),
+                type_uuid: row.type_uuid,
+                schema_hash: row.logical_hash,
+                lineage: EntryLineageV1::Bootstrap {
+                    bundle_format_version: 1,
+                },
+                authoring_only: true,
+                data: distill_json::AuthoredValue::Object(BTreeMap::from([(
+                    "types".to_owned(),
+                    distill_json::AuthoredValue::Array(Vec::new()),
+                )])),
+            },
+        )]),
+    })
+    .unwrap();
+    let path = temp.path().join("assets/schema/lineage.bundle");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !predicate() {
@@ -131,6 +171,44 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
         "disabled codegen must not create its output directory"
     );
     drop(process);
+}
+
+#[cfg(unix)]
+#[test]
+fn disabled_existing_codegen_output_is_still_identity_excluded() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(&temp);
+    let output = temp.path().join("generated");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("owned.rs"), b"daemon owned").unwrap();
+    let alias = temp.path().join("assets/generated-alias");
+    symlink(&output, &alias).unwrap();
+
+    let process = DaemonProcess::start(config).unwrap();
+    assert!(process
+        .coordinator()
+        .scan_diagnostics()
+        .iter()
+        .any(|diagnostic| matches!(
+            diagnostic,
+            ScanDiagnostic::DaemonOwnedDirectoryAlias {
+                normalized_path,
+                kind: DaemonOwnedDirectoryKind::CodegenOutput,
+                ..
+            } if normalized_path == "generated-alias"
+        )));
+    assert!(process
+        .coordinator()
+        .store()
+        .lock()
+        .unwrap()
+        .all_files()
+        .unwrap()
+        .iter()
+        .all(|(_, path, _)| !path.starts_with("generated-alias")));
+    assert!(output.join("owned.rs").is_file());
 }
 
 #[test]
@@ -220,6 +298,68 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
         },
         "valid configuration did not clear its malformed-source poison",
     );
+}
+
+#[test]
+fn simultaneous_configuration_defects_choose_canonical_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let process = DaemonProcess::start(config(&temp)).unwrap();
+    let source = config_source(&temp)
+        .replace("apis = [\"vulkan\"]", "apis = []")
+        .replace("parallelism = 2", "parallelism = 0");
+    std::fs::write(temp.path().join("distill.toml"), source).unwrap();
+
+    wait_until(
+        || {
+            matches!(
+                process
+                    .coordinator()
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .configuration_state()
+                    .unwrap(),
+                ConfigurationState::Poisoned { reason, .. }
+                    if matches!(
+                        reason.detail.as_ref(),
+                        DscpV1::EmptyTargetApis { target } if target == "dev"
+                    )
+            )
+        },
+        "canonical configuration defect was not selected",
+    );
+    assert!(process.last_background_error().is_none());
+}
+
+#[test]
+fn schema_bound_target_mismatches_publish_configuration_poison() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(&temp);
+    write_empty_lineage_manifest(&temp);
+    let process = DaemonProcess::start(config).unwrap();
+    let source = config_source(&temp).replace("os = \"macos\"", "os = \"linux\"");
+    std::fs::write(temp.path().join("distill.toml"), source).unwrap();
+
+    wait_until(
+        || {
+            matches!(
+                process
+                    .coordinator()
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .configuration_state()
+                    .unwrap(),
+                ConfigurationState::Poisoned { reason, .. }
+                    if matches!(
+                        reason.detail.as_ref(),
+                        DscpV1::UnsupportedTargetIdentity { target, .. } if target == "dev"
+                    )
+            )
+        },
+        "schema-bound target mismatch was not published",
+    );
+    assert!(process.last_background_error().is_none());
 }
 
 #[test]

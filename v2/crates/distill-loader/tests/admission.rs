@@ -47,3 +47,40 @@ fn payloads_beyond_the_pinned_threshold_are_spooled() {
     assert_eq!(permit.bytes(), 200);
     assert!(permit.is_exclusive());
 }
+
+#[test]
+fn dswl_bytes_resize_the_same_fetch_reservation_and_spool_decision() {
+    let mut gate = FetchAdmission::new(100, 80);
+    let mut permit = match gate.admit(60).unwrap() {
+        Admission::Memory(permit) => permit,
+        other => panic!("unexpected {other:?}"),
+    };
+
+    assert!(gate.resize(&mut permit, 90).unwrap());
+    assert_eq!((permit.bytes(), gate.used()), (90, 90));
+    assert!(gate.should_spool(90));
+
+    assert!(gate.resize(&mut permit, 140).unwrap());
+    assert!(permit.is_exclusive());
+    assert_eq!(gate.admit(1).unwrap(), Admission::Wait);
+    gate.release(permit).unwrap();
+}
+
+#[test]
+fn resize_waits_until_other_completed_fetches_release_their_permits() {
+    let mut gate = FetchAdmission::new(100, 200);
+    let mut first = match gate.admit(40).unwrap() {
+        Admission::Memory(permit) => permit,
+        other => panic!("unexpected {other:?}"),
+    };
+    let second = match gate.admit(40).unwrap() {
+        Admission::Memory(permit) => permit,
+        other => panic!("unexpected {other:?}"),
+    };
+
+    assert!(!gate.resize(&mut first, 101).unwrap());
+    assert_eq!(first.bytes(), 40);
+    gate.release(second).unwrap();
+    assert!(gate.resize(&mut first, 101).unwrap());
+    assert!(first.is_exclusive());
+}

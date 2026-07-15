@@ -12,9 +12,7 @@ use distill_build::import::{
     fold_import, DirectoryOrigin, FileDep, FoldRequest, IdentitySource, ImportBackend,
     ImportContext, ImportError, ImportOutput, ImportRecord, ImportedBundle, ImportedEntry,
 };
-use distill_build::query::{
-    file_query_result_hash, normalize_identifier, normalize_path, FileQuery, RootName, RootedPath,
-};
+use distill_build::query::{normalize_identifier, normalize_path, FileQuery, RootName, RootedPath};
 use distill_build::trace::{
     CapabilityKey, DirectoryGrouping, LocalFailureClass, Observed, RawFileFailureClass, RawFileOp,
     RawFileSubject, StableFailureFingerprint,
@@ -125,7 +123,6 @@ pub(crate) struct DirectoryImportTask {
     settings: AuthoredValue,
     destination_root: String,
     destination_path: String,
-    listing_dep: FileDep,
 }
 
 #[derive(Debug, Clone)]
@@ -368,7 +365,7 @@ impl AuthoringService {
     /// reproduces under the current rooted filesystem and importer-capability
     /// projection. The caller reruns these under the single-writer RPC CAS.
     pub fn watched_imports_needing_reimport(&self) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(None)
+        self.watched_imports_needing_reimport_inner(None, false)
     }
 
     /// Incremental watcher variant: read sets that cannot observe any dirty
@@ -379,7 +376,15 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
         renames: &[distill_store::files::RenameEvent],
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(Some((dirty, renames)))
+        self.watched_imports_needing_reimport_inner(Some((dirty, renames)), false)
+    }
+
+    pub(crate) fn watched_imports_affected_by_capabilities(
+        &self,
+        dirty: &[distill_store::files::DirtyEntry],
+        renames: &[distill_store::files::RenameEvent],
+    ) -> Result<Vec<BundleUuid>, RpcFailure> {
+        self.watched_imports_needing_reimport_inner(Some((dirty, renames)), true)
     }
 
     fn watched_imports_needing_reimport_inner(
@@ -388,6 +393,7 @@ impl AuthoringService {
             &[distill_store::files::DirtyEntry],
             &[distill_store::files::RenameEvent],
         )>,
+        capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let store = self
             .store
@@ -413,7 +419,7 @@ impl AuthoringService {
             let mut backend =
                 RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
             if work.is_some_and(|(dirty, renames)| {
-                !read_set_intersects_work(&indexed.basis, dirty, renames)
+                !read_set_intersects_work(&indexed.basis, dirty, renames, capabilities_changed)
             }) {
                 continue;
             }
@@ -427,7 +433,7 @@ impl AuthoringService {
     }
 
     pub(crate) fn directory_import_tasks(&self) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(None)
+        self.directory_import_tasks_inner(None, false)
     }
 
     pub(crate) fn directory_import_tasks_affected_by(
@@ -435,7 +441,15 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
         renames: &[distill_store::files::RenameEvent],
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(Some((dirty, renames)))
+        self.directory_import_tasks_inner(Some((dirty, renames)), false)
+    }
+
+    pub(crate) fn directory_import_tasks_affected_by_capabilities(
+        &self,
+        dirty: &[distill_store::files::DirtyEntry],
+        renames: &[distill_store::files::RenameEvent],
+    ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
+        self.directory_import_tasks_inner(Some((dirty, renames)), true)
     }
 
     fn directory_import_tasks_inner(
@@ -444,6 +458,7 @@ impl AuthoringService {
             &[distill_store::files::DirtyEntry],
             &[distill_store::files::RenameEvent],
         )>,
+        capabilities_changed: bool,
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
         let mut store = self
             .store
@@ -515,6 +530,11 @@ impl AuthoringService {
                         &mut touched,
                         &mut touched_origins,
                     )?;
+                }
+            }
+            if capabilities_changed {
+                for entry in index.directories.values() {
+                    touch_all_directory_groups(entry, &mut touched, &mut touched_origins);
                 }
             }
         } else {
@@ -693,7 +713,7 @@ impl AuthoringService {
         task: &DirectoryImportTask,
     ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
         let (importer, invocation) = self.directory_import_invocation(base, task)?;
-        match self.execute_import(base, importer, invocation) {
+        match self.execute_import(base, importer, invocation, ImportExecutionMode::Publish) {
             Ok(prepared) => Ok(Some(prepared)),
             Err(error) if error.memoized => Ok(None),
             Err(error) => Err(error.into_rpc()),
@@ -751,7 +771,10 @@ impl AuthoringService {
                 explicit_settings: Some(task.settings.clone()),
                 watch: true,
                 origin: Some(origin),
-                basis_deps: vec![task.listing_dep.clone()],
+                // The authored rules bundle owns the directory listing. Each
+                // generated output is an independent fold whose own sources,
+                // probes, and importer capability form its read set.
+                basis_deps: Vec::new(),
             },
         ))
     }
@@ -845,6 +868,7 @@ impl AuthoringService {
                 origin: None,
                 basis_deps: Vec::new(),
             },
+            ImportExecutionMode::Publish,
         )
         .map_err(ImportExecutionError::into_rpc)
     }
@@ -853,6 +877,55 @@ impl AuthoringService {
         &self,
         base: InputVersion,
         bundle: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        self.prepare_reimport_bundle_mode(base, bundle, ImportExecutionMode::Publish)
+    }
+
+    pub(crate) fn verify_watched_import_fixpoints(
+        &self,
+        base: InputVersion,
+    ) -> Result<Vec<BundleUuid>, RpcFailure> {
+        let watched = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            require_base(&store, base)?;
+            let mut watched = Vec::new();
+            for meta in store.all_bundles().map_err(invalid)? {
+                let bundle = self.cached_bundle(&store, &meta)?;
+                let Some(record) = bundle.assets.get("$record") else {
+                    continue;
+                };
+                if record.type_uuid != IMPORT_RECORD_TYPE_UUID || !record.authoring_only {
+                    return Err(invalid(format!(
+                        "bundle {} has a malformed import record marker",
+                        meta.bundle
+                    )));
+                }
+                if decode_import_record(&record.data)?.watch {
+                    watched.push(meta.bundle);
+                }
+            }
+            watched
+        };
+        let mut failed = Vec::new();
+        for bundle in watched {
+            if self
+                .prepare_reimport_bundle_mode(base, bundle, ImportExecutionMode::Verify)
+                .is_err()
+            {
+                failed.push(bundle);
+            }
+        }
+        Ok(failed)
+    }
+
+    fn prepare_reimport_bundle_mode(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+        mode: ImportExecutionMode,
     ) -> Result<PreparedImportCommit, RpcFailure> {
         let store = self
             .store
@@ -900,6 +973,7 @@ impl AuthoringService {
                     origin: None,
                     basis_deps: Vec::new(),
                 },
+                mode,
             )
             .map_err(ImportExecutionError::into_rpc)?;
         debug_assert_eq!(prepared.bundle, bundle);
@@ -982,6 +1056,7 @@ impl AuthoringService {
                 origin: None,
                 basis_deps: Vec::new(),
             },
+            ImportExecutionMode::Publish,
         )?;
         debug_assert_eq!(prepared.bundle, bundle);
         Ok(prepared)
@@ -992,6 +1067,7 @@ impl AuthoringService {
         base: InputVersion,
         importer: RegisteredImporter,
         invocation: ImportInvocation,
+        mode: ImportExecutionMode,
     ) -> Result<PreparedImportCommit, ImportExecutionError> {
         let ImportInvocation {
             destination,
@@ -1067,8 +1143,8 @@ impl AuthoringService {
                     }
                 };
                 let message = error.message();
-                let memoized = self
-                    .record_failed_attempt(
+                let memoized = if mode == ImportExecutionMode::Publish {
+                    self.record_failed_attempt(
                         base,
                         destination.meta.as_ref(),
                         watch,
@@ -1076,7 +1152,10 @@ impl AuthoringService {
                         terminal,
                         &message,
                     )
-                    .map_err(ImportExecutionError::unmemoized)?;
+                    .map_err(ImportExecutionError::unmemoized)?
+                } else {
+                    false
+                };
                 return Err(ImportExecutionError {
                     rpc: invalid(format!("importer {:?} failed: {message}", importer.id)),
                     memoized,
@@ -1085,8 +1164,8 @@ impl AuthoringService {
         };
         if read_set.iter().any(dep_has_failure) {
             let message = "an importer cannot publish after catching a failed context observation";
-            let memoized = self
-                .record_failed_attempt(
+            let memoized = if mode == ImportExecutionMode::Publish {
+                self.record_failed_attempt(
                     base,
                     destination.meta.as_ref(),
                     watch,
@@ -1094,7 +1173,10 @@ impl AuthoringService {
                     WatchedImportTerminal::Dependency,
                     message,
                 )
-                .map_err(ImportExecutionError::unmemoized)?;
+                .map_err(ImportExecutionError::unmemoized)?
+            } else {
+                false
+            };
             return Err(ImportExecutionError {
                 rpc: invalid(message),
                 memoized,
@@ -1190,6 +1272,22 @@ impl AuthoringService {
             importer.capability_hash,
             &bytes,
         );
+        if mode == ImportExecutionMode::Verify {
+            let observed = self
+                .scanner
+                .read_identity_checked(&destination.target)
+                .map_err(invalid)
+                .map_err(ImportExecutionError::unmemoized)?;
+            if observed != bytes {
+                return Err(ImportExecutionError::unmemoized(invalid(format!(
+                    "watched import bundle {bundle} is not a byte-identical importer fixpoint"
+                ))));
+            }
+            return Ok(PreparedImportCommit {
+                bundle,
+                commit: distill_rpc::Commit::default(),
+            });
+        }
         if destination.meta.is_some() {
             store
                 .clear_watched_import_failure(bundle)
@@ -1496,6 +1594,7 @@ fn read_set_intersects_work(
     read_set: &[FileDep],
     dirty: &[distill_store::files::DirtyEntry],
     renames: &[distill_store::files::RenameEvent],
+    capabilities_changed: bool,
 ) -> bool {
     read_set.iter().any(|dependency| match dependency {
         FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
@@ -1510,7 +1609,7 @@ fn read_set_intersects_work(
                     query_matches(query, &rename.from_path) || query_matches(query, &rename.to_path)
                 })
         }
-        FileDep::Capability { .. } => false,
+        FileDep::Capability { .. } => capabilities_changed,
     })
 }
 
@@ -1683,7 +1782,6 @@ fn indexed_directory_task(
 ) -> Result<DirectoryImportTask, RpcFailure> {
     let rule = &entry.rules.rules[rule_index];
     let sources = sources.iter().cloned().collect::<Vec<_>>();
-    let listed = entry.listed.iter().cloned().collect::<Vec<_>>();
     let destination_path = render_directory_output(&rule.output, group, &sources)?;
     Ok(DirectoryImportTask {
         rules_bundle: entry.rules_bundle,
@@ -1694,10 +1792,6 @@ fn indexed_directory_task(
         settings: rule.settings.clone(),
         destination_root: group.root.0.clone(),
         destination_path,
-        listing_dep: FileDep::Listing {
-            query: entry.rules.listing.clone(),
-            observed: Observed::Ok(file_query_result_hash(&listed)),
-        },
     })
 }
 
@@ -3085,6 +3179,12 @@ struct ImportInvocation {
     basis_deps: Vec<FileDep>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportExecutionMode {
+    Publish,
+    Verify,
+}
+
 struct ImportExecutionError {
     rpc: RpcFailure,
     memoized: bool,
@@ -3169,4 +3269,36 @@ fn encode_import_basis(
     encoder.raw(&capability);
     encoder.raw(blake3::hash(proposed).as_bytes());
     encoder.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_changes_select_only_read_sets_that_record_capabilities() {
+        let capability = FileDep::Capability {
+            key: CapabilityKey::Importer("image".to_owned()),
+            observed: Observed::Ok([7; 32]),
+        };
+
+        assert!(!read_set_intersects_work(
+            std::slice::from_ref(&capability),
+            &[],
+            &[],
+            false,
+        ));
+        assert!(read_set_intersects_work(
+            std::slice::from_ref(&capability),
+            &[],
+            &[],
+            true,
+        ));
+
+        let unrelated_file = FileDep::Probe {
+            path: "unrelated.source".to_owned(),
+            observed: Observed::Ok(None),
+        };
+        assert!(!read_set_intersects_work(&[unrelated_file], &[], &[], true,));
+    }
 }

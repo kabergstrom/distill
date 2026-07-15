@@ -347,6 +347,7 @@ fn run_thread(
             request_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 IN_FLIGHT_REQUEST_LIMIT,
             )),
+            fetch_finalize_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             spool_directory: config.spool_directory,
         }
         .run()
@@ -367,6 +368,7 @@ struct Driver {
     fetch_admission: Rc<RefCell<FetchAdmission>>,
     fetch_wake: Rc<Notify>,
     request_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    fetch_finalize_slot: std::sync::Arc<tokio::sync::Semaphore>,
     spool_directory: Option<PathBuf>,
 }
 
@@ -449,6 +451,7 @@ impl Driver {
                     return true;
                 }
                 let request_slots = std::sync::Arc::clone(&self.request_slots);
+                let fetch_finalize_slot = std::sync::Arc::clone(&self.fetch_finalize_slot);
                 let hub = self.hub.clone();
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
@@ -460,6 +463,10 @@ impl Driver {
                         return;
                     };
                     let _request_slot = request_slot;
+                    let Ok(fetch_finalize_slot) = fetch_finalize_slot.acquire_owned().await else {
+                        return;
+                    };
+                    let _fetch_finalize_slot = fetch_finalize_slot;
                     let completion = fetch_event(
                         (hub, snapshot),
                         req,
@@ -798,7 +805,7 @@ async fn fetch_event(
             ))
         }
     };
-    let permit = match acquire_fetch(admission, wake, total_bytes).await {
+    let mut permit = match acquire_fetch(admission, wake, total_bytes).await {
         Ok(permit) => permit,
         Err(error) => return Completion::event(request_error(req, request_basis, error)),
     };
@@ -844,7 +851,27 @@ async fn fetch_event(
             return Completion::event(request_error(req, request_basis, error.to_string()))
         }
     };
-    match payload.finish(layout_hash, load_edges, wire_layout) {
+    let admitted_bytes = match total_bytes.checked_add(wire_layout.len()) {
+        Some(bytes) => bytes,
+        None => {
+            return Completion::event(request_error(
+                req,
+                request_basis,
+                "artifact plus DSWL length overflows this client".into(),
+            ))
+        }
+    };
+    if let Err(error) = resize_fetch(&mut permit, admitted_bytes).await {
+        return Completion::event(request_error(req, request_basis, error));
+    }
+    let spool = permit.admission.borrow().should_spool(admitted_bytes);
+    match payload.finish(
+        layout_hash,
+        load_edges,
+        wire_layout,
+        spool,
+        spool_directory.as_deref(),
+    ) {
         Ok(artifact) => Completion {
             event: IoEvent::Fetched {
                 req,
@@ -931,6 +958,27 @@ impl FetchAdmissionGuard {
     }
 }
 
+async fn resize_fetch(guard: &mut FetchAdmissionGuard, bytes: usize) -> Result<(), String> {
+    loop {
+        let notified = guard.wake.notified();
+        let resized = {
+            let permit = guard
+                .permit
+                .as_mut()
+                .expect("an admitted fetch guard always owns its permit");
+            guard
+                .admission
+                .borrow_mut()
+                .resize(permit, bytes)
+                .map_err(|error| format!("fetch admission resize failed: {error:?}"))?
+        };
+        if resized {
+            return Ok(());
+        }
+        notified.await;
+    }
+}
+
 async fn acquire_fetch(
     admission: Rc<RefCell<FetchAdmission>>,
     wake: Rc<Notify>,
@@ -970,7 +1018,7 @@ enum FetchPayload {
         blobs: Vec<Vec<u8>>,
     },
     Spool {
-        backing: ArcMappedSpool,
+        file: tempfile::NamedTempFile,
         structural: Range<usize>,
         blobs: Vec<Range<usize>>,
     },
@@ -988,10 +1036,16 @@ impl FetchPayload {
                 artifact_layout_hash(content_hash, structural, blobs)
             }
             Self::Spool {
-                backing,
+                file,
                 structural,
                 blobs,
-            } => artifact_layout_hash_backed(content_hash, backing.as_ref(), structural, blobs),
+            } => {
+                // Safety: the temporary is flushed before this point and no
+                // writer runs while this short-lived validation map exists.
+                let mapping = unsafe { memmap2::MmapOptions::new().map(file.as_file()) }
+                    .map_err(|error| format!("cannot map fetch spool: {error}"))?;
+                artifact_layout_hash_backed(content_hash, &mapping, structural, blobs)
+            }
         }
     }
 
@@ -1000,25 +1054,95 @@ impl FetchPayload {
         layout_hash: distill_core::id::LayoutHash,
         load_edges: Vec<distill_rpc::ServedLoadEdge>,
         wire_layout: std::sync::Arc<[u8]>,
+        spool: bool,
+        spool_directory: Option<&std::path::Path>,
     ) -> Result<crate::FetchedArtifact, String> {
         match self {
-            Self::Memory { structural, blobs } => {
-                fetched_artifact(layout_hash, structural, blobs, load_edges, wire_layout)
-            }
-            Self::Spool {
-                backing,
-                structural,
-                blobs,
-            } => fetched_artifact_backed(
+            Self::Memory { structural, blobs } if !spool => fetched_artifact(
                 layout_hash,
-                backing,
                 structural,
                 blobs,
                 load_edges,
-                wire_layout,
+                memory_wire_blob(wire_layout),
             ),
+            Self::Memory { structural, blobs } => spool_complete_payload(
+                layout_hash,
+                structural,
+                blobs,
+                load_edges,
+                &wire_layout,
+                spool_directory,
+            ),
+            Self::Spool {
+                mut file,
+                structural,
+                blobs,
+            } => {
+                let wire_start = structural.len() + blobs.iter().map(Range::len).sum::<usize>();
+                file.write_all(&wire_layout)
+                    .map_err(|error| format!("cannot write DSWL fetch spool: {error}"))?;
+                file.flush()
+                    .map_err(|error| format!("cannot flush fetch spool: {error}"))?;
+                let backing = map_spool(file)?;
+                let wire = distill_wire::exec::Blob::new(
+                    std::sync::Arc::clone(&backing),
+                    wire_start,
+                    wire_layout.len(),
+                );
+                fetched_artifact_backed(layout_hash, backing, structural, blobs, load_edges, wire)
+            }
         }
     }
+}
+
+fn memory_wire_blob(bytes: std::sync::Arc<[u8]>) -> distill_wire::exec::Blob {
+    let len = bytes.len();
+    let backing: ArcMappedSpool = std::sync::Arc::new(bytes);
+    distill_wire::exec::Blob::new(backing, 0, len)
+}
+
+fn spool_complete_payload(
+    layout_hash: distill_core::id::LayoutHash,
+    structural: Vec<u8>,
+    blobs: Vec<Vec<u8>>,
+    load_edges: Vec<distill_rpc::ServedLoadEdge>,
+    wire_layout: &[u8],
+    directory: Option<&std::path::Path>,
+) -> Result<crate::FetchedArtifact, String> {
+    let mut file = create_spool(directory)?;
+    file.write_all(&structural)
+        .map_err(|error| format!("cannot write fetch spool: {error}"))?;
+    let structural_range = 0..structural.len();
+    let mut cursor = structural.len();
+    let mut blob_ranges = Vec::with_capacity(blobs.len());
+    for blob in blobs {
+        let end = cursor
+            .checked_add(blob.len())
+            .ok_or_else(|| "fetch spool length overflow".to_owned())?;
+        file.write_all(&blob)
+            .map_err(|error| format!("cannot write fetch spool: {error}"))?;
+        blob_ranges.push(cursor..end);
+        cursor = end;
+    }
+    let wire_start = cursor;
+    file.write_all(wire_layout)
+        .map_err(|error| format!("cannot write DSWL fetch spool: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("cannot flush fetch spool: {error}"))?;
+    let backing = map_spool(file)?;
+    let wire = distill_wire::exec::Blob::new(
+        std::sync::Arc::clone(&backing),
+        wire_start,
+        wire_layout.len(),
+    );
+    fetched_artifact_backed(
+        layout_hash,
+        backing,
+        structural_range,
+        blob_ranges,
+        load_edges,
+        wire,
+    )
 }
 
 struct MappedSpool {
@@ -1040,11 +1164,7 @@ async fn spool_remote_chunks(
     if total_bytes == 0 {
         return Err("artifact stream cannot be empty".into());
     }
-    let mut file = match directory {
-        Some(directory) => tempfile::NamedTempFile::new_in(directory),
-        None => tempfile::NamedTempFile::new(),
-    }
-    .map_err(|error| format!("cannot create fetch spool: {error}"))?;
+    let mut file = create_spool(directory)?;
     let mut structural = 0usize..0usize;
     let mut blobs = Vec::<Range<usize>>::new();
     let mut total = 0usize;
@@ -1100,18 +1220,30 @@ async fn spool_remote_chunks(
     }
     file.flush()
         .map_err(|error| format!("cannot flush fetch spool: {error}"))?;
+    Ok(FetchPayload::Spool {
+        file,
+        structural,
+        blobs,
+    })
+}
+
+fn create_spool(directory: Option<&std::path::Path>) -> Result<tempfile::NamedTempFile, String> {
+    match directory {
+        Some(directory) => tempfile::NamedTempFile::new_in(directory),
+        None => tempfile::NamedTempFile::new(),
+    }
+    .map_err(|error| format!("cannot create fetch spool: {error}"))
+}
+
+fn map_spool(file: tempfile::NamedTempFile) -> Result<ArcMappedSpool, String> {
     // Safety: the file is retained by MappedSpool and is never mutated after
     // this point. Every exposed range is checked before Blob construction.
     let mapping = unsafe { memmap2::MmapOptions::new().map(file.as_file()) }
         .map_err(|error| format!("cannot map fetch spool: {error}"))?;
-    Ok(FetchPayload::Spool {
-        backing: std::sync::Arc::new(MappedSpool {
-            mapping,
-            _file: file,
-        }),
-        structural,
-        blobs,
-    })
+    Ok(std::sync::Arc::new(MappedSpool {
+        mapping,
+        _file: file,
+    }))
 }
 
 fn remote_request_event<T: std::fmt::Debug>(

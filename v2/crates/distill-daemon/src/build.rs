@@ -44,7 +44,8 @@ use distill_rpc::{
     ArtifactPayloadBackend, AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication,
     BuildBackend, BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree,
     BuildWorkClass, Commit, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure,
-    ServedLoadEdge, TagPoisonMutation, TagProjectionMutation,
+    RuntimeTypePolicy, RuntimeTypePolicyRequest, ServedLoadEdge, TagPoisonMutation,
+    TagProjectionMutation,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
 use distill_store::artifacts::PinKind;
@@ -228,6 +229,52 @@ impl BuildBackend for CoordinatorBuildBackend {
                 })
             }
         }
+    }
+
+    fn runtime_type_policy(
+        &self,
+        request: &RuntimeTypePolicyRequest,
+    ) -> Result<RuntimeTypePolicy, RpcFailure> {
+        let coordinator =
+            self.coordinator
+                .upgrade()
+                .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
+                    operation: "runtime type-policy coordinator stopped".to_owned(),
+                })?;
+        let target =
+            coordinator
+                .build_target(&request.target)
+                .ok_or_else(|| RpcFailure::InvalidQuery {
+                    detail: format!(
+                        "runtime type-policy target {} is not published",
+                        request.target
+                    ),
+                })?;
+        if distill_build::keys::target_definition_hash(&target) != request.target_definition.0 {
+            return Err(RpcFailure::InvalidQuery {
+                detail: format!(
+                    "runtime type-policy target definition changed for {}",
+                    request.target
+                ),
+            });
+        }
+        let authority = coordinator.schema_authority().ok_or_else(|| {
+            RpcFailure::AuthoringBackendUnavailable {
+                operation: "runtime type-policy schema authority is not published".to_owned(),
+            }
+        })?;
+        let project =
+            authority
+                .project_type(request.type_uuid)
+                .ok_or_else(|| RpcFailure::InvalidQuery {
+                    detail: format!(
+                        "runtime type {} has no published schema authority",
+                        request.type_uuid
+                    ),
+                })?;
+        Ok(RuntimeTypePolicy {
+            build_only: project.build_only,
+        })
     }
 
     fn build_finished(&self, request: &BuildRequest) -> Result<(), RpcFailure> {
@@ -460,6 +507,140 @@ struct BuildContext {
     visiting: BTreeSet<AssetUuid>,
     callback_chain: Vec<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodePublication>,
+    verify_fresh: bool,
+}
+
+struct CurrentLoadRuntime<'a> {
+    store: &'a Arc<Mutex<Store>>,
+    store_instance: distill_store::state::StoreInstanceId,
+    drifted_input: &'a DriftedInput,
+    pipeline: &'a PipelineSnapshot,
+    basis: distill_store::state::InputVersion,
+}
+
+impl<'a> CurrentLoadRuntime<'a> {
+    fn from_build(context: &'a BuildContext) -> Self {
+        Self {
+            store: &context.store,
+            store_instance: context.store_instance,
+            drifted_input: &context.drifted_input,
+            pipeline: &context.pipeline,
+            basis: context.basis,
+        }
+    }
+}
+
+fn lock_current_load_store<'a>(
+    runtime: &'a CurrentLoadRuntime<'_>,
+) -> Result<MutexGuard<'a, Store>, BuildError> {
+    let store = runtime
+        .store
+        .lock()
+        .map_err(|_| BuildError::Infrastructure("durable store mutex is poisoned".to_owned()))?;
+    if store.instance_id() != runtime.store_instance || store.input_version() != runtime.basis {
+        return Err(BuildError::Drifted(runtime.drifted_input.clone()));
+    }
+    Ok(store)
+}
+
+pub(crate) struct CurrentDiskValue {
+    pub(crate) value: AuthoredValue,
+    pub(crate) schema: distill_schema::ngp_schema::LogicalSchema,
+    pub(crate) schema_hash: LogicalHash,
+    pub(crate) lineage: distill_bundle::LineageStamp,
+}
+
+pub(crate) struct CurrentLoadService {
+    store: Arc<Mutex<Store>>,
+    store_instance: distill_store::state::StoreInstanceId,
+    basis: distill_store::state::InputVersion,
+    pipeline: PipelineSnapshot,
+    source: CurrentLoadSource,
+}
+
+impl CurrentLoadService {
+    pub(crate) fn capture(
+        coordinator: &DaemonCoordinator,
+        basis: distill_store::state::InputVersion,
+    ) -> Result<Self, String> {
+        let store = coordinator.store();
+        let scanner = coordinator.scanner();
+        let pipeline = coordinator.pipeline_snapshot();
+        let (store_instance, source) = {
+            let durable = store
+                .lock()
+                .map_err(|_| "durable store mutex is poisoned".to_owned())?;
+            if durable.input_version() != basis {
+                return Err(format!(
+                    "disk-migration basis drifted: expected {basis:?}, observed {:?}",
+                    durable.input_version()
+                ));
+            }
+            let ready = pipeline.epoch().ok();
+            let dylib_hash = ready.map(PipelineEpoch::dylib_hash);
+            let source = CurrentLoadSource::capture(&durable, &scanner, ready, dylib_hash)
+                .map_err(|error| format!("capture current-load inputs: {error:?}"))?;
+            (durable.instance_id(), source)
+        };
+        Ok(Self {
+            store,
+            store_instance,
+            basis,
+            pipeline,
+            source,
+        })
+    }
+
+    pub(crate) fn load(
+        &self,
+        entry: &AssetEntry,
+        bundle: &Bundle,
+        bundle_path: &str,
+    ) -> Result<CurrentDiskValue, String> {
+        let drifted_input = DriftedInput::File(bundle_path.to_owned());
+        let runtime = CurrentLoadRuntime {
+            store: &self.store,
+            store_instance: self.store_instance,
+            drifted_input: &drifted_input,
+            pipeline: &self.pipeline,
+            basis: self.basis,
+        };
+        let (lineage, schema_hash, schema) = {
+            let durable = lock_current_load_store(&runtime)
+                .map_err(|error| format!("read current schema: {error:?}"))?;
+            let lineage = durable
+                .current_lineage_stamp(entry.type_uuid)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("type {} has no accepted lineage", entry.type_uuid))?;
+            let schema_hash = lineage
+                .selected_digest()
+                .ok_or_else(|| "accepted lineage cursor is out of range".to_owned())?;
+            let snapshot = durable
+                .schema(schema_hash)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "store omitted the accepted current schema snapshot".to_owned())?;
+            let schema = distill_schema::ngp_schema::verify_snapshot(&snapshot, schema_hash)
+                .map_err(|error| error.to_string())?;
+            (lineage, schema_hash, schema)
+        };
+        let mut trace = Vec::new();
+        let value = load_current_entry(
+            &runtime,
+            entry,
+            bundle,
+            &schema,
+            schema_hash,
+            &self.source,
+            &mut trace,
+        )
+        .map_err(|error| format!("load asset {} at current schema: {error:?}", entry.uuid))?;
+        Ok(CurrentDiskValue {
+            value,
+            schema,
+            schema_hash,
+            lineage,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -820,6 +1001,14 @@ fn build_with_runtime(
     coordinator: &DaemonCoordinator,
     request: &BuildRequest,
 ) -> Result<BuildPublication, BuildError> {
+    build_with_runtime_mode(coordinator, request, false)
+}
+
+fn build_with_runtime_mode(
+    coordinator: &DaemonCoordinator,
+    request: &BuildRequest,
+    verify_fresh: bool,
+) -> Result<BuildPublication, BuildError> {
     let authority = coordinator.schema_authority().ok_or_else(|| {
         BuildError::Failed("project schema authority is not published".to_owned())
     })?;
@@ -912,6 +1101,7 @@ fn build_with_runtime(
         visiting: BTreeSet::new(),
         callback_chain: Vec::new(),
         memo: BTreeMap::new(),
+        verify_fresh,
     };
     let root = build_asset(&mut context, request.entry.uuid)?;
     ensure_build_basis(&context)?;
@@ -938,6 +1128,67 @@ fn build(
     coordinator.run_scheduled(WorkClass::Interactive, move || {
         build_with_runtime(&job_coordinator, &request)
     })
+}
+
+pub(crate) fn doctor_verify_builds(
+    coordinator: &Arc<DaemonCoordinator>,
+) -> Result<Vec<String>, String> {
+    let requests = match coordinator.server().verification_build_requests() {
+        Ok(requests) => requests,
+        Err(error) => {
+            return Ok(vec![format!(
+                "build verification is unavailable for the current authority state: {error:?}"
+            )])
+        }
+    };
+    let mut defects = Vec::new();
+    for request in requests {
+        let run = |request: BuildRequest, verify_fresh| {
+            let job_coordinator = Arc::clone(coordinator);
+            coordinator.run_scheduled(WorkClass::Batch, move || {
+                build_with_runtime_mode(&job_coordinator, &request, verify_fresh)
+            })
+        };
+        let published = run(request.clone(), false);
+        let first = run(request.clone(), true);
+        let second = run(request.clone(), true);
+        match (published, first, second) {
+            (Ok(published), Ok(first), Ok(second))
+                if published == first && first == second => {}
+            (Ok(published), Ok(first), Ok(second)) if first == second => defects.push(format!(
+                "asset {} target {:?} fresh rebuild differs from the published artifact set: published root {}, rebuilt root {}",
+                request.requested_asset,
+                request.target,
+                published.root_content_hash,
+                first.root_content_hash
+            )),
+            (Ok(_), Ok(_), Ok(_)) => defects.push(format!(
+                "asset {} target {:?} produced different fresh rebuild publications",
+                request.requested_asset, request.target
+            )),
+            (Err(published), Err(first), Err(second)) => {
+                let published = format!("{published:?}");
+                let first = format!("{first:?}");
+                let second = format!("{second:?}");
+                if published == first && first == second {
+                    defects.push(format!(
+                        "asset {} target {:?} failed reproducibly: {first}",
+                        request.requested_asset, request.target
+                    ));
+                } else {
+                    defects.push(format!(
+                        "asset {} target {:?} produced different rebuild failures: {first}; {second}",
+                        request.requested_asset, request.target
+                    ));
+                }
+            }
+            (published, first, second) => defects.push(format!(
+                "asset {} target {:?} changed published/fresh rebuild outcome: {published:?}; {first:?}; {second:?}",
+                request.requested_asset, request.target
+            )),
+        }
+    }
+    Ok(defects)
 }
 
 /// Finish §10 tag indexing against a namespace that has advanced durably but
@@ -1076,6 +1327,7 @@ fn try_refine_published_tag_index(
             visiting: BTreeSet::new(),
             callback_chain: Vec::new(),
             memo: BTreeMap::new(),
+            verify_fresh: false,
         };
         for asset in assets {
             let indexed = index_one_tag_entry(&mut context, asset, tag_epoch);
@@ -1494,8 +1746,10 @@ fn process_chain(
     imported: EncodedNodeOutput,
     current_value: Option<AuthoredValue>,
 ) -> Result<Vec<EncodedNodeOutput>, BuildError> {
-    if let Some(outputs) = hydrate_complete_chain(context, loaded, chain, &imported)? {
-        return Ok(outputs);
+    if !context.verify_fresh {
+        if let Some(outputs) = hydrate_complete_chain(context, loaded, chain, &imported)? {
+            return Ok(outputs);
+        }
     }
 
     let mut current_value = match current_value {
@@ -1558,12 +1812,16 @@ fn run_processor_stage(
         .epoch()
         .map_err(|poison| BuildError::Failed(poison.to_string()))?
         .clone();
+    let verify_fresh = context.verify_fresh;
     let mut process_context = BuildProcessContext::new(
         context,
         loaded.meta.bundle,
         loaded.entry.uuid,
         stage.registration.outputs.clone(),
     );
+    if verify_fresh {
+        process_context.cacheable = false;
+    }
     let outcome =
         epoch.invoke_processor(&stage.registration.id, current_value, &mut process_context);
     let (mut trace, cacheable, context_error) = process_context.finish();
@@ -1626,19 +1884,17 @@ fn run_processor_stage(
                 return Err(error);
             }
         };
-    if cacheable {
-        if let Some((cached_outputs, cached_debug)) = cached.as_ref() {
-            ensure_cached_stage_matches(cached_outputs, cached_debug, &encoded, &products.debug)?;
-        } else {
-            commit_processor_stage(
-                context,
-                loaded,
-                static_inputs,
-                &trace,
-                &encoded,
-                &products.debug,
-            )?;
-        }
+    if let Some((cached_outputs, cached_debug)) = cached.as_ref() {
+        ensure_cached_stage_matches(cached_outputs, cached_debug, &encoded, &products.debug)?;
+    } else if cacheable {
+        commit_processor_stage(
+            context,
+            loaded,
+            static_inputs,
+            &trace,
+            &encoded,
+            &products.debug,
+        )?;
     }
     let next = products
         .primary
@@ -1735,7 +1991,9 @@ fn hydrate_processor_stage(
     let key = static_inputs_digest(static_inputs);
     preload_persisted_reads(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
     let trace_source = capture_trace_source(context)?;
-    let hit = {
+    let hit = if context.verify_fresh {
+        None
+    } else {
         let mut store = lock_build_store(context)?;
         lookup_persisted_candidate(
             &mut store,
@@ -2467,6 +2725,26 @@ impl DefaultProvider for EpochDefaults<'_> {
     }
 }
 
+struct NoMigrationDefaults;
+
+impl DefaultProvider for NoMigrationDefaults {
+    fn field_default(
+        &self,
+        _to_schema: &distill_schema::ngp_schema::SchemaNode,
+        _at: &FieldPath,
+    ) -> Option<AuthoredValue> {
+        None
+    }
+
+    fn parent_default(
+        &self,
+        _to_schema: &distill_schema::ngp_schema::SchemaNode,
+        _at: &FieldPath,
+    ) -> Option<AuthoredValue> {
+        None
+    }
+}
+
 fn migration_ops_use_defaults(ops: &[MigrationOp]) -> bool {
     ops.iter().any(|op| match op {
         MigrationOp::WriteFieldDefault { .. } | MigrationOp::WriteParentDefault { .. } => true,
@@ -2507,6 +2785,7 @@ fn migration_key_inputs(
             return Ok((migrations, None));
         }
         let records = source
+            .current_load
             .migration_controls
             .values()
             .filter(|record| {
@@ -2714,39 +2993,59 @@ fn load_current_value(
     trace_source: &StoreTraceSource,
     trace: &mut Vec<TraceOp>,
 ) -> Result<AuthoredValue, BuildError> {
-    if loaded.entry.schema_hash == project.logical_hash {
-        return Ok(loaded.entry.data.clone());
-    }
     let bundle = distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
+    load_current_entry(
+        &CurrentLoadRuntime::from_build(context),
+        &loaded.entry,
+        &bundle,
+        &project.logical_schema,
+        project.logical_hash,
+        &trace_source.current_load,
+        trace,
+    )
+}
+
+fn load_current_entry(
+    runtime: &CurrentLoadRuntime<'_>,
+    entry: &AssetEntry,
+    bundle: &Bundle,
+    current_schema: &distill_schema::ngp_schema::LogicalSchema,
+    current_hash: LogicalHash,
+    trace_source: &CurrentLoadSource,
+    trace: &mut Vec<TraceOp>,
+) -> Result<AuthoredValue, BuildError> {
+    if entry.schema_hash == current_hash {
+        return Ok(entry.data.clone());
+    }
     let old = bundle
         .schemas
-        .get(&loaded.entry.schema_hash)
+        .get(&entry.schema_hash)
         .ok_or_else(|| {
             BuildError::Failed("bundle omitted the entry's old schema snapshot".to_owned())
         })?
         .clone();
     let selected = select_migration_chain(
         trace_source,
-        loaded.entry.type_uuid,
-        loaded.entry.schema_hash,
-        project.logical_hash,
+        entry.type_uuid,
+        entry.schema_hash,
+        current_hash,
         trace,
     )?;
-    let mut value = loaded.entry.data.clone();
+    let mut value = entry.data.clone();
     let mut schema = old;
-    let mut node = loaded.entry.schema_hash;
-    let mut tail_stamp = match &loaded.entry.lineage {
+    let mut node = entry.schema_hash;
+    let mut tail_stamp = match &entry.lineage {
         EntryLineageV1::Manifest(stamp) => Some(stamp.clone()),
         EntryLineageV1::Bootstrap { .. } => None,
     };
     let last_custom_edge = selected.edges.last().map(|edge| edge.asset);
     for edge in selected.edges {
-        if edge.target_type_uuid != loaded.entry.type_uuid
+        if edge.target_type_uuid != entry.type_uuid
             || edge.from_hash != node
             || edge.from_schema != schema
         {
             return Err(migration_plan_error(
-                loaded.entry.type_uuid,
+                entry.type_uuid,
                 node,
                 edge.to_hash,
                 MigrationPlanFailureV1::NonConformingOutput {
@@ -2759,25 +3058,18 @@ fn load_current_value(
                 ),
             ));
         }
-        value = execute_custom_migration(
-            context,
-            trace_source,
-            trace,
-            loaded.entry.uuid,
-            &edge,
-            value,
-        )?;
+        value = execute_custom_migration(runtime, trace_source, trace, entry.uuid, &edge, value)?;
         schema = edge.to_schema.clone();
         node = edge.to_hash;
         tail_stamp = Some(edge.to_lineage.clone());
     }
-    if node == project.logical_hash {
-        if schema != project.logical_schema {
-            let edge = last_custom_edge.unwrap_or(loaded.entry.uuid);
+    if node == current_hash {
+        if schema != *current_schema {
+            let edge = last_custom_edge.unwrap_or(entry.uuid);
             return Err(migration_plan_error(
-                loaded.entry.type_uuid,
-                loaded.entry.schema_hash,
-                project.logical_hash,
+                entry.type_uuid,
+                entry.schema_hash,
+                current_hash,
                 MigrationPlanFailureV1::NonConformingOutput {
                     edge,
                     path: FieldPath::root(),
@@ -2789,44 +3081,39 @@ fn load_current_value(
     }
     if !selected.needs_automatic_tail {
         return Err(migration_plan_error(
-            loaded.entry.type_uuid,
+            entry.type_uuid,
             node,
-            project.logical_hash,
+            current_hash,
             MigrationPlanFailureV1::MissingReverseEdge {
                 missing_from: node,
-                missing_to: project.logical_hash,
+                missing_to: current_hash,
             },
             "Migration chain stopped before the current schema",
         ));
     }
-    let placement = lock_build_store(context)?
-        .classify_lineage(
-            loaded.entry.type_uuid,
-            node,
-            tail_stamp,
-            project.logical_hash,
-        )
+    let placement = lock_current_load_store(runtime)?
+        .classify_lineage(entry.type_uuid, node, tail_stamp, current_hash)
         .map_err(BuildError::infrastructure)?;
     if !placement.permits_automatic_diff() {
         return Err(migration_plan_error(
-            loaded.entry.type_uuid,
+            entry.type_uuid,
             node,
-            project.logical_hash,
+            current_hash,
             MigrationPlanFailureV1::MissingReverseEdge {
                 missing_from: node,
-                missing_to: project.logical_hash,
+                missing_to: current_hash,
             },
             format!(
                 "asset {} cannot automatically migrate the custom-chain tail from {} to {}: {placement:?}",
-                loaded.entry.uuid, node, project.logical_hash
+                entry.uuid, node, current_hash
             ),
         ));
     }
-    let plan = plan_automatic(&schema.root, &project.logical_schema.root).map_err(|error| {
+    let plan = plan_automatic(&schema.root, &current_schema.root).map_err(|error| {
         migration_plan_error(
-            loaded.entry.type_uuid,
+            entry.type_uuid,
             node,
-            project.logical_hash,
+            current_hash,
             MigrationPlanFailureV1::MissingPath {
                 path: FieldPath::root(),
             },
@@ -2836,14 +3123,14 @@ fn load_current_value(
     validate_plan(
         &plan,
         &schema.root,
-        &project.logical_schema.root,
+        &current_schema.root,
         EdgeKind::Automatic,
     )
     .map_err(|errors| {
         migration_plan_error(
-            loaded.entry.type_uuid,
+            entry.type_uuid,
             node,
-            project.logical_hash,
+            current_hash,
             MigrationPlanFailureV1::MissingPath {
                 path: FieldPath::root(),
             },
@@ -2851,8 +3138,9 @@ fn load_current_value(
         )
     })?;
 
-    if migration_ops_use_defaults(&plan) {
-        let key = CapabilityKey::DefaultTable(loaded.entry.type_uuid);
+    let uses_defaults = migration_ops_use_defaults(&plan);
+    if uses_defaults {
+        let key = CapabilityKey::DefaultTable(entry.type_uuid);
         let observed = trace_source.capability(&key);
         trace.push(TraceOp::Capability {
             key,
@@ -2865,39 +3153,53 @@ fn load_current_value(
         }
     }
 
-    let epoch = context
-        .pipeline
-        .epoch()
-        .map_err(|poison| BuildError::Failed(poison.to_string()))?;
-    let defaults = EpochDefaults::new(epoch, loaded.entry.type_uuid);
-    let migrated = execute_ops(
-        &plan,
-        &value,
-        &schema.root,
-        &project.logical_schema.root,
-        &defaults,
-    )
-    .map_err(|error| {
-        if let Some(callback) = defaults.take_error() {
-            BuildError::Failed(format!("default callback failed: {callback}"))
-        } else {
+    let migrated = if uses_defaults {
+        let epoch = runtime
+            .pipeline
+            .epoch()
+            .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+        let defaults = EpochDefaults::new(epoch, entry.type_uuid);
+        execute_ops(&plan, &value, &schema.root, &current_schema.root, &defaults)
+            .map_err(|error| {
+                if let Some(callback) = defaults.take_error() {
+                    BuildError::Failed(format!("default callback failed: {callback}"))
+                } else {
+                    migration_plan_error(
+                        entry.type_uuid,
+                        node,
+                        current_hash,
+                        migration_execution_failure(&error),
+                        error.to_string(),
+                    )
+                }
+            })?
+            .value
+    } else {
+        execute_ops(
+            &plan,
+            &value,
+            &schema.root,
+            &current_schema.root,
+            &NoMigrationDefaults,
+        )
+        .map_err(|error| {
             migration_plan_error(
-                loaded.entry.type_uuid,
+                entry.type_uuid,
                 node,
-                project.logical_hash,
+                current_hash,
                 migration_execution_failure(&error),
                 error.to_string(),
             )
-        }
-    })?
-    .value;
-    conforms(&migrated, &project.logical_schema.root).map_err(|error| {
+        })?
+        .value
+    };
+    conforms(&migrated, &current_schema.root).map_err(|error| {
         migration_plan_error(
-            loaded.entry.type_uuid,
+            entry.type_uuid,
             node,
-            project.logical_hash,
+            current_hash,
             MigrationPlanFailureV1::NonConformingOutput {
-                edge: last_custom_edge.unwrap_or(loaded.entry.uuid),
+                edge: last_custom_edge.unwrap_or(entry.uuid),
                 path: FieldPath::root(),
             },
             format!("migrated value is non-conforming: {error}"),
@@ -2912,7 +3214,7 @@ struct SelectedMigrationChain {
 }
 
 fn select_migration_chain(
-    source: &StoreTraceSource,
+    source: &CurrentLoadSource,
     type_uuid: TypeUuid,
     start: LogicalHash,
     target: LogicalHash,
@@ -3010,8 +3312,8 @@ fn select_migration_chain(
 }
 
 fn execute_custom_migration(
-    context: &BuildContext,
-    source: &StoreTraceSource,
+    runtime: &CurrentLoadRuntime<'_>,
+    source: &CurrentLoadSource,
     trace: &mut Vec<TraceOp>,
     asset: AssetUuid,
     edge: &MigrationControlValue,
@@ -3039,17 +3341,12 @@ fn execute_custom_migration(
                     ),
                 )
             })?;
-            let epoch = context
-                .pipeline
-                .epoch()
-                .map_err(|poison| BuildError::Failed(poison.to_string()))?;
-            let defaults = EpochDefaults::new(epoch, edge.target_type_uuid);
             execute_ops(
                 ops,
                 &input,
                 &edge.from_schema.root,
                 &edge.to_schema.root,
-                &defaults,
+                &NoMigrationDefaults,
             )
             .map_err(|error| {
                 migration_plan_error(
@@ -3074,7 +3371,7 @@ fn execute_custom_migration(
                     "Migration function capability {key:?} is unavailable: {error:?}"
                 )));
             }
-            match context
+            match runtime
                 .pipeline
                 .epoch()
                 .map_err(|poison| BuildError::Failed(poison.to_string()))?
@@ -3197,7 +3494,9 @@ fn encode_or_hydrate(
                     BuildError::Deterministic { facts, .. } => Some(facts.as_ref()),
                     _ => None,
                 };
-                if trace.last().is_some_and(TraceOp::failed) || facts.is_some() {
+                if !context.verify_fresh
+                    && (trace.last().is_some_and(TraceOp::failed) || facts.is_some())
+                {
                     commit_build_import_failure(context, loaded, key, &trace, facts)?;
                 }
                 return Err(error);
@@ -3223,21 +3522,23 @@ fn encode_or_hydrate(
                 error_paths,
             };
             let detail = facts.digest().map_err(BuildError::failed)?;
-            lock_build_store(context)?
-                .commit_build(BuildCommit {
-                    key_kind: KeyKind::BuildImport,
-                    static_input_key: key,
-                    asset_uuid: loaded.entry.uuid,
-                    static_inputs_canonical: Vec::new(),
-                    trace: trace_payload_bytes(&trace),
-                    outcome: CommitOutcome::Failure {
-                        cause: StoreFailureCause::Local(StoreFailureFingerprint::Local {
-                            class: StoreLocalFailureClass::Validator,
-                            detail,
-                        }),
-                    },
-                })
-                .map_err(BuildError::infrastructure)?;
+            if !context.verify_fresh {
+                lock_build_store(context)?
+                    .commit_build(BuildCommit {
+                        key_kind: KeyKind::BuildImport,
+                        static_input_key: key,
+                        asset_uuid: loaded.entry.uuid,
+                        static_inputs_canonical: Vec::new(),
+                        trace: trace_payload_bytes(&trace),
+                        outcome: CommitOutcome::Failure {
+                            cause: StoreFailureCause::Local(StoreFailureFingerprint::Local {
+                                class: StoreLocalFailureClass::Validator,
+                                detail,
+                            }),
+                        },
+                    })
+                    .map_err(BuildError::infrastructure)?;
+            }
             return Err(BuildError::Failed(format!(
                 "asset {} failed validation: {diagnostics:?}",
                 loaded.entry.uuid
@@ -3281,7 +3582,9 @@ fn encode_or_hydrate(
                 encoded_type: loaded.entry.type_uuid,
                 failure,
             });
-            if trace.last().is_some_and(TraceOp::failed) || facts.is_some() {
+            if !context.verify_fresh
+                && (trace.last().is_some_and(TraceOp::failed) || facts.is_some())
+            {
                 commit_build_import_failure(context, loaded, key, &trace, facts.as_ref())?;
             }
             return Err(match facts {
@@ -3298,24 +3601,26 @@ fn encode_or_hydrate(
         loaded.entry.type_uuid,
         terminal_type,
     );
-    lock_build_store(context)?
-        .commit_build(BuildCommit {
-            key_kind: KeyKind::BuildImport,
-            static_input_key: key,
-            asset_uuid: loaded.entry.uuid,
-            static_inputs_canonical: Vec::new(),
-            trace: trace_payload_bytes(&trace),
-            outcome: CommitOutcome::Success {
-                payload_kind: PayloadKind::ImportEncoding,
-                outputs: vec![OutputSpec {
-                    output_key: String::new(),
-                    type_uuids: types,
-                    bytes: bytes.clone(),
-                }],
-                aux: Vec::new(),
-            },
-        })
-        .map_err(BuildError::infrastructure)?;
+    if !context.verify_fresh {
+        lock_build_store(context)?
+            .commit_build(BuildCommit {
+                key_kind: KeyKind::BuildImport,
+                static_input_key: key,
+                asset_uuid: loaded.entry.uuid,
+                static_inputs_canonical: Vec::new(),
+                trace: trace_payload_bytes(&trace),
+                outcome: CommitOutcome::Success {
+                    payload_kind: PayloadKind::ImportEncoding,
+                    outputs: vec![OutputSpec {
+                        output_key: String::new(),
+                        type_uuids: types,
+                        bytes: bytes.clone(),
+                    }],
+                    aux: Vec::new(),
+                },
+            })
+            .map_err(BuildError::infrastructure)?;
+    }
     Ok((bytes, references, Some(current_value)))
 }
 
@@ -3534,10 +3839,15 @@ struct StoreTraceSource {
     roles: BTreeMap<AssetUuid, EntryRole>,
     paths: BTreeMap<String, Vec<AssetUuid>>,
     tools: BTreeMap<String, [u8; 32]>,
-    capabilities: Vec<(CapabilityKey, [u8; 32])>,
-    migration_controls: BTreeMap<AssetUuid, MigrationControlRecord>,
+    current_load: CurrentLoadSource,
     content_hashes: BTreeMap<AssetUuid, ContentHash>,
     tag_poisons: BTreeMap<AssetUuid, BundleUuid>,
+}
+
+#[derive(Clone)]
+struct CurrentLoadSource {
+    capabilities: Vec<(CapabilityKey, [u8; 32])>,
+    migration_controls: BTreeMap<AssetUuid, MigrationControlRecord>,
 }
 
 struct TraceCaptureBasis<'a> {
@@ -3772,21 +4082,12 @@ impl StoreTraceSource {
         let tools = store
             .tool_hashes_at(basis.input_version)
             .map_err(BuildError::infrastructure)?;
-        let capabilities = basis
-            .epoch
-            .default_table_types()
-            .into_iter()
-            .map(CapabilityKey::DefaultTable)
-            .chain(
-                basis
-                    .epoch
-                    .migration_function_keys()
-                    .into_iter()
-                    .map(CapabilityKey::MigrationFn),
-            )
-            .map(|key| (key, basis.dylib_hash))
-            .collect();
-        let migration_controls = capture_migration_controls(store, basis.scanner)?;
+        let current_load = CurrentLoadSource::capture(
+            store,
+            basis.scanner,
+            Some(basis.epoch),
+            Some(basis.dylib_hash),
+        )?;
         let mut content_hashes = BTreeMap::new();
         for publication in basis.memo.values() {
             for output in publication.outputs.values() {
@@ -3807,21 +4108,10 @@ impl StoreTraceSource {
             roles,
             paths,
             tools,
-            capabilities,
-            migration_controls,
+            current_load,
             content_hashes,
             tag_poisons,
         })
-    }
-
-    fn migration_assets(&self, type_uuid: TypeUuid, from_hash: LogicalHash) -> Vec<AssetUuid> {
-        self.migration_controls
-            .iter()
-            .filter(|(_, record)| {
-                record.header.target_type_uuid == type_uuid && record.header.from_hash == from_hash
-            })
-            .map(|(asset, _)| *asset)
-            .collect()
     }
 
     fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
@@ -3882,6 +4172,87 @@ impl StoreTraceSource {
             })
             .map(|entry| entry.asset)
             .collect()
+    }
+}
+
+impl CurrentLoadSource {
+    fn capture(
+        store: &Store,
+        scanner: &RootedScanner,
+        epoch: Option<&PipelineEpoch>,
+        dylib_hash: Option<[u8; 32]>,
+    ) -> Result<Self, BuildError> {
+        let capabilities = match (epoch, dylib_hash) {
+            (Some(epoch), Some(dylib_hash)) => epoch
+                .default_table_types()
+                .into_iter()
+                .map(CapabilityKey::DefaultTable)
+                .chain(
+                    epoch
+                        .migration_function_keys()
+                        .into_iter()
+                        .map(CapabilityKey::MigrationFn),
+                )
+                .map(|key| (key, dylib_hash))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            capabilities,
+            migration_controls: capture_migration_controls(store, scanner)?,
+        })
+    }
+
+    fn migration_assets(&self, type_uuid: TypeUuid, from_hash: LogicalHash) -> Vec<AssetUuid> {
+        self.migration_controls
+            .iter()
+            .filter(|(_, record)| {
+                record.header.target_type_uuid == type_uuid && record.header.from_hash == from_hash
+            })
+            .map(|(asset, _)| *asset)
+            .collect()
+    }
+
+    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {
+        self.capabilities
+            .iter()
+            .find_map(|(registered, hash)| (registered == key).then_some(*hash))
+            .map_or_else(
+                || Observed::Err(StableFailureFingerprint::MissingCapability { key: key.clone() }),
+                Observed::Ok,
+            )
+    }
+
+    fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]> {
+        match query {
+            ControlQuery::MigrationEdges {
+                type_uuid,
+                from_hash,
+            } => Observed::Ok(asset_query_result_hash(
+                &self.migration_assets(*type_uuid, *from_hash),
+            )),
+            ControlQuery::DirectoryImportRuleSet => no_trace(),
+        }
+    }
+
+    fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
+        match subject {
+            ControlSubject::Migration(asset) => self
+                .migration_controls
+                .get(asset)
+                .map(|record| record.observed.clone())
+                .unwrap_or_else(|| {
+                    Observed::Err(
+                        control_failure_fingerprint(
+                            ControlFailureSubject::Read(subject.clone()),
+                            ControlFailureCode::Missing,
+                            Vec::<AssetUuid>::new(),
+                        )
+                        .expect("missing control read has valid cardinality"),
+                    )
+                }),
+            _ => no_trace(),
+        }
     }
 }
 
@@ -3954,13 +4325,7 @@ impl TraceSource for StoreTraceSource {
     }
 
     fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {
-        self.capabilities
-            .iter()
-            .find_map(|(registered, hash)| (registered == key).then_some(*hash))
-            .map_or_else(
-                || Observed::Err(StableFailureFingerprint::MissingCapability { key: key.clone() }),
-                Observed::Ok,
-            )
+        self.current_load.capability(key)
     }
 
     fn ref_check(&self, asset: AssetUuid, _expected: TypeUuid) -> Observed<Option<TypeUuid>> {
@@ -3972,35 +4337,11 @@ impl TraceSource for StoreTraceSource {
     }
 
     fn control(&self, query: &ControlQuery) -> Observed<[u8; 32]> {
-        match query {
-            ControlQuery::MigrationEdges {
-                type_uuid,
-                from_hash,
-            } => Observed::Ok(asset_query_result_hash(
-                &self.migration_assets(*type_uuid, *from_hash),
-            )),
-            ControlQuery::DirectoryImportRuleSet => no_trace(),
-        }
+        self.current_load.control(query)
     }
 
     fn control_read(&self, subject: &ControlSubject) -> Observed<ControlValueHash> {
-        match subject {
-            ControlSubject::Migration(asset) => self
-                .migration_controls
-                .get(asset)
-                .map(|record| record.observed.clone())
-                .unwrap_or_else(|| {
-                    Observed::Err(
-                        control_failure_fingerprint(
-                            ControlFailureSubject::Read(subject.clone()),
-                            ControlFailureCode::Missing,
-                            Vec::<AssetUuid>::new(),
-                        )
-                        .expect("missing control read has valid cardinality"),
-                    )
-                }),
-            _ => no_trace(),
-        }
+        self.current_load.control_read(subject)
     }
 }
 
@@ -5099,6 +5440,17 @@ mod tests {
 
         let first = build(&coordinator, &request).unwrap();
         let payload_backend = CoordinatorBuildBackend::new(&coordinator);
+        assert_eq!(
+            payload_backend
+                .runtime_type_policy(&RuntimeTypePolicyRequest {
+                    basis: request.basis,
+                    target: request.target.clone(),
+                    target_definition: request.target_definition,
+                    type_uuid: TYPE,
+                })
+                .unwrap(),
+            RuntimeTypePolicy { build_only: false }
+        );
         for artifact in &first.artifacts {
             payload_backend
                 .store_artifact(artifact.content_hash, &artifact.payload)
@@ -5228,8 +5580,10 @@ mod tests {
             roles: BTreeMap::from([(ASSET, EntryRole::Runtime)]),
             paths: BTreeMap::from([("target.bundle".to_owned(), vec![ASSET])]),
             tools: BTreeMap::new(),
-            capabilities: Vec::new(),
-            migration_controls: BTreeMap::new(),
+            current_load: CurrentLoadSource {
+                capabilities: Vec::new(),
+                migration_controls: BTreeMap::new(),
+            },
             content_hashes: BTreeMap::new(),
             tag_poisons: BTreeMap::new(),
         };
@@ -5274,8 +5628,10 @@ mod tests {
             roles: BTreeMap::new(),
             paths: BTreeMap::new(),
             tools: BTreeMap::new(),
-            capabilities: Vec::new(),
-            migration_controls: BTreeMap::new(),
+            current_load: CurrentLoadSource {
+                capabilities: Vec::new(),
+                migration_controls: BTreeMap::new(),
+            },
             content_hashes: BTreeMap::new(),
             tag_poisons: BTreeMap::new(),
         };

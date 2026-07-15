@@ -174,6 +174,121 @@ async fn remote_loader_client_preserves_typed_calls() {
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn capnp_connection_deadline_ends_delta_stream_and_returns_typed_lease_failure() {
+    LocalSet::new()
+        .run_until(async {
+            let server = server();
+            server
+                .install_lease_policy(LeasePolicy {
+                    ttl: std::time::Duration::from_millis(250),
+                    max_snapshot_leases: 1,
+                    max_connections: 8,
+                })
+                .unwrap();
+            let listener = Rc::new(
+                StagedListener::bind(server.root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let server_listener = Rc::clone(&listener);
+            let server_task =
+                tokio::task::spawn_local(async move { server_listener.serve_one().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = match client.connect(&request()).await.unwrap() {
+                RemoteConnectOutcome::Connected { hub, .. } => hub,
+                other => panic!("expected connected, got {other:?}"),
+            };
+
+            let first_response = hub.snapshot_request().send().promise.await.unwrap();
+            let first_result = first_response.get().unwrap().get_result().unwrap();
+            let first_snapshot = match first_result.which().unwrap() {
+                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                _ => panic!("expected first snapshot"),
+            };
+            let second_response = hub.snapshot_request().send().promise.await.unwrap();
+            assert!(matches!(
+                second_response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                schema::snapshot_call::Which::Success(_)
+            ));
+            let expired_snapshot = first_snapshot
+                .version_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert!(matches!(
+                expired_snapshot
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                schema::u_int64_call::Which::LeaseFailure(_)
+            ));
+
+            let mut subscribe = hub.subscribe_request();
+            {
+                let mut params = subscribe.get();
+                params.set_since(0);
+                params.reborrow().init_assets(0);
+                params.init_paths(0);
+            }
+            let response = subscribe.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            let installed = match result.which().unwrap() {
+                schema::subscribe_call::Which::Success(installed) => installed.unwrap(),
+                _ => panic!("expected subscription"),
+            };
+            let deltas = installed.get_deltas().unwrap();
+            let initial = deltas.next_request().send().promise.await.unwrap();
+            assert!(!initial.get().unwrap().get_done());
+
+            let pending = deltas.next_request().send().promise;
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+                .await
+                .expect("leased DeltaStream remained blocked past its deadline")
+                .unwrap();
+            assert!(ended.get().unwrap().get_done());
+
+            let response = hub.snapshot_request().send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            assert!(matches!(
+                result.which().unwrap(),
+                schema::snapshot_call::Which::LeaseFailure(_)
+            ));
+            let mut wire_tree = hub.wire_tree_request();
+            wire_tree.get().set_layout_hash(&[0; 32]);
+            let response = wire_tree.send().promise.await.unwrap();
+            assert!(matches!(
+                response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap(),
+                schema::data_call::Which::LeaseFailure(_)
+            ));
+
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
+}
+
 #[derive(Default)]
 struct RecordingAuthoringBackend {
     imports: Mutex<Vec<ImportRequest>>,

@@ -184,6 +184,9 @@ pub enum StoreError {
     /// A wire-tree body or stored DSWL preimage was malformed, noncanonical,
     /// or did not authenticate to the requested LayoutHash.
     InvalidWireTree { detail: String },
+    /// A disposable exact-hash schema cache row is malformed. Rebuilding the
+    /// projection is safe; doctor must not use the row as repair input.
+    InvalidSchemaCache { detail: String },
     /// The bytes read back for a hash no longer verify against it —
     /// corruption caught at read time, never returned.
     CorruptExtent { segment: u64, offset: u64 },
@@ -421,6 +424,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::InvalidWireTree { detail } => {
                 write!(f, "invalid DSWL wire tree: {detail}")
+            }
+            StoreError::InvalidSchemaCache { detail } => {
+                write!(f, "invalid cached schema snapshot: {detail}")
             }
             StoreError::CorruptExtent { segment, offset } => write!(
                 f,

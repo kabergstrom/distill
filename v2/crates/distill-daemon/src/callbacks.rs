@@ -5,6 +5,7 @@
 //! generic erasure thunks are monomorphized into the registering module and
 //! contain unwind before returning to the host.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::mem::ManuallyDrop;
@@ -19,7 +20,7 @@ use distill_build::outputs::OutputDecls;
 use distill_build::pipeline::{Target, TargetSelector};
 use distill_build::query::{AssetQuery, IntakeError};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolOutput, ToolRunError};
-use distill_build::trace::StableFailureFingerprint;
+use distill_build::trace::{CapabilityKey, StableFailureFingerprint};
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_core::tool::ToolCwdPolicy;
 use distill_json::AuthoredValue;
@@ -356,6 +357,232 @@ pub trait PipelineCodegenContext {
 
     fn read(&mut self, _asset: AssetUuid) -> Result<Option<CodegenAsset>, CodegenContextError> {
         Err(CodegenContextError::Unavailable("read"))
+    }
+}
+
+/// Daemon-owned reverse-ABI adapter. Every vtable entry contains a host panic
+/// before control returns through module frames; the latched failure overrides
+/// any result the module subsequently tries to return.
+pub(crate) struct ContainedImportContext<'a> {
+    inner: &'a mut dyn AuthoringImportContext,
+    panicked: Cell<bool>,
+}
+
+impl<'a> ContainedImportContext<'a> {
+    pub(crate) fn new(inner: &'a mut dyn AuthoringImportContext) -> Self {
+        Self {
+            inner,
+            panicked: Cell::new(false),
+        }
+    }
+
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked.get()
+    }
+
+    fn failure(&self) -> distill_build::import::ImportError {
+        self.panicked.set(true);
+        distill_build::import::ImportError {
+            fingerprint: StableFailureFingerprint::MissingCapability {
+                key: CapabilityKey::Importer("host-callback-panic".to_owned()),
+            },
+        }
+    }
+}
+
+impl AuthoringImportContext for ContainedImportContext<'_> {
+    fn sources(&self) -> &[distill_build::query::RootedPath] {
+        if self.panicked.get() {
+            return &[];
+        }
+        match catch_unwind(AssertUnwindSafe(|| self.inner.sources())) {
+            Ok(sources) => sources,
+            Err(_) => {
+                self.panicked.set(true);
+                &[]
+            }
+        }
+    }
+
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, distill_build::import::ImportError> {
+        if self.panicked.get() {
+            return Err(self.failure());
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.read(path)))
+            .unwrap_or_else(|_| Err(self.failure()))
+    }
+
+    fn probe(&mut self, path: &str) -> Result<bool, distill_build::import::ImportError> {
+        if self.panicked.get() {
+            return Err(self.failure());
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.probe(path)))
+            .unwrap_or_else(|_| Err(self.failure()))
+    }
+
+    fn enumerate(
+        &mut self,
+        query: &distill_build::query::FileQuery,
+    ) -> Result<Vec<distill_build::query::RootedPath>, distill_build::import::ImportError> {
+        if self.panicked.get() {
+            return Err(self.failure());
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.enumerate(query)))
+            .unwrap_or_else(|_| Err(self.failure()))
+    }
+
+    fn importer_capability(
+        &mut self,
+        id: &str,
+    ) -> Result<[u8; 32], distill_build::import::ImportError> {
+        if self.panicked.get() {
+            return Err(self.failure());
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.importer_capability(id)))
+            .unwrap_or_else(|_| Err(self.failure()))
+    }
+}
+
+pub(crate) struct ContainedProcessContext<'a> {
+    inner: &'a mut dyn PipelineProcessContext,
+    panicked: Cell<bool>,
+}
+
+impl<'a> ContainedProcessContext<'a> {
+    pub(crate) fn new(inner: &'a mut dyn PipelineProcessContext) -> Self {
+        Self {
+            inner,
+            panicked: Cell::new(false),
+        }
+    }
+
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked.get()
+    }
+
+    fn failed<T>(&self) -> Result<T, ProcessContextError> {
+        self.panicked.set(true);
+        Err(ProcessContextError::Failed(
+            "daemon process-context callback panicked".to_owned(),
+        ))
+    }
+}
+
+impl PipelineProcessContext for ContainedProcessContext<'_> {
+    fn read(
+        &mut self,
+        asset: AssetUuid,
+        expected_terminal: TypeUuid,
+    ) -> Result<ProcessArtifact, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| {
+            self.inner.read(asset, expected_terminal)
+        }))
+        .unwrap_or_else(|_| self.failed())
+    }
+
+    fn read_path(
+        &mut self,
+        path: &str,
+        expected_terminal: TypeUuid,
+    ) -> Result<ProcessArtifact, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| {
+            self.inner.read_path(path, expected_terminal)
+        }))
+        .unwrap_or_else(|_| self.failed())
+    }
+
+    fn query(&mut self, query: &AssetQuery) -> Result<Vec<AssetUuid>, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.query(query))).unwrap_or_else(|_| self.failed())
+    }
+
+    fn target(&self) -> Result<&Target, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        match catch_unwind(AssertUnwindSafe(|| self.inner.target())) {
+            Ok(target) => target,
+            Err(_) => self.failed(),
+        }
+    }
+
+    fn outputs(&self) -> Result<ProcessOutputs, ProcessContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.outputs())).unwrap_or_else(|_| self.failed())
+    }
+
+    fn run_tool(
+        &mut self,
+        id: &str,
+        args: &[String],
+        stdin: &[u8],
+    ) -> Result<ToolOutput, ToolRunError> {
+        if self.panicked.get() {
+            return Err(ToolRunError::Infrastructure {
+                id: id.to_owned(),
+                detail: "daemon process-context callback panicked".to_owned(),
+            });
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.run_tool(id, args, stdin))).unwrap_or_else(
+            |_| {
+                self.panicked.set(true);
+                Err(ToolRunError::Infrastructure {
+                    id: id.to_owned(),
+                    detail: "daemon process-context callback panicked".to_owned(),
+                })
+            },
+        )
+    }
+}
+
+pub(crate) struct ContainedCodegenContext<'a> {
+    inner: &'a mut dyn PipelineCodegenContext,
+    panicked: Cell<bool>,
+}
+
+impl<'a> ContainedCodegenContext<'a> {
+    pub(crate) fn new(inner: &'a mut dyn PipelineCodegenContext) -> Self {
+        Self {
+            inner,
+            panicked: Cell::new(false),
+        }
+    }
+
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked.get()
+    }
+
+    fn failed<T>(&self) -> Result<T, CodegenContextError> {
+        self.panicked.set(true);
+        Err(CodegenContextError::Failed(
+            "daemon codegen-context callback panicked".to_owned(),
+        ))
+    }
+}
+
+impl PipelineCodegenContext for ContainedCodegenContext<'_> {
+    fn query(&mut self, query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.query(query))).unwrap_or_else(|_| self.failed())
+    }
+
+    fn read(&mut self, asset: AssetUuid) -> Result<Option<CodegenAsset>, CodegenContextError> {
+        if self.panicked.get() {
+            return self.failed();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.read(asset))).unwrap_or_else(|_| self.failed())
     }
 }
 

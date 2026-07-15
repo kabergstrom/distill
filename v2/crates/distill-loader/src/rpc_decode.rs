@@ -65,9 +65,9 @@ pub(crate) fn fetched_artifact(
     structural: Vec<u8>,
     raw_blobs: Vec<Vec<u8>>,
     load_edges: Vec<distill_rpc::ServedLoadEdge>,
-    wire_layout: Arc<[u8]>,
+    wire_layout: Blob,
 ) -> Result<FetchedArtifact, String> {
-    verify_wire_layout(layout_hash, &wire_layout)?;
+    verify_wire_layout(layout_hash, wire_layout.as_bytes())?;
     let blobs = raw_blobs
         .into_iter()
         .map(|bytes| {
@@ -90,9 +90,9 @@ pub(crate) fn fetched_artifact_backed(
     structural: Range<usize>,
     blob_ranges: Vec<Range<usize>>,
     load_edges: Vec<distill_rpc::ServedLoadEdge>,
-    wire_layout: Arc<[u8]>,
+    wire_layout: Blob,
 ) -> Result<FetchedArtifact, String> {
-    verify_wire_layout(layout_hash, &wire_layout)?;
+    verify_wire_layout(layout_hash, wire_layout.as_bytes())?;
     let structural_bytes = backing
         .as_ref()
         .as_ref()

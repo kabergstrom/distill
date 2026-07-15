@@ -82,22 +82,36 @@ struct SemanticFacts {
 struct Sink(Vec<String>);
 
 impl EncodeSink for Sink {
-    fn flat(&mut self, bytes: &[u8]) {
+    fn flat(&mut self, bytes: &[u8]) -> Result<(), distill_asset::CallbackPanic> {
         self.0.push(format!("flat:{bytes:?}"));
+        Ok(())
     }
-    fn begin(&mut self, kind: EncodeContainer, len: u32) {
+    fn begin(
+        &mut self,
+        kind: EncodeContainer,
+        len: u32,
+    ) -> Result<(), distill_asset::CallbackPanic> {
         self.0.push(format!("begin:{kind:?}:{len}"));
+        Ok(())
     }
-    fn push(&mut self) {
+    fn push(&mut self) -> Result<(), distill_asset::CallbackPanic> {
         self.0.push("push".into());
+        Ok(())
     }
-    fn finish(&mut self) {
+    fn finish(&mut self) -> Result<(), distill_asset::CallbackPanic> {
         self.0.push("finish".into());
+        Ok(())
     }
-    fn blob(&mut self, bytes: &[u8]) {
+    fn blob(&mut self, bytes: &[u8]) -> Result<(), distill_asset::CallbackPanic> {
         self.0.push(format!("blob:{bytes:?}"));
+        Ok(())
     }
-    fn reference(&mut self, _: bool, _: AssetUuid, _: TypeUuid) {
+    fn reference(
+        &mut self,
+        _: bool,
+        _: AssetUuid,
+        _: TypeUuid,
+    ) -> Result<(), distill_asset::CallbackPanic> {
         unreachable!()
     }
 }
@@ -156,7 +170,7 @@ fn macro_generates_logical_hash_defaults_and_deterministic_encoding() {
     value.map.insert(20, "twenty".into());
     value.map.insert(1, "one".into());
     let mut sink = Sink::default();
-    AssetReflect::encode(&value, &mut sink);
+    AssetReflect::encode(&value, &mut sink).unwrap();
     assert!(sink.0.starts_with(&["begin:Struct:4".into()]));
     let one = sink
         .0
@@ -183,7 +197,7 @@ fn enum_descriptor_and_encoder_use_name_sorted_wire_variant_indices() {
     };
     assert_eq!(variants.len(), 2);
     let mut sink = Sink::default();
-    AssetReflect::encode(&Choice::Alpha(7), &mut sink);
+    AssetReflect::encode(&Choice::Alpha(7), &mut sink).unwrap();
     assert_eq!(sink.0.first().unwrap(), "begin:Variant(0):1");
 
     let value = Choice::Alpha(7);

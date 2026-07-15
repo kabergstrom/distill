@@ -211,6 +211,17 @@ fn target_binding_checks_only_the_module_target_definition_hash() {
 }
 
 #[test]
+fn mount_canonicalizes_the_runtime_target_name() {
+    let (manifest, archive, mut runtime, _, _) = fixture(true);
+    let mut decoded = distill_pack::manifest::decode_manifest(&manifest).unwrap();
+    decoded.target.name = "t\u{e9}st".into();
+    let manifest = encode_manifest(&decoded).unwrap();
+    runtime.target = "te\u{301}st".into();
+
+    mount_pack(&manifest, &archive, &runtime).unwrap();
+}
+
+#[test]
 fn absent_path_table_is_loudly_unsupported() {
     let (manifest, archive, runtime, _, _) = fixture(false);
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
@@ -255,6 +266,38 @@ fn mount_refuses_wrong_runtime_or_archive_identity() {
     assert!(matches!(
         mount_pack(&manifest, &bad_archive, &runtime),
         Err(MountError::Archive(_))
+    ));
+}
+
+#[test]
+fn mount_authenticates_complete_manifest_before_serving_any_asset() {
+    let (manifest, archive, runtime, _, _) = fixture(true);
+    let mut missing_encoding = distill_pack::manifest::decode_manifest(&manifest).unwrap();
+    let content_hash = missing_encoding.assets[0].content_hash;
+    missing_encoding.encodings.clear();
+    let missing_encoding = encode_manifest(&missing_encoding).unwrap();
+    assert!(matches!(
+        mount_pack(&missing_encoding, &archive, &runtime),
+        Err(MountError::MissingEncoding(hash)) if hash == content_hash
+    ));
+
+    let mut bad_wire = distill_pack::manifest::decode_manifest(&manifest).unwrap();
+    let layout_hash = bad_wire.wire_trees[0].layout_hash;
+    bad_wire.wire_trees[0].bytes.push(0);
+    let bad_wire = encode_manifest(&bad_wire).unwrap();
+    assert!(matches!(
+        mount_pack(&bad_wire, &archive, &runtime),
+        Err(MountError::WireTree(hash)) if hash == layout_hash
+    ));
+
+    let mut wrong_header = distill_pack::manifest::decode_manifest(&manifest).unwrap();
+    wrong_header.assets[0].asset_uuid = AssetUuid([9; 16]);
+    let wrong_header = encode_manifest(&wrong_header).unwrap();
+    assert!(matches!(
+        mount_pack(&wrong_header, &archive, &runtime),
+        Err(MountError::Manifest(
+            distill_pack::manifest::ManifestError::MetadataMismatch
+        ))
     ));
 }
 

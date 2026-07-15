@@ -181,5 +181,14 @@ fn rejects_target_without_an_exact_schema_compilation_layout() {
         .target_definitions(&test_layout_identity())
         .unwrap_err();
 
-    assert!(matches!(error, DaemonConfigError::Target(_)));
+    assert!(matches!(
+        error,
+        DaemonConfigError::UnsupportedTargetIdentity {
+            target,
+            expected,
+            observed,
+        } if target == "dev"
+            && expected.target_triple == "x86_64-unknown-linux-gnu"
+            && *observed == test_layout_identity()
+    ));
 }

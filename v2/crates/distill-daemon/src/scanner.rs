@@ -71,6 +71,12 @@ pub enum ScanError {
         second: PathBuf,
         identity: ObservedFileIdentity,
     },
+    DaemonOwnedDirectoryAlias {
+        path: PathBuf,
+        owned_path: PathBuf,
+        kind: DaemonOwnedDirectoryKind,
+        identity: ObservedFileIdentity,
+    },
     FileIdentityChanged {
         path: PathBuf,
     },
@@ -109,6 +115,17 @@ impl std::fmt::Display for ScanError {
                 first.display(),
                 second.display()
             ),
+            Self::DaemonOwnedDirectoryAlias {
+                path,
+                owned_path,
+                kind,
+                ..
+            } => write!(
+                f,
+                "{} aliases retained {kind} directory {}",
+                path.display(),
+                owned_path.display()
+            ),
             Self::FileIdentityChanged { path } => {
                 write!(f, "file identity changed while reading {}", path.display())
             }
@@ -136,7 +153,6 @@ impl std::error::Error for ScanError {
 struct CanonicalRoot {
     configured: AssetRoot,
     canonical_path: PathBuf,
-    quarantine_identity: Option<FileIdentity>,
     directory: DirectoryCapability,
 }
 
@@ -151,7 +167,42 @@ struct DirectoryCapability {
 #[derive(Debug, Clone)]
 pub struct RootedScanner {
     roots: Arc<RwLock<BTreeMap<String, CanonicalRoot>>>,
+    daemon_owned: Arc<RwLock<BTreeMap<FileIdentity, RetainedDaemonDirectory>>>,
     revision: Arc<AtomicU64>,
+}
+
+/// A directory whose contents are produced or retained by the daemon and can
+/// therefore never participate in the authored asset namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DaemonOwnedDirectoryKind {
+    State,
+    ModuleStaging,
+    PackageOutput,
+    CodegenOutput,
+    Quarantine,
+}
+
+impl std::fmt::Display for DaemonOwnedDirectoryKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::State => "daemon state",
+            Self::ModuleStaging => "pipeline module staging",
+            Self::PackageOutput => "package output",
+            Self::CodegenOutput => "codegen output",
+            Self::Quarantine => "quarantine",
+        };
+        formatter.write_str(name)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RetainedDaemonDirectory {
+    kind: DaemonOwnedDirectoryKind,
+    path: PathBuf,
+    identity: FileIdentity,
+    // Keeping the descriptor alive pins the identity even if the configured
+    // spelling is subsequently exchanged or renamed.
+    _directory: DirectoryCapability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +235,7 @@ pub struct ScannedBundle {
     pub file_hash: BundleFileHash,
     pub bytes: Vec<u8>,
     pub parsed: Result<distill_bundle::Bundle, distill_bundle::BundleError>,
+    pub namespace_skeleton: Option<distill_bundle::BundleNamespaceSkeleton>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -195,6 +247,42 @@ pub struct ScanSnapshot {
     directory_by_identity: BTreeMap<FileIdentity, (String, String, PathBuf)>,
     symlink_aliases: BTreeMap<(String, String), PathBuf>,
     aliases_by_target: BTreeMap<PathBuf, BTreeSet<(String, String)>>,
+    diagnostics: BTreeMap<(String, String), ScanDiagnostic>,
+}
+
+/// A non-fatal filesystem observation that was excluded from the authored
+/// namespace. Diagnostics are keyed by their canonical rooted path so an
+/// incremental rescan replaces only the affected diagnostic rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanDiagnostic {
+    DaemonOwnedDirectoryAlias {
+        root_name: String,
+        normalized_path: String,
+        physical_path: PathBuf,
+        owned_path: PathBuf,
+        kind: DaemonOwnedDirectoryKind,
+        identity: ObservedFileIdentity,
+    },
+}
+
+impl std::fmt::Display for ScanDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DaemonOwnedDirectoryAlias {
+                root_name,
+                normalized_path,
+                physical_path,
+                owned_path,
+                kind,
+                identity,
+            } => write!(
+                formatter,
+                "daemon-owned-directory-alias: {root_name}/{normalized_path} ({}) aliases retained {kind} directory {} with identity {identity:?}; subtree skipped",
+                physical_path.display(),
+                owned_path.display(),
+            ),
+        }
+    }
 }
 
 /// The complete observation replacing a bounded set of logical path prefixes.
@@ -210,6 +298,10 @@ impl ScanSnapshot {
     /// Equality of filesystem authority, excluding parsed-object allocation
     /// details. Used to suppress watcher echoes of daemon-authored writes.
     pub fn same_observation(&self, other: &Self) -> bool {
+        self.same_namespace_observation(other) && self.diagnostics == other.diagnostics
+    }
+
+    pub(crate) fn same_namespace_observation(&self, other: &Self) -> bool {
         self.files == other.files
             && self.bundles.len() == other.bundles.len()
             && self
@@ -247,6 +339,10 @@ impl ScanSnapshot {
         self.bundles.values().map(AsRef::as_ref)
     }
 
+    pub fn diagnostic_rows(&self) -> impl Iterator<Item = &ScanDiagnostic> {
+        self.diagnostics.values()
+    }
+
     pub(crate) fn bundle_entries(
         &self,
     ) -> impl Iterator<Item = (&(String, String), &Arc<ScannedBundle>)> {
@@ -278,6 +374,7 @@ impl ScanSnapshot {
                     remove_reverse_alias(&mut self.aliases_by_target, &target, &key);
                 }
             }
+            remove_matching(&mut self.diagnostics, affected);
         }
         for (key, file) in delta.observed.files {
             self.logical_roots
@@ -305,6 +402,7 @@ impl ScanSnapshot {
                 .insert(key.clone());
             self.symlink_aliases.insert(key, target);
         }
+        self.diagnostics.extend(delta.observed.diagnostics);
     }
 }
 
@@ -334,6 +432,14 @@ impl ScanDelta {
     }
 
     pub fn is_same_observation(&self, baseline: &ScanSnapshot) -> bool {
+        self.is_same_namespace_observation(baseline)
+            && self.affected.iter().all(|affected| {
+                matching_values(&baseline.diagnostics, affected)
+                    .eq(matching_values(&self.observed.diagnostics, affected))
+            })
+    }
+
+    pub(crate) fn is_same_namespace_observation(&self, baseline: &ScanSnapshot) -> bool {
         self.affected.iter().all(|affected| {
             matching_values(&baseline.files, affected)
                 .eq(matching_values(&self.observed.files, affected))
@@ -380,6 +486,7 @@ struct OpenedChild {
     file: File,
     metadata: Metadata,
     symlink_identity: Option<FileIdentity>,
+    daemon_owned: Option<RetainedDaemonDirectory>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -429,10 +536,78 @@ impl From<FileIdentity> for ObservedFileIdentity {
 
 impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
+        let roots = roots.into_iter().collect::<Vec<_>>();
+        let daemon_owned = Arc::new(RwLock::new(BTreeMap::new()));
+        let scanner = Self {
+            roots: Arc::new(RwLock::new(canonicalize_roots(roots.clone())?)),
+            daemon_owned,
+            revision: Arc::new(AtomicU64::new(0)),
+        };
+        for root in roots {
+            if root.quarantine_dir.is_dir() {
+                scanner.retain_daemon_owned_directory(
+                    DaemonOwnedDirectoryKind::Quarantine,
+                    root.quarantine_dir,
+                )?;
+            }
+        }
+        Ok(scanner)
+    }
+
+    pub(crate) fn candidate_with_roots(
+        &self,
+        roots: impl IntoIterator<Item = AssetRoot>,
+    ) -> Result<Self, ScanError> {
         Ok(Self {
             roots: Arc::new(RwLock::new(canonicalize_roots(roots)?)),
+            daemon_owned: Arc::clone(&self.daemon_owned),
             revision: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Retain one daemon-owned directory capability and exclude its identity
+    /// from every current and future root candidate. Duplicate registrations
+    /// converge on the canonical `(kind, path)` representative.
+    pub(crate) fn retain_daemon_owned_directory(
+        &self,
+        kind: DaemonOwnedDirectoryKind,
+        path: impl AsRef<Path>,
+    ) -> Result<(), ScanError> {
+        let path = fs::canonicalize(path.as_ref()).map_err(|source| ScanError::Io {
+            path: path.as_ref().to_path_buf(),
+            source,
+        })?;
+        let directory = DirectoryCapability::open_root(&path).map_err(|source| ScanError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let metadata = directory_metadata(&directory, &path)?;
+        if !metadata.is_dir() {
+            return Err(ScanError::NonRegularFile { path });
+        }
+        let identity = file_identity(&metadata);
+        let retained = RetainedDaemonDirectory {
+            kind,
+            path,
+            identity,
+            _directory: directory,
+        };
+        let mut directories = self
+            .daemon_owned
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match directories.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(retained);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if (retained.kind, &retained.path) < (current.kind, &current.path) {
+                    entry.insert(retained);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate a replacement root set completely before making it visible
@@ -443,7 +618,16 @@ impl RootedScanner {
         &self,
         roots: impl IntoIterator<Item = AssetRoot>,
     ) -> Result<(), ScanError> {
-        let replacement = Self::new(roots)?;
+        let roots = roots.into_iter().collect::<Vec<_>>();
+        let replacement = self.candidate_with_roots(roots.clone())?;
+        for root in roots {
+            if root.quarantine_dir.is_dir() {
+                self.retain_daemon_owned_directory(
+                    DaemonOwnedDirectoryKind::Quarantine,
+                    root.quarantine_dir,
+                )?;
+            }
+        }
         self.replace_from(&replacement);
         Ok(())
     }
@@ -459,7 +643,6 @@ impl RootedScanner {
                 replacement.get(name).is_none_or(|next| {
                     current.configured != next.configured
                         || current.canonical_path != next.canonical_path
-                        || current.quarantine_identity != next.quarantine_identity
                 })
             });
         *roots = replacement;
@@ -540,6 +723,13 @@ impl RootedScanner {
             .clone()
     }
 
+    fn daemon_owned_snapshot(&self) -> BTreeMap<FileIdentity, RetainedDaemonDirectory> {
+        self.daemon_owned
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Locate an observed physical error beneath its configured root and
     /// preserve the platform's exact relative path units for DSVP.
     pub fn scan_subject(&self, path: &Path) -> Option<distill_store::state::ScanSubject> {
@@ -578,6 +768,30 @@ impl RootedScanner {
         } else {
             format!("{root}/{relative}")
         }
+    }
+
+    pub fn normalized_observed_subject(&self, path: &Path) -> String {
+        let roots = self.root_snapshot();
+        roots
+            .values()
+            .filter_map(|root| {
+                path.strip_prefix(&root.configured.path)
+                    .or_else(|_| path.strip_prefix(&root.canonical_path))
+                    .ok()
+                    .map(|relative| (root, relative))
+            })
+            .max_by_key(|(root, _)| root.canonical_path.components().count())
+            .map_or_else(
+                || path.to_string_lossy().nfc().collect(),
+                |(root, relative)| {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    if relative.is_empty() {
+                        root.configured.name.clone()
+                    } else {
+                        format!("{}/{relative}", root.configured.name)
+                    }
+                },
+            )
     }
 
     pub fn inspect_destination(
@@ -636,6 +850,7 @@ impl RootedScanner {
     /// use incremental path/subtree observation instead.
     pub fn scan(&self) -> Result<ScanSnapshot, ScanError> {
         let roots = self.validated_root_snapshot()?;
+        let daemon_owned = self.daemon_owned_snapshot();
         let stack = roots
             .values()
             .rev()
@@ -648,7 +863,7 @@ impl RootedScanner {
                 entry_guards: Vec::new(),
             })
             .collect::<Vec<_>>();
-        scan_pending(&roots, stack)
+        scan_pending(&roots, &daemon_owned, stack)
     }
 
     /// Re-observe only native-event paths and directory subtrees, merging the
@@ -660,6 +875,7 @@ impl RootedScanner {
         event_paths: &[PathBuf],
     ) -> Result<Option<ScanDelta>, ScanError> {
         let roots = self.validated_root_snapshot()?;
+        let daemon_owned = self.daemon_owned_snapshot();
         let mut affected = BTreeSet::<(String, String)>::new();
         for event_path in event_paths {
             if let Some((root, path)) = event_key(&roots, event_path)? {
@@ -679,13 +895,14 @@ impl RootedScanner {
         let affected = collapse_affected(affected);
         let mut observed = ScanSnapshot::default();
         for (root, path) in &affected {
-            if let Some(partial) = scan_logical_path(&roots, root, path)? {
+            if let Some(partial) = scan_logical_path(&roots, &daemon_owned, root, path)? {
                 observed.files.extend(partial.files);
                 observed.bundles.extend(partial.bundles);
                 observed
                     .directory_identities
                     .extend(partial.directory_identities);
                 observed.symlink_aliases.extend(partial.symlink_aliases);
+                observed.diagnostics.extend(partial.diagnostics);
             }
         }
         rebuild_reverse_indexes(&mut observed)?;
@@ -711,6 +928,7 @@ impl RootedScanner {
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
         let roots = self.validated_root_snapshot()?;
+        let daemon_owned = self.daemon_owned_snapshot();
         let Some(root) = roots
             .values()
             .filter_map(|root| {
@@ -739,7 +957,9 @@ impl RootedScanner {
         let mut entry_guards = Vec::new();
         for (index, component) in components.iter().enumerate() {
             display.push(component);
-            let opened = open_scanned_child(&directory, component, &display, &roots)?;
+            let opened =
+                open_scanned_child(&directory, component, &display, &roots, &daemon_owned)?;
+            reject_daemon_owned_access(&opened, &display)?;
             let guard = EntryGuard::new(&directory, component, &display, &opened);
             if index + 1 == components.len() {
                 if !opened.metadata.is_file() {
@@ -747,7 +967,7 @@ impl RootedScanner {
                 }
                 let bytes = read_opened_file(opened.file, path, &opened.metadata)?;
                 entry_guards.push(guard);
-                revalidate_entry_guards(&entry_guards, &roots)?;
+                revalidate_entry_guards(&entry_guards, &roots, &daemon_owned)?;
                 return Ok(bytes);
             }
             if !opened.metadata.is_dir() {
@@ -789,12 +1009,12 @@ impl RootedScanner {
 
 fn scan_pending(
     roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
     mut stack: Vec<PendingDirectory>,
 ) -> Result<ScanSnapshot, ScanError> {
     let mut snapshot = ScanSnapshot::default();
     while let Some(pending) = stack.pop() {
-        let root = &roots[&pending.root_name];
-        revalidate_entry_guards(&pending.entry_guards, roots)?;
+        revalidate_entry_guards(&pending.entry_guards, roots, daemon_owned)?;
         let metadata = directory_metadata(&pending.directory, &pending.physical_path)?;
         if !metadata.is_dir() {
             return Err(ScanError::NonRegularFile {
@@ -802,14 +1022,17 @@ fn scan_pending(
             });
         }
         let identity = file_identity(&metadata);
-        let live_quarantine_identity = fs::metadata(&root.configured.quarantine_dir)
-            .ok()
-            .filter(|metadata| metadata.is_dir())
-            .map(|metadata| file_identity(&metadata));
-        if pending.physical_path == root.configured.quarantine_dir
-            || root.quarantine_identity == Some(identity)
-            || live_quarantine_identity == Some(identity)
-        {
+        if let Some(retained) = daemon_owned.get(&identity) {
+            if retained.kind == DaemonOwnedDirectoryKind::Quarantine {
+                continue;
+            }
+            record_daemon_owned_diagnostic(
+                &mut snapshot,
+                &pending.root_name,
+                &pending.relative_components,
+                &pending.physical_path,
+                retained,
+            );
             continue;
         }
         if pending.ancestry.contains(&identity) {
@@ -847,16 +1070,30 @@ fn scan_pending(
                 path: pending.physical_path,
             });
         }
-        revalidate_entry_guards(&pending.entry_guards, roots)?;
+        revalidate_entry_guards(&pending.entry_guards, roots, daemon_owned)?;
 
         for entry in entries.into_iter().rev() {
             let component = normalize_component(&entry)?;
             let mut relative = pending.relative_components.clone();
             relative.push(component);
             let physical = pending.physical_path.join(&entry);
-            let opened = open_scanned_child(&pending.directory, &entry, &physical, roots)?;
+            let opened =
+                open_scanned_child(&pending.directory, &entry, &physical, roots, daemon_owned)?;
             let guard = EntryGuard::new(&pending.directory, &entry, &physical, &opened);
             if opened.metadata.is_dir() {
+                if let Some(retained) = &opened.daemon_owned {
+                    if retained.kind == DaemonOwnedDirectoryKind::Quarantine {
+                        continue;
+                    }
+                    record_daemon_owned_diagnostic(
+                        &mut snapshot,
+                        &pending.root_name,
+                        &relative,
+                        &physical,
+                        retained,
+                    );
+                    continue;
+                }
                 let mut ancestry = pending.ancestry.clone();
                 ancestry.insert(identity);
                 let mut entry_guards = pending.entry_guards.clone();
@@ -873,6 +1110,7 @@ fn scan_pending(
             } else if opened.metadata.is_file() {
                 observe_opened_file(
                     roots,
+                    daemon_owned,
                     &mut snapshot,
                     &pending.root_name,
                     relative,
@@ -893,6 +1131,7 @@ fn scan_pending(
 #[allow(clippy::too_many_arguments)]
 fn observe_opened_file(
     roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
     snapshot: &mut ScanSnapshot,
     root_name: &str,
     relative: Vec<String>,
@@ -904,8 +1143,8 @@ fn observe_opened_file(
     let metadata = opened.metadata;
     let is_symlink = opened.symlink_identity.is_some();
     let bytes = read_opened_file(opened.file, &physical, &metadata)?;
-    revalidate_entry_guards(parent_guards, roots)?;
-    revalidate_entry_guards(std::slice::from_ref(&guard), roots)?;
+    revalidate_entry_guards(parent_guards, roots, daemon_owned)?;
+    revalidate_entry_guards(std::slice::from_ref(&guard), roots, daemon_owned)?;
     let normalized_path = relative.join("/");
     let file = ScannedFile {
         root_name: root_name.to_owned(),
@@ -936,11 +1175,17 @@ fn observe_opened_file(
         .and_then(|extension| extension.to_str())
         == Some("bundle")
     {
+        let parsed = distill_bundle::parse_bundle(&bytes);
+        let namespace_skeleton = parsed
+            .is_err()
+            .then(|| distill_bundle::extract_namespace_skeleton(&bytes).ok())
+            .flatten();
         let bundle = ScannedBundle {
             root_name: root_name.to_owned(),
             normalized_path: normalized_path.clone(),
             file_hash: BundleFileHash::of_observed_bytes(&bytes),
-            parsed: distill_bundle::parse_bundle(&bytes),
+            parsed,
+            namespace_skeleton,
             bytes,
         };
         snapshot
@@ -952,6 +1197,7 @@ fn observe_opened_file(
 
 fn scan_logical_path(
     roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
     root_name: &str,
     path: &str,
 ) -> Result<Option<ScanSnapshot>, ScanError> {
@@ -961,6 +1207,7 @@ fn scan_logical_path(
     if path.is_empty() {
         return scan_pending(
             roots,
+            daemon_owned,
             vec![PendingDirectory {
                 root_name: root_name.to_owned(),
                 physical_path: root.canonical_path.clone(),
@@ -983,7 +1230,13 @@ fn scan_logical_path(
     for (index, component) in components.iter().enumerate() {
         physical.push(component);
         relative.push((*component).to_owned());
-        let opened = match open_scanned_child(&directory, component.as_ref(), &physical, roots) {
+        let opened = match open_scanned_child(
+            &directory,
+            component.as_ref(),
+            &physical,
+            roots,
+            daemon_owned,
+        ) {
             Ok(opened) => opened,
             Err(ScanError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None)
@@ -996,6 +1249,7 @@ fn scan_logical_path(
             let mut snapshot = ScanSnapshot::default();
             observe_opened_file(
                 roots,
+                daemon_owned,
                 &mut snapshot,
                 root_name,
                 relative,
@@ -1010,6 +1264,19 @@ fn scan_logical_path(
         if !opened.metadata.is_dir() {
             return Err(ScanError::NonRegularFile { path: physical });
         }
+        if let Some(retained) = &opened.daemon_owned {
+            let mut snapshot = ScanSnapshot::default();
+            if retained.kind != DaemonOwnedDirectoryKind::Quarantine {
+                record_daemon_owned_diagnostic(
+                    &mut snapshot,
+                    root_name,
+                    &relative,
+                    &physical,
+                    retained,
+                );
+            }
+            return Ok(Some(snapshot));
+        }
         ancestry.insert(parent_identity);
         parent_identity = file_identity(&opened.metadata);
         entry_guards.push(guard);
@@ -1017,6 +1284,7 @@ fn scan_logical_path(
         if final_component {
             return scan_pending(
                 roots,
+                daemon_owned,
                 vec![PendingDirectory {
                     root_name: root_name.to_owned(),
                     physical_path: physical,
@@ -1451,6 +1719,7 @@ fn open_scanned_child(
     name: &std::ffi::OsStr,
     physical: &Path,
     roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
 ) -> Result<OpenedChild, ScanError> {
     #[cfg(unix)]
     {
@@ -1465,19 +1734,25 @@ fn open_scanned_child(
                 path: physical.to_path_buf(),
                 source,
             })?;
-            if !roots
-                .values()
-                .any(|candidate| canonical.starts_with(&candidate.canonical_path))
+            let metadata = fs::metadata(&canonical).map_err(|source| ScanError::Io {
+                path: canonical.clone(),
+                source,
+            })?;
+            let retained = metadata
+                .is_dir()
+                .then(|| daemon_owned.get(&file_identity(&metadata)))
+                .flatten();
+            if retained.is_none()
+                && !roots
+                    .values()
+                    .any(|candidate| canonical.starts_with(&candidate.canonical_path))
             {
                 return Err(ScanError::SymlinkEscape {
                     path: physical.to_path_buf(),
                     target: canonical,
                 });
             }
-            Some(fs::metadata(&canonical).map_err(|source| ScanError::Io {
-                path: canonical,
-                source,
-            })?)
+            Some(metadata)
         } else {
             None
         };
@@ -1507,6 +1782,10 @@ fn open_scanned_child(
         }
         Ok(OpenedChild {
             file,
+            daemon_owned: metadata
+                .is_dir()
+                .then(|| daemon_owned.get(&file_identity(&metadata)).cloned())
+                .flatten(),
             metadata,
             symlink_identity,
         })
@@ -1527,9 +1806,18 @@ fn open_scanned_child(
                 path: physical.to_path_buf(),
                 source,
             })?;
-            if !roots
-                .values()
-                .any(|candidate| canonical.starts_with(&candidate.canonical_path))
+            let metadata = fs::metadata(&canonical).map_err(|source| ScanError::Io {
+                path: canonical.clone(),
+                source,
+            })?;
+            let retained = metadata
+                .is_dir()
+                .then(|| daemon_owned.get(&file_identity(&metadata)))
+                .flatten();
+            if retained.is_none()
+                && !roots
+                    .values()
+                    .any(|candidate| canonical.starts_with(&candidate.canonical_path))
             {
                 return Err(ScanError::SymlinkEscape {
                     path: physical.to_path_buf(),
@@ -1561,9 +1849,50 @@ fn open_scanned_child(
         }
         Ok(OpenedChild {
             file,
+            daemon_owned: metadata
+                .is_dir()
+                .then(|| daemon_owned.get(&file_identity(&metadata)).cloned())
+                .flatten(),
             metadata,
             symlink_identity,
         })
+    }
+}
+
+fn record_daemon_owned_diagnostic(
+    snapshot: &mut ScanSnapshot,
+    root_name: &str,
+    relative_components: &[String],
+    physical_path: &Path,
+    retained: &RetainedDaemonDirectory,
+) {
+    let normalized_path = relative_components.join("/");
+    snapshot.diagnostics.insert(
+        (root_name.to_owned(), normalized_path.clone()),
+        ScanDiagnostic::DaemonOwnedDirectoryAlias {
+            root_name: root_name.to_owned(),
+            normalized_path,
+            physical_path: physical_path.to_path_buf(),
+            owned_path: retained.path.clone(),
+            kind: retained.kind,
+            identity: retained.identity.into(),
+        },
+    );
+}
+
+fn daemon_owned_alias(path: &Path, retained: &RetainedDaemonDirectory) -> ScanError {
+    ScanError::DaemonOwnedDirectoryAlias {
+        path: path.to_path_buf(),
+        owned_path: retained.path.clone(),
+        kind: retained.kind,
+        identity: retained.identity.into(),
+    }
+}
+
+fn reject_daemon_owned_access(opened: &OpenedChild, path: &Path) -> Result<(), ScanError> {
+    match &opened.daemon_owned {
+        Some(retained) => Err(daemon_owned_alias(path, retained)),
+        None => Ok(()),
     }
 }
 
@@ -1587,9 +1916,17 @@ impl EntryGuard {
 fn revalidate_entry_guards(
     guards: &[EntryGuard],
     roots: &BTreeMap<String, CanonicalRoot>,
+    daemon_owned: &BTreeMap<FileIdentity, RetainedDaemonDirectory>,
 ) -> Result<(), ScanError> {
     for guard in guards {
-        let current = open_scanned_child(&guard.parent, &guard.name, &guard.display_path, roots)?;
+        let current = open_scanned_child(
+            &guard.parent,
+            &guard.name,
+            &guard.display_path,
+            roots,
+            daemon_owned,
+        )?;
+        reject_daemon_owned_access(&current, &guard.display_path)?;
         if file_identity(&current.metadata) != guard.target_identity
             || current.symlink_identity != guard.symlink_identity
         {
@@ -1649,33 +1986,18 @@ fn canonicalize_roots(
                     path: root.path.clone(),
                 });
             }
-            let quarantine_identity = match fs::metadata(&root.quarantine_dir) {
-                Ok(metadata) if metadata.is_dir() => Some(file_identity(&metadata)),
-                Ok(_) => {
-                    return Err(ScanError::NonRegularFile {
-                        path: root.quarantine_dir.clone(),
-                    })
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(source) => {
-                    return Err(ScanError::Io {
-                        path: root.quarantine_dir.clone(),
-                        source,
-                    })
-                }
-            };
             let directory = DirectoryCapability::open_root(&canonical_path).map_err(|source| {
                 ScanError::Io {
                     path: canonical_path.clone(),
                     source,
                 }
             })?;
-            Ok((root.clone(), canonical_path, quarantine_identity, directory))
+            Ok((root.clone(), canonical_path, directory))
         })
         .collect::<Result<Vec<_>, ScanError>>()?;
 
     let mut roots = BTreeMap::new();
-    for (configured, canonical_path, quarantine_identity, directory) in canonical_paths {
+    for (configured, canonical_path, directory) in canonical_paths {
         let name = configured.name.clone();
         if roots
             .insert(
@@ -1683,7 +2005,6 @@ fn canonicalize_roots(
                 CanonicalRoot {
                     configured,
                     canonical_path,
-                    quarantine_identity,
                     directory,
                 },
             )

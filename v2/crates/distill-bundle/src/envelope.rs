@@ -58,6 +58,123 @@ pub(crate) fn parse_plain(bytes: &[u8]) -> Result<Bundle, BundleError> {
     Ok(bundle)
 }
 
+pub(crate) fn parse_plain_namespace(bytes: &[u8]) -> Result<Bundle, BundleError> {
+    let text = utf8(bytes)?;
+    let value = distill_json::parse(text).map_err(BundleError::Json)?;
+    let mut bundle = decode_namespace(value)?;
+    let Bundle {
+        schemas, assets, ..
+    } = &mut bundle;
+    for (local_id, entry) in assets.iter_mut() {
+        let schema = schemas
+            .get(&entry.schema_hash)
+            .ok_or_else(|| BundleError::Internal {
+                detail: format!("schema closure not upheld for {local_id:?}"),
+            })?;
+        walk_entry(
+            local_id,
+            &schema.root,
+            &mut entry.data,
+            WalkMode::PlainParse,
+        )?;
+    }
+    Ok(bundle)
+}
+
+/// Decode the complete namespace while discarding only fields that the v1
+/// grammar proves cannot affect it. The ordinary decoder still reports these
+/// defects; this path exists solely to decide whether their poison can be
+/// bundle-scoped.
+pub(crate) fn decode_namespace(value: AuthoredValue) -> Result<Bundle, BundleError> {
+    let AuthoredValue::Object(mut top) = value else {
+        return decode(value);
+    };
+    top.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "assets" | "format_version" | "primary" | "schemas" | "uuid"
+        )
+    });
+    // A broken primary affects path selection, but not the complete set of
+    // bundle/asset/type claims. Physical-path lookup is poisoned by the bundle
+    // row itself.
+    top.remove("primary");
+    if let Some(AuthoredValue::Object(assets)) = top.get_mut("assets") {
+        for entry in assets.values_mut() {
+            if let AuthoredValue::Object(fields) = entry {
+                fields.retain(|key, _| {
+                    matches!(
+                        key.as_str(),
+                        "authoring_only"
+                            | "data"
+                            | "lineage"
+                            | "schema_hash"
+                            | "type_uuid"
+                            | "uuid"
+                    )
+                });
+            }
+        }
+    }
+    decode(AuthoredValue::Object(top))
+}
+
+pub(crate) fn inject_missing_schemas(
+    value: &mut AuthoredValue,
+    holders: &BTreeMap<LogicalHash, LogicalSchema>,
+) -> Result<bool, BundleError> {
+    let AuthoredValue::Object(top) = value else {
+        return Ok(false);
+    };
+    let Some(AuthoredValue::Object(assets)) = top.get("assets") else {
+        return Ok(false);
+    };
+    let existing = match top.get("schemas") {
+        Some(AuthoredValue::Object(existing)) => existing.keys().cloned().collect::<BTreeSet<_>>(),
+        None => BTreeSet::new(),
+        Some(_) => return Ok(false),
+    };
+    let mut missing = BTreeMap::<LogicalHash, String>::new();
+    for (local_id, entry) in assets {
+        let AuthoredValue::Object(fields) = entry else {
+            continue;
+        };
+        let Some(AuthoredValue::Str(hash)) = fields.get("schema_hash") else {
+            continue;
+        };
+        let Ok(hash) = hash.parse::<LogicalHash>() else {
+            continue;
+        };
+        if !existing.contains(&hash.to_string()) {
+            missing.entry(hash).or_insert_with(|| local_id.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let AuthoredValue::Object(top) = value else {
+        unreachable!()
+    };
+    let schemas = top
+        .entry("schemas".to_owned())
+        .or_insert_with(|| AuthoredValue::Object(BTreeMap::new()));
+    let AuthoredValue::Object(schemas) = schemas else {
+        unreachable!()
+    };
+    for (hash, local_id) in missing {
+        let schema = holders.get(&hash).ok_or(BundleError::MissingSchema {
+            local_id,
+            schema_hash: hash,
+        })?;
+        let text = ngp_schema::snapshot_to_json(schema).map_err(|error| BundleError::Internal {
+            detail: format!("cannot render held schema {hash}: {error}"),
+        })?;
+        let snapshot = distill_json::parse(&text).map_err(BundleError::Json)?;
+        schemas.insert(hash.to_string(), snapshot);
+    }
+    Ok(true)
+}
+
 /// Decode the envelope JSON value into a `Bundle` (data left as-is; the
 /// caller runs the schema walk in its encoding's mode). Enforces key
 /// strictness, id/hash parsing, snapshot verification against map keys,

@@ -19,7 +19,7 @@ pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
 pub use server::{
     decode_asset_reference_query, decode_authoring_payload, AuthoringSnapshot,
-    CoordinatedCommitError, DeltaStream, Hub, LineageRepair, MetadataAuthoringSnapshot,
-    MetadataHub, MetadataSnapshot, Root, Server, Snapshot,
+    CoordinatedCommitError, DeltaStream, Hub, LeasePolicy, LineageRepair,
+    MetadataAuthoringSnapshot, MetadataHub, MetadataSnapshot, Root, Server, Snapshot,
 };
 pub use target::{TargetDefinition, TargetSetError};

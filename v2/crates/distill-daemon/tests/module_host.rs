@@ -1043,7 +1043,9 @@ fn host_reverse_callback_boundary_contains_panics_on_all_audited_surfaces() {
     for surface in [
         HostCallbackSurface::Registry,
         HostCallbackSurface::EncodeSink,
+        HostCallbackSurface::AuthoringImportContext,
         HostCallbackSurface::ProcessContext,
+        HostCallbackSurface::CodegenContext,
     ] {
         let boundary = HostCallbackBoundary::new(surface);
         let crossed = std::panic::catch_unwind(|| {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use distill_json::AuthoredValue;
 use distill_wire::exec::Blob;
-use distill_wire::native::{NativeLayoutNode, ScalarKind};
+use distill_wire::native::{CallbackPanic, NativeLayoutNode, ScalarKind};
 
 use crate::build::{checked_align, checked_len, checked_size, LayoutBuilder, LogicalBuilder};
 use crate::defaults::{DefaultCollector, DefaultWriter, PathStep};
@@ -38,7 +38,7 @@ pub unsafe trait AssetReflect: 'static {
 
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode;
     fn logical(builder: &mut LogicalBuilder);
-    fn encode(&self, sink: &mut dyn EncodeSink);
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic>;
     fn to_authored(&self) -> AuthoredValue;
 
     fn default_writer() -> Option<DefaultWriter> {
@@ -104,7 +104,7 @@ macro_rules! unsigned {
             fn logical(builder: &mut LogicalBuilder) {
                 logical_primitive(builder, $name)
             }
-            fn encode(&self, sink: &mut dyn EncodeSink) {
+            fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
                 sink.flat(&self.to_le_bytes())
             }
             fn to_authored(&self) -> AuthoredValue {
@@ -126,7 +126,7 @@ macro_rules! signed {
             fn logical(builder: &mut LogicalBuilder) {
                 logical_primitive(builder, $name)
             }
-            fn encode(&self, sink: &mut dyn EncodeSink) {
+            fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
                 sink.flat(&self.to_le_bytes())
             }
             fn to_authored(&self) -> AuthoredValue {
@@ -161,7 +161,7 @@ unsafe impl AssetReflect for bool {
     fn logical(builder: &mut LogicalBuilder) {
         logical_primitive(builder, "bool")
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&[u8::from(*self)])
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -179,7 +179,7 @@ unsafe impl AssetReflect for char {
     fn logical(builder: &mut LogicalBuilder) {
         logical_primitive(builder, "char")
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&(*self as u32).to_le_bytes())
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -199,7 +199,7 @@ macro_rules! float {
             fn logical(builder: &mut LogicalBuilder) {
                 logical_primitive(builder, $name)
             }
-            fn encode(&self, sink: &mut dyn EncodeSink) {
+            fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
                 sink.flat(&self.to_bits().to_le_bytes())
             }
             fn to_authored(&self) -> AuthoredValue {
@@ -223,7 +223,7 @@ unsafe impl AssetReflect for f32 {
         logical_primitive(builder, "f32")
     }
 
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&self.to_bits().to_le_bytes())
     }
 
@@ -251,7 +251,7 @@ unsafe impl AssetReflect for () {
     fn logical(builder: &mut LogicalBuilder) {
         builder.byte(0x0D)
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.flat(&[])
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -275,10 +275,10 @@ unsafe impl AssetReflect for String {
     fn logical(builder: &mut LogicalBuilder) {
         builder.byte(0x08)
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
-        sink.begin(EncodeContainer::Str, checked_len(self.len()));
-        sink.flat(self.as_bytes());
-        sink.finish();
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        sink.begin(EncodeContainer::Str, checked_len(self.len()))?;
+        sink.flat(self.as_bytes())?;
+        sink.finish()
     }
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Str(self.clone())
@@ -302,7 +302,7 @@ unsafe impl AssetReflect for Blob {
     fn logical(builder: &mut LogicalBuilder) {
         builder.byte(0x0B)
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.blob(self.as_bytes())
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -327,13 +327,13 @@ unsafe impl<T: AssetReflect> AssetReflect for Vec<T> {
         builder.byte(0x04);
         T::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
-        sink.begin(EncodeContainer::Vec, checked_len(self.len()));
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        sink.begin(EncodeContainer::Vec, checked_len(self.len()))?;
         for value in self {
-            sink.push();
-            value.encode(sink);
+            sink.push()?;
+            value.encode(sink)?;
         }
-        sink.finish();
+        sink.finish()
     }
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Array(self.iter().map(AssetReflect::to_authored).collect())
@@ -364,13 +364,13 @@ unsafe impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
         builder.u64(N as u64);
         T::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
-        sink.begin(EncodeContainer::Array, checked_len(N));
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        sink.begin(EncodeContainer::Array, checked_len(N))?;
         for value in self {
-            sink.push();
-            value.encode(sink);
+            sink.push()?;
+            value.encode(sink)?;
         }
-        sink.finish();
+        sink.finish()
     }
     fn to_authored(&self) -> AuthoredValue {
         AuthoredValue::Array(self.iter().map(AssetReflect::to_authored).collect())
@@ -402,13 +402,13 @@ unsafe impl<T: AssetReflect> AssetReflect for Option<T> {
         builder.byte(0x06);
         T::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
-        sink.begin(EncodeContainer::Option, u32::from(self.is_some()));
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        sink.begin(EncodeContainer::Option, u32::from(self.is_some()))?;
         if let Some(value) = self {
-            sink.push();
-            value.encode(sink);
+            sink.push()?;
+            value.encode(sink)?;
         }
-        sink.finish();
+        sink.finish()
     }
     fn to_authored(&self) -> AuthoredValue {
         self.as_ref()
@@ -438,11 +438,11 @@ unsafe impl<T: AssetReflect> AssetReflect for Box<T> {
     fn logical(builder: &mut LogicalBuilder) {
         T::logical(builder)
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
-        sink.begin(EncodeContainer::Box, 1);
-        sink.push();
-        (**self).encode(sink);
-        sink.finish();
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        sink.begin(EncodeContainer::Box, 1)?;
+        sink.push()?;
+        (**self).encode(sink)?;
+        sink.finish()
     }
     fn to_authored(&self) -> AuthoredValue {
         (**self).to_authored()
@@ -468,11 +468,11 @@ unsafe impl<T: AssetReflect> AssetReflect for Arc<T> {
     fn logical(builder: &mut LogicalBuilder) {
         T::logical(builder)
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
-        sink.begin(EncodeContainer::Arc, 1);
-        sink.push();
-        (**self).encode(sink);
-        sink.finish();
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
+        sink.begin(EncodeContainer::Arc, 1)?;
+        sink.push()?;
+        (**self).encode(sink)?;
+        sink.finish()
     }
     fn to_authored(&self) -> AuthoredValue {
         (**self).to_authored()
@@ -503,7 +503,7 @@ where
         builder.byte(0x0E);
         T::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_set(self.iter(), self.len(), sink)
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -537,7 +537,7 @@ where
         builder.byte(0x0E);
         T::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_set(self.iter(), self.len(), sink)
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -578,7 +578,7 @@ where
         K::logical(builder);
         V::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_map(self.iter(), self.len(), sink)
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -617,7 +617,7 @@ where
         K::logical(builder);
         V::logical(builder);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         encode_map(self.iter(), self.len(), sink)
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -654,7 +654,7 @@ unsafe impl<T: AssetType> AssetReflect for AssetRef<T> {
         builder.byte(0x09);
         builder.bytes(&T::TYPE_UUID.0);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.reference(true, self.uuid(), T::TYPE_UUID)
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -670,7 +670,7 @@ unsafe impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
         builder.byte(0x0A);
         builder.bytes(&T::TYPE_UUID.0);
     }
-    fn encode(&self, sink: &mut dyn EncodeSink) {
+    fn encode(&self, sink: &mut dyn EncodeSink) -> Result<(), CallbackPanic> {
         sink.reference(false, self.uuid(), T::TYPE_UUID)
     }
     fn to_authored(&self) -> AuthoredValue {
@@ -682,15 +682,15 @@ fn encode_set<'a, T: AssetReflect + 'a>(
     values: impl Iterator<Item = &'a T>,
     len: usize,
     sink: &mut dyn EncodeSink,
-) {
+) -> Result<(), CallbackPanic> {
     let mut values: Vec<_> = values.map(|v| (canonical_bytes(v), v)).collect();
     values.sort_by(|a, b| a.0.cmp(&b.0));
-    sink.begin(EncodeContainer::Set, checked_len(len));
+    sink.begin(EncodeContainer::Set, checked_len(len))?;
     for (_, value) in values {
-        sink.push();
-        value.encode(sink);
+        sink.push()?;
+        value.encode(sink)?;
     }
-    sink.finish();
+    sink.finish()
 }
 
 fn authored_set<'a, T: AssetReflect + 'a>(values: impl Iterator<Item = &'a T>) -> AuthoredValue {
@@ -703,16 +703,16 @@ fn encode_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
     entries: impl Iterator<Item = (&'a K, &'a V)>,
     len: usize,
     sink: &mut dyn EncodeSink,
-) {
+) -> Result<(), CallbackPanic> {
     let mut entries: Vec<_> = entries.map(|(k, v)| (canonical_bytes(k), k, v)).collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    sink.begin(EncodeContainer::Map, checked_len(len));
+    sink.begin(EncodeContainer::Map, checked_len(len))?;
     for (_, key, value) in entries {
-        sink.push();
-        key.encode(sink);
-        value.encode(sink);
+        sink.push()?;
+        key.encode(sink)?;
+        value.encode(sink)?;
     }
-    sink.finish();
+    sink.finish()
 }
 
 fn authored_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
@@ -745,7 +745,9 @@ fn authored_map<'a, K: AssetReflect + 'a, V: AssetReflect + 'a>(
 /// for §5 map/set ordering, never as an artifact encoding.
 pub fn canonical_bytes<T: AssetReflect>(value: &T) -> Vec<u8> {
     let mut sink = CanonicalSink(Vec::new());
-    value.encode(&mut sink);
+    value
+        .encode(&mut sink)
+        .expect("the canonical ordering sink cannot reject an event");
     sink.0
 }
 
@@ -759,11 +761,12 @@ impl CanonicalSink {
 }
 
 impl EncodeSink for CanonicalSink {
-    fn flat(&mut self, bytes: &[u8]) {
+    fn flat(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic> {
         self.frame(0x01, checked_len(bytes.len()));
         self.0.extend_from_slice(bytes);
+        Ok(())
     }
-    fn begin(&mut self, kind: EncodeContainer, len: u32) {
+    fn begin(&mut self, kind: EncodeContainer, len: u32) -> Result<(), CallbackPanic> {
         let (tag, extra) = match kind {
             EncodeContainer::Vec => (0x10, None),
             EncodeContainer::Array => (0x11, None),
@@ -780,26 +783,31 @@ impl EncodeSink for CanonicalSink {
         if let Some(index) = extra {
             self.0.extend_from_slice(&index.to_be_bytes());
         }
+        Ok(())
     }
-    fn push(&mut self) {
-        self.0.push(0x20)
+    fn push(&mut self) -> Result<(), CallbackPanic> {
+        self.0.push(0x20);
+        Ok(())
     }
-    fn finish(&mut self) {
-        self.0.push(0x21)
+    fn finish(&mut self) -> Result<(), CallbackPanic> {
+        self.0.push(0x21);
+        Ok(())
     }
-    fn blob(&mut self, bytes: &[u8]) {
+    fn blob(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic> {
         self.frame(0x30, checked_len(bytes.len()));
         self.0.extend_from_slice(bytes);
+        Ok(())
     }
     fn reference(
         &mut self,
         strong: bool,
         target: distill_core::id::AssetUuid,
         expected_terminal: distill_core::id::TypeUuid,
-    ) {
+    ) -> Result<(), CallbackPanic> {
         self.0.push(if strong { 0x40 } else { 0x41 });
         self.0.extend_from_slice(&target.0);
         self.0.extend_from_slice(&expected_terminal.0);
+        Ok(())
     }
 }
 

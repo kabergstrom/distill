@@ -33,7 +33,7 @@ use crate::lineage_repair::{
 };
 use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::{QuarantineDriver, QuarantineError, QuarantineRoot};
-use crate::scanner::{AssetRoot, RootedScanner, ScanError, ScanSnapshot};
+use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanError, ScanSnapshot};
 
 pub struct AuthoringService {
     pub(crate) store: Arc<Mutex<Store>>,
@@ -72,15 +72,25 @@ impl AuthoringService {
     pub fn new(
         store: Arc<Mutex<Store>>,
         roots: Vec<AssetRoot>,
+        scanner: RootedScanner,
         lineage_destination: LineageDestination,
         scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     ) -> Result<Self, AuthoringServiceInitError> {
-        let scanner = RootedScanner::new(roots.clone())?;
         let quarantine = QuarantineDriver::new(
             roots
                 .iter()
                 .map(|root| QuarantineRoot::new(&root.path, &root.quarantine_dir)),
         )?;
+        for root in &roots {
+            fs::create_dir_all(&root.quarantine_dir).map_err(|source| ScanError::Io {
+                path: root.quarantine_dir.clone(),
+                source,
+            })?;
+            scanner.retain_daemon_owned_directory(
+                DaemonOwnedDirectoryKind::Quarantine,
+                &root.quarantine_dir,
+            )?;
+        }
         let lineage = LineageRepairBackend::new(Arc::clone(&store), roots.clone())?;
         Ok(Self {
             store,
@@ -136,12 +146,22 @@ impl AuthoringService {
         roots: Vec<AssetRoot>,
         lineage_destination: LineageDestination,
     ) -> Result<AuthoringFilesystemCandidate, AuthoringServiceInitError> {
-        let scanner = RootedScanner::new(roots.clone())?;
+        let scanner = self.scanner.candidate_with_roots(roots.clone())?;
         let quarantine = QuarantineDriver::new(
             roots
                 .iter()
                 .map(|root| QuarantineRoot::new(&root.path, &root.quarantine_dir)),
         )?;
+        for root in &roots {
+            fs::create_dir_all(&root.quarantine_dir).map_err(|source| ScanError::Io {
+                path: root.quarantine_dir.clone(),
+                source,
+            })?;
+            scanner.retain_daemon_owned_directory(
+                DaemonOwnedDirectoryKind::Quarantine,
+                &root.quarantine_dir,
+            )?;
+        }
         let lineage = LineageRepairBackend::new(Arc::clone(&self.store), roots.clone())?;
         Ok(AuthoringFilesystemCandidate {
             roots,

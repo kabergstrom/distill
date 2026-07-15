@@ -321,8 +321,8 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
     let encode_fields = logical.iter().map(|field| {
         let member = &field.member;
         quote! {
-            sink.push();
-            ::distill_asset::AssetReflect::encode(&self.#member, sink);
+            sink.push()?;
+            ::distill_asset::AssetReflect::encode(&self.#member, sink)?;
         }
     });
     let authored_fields = logical.iter().map(|field| {
@@ -369,10 +369,13 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
                 builder.exit::<Self>();
             }
 
-            fn encode(&self, sink: &mut dyn ::distill_asset::EncodeSink) {
-                sink.begin(::distill_asset::EncodeContainer::Struct, #serializable_count);
+            fn encode(
+                &self,
+                sink: &mut dyn ::distill_asset::EncodeSink,
+            ) -> ::core::result::Result<(), ::distill_asset::CallbackPanic> {
+                sink.begin(::distill_asset::EncodeContainer::Struct, #serializable_count)?;
                 #(#encode_fields)*
-                sink.finish();
+                sink.finish()
             }
 
             fn to_authored(&self) -> ::distill_asset::AuthoredValue {
@@ -684,7 +687,10 @@ fn enum_reflect(
                 builder.exit::<Self>();
             }
 
-            fn encode(&self, sink: &mut dyn ::distill_asset::EncodeSink) {
+            fn encode(
+                &self,
+                sink: &mut dyn ::distill_asset::EncodeSink,
+            ) -> ::core::result::Result<(), ::distill_asset::CallbackPanic> {
                 match self { #(#encode_arms),* }
             }
 
@@ -821,15 +827,15 @@ fn enum_encode_arm(variant: &&VariantInfo, wire_index: u32) -> TokenStream2 {
     let encodes = fields.iter().map(|field| {
         let binding = &field.binding;
         quote! {
-            sink.push();
-            ::distill_asset::AssetReflect::encode(#binding, sink);
+            sink.push()?;
+            ::distill_asset::AssetReflect::encode(#binding, sink)?;
         }
     });
     quote! {
         #pattern => {
-            sink.begin(::distill_asset::EncodeContainer::Variant(#wire_index), #len);
+            sink.begin(::distill_asset::EncodeContainer::Variant(#wire_index), #len)?;
             #(#encodes)*
-            sink.finish();
+            sink.finish()
         }
     }
 }

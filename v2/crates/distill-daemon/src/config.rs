@@ -112,7 +112,18 @@ pub enum DaemonConfigError {
         controlled_path: PathBuf,
         role: &'static str,
     },
+    UnsupportedTargetIdentity {
+        target: String,
+        expected: Box<LayoutIdentity>,
+        observed: Box<LayoutIdentity>,
+    },
     Target(String),
+}
+
+pub(crate) struct StagedExecutionCandidate {
+    pub requirements: CandidateRequirements,
+    pub targets: Vec<TargetDefinition>,
+    pub build_targets: BTreeMap<String, Target>,
 }
 
 impl std::fmt::Display for DaemonConfigError {
@@ -336,6 +347,36 @@ impl DaemonConfig {
         })
     }
 
+    /// Parse a watched staging candidate while retaining every independently
+    /// observable semantic defect. TOML/UTF-8 shape failures remain a single
+    /// blocking defect; once the sealed raw structure exists, validation does
+    /// not give discovery order authority.
+    pub(crate) fn parse_staged(
+        source_path: impl AsRef<Path>,
+        source: &str,
+    ) -> Result<Self, Vec<DaemonConfigError>> {
+        match Self::parse(source_path.as_ref(), source) {
+            Ok(config) => Ok(config),
+            Err(first) => {
+                let source_path = match absolutize(source_path.as_ref()) {
+                    Ok(path) => path,
+                    Err(_) => return Err(vec![first]),
+                };
+                let raw: RawConfig = match toml::from_str(source) {
+                    Ok(raw) => raw,
+                    Err(_) => return Err(vec![first]),
+                };
+                let base = source_path.parent().unwrap_or_else(|| Path::new("/"));
+                let errors = validate_raw_candidate(&raw, base);
+                if errors.is_empty() {
+                    Err(vec![first])
+                } else {
+                    Err(errors)
+                }
+            }
+        }
+    }
+
     pub fn store_config(&self) -> StoreConfig {
         StoreConfig {
             state_path: self.daemon.state_path.clone(),
@@ -361,14 +402,24 @@ impl DaemonConfig {
         &self,
         identity: &LayoutIdentity,
     ) -> Result<BTreeMap<String, Target>, DaemonConfigError> {
-        self.targets
-            .iter()
-            .map(|(name, target)| {
+        self.build_targets_staged(identity)
+            .map_err(|mut errors| errors.remove(0))
+    }
+
+    fn build_targets_staged(
+        &self,
+        identity: &LayoutIdentity,
+    ) -> Result<BTreeMap<String, Target>, Vec<DaemonConfigError>> {
+        let mut errors = Vec::new();
+        let mut targets = BTreeMap::new();
+        for (name, target) in &self.targets {
+            let result = (|| {
                 if !target_matches_layout_identity(target, identity) {
-                    return Err(DaemonConfigError::Target(format!(
-                        "{name}: configured {:?}/{:?} does not match schema compilation target `{}`; cross-target layouts are not emitted yet",
-                        target.os, target.arch, identity.target_triple
-                    )));
+                    return Err(DaemonConfigError::UnsupportedTargetIdentity {
+                        target: name.clone(),
+                        expected: Box::new(configured_layout_identity(target, identity)),
+                        observed: Box::new(identity.clone()),
+                    });
                 }
                 Target::new(
                     target.os,
@@ -378,10 +429,20 @@ impl DaemonConfig {
                     target.debug_info,
                     identity.clone(),
                 )
-                .map(|target| (name.clone(), target))
                 .map_err(|error| DaemonConfigError::Target(format!("{name}: {error:?}")))
-            })
-            .collect()
+            })();
+            match result {
+                Ok(target) => {
+                    targets.insert(name.clone(), target);
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(targets)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Host-identity target binding. Cross-target layout emission remains the
@@ -420,6 +481,201 @@ impl DaemonConfig {
             targets,
         })
     }
+
+    pub(crate) fn stage_execution_candidate(
+        &self,
+        authority: &ProjectSchemaAuthority,
+    ) -> Result<StagedExecutionCandidate, Vec<DaemonConfigError>> {
+        let mut errors = Vec::new();
+        let build_targets = match self.build_targets_staged(authority.identity()) {
+            Ok(targets) => Some(targets),
+            Err(target_errors) => {
+                errors.extend(target_errors);
+                None
+            }
+        };
+        let schema_registry = match authority.logical_registry() {
+            Ok(registry) => Some(registry),
+            Err(error) => {
+                errors.push(DaemonConfigError::Target(error.to_string()));
+                None
+            }
+        };
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let build_targets = build_targets.expect("staging defects were checked");
+        let schema_registry = schema_registry.expect("staging defects were checked");
+        let targets = build_targets
+            .iter()
+            .map(|(name, target)| {
+                TargetDefinition::new(name, TargetDefinitionHash(target_definition_hash(target)))
+            })
+            .collect::<Vec<_>>();
+        let requirements = CandidateRequirements {
+            module_abi: host_module_abi_identity(),
+            source_hashes: authority.schema().source_hashes.clone(),
+            schema_registry,
+            targets: targets
+                .iter()
+                .map(|target| PipelineTarget {
+                    name: target.name().to_owned(),
+                    fingerprint: target.definition_hash().0,
+                })
+                .collect(),
+        };
+        Ok(StagedExecutionCandidate {
+            requirements,
+            targets,
+            build_targets,
+        })
+    }
+}
+
+fn configured_layout_identity(target: &TargetSection, observed: &LayoutIdentity) -> LayoutIdentity {
+    let arch = match target.arch {
+        TargetArch::Aarch64 => "aarch64",
+        TargetArch::X86_64 => "x86_64",
+    };
+    let target_triple = match target.os {
+        TargetOs::Linux => format!("{arch}-unknown-linux-gnu"),
+        TargetOs::MacOs => format!("{arch}-apple-darwin"),
+        TargetOs::Windows => format!("{arch}-pc-windows-msvc"),
+    };
+    LayoutIdentity {
+        target_triple,
+        rustc: observed.rustc.clone(),
+        algorithm_version: observed.algorithm_version,
+    }
+}
+
+fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError> {
+    let mut errors = Vec::new();
+
+    match raw.daemon.address.parse::<SocketAddr>() {
+        Ok(address) if !address.ip().is_loopback() => {
+            errors.push(DaemonConfigError::NonLoopbackAddress(address));
+        }
+        Ok(_) => {}
+        Err(_) => errors.push(DaemonConfigError::InvalidAddress(
+            raw.daemon.address.clone(),
+        )),
+    }
+
+    let mut normalized_roots = BTreeSet::new();
+    let mut resolved_roots = Vec::new();
+    for (raw_name, path) in &raw.assets.roots {
+        if let Err(error) = validate_name("asset root", raw_name) {
+            errors.push(error);
+        }
+        let name = raw_name.nfc().collect::<String>();
+        if !normalized_roots.insert(name.clone()) {
+            errors.push(DaemonConfigError::DuplicateNormalizedName {
+                kind: "asset root",
+                name,
+            });
+        }
+        match resolve(base, path) {
+            Ok(path) => {
+                if !path.is_dir() {
+                    errors.push(DaemonConfigError::RootUnavailable(path.clone()));
+                }
+                resolved_roots.push(path);
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    let lineage_root = raw.assets.lineage_manifest.root.nfc().collect::<String>();
+    if !normalized_roots.contains(&lineage_root) {
+        errors.push(DaemonConfigError::UnknownLineageRoot(
+            raw.assets.lineage_manifest.root.clone(),
+        ));
+    }
+    if distill_build::query::normalize_path(&raw.assets.lineage_manifest.path).is_err() {
+        errors.push(DaemonConfigError::InvalidLineagePath(
+            raw.assets.lineage_manifest.path.clone(),
+        ));
+    }
+
+    let controlled = [
+        ("daemon.state_path", &raw.daemon.state_path),
+        ("assets.schema_path", &raw.assets.schema_path),
+        ("modules.pipeline_dylib", &raw.modules.pipeline_dylib),
+        ("codegen.rs_mod_path", &raw.codegen.rs_mod_path),
+    ]
+    .into_iter()
+    .filter_map(|(role, path)| match resolve(base, path) {
+        Ok(path) => Some((role, path)),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    })
+    .collect::<Vec<_>>();
+    for root in &resolved_roots {
+        for (role, path) in &controlled {
+            if nested_either_way(root, path) {
+                errors.push(DaemonConfigError::PathOverlap {
+                    asset_root: root.clone(),
+                    controlled_path: path.clone(),
+                    role,
+                });
+            }
+        }
+    }
+
+    let scheduler = StoreConfig {
+        state_path: PathBuf::new(),
+        displaced_retention_days: raw.daemon.displaced_retention_days,
+        segment_size: 1,
+        cache_limit: 1,
+        parallelism: raw.pipeline.parallelism,
+        batch_reserved_workers: raw.pipeline.batch_reserved_workers,
+    };
+    if let Err(error) = scheduler.validate_scheduler() {
+        errors.push(DaemonConfigError::Scheduler(error));
+    }
+    if !(1..=MAX_DEPENDENCY_DEPTH).contains(&raw.pipeline.max_dependency_depth) {
+        errors.push(DaemonConfigError::Target(format!(
+            "pipeline.max_dependency_depth must be in 1..={MAX_DEPENDENCY_DEPTH}"
+        )));
+    }
+
+    if raw.targets.is_empty() {
+        errors.push(DaemonConfigError::EmptyTargets);
+    }
+    let mut normalized_targets = BTreeSet::new();
+    for (raw_name, target) in &raw.targets {
+        if let Err(error) = validate_name("target", raw_name) {
+            errors.push(error);
+        }
+        let name = raw_name.nfc().collect::<String>();
+        if !normalized_targets.insert(name.clone()) {
+            errors.push(DaemonConfigError::DuplicateNormalizedName {
+                kind: "target",
+                name: name.clone(),
+            });
+        }
+        if target.apis.is_empty() {
+            errors.push(DaemonConfigError::EmptyTargetApis(name.clone()));
+        }
+        for api in &target.apis {
+            if GraphicsApi::new(api).is_err() {
+                errors.push(DaemonConfigError::InvalidTargetApi {
+                    target: name.clone(),
+                    api: api.clone(),
+                });
+            }
+        }
+    }
+
+    if let Err(error) = parse_byte_size(&raw.cas.segment_size) {
+        errors.push(DaemonConfigError::InvalidByteSize(error.to_string()));
+    }
+    if let Err(error) = parse_byte_size(&raw.cas.cache_limit) {
+        errors.push(DaemonConfigError::InvalidByteSize(error.to_string()));
+    }
+    errors
 }
 
 fn target_matches_layout_identity(target: &TargetSection, identity: &LayoutIdentity) -> bool {
@@ -512,7 +768,31 @@ pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> D
             },
             _ => malformed(),
         },
+        DaemonConfigError::UnsupportedTargetIdentity {
+            target,
+            expected,
+            observed,
+        } => DscpV1::UnsupportedTargetIdentity {
+            target: target.clone(),
+            expected: expected.as_ref().clone(),
+            observed: observed.as_ref().clone(),
+        },
         _ => malformed(),
+    }
+}
+
+pub(crate) fn candidate_error_reason(error: &DaemonConfigError, file_hash: [u8; 32]) -> DscpV1 {
+    match error {
+        DaemonConfigError::UnsupportedTargetIdentity {
+            target,
+            expected,
+            observed,
+        } => DscpV1::UnsupportedTargetIdentity {
+            target: target.clone(),
+            expected: expected.as_ref().clone(),
+            observed: observed.as_ref().clone(),
+        },
+        _ => DscpV1::MalformedConfiguration { file_hash },
     }
 }
 

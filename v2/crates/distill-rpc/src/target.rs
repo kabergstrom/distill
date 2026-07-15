@@ -1,4 +1,5 @@
 use crate::TargetDefinitionHash;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetSetError {
@@ -22,7 +23,7 @@ pub struct TargetDefinition {
 impl TargetDefinition {
     pub fn new(name: impl Into<String>, definition_hash: TargetDefinitionHash) -> Self {
         Self {
-            name: name.into(),
+            name: name.into().nfc().collect(),
             definition_hash,
         }
     }

@@ -248,19 +248,24 @@ impl ErasedValue {
 /// value ever crosses the module boundary on the output path.
 pub trait EncodeSink {
     /// Flat value bytes (scalars, flat structs) at the current position.
-    fn flat(&mut self, bytes: &[u8]);
+    fn flat(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic>;
     /// Container events, in canonical order (§5): the visitor — not the
     /// sink — owns iteration order, and emits map/set members sorted by
     /// their encoded bytes.
-    fn begin(&mut self, kind: EncodeContainer, len: u32);
-    fn push(&mut self);
-    fn finish(&mut self);
+    fn begin(&mut self, kind: EncodeContainer, len: u32) -> Result<(), CallbackPanic>;
+    fn push(&mut self) -> Result<(), CallbackPanic>;
+    fn finish(&mut self) -> Result<(), CallbackPanic>;
     /// `#[asset(blob)]` payload handoff — the bytes, never a slot
     /// encoding.
-    fn blob(&mut self, bytes: &[u8]);
+    fn blob(&mut self, bytes: &[u8]) -> Result<(), CallbackPanic>;
     /// Typed reference emission: §9's result binding validates each one
     /// against the job's snapshot and records the TraceOp::RefCheck.
-    fn reference(&mut self, strong: bool, target: AssetUuid, expected_terminal: TypeUuid);
+    fn reference(
+        &mut self,
+        strong: bool,
+        target: AssetUuid,
+        expected_terminal: TypeUuid,
+    ) -> Result<(), CallbackPanic>;
 }
 
 /// Container kinds in the encode vocabulary (§4). `Variant(u32)` carries

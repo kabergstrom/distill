@@ -701,6 +701,22 @@ impl Store {
         Ok(entries)
     }
 
+    /// Raw deterministic identity set for one bundle, including poisoned
+    /// skeleton rows. Incremental healing needs the prior UUID set without
+    /// interpreting poisoned metadata or enumerating unrelated bundles.
+    pub fn asset_ids_in_bundle(
+        &self,
+        bundle: BundleUuid,
+    ) -> Result<BTreeSet<AssetUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1 ORDER BY asset_uuid")?;
+        let rows = statement.query_map([bundle.0.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Complete path-index projection grouped by normalized logical path.
     /// Multiple roots remain multiple candidates; no root is selected here.
     pub fn all_path_entries(&self) -> Result<Vec<(String, RootId, AssetUuid)>, StoreError> {
@@ -1042,6 +1058,30 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Every retained exact-hash schema snapshot, including snapshots no
+    /// longer referenced by the current bundle projection. Doctor uses this
+    /// disposable cache as one additional exact repair source.
+    pub fn all_schemas(&self) -> Result<Vec<(LogicalHash, String)>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT logical_hash, schema_json FROM schemas ORDER BY logical_hash")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(hash, json)| {
+                if hash.len() != 32 {
+                    return Err(StoreError::InvalidSchemaCache {
+                        detail: "schema cache contains a non-32-byte logical hash".to_owned(),
+                    });
+                }
+                Ok((LogicalHash(blob32(hash)), json))
+            })
+            .collect()
     }
 }
 

@@ -5,11 +5,15 @@
 mod common;
 
 use common::*;
-use distill_bundle::{parse_bundle, write_bundle, Bundle, BundleError as E, EntryLineageV1};
+use distill_bundle::{
+    extract_namespace_skeleton, parse_bundle, repair_missing_schemas, write_bundle, Bundle,
+    BundleError as E, EntryLineageV1,
+};
 use distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS;
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
 use distill_json::AuthoredValue as V;
 use ngp_schema::{SchemaNode as N, SnapshotError};
+use std::collections::BTreeMap;
 
 fn valid_plain() -> (Vec<u8>, Bundle) {
     let sc = simple_schema();
@@ -42,6 +46,82 @@ fn schema_closure_missing_hash() {
 }
 
 #[test]
+fn exact_held_schema_repairs_plain_bundle_canonically() {
+    let (plain, bundle) = valid_plain();
+    let schema_hash = bundle.assets["a"].schema_hash;
+    let missing = mutate_envelope(&plain, |env| {
+        *as_obj(env).get_mut("schemas").unwrap() = obj(&[]);
+    });
+    let holders = BTreeMap::from([(schema_hash, bundle.schemas[&schema_hash].clone())]);
+
+    let repaired = repair_missing_schemas(&missing, &holders)
+        .unwrap()
+        .expect("missing schema is repairable");
+    assert_eq!(repaired, plain);
+    assert_eq!(parse_bundle(&repaired).unwrap(), bundle);
+}
+
+#[test]
+fn exact_held_schema_repairs_an_omitted_schema_table() {
+    let (plain, bundle) = valid_plain();
+    let schema_hash = bundle.assets["a"].schema_hash;
+    let missing = mutate_envelope(&plain, |env| {
+        as_obj(env).remove("schemas");
+    });
+    let holders = BTreeMap::from([(schema_hash, bundle.schemas[&schema_hash].clone())]);
+
+    assert_eq!(
+        repair_missing_schemas(&missing, &holders).unwrap(),
+        Some(plain)
+    );
+}
+
+#[test]
+fn absent_exact_holder_never_guesses_schema() {
+    let (plain, bundle) = valid_plain();
+    let schema_hash = bundle.assets["a"].schema_hash;
+    let missing = mutate_envelope(&plain, |env| {
+        *as_obj(env).get_mut("schemas").unwrap() = obj(&[]);
+    });
+
+    let error = repair_missing_schemas(&missing, &BTreeMap::new()).unwrap_err();
+    assert!(matches!(
+        error,
+        E::MissingSchema {
+            local_id,
+            schema_hash: missing_hash
+        } if local_id == "a" && missing_hash == schema_hash
+    ));
+}
+
+#[test]
+fn exact_held_schema_repairs_container_without_changing_blob_data() {
+    let schema = schema(st(&[("payload", N::Blob)]));
+    let bundle = bundle(
+        &[&schema],
+        vec![(
+            "a",
+            entry(UUID_A, &schema, obj(&[("payload", blob(b"payload"))])),
+        )],
+        None,
+    );
+    let canonical = write_bundle(&bundle).unwrap();
+    let (json, _, chunk) = container_parts(&canonical);
+    let missing_json = mutate_envelope(&json, |env| {
+        *as_obj(env).get_mut("schemas").unwrap() = obj(&[]);
+    });
+    let missing = build_container(&missing_json, &chunk);
+    let schema_hash = bundle.assets["a"].schema_hash;
+    let holders = BTreeMap::from([(schema_hash, bundle.schemas[&schema_hash].clone())]);
+
+    let repaired = repair_missing_schemas(&missing, &holders)
+        .unwrap()
+        .expect("container schema is repairable");
+    assert_eq!(repaired, canonical);
+    assert_eq!(parse_bundle(&repaired).unwrap(), bundle);
+}
+
+#[test]
 fn schemas_key_must_equal_snapshot_hash() {
     let (plain, b) = valid_plain();
     let real = b.assets["a"].schema_hash;
@@ -70,6 +150,22 @@ fn primary_must_name_an_existing_entry() {
         matches!(&err, E::PrimaryNotFound { primary } if primary == "nope"),
         "got {err:?}"
     );
+}
+
+#[test]
+fn invalid_primary_still_yields_the_current_namespace_skeleton() {
+    let (plain, bundle) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        as_obj(env).insert("primary".to_string(), s("nope"));
+    });
+    assert!(matches!(
+        parse_bundle(&bytes),
+        Err(E::PrimaryNotFound { .. })
+    ));
+
+    let skeleton = extract_namespace_skeleton(&bytes).unwrap();
+    assert_eq!(skeleton.uuid, bundle.uuid);
+    assert_eq!(skeleton.assets, bundle.assets);
 }
 
 #[test]
@@ -321,6 +417,22 @@ fn unknown_envelope_key_rejected() {
         matches!(&err, E::UnknownEnvelopeKey { key } if key == "extra"),
         "got {err:?}"
     );
+}
+
+#[test]
+fn unknown_extension_key_does_not_hide_the_validated_namespace() {
+    let (plain, bundle) = valid_plain();
+    let bytes = mutate_envelope(&plain, |env| {
+        as_obj(env).insert("future".to_string(), u(1));
+    });
+    assert!(matches!(
+        parse_bundle(&bytes),
+        Err(E::UnknownEnvelopeKey { .. })
+    ));
+
+    let skeleton = extract_namespace_skeleton(&bytes).unwrap();
+    assert_eq!(skeleton.uuid, bundle.uuid);
+    assert_eq!(skeleton.assets, bundle.assets);
 }
 
 #[test]

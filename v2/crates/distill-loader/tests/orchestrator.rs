@@ -28,6 +28,12 @@ struct BuildOnly;
 
 const PLACEHOLDER_TYPE: TypeUuid = TypeUuid([0x43; 16]);
 
+fn blob(bytes: Vec<u8>) -> distill_wire::exec::Blob {
+    let len = bytes.len();
+    let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(bytes);
+    distill_wire::exec::Blob::new(backing, 0, len)
+}
+
 struct RefPlaceholder;
 
 #[derive(Clone, Default)]
@@ -53,17 +59,20 @@ unsafe fn encode_ref_placeholder(
     value_ptr: *const u8,
     sink: &mut dyn EncodeSink,
 ) -> Result<(), CallbackPanic> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = value_ptr;
         PLACEHOLDER_CONFIG.with(|config| {
             let config = config.borrow();
             assert!(!config.panic_while_visiting, "test visitor panic");
             for (strong, target, expected) in &config.references {
-                sink.reference(*strong, *target, *expected);
+                sink.reference(*strong, *target, *expected)?;
             }
-        });
-    }))
-    .map_err(|_| CallbackPanic)
+            Ok(())
+        })
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(CallbackPanic),
+    }
 }
 
 unsafe impl AssetType for RefPlaceholder {
@@ -365,7 +374,7 @@ fn artifact_with_edges<T: AssetType>(
                     expected_terminal: *expected_terminal,
                 })
                 .collect(),
-            wire_layout: Arc::from(dswl_bytes(&wire).unwrap()),
+            wire_layout: blob(dswl_bytes(&wire).unwrap()),
         },
     )
 }
@@ -511,7 +520,7 @@ fn malformed_fetch_terminally_fails_its_candidate() {
             structural: Arc::from([0_u8]),
             blobs: Vec::new(),
             load_edges: Vec::new(),
-            wire_layout: Arc::from([]),
+            wire_layout: blob(Vec::new()),
         },
     );
     loader.process(&mut storage).unwrap();

@@ -64,6 +64,103 @@ fn looks_line_ending_mangled(found: &[u8; 8]) -> bool {
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> Result<Bundle, BundleError> {
+    parse_with(bytes, envelope::decode)
+}
+
+pub(crate) fn parse_namespace(bytes: &[u8]) -> Result<Bundle, BundleError> {
+    parse_with(bytes, envelope::decode_namespace)
+}
+
+pub(crate) fn repair_missing_schemas(
+    bytes: &[u8],
+    holders: &BTreeMap<distill_core::id::LogicalHash, ngp_schema::LogicalSchema>,
+) -> Result<Option<Vec<u8>>, BundleError> {
+    if bytes.len() < HEADER_LEN as usize {
+        return Err(E::TooShortForHeader { len: bytes.len() });
+    }
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&bytes[0..8]);
+    if magic != CONTAINER_MAGIC {
+        return Err(E::BadMagic {
+            found: magic,
+            line_ending_mangled: looks_line_ending_mangled(&magic),
+        });
+    }
+    let version = le_u32(bytes, 8);
+    if version != CONTAINER_VERSION {
+        return Err(E::UnsupportedContainerVersion { found: version });
+    }
+    let json_len = le_u64(bytes, 12);
+    let blob_len = le_u64(bytes, 20);
+    let json_crc = le_u32(bytes, 28);
+    let blob_crc = le_u32(bytes, 32);
+    let overflow = E::HeaderOverflow { json_len, blob_len };
+    let json_end = HEADER_LEN.checked_add(json_len).ok_or(overflow.clone())?;
+    let chunk_start = align16(json_end).ok_or(overflow.clone())?;
+    let expected_total = chunk_start.checked_add(blob_len).ok_or(overflow)?;
+    if bytes.len() as u64 != expected_total {
+        return if (bytes.len() as u64) < expected_total {
+            Err(E::Truncated {
+                expected: expected_total,
+                actual: bytes.len() as u64,
+            })
+        } else {
+            Err(E::TrailingBytes {
+                expected: expected_total,
+                actual: bytes.len() as u64,
+            })
+        };
+    }
+    let json = &bytes[HEADER_LEN as usize..json_end as usize];
+    let pad = &bytes[json_end as usize..chunk_start as usize];
+    let chunk = &bytes[chunk_start as usize..];
+    if crc32c(json) != json_crc {
+        return Err(E::JsonCrcMismatch {
+            expected: json_crc,
+            actual: crc32c(json),
+        });
+    }
+    if crc32c(chunk) != blob_crc {
+        return Err(E::BlobCrcMismatch {
+            expected: blob_crc,
+            actual: crc32c(chunk),
+        });
+    }
+    if let Some(index) = pad.iter().position(|byte| *byte != 0) {
+        return Err(E::NonzeroPadByte {
+            file_offset: json_end + index as u64,
+        });
+    }
+    let text = envelope::utf8(json)?;
+    let mut value = distill_json::parse(text).map_err(E::Json)?;
+    if !envelope::inject_missing_schemas(&mut value, holders)? {
+        return Ok(None);
+    }
+    let mut repaired_json = distill_json::write(&value).map_err(E::JsonWrite)?;
+    repaired_json.push('\n');
+    let mut candidate =
+        Vec::with_capacity(HEADER_LEN as usize + repaired_json.len() + 15 + chunk.len());
+    candidate.extend_from_slice(&CONTAINER_MAGIC);
+    candidate.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+    candidate.extend_from_slice(&(repaired_json.len() as u64).to_le_bytes());
+    candidate.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+    candidate.extend_from_slice(&crc32c(repaired_json.as_bytes()).to_le_bytes());
+    candidate.extend_from_slice(&crc32c(chunk).to_le_bytes());
+    candidate.extend_from_slice(repaired_json.as_bytes());
+    let padded = align16(candidate.len() as u64).ok_or(E::HeaderOverflow {
+        json_len: repaired_json.len() as u64,
+        blob_len,
+    })?;
+    candidate.resize(padded as usize, 0);
+    candidate.extend_from_slice(chunk);
+    let repaired = parse(&candidate)?;
+    write(&repaired).map(Some)
+}
+
+fn parse_with(
+    bytes: &[u8],
+    decode: fn(AuthoredValue) -> Result<Bundle, BundleError>,
+) -> Result<Bundle, BundleError> {
     // ---- framing: everything here runs before any allocation ----
     if bytes.len() < HEADER_LEN as usize {
         return Err(E::TooShortForHeader { len: bytes.len() });
@@ -131,7 +228,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Bundle, BundleError> {
     // ---- envelope ----
     let text = envelope::utf8(json)?;
     let value = distill_json::parse(text).map_err(E::Json)?;
-    let mut bundle = envelope::decode(value)?;
+    let mut bundle = decode(value)?;
 
     // ---- pass A: schema-directed walk, validate placement leaves ----
     let mut sites: Vec<BlobSite> = Vec::new();

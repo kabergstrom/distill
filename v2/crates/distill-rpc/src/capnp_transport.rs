@@ -1406,10 +1406,14 @@ impl schema::delta_stream::Server for DeltaStreamService {
         mut results: schema::delta_stream::NextResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            let event = self.stream.next_async().await;
             let mut output = results.get();
-            output.set_done(false);
-            write_stream_event(output.init_event(), &event)?;
+            match self.stream.next_async().await {
+                Some(event) => {
+                    output.set_done(false);
+                    write_stream_event(output.init_event(), &event)?;
+                }
+                None => output.set_done(true),
+            }
             Ok(())
         }
     }
@@ -3322,6 +3326,9 @@ fn write_bundle_uuid_result(
             RPC_FAILURE,
             &format!("unexpected version poison on authoring operation: {poison}"),
         ),
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "connection lease expired")
+        }
         RpcResult::Failure(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
@@ -3351,6 +3358,9 @@ fn write_progress_result(
             RPC_FAILURE,
             &format!("unexpected version poison on authoring operation: {poison}"),
         ),
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "connection lease expired")
+        }
         RpcResult::Failure(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
@@ -3371,6 +3381,9 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
             RPC_FAILURE,
             &format!("unexpected version poison on wire-tree fetch: {poison}"),
         ),
+        RpcResult::Failure(RpcFailure::LeaseExpired) => {
+            write_lease_failure(result.init_lease_failure(), "connection lease expired")
+        }
         RpcResult::Failure(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }

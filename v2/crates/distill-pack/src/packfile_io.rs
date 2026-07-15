@@ -12,13 +12,15 @@ use distill_loader::{
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::Blob;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::activation::{archive_filename, manifest_filename, read_current, PointerError};
 use crate::archive::{
     decode_structural, scan_archive, ArchiveError, ArchiveObjectKind, EKey, ScannedArchive,
 };
 use crate::manifest::{
-    decode_manifest, manifest_hash, verify_artifact_header, ManifestError, PackManifest,
+    decode_manifest, manifest_hash, verify_artifact_header, verify_expected_terminals,
+    ManifestAssetRow, ManifestError, PackManifest,
 };
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,7 @@ pub enum MountError {
     ContentHash(ContentHash),
     MissingEncoding(ContentHash),
     UnreferencedEncoding(ContentHash),
+    DuplicateContentHash(ContentHash),
     MissingWireTree(LayoutHash),
     WireTree(LayoutHash),
 }
@@ -176,11 +179,44 @@ impl PackfileIO {
         verify_index(&manifest, &archives)?;
         let referenced: std::collections::BTreeSet<_> =
             manifest.assets.iter().map(|row| row.content_hash).collect();
+        if referenced.len() != manifest.assets.len() {
+            let mut seen = std::collections::BTreeSet::new();
+            let duplicate = manifest
+                .assets
+                .iter()
+                .map(|row| row.content_hash)
+                .find(|hash| !seen.insert(*hash))
+                .expect("set cardinality proved a duplicate content hash");
+            return Err(MountError::DuplicateContentHash(duplicate));
+        }
+        let encoded = manifest
+            .encodings
+            .iter()
+            .map(|row| row.content_hash)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(missing) = referenced.difference(&encoded).next() {
+            return Err(MountError::MissingEncoding(*missing));
+        }
         for encoding in &manifest.encodings {
             if !referenced.contains(&encoding.content_hash) {
                 return Err(MountError::UnreferencedEncoding(encoding.content_hash));
             }
         }
+        for row in &manifest.wire_trees {
+            let wire =
+                decode_dswl(&row.bytes).map_err(|_| MountError::WireTree(row.layout_hash))?;
+            if dswl_hash(&wire).map_err(|_| MountError::WireTree(row.layout_hash))?
+                != row.layout_hash
+            {
+                return Err(MountError::WireTree(row.layout_hash));
+            }
+        }
+        let mut terminal_types = BTreeMap::new();
+        for row in &manifest.assets {
+            let decoded = decode_fetched(&manifest, &archives, row)?;
+            terminal_types.insert(row.asset_uuid, decoded.terminal_type);
+        }
+        verify_expected_terminals(&manifest, &terminal_types)?;
         let basis = IoBasis::Pack {
             manifest: ManifestHash(manifest_hash),
         };
@@ -197,7 +233,7 @@ impl PackfileIO {
     }
 
     fn verify_runtime(manifest: &PackManifest, runtime: &RuntimeTarget) -> Result<(), MountError> {
-        if manifest.target.name != runtime.target
+        if manifest.target.name != runtime.target.nfc().collect::<String>()
             || manifest.target_def_hash != runtime.target_def_hash
         {
             return Err(MountError::TargetMismatch);
@@ -257,11 +293,17 @@ fn verify_index(
     Ok(())
 }
 
+struct DecodedFetched {
+    artifact: FetchedArtifact,
+    terminal_type: distill_core::id::TypeUuid,
+}
+
 fn decode_fetched(
     manifest: &PackManifest,
     archives: &BTreeMap<u32, MountedArchive>,
-    content_hash: ContentHash,
-) -> Result<FetchedArtifact, MountError> {
+    row: &ManifestAssetRow,
+) -> Result<DecodedFetched, MountError> {
+    let content_hash = row.content_hash;
     let encoding_index = manifest
         .encodings
         .binary_search_by_key(&content_hash, |row| row.content_hash)
@@ -324,12 +366,8 @@ fn decode_fetched(
     if dswl_hash(&wire).map_err(|_| MountError::WireTree(parts.layout_hash))? != parts.layout_hash {
         return Err(MountError::WireTree(parts.layout_hash));
     }
-    let row = manifest
-        .assets
-        .iter()
-        .find(|row| row.content_hash == content_hash)
-        .ok_or(MountError::MissingEncoding(content_hash))?;
     verify_artifact_header(row, parts.asset_uuid, &parts.load_deps)?;
+    let terminal_type = parts.terminal_type;
     let load_edges = row
         .load_deps
         .iter()
@@ -342,11 +380,16 @@ fn decode_fetched(
         .into_iter()
         .map(|(backing, offset, len)| Blob::new(backing, offset, len))
         .collect();
-    Ok(FetchedArtifact {
-        structural: Arc::from(structural),
-        blobs,
-        load_edges,
-        wire_layout: Arc::from(wire_layout),
+    let wire_len = wire_layout.len();
+    let wire_backing: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(wire_layout);
+    Ok(DecodedFetched {
+        artifact: FetchedArtifact {
+            structural: Arc::from(structural),
+            blobs,
+            load_edges,
+            wire_layout: Blob::new(wire_backing, 0, wire_len),
+        },
+        terminal_type,
     })
 }
 
@@ -419,12 +462,18 @@ impl LoaderIO for PackfileIO {
             });
             return;
         }
-        let result = decode_fetched(&self.manifest, &self.archives, content_hash);
+        let result = self
+            .manifest
+            .assets
+            .iter()
+            .find(|row| row.content_hash == content_hash)
+            .ok_or(MountError::MissingEncoding(content_hash))
+            .and_then(|row| decode_fetched(&self.manifest, &self.archives, row));
         match result {
-            Ok(artifact) => self.events.push_back(IoEvent::Fetched {
+            Ok(decoded) => self.events.push_back(IoEvent::Fetched {
                 req,
                 content_hash,
-                artifact,
+                artifact: decoded.artifact,
                 basis: self.basis.clone(),
             }),
             Err(error) => self.events.push_back(IoEvent::RequestError {

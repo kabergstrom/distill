@@ -514,7 +514,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .unwrap();
     let work = coordinator.pending_file_work().unwrap();
     assert!(coordinator
-        .reconcile_directory_imports_affected(&work)
+        .reconcile_directory_imports_affected(&work, false)
         .unwrap()
         .is_empty());
     coordinator.acknowledge_file_work(&work).unwrap();

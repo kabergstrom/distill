@@ -87,6 +87,19 @@ pub struct AssetEntry {
     pub data: AuthoredValue,
 }
 
+/// The namespace-bearing portion of malformed bundle bytes. This is returned
+/// only when the physical framing, envelope identities, schema closure, and
+/// every entry's schema-directed data walk still validate; non-namespace
+/// defects such as an invalid `primary` declaration or unknown extension key
+/// are ignored by the extractor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BundleNamespaceSkeleton {
+    pub format_version: u32,
+    pub uuid: BundleUuid,
+    pub schemas: BTreeMap<LogicalHash, LogicalSchema>,
+    pub assets: BTreeMap<String, AssetEntry>,
+}
+
 /// Revalidate an entry against the unique accepted lineage-manifest
 /// authority after ordinary bundle parsing has established its local shape.
 /// Bootstrap controls deliberately receive `None`; every other type requires
@@ -167,6 +180,50 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, BundleError> {
         } else {
             envelope::parse_plain(bytes)
         }
+    })
+}
+
+/// Extract a complete namespace skeleton from malformed bytes when the
+/// malformed portion cannot change bundle/asset identity or entry data. This
+/// deliberately remains stricter than a best-effort parser: if framing,
+/// schema closure, lineage, or any schema-directed value walk fails, callers
+/// must use version-global poison.
+pub fn extract_namespace_skeleton(bytes: &[u8]) -> Result<BundleNamespaceSkeleton, BundleError> {
+    on_reserved_stack(|| {
+        let bundle = if bytes.first() == Some(&0x89) {
+            container::parse_namespace(bytes)?
+        } else {
+            envelope::parse_plain_namespace(bytes)?
+        };
+        Ok(BundleNamespaceSkeleton {
+            format_version: bundle.format_version,
+            uuid: bundle.uuid,
+            schemas: bundle.schemas,
+            assets: bundle.assets,
+        })
+    })
+}
+
+/// Repair only exact schema-closure omissions from authenticated snapshots
+/// held by other bundles. No schema is inferred: an unavailable hash remains
+/// an error, and every repaired file is reparsed and rewritten canonically.
+pub fn repair_missing_schemas(
+    bytes: &[u8],
+    holders: &BTreeMap<LogicalHash, LogicalSchema>,
+) -> Result<Option<Vec<u8>>, BundleError> {
+    on_reserved_stack(|| {
+        if bytes.first() == Some(&0x89) {
+            return container::repair_missing_schemas(bytes, holders);
+        }
+        let text = envelope::utf8(bytes)?;
+        let mut value = distill_json::parse(text).map_err(BundleError::Json)?;
+        if !envelope::inject_missing_schemas(&mut value, holders)? {
+            return Ok(None);
+        }
+        let mut repaired = distill_json::write(&value).map_err(BundleError::JsonWrite)?;
+        repaired.push('\n');
+        let bundle = envelope::parse_plain(repaired.as_bytes())?;
+        write_bundle(&bundle).map(Some)
     })
 }
 

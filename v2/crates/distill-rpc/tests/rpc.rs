@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use distill_core::id::BundleFileHash;
 use distill_json::AuthoredValue;
@@ -251,6 +252,130 @@ fn resolve_pins_before_build_release_and_snapshot_clones_share_one_lease() {
         1,
         "expiry and final drop release a shared lease only once"
     );
+}
+
+#[test]
+fn snapshot_leases_expire_by_deadline_and_new_connections_mint_fresh_leases() {
+    let server = server_with(&[]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
+        events: Arc::clone(&events),
+    }));
+    server
+        .install_lease_policy(LeasePolicy {
+            ttl: Duration::from_millis(50),
+            max_snapshot_leases: 8,
+            max_connections: 8,
+        })
+        .unwrap();
+    let hub = connect(&server, &[]);
+    let first = snapshot(&hub);
+    let wait_started = std::time::Instant::now();
+    while !events.lock().unwrap().contains(&"release") {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(2),
+            "snapshot CAS lease was not released at its deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        first.version(),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    );
+    let refreshed = snapshot(&connect(&server, &[]));
+    assert_eq!(refreshed.version(), RpcResult::Success(InputVersion(0)));
+}
+
+#[test]
+fn snapshot_and_connection_bounds_expire_the_oldest_capabilities() {
+    let server = server_with(&[]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
+        events: Arc::clone(&events),
+    }));
+    server
+        .install_lease_policy(LeasePolicy {
+            ttl: Duration::from_secs(60),
+            max_snapshot_leases: 1,
+            max_connections: 2,
+        })
+        .unwrap();
+    let first_hub = connect(&server, &[]);
+    let first_snapshot = snapshot(&first_hub);
+    let second_snapshot = snapshot(&first_hub);
+    assert_eq!(
+        first_snapshot.version(),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    );
+    assert_eq!(
+        second_snapshot.version(),
+        RpcResult::Success(InputVersion(0))
+    );
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "release")
+            .count(),
+        1,
+        "snapshot-cap eviction must release the old CAS holder immediately"
+    );
+
+    let second_hub = connect(&server, &[]);
+    assert!(matches!(first_hub.snapshot(), RpcResult::Success(_)));
+    server
+        .install_lease_policy(LeasePolicy {
+            ttl: Duration::from_secs(60),
+            max_snapshot_leases: 1,
+            max_connections: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        first_hub.snapshot(),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    ));
+    assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connection_cap_terminates_an_already_waiting_delta_stream() {
+    let server = server_with(&[]);
+    server
+        .install_lease_policy(LeasePolicy {
+            ttl: Duration::from_secs(60),
+            max_snapshot_leases: 8,
+            max_connections: 1,
+        })
+        .unwrap();
+    let first_hub = connect(&server, &[]);
+    let install = first_hub
+        .subscribe(InputVersion(0), Vec::new(), Vec::new())
+        .success()
+        .unwrap();
+    assert!(matches!(
+        install.deltas.next(),
+        Some(StreamEvent::InitialDelta { .. })
+    ));
+
+    let stream = install.deltas.clone();
+    let pending = tokio::spawn(async move { stream.next_async().await });
+    tokio::task::yield_now().await;
+    let second_hub = connect(&server, &[]);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("evicted delta stream remained blocked")
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        first_hub.snapshot(),
+        RpcResult::Failure(RpcFailure::LeaseExpired)
+    ));
+    assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
 }
 
 #[test]
@@ -1322,6 +1447,26 @@ fn connect_rejects_protocol_target_and_definition_mismatches() {
     assert!(matches!(
         server.root().connect(request_for(8, 1, &[(1, false)])),
         ConnectOutcome::Rejected(ConnectError::TargetDefinitionMismatch { .. })
+    ));
+}
+
+#[test]
+fn connect_canonicalizes_equivalent_target_names() {
+    let server = Server::new(
+        StoreInstanceId([9; 16]),
+        vec![TargetDefinition::new(
+            "t\u{e9}st",
+            TargetDefinitionHash([7; 32]),
+        )],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        server.root().connect(ConnectRequest::new(
+            "te\u{301}st",
+            TargetDefinitionHash([7; 32]),
+        )),
+        ConnectOutcome::Connected(_)
     ));
 }
 

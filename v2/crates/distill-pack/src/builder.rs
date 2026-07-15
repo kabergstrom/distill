@@ -15,6 +15,7 @@ use distill_rpc::{
     ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::activation::{activate, publish_archive, publish_manifest, PointerError};
 use crate::archive::{encode_archive, ArchiveError, ArtifactPayload};
@@ -71,6 +72,9 @@ pub enum PackBuildError {
     },
     ArtifactIdentity {
         asset: AssetUuid,
+    },
+    BuildOnlyType {
+        type_uuid: TypeUuid,
     },
     InvalidWireTree(LayoutHash),
     Path {
@@ -349,10 +353,12 @@ pub fn build_pack(
     snapshot: &Snapshot,
     hub: &Hub,
 ) -> Result<PackBuildOutput, PackBuildError> {
-    if definition.target != target.name {
+    let target_name = target.name.nfc().collect::<String>();
+    let definition_target = definition.target.nfc().collect::<String>();
+    if definition_target != target_name {
         return Err(PackBuildError::TargetMismatch {
-            definition: definition.target.clone(),
-            requested: target.name.clone(),
+            definition: definition_target,
+            requested: target_name,
         });
     }
     if definition.roots.is_empty() {
@@ -420,6 +426,16 @@ pub fn build_pack(
         );
     }
 
+    for type_uuid in artifacts
+        .values()
+        .map(|artifact| artifact.terminal_type)
+        .collect::<BTreeSet<_>>()
+    {
+        if rpc_success(snapshot.runtime_type_policy(type_uuid))?.build_only {
+            return Err(PackBuildError::BuildOnlyType { type_uuid });
+        }
+    }
+
     let mut wire_trees = Vec::new();
     for layout_hash in artifacts
         .values()
@@ -478,9 +494,7 @@ pub fn build_pack(
     )?;
     let archive_file_hash = *blake3::hash(&archive.bytes).as_bytes();
     let manifest = canonicalize(PackManifest {
-        target: PackTarget {
-            name: target.name.clone(),
-        },
+        target: PackTarget { name: target_name },
         target_def_hash: target.definition_hash,
         archives: vec![ArchiveRef {
             generation: 0,

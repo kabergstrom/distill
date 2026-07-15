@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
+use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 use crate::archive::{append_trailer, EKey, ObjectLocation, PACK_MAGIC, PACK_VERSION};
 
@@ -88,6 +89,10 @@ pub enum ManifestError {
 }
 
 pub fn canonicalize(mut manifest: PackManifest) -> Result<PackManifest, ManifestError> {
+    manifest.target.name = manifest.target.name.nfc().collect();
+    if manifest.target.name.is_empty() || manifest.target.name.contains('\0') {
+        return Err(ManifestError::TargetMismatch);
+    }
     sort_unique(&mut manifest.archives, |v| v.generation)?;
     for row in &mut manifest.assets {
         row.load_deps.sort_unstable();
@@ -270,7 +275,7 @@ fn encode_target(target: &PackTarget) -> Vec<u8> {
 fn decode_target(bytes: &[u8]) -> Result<PackTarget, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
     let name = r.string()?;
-    if name.is_empty() {
+    if name.is_empty() || name.contains('\0') || !is_nfc(&name) {
         return Err(ManifestError::TargetMismatch);
     }
     if r.pos != bytes.len() {

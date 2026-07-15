@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use unicode_normalization::UnicodeNormalization;
@@ -14,6 +15,47 @@ use crate::*;
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_PENDING_STREAM_EVENTS: usize = 1024;
 const MAX_RETAINED_HISTORY_DELTAS: usize = 4096;
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_MAX_SNAPSHOT_LEASES: usize = 1024;
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Resource bounds for target-bound RPC capabilities. Snapshot leases are
+/// absolute: clients obtain a fresh capability through `refresh`. Hub
+/// connections use the same deadline and reconnect after expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeasePolicy {
+    pub ttl: Duration,
+    pub max_snapshot_leases: usize,
+    pub max_connections: usize,
+}
+
+impl Default for LeasePolicy {
+    fn default() -> Self {
+        Self {
+            ttl: DEFAULT_LEASE_TTL,
+            max_snapshot_leases: DEFAULT_MAX_SNAPSHOT_LEASES,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+}
+
+impl LeasePolicy {
+    fn validate(self) -> Result<Self, &'static str> {
+        if self.ttl.is_zero() {
+            return Err("RPC lease TTL must be nonzero");
+        }
+        if Instant::now().checked_add(self.ttl).is_none() {
+            return Err("RPC lease TTL is too large");
+        }
+        if self.max_snapshot_leases == 0 {
+            return Err("RPC snapshot lease bound must be nonzero");
+        }
+        if self.max_connections == 0 {
+            return Err("RPC connection bound must be nonzero");
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Clone)]
 pub struct Server {
@@ -23,6 +65,8 @@ pub struct Server {
     lease_backend: Arc<RwLock<Arc<dyn ArtifactLeaseBackend>>>,
     payload_backend: Arc<RwLock<Arc<dyn ArtifactPayloadBackend>>>,
     next_lease_id: Arc<AtomicU64>,
+    lease_policy: Arc<RwLock<LeasePolicy>>,
+    snapshot_leases: Arc<Mutex<VecDeque<Weak<ViewLease>>>>,
 }
 
 struct UnavailableAuthoringBackend;
@@ -207,18 +251,16 @@ pub struct MetadataHub {
 pub struct MetadataSnapshot {
     server: Server,
     binding: Arc<MetadataBinding>,
-    view: Arc<VersionView>,
     basis: MetadataBasis,
-    lease_alive: Arc<AtomicBool>,
+    lease: Arc<ViewLease>,
 }
 
 #[derive(Clone)]
 pub struct MetadataAuthoringSnapshot {
     server: Server,
     binding: Arc<MetadataBinding>,
-    view: Arc<VersionView>,
     basis: MetadataBasis,
-    lease_alive: Arc<AtomicBool>,
+    lease: Arc<ViewLease>,
 }
 
 #[derive(Clone)]
@@ -226,9 +268,8 @@ pub struct Snapshot {
     server: Server,
     connection: Arc<Mutex<ConnectionState>>,
     connection_id: u64,
-    view: Arc<VersionView>,
     basis: RpcBasis,
-    lease: Arc<ArtifactLease>,
+    lease: Arc<ViewLease>,
 }
 
 #[derive(Clone)]
@@ -236,9 +277,8 @@ pub struct AuthoringSnapshot {
     server: Server,
     connection: Arc<Mutex<ConnectionState>>,
     connection_id: u64,
-    view: Arc<VersionView>,
     basis: RpcBasis,
-    lease_alive: Arc<AtomicBool>,
+    lease: Arc<ViewLease>,
 }
 
 #[derive(Clone)]
@@ -268,6 +308,62 @@ struct ArtifactLease {
     alive: Mutex<bool>,
 }
 
+/// Owns every resource retained by one snapshot capability. Expiration drops
+/// the pinned version view as well as its CAS pins, so abandoned Cap'n Proto
+/// capabilities cannot keep old daemon state alive after their lease ends.
+struct ViewLease {
+    deadline: Instant,
+    expiry_active: Arc<AtomicBool>,
+    view: Mutex<Option<Arc<VersionView>>>,
+    artifact: Option<Arc<ArtifactLease>>,
+}
+
+impl ViewLease {
+    fn view(&self) -> Option<Arc<VersionView>> {
+        if !self.expiry_active.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            return None;
+        }
+        self.view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn alive(&self) -> bool {
+        self.view().is_some()
+    }
+
+    fn expire(&self) {
+        if !self.expiry_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        LeaseExpiryScheduler::cancel(&self.expiry_active);
+        self.view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(artifact) = &self.artifact {
+            artifact.expire();
+        }
+    }
+
+    fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
+        if self.view().is_none() {
+            return Err(RpcFailure::LeaseExpired);
+        }
+        self.artifact
+            .as_ref()
+            .ok_or(RpcFailure::LeaseExpired)?
+            .pin(hashes)
+    }
+}
+
+impl Drop for ViewLease {
+    fn drop(&mut self) {
+        self.expire();
+    }
+}
+
 impl ArtifactLease {
     fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
         let alive = self
@@ -284,19 +380,15 @@ impl ArtifactLease {
             })
     }
 
-    fn alive(&self) -> bool {
-        *self
-            .alive
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     fn expire(&self) {
-        let mut alive = self
-            .alive
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if std::mem::replace(&mut *alive, false) {
+        let release = {
+            let mut alive = self
+                .alive
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *alive, false)
+        };
+        if release {
             self.backend.release_lease(self.holder);
         }
     }
@@ -506,11 +598,167 @@ struct ConnectionState {
     store_instance: StoreInstanceId,
     protocol_epoch: u32,
     pipeline_generation: u64,
+    deadline: Instant,
+    expiry_active: Arc<AtomicBool>,
+    active: bool,
     subscribed_assets: BTreeSet<AssetUuid>,
     subscribed_paths: BTreeSet<String>,
     queue: VecDeque<StreamEvent>,
     stream_installed: bool,
     notify: Arc<Notify>,
+}
+
+impl Drop for ConnectionState {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            LeaseExpiryScheduler::cancel(&self.expiry_active);
+        }
+    }
+}
+
+#[derive(Clone)]
+enum LeaseExpiryTarget {
+    View(Weak<ViewLease>),
+    Connection(Weak<Mutex<ConnectionState>>),
+}
+
+impl LeaseExpiryTarget {
+    fn expire(self) {
+        match self {
+            Self::View(lease) => {
+                if let Some(lease) = lease.upgrade() {
+                    lease.expire();
+                }
+            }
+            Self::Connection(connection) => {
+                if let Some(connection) = connection.upgrade() {
+                    expire_connection(&mut lock_connection(&connection));
+                }
+            }
+        }
+    }
+}
+
+struct ScheduledLeaseExpiry {
+    deadline: Instant,
+    active: Weak<AtomicBool>,
+    target: LeaseExpiryTarget,
+}
+
+struct LeaseExpiryScheduler {
+    entries: Mutex<Vec<ScheduledLeaseExpiry>>,
+    wake: Condvar,
+}
+
+impl LeaseExpiryScheduler {
+    fn global() -> &'static Arc<Self> {
+        static SCHEDULER: OnceLock<Arc<LeaseExpiryScheduler>> = OnceLock::new();
+        SCHEDULER.get_or_init(|| {
+            let scheduler = Arc::new(Self {
+                entries: Mutex::new(Vec::new()),
+                wake: Condvar::new(),
+            });
+            let worker = Arc::clone(&scheduler);
+            std::thread::Builder::new()
+                .name("distill-rpc-lease-expiry".to_owned())
+                .spawn(move || worker.run())
+                .expect("failed to start RPC lease expiry worker");
+            scheduler
+        })
+    }
+
+    fn schedule(deadline: Instant, active: &Arc<AtomicBool>, target: LeaseExpiryTarget) {
+        let scheduler = Self::global();
+        let mut entries = scheduler
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::compact(&mut entries);
+        entries.push(ScheduledLeaseExpiry {
+            deadline,
+            active: Arc::downgrade(active),
+            target,
+        });
+        drop(entries);
+        scheduler.wake.notify_one();
+    }
+
+    fn cancel(active: &Arc<AtomicBool>) {
+        active.store(false, Ordering::Release);
+        let scheduler = Self::global();
+        let mut entries = scheduler
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::compact(&mut entries);
+        drop(entries);
+        scheduler.wake.notify_one();
+    }
+
+    fn compact(entries: &mut Vec<ScheduledLeaseExpiry>) {
+        entries.retain(|entry| {
+            entry
+                .active
+                .upgrade()
+                .is_some_and(|active| active.load(Ordering::Acquire))
+        });
+    }
+
+    #[cfg(test)]
+    fn entry_count() -> usize {
+        let scheduler = Self::global();
+        let mut entries = scheduler
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::compact(&mut entries);
+        entries.len()
+    }
+
+    fn run(&self) {
+        loop {
+            let due = {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    Self::compact(&mut entries);
+                    let now = Instant::now();
+                    let mut due = Vec::new();
+                    let mut index = 0;
+                    while index < entries.len() {
+                        if entries[index].deadline <= now {
+                            due.push(entries.swap_remove(index).target);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    if !due.is_empty() {
+                        break due;
+                    }
+
+                    if let Some(deadline) = entries.iter().map(|entry| entry.deadline).min() {
+                        let timeout = deadline.saturating_duration_since(now);
+                        let (next, _) = self
+                            .wake
+                            .wait_timeout(entries, timeout)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        entries = next;
+                    } else {
+                        entries = self
+                            .wake
+                            .wait(entries)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+            };
+            for target in due {
+                target.expire();
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -606,7 +854,89 @@ impl Server {
             lease_backend: Arc::new(RwLock::new(Arc::new(InMemoryArtifactLeases))),
             payload_backend: Arc::new(RwLock::new(Arc::new(InMemoryArtifactPayloads::default()))),
             next_lease_id: Arc::new(AtomicU64::new(1)),
+            lease_policy: Arc::new(RwLock::new(LeasePolicy::default())),
+            snapshot_leases: Arc::new(Mutex::new(VecDeque::new())),
         })
+    }
+
+    /// Replace the capability resource policy. Production should install this
+    /// before accepting clients; lowering either bound expires the oldest
+    /// extant snapshot leases or target connections immediately.
+    pub fn install_lease_policy(&self, policy: LeasePolicy) -> Result<(), &'static str> {
+        let policy = policy.validate()?;
+        let mut installed_policy = self
+            .lease_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *installed_policy = policy;
+        let evicted = {
+            let mut leases = self
+                .snapshot_leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prune_snapshot_leases(&mut leases);
+            let mut evicted = Vec::new();
+            while leases.len() > policy.max_snapshot_leases {
+                if let Some(lease) = leases.pop_front().and_then(|lease| lease.upgrade()) {
+                    evicted.push(lease);
+                }
+                prune_snapshot_leases(&mut leases);
+            }
+            evicted
+        };
+        drop(installed_policy);
+        for lease in evicted {
+            lease.expire();
+        }
+        enforce_connection_bound(&mut self.lock(), policy.max_connections, false);
+        Ok(())
+    }
+
+    fn register_view_lease(
+        &self,
+        view: Arc<VersionView>,
+        artifact: Option<Arc<ArtifactLease>>,
+    ) -> Arc<ViewLease> {
+        let policy_guard = self
+            .lease_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let policy = *policy_guard;
+        let expiry_active = Arc::new(AtomicBool::new(true));
+        let lease = Arc::new(ViewLease {
+            deadline: Instant::now()
+                .checked_add(policy.ttl)
+                .expect("validated RPC lease TTL must fit in Instant"),
+            expiry_active: Arc::clone(&expiry_active),
+            view: Mutex::new(Some(view)),
+            artifact,
+        });
+        let evicted = {
+            let mut leases = self
+                .snapshot_leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prune_snapshot_leases(&mut leases);
+            let mut evicted = Vec::new();
+            while leases.len() >= policy.max_snapshot_leases {
+                if let Some(oldest) = leases.pop_front().and_then(|lease| lease.upgrade()) {
+                    evicted.push(oldest);
+                }
+                prune_snapshot_leases(&mut leases);
+            }
+            leases.push_back(Arc::downgrade(&lease));
+            evicted
+        };
+        drop(policy_guard);
+        LeaseExpiryScheduler::schedule(
+            lease.deadline,
+            &expiry_active,
+            LeaseExpiryTarget::View(Arc::downgrade(&lease)),
+        );
+        for oldest in evicted {
+            oldest.expire();
+        }
+        lease
     }
 
     /// Replace the lazy-build implementation used by subsequent drifted
@@ -649,6 +979,51 @@ impl Server {
     pub fn current_stamp(&self) -> SnapshotStamp {
         let state = self.lock();
         stamp(&state)
+    }
+
+    /// Snapshot-pinned batch requests used by `doctor verify`. This bypasses
+    /// transport capabilities but not configuration/pipeline/version poison;
+    /// the daemon still executes each request through the ordinary build core.
+    pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
+        let state = self.lock();
+        let view = state
+            .views
+            .get(&state.current)
+            .expect("current view must exist");
+        if let Some(poison) = &view.version_poison {
+            return Err(RpcFailure::InvalidQuery {
+                detail: format!("cannot verify a poisoned input version: {poison:?}"),
+            });
+        }
+        if let ConfigurationStatus::Poisoned(poison) = &view.configuration {
+            return Err(RpcFailure::InvalidQuery {
+                detail: format!("cannot verify poisoned configuration: {poison:?}"),
+            });
+        }
+        if let Some(error) = pipeline_failure(view) {
+            return Err(error);
+        }
+        let mut requests = Vec::new();
+        for (target_name, target) in &state.targets {
+            for entry in view
+                .authoring
+                .values()
+                .filter(|entry| entry.role == AuthoringEntryRole::Runtime)
+            {
+                requests.push(BuildRequest {
+                    work_class: BuildWorkClass::Batch,
+                    basis: view.stamp,
+                    target: target_name.clone(),
+                    target_definition: target.definition.definition_hash(),
+                    requested_asset: entry.uuid,
+                    output_key: String::new(),
+                    requested_terminal_type: entry.terminal_type,
+                    entry: entry.clone(),
+                    drifted_input: DriftedInput::Asset(entry.uuid),
+                });
+            }
+        }
+        Ok(requests)
     }
 
     /// Persist and publish a runtime failure for the pipeline epoch currently
@@ -1176,11 +1551,12 @@ impl Root {
                 got: request.protocol,
             });
         }
-        let runtime = match state.targets.get(&request.target) {
+        let target_name = request.target.nfc().collect::<String>();
+        let runtime = match state.targets.get(&target_name) {
             Some(runtime) => runtime,
             None => {
                 return ConnectOutcome::Rejected(ConnectError::UnknownTarget {
-                    target: request.target,
+                    target: target_name,
                 })
             }
         };
@@ -1217,18 +1593,31 @@ impl Root {
             }
         }
 
+        let lease_policy = *self
+            .server
+            .lease_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enforce_connection_bound(&mut state, lease_policy.max_connections, true);
         let id = state.next_connection_id;
         state.next_connection_id = state
             .next_connection_id
             .checked_add(1)
             .expect("connection id exhausted");
+        let deadline = Instant::now()
+            .checked_add(lease_policy.ttl)
+            .expect("validated RPC lease TTL must fit in Instant");
+        let expiry_active = Arc::new(AtomicBool::new(true));
         let connection = Arc::new(Mutex::new(ConnectionState {
             id,
-            target: request.target,
+            target: target_name,
             target_generation,
             store_instance: state.instance,
             protocol_epoch: state.protocol_epoch,
             pipeline_generation: state.pipeline_generation,
+            deadline,
+            expiry_active: Arc::clone(&expiry_active),
+            active: true,
             subscribed_assets: BTreeSet::new(),
             subscribed_paths: BTreeSet::new(),
             queue: VecDeque::new(),
@@ -1236,6 +1625,11 @@ impl Root {
             notify: Arc::new(Notify::new()),
         }));
         state.connections.push(Arc::downgrade(&connection));
+        LeaseExpiryScheduler::schedule(
+            deadline,
+            &expiry_active,
+            LeaseExpiryTarget::Connection(Arc::downgrade(&connection)),
+        );
         ConnectOutcome::Connected(Connected {
             hub: Hub {
                 server: self.server.clone(),
@@ -1636,12 +2030,13 @@ impl MetadataHub {
             .get(&state.current)
             .expect("current view must exist")
             .clone();
+        let basis = metadata_basis(&self.binding, view.stamp);
+        drop(state);
         MetadataCall::Success(MetadataSnapshot {
             server: self.server.clone(),
             binding: self.binding.clone(),
-            basis: metadata_basis(&self.binding, view.stamp),
-            view,
-            lease_alive: Arc::new(AtomicBool::new(true)),
+            basis,
+            lease: self.server.register_view_lease(view, None),
         })
     }
 
@@ -1655,12 +2050,13 @@ impl MetadataHub {
             .get(&state.current)
             .expect("current view must exist")
             .clone();
+        let basis = metadata_basis(&self.binding, view.stamp);
+        drop(state);
         MetadataCall::Success(MetadataAuthoringSnapshot {
             server: self.server.clone(),
             binding: self.binding.clone(),
-            basis: metadata_basis(&self.binding, view.stamp),
-            view,
-            lease_alive: Arc::new(AtomicBool::new(true)),
+            basis,
+            lease: self.server.register_view_lease(view, None),
         })
     }
 
@@ -1716,11 +2112,14 @@ impl MetadataSnapshot {
         if let Some(result) = self.preflight(&state) {
             return result;
         }
+        let Some(view) = self.lease.view() else {
+            return MetadataCall::LeaseFailure;
+        };
         MetadataCall::Success(MetadataDiagnostics {
             stamp: self.basis.snapshot,
-            configuration: self.view.configuration.clone(),
-            pipeline: pipeline_diagnostic(&self.view),
-            version_poison: self.view.version_poison.clone(),
+            configuration: view.configuration.clone(),
+            pipeline: pipeline_diagnostic(&view),
+            version_poison: view.version_poison.clone(),
         })
     }
 
@@ -1729,6 +2128,9 @@ impl MetadataSnapshot {
         if let Some(result) = self.namespace_preflight(&state) {
             return result;
         }
+        let Some(view) = self.lease.view() else {
+            return MetadataNamespaceCall::LeaseFailure;
+        };
         if query
             .normalized_path_prefix
             .as_ref()
@@ -1738,7 +2140,7 @@ impl MetadataSnapshot {
                 path: query.normalized_path_prefix.clone().unwrap_or_default(),
             });
         }
-        MetadataNamespaceCall::Success(query_pure_metadata(&self.view, query))
+        MetadataNamespaceCall::Success(query_pure_metadata(&view, query))
     }
 
     pub fn entry(&self, uuid: AssetUuid) -> MetadataNamespaceCall<PureMetadataEntry> {
@@ -1746,7 +2148,10 @@ impl MetadataSnapshot {
         if let Some(result) = self.namespace_preflight(&state) {
             return result;
         }
-        let Some(entry) = self.view.authoring.get(&uuid) else {
+        let Some(view) = self.lease.view() else {
+            return MetadataNamespaceCall::LeaseFailure;
+        };
+        let Some(entry) = view.authoring.get(&uuid) else {
             return MetadataNamespaceCall::Error(RpcFailure::AssetNotFound { uuid });
         };
         MetadataNamespaceCall::Success(pure_metadata_entry(entry))
@@ -1757,12 +2162,15 @@ impl MetadataSnapshot {
         if let Some(result) = self.namespace_preflight(&state) {
             return result;
         }
+        let Some(view) = self.lease.view() else {
+            return MetadataNamespaceCall::LeaseFailure;
+        };
         if !valid_logical_path(path) {
             return MetadataNamespaceCall::Error(RpcFailure::InvalidPath {
                 path: path.to_owned(),
             });
         }
-        let value = match self.view.paths.get(path) {
+        let value = match view.paths.get(path) {
             None => PathResolveResult::Missing,
             Some(candidates) if candidates.len() == 1 => {
                 PathResolveResult::Resolved(*candidates.first().expect("one candidate"))
@@ -1784,24 +2192,25 @@ impl MetadataSnapshot {
             .get(&state.current)
             .expect("current view must exist")
             .clone();
+        let basis = metadata_basis(&self.binding, view.stamp);
+        drop(state);
         MetadataCall::Success(Self {
             server: self.server.clone(),
             binding: self.binding.clone(),
-            basis: metadata_basis(&self.binding, view.stamp),
-            view,
-            lease_alive: Arc::new(AtomicBool::new(true)),
+            basis,
+            lease: self.server.register_view_lease(view, None),
         })
     }
 
     pub fn expire_lease(&self) {
-        self.lease_alive.store(false, Ordering::Release);
+        self.lease.expire();
     }
 
     fn preflight<T>(&self, state: &ServerState) -> Option<MetadataCall<T>> {
         if let Some(reason) = metadata_fence(state, &self.binding) {
             return Some(MetadataCall::ReconnectRequired { reason });
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        if !self.lease.alive() {
             return Some(MetadataCall::LeaseFailure);
         }
         None
@@ -1811,11 +2220,10 @@ impl MetadataSnapshot {
         if let Some(reason) = metadata_fence(state, &self.binding) {
             return Some(MetadataNamespaceCall::ReconnectRequired { reason });
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        let Some(view) = self.lease.view() else {
             return Some(MetadataNamespaceCall::LeaseFailure);
-        }
-        self.view
-            .version_poison
+        };
+        view.version_poison
             .clone()
             .map(MetadataNamespaceCall::VersionPoisoned)
     }
@@ -1839,6 +2247,9 @@ impl MetadataAuthoringSnapshot {
         if let Some(result) = self.namespace_preflight(&state) {
             return result;
         }
+        let Some(view) = self.lease.view() else {
+            return MetadataNamespaceCall::LeaseFailure;
+        };
         if query
             .normalized_path_prefix
             .as_ref()
@@ -1848,7 +2259,7 @@ impl MetadataAuthoringSnapshot {
                 path: query.normalized_path_prefix.clone().unwrap_or_default(),
             });
         }
-        MetadataNamespaceCall::Success(query_pure_metadata(&self.view, query))
+        MetadataNamespaceCall::Success(query_pure_metadata(&view, query))
     }
 
     pub fn inspect(&self, uuid: AssetUuid) -> MetadataNamespaceCall<AuthoringInspectResult> {
@@ -1856,7 +2267,10 @@ impl MetadataAuthoringSnapshot {
         if let Some(result) = self.namespace_preflight(&state) {
             return result;
         }
-        MetadataNamespaceCall::Success(inspect_authoring(&self.view, self.basis.snapshot, uuid))
+        let Some(view) = self.lease.view() else {
+            return MetadataNamespaceCall::LeaseFailure;
+        };
+        MetadataNamespaceCall::Success(inspect_authoring(&view, self.basis.snapshot, uuid))
     }
 
     pub fn refresh(&self) -> MetadataCall<MetadataAuthoringSnapshot> {
@@ -1869,24 +2283,25 @@ impl MetadataAuthoringSnapshot {
             .get(&state.current)
             .expect("current view must exist")
             .clone();
+        let basis = metadata_basis(&self.binding, view.stamp);
+        drop(state);
         MetadataCall::Success(Self {
             server: self.server.clone(),
             binding: self.binding.clone(),
-            basis: metadata_basis(&self.binding, view.stamp),
-            view,
-            lease_alive: Arc::new(AtomicBool::new(true)),
+            basis,
+            lease: self.server.register_view_lease(view, None),
         })
     }
 
     pub fn expire_lease(&self) {
-        self.lease_alive.store(false, Ordering::Release);
+        self.lease.expire();
     }
 
     fn preflight<T>(&self, state: &ServerState) -> Option<MetadataCall<T>> {
         if let Some(reason) = metadata_fence(state, &self.binding) {
             return Some(MetadataCall::ReconnectRequired { reason });
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        if !self.lease.alive() {
             return Some(MetadataCall::LeaseFailure);
         }
         None
@@ -1896,11 +2311,10 @@ impl MetadataAuthoringSnapshot {
         if let Some(reason) = metadata_fence(state, &self.binding) {
             return Some(MetadataNamespaceCall::ReconnectRequired { reason });
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        let Some(view) = self.lease.view() else {
             return Some(MetadataNamespaceCall::LeaseFailure);
-        }
-        self.view
-            .version_poison
+        };
+        view.version_poison
             .clone()
             .map(MetadataNamespaceCall::VersionPoisoned)
     }
@@ -1923,13 +2337,26 @@ impl Hub {
     pub fn snapshot(&self) -> RpcResult<Snapshot> {
         let state = self.server.lock();
         let connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
+        let view = state
+            .views
+            .get(&state.current)
+            .expect("current view must exist")
+            .clone();
+        let connection_id = connection.id;
+        let basis = basis_for(&connection, view.stamp);
+        drop(connection);
+        drop(state);
         RpcResult::Success(snapshot_from(
             &self.server,
-            &state,
-            &connection,
+            view,
+            connection_id,
+            basis,
             self.connection.clone(),
         ))
     }
@@ -1940,13 +2367,26 @@ impl Hub {
     pub fn authoring_snapshot(&self) -> RpcResult<AuthoringSnapshot> {
         let state = self.server.lock();
         let connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
+        let view = state
+            .views
+            .get(&state.current)
+            .expect("current view must exist")
+            .clone();
+        let connection_id = connection.id;
+        let basis = basis_for(&connection, view.stamp);
+        drop(connection);
+        drop(state);
         RpcResult::Success(authoring_snapshot_from(
             &self.server,
-            &state,
-            &connection,
+            view,
+            connection_id,
+            basis,
             self.connection.clone(),
         ))
     }
@@ -2150,6 +2590,9 @@ impl Hub {
     pub fn wire_tree(&self, hash: LayoutHash) -> RpcResult<Arc<[u8]>> {
         let state = self.server.lock();
         let connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
@@ -2172,6 +2615,9 @@ impl Hub {
         {
             let state = self.server.lock();
             let connection = lock_connection(&self.connection);
+            if !connection_lease_alive(&connection) {
+                return RpcResult::Failure(RpcFailure::LeaseExpired);
+            }
             if let Some(reason) = generation_fence(&state, &connection) {
                 return RpcResult::ReconnectRequired { reason };
             }
@@ -2192,6 +2638,9 @@ impl Hub {
     ) -> RpcResult<SubscriptionInstall> {
         let state = self.server.lock();
         let mut connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
@@ -2271,6 +2720,9 @@ impl Hub {
     pub fn unsubscribe(&self, assets: Vec<AssetUuid>, paths: Vec<String>) -> RpcResult<()> {
         let state = self.server.lock();
         let mut connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
@@ -2313,7 +2765,10 @@ impl Snapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        RpcResult::Success(self.view.configuration.clone())
+        let Some(view) = self.lease.view() else {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        };
+        RpcResult::Success(view.configuration.clone())
     }
 
     pub fn basis(&self) -> &RpcBasis {
@@ -2327,16 +2782,29 @@ impl Snapshot {
     pub fn refresh(&self) -> RpcResult<Snapshot> {
         let state = self.server.lock();
         let connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
         if !self.lease.alive() {
             return RpcResult::Failure(RpcFailure::LeaseExpired);
         }
+        let view = state
+            .views
+            .get(&state.current)
+            .expect("current view must exist")
+            .clone();
+        let connection_id = connection.id;
+        let basis = basis_for(&connection, view.stamp);
+        drop(connection);
+        drop(state);
         RpcResult::Success(snapshot_from(
             &self.server,
-            &state,
-            &connection,
+            view,
+            connection_id,
+            basis,
             self.connection.clone(),
         ))
     }
@@ -2347,22 +2815,25 @@ impl Snapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        if let Some(poison) = &self.view.version_poison {
+        let Some(view) = self.lease.view() else {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        };
+        if let Some(poison) = &view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
         }
         if query.terminal_type.is_some() {
-            if let Some(error) = pipeline_failure(&self.view) {
+            if let Some(error) = pipeline_failure(&view) {
                 return RpcResult::Failure(error);
             }
         }
         if let Err(detail) = validate_asset_query(&query, false) {
             return RpcResult::Failure(RpcFailure::InvalidQuery { detail });
         }
-        if let Some(error) = tag_query_poison(&self.view, &query, AuthoringEntryRole::Runtime) {
+        if let Some(error) = tag_query_poison(&view, &query, AuthoringEntryRole::Runtime) {
             return RpcResult::Failure(error);
         }
         RpcResult::Success(query_asset_entries(
-            &self.view,
+            &view,
             &query,
             AuthoringEntryRole::Runtime,
         ))
@@ -2374,19 +2845,62 @@ impl Snapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        if let Some(poison) = &self.view.version_poison {
+        let Some(view) = self.lease.view() else {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        };
+        if let Some(poison) = &view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
         }
-        if let Some(error) = pipeline_failure(&self.view) {
+        if let Some(error) = pipeline_failure(&view) {
             return RpcResult::Failure(error);
         }
-        let Some(entry) = self.view.authoring.get(&uuid) else {
+        let Some(entry) = view.authoring.get(&uuid) else {
             return RpcResult::Failure(RpcFailure::AssetNotFound { uuid });
         };
         if entry.role != AuthoringEntryRole::Runtime {
             return RpcResult::Failure(RpcFailure::AssetNotFound { uuid });
         }
         RpcResult::Success(metadata_entry(entry))
+    }
+
+    /// Read the non-hashed runtime policy for one terminal type from the same
+    /// target/pipeline epoch as this snapshot. The second fence prevents a
+    /// concurrent epoch replacement from publishing a stale policy answer.
+    pub fn runtime_type_policy(&self, type_uuid: TypeUuid) -> RpcResult<RuntimeTypePolicy> {
+        let (request, backend) = {
+            let state = self.server.lock();
+            let connection = lock_connection(&self.connection);
+            if let Some(result) = self.preflight(&state, &connection) {
+                return result;
+            }
+            let target = state
+                .targets
+                .get(&connection.target)
+                .expect("a generation-fenced connection has a target");
+            (
+                RuntimeTypePolicyRequest {
+                    basis: self.basis.snapshot,
+                    target: connection.target.clone(),
+                    target_definition: target.definition.definition_hash(),
+                    type_uuid,
+                },
+                self.server
+                    .build_backend
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            )
+        };
+        let policy = match backend.runtime_type_policy(&request) {
+            Ok(policy) => policy,
+            Err(error) => return RpcResult::Failure(error),
+        };
+        let state = self.server.lock();
+        let connection = lock_connection(&self.connection);
+        if let Some(result) = self.preflight(&state, &connection) {
+            return result;
+        }
+        RpcResult::Success(policy)
     }
 
     pub fn resolve(&self, uuid: AssetUuid) -> RpcResult<TerminalEvent<ResolveResult>> {
@@ -2410,19 +2924,21 @@ impl Snapshot {
             if let Some(result) = self.preflight(&state, &connection) {
                 return result;
             }
-            if let Some(poison) = &self.view.version_poison {
+            let Some(view) = self.lease.view() else {
+                return RpcResult::Failure(RpcFailure::LeaseExpired);
+            };
+            if let Some(poison) = &view.version_poison {
                 return RpcResult::VersionPoisoned(poison.clone());
             }
-            if let Some(error) = pipeline_failure(&self.view) {
+            if let Some(error) = pipeline_failure(&view) {
                 return RpcResult::Failure(error);
             }
-            if let ConfigurationStatus::Poisoned(poison) = &self.view.configuration {
+            if let ConfigurationStatus::Poisoned(poison) = &view.configuration {
                 return RpcResult::ConfigurationPoisoned(poison.clone());
             }
-            let derived = self.view.derived_outputs.get(&uuid).cloned();
+            let derived = view.derived_outputs.get(&uuid).cloned();
             let authoring_uuid = derived.as_ref().map_or(uuid, |output| output.parent);
-            if self
-                .view
+            if view
                 .authoring
                 .get(&authoring_uuid)
                 .is_some_and(|entry| entry.role == AuthoringEntryRole::AuthoringOnly)
@@ -2434,8 +2950,7 @@ impl Snapshot {
                     },
                 });
             }
-            let runtime_entry = self
-                .view
+            let runtime_entry = view
                 .authoring
                 .get(&authoring_uuid)
                 .filter(|entry| entry.role == AuthoringEntryRole::Runtime)
@@ -2450,7 +2965,7 @@ impl Snapshot {
             };
             let build_resolution = state.build_results.get(&key).cloned();
             let version_resolution = derived.as_ref().map_or_else(
-                || self.view.assets.get(&uuid).cloned(),
+                || view.assets.get(&uuid).cloned(),
                 |output| {
                     Some(VersionResolve::Drifted {
                         input: DriftedInput::Asset(output.parent),
@@ -2525,8 +3040,13 @@ impl Snapshot {
                     }
                     let mut state = self.server.lock();
                     state.build_flights.remove(&key);
-                    if let Some(error) = pipeline_failure(&self.view) {
-                        outcome = Err(error);
+                    match self.lease.view() {
+                        Some(view) => {
+                            if let Some(error) = pipeline_failure(&view) {
+                                outcome = Err(error);
+                            }
+                        }
+                        None => outcome = Err(RpcFailure::LeaseExpired),
                     }
                     if let Ok(BuildResolution::Built(content_hash)) = &outcome {
                         outcome = match state.artifacts.get(content_hash) {
@@ -2592,7 +3112,10 @@ impl Snapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        if let Some(poison) = &self.view.version_poison {
+        let Some(view) = self.lease.view() else {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        };
+        if let Some(poison) = &view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
         }
         if !valid_logical_path(path) {
@@ -2600,7 +3123,7 @@ impl Snapshot {
                 path: path.to_owned(),
             });
         }
-        let value = match self.view.paths.get(path) {
+        let value = match view.paths.get(path) {
             None => PathResolveResult::Missing,
             Some(candidates) if candidates.len() == 1 => {
                 let uuid = *candidates.first().expect("one candidate");
@@ -2649,6 +3172,9 @@ impl Snapshot {
         if let Some(reason) = generation_fence(state, connection) {
             return Some(RpcResult::ReconnectRequired { reason });
         }
+        if !connection_lease_alive(connection) {
+            return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
+        }
         if !self.lease.alive() {
             return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
         }
@@ -2681,7 +3207,7 @@ impl AuthoringSnapshot {
     }
 
     pub fn expire_lease(&self) {
-        self.lease_alive.store(false, Ordering::Release);
+        self.lease.expire();
     }
 
     pub fn query(&self, query: AssetQuery) -> RpcResult<Vec<AssetUuid>> {
@@ -2690,7 +3216,10 @@ impl AuthoringSnapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        if let Some(poison) = &self.view.version_poison {
+        let Some(view) = self.lease.view() else {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        };
+        if let Some(poison) = &view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
         }
         if let Err(detail) = validate_asset_query(&query, true) {
@@ -2701,11 +3230,10 @@ impl AuthoringSnapshot {
         } else {
             AuthoringEntryRole::Runtime
         };
-        if let Some(error) = tag_query_poison(&self.view, &query, role) {
+        if let Some(error) = tag_query_poison(&view, &query, role) {
             return RpcResult::Failure(error);
         }
-        let values = self
-            .view
+        let values = view
             .authoring
             .iter()
             .filter(|(uuid, entry)| query_asset_entry_matches(entry, **uuid, &query, role))
@@ -2720,11 +3248,14 @@ impl AuthoringSnapshot {
         if let Some(result) = self.preflight(&state, &connection) {
             return result;
         }
-        if let Some(poison) = &self.view.version_poison {
+        let Some(view) = self.lease.view() else {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        };
+        if let Some(poison) = &view.version_poison {
             return RpcResult::VersionPoisoned(poison.clone());
         }
-        let Some(entry) = self.view.authoring.get(&uuid) else {
-            if self.view.assets.contains_key(&uuid) {
+        let Some(entry) = view.authoring.get(&uuid) else {
+            if view.assets.contains_key(&uuid) {
                 return RpcResult::Success(AuthoringInspectResult::RoleIneligible {
                     observed: AuthoringEntryRole::Runtime,
                 });
@@ -2748,16 +3279,29 @@ impl AuthoringSnapshot {
     pub fn refresh(&self) -> RpcResult<AuthoringSnapshot> {
         let state = self.server.lock();
         let connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        }
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        if !self.lease.alive() {
             return RpcResult::Failure(RpcFailure::LeaseExpired);
         }
+        let view = state
+            .views
+            .get(&state.current)
+            .expect("current view must exist")
+            .clone();
+        let connection_id = connection.id;
+        let basis = basis_for(&connection, view.stamp);
+        drop(connection);
+        drop(state);
         RpcResult::Success(authoring_snapshot_from(
             &self.server,
-            &state,
-            &connection,
+            view,
+            connection_id,
+            basis,
             self.connection.clone(),
         ))
     }
@@ -2770,7 +3314,10 @@ impl AuthoringSnapshot {
         if let Some(reason) = generation_fence(state, connection) {
             return Some(RpcResult::ReconnectRequired { reason });
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        if !connection_lease_alive(connection) {
+            return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
+        }
+        if !self.lease.alive() {
             return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
         }
         None
@@ -2779,74 +3326,86 @@ impl AuthoringSnapshot {
 
 impl DeltaStream {
     pub fn next(&self) -> Option<StreamEvent> {
-        let event = lock_connection(&self.connection).queue.pop_front();
-        event
+        let mut connection = lock_connection(&self.connection);
+        if !connection_lease_alive(&connection) {
+            expire_connection(&mut connection);
+            return None;
+        }
+        connection.queue.pop_front()
     }
 
     /// Wait for the next stream event without blocking the single-threaded
     /// Cap'n Proto `RpcSystem`. Registration happens while the queue mutex is
     /// held, closing the check/notify lost-wakeup window.
-    pub async fn next_async(&self) -> StreamEvent {
+    pub async fn next_async(&self) -> Option<StreamEvent> {
         loop {
-            let notified = {
+            let (notified, deadline) = {
                 let mut connection = lock_connection(&self.connection);
-                if let Some(event) = connection.queue.pop_front() {
-                    return event;
+                if !connection_lease_alive(&connection) {
+                    expire_connection(&mut connection);
+                    return None;
                 }
-                connection.notify.clone().notified_owned()
+                if let Some(event) = connection.queue.pop_front() {
+                    return Some(event);
+                }
+                let mut notified = Box::pin(connection.notify.clone().notified_owned());
+                notified.as_mut().enable();
+                (
+                    notified,
+                    tokio::time::Instant::from_std(connection.deadline),
+                )
             };
-            notified.await;
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    expire_connection(&mut lock_connection(&self.connection));
+                    return None;
+                }
+            }
         }
     }
 }
 
 fn snapshot_from(
     server: &Server,
-    state: &ServerState,
-    connection: &ConnectionState,
+    view: Arc<VersionView>,
+    connection_id: u64,
+    basis: RpcBasis,
     connection_arc: Arc<Mutex<ConnectionState>>,
 ) -> Snapshot {
-    let view = state
-        .views
-        .get(&state.current)
-        .expect("current view must exist")
-        .clone();
     Snapshot {
         server: server.clone(),
         connection: connection_arc,
-        connection_id: connection.id,
-        basis: basis_for(connection, view.stamp),
-        view,
-        lease: Arc::new(ArtifactLease {
-            holder: server.next_lease_id.fetch_add(1, Ordering::Relaxed),
-            backend: server
-                .lease_backend
-                .read()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone(),
-            alive: Mutex::new(true),
-        }),
+        connection_id,
+        basis,
+        lease: server.register_view_lease(
+            view,
+            Some(Arc::new(ArtifactLease {
+                holder: server.next_lease_id.fetch_add(1, Ordering::Relaxed),
+                backend: server
+                    .lease_backend
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+                alive: Mutex::new(true),
+            })),
+        ),
     }
 }
 
 fn authoring_snapshot_from(
     server: &Server,
-    state: &ServerState,
-    connection: &ConnectionState,
+    view: Arc<VersionView>,
+    connection_id: u64,
+    basis: RpcBasis,
     connection_arc: Arc<Mutex<ConnectionState>>,
 ) -> AuthoringSnapshot {
-    let view = state
-        .views
-        .get(&state.current)
-        .expect("current view must exist")
-        .clone();
     AuthoringSnapshot {
         server: server.clone(),
         connection: connection_arc,
-        connection_id: connection.id,
-        basis: basis_for(connection, view.stamp),
-        view,
-        lease_alive: Arc::new(AtomicBool::new(true)),
+        connection_id,
+        basis,
+        lease: server.register_view_lease(view, None),
     }
 }
 
@@ -2898,6 +3457,9 @@ fn authoring_gate(
     connection: &ConnectionState,
     base: InputVersion,
 ) -> Option<AuthoringGate> {
+    if !connection_lease_alive(connection) {
+        return Some(AuthoringGate::Failure(RpcFailure::LeaseExpired));
+    }
     if let Some(reason) = generation_fence(state, connection) {
         return Some(AuthoringGate::Reconnect(reason));
     }
@@ -3394,6 +3956,12 @@ fn live_connections(state: &mut ServerState) -> Vec<Arc<Mutex<ConnectionState>>>
     let mut live = Vec::new();
     state.connections.retain(|weak| {
         if let Some(connection) = weak.upgrade() {
+            let mut guard = lock_connection(&connection);
+            if !connection_lease_alive(&guard) {
+                expire_connection(&mut guard);
+                return false;
+            }
+            drop(guard);
             live.push(connection);
             true
         } else {
@@ -3401,6 +3969,40 @@ fn live_connections(state: &mut ServerState) -> Vec<Arc<Mutex<ConnectionState>>>
         }
     });
     live
+}
+
+fn connection_lease_alive(connection: &ConnectionState) -> bool {
+    connection.active && Instant::now() < connection.deadline
+}
+
+fn expire_connection(connection: &mut ConnectionState) {
+    if !std::mem::replace(&mut connection.active, false) {
+        return;
+    }
+    LeaseExpiryScheduler::cancel(&connection.expiry_active);
+    connection.subscribed_assets.clear();
+    connection.subscribed_paths.clear();
+    connection.queue.clear();
+    connection.notify.notify_waiters();
+}
+
+fn enforce_connection_bound(
+    state: &mut ServerState,
+    max_connections: usize,
+    reserve_for_new_connection: bool,
+) {
+    let mut live = live_connections(state);
+    let reserved = usize::from(reserve_for_new_connection);
+    while live.len().saturating_add(reserved) > max_connections {
+        if let Some(oldest) = live.first() {
+            expire_connection(&mut lock_connection(oldest));
+        }
+        live.remove(0);
+    }
+    state.connections.retain(|weak| {
+        weak.upgrade()
+            .is_some_and(|connection| connection_lease_alive(&lock_connection(&connection)))
+    });
 }
 
 fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStamp, AdminError> {
@@ -4352,7 +4954,7 @@ fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
 }
 
 fn pin_artifact(
-    lease: &ArtifactLease,
+    lease: &ViewLease,
     metadata: &StoredArtifact,
     hash: ContentHash,
 ) -> Result<(), RpcFailure> {
@@ -4438,6 +5040,10 @@ fn lock_connection(connection: &Arc<Mutex<ConnectionState>>) -> MutexGuard<'_, C
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+fn prune_snapshot_leases(leases: &mut VecDeque<Weak<ViewLease>>) {
+    leases.retain(|lease| lease.strong_count() != 0);
+}
+
 fn enqueue_event(connection: &mut ConnectionState, event: StreamEvent) {
     if connection.queue.len() >= MAX_PENDING_STREAM_EVENTS {
         let basis = event.basis().clone();
@@ -4460,4 +5066,58 @@ fn enqueue_event(connection: &mut ConnectionState, event: StreamEvent) {
     }
     connection.queue.push_back(event);
     connection.notify.notify_one();
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    fn connect(server: &Server) -> Hub {
+        let request = ConnectRequest::new("dev", TargetDefinitionHash([7; 32]));
+        match server.root().connect(request) {
+            ConnectOutcome::Connected(connected) => connected.hub,
+            other => panic!("expected connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capability_churn_keeps_deadline_bookkeeping_within_active_bounds() {
+        let server = Server::new(
+            StoreInstanceId([9; 16]),
+            vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
+        )
+        .unwrap();
+        server
+            .install_lease_policy(LeasePolicy {
+                ttl: Duration::from_secs(60 * 60),
+                max_snapshot_leases: 1,
+                max_connections: 1,
+            })
+            .unwrap();
+
+        let first_hub = connect(&server);
+        let mut snapshots = Vec::new();
+        for _ in 0..4096 {
+            snapshots.push(match first_hub.snapshot() {
+                RpcResult::Success(snapshot) => snapshot,
+                other => panic!("expected snapshot, got {other:?}"),
+            });
+        }
+        assert!(
+            LeaseExpiryScheduler::entry_count() <= 2,
+            "evicted snapshot deadlines accumulated despite a one-lease bound"
+        );
+
+        let mut hubs = vec![first_hub];
+        for _ in 0..4096 {
+            hubs.push(connect(&server));
+        }
+        assert!(
+            LeaseExpiryScheduler::entry_count() <= 2,
+            "evicted connection deadlines accumulated despite a one-connection bound"
+        );
+
+        assert_eq!(snapshots.len(), 4096);
+        assert_eq!(hubs.len(), 4097);
+    }
 }

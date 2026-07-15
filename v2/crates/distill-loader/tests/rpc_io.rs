@@ -13,7 +13,7 @@ use distill_rpc::{
 };
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
-use distill_wire::wire::WireNode;
+use distill_wire::wire::{WireField, WireNode};
 
 const TARGET_HASH: [u8; 32] = [7; 32];
 
@@ -22,6 +22,8 @@ struct Fixture {
     request: ConnectRequest,
     asset: AssetUuid,
     hash: distill_core::id::ContentHash,
+    artifact_bytes: usize,
+    wire_bytes: usize,
 }
 
 fn fixture() -> Fixture {
@@ -31,10 +33,22 @@ fn fixture() -> Fixture {
     let target = TargetDefinition::new("dev", TargetDefinitionHash(TARGET_HASH));
     let server = Server::new(StoreInstanceId([5; 16]), vec![target]).unwrap();
 
-    let wire = WireNode::Unit { offset: 0 };
+    let wire = WireNode::Struct {
+        offset: 0,
+        size: 0,
+        align: 1,
+        fields: (0..64)
+            .map(|index| WireField {
+                name: format!("field-{index:02}"),
+                declaration_index: index,
+                node: WireNode::Unit { offset: 0 },
+            })
+            .collect(),
+    };
     let layout_hash = dswl_hash(&wire).unwrap();
+    let wire_bytes = dswl_bytes(&wire).unwrap();
     server
-        .install_wire_tree(layout_hash, Arc::from(dswl_bytes(&wire).unwrap()))
+        .install_wire_tree(layout_hash, Arc::from(wire_bytes.clone()))
         .unwrap();
     let blob = vec![0x5a; 64];
     let complete = write_artifact(
@@ -55,6 +69,7 @@ fn fixture() -> Fixture {
     let parsed = parse_artifact(&complete).unwrap();
     let structural_len = complete.len() - parsed.blob_section.len();
     let hash = content_hash(&complete);
+    let artifact_bytes = complete.len();
     server
         .install_artifact(
             hash,
@@ -86,6 +101,8 @@ fn fixture() -> Fixture {
         request,
         asset,
         hash,
+        artifact_bytes,
+        wire_bytes: wire_bytes.len(),
     }
 }
 
@@ -96,6 +113,8 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         request,
         asset,
         hash,
+        artifact_bytes,
+        wire_bytes,
     } = fixture();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let root = server.root();
@@ -119,12 +138,14 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         target_definition_hash: request.target_definition_hash.0,
     };
     let spool = tempfile::tempdir().unwrap();
+    let budget = artifact_bytes * 2;
+    assert!(wire_bytes > budget);
     let mut io = RpcIo::connect_with_config(
         address,
         request,
         RpcIoConfig {
-            fetch_memory_budget: 8,
-            spool_threshold: 1,
+            fetch_memory_budget: budget,
+            spool_threshold: budget,
             spool_directory: Some(spool.path().to_owned()),
         },
     )

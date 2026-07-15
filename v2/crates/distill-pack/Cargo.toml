@@ -8,6 +8,7 @@ license.workspace = true
 blake3.workspace = true
 memmap2 = "0.7"
 zstd.workspace = true
+unicode-normalization.workspace = true
 distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }
 distill-build = { path = "../distill-build" }

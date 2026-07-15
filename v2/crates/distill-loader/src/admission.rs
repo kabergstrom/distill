@@ -105,6 +105,46 @@ impl FetchAdmission {
         Ok(())
     }
 
+    /// Resize an existing reservation after authenticated auxiliary bytes are
+    /// known. `Ok(false)` means the caller must wait; the permit is unchanged.
+    pub fn resize(
+        &mut self,
+        permit: &mut FetchPermit,
+        bytes: usize,
+    ) -> Result<bool, AdmissionError> {
+        let Some((old_bytes, old_exclusive)) = self.active.get(&permit.id).copied() else {
+            return Err(AdmissionError::UnknownPermit);
+        };
+        if old_bytes != permit.bytes || old_exclusive != permit.exclusive {
+            return Err(AdmissionError::UnknownPermit);
+        }
+        if old_bytes == bytes {
+            return Ok(true);
+        }
+        let exclusive = bytes > self.budget;
+        if exclusive && self.active.len() != 1 {
+            return Ok(false);
+        }
+        let used_without = self.used - old_bytes;
+        if !exclusive
+            && used_without
+                .checked_add(bytes)
+                .is_none_or(|used| used > self.budget)
+        {
+            return Ok(false);
+        }
+        self.used = used_without.saturating_add(bytes);
+        self.exclusive = exclusive;
+        self.active.insert(permit.id, (bytes, exclusive));
+        permit.bytes = bytes;
+        permit.exclusive = exclusive;
+        Ok(true)
+    }
+
+    pub fn should_spool(&self, bytes: usize) -> bool {
+        bytes > self.spool_threshold
+    }
+
     pub fn used(&self) -> usize {
         self.used
     }

@@ -15,7 +15,6 @@ use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;
-use distill_migrate::{execute_ops, plan_automatic, validate_plan, DefaultProvider, EdgeKind};
 use distill_rpc::{
     AuthoringProgressEvent, AuthoringProgressState, Commit, DeferredOperation,
     DeferredOperationResult, DiskMigrationRequest, DoctorRequest, InputVersion, LongRunningOp,
@@ -29,6 +28,7 @@ use distill_store::journal::{
 use distill_store::Store;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
+use crate::build::CurrentLoadService;
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
 use crate::lineage_repair::{unique_sibling, write_same_dir_temp};
 use crate::pipeline_map::PipelineProjection;
@@ -77,9 +77,27 @@ impl AuthoringService {
                     files: self.plan_disk_migration(base, &request)?,
                 }
             }
-            LongRunningOp::Doctor(payload) => PlannedOperation::Doctor(
-                DoctorRequest::decode(payload).map_err(|error| invalid(error.to_string()))?,
-            ),
+            LongRunningOp::Doctor(payload) => {
+                let request =
+                    DoctorRequest::decode(payload).map_err(|error| invalid(error.to_string()))?;
+                let (import_failures, schema_repairs, schema_repair_failures) =
+                    if request == DoctorRequest::Verify {
+                        let (repairs, failures) = self.plan_schema_repairs(base)?;
+                        (
+                            self.verify_watched_import_fixpoints(base)?,
+                            repairs,
+                            failures,
+                        )
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
+                    };
+                PlannedOperation::Doctor {
+                    request,
+                    import_failures,
+                    schema_repairs,
+                    schema_repair_failures,
+                }
+            }
         };
         let running_payload = operation_summary(&planned);
         Ok(PreparedOperationCommit::deferred(
@@ -102,6 +120,74 @@ impl AuthoringService {
                 },
             ],
         ))
+    }
+
+    fn plan_schema_repairs(
+        &self,
+        base: InputVersion,
+    ) -> Result<(Vec<OperationFile>, Vec<String>), RpcFailure> {
+        let cached_schemas = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            require_base(&store, base)?;
+            store.all_schemas().map_err(invalid)?
+        };
+        let snapshot = self
+            .scan_snapshot
+            .lock()
+            .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
+        let mut holders = BTreeMap::new();
+        let mut failures = Vec::new();
+        for (hash, json) in cached_schemas {
+            match distill_schema::ngp_schema::verify_snapshot(&json, hash) {
+                Ok(schema) => {
+                    holders.insert(hash, schema);
+                }
+                Err(error) => failures.push(format!(
+                    "cached schema {hash} does not authenticate and was ignored: {error}"
+                )),
+            }
+        }
+        for row in snapshot.bundle_rows() {
+            let schemas = match &row.parsed {
+                Ok(bundle) => Some(&bundle.schemas),
+                Err(_) => row
+                    .namespace_skeleton
+                    .as_ref()
+                    .map(|skeleton| &skeleton.schemas),
+            };
+            if let Some(schemas) = schemas {
+                holders.extend(schemas.iter().map(|(hash, schema)| (*hash, schema.clone())));
+            }
+        }
+        let mut repairs = Vec::new();
+        for row in snapshot.bundle_rows().filter(|row| row.parsed.is_err()) {
+            match distill_bundle::repair_missing_schemas(&row.bytes, &holders) {
+                Ok(Some(proposed)) => {
+                    let target = self
+                        .scanner
+                        .physical_path(&row.root_name, &row.normalized_path)
+                        .map_err(invalid)?;
+                    repairs.push(OperationFile::replace(
+                        target,
+                        ContentHash(*blake3::hash(&row.bytes).as_bytes()),
+                        proposed,
+                    ));
+                }
+                Ok(None) => {}
+                Err(distill_bundle::BundleError::MissingSchema {
+                    local_id,
+                    schema_hash,
+                }) => failures.push(format!(
+                    "{}:{} entry {local_id:?} references unavailable schema {schema_hash}",
+                    row.root_name, row.normalized_path
+                )),
+                Err(_) => {}
+            }
+        }
+        Ok((repairs, failures))
     }
 
     fn plan_rename_with_fixups(
@@ -185,29 +271,44 @@ impl AuthoringService {
         base: InputVersion,
         request: &DiskMigrationRequest,
     ) -> Result<Vec<OperationFile>, RpcFailure> {
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
-        require_base(&store, base)?;
+        let coordinator = self
+            .tag_index_coordinator()
+            .ok_or_else(|| invalid("disk migration coordinator is unavailable"))?;
+        let loader = CurrentLoadService::capture(&coordinator, base).map_err(invalid)?;
         let requested = request.bundles.iter().copied().collect::<BTreeSet<_>>();
-        let all = store.all_bundles().map_err(invalid)?;
+        let all = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            require_base(&store, base)?;
+            store
+                .all_bundles()
+                .map_err(invalid)?
+                .into_iter()
+                .map(|meta| {
+                    let root = store
+                        .root_name(meta.root)
+                        .map_err(invalid)?
+                        .ok_or_else(|| invalid("bundle root identity is missing"))?;
+                    Ok((meta, root))
+                })
+                .collect::<Result<Vec<_>, RpcFailure>>()?
+        };
         if !requested.is_empty() {
-            let present = all.iter().map(|meta| meta.bundle).collect::<BTreeSet<_>>();
+            let present = all
+                .iter()
+                .map(|(meta, _)| meta.bundle)
+                .collect::<BTreeSet<_>>();
             if let Some(missing) = requested.difference(&present).next() {
                 return Err(invalid(format!("cannot migrate unknown bundle {missing}")));
             }
         }
-        let defaults = NoDefaults;
         let mut files = Vec::new();
-        for meta in all {
+        for (meta, root) in all {
             if !requested.is_empty() && !requested.contains(&meta.bundle) {
                 continue;
             }
-            let root = store
-                .root_name(meta.root)
-                .map_err(invalid)?
-                .ok_or_else(|| invalid("bundle root identity is missing"))?;
             let target = self
                 .scanner
                 .physical_path(&root, &meta.path)
@@ -224,60 +325,23 @@ impl AuthoringService {
                 )));
             }
             let mut bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
+            let load_bundle = bundle.clone();
             let mut changed = false;
-            let existing_schemas = bundle.schemas.clone();
             let mut migrated_schemas = BTreeMap::new();
             for entry in bundle.assets.values_mut() {
                 if is_bootstrap_control_type(entry.type_uuid) {
                     continue;
                 }
-                let current = store
-                    .current_lineage_stamp(entry.type_uuid)
-                    .map_err(invalid)?
-                    .ok_or_else(|| {
-                        invalid(format!("type {} has no accepted lineage", entry.type_uuid))
-                    })?;
-                let current_hash = current
-                    .selected_digest()
-                    .ok_or_else(|| invalid("accepted lineage cursor is out of range"))?;
-                if entry.schema_hash == current_hash {
+                let current = loader
+                    .load(entry, &load_bundle, &meta.path)
+                    .map_err(invalid)?;
+                if entry.schema_hash == current.schema_hash {
                     continue;
                 }
-                let EntryLineageV1::Manifest(prior) = &entry.lineage else {
-                    return Err(invalid("bootstrap lineage appeared on a user asset"));
-                };
-                if prior.epochs.len() > current.epochs.len()
-                    || current.epochs[..prior.epochs.len()] != prior.epochs
-                {
-                    return Err(invalid(format!(
-                        "asset {} lineage is not a prefix of current authority",
-                        entry.uuid
-                    )));
-                }
-                let from = existing_schemas
-                    .get(&entry.schema_hash)
-                    .ok_or_else(|| invalid("bundle omitted the entry's old schema snapshot"))?;
-                let snapshot = store
-                    .schema(current_hash)
-                    .map_err(invalid)?
-                    .ok_or_else(|| invalid("store omitted the accepted current schema snapshot"))?;
-                let to = distill_schema::ngp_schema::verify_snapshot(&snapshot, current_hash)
-                    .map_err(invalid)?;
-                let plan = plan_automatic(&from.root, &to.root)
-                    .map_err(|error| invalid(error.to_string()))?;
-                if let Err(validation) =
-                    validate_plan(&plan, &from.root, &to.root, EdgeKind::Automatic)
-                {
-                    return Err(invalid(format!(
-                        "automatic migration plan rejected: {validation:?}"
-                    )));
-                }
-                entry.data = execute_ops(&plan, &entry.data, &from.root, &to.root, &defaults)
-                    .map_err(|error| invalid(error.to_string()))?
-                    .value;
-                entry.schema_hash = current_hash;
-                entry.lineage = EntryLineageV1::Manifest(current);
-                migrated_schemas.insert(current_hash, to);
+                entry.data = current.value;
+                entry.schema_hash = current.schema_hash;
+                entry.lineage = EntryLineageV1::Manifest(current.lineage);
+                migrated_schemas.insert(current.schema_hash, current.schema);
                 changed = true;
             }
             if changed {
@@ -299,26 +363,6 @@ impl AuthoringService {
     }
 }
 
-struct NoDefaults;
-
-impl DefaultProvider for NoDefaults {
-    fn field_default(
-        &self,
-        _to_schema: &SchemaNode,
-        _at: &distill_migrate::FieldPath,
-    ) -> Option<AuthoredValue> {
-        None
-    }
-
-    fn parent_default(
-        &self,
-        _to_schema: &SchemaNode,
-        _at: &distill_migrate::FieldPath,
-    ) -> Option<AuthoredValue> {
-        None
-    }
-}
-
 #[derive(Clone)]
 struct OperationRuntime {
     store: Arc<Mutex<Store>>,
@@ -336,7 +380,12 @@ enum PlannedOperation {
         basis: Vec<u8>,
         files: Vec<OperationFile>,
     },
-    Doctor(DoctorRequest),
+    Doctor {
+        request: DoctorRequest,
+        import_failures: Vec<distill_core::id::BundleUuid>,
+        schema_repairs: Vec<OperationFile>,
+        schema_repair_failures: Vec<String>,
+    },
 }
 
 struct DeferredAuthoringOperation {
@@ -350,7 +399,18 @@ impl DeferredOperation for DeferredAuthoringOperation {
             PlannedOperation::Files { kind, basis, files } => {
                 self.runtime.publish_files(base, *kind, basis, files)
             }
-            PlannedOperation::Doctor(request) => self.runtime.run_doctor(base, *request),
+            PlannedOperation::Doctor {
+                request,
+                import_failures,
+                schema_repairs,
+                schema_repair_failures,
+            } => self.runtime.run_doctor(
+                base,
+                *request,
+                import_failures,
+                schema_repairs,
+                schema_repair_failures,
+            ),
         }
     }
 }
@@ -455,7 +515,34 @@ impl OperationRuntime {
         &self,
         base: InputVersion,
         request: DoctorRequest,
+        import_failures: &[distill_core::id::BundleUuid],
+        schema_repairs: &[OperationFile],
+        schema_repair_failures: &[String],
     ) -> Result<DeferredOperationResult, String> {
+        let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
+            let observed = self.scanner.scan().map_err(|error| error.to_string())?;
+            let published = self
+                .scan_snapshot
+                .lock()
+                .map_err(|_| "scan snapshot mutex is poisoned".to_owned())?;
+            let mismatch = !observed.same_observation(&published);
+            let diagnostics = observed
+                .diagnostic_rows()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            (mismatch, diagnostics)
+        } else {
+            (false, Vec::new())
+        };
+        let build_defects = if request == DoctorRequest::Verify {
+            let coordinator = self
+                .tag_index_coordinator
+                .upgrade()
+                .ok_or_else(|| "build coordinator stopped during doctor verify".to_owned())?;
+            crate::build::doctor_verify_builds(&coordinator)?
+        } else {
+            Vec::new()
+        };
         let mut store = self
             .store
             .lock()
@@ -470,8 +557,40 @@ impl OperationRuntime {
                     .quarantine
                     .doctor_verify(&store)
                     .map_err(|error| error.to_string())?;
-                (!recovered.is_empty())
-                    .then(|| format!("{} recovered edit(s) require attention", recovered.len()))
+                let mut defects = Vec::new();
+                if filesystem_mismatch {
+                    defects.push(
+                        "full filesystem rehash differs from the published input snapshot"
+                            .to_owned(),
+                    );
+                }
+                defects.extend(scan_diagnostics);
+                if !import_failures.is_empty() {
+                    defects.push(format!(
+                        "{} watched import bundle(s) are not byte-identical fixpoints: {}",
+                        import_failures.len(),
+                        import_failures
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !schema_repair_failures.is_empty() {
+                    defects.push(format!(
+                        "{} exact schema repair defect(s): {}",
+                        schema_repair_failures.len(),
+                        schema_repair_failures.join(", ")
+                    ));
+                }
+                defects.extend(build_defects);
+                if !recovered.is_empty() {
+                    defects.push(format!(
+                        "{} recovered edit(s) require attention",
+                        recovered.len()
+                    ));
+                }
+                (!defects.is_empty()).then(|| defects.join("; "))
             }
             DoctorRequest::Clean => {
                 let now = SystemTime::now()
@@ -488,13 +607,22 @@ impl OperationRuntime {
                 None
             }
         };
-        store
-            .input_transaction(|_| Ok(()))
-            .map_err(|error| error.to_string())?;
-        Ok(DeferredOperationResult {
-            commit: Commit::default(),
-            terminal_error,
-        })
+        drop(store);
+        if schema_repairs.is_empty() {
+            return self.advance_empty(base, terminal_error);
+        }
+        let basis = encode_schema_repair_basis(base, schema_repairs);
+        let mut result = self.publish_files(
+            base,
+            PublicationGroupKind::SchemaRepair,
+            &basis,
+            schema_repairs,
+        )?;
+        result.terminal_error = match (terminal_error, result.terminal_error) {
+            (Some(left), Some(right)) => Some(format!("{left}; {right}")),
+            (left, right) => left.or(right),
+        };
+        Ok(result)
     }
 
     fn advance_empty(
@@ -685,10 +813,26 @@ fn encode_migration_basis(base: InputVersion, request: &DiskMigrationRequest) ->
     encoder.into_bytes()
 }
 
+fn encode_schema_repair_basis(base: InputVersion, files: &[OperationFile]) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new();
+    encoder.u64(base.0);
+    encoder.u32(files.len() as u32);
+    for file in files {
+        encoder.raw(
+            &file
+                .preimage
+                .expect("schema repair replaces an observed file")
+                .0,
+        );
+        encoder.raw(&file.proposed_hash().0);
+    }
+    encoder.into_bytes()
+}
+
 fn operation_summary(operation: &PlannedOperation) -> String {
     match operation {
         PlannedOperation::Files { kind, files, .. } => format!("{kind:?}: {} file(s)", files.len()),
-        PlannedOperation::Doctor(request) => format!("doctor {request:?}"),
+        PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
     }
 }
 
