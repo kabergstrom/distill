@@ -54,7 +54,11 @@ they must never scan or hash unrelated tree state. Complete post-startup scans
 are limited to configured-root replacement, explicit verification, or native
 overflow/incomplete-observation recovery. The existing `dirty_files` and
 `rename_events` tables are required implementation surfaces, not deletion
-candidates.
+candidates. Config, schema, and pipeline-module sources use the same event
+stream through exact-path admission; polling them on every debounce tick is
+nonconforming. Dirty/rename queue acknowledgement is an observation-checked
+unversioned maintenance compare-and-delete and does not create a synthetic
+input version.
 
 **Memory constraints (from `MEMORY.md`):**
 - Use `nix run nixpkgs#cargo -- <cmd>` for all v2 cargo commands (plain `cargo`

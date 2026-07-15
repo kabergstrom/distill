@@ -5849,9 +5849,14 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   `UnreadableScanSubtree { Root|Subtree, PermissionDenied|NotFound|
   InvalidFileType|SymlinkIdentityChanged|IoDataLoss }`; no unreadable branch is
   silently treated as an empty directory or synthesized deletion set.
-- **Dirty queue discipline.** Downstream consumers read dirty entries, do the
-  work, and clear entries in the same transaction, comparing stored state to
-  what they actually read to avoid racing the watcher. For watched
+- **Dirty queue discipline.** Downstream consumers capture a dirty/rename
+  prefix, publish their idempotent input results, then clear that prefix in one
+  unversioned maintenance compare-and-delete transaction. The acknowledgement
+  compares each path's stored observation generation with the generation the
+  consumer used;
+  a mismatch, crash, or failed consumer clears nothing and the prefix retries,
+  while rows appended after the captured sequence survive. Queue maintenance
+  never fabricates a new externally visible input version. For watched
   imports the comparison is total: the entire outcome-bearing read-set —
   failed reads/probes/listings and importer-capability hit/miss included —
   plus a failure's terminal cause revalidates inside the committing
@@ -8526,7 +8531,14 @@ unbound local `LineageRepair` surface while the reason is exactly missing or
 duplicate lineage authority; it performs only §6's absence/duplicate repair
 and cannot serve or mutate ordinary authored state.
 
-The configured source file itself remains a watched input. If its exact raw
+The configured source file itself remains a watched input. The native watcher
+also covers the exact active `assets.schema_path` and
+`modules.pipeline_dylib` paths; it watches their existing parent directories,
+filters sibling and daemon-quarantine events before queue admission, and arms
+replacement paths before reading or publishing a candidate that names them.
+These files are re-read only after an admitted native event (or explicit
+overflow/incomplete-observation recovery), never by periodic hash polling. If
+the configuration source's exact raw
 Unix path or Windows UTF-16 path is missing, permission-denied, not a permitted
 regular file, or unreadable without I/O data loss, the candidate publishes
 DSCP code 14 `ConfigurationSourceUnavailable`; deletion never means “reload

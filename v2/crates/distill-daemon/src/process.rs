@@ -16,7 +16,9 @@ use distill_store::state::{
 use crate::codegen::CodegenService;
 use crate::config::{config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
-use crate::watcher::{WatcherAction, WatcherQueue, WatcherStartError, WatcherThread};
+use crate::watcher::{
+    WatcherAction, WatcherControl, WatcherQueue, WatcherStartError, WatcherThread,
+};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
@@ -60,20 +62,24 @@ impl DaemonProcess {
             config.pipeline.max_dependency_depth,
         )?);
         coordinator.attach_build_backend();
-        // The first schema/module/target candidate may replace the scanner's
-        // root set. Publish it before attaching the filesystem watcher so the
-        // watcher is born against the installed scanner, never an obsolete
-        // startup instance.
         let mut config_watch = ConfigWatch::new(config.clone());
-        config_watch.reconcile(&coordinator)?;
+        let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new()));
+        // Arm both asset and control-file coverage before any candidate scan.
+        // Root replacement is synchronously scanned by candidate publication;
+        // the watcher then installs the new root and requests one catch-up scan.
+        let watcher = WatcherThread::start(
+            coordinator.scanner(),
+            config_watch.control_paths(),
+            Arc::clone(&watcher_queue),
+        )?;
+        let watcher_control = watcher.control();
+        config_watch.reconcile(&coordinator, &watcher_control)?;
         let mut codegen = CodegenService::new(
             &coordinator,
             &config.codegen.rs_mod_path,
             config.codegen.auto_codegen,
         )
         .map_err(DaemonProcessError::Codegen)?;
-        let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new()));
-        let watcher = WatcherThread::start(coordinator.scanner(), Arc::clone(&watcher_queue))?;
         coordinator.reconcile_startup(&watcher_queue)?;
         reconcile_imports(&coordinator, true)?;
         coordinator.sweep_displaced_retention(unix_seconds())?;
@@ -89,6 +95,7 @@ impl DaemonProcess {
             Arc::clone(&stop),
             Arc::clone(&last_background_error),
             config_watch,
+            watcher_control,
             codegen,
         ));
 
@@ -213,6 +220,7 @@ fn spawn_coordinator_loop(
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     mut config_watch: ConfigWatch,
+    watcher_control: WatcherControl,
     mut codegen: CodegenService,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -222,18 +230,32 @@ fn spawn_coordinator_loop(
             while !stop.load(Ordering::Acquire) {
                 thread::sleep(DEBOUNCE);
                 let action = lock(&watcher).take_live_action();
+                if let WatcherAction::Failed(message) = &action {
+                    *lock(&last_error) = Some(message.clone());
+                    stop.store(true, Ordering::Release);
+                    break;
+                }
                 let retry_action = action.clone();
-                let result = config_watch
-                    .reconcile(&coordinator)
-                    .and_then(|()| match action {
-                        WatcherAction::None => Ok(()),
-                        WatcherAction::Batch(batch) => coordinator
-                            .reconcile_incremental(&batch)
-                            .and_then(|_| reconcile_imports(&coordinator, false)),
-                        WatcherAction::FullRescan => coordinator
-                            .reconcile_startup(&watcher)
-                            .and_then(|_| reconcile_imports(&coordinator, true)),
-                    });
+                let reconcile_control = match &action {
+                    WatcherAction::Batch(batch) => config_watch.affected_by(batch),
+                    WatcherAction::FullRescan => true,
+                    WatcherAction::None | WatcherAction::Failed(_) => false,
+                };
+                let result = (if reconcile_control {
+                    config_watch.reconcile(&coordinator, &watcher_control)
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| match action {
+                    WatcherAction::None => Ok(()),
+                    WatcherAction::Batch(batch) => coordinator
+                        .reconcile_incremental(&batch)
+                        .and_then(|_| reconcile_imports(&coordinator, false)),
+                    WatcherAction::FullRescan => coordinator
+                        .reconcile_startup(&watcher)
+                        .and_then(|_| reconcile_imports(&coordinator, true)),
+                    WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
+                });
                 let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
                 let retention_result = if Instant::now() >= next_retention_sweep {
                     next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
@@ -341,7 +363,31 @@ impl ConfigWatch {
         }
     }
 
-    fn reconcile(&mut self, coordinator: &DaemonCoordinator) -> Result<(), CoordinatorError> {
+    fn control_paths(&self) -> [PathBuf; 3] {
+        [
+            self.path.clone(),
+            self.active.assets.schema_path.clone(),
+            self.active.modules.pipeline_dylib.clone(),
+        ]
+    }
+
+    fn affected_by(&self, batch: &crate::watcher::WatcherBatch) -> bool {
+        let paths = self
+            .control_paths()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        batch.paths.iter().any(|path| paths.contains(path))
+            || batch
+                .renames
+                .iter()
+                .any(|rename| paths.contains(&rename.from) || paths.contains(&rename.to))
+    }
+
+    fn reconcile(
+        &mut self,
+        coordinator: &DaemonCoordinator,
+        watcher: &WatcherControl,
+    ) -> Result<(), CoordinatorError> {
         let observation = observe_configuration(&self.path);
         match observation.outcome {
             Err((reason, message)) => {
@@ -353,16 +399,26 @@ impl ConfigWatch {
                 self.observed = Some(observation.state);
                 Ok(())
             }
-            Ok(candidate) => self.reconcile_valid(coordinator, observation.state, candidate),
+            Ok(candidate) => {
+                self.reconcile_valid(coordinator, watcher, observation.state, candidate)
+            }
         }
     }
 
     fn reconcile_valid(
         &mut self,
         coordinator: &DaemonCoordinator,
+        watcher: &WatcherControl,
         config_state: ConfigSourceState,
         candidate: DaemonConfig,
     ) -> Result<(), CoordinatorError> {
+        watcher
+            .replace_paths([
+                self.path.clone(),
+                candidate.assets.schema_path.clone(),
+                candidate.modules.pipeline_dylib.clone(),
+            ])
+            .map_err(CoordinatorError::InvalidManifest)?;
         let schema = observe_schema_source(&candidate.assets.schema_path);
         let pipeline_state = observe_artifact_source(&candidate.modules.pipeline_dylib);
         let config_changed = self.observed.as_ref() != Some(&config_state);

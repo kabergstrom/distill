@@ -189,11 +189,13 @@ fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
         })
         .unwrap();
     let version = store.input_version();
-    let (acknowledged, next) = store
-        .input_transaction(|transaction| transaction.acknowledge_file_work(&observed))
-        .unwrap();
+    let acknowledged = store.acknowledge_file_work(&observed).unwrap();
     assert!(acknowledged);
-    assert_eq!(next.0, version.0 + 1, "acknowledgement is input-versioned");
+    assert_eq!(
+        store.input_version(),
+        version,
+        "internal queue acknowledgement is unversioned"
+    );
 
     let remaining = store.pending_file_work().unwrap();
     assert_eq!(remaining.dirty.len(), 1);
@@ -221,9 +223,7 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
         })
         .unwrap();
 
-    let (acknowledged, _) = store
-        .input_transaction(|transaction| transaction.acknowledge_file_work(&stale))
-        .unwrap();
+    let acknowledged = store.acknowledge_file_work(&stale).unwrap();
     assert!(!acknowledged);
     assert_eq!(store.pending_file_work().unwrap().dirty.len(), 2);
 }

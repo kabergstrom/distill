@@ -129,6 +129,19 @@ fn bounded_event_overflow_discards_partial_paths() {
 }
 
 #[test]
+fn failed_watch_coverage_is_terminal_instead_of_becoming_a_scan_loop() {
+    let mut queue = WatcherQueue::new();
+    queue.push_native(create("/assets/pending.txt"));
+    queue.fail("watch installation failed");
+
+    assert_eq!(
+        queue.take_live_action(),
+        WatcherAction::Failed("watch installation failed".to_owned())
+    );
+    assert_eq!(queue.take_live_action(), WatcherAction::None);
+}
+
+#[test]
 fn native_watcher_reports_create_without_scanning() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");
@@ -140,7 +153,7 @@ fn native_watcher_reports_create_without_scanning() {
     )])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner, Arc::clone(&queue)).unwrap();
+    let _watcher = WatcherThread::start(scanner, [], Arc::clone(&queue)).unwrap();
     let path = root.join("source.txt");
 
     std::fs::write(&path, b"first").unwrap();
@@ -167,7 +180,7 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
     )])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner.clone(), Arc::clone(&queue)).unwrap();
+    let _watcher = WatcherThread::start(scanner.clone(), [], Arc::clone(&queue)).unwrap();
 
     scanner
         .replace_roots([AssetRoot::new(
@@ -187,4 +200,34 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
         .paths
         .iter()
         .any(|observed| observed.ends_with("later.txt")));
+}
+
+#[test]
+fn native_watcher_admits_exact_control_files_but_not_siblings_or_quarantine() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    let controls = temp.path().join("controls");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&controls).unwrap();
+    let quarantine = root.join(".distill-displaced");
+    let control = controls.join("distill.toml");
+    std::fs::write(&control, b"initial").unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &root, &quarantine)]).unwrap();
+    let queue = Arc::new(Mutex::new(WatcherQueue::new()));
+    let _watcher = WatcherThread::start(scanner, [control.clone()], Arc::clone(&queue)).unwrap();
+
+    std::fs::create_dir(&quarantine).unwrap();
+    std::fs::write(quarantine.join("intent"), b"displaced").unwrap();
+    std::fs::write(controls.join("unrelated.txt"), b"noise").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        queue.lock().unwrap().take_live_action(),
+        WatcherAction::None
+    );
+
+    std::fs::write(&control, b"changed").unwrap();
+    let WatcherAction::Batch(batch) = wait_for_action(&queue) else {
+        panic!("exact control-file edit must be admitted")
+    };
+    assert_eq!(batch.paths, [control]);
 }

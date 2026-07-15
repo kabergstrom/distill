@@ -472,14 +472,42 @@ impl RootedScanner {
         self.revision.load(Ordering::Acquire)
     }
 
+    pub(crate) fn has_same_roots(&self, other: &Self) -> bool {
+        let left = self.root_snapshot();
+        let right = other.root_snapshot();
+        left.len() == right.len()
+            && left.iter().all(|(name, root)| {
+                right
+                    .get(name)
+                    .is_some_and(|candidate| root.configured == candidate.configured)
+            })
+    }
+
     /// Canonical configured roots to hand to the native watcher. The watcher
     /// never derives authority from these strings; every delivered path is
     /// reopened through this scanner's retained directory capabilities.
-    pub(crate) fn watch_roots(&self) -> Vec<PathBuf> {
-        self.root_snapshot()
+    /// Native-watch roots and the daemon-owned quarantine prefixes nested
+    /// beneath them. The watcher filters the latter before queue admission;
+    /// scanner identity checks remain the defense-in-depth boundary.
+    pub(crate) fn watch_coverage(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let roots = self.root_snapshot();
+        let watched = roots
             .values()
             .map(|root| root.canonical_path.clone())
-            .collect()
+            .collect();
+        let excluded = roots
+            .values()
+            .map(|root| {
+                root.configured
+                    .quarantine_dir
+                    .strip_prefix(&root.configured.path)
+                    .map_or_else(
+                        |_| root.configured.quarantine_dir.clone(),
+                        |suffix| root.canonical_path.join(suffix),
+                    )
+            })
+            .collect();
+        (watched, excluded)
     }
 
     /// Translate one native invalidation path to the canonical rooted key

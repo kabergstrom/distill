@@ -601,7 +601,16 @@ impl DaemonCoordinator {
             .authoring
             .prepare_filesystem_candidate(roots, lineage_destination)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let scan = filesystem.scanner().scan()?;
+        let filesystem_changed = !self.scanner.has_same_roots(filesystem.scanner())
+            || self.lineage_destination() != *filesystem.lineage_destination();
+        // Schema, target, or module-only candidates reuse the already
+        // observed asset snapshot. A physical complete scan is reserved for
+        // an actual configured-root/destination replacement.
+        let scan = if filesystem_changed {
+            filesystem.scanner().scan()?
+        } else {
+            lock_scan_snapshot(&self.scan_snapshot).clone()
+        };
         let installed_snapshot = scan.clone();
         let destination = filesystem.lineage_destination().clone();
         let candidate = ScanCandidate::build(filesystem.scanner(), &destination, scan, None)?;
@@ -980,6 +989,12 @@ impl DaemonCoordinator {
     /// Reconcile one complete identity-checked namespace scan.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         match self.scanner.scan() {
+            Ok(scan)
+                if self.scan_healthy.load(Ordering::Acquire)
+                    && scan.same_observation(&lock_scan_snapshot(&self.scan_snapshot)) =>
+            {
+                Ok(self.server.current_stamp())
+            }
             Ok(scan) => self.publish_scan(scan),
             Err(error) => {
                 self.scan_healthy.store(false, Ordering::Release);
@@ -1002,6 +1017,9 @@ impl DaemonCoordinator {
                 WatcherAction::None => return Ok(stamp),
                 WatcherAction::Batch(batch) => return self.reconcile_incremental(&batch),
                 WatcherAction::FullRescan => continue,
+                WatcherAction::Failed(message) => {
+                    return Err(CoordinatorError::InvalidManifest(message))
+                }
             }
         }
     }
@@ -1304,27 +1322,13 @@ impl DaemonCoordinator {
         if work.is_empty() {
             return Ok(());
         }
-        let base = self.server.current_stamp().version;
-        let store = Arc::clone(&self.store);
-        self.server
-            .coordinated_commit(base, || {
-                let mut store = lock_store(&store);
-                store
-                    .input_transaction(|transaction| {
-                        if transaction.acknowledge_file_work(work)? {
-                            Ok(())
-                        } else {
-                            Err(StoreError::InvalidConfiguration {
-                                error: "watcher work observation changed before acknowledgement"
-                                    .to_owned(),
-                            })
-                        }
-                    })
-                    .map_err(|error| error.to_string())?;
-                Ok(Commit::default())
-            })
-            .map(|_| ())
-            .map_err(CoordinatorError::Coordinated)
+        match lock_store(&self.store).acknowledge_file_work(work) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CoordinatorError::InvalidManifest(
+                "watcher work observation changed before acknowledgement".to_owned(),
+            )),
+            Err(error) => Err(CoordinatorError::InvalidManifest(error.to_string())),
+        }
     }
 
     /// Discover and apply authored directory-import rules. Every generated

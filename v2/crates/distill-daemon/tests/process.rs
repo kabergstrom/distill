@@ -65,6 +65,10 @@ fn config(temp: &tempfile::TempDir) -> DaemonConfig {
 }
 
 fn write_schema(temp: &tempfile::TempDir, marker: &str) {
+    write_schema_path(&temp.path().join("schema.json"), marker);
+}
+
+fn write_schema_path(path: &std::path::Path, marker: &str) {
     let schema = Schema {
         source_hashes: [("test-marker".to_owned(), marker.to_owned())]
             .into_iter()
@@ -75,11 +79,7 @@ fn write_schema(temp: &tempfile::TempDir, marker: &str) {
             layouts: Vec::new(),
         }],
     };
-    std::fs::write(
-        temp.path().join("schema.json"),
-        serde_json::to_vec(&schema).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(path, serde_json::to_vec(&schema).unwrap()).unwrap();
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
@@ -424,6 +424,44 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
         after
     );
     assert!(process.last_background_error().is_none());
+}
+
+#[test]
+fn config_retargets_native_schema_watch_without_polling_the_old_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let process = DaemonProcess::start(config(&temp)).unwrap();
+    let old_schema = temp.path().join("schema.json");
+    let next_schema = temp.path().join("schema-next.json");
+    write_schema_path(&next_schema, "next-initial");
+    let before = process.coordinator().server().current_stamp().version;
+    let edited = config_source(&temp).replace(
+        &old_schema.display().to_string(),
+        &next_schema.display().to_string(),
+    );
+    std::fs::write(temp.path().join("distill.toml"), edited).unwrap();
+    wait_until(
+        || process.coordinator().server().current_stamp().version > before,
+        "schema watch path replacement did not publish",
+    );
+    let replaced = process.coordinator().server().current_stamp().version;
+
+    write_schema_path(&old_schema, "obsolete-path");
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        process.coordinator().server().current_stamp().version,
+        replaced,
+        "the retired schema path must no longer drive candidates"
+    );
+
+    write_schema_path(&next_schema, "next-edited");
+    wait_until(
+        || process.coordinator().server().current_stamp().version > replaced,
+        "replacement schema path was not watched",
+    );
+    assert_eq!(
+        process.coordinator().server().current_stamp().version.0,
+        replaced.0 + 1
+    );
 }
 
 #[test]
