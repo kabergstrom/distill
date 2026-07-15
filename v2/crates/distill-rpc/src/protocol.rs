@@ -14,7 +14,7 @@ pub use distill_store::state::{
 };
 pub use distill_store::RetiredTypeReference;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -271,6 +271,7 @@ pub enum ReconnectReason {
     TargetDefinitionChanged,
     StoreInstanceChanged,
     ProtocolEpochChanged,
+    PipelineEpochChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1369,6 +1370,11 @@ pub struct Commit {
     pub tag_projection: Option<BTreeMap<AssetUuid, BTreeMap<String, Option<String>>>>,
     pub configuration: Option<ConfigurationStatus>,
     pub pipeline: Option<PipelineDiagnostic>,
+    /// The publication installs, retires, or poisons a module epoch even when
+    /// the externally visible diagnostic remains `Ready`. Existing target
+    /// Hubs must reconnect instead of retaining capabilities across that
+    /// boundary.
+    pub pipeline_epoch_changed: bool,
     /// `Some(None)` heals version poison; `Some(Some(_))` publishes it.
     pub version_poison: Option<Option<VersionPoison>>,
     /// `Some(None)` clears repair inspection; `Some(Some(_))` publishes the

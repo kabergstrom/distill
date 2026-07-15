@@ -125,10 +125,13 @@ async fn remote_loader_client_preserves_typed_calls() {
             };
             assert_eq!(path_result, PathResolveResult::Resolved(asset));
 
-            let mut fetched = match hub.fetch(content_hash).await.unwrap() {
+            let newer = server.commit(Commit::default()).unwrap();
+            assert_ne!(newer, stamp);
+            let mut fetched = match snapshot.fetch(content_hash).await.unwrap() {
                 RemoteCall::Success(terminal) => terminal,
                 other => panic!("fetch failed: {other:?}"),
             };
+            assert_eq!(fetched.basis.snapshot, stamp);
             let fetched_total = fetched.value.total_bytes();
             let mut structural = Vec::new();
             while let Some(chunk) = fetched.value.next_chunk().await.unwrap() {
@@ -317,7 +320,9 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     ] {
         assert!(inspect.contains(arm), "missing authoring inspect arm {arm}");
     }
-    assert!(source.contains("authoringSnapshot @9 () -> (result :AuthoringSnapshotCall);"));
+    assert!(source.contains("authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);"));
+    assert!(!source.contains("fetch @6 (hash :Data) -> (result :ChunkStreamCall);"));
+    assert!(source.contains("fetch @7 (hash :Data) -> (result :ChunkStreamCall);"));
     assert!(source.contains("interface AuthoringSnapshot {"));
     assert!(source.contains("version @0 () -> (result :UInt64Call);"));
     assert!(source.contains("query @1 (query :AssetQuery) -> (result :UuidListCall);"));
@@ -1014,7 +1019,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 _ => panic!("expected built result"),
             }
 
-            let mut fetch = hub.fetch_request();
+            let mut fetch = snapshot.fetch_request();
             fetch.get().set_hash(&hash.0);
             let fetch_response = fetch.send().promise.await.unwrap();
             let fetch_result = fetch_response.get().unwrap().get_result().unwrap();
@@ -1386,7 +1391,7 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
                 _ => panic!("wrong UUID width must be a typed failure"),
             }
 
-            let mut fetch = hub.fetch_request();
+            let mut fetch = snapshot.fetch_request();
             fetch.get().set_hash(&[2; 31]);
             let response = fetch.send().promise.await.unwrap();
             let result = response.get().unwrap().get_result().unwrap();

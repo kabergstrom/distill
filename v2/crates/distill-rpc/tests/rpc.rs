@@ -1276,6 +1276,10 @@ fn reconnect_reason_vocabulary_is_shared_and_complete() {
         ReconnectReason::TargetDefinitionChanged,
         ReconnectReason::StoreInstanceChanged
     );
+    assert_ne!(
+        ReconnectReason::PipelineEpochChanged,
+        ReconnectReason::ProtocolEpochChanged
+    );
 }
 
 #[test]
@@ -1661,9 +1665,6 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
         "processor callback panicked",
     )
     .unwrap();
-    let unavailable = RpcFailure::PipelineUnavailable(Box::new(
-        PipelineUnavailableDiagnostic::PipelinePoison(poison.clone()),
-    ));
     let mut persisted = false;
 
     server
@@ -1675,33 +1676,25 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
 
     assert!(persisted);
     assert_eq!(server.current_stamp(), stamp);
-    assert_eq!(pinned.version(), RpcResult::Success(stamp.version));
-    assert!(matches!(
+    let reason = ReconnectReason::PipelineEpochChanged;
+    assert_reconnect(pinned.version(), reason);
+    assert_reconnect(
         pinned.query(AssetQuery {
             uuid: Some(entry.uuid),
             ..AssetQuery::default()
         }),
-        RpcResult::Success(_)
-    ));
-    assert_eq!(
+        reason,
+    );
+    assert_reconnect(
         pinned.query(AssetQuery {
             terminal_type: Some(entry.terminal_type),
             ..AssetQuery::default()
         }),
-        RpcResult::Failure(unavailable.clone())
+        reason,
     );
-    assert_eq!(
-        pinned.entry(entry.uuid),
-        RpcResult::Failure(unavailable.clone())
-    );
-    assert_eq!(
-        pinned.resolve(entry.uuid),
-        RpcResult::Failure(unavailable.clone())
-    );
-    assert_eq!(
-        hub.write(stamp.version, Vec::new()),
-        RpcResult::Failure(unavailable.clone())
-    );
+    assert_reconnect(pinned.entry(entry.uuid), reason);
+    assert_reconnect(pinned.resolve(entry.uuid), reason);
+    assert_reconnect(hub.write(stamp.version, Vec::new()), reason);
     assert_eq!(
         server.root().connect(request_for(7, 3, &[(1, false)])),
         ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelinePoison(
@@ -2093,11 +2086,58 @@ fn target_definition_change_fences_every_target_bound_method_and_prompts_stream(
     assert_reconnect(snap.resolve_path("a.asset"), reason);
     assert_reconnect(snap.fetch(content_hash(1)), reason);
     assert_reconnect(hub.fetch(&snap, content_hash(1)), reason);
-    assert_reconnect(hub.fetch_latest(content_hash(1)), reason);
     assert_reconnect(hub.subscribe(InputVersion(0), vec![], vec![]), reason);
     assert_reconnect(hub.unsubscribe(vec![], vec![]), reason);
     assert_reconnect(snap.version(), reason);
     assert_reconnect(snap.configuration(), reason);
+}
+
+#[test]
+fn pipeline_epoch_change_fences_every_target_bound_capability_and_prompts_stream() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let snapshot = snapshot(&hub);
+    let install = hub
+        .subscribe(InputVersion(0), vec![], vec![])
+        .success()
+        .unwrap();
+    install.deltas.next().unwrap();
+
+    server
+        .commit(Commit {
+            pipeline: Some(PipelineDiagnostic::Ready),
+            pipeline_epoch_changed: true,
+            ..Commit::default()
+        })
+        .unwrap();
+
+    assert!(matches!(
+        install.deltas.next(),
+        Some(StreamEvent::Asset {
+            event: AssetEvent::ReconnectRequired {
+                reason: ReconnectReason::PipelineEpochChanged,
+            },
+            ..
+        })
+    ));
+    assert_reconnect(hub.snapshot(), ReconnectReason::PipelineEpochChanged);
+    assert_reconnect(
+        snapshot.fetch(content_hash(1)),
+        ReconnectReason::PipelineEpochChanged,
+    );
+}
+
+#[test]
+fn unchanged_pipeline_diagnostic_does_not_create_a_false_epoch_fence() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    server
+        .commit(Commit {
+            pipeline: Some(PipelineDiagnostic::Ready),
+            ..Commit::default()
+        })
+        .unwrap();
+    assert!(matches!(hub.snapshot(), RpcResult::Success(_)));
 }
 
 #[test]

@@ -88,6 +88,7 @@ pub enum ReconnectReason {
     TargetDefinitionChanged,
     StoreInstanceChanged,
     ProtocolEpochChanged,
+    PipelineEpochChanged,
 }
 
 #[derive(Debug, Clone)]

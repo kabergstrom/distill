@@ -737,31 +737,6 @@ impl schema::hub::Server for HubService {
         }
     }
 
-    fn fetch(
-        self: capnp::capability::Rc<Self>,
-        params: schema::hub::FetchParams,
-        mut results: schema::hub::FetchResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            if let Some(reason) = self.hub.generation_reconnect() {
-                write_reconnect(
-                    results.get().init_result().init_reconnect_required(),
-                    reason,
-                );
-                return Ok(());
-            }
-            let hash = match decode_hash(params.get()?.get_hash()?, "hash") {
-                Ok(hash) => ContentHash(hash),
-                Err(error) => {
-                    write_wire_error(results.get().init_result().init_error(), &error);
-                    return Ok(());
-                }
-            };
-            write_fetch_result(results.get().init_result(), self.hub.fetch_latest(hash));
-            Ok(())
-        }
-    }
-
     fn wire_tree(
         self: capnp::capability::Rc<Self>,
         params: schema::hub::WireTreeParams,
@@ -1020,6 +995,31 @@ impl schema::snapshot::Server for SnapshotService {
                 results.get().init_result(),
                 self.snapshot.configuration(),
             );
+            Ok(())
+        }
+    }
+
+    fn fetch(
+        self: capnp::capability::Rc<Self>,
+        params: schema::snapshot::FetchParams,
+        mut results: schema::snapshot::FetchResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            if let Some(reason) = self.snapshot.generation_reconnect() {
+                write_reconnect(
+                    results.get().init_result().init_reconnect_required(),
+                    reason,
+                );
+                return Ok(());
+            }
+            let hash = match decode_hash(params.get()?.get_hash()?, "hash") {
+                Ok(hash) => ContentHash(hash),
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_fetch_result(results.get().init_result(), self.snapshot.fetch(hash));
             Ok(())
         }
     }
@@ -4333,5 +4333,6 @@ fn wire_reconnect(reason: ReconnectReason) -> schema::ReconnectReason {
         }
         ReconnectReason::StoreInstanceChanged => schema::ReconnectReason::StoreInstanceChanged,
         ReconnectReason::ProtocolEpochChanged => schema::ReconnectReason::ProtocolEpochChanged,
+        ReconnectReason::PipelineEpochChanged => schema::ReconnectReason::PipelineEpochChanged,
     }
 }

@@ -334,6 +334,7 @@ impl fmt::Debug for DeltaStream {
 struct ServerState {
     instance: StoreInstanceId,
     protocol_epoch: u32,
+    pipeline_generation: u64,
     current: InputVersion,
     views: BTreeMap<InputVersion, Arc<VersionView>>,
     history: VecDeque<HistoryDelta>,
@@ -447,6 +448,7 @@ struct ConnectionState {
     target_generation: u64,
     store_instance: StoreInstanceId,
     protocol_epoch: u32,
+    pipeline_generation: u64,
     subscribed_assets: BTreeSet<AssetUuid>,
     subscribed_paths: BTreeSet<String>,
     queue: VecDeque<StreamEvent>,
@@ -527,6 +529,7 @@ impl Server {
             inner: Arc::new(Mutex::new(ServerState {
                 instance,
                 protocol_epoch: PROTOCOL_VERSION,
+                pipeline_generation: 0,
                 current: version,
                 views,
                 history: VecDeque::new(),
@@ -598,11 +601,13 @@ impl Server {
             return Err("runtime poison publication requires PublishedRuntime origin".to_owned());
         }
 
-        let state = self.lock();
-        let view = state
-            .views
-            .get(&state.current)
-            .expect("current view must exist");
+        let mut state = self.lock();
+        let view = Arc::clone(
+            state
+                .views
+                .get(&state.current)
+                .expect("current view must exist"),
+        );
         {
             let diagnostic = view
                 .pipeline
@@ -624,6 +629,11 @@ impl Server {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             PipelineDiagnostic::Poisoned(poison);
+        state.pipeline_generation = state
+            .pipeline_generation
+            .checked_add(1)
+            .expect("pipeline generation exhausted");
+        notify_all_reconnect(&mut state, ReconnectReason::PipelineEpochChanged);
         Ok(())
     }
 
@@ -1121,6 +1131,7 @@ impl Root {
             target_generation,
             store_instance: state.instance,
             protocol_epoch: state.protocol_epoch,
+            pipeline_generation: state.pipeline_generation,
             subscribed_assets: BTreeSet::new(),
             subscribed_paths: BTreeSet::new(),
             queue: VecDeque::new(),
@@ -2066,26 +2077,6 @@ impl Hub {
         snapshot.fetch(hash)
     }
 
-    /// Cap'n Proto `Hub.fetch` convenience. Loader integrations should prefer
-    /// [`Hub::fetch`] with their adopted snapshot so the request basis is
-    /// explicit; this method pins latest atomically and returns that basis.
-    pub fn fetch_latest(&self, hash: ContentHash) -> RpcResult<TerminalEvent<ChunkStream>> {
-        let state = self.server.lock();
-        let connection = lock_connection(&self.connection);
-        if let Some(reason) = generation_fence(&state, &connection) {
-            return RpcResult::ReconnectRequired { reason };
-        }
-        let payload = match state.artifacts.get(&hash) {
-            Some(payload) => payload,
-            None => return RpcResult::Failure(RpcFailure::ArtifactNotFound { hash }),
-        };
-        let current = stamp(&state);
-        RpcResult::Success(TerminalEvent {
-            basis: basis_for(&connection, current),
-            value: chunk_payload(&payload.payload, state.chunk_size),
-        })
-    }
-
     pub fn subscribe(
         &self,
         since: InputVersion,
@@ -2844,6 +2835,9 @@ fn generation_fence(state: &ServerState, connection: &ConnectionState) -> Option
     if state.protocol_epoch != connection.protocol_epoch {
         return Some(ReconnectReason::ProtocolEpochChanged);
     }
+    if state.pipeline_generation != connection.pipeline_generation {
+        return Some(ReconnectReason::PipelineEpochChanged);
+    }
     let Some(target) = state.targets.get(&connection.target) else {
         return Some(ReconnectReason::TargetDefinitionChanged);
     };
@@ -3266,6 +3260,15 @@ fn live_connections(state: &mut ServerState) -> Vec<Arc<Mutex<ConnectionState>>>
 
 fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStamp, AdminError> {
     validate_commit(&commit)?;
+    let pipeline_epoch_changed = commit.pipeline_epoch_changed
+        || commit.pipeline.as_ref().is_some_and(|next| {
+            next != &pipeline_diagnostic(
+                state
+                    .views
+                    .get(&state.current)
+                    .expect("current view must exist"),
+            )
+        });
     let next = InputVersion(
         state
             .current
@@ -3364,13 +3367,23 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
 
     state.current = next;
     state.views.insert(next, Arc::new(view));
+    if pipeline_epoch_changed {
+        state.pipeline_generation = state
+            .pipeline_generation
+            .checked_add(1)
+            .expect("pipeline generation exhausted");
+    }
     let delta = HistoryDelta {
         stamp: next_stamp,
         assets: asset_deltas,
         paths: path_deltas,
     };
     state.history.push_back(delta.clone());
-    notify_live_delta(state, &delta);
+    if pipeline_epoch_changed {
+        notify_all_reconnect(state, ReconnectReason::PipelineEpochChanged);
+    } else {
+        notify_live_delta(state, &delta);
+    }
     Ok(next_stamp)
 }
 

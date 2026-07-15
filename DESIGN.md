@@ -81,9 +81,12 @@ There are three independent boundaries:
    `DSTS`, a second digest stored beside those rows, adds no authority and is
    removed.
 
-RPC validates each fetched artifact at the load boundary above. A module epoch
-change invalidates the connection; clients reconnect and resubscribe instead of
-mutating an existing Hub with `reattest`. Packs carry their target/DSTG,
+RPC validates each fetched artifact at the load boundary above. Artifact fetch
+exists only on a pinned `Snapshot` capability, so resolve and fetch return the
+same `SnapshotStamp`; there is no target-bound “fetch latest” Hub bypass. A
+module epoch change advances the connection fence and returns
+`PipelineEpochChanged`; clients reconnect and resubscribe instead of mutating
+an existing Hub with `reattest`. Packs carry their target/DSTG,
 artifact content hashes, authenticated artifact bytes, wire trees, and typed
 dependency edges; mount/load applies the same live-descriptor checks. Pack
 construction enforces build-only policy, and runtime loading independently

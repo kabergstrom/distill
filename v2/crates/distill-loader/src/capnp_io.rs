@@ -457,6 +457,7 @@ impl Driver {
                     return false;
                 };
                 let hub = self.hub.clone();
+                let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
                 let admission = Rc::clone(&self.fetch_admission);
                 let wake = Rc::clone(&self.fetch_wake);
@@ -464,7 +465,7 @@ impl Driver {
                 tokio::task::spawn_local(async move {
                     let _request_slot = request_slot;
                     let completion = fetch_event(
-                        hub,
+                        (hub, snapshot),
                         req,
                         content_hash,
                         basis,
@@ -775,7 +776,7 @@ async fn path_event(
 }
 
 async fn fetch_event(
-    hub: RemoteHub,
+    remote: (RemoteHub, RemoteSnapshot),
     req: ReqId,
     content_hash: ContentHash,
     request_basis: IoBasis,
@@ -783,7 +784,8 @@ async fn fetch_event(
     wake: Rc<Notify>,
     spool_directory: Option<PathBuf>,
 ) -> Completion {
-    let mut terminal = match hub.fetch(content_hash).await {
+    let (hub, snapshot) = remote;
+    let mut terminal = match snapshot.fetch(content_hash).await {
         Ok(RemoteCall::Success(terminal)) => terminal,
         Ok(call) => return Completion::event(remote_request_event(call, req, request_basis)),
         Err(error) => {
@@ -1219,6 +1221,7 @@ fn reconnect_reason(reason: distill_rpc::ReconnectReason) -> ReconnectReason {
         }
         distill_rpc::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         distill_rpc::ReconnectReason::ProtocolEpochChanged => ReconnectReason::ProtocolEpochChanged,
+        distill_rpc::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
     }
 }
 

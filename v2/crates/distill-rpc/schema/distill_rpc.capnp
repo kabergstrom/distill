@@ -24,6 +24,7 @@ enum ReconnectReason {
   targetDefinitionChanged @0;
   storeInstanceChanged @1;
   protocolEpochChanged @2;
+  pipelineEpochChanged @3;
 }
 
 struct ReconnectRequired {
@@ -973,11 +974,10 @@ interface Hub {
   import @3 (base :UInt64, request :ImportRequest) -> (result :UuidCall);
   reimport @4 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
   operation @5 (base :UInt64, operation :LongRunningOp) -> (result :ProgressCall);
-  fetch @6 (hash :Data) -> (result :ChunkStreamCall);
-  wireTree @7 (layoutHash :Data) -> (result :DataCall);
-  unsubscribe @8 (assets :List(Data), paths :List(Text))
+  wireTree @6 (layoutHash :Data) -> (result :DataCall);
+  unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
-  authoringSnapshot @9 () -> (result :AuthoringSnapshotCall);
+  authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
 }
 
 interface Snapshot {
@@ -988,6 +988,7 @@ interface Snapshot {
   refresh @4 () -> (result :SnapshotCall);
   resolvePath @5 (path :Text) -> (result :PathResolveCall);
   configuration @6 () -> (result :VoidCall);
+  fetch @7 (hash :Data) -> (result :ChunkStreamCall);
 }
 
 interface AuthoringSnapshot {

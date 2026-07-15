@@ -770,6 +770,7 @@ impl DaemonCoordinator {
                     &commit_asset_bundles(&commit, &fallback_bundles),
                 )
                 .apply(&mut commit);
+                commit.pipeline_epoch_changed = true;
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)
@@ -886,6 +887,7 @@ impl DaemonCoordinator {
             };
             let mut commit = Commit {
                 pipeline: Some(diagnostic),
+                pipeline_epoch_changed: true,
                 ..Commit::default()
             };
             crate::build::refine_published_tag_index(
@@ -935,6 +937,7 @@ impl DaemonCoordinator {
                 .map_err(|error| error.to_string())?;
             Ok(Commit {
                 pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
+                pipeline_epoch_changed: true,
                 ..Commit::default()
             })
         });

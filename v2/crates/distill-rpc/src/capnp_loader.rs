@@ -94,57 +94,6 @@ impl RemoteHub {
         }
     }
 
-    pub async fn fetch(
-        &self,
-        content_hash: ContentHash,
-    ) -> Result<RemoteCall<TerminalEvent<RemoteChunkStream>>, capnp::Error> {
-        let mut request = self.client.fetch_request();
-        request.get().set_hash(&content_hash.0);
-        let response = request.send().promise.await?;
-        let result = response.get()?.get_result()?;
-        match result.which()? {
-            schema::chunk_stream_call::Which::Success(value) => {
-                let value = value?;
-                let basis = decode_connection_basis(value.get_basis()?, &self.basis)?;
-                let mut load_edges = Vec::with_capacity(value.get_load_edges()?.len() as usize);
-                for edge in value.get_load_edges()?.iter() {
-                    load_edges.push(ServedLoadEdge {
-                        asset: AssetUuid(fixed::<16>(edge.get_asset()?, "fetch.loadEdge.asset")?),
-                        expected_terminal: distill_core::id::TypeUuid(fixed::<16>(
-                            edge.get_expected_terminal()?,
-                            "fetch.loadEdge.expectedTerminal",
-                        )?),
-                    });
-                }
-                if load_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
-                    return Err(capnp::Error::failed(
-                        "fetch load edges are not strictly sorted".into(),
-                    ));
-                }
-                Ok(RemoteCall::Success(TerminalEvent {
-                    basis,
-                    value: RemoteChunkStream {
-                        client: value.get_chunks()?,
-                        total_bytes: value.get_total_bytes(),
-                        load_edges,
-                    },
-                }))
-            }
-            schema::chunk_stream_call::Which::ReconnectRequired(value) => Ok(
-                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
-            ),
-            schema::chunk_stream_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
-            ),
-            schema::chunk_stream_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
-            schema::chunk_stream_call::Which::Error(value) => {
-                Ok(RemoteCall::Error(decode_error(value?)?))
-            }
-        }
-    }
-
     pub async fn wire_tree(
         &self,
         layout_hash: LayoutHash,
@@ -315,6 +264,57 @@ impl RemoteSnapshot {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
             }
             schema::snapshot_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
+        }
+    }
+
+    pub async fn fetch(
+        &self,
+        content_hash: ContentHash,
+    ) -> Result<RemoteCall<TerminalEvent<RemoteChunkStream>>, capnp::Error> {
+        let mut request = self.client.fetch_request();
+        request.get().set_hash(&content_hash.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::chunk_stream_call::Which::Success(value) => {
+                let value = value?;
+                let basis = decode_rpc_basis(value.get_basis()?, &self.basis)?;
+                let mut load_edges = Vec::with_capacity(value.get_load_edges()?.len() as usize);
+                for edge in value.get_load_edges()?.iter() {
+                    load_edges.push(ServedLoadEdge {
+                        asset: AssetUuid(fixed::<16>(edge.get_asset()?, "fetch.loadEdge.asset")?),
+                        expected_terminal: distill_core::id::TypeUuid(fixed::<16>(
+                            edge.get_expected_terminal()?,
+                            "fetch.loadEdge.expectedTerminal",
+                        )?),
+                    });
+                }
+                if load_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(capnp::Error::failed(
+                        "fetch load edges are not strictly sorted".into(),
+                    ));
+                }
+                Ok(RemoteCall::Success(TerminalEvent {
+                    basis,
+                    value: RemoteChunkStream {
+                        client: value.get_chunks()?,
+                        total_bytes: value.get_total_bytes(),
+                        load_edges,
+                    },
+                }))
+            }
+            schema::chunk_stream_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::chunk_stream_call::Which::ConfigurationPoisoned(value) => Ok(
+                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            ),
+            schema::chunk_stream_call::Which::LeaseFailure(value) => {
+                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
+            }
+            schema::chunk_stream_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
         }
@@ -628,6 +628,7 @@ fn decode_reconnect(value: schema::ReconnectReason) -> ReconnectReason {
         }
         schema::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         schema::ReconnectReason::ProtocolEpochChanged => ReconnectReason::ProtocolEpochChanged,
+        schema::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
     }
 }
 
