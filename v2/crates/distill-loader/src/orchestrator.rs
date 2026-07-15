@@ -2,9 +2,8 @@
 //!
 //! IO remains behind [`LoaderIO`]; this module owns request generations, the
 //! client manifest, dependency-component decisions, and the frame-boundary
-//! `update`/`poll`/`commit` protocol. Artifact construction is deliberately an
-//! injection boundary: fetched bytes are parsed and validated here, then handed
-//! to game-side fixup code which returns an owned [`ErasedValue`].
+//! `update`/`poll`/`commit` protocol. Fetched bytes are parsed, validated, and
+//! fixed up into owned [`ErasedValue`] instances here before atomic adoption.
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,10 +70,6 @@ pub enum LoaderError {
     RequestIdsExhausted,
     AdoptionIdsExhausted,
     UnknownHandle(HandleId),
-    HandleAssetMismatch,
-    CandidateNotFetched,
-    CandidateHashMismatch,
-    CandidateMetadataMismatch,
     TypeMismatch {
         expected: TypeUuid,
         actual: TypeUuid,
@@ -257,25 +252,6 @@ struct Sweep {
     candidates: BTreeMap<AssetUuid, CandidateRecord>,
 }
 
-pub struct FetchedInput {
-    pub uuid: AssetUuid,
-    pub content_hash: ContentHash,
-    pub type_uuid: TypeUuid,
-    pub load_deps: Vec<AssetUuid>,
-    pub handles: Vec<HandleId>,
-    pub basis: IoBasis,
-    pub artifact: FetchedArtifact,
-}
-
-pub struct PreparedValue {
-    pub handle: HandleId,
-    pub uuid: AssetUuid,
-    pub content_hash: ContentHash,
-    pub type_uuid: TypeUuid,
-    pub load_deps: Vec<AssetUuid>,
-    pub value: ErasedValue,
-}
-
 struct PendingUpdate {
     handle: HandleId,
     uuid: AssetUuid,
@@ -298,7 +274,6 @@ pub struct Loader<I: LoaderIO> {
     epochs: RuntimeEpochs,
     descriptors: BTreeMap<TypeUuid, DescriptorRecord>,
     placeholders: BTreeMap<TypeUuid, PlaceholderRecord>,
-    injected_placeholders: BTreeMap<HandleId, InspectedPlaceholder>,
     slots: BTreeMap<HandleId, Slot>,
     direct_slots: BTreeMap<(AssetUuid, TypeUuid), HandleId>,
     path_slots: BTreeMap<(String, TypeUuid), HandleId>,
@@ -306,7 +281,6 @@ pub struct Loader<I: LoaderIO> {
     dirty: BTreeSet<AssetUuid>,
     dirty_paths: BTreeSet<String>,
     sweep: Option<Sweep>,
-    fetched: Vec<FetchedInput>,
     pending: Vec<PendingComponent>,
     diagnostics: Vec<LoaderDiagnostic>,
     next_handle: u64,
@@ -324,7 +298,6 @@ impl<I: LoaderIO> Loader<I> {
             epochs: RuntimeEpochs::default(),
             descriptors: BTreeMap::new(),
             placeholders: BTreeMap::new(),
-            injected_placeholders: BTreeMap::new(),
             slots: BTreeMap::new(),
             direct_slots: BTreeMap::new(),
             path_slots: BTreeMap::new(),
@@ -332,7 +305,6 @@ impl<I: LoaderIO> Loader<I> {
             dirty: BTreeSet::new(),
             dirty_paths: BTreeSet::new(),
             sweep: None,
-            fetched: Vec::new(),
             pending: Vec::new(),
             diagnostics: Vec::new(),
             next_handle: 1,
@@ -502,129 +474,8 @@ impl<I: LoaderIO> Loader<I> {
         self.manifest.get(&uuid)
     }
 
-    pub fn take_fetched(&mut self) -> Vec<FetchedInput> {
-        std::mem::take(&mut self.fetched)
-    }
-
     pub fn take_diagnostics(&mut self) -> Vec<LoaderDiagnostic> {
         std::mem::take(&mut self.diagnostics)
-    }
-
-    pub fn inject_value(&mut self, prepared: PreparedValue) -> Result<(), LoaderError> {
-        let slot = self
-            .slots
-            .get(&prepared.handle)
-            .ok_or(LoaderError::UnknownHandle(prepared.handle))?;
-        if slot.binding.uuid() != Some(prepared.uuid) {
-            return Err(LoaderError::HandleAssetMismatch);
-        }
-        if slot
-            .expected_type
-            .is_some_and(|expected| expected != prepared.type_uuid)
-        {
-            return Err(LoaderError::TypeMismatch {
-                expected: slot.expected_type.expect("checked Some"),
-                actual: prepared.type_uuid,
-            });
-        }
-        self.validate_value_owner(prepared.type_uuid, &prepared.value)?;
-        let sweep = self
-            .sweep
-            .as_mut()
-            .ok_or(LoaderError::CandidateNotFetched)?;
-        let candidate = sweep
-            .candidates
-            .get_mut(&prepared.uuid)
-            .ok_or(LoaderError::CandidateNotFetched)?;
-        let CandidateTerminal::Built {
-            content_hash,
-            type_uuid,
-            load_deps,
-            values,
-            ..
-        } = &mut candidate.terminal
-        else {
-            return Err(LoaderError::CandidateNotFetched);
-        };
-        if *content_hash != prepared.content_hash {
-            return Err(LoaderError::CandidateHashMismatch);
-        }
-        if type_uuid.is_some_and(|value| value != prepared.type_uuid)
-            || load_deps
-                .as_ref()
-                .is_some_and(|value| value != &prepared.load_deps)
-        {
-            return Err(LoaderError::CandidateMetadataMismatch);
-        }
-        *type_uuid = Some(prepared.type_uuid);
-        *load_deps = Some(prepared.load_deps);
-        values.insert(prepared.handle, prepared.value);
-        Ok(())
-    }
-
-    pub fn inject_placeholder(
-        &mut self,
-        handle: HandleId,
-        value: ErasedValue,
-    ) -> Result<(), LoaderError> {
-        let context = self
-            .slots
-            .get(&handle)
-            .ok_or(LoaderError::UnknownHandle(handle))
-            .and_then(|slot| {
-                let uuid = slot
-                    .binding
-                    .uuid()
-                    .ok_or(LoaderError::HandleAssetMismatch)?;
-                let type_uuid = slot
-                    .current
-                    .as_ref()
-                    .map(|current| current.type_uuid)
-                    .or(slot.expected_type)
-                    .ok_or(LoaderError::HandleAssetMismatch)?;
-                Ok((uuid, type_uuid))
-            });
-        let (uuid, type_uuid) = match context {
-            Ok(context) => context,
-            Err(error) => {
-                let _ = value.destroy();
-                return Err(error);
-            }
-        };
-        let strong_references = match self.inspect_placeholder_value(type_uuid, &value) {
-            Ok(references) => references,
-            Err(error) => {
-                let _ = value.destroy();
-                return Err(error);
-            }
-        };
-        if let Some(candidate) = self
-            .sweep
-            .as_mut()
-            .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-        {
-            if let CandidateTerminal::Deleted {
-                values,
-                strong_references: candidate_references,
-            } = &mut candidate.terminal
-            {
-                merge_placeholder_references(candidate_references, strong_references);
-                if let Some(old) = values.insert(handle, value) {
-                    let _ = old.destroy();
-                }
-                return Ok(());
-            }
-        }
-        if let Some(old) = self.injected_placeholders.insert(
-            handle,
-            InspectedPlaceholder {
-                value,
-                strong_references,
-            },
-        ) {
-            let _ = old.value.destroy();
-        }
-        Ok(())
     }
 
     pub fn process(&mut self, storage: &mut dyn AssetStorage) -> Result<(), LoaderError> {
@@ -645,24 +496,6 @@ impl<I: LoaderIO> Loader<I> {
     }
 
     pub fn begin_module_drain(&mut self, epoch: GameModuleEpoch) -> Result<(), LoaderError> {
-        let owner = self
-            .descriptors
-            .values()
-            .find(|record| record.epoch == epoch)
-            .map(|record| record.token.clone());
-        if let Some(owner) = owner {
-            let injected = self
-                .injected_placeholders
-                .iter()
-                .filter(|(_, placeholder)| owner.same_epoch(placeholder.value.owner_token()))
-                .map(|(handle, _)| *handle)
-                .collect::<Vec<_>>();
-            for handle in injected {
-                if let Some(placeholder) = self.injected_placeholders.remove(&handle) {
-                    let _ = placeholder.value.destroy();
-                }
-            }
-        }
         self.epochs
             .begin_module_drain(epoch)
             .map_err(LoaderError::RuntimeEpoch)?;
@@ -772,7 +605,6 @@ impl<I: LoaderIO> Loader<I> {
                 destroy_candidate_values(candidate.terminal);
             }
         }
-        self.fetched.clear();
     }
 
     fn prune_released(&mut self, storage: &mut dyn AssetStorage) {
@@ -858,9 +690,6 @@ impl<I: LoaderIO> Loader<I> {
 
     fn prune_released_slots(&mut self, storage: &mut dyn AssetStorage, released: Vec<HandleId>) {
         for id in released {
-            if let Some(placeholder) = self.injected_placeholders.remove(&id) {
-                let _ = placeholder.value.destroy();
-            }
             if let Some(slot) = self.slots.remove(&id) {
                 if let Some(uuid) = slot.subscribed_uuid {
                     self.io.unsubscribe(uuid);
@@ -1530,15 +1359,6 @@ impl<I: LoaderIO> Loader<I> {
         *candidate_deps = Some(load_deps.clone());
         values.extend(constructed);
         candidate.load_expectations = load_expectations;
-        self.fetched.push(FetchedInput {
-            uuid,
-            content_hash,
-            type_uuid,
-            load_deps,
-            handles,
-            basis,
-            artifact,
-        });
     }
 
     fn content_candidate_uuid(
@@ -1603,32 +1423,27 @@ impl<I: LoaderIO> Loader<I> {
             let Some(type_uuid) = type_uuid else {
                 continue;
             };
-            let inspected = if let Some(injected) = self.injected_placeholders.remove(&handle) {
-                Some(Ok(injected))
-            } else {
-                self.placeholders.get(&type_uuid).map(|placeholder| {
-                    if !self.epochs.can_issue_work(placeholder.epoch) {
-                        return Err("placeholder epoch is fenced".to_owned());
+            let inspected = self.placeholders.get(&type_uuid).map(|placeholder| {
+                if !self.epochs.can_issue_work(placeholder.epoch) {
+                    return Err("placeholder epoch is fenced".to_owned());
+                }
+                let value = (placeholder.thunk.make)(placeholder.token.clone()).map_err(|_| {
+                    placeholder
+                        .token
+                        .poison_with(ModuleEpochPoisonCause::CallbackPanic);
+                    "placeholder factory callback failed".to_owned()
+                })?;
+                match self.inspect_placeholder_value(type_uuid, &value) {
+                    Ok(strong_references) => Ok(InspectedPlaceholder {
+                        value,
+                        strong_references,
+                    }),
+                    Err(error) => {
+                        let _ = value.destroy();
+                        Err(format!("placeholder visitor failed: {error:?}"))
                     }
-                    let value =
-                        (placeholder.thunk.make)(placeholder.token.clone()).map_err(|_| {
-                            placeholder
-                                .token
-                                .poison_with(ModuleEpochPoisonCause::CallbackPanic);
-                            "placeholder factory callback failed".to_owned()
-                        })?;
-                    match self.inspect_placeholder_value(type_uuid, &value) {
-                        Ok(strong_references) => Ok(InspectedPlaceholder {
-                            value,
-                            strong_references,
-                        }),
-                        Err(error) => {
-                            let _ = value.destroy();
-                            Err(format!("placeholder visitor failed: {error:?}"))
-                        }
-                    }
-                })
-            };
+                }
+            });
             match inspected {
                 Some(Ok(inspected)) => {
                     if let Some(candidate) = self

@@ -26,8 +26,8 @@ pub use io::{
     ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
 pub use orchestrator::{
-    FetchedInput, Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, PreparedValue,
-    RegistrationError, TargetBindingState,
+    Handle, LoadStatus, Loader, LoaderDiagnostic, LoaderError, RegistrationError,
+    TargetBindingState,
 };
 pub use runtime::{
     AdoptionId, CompletionDisposition, ConnectionEpoch, HandleId, ManifestEntry, ManifestState,

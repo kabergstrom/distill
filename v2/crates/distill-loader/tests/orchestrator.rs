@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
@@ -5,9 +6,9 @@ use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
-    LoadStatus, Loader, LoaderDiagnostic, LoaderError, LoaderIO, ManifestHash, PathResolveResult,
-    PendingState, PendingToken, PreparedValue, ReqId, ResolveResult, RuntimeTarget, StorageError,
-    TargetBindingState, UpdateResult,
+    LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, PathResolveResult, PendingState,
+    PendingToken, ReqId, ResolveResult, RuntimeTarget, StorageError, TargetBindingState,
+    UpdateResult,
 };
 use distill_rpc::ServedLoadEdge;
 use distill_store::state::{InputVersion, StoreInstanceId};
@@ -27,9 +28,25 @@ struct BuildOnly;
 
 const PLACEHOLDER_TYPE: TypeUuid = TypeUuid([0x43; 16]);
 
-struct RefPlaceholder {
+struct RefPlaceholder;
+
+#[derive(Clone, Default)]
+struct PlaceholderConfig {
     references: Vec<(bool, AssetUuid, TypeUuid)>,
     panic_while_visiting: bool,
+}
+
+thread_local! {
+    static PLACEHOLDER_CONFIG: RefCell<PlaceholderConfig> = RefCell::default();
+}
+
+fn configure_placeholder(references: Vec<(bool, AssetUuid, TypeUuid)>, panic_while_visiting: bool) {
+    PLACEHOLDER_CONFIG.with(|config| {
+        *config.borrow_mut() = PlaceholderConfig {
+            references,
+            panic_while_visiting,
+        };
+    });
 }
 
 unsafe fn encode_ref_placeholder(
@@ -37,12 +54,14 @@ unsafe fn encode_ref_placeholder(
     sink: &mut dyn EncodeSink,
 ) -> Result<(), CallbackPanic> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Safety: this function is installed only in RefPlaceholder's descriptor.
-        let value = unsafe { &*value_ptr.cast::<RefPlaceholder>() };
-        assert!(!value.panic_while_visiting, "test visitor panic");
-        for (strong, target, expected) in &value.references {
-            sink.reference(*strong, *target, *expected);
-        }
+        let _ = value_ptr;
+        PLACEHOLDER_CONFIG.with(|config| {
+            let config = config.borrow();
+            assert!(!config.panic_while_visiting, "test visitor panic");
+            for (strong, target, expected) in &config.references {
+                sink.reference(*strong, *target, *expected);
+            }
+        });
     }))
     .map_err(|_| CallbackPanic)
 }
@@ -368,6 +387,15 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
     assert_eq!(loader.target_binding_state(), TargetBindingState::Required);
 }
 
+fn register_ref_placeholder(loader: &mut Loader<MockIo>, epoch: u64) {
+    loader
+        .register_placeholder(
+            GameModuleEpoch(epoch),
+            distill_asset::placeholder!(RefPlaceholder, RefPlaceholder),
+        )
+        .unwrap();
+}
+
 fn resolve(loader: &mut Loader<MockIo>, asset_uuid: AssetUuid, hash: ContentHash) {
     let (req, request_basis) = loader.io().resolve_for(asset_uuid);
     loader.io_mut().push(IoEvent::Resolved {
@@ -391,7 +419,6 @@ fn fetched(loader: &mut Loader<MockIo>, hash: ContentHash, artifact: FetchedArti
 fn load_placeholder_root(
     loader: &mut Loader<MockIo>,
     storage: &mut Storage,
-    token: &ModuleEpochToken,
     root: AssetUuid,
 ) -> distill_loader::Handle<RefPlaceholder> {
     let handle = loader.add_ref::<RefPlaceholder>(root).unwrap();
@@ -399,22 +426,6 @@ fn load_placeholder_root(
     let (hash, root_artifact) = artifact::<RefPlaceholder>(root, &[]);
     resolve(loader, root, hash);
     loader.process(storage).unwrap();
-    loader
-        .inject_value(PreparedValue {
-            handle: handle.id(),
-            uuid: root,
-            content_hash: hash,
-            type_uuid: RefPlaceholder::TYPE_UUID,
-            load_deps: Vec::new(),
-            value: ErasedValue::new_in(
-                RefPlaceholder {
-                    references: Vec::new(),
-                    panic_while_visiting: false,
-                },
-                token.clone(),
-            ),
-        })
-        .unwrap();
     fetched(loader, hash, root_artifact);
     loader.process(storage).unwrap();
     assert_eq!(loader.status(&handle), LoadStatus::Loaded);
@@ -439,7 +450,7 @@ fn begin_deletion(loader: &mut Loader<MockIo>, storage: &mut Storage, root: Asse
 }
 
 #[test]
-fn one_basis_resolve_fetch_and_preconstructed_injection_commit_at_process_boundary() {
+fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
     let token = ModuleEpochToken::new(1);
     let mut loader = Loader::new(mock_io());
     register(&mut loader, 1, &token);
@@ -454,16 +465,6 @@ fn one_basis_resolve_fetch_and_preconstructed_injection_commit_at_process_bounda
     let (fetch_req, fetch_basis) = loader.io().fetch_for(hash);
     assert_eq!(fetch_basis, basis());
 
-    loader
-        .inject_value(PreparedValue {
-            handle: handle.id(),
-            uuid: asset_uuid,
-            content_hash: hash,
-            type_uuid: A::TYPE_UUID,
-            load_deps: Vec::new(),
-            value: ErasedValue::new_in(A, token.clone()),
-        })
-        .unwrap();
     loader.io_mut().push(IoEvent::Fetched {
         req: fetch_req,
         content_hash: hash,
@@ -902,22 +903,11 @@ fn placeholder_strong_reference_expands_and_gates_the_component() {
     register(&mut loader, 20, &token);
     let root = uuid(20);
     let target = uuid(21);
+    configure_placeholder(vec![(true, target, B::TYPE_UUID)], false);
+    register_ref_placeholder(&mut loader, 20);
     let mut storage = Storage::default();
-    let handle = load_placeholder_root(&mut loader, &mut storage, &token, root);
+    let handle = load_placeholder_root(&mut loader, &mut storage, root);
     assert_eq!(storage.updates.len(), 1);
-
-    loader
-        .inject_placeholder(
-            handle.id(),
-            ErasedValue::new_in(
-                RefPlaceholder {
-                    references: vec![(true, target, B::TYPE_UUID)],
-                    panic_while_visiting: false,
-                },
-                token.clone(),
-            ),
-        )
-        .unwrap();
     begin_deletion(&mut loader, &mut storage, root);
 
     assert_eq!(storage.updates.len(), 1, "placeholder must not half-adopt");
@@ -944,21 +934,10 @@ fn placeholder_weak_reference_does_not_expand_the_component() {
     register(&mut loader, 21, &token);
     let root = uuid(22);
     let weak_target = uuid(23);
+    configure_placeholder(vec![(false, weak_target, B::TYPE_UUID)], false);
+    register_ref_placeholder(&mut loader, 21);
     let mut storage = Storage::default();
-    let handle = load_placeholder_root(&mut loader, &mut storage, &token, root);
-
-    loader
-        .inject_placeholder(
-            handle.id(),
-            ErasedValue::new_in(
-                RefPlaceholder {
-                    references: vec![(false, weak_target, B::TYPE_UUID)],
-                    panic_while_visiting: false,
-                },
-                token.clone(),
-            ),
-        )
-        .unwrap();
+    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
     begin_deletion(&mut loader, &mut storage, root);
 
     assert_eq!(storage.updates.len(), 2);
@@ -974,21 +953,10 @@ fn placeholder_terminal_type_mismatch_poisons_without_partial_swap() {
     register(&mut loader, 22, &token);
     let root = uuid(24);
     let target = uuid(25);
+    configure_placeholder(vec![(true, target, A::TYPE_UUID)], false);
+    register_ref_placeholder(&mut loader, 22);
     let mut storage = Storage::default();
-    let handle = load_placeholder_root(&mut loader, &mut storage, &token, root);
-
-    loader
-        .inject_placeholder(
-            handle.id(),
-            ErasedValue::new_in(
-                RefPlaceholder {
-                    references: vec![(true, target, A::TYPE_UUID)],
-                    panic_while_visiting: false,
-                },
-                token.clone(),
-            ),
-        )
-        .unwrap();
+    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
     begin_deletion(&mut loader, &mut storage, root);
     loader.process(&mut storage).unwrap();
     let (target_hash, target_artifact) = artifact::<B>(target, &[]);
@@ -1011,21 +979,10 @@ fn placeholder_resolution_failure_poisons_without_partial_swap() {
     register(&mut loader, 23, &token);
     let root = uuid(26);
     let target = uuid(27);
+    configure_placeholder(vec![(true, target, B::TYPE_UUID)], false);
+    register_ref_placeholder(&mut loader, 23);
     let mut storage = Storage::default();
-    let handle = load_placeholder_root(&mut loader, &mut storage, &token, root);
-
-    loader
-        .inject_placeholder(
-            handle.id(),
-            ErasedValue::new_in(
-                RefPlaceholder {
-                    references: vec![(true, target, B::TYPE_UUID)],
-                    panic_while_visiting: false,
-                },
-                token.clone(),
-            ),
-        )
-        .unwrap();
+    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
     begin_deletion(&mut loader, &mut storage, root);
     loader.process(&mut storage).unwrap();
     let (req, request_basis) = loader.io().resolve_for(target);
@@ -1080,50 +1037,15 @@ fn role_ineligible_is_a_typed_failure_not_a_missing_asset() {
 }
 
 #[test]
-fn placeholder_visitor_failure_is_observed_and_destroys_the_injected_value() {
-    let token = ModuleEpochToken::new(24);
-    let mut loader = Loader::new(mock_io());
-    register(&mut loader, 24, &token);
-    let handle = loader.add_ref::<RefPlaceholder>(uuid(28)).unwrap();
-
-    let result = loader.inject_placeholder(
-        handle.id(),
-        ErasedValue::new_in(
-            RefPlaceholder {
-                references: Vec::new(),
-                panic_while_visiting: true,
-            },
-            token.clone(),
-        ),
-    );
-
-    assert!(matches!(
-        result,
-        Err(LoaderError::PlaceholderVisitorFailed(PLACEHOLDER_TYPE))
-    ));
-    assert!(token.is_poisoned());
-}
-
-#[test]
 fn minted_placeholder_visitor_failure_poisons_the_component() {
     let token = ModuleEpochToken::new(26);
     let mut loader = Loader::new(mock_io());
     register(&mut loader, 26, &token);
-    loader
-        .register_placeholder(
-            GameModuleEpoch(26),
-            distill_asset::placeholder!(
-                RefPlaceholder,
-                RefPlaceholder {
-                    references: Vec::new(),
-                    panic_while_visiting: true,
-                }
-            ),
-        )
-        .unwrap();
+    configure_placeholder(Vec::new(), true);
+    register_ref_placeholder(&mut loader, 26);
     let root = uuid(31);
     let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, &token, root);
+    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
 
     begin_deletion(&mut loader, &mut storage, root);
 
@@ -1141,21 +1063,11 @@ fn placeholder_edges_restart_and_resolve_as_one_fresh_basis() {
     let token = ModuleEpochToken::new(25);
     let mut loader = Loader::new(mock_io());
     register(&mut loader, 25, &token);
-    loader
-        .register_placeholder(
-            GameModuleEpoch(25),
-            distill_asset::placeholder!(
-                RefPlaceholder,
-                RefPlaceholder {
-                    references: vec![(true, TARGET, B::TYPE_UUID)],
-                    panic_while_visiting: false,
-                }
-            ),
-        )
-        .unwrap();
+    configure_placeholder(vec![(true, TARGET, B::TYPE_UUID)], false);
+    register_ref_placeholder(&mut loader, 25);
     let root = uuid(29);
     let mut storage = Storage::default();
-    let _handle = load_placeholder_root(&mut loader, &mut storage, &token, root);
+    let _handle = load_placeholder_root(&mut loader, &mut storage, root);
     begin_deletion(&mut loader, &mut storage, root);
     loader.process(&mut storage).unwrap();
     let (old_req, old_basis) = loader.io().resolve_for(TARGET);
