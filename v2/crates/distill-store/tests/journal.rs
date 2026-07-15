@@ -348,59 +348,6 @@ fn doctor_clean_removes_fresh_entries_but_keeps_named_audit_history() {
 }
 
 #[test]
-fn deletion_is_rename_into_quarantine_then_preimage_verification() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let target = root.join("delete.bundle");
-    std::fs::write(&target, b"expected bytes").unwrap();
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    let id = store
-        .record_intent(
-            target.to_str().unwrap(),
-            root.join(".delete.tmp").to_str().unwrap(),
-            root.join("delete.conflict").to_str().unwrap(),
-            Some(hash(b"expected bytes")),
-            hash(b""),
-        )
-        .unwrap();
-
-    let qpath = store
-        .delete_with_intent(id, &target, &quarantine_dir(&dir))
-        .unwrap();
-    assert!(!target.exists());
-    assert_eq!(std::fs::read(qpath).unwrap(), b"expected bytes");
-    assert!(store.unretired_intents().unwrap().is_empty());
-}
-
-#[test]
-fn deletion_mismatch_restores_user_bytes_and_reports_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let target = root.join("delete.bundle");
-    std::fs::write(&target, b"new external save").unwrap();
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    let id = store
-        .record_intent(
-            target.to_str().unwrap(),
-            root.join(".delete.tmp").to_str().unwrap(),
-            root.join("delete.conflict").to_str().unwrap(),
-            Some(hash(b"old preimage")),
-            hash(b""),
-        )
-        .unwrap();
-
-    let err = store
-        .delete_with_intent(id, &target, &quarantine_dir(&dir))
-        .unwrap_err();
-    assert!(matches!(err, StoreError::DeleteConflict { intent_id, .. } if intent_id == id));
-    assert_eq!(std::fs::read(&target).unwrap(), b"new external save");
-    assert_eq!(store.quarantined_entries().unwrap().len(), 0);
-    assert!(store.displacement_history().unwrap()[0].restored);
-}
-
-#[test]
 fn native_journaled_replacement_installs_no_replace_and_retains_the_preimage() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("asset-root");

@@ -418,67 +418,6 @@ impl Store {
         Ok(qpath)
     }
 
-    /// Whole-file deletion uses the same journaled displacement family as
-    /// rewrites: rename into quarantine, hash/compare the displaced inode,
-    /// retain on success, restore and fail on mismatch.
-    pub fn delete_with_intent(
-        &mut self,
-        intent_id: i64,
-        target: &Path,
-        quarantine_dir: &Path,
-    ) -> Result<PathBuf, StoreError> {
-        self.ensure_unretired_intent(intent_id)?;
-        let (target_path, expected): (String, Option<Vec<u8>>) = self.conn.query_row(
-            "SELECT target_path, pre_image_hash FROM write_intents WHERE intent_id = ?1",
-            [intent_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if Path::new(&target_path) != target {
-            return Err(StoreError::BadIntent {
-                intent_id,
-                detail: "delete target differs from journaled target".to_owned(),
-            });
-        }
-        let expected = expected.ok_or_else(|| StoreError::BadIntent {
-            intent_id,
-            detail: "deletion intent has no expected pre-image".to_owned(),
-        })?;
-        let expected = blob32(expected);
-        let qpath = self.quarantine_displaced(intent_id, target, quarantine_dir)?;
-        let actual = *blake3::hash(&std::fs::read(&qpath).map_err(|source| StoreError::Io {
-            path: qpath.clone(),
-            source,
-        })?)
-        .as_bytes();
-        if actual != expected {
-            if target.exists() {
-                return Err(StoreError::DeleteConflict {
-                    intent_id,
-                    expected,
-                    actual,
-                });
-            }
-            std::fs::rename(&qpath, target).map_err(|source| StoreError::Io {
-                path: target.to_path_buf(),
-                source,
-            })?;
-            self.conn.execute(
-                "UPDATE displaced SET restored = 1 WHERE intent_id = ?1 AND quarantine_path = ?2",
-                rusqlite::params![intent_id, qpath.to_string_lossy()],
-            )?;
-            if let Some(parent) = target.parent() {
-                crate::cas::manifest::fsync_dir(parent)?;
-            }
-            return Err(StoreError::DeleteConflict {
-                intent_id,
-                expected,
-                actual,
-            });
-        }
-        self.retire_intent(intent_id)?;
-        Ok(qpath)
-    }
-
     /// Execute or resume the portable no-replace replacement state machine.
     /// Every move preserves a destination that appeared after the basis CAS;
     /// the exact pre-image and any raced target remain journal-addressable.
@@ -549,39 +488,6 @@ impl Store {
         filesystem: &mut dyn JournalFilesystem,
     ) -> Result<CreationRecoveryOutcome, StoreError> {
         self.reconcile_creation_with(intent_id, filesystem)
-    }
-
-    /// Execute or resume §14's Windows rename-aside fallback.
-    ///
-    /// `MoveFileExW` is used without `MOVEFILE_REPLACE_EXISTING` for all
-    /// three possible moves: target to aside/conflict, proposed temp to the
-    /// canonical target, and verified pre-image restoration. If a target
-    /// reappears in either absence window, this method stops with all names
-    /// retained by the unretired journal rather than overwriting it.
-    #[cfg(windows)]
-    pub fn publish_windows_rename_aside(
-        &mut self,
-        intent_id: i64,
-        quarantine_dir: &Path,
-    ) -> Result<RenameAsideOutcome, StoreError> {
-        self.publish_journaled_replacement(intent_id, quarantine_dir)
-    }
-
-    #[cfg(windows)]
-    pub fn reconcile_windows_deletion(
-        &mut self,
-        intent_id: i64,
-        quarantine_dir: &Path,
-    ) -> Result<DeletionRecoveryOutcome, StoreError> {
-        self.reconcile_journaled_deletion(intent_id, quarantine_dir)
-    }
-
-    #[cfg(windows)]
-    pub fn reconcile_windows_creation(
-        &mut self,
-        intent_id: i64,
-    ) -> Result<CreationRecoveryOutcome, StoreError> {
-        self.reconcile_journaled_creation(intent_id)
     }
 
     fn reconcile_deletion_with<F: JournalFilesystem + ?Sized>(
