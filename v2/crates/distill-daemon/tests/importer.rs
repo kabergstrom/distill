@@ -12,8 +12,8 @@ use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, Author
 use distill_daemon::scanner::AssetRoot;
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    AuthoringBackend, AuthoringValue, Commit, ImportRequest, InputVersion, LoadPolicyEntry,
-    TargetDefinition, TargetDefinitionHash,
+    AuthoringBackend, AuthoringValue, Commit, ImportRequest, InputVersion, TargetDefinition,
+    TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
 use distill_store::pipeline::{
@@ -108,18 +108,8 @@ fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) 
 }
 
 fn target() -> TargetDefinition {
-    let rows = distill_schema::bootstrap_gen_v1::consumer_bootstrap_authority_v1()
+    TargetDefinition::canonical("dev", TargetDefinitionHash([4; 32]), Vec::new(), Vec::new())
         .unwrap()
-        .rows()
-        .to_vec();
-    let policy = rows
-        .iter()
-        .map(|row| LoadPolicyEntry {
-            type_uuid: row.type_uuid,
-            build_only: row.build_only,
-        })
-        .collect();
-    TargetDefinition::canonical("dev", TargetDefinitionHash([4; 32]), rows, policy).unwrap()
 }
 
 fn object<const N: usize>(fields: [(&str, AuthoredValue); N]) -> AuthoredValue {

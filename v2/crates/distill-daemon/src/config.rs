@@ -6,9 +6,8 @@ use std::path::{Component, Path, PathBuf};
 
 use distill_build::keys::target_definition_hash;
 use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
-use distill_core::attestation::CompiledTypeTable;
-use distill_rpc::{LoadPolicyEntry, TargetDefinition, TargetDefinitionHash};
-use distill_schema::ngp_schema::CompilationIdentity;
+use distill_rpc::{TargetDefinition, TargetDefinitionHash};
+use distill_schema::{ngp_schema::CompilationIdentity, ProjectSchemaAuthority};
 use distill_store::config::{parse_byte_size, ConfigValidationError};
 use distill_store::state::{ConfigurationPathKey, DscpV1, OwnedPathKind, OwnedPathSide};
 use distill_store::StoreConfig;
@@ -383,22 +382,13 @@ impl DaemonConfig {
     /// explicitly named §22 gate; it cannot substitute a caller hash here.
     pub fn target_definitions(
         &self,
-        compiled: &CompiledTypeTable,
         identity: &CompilationIdentity,
     ) -> Result<Vec<TargetDefinition>, DaemonConfigError> {
         self.build_targets(identity)?
             .iter()
             .map(|(name, target)| {
                 let definition_hash = TargetDefinitionHash(target_definition_hash(target, &[]));
-                let policy = compiled
-                    .rows
-                    .iter()
-                    .map(|row| LoadPolicyEntry {
-                        type_uuid: row.type_uuid,
-                        build_only: row.build_only,
-                    })
-                    .collect();
-                TargetDefinition::canonical(name, definition_hash, compiled.rows.clone(), policy)
+                TargetDefinition::canonical(name, definition_hash, Vec::new(), Vec::new())
                     .map_err(|error| DaemonConfigError::Target(format!("{name}: {error}")))
             })
             .collect()
@@ -406,11 +396,9 @@ impl DaemonConfig {
 
     pub fn candidate_requirements(
         &self,
-        compiled: &CompiledTypeTable,
-        identity: &CompilationIdentity,
-        source_hashes: &BTreeMap<String, String>,
+        authority: &ProjectSchemaAuthority,
     ) -> Result<CandidateRequirements, DaemonConfigError> {
-        let rpc_targets = self.target_definitions(compiled, identity)?;
+        let rpc_targets = self.target_definitions(authority.identity())?;
         let targets = rpc_targets
             .iter()
             .map(|target| PipelineTarget {
@@ -420,12 +408,10 @@ impl DaemonConfig {
             .collect();
         Ok(CandidateRequirements {
             module_abi: host_module_abi_identity(),
-            source_hashes: source_hashes.clone(),
-            schema_registry: compiled
-                .rows
-                .iter()
-                .map(|row| (row.type_uuid, row.logical_hash))
-                .collect(),
+            source_hashes: authority.schema().source_hashes.clone(),
+            schema_registry: authority
+                .logical_registry()
+                .map_err(|error| DaemonConfigError::Target(error.to_string()))?,
             targets,
         })
     }

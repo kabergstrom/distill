@@ -1104,11 +1104,7 @@ fn try_refine_published_tag_index(
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
 ) -> Result<PublishedTagIndex, String> {
-    let tag_epoch = authority
-        .compiled_table()
-        .tag_annotation_epoch()
-        .map_err(|error| format!("cannot derive DSTA for tag publication: {error}"))?
-        .0;
+    let tag_epoch = authority.source_hash();
     let (store_instance, basis, assets, tools, execution_root) = {
         let store = store_handle
             .lock()

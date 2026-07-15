@@ -7,9 +7,6 @@ use tokio::sync::Notify;
 use unicode_normalization::UnicodeNormalization;
 
 use distill_json::AuthoredValue;
-use distill_schema::bootstrap_gen_v1::{
-    consumer_bootstrap_authority_v1, ConsumerBootstrapAuthorityV1,
-};
 use distill_schema::ngp_schema::{verify_snapshot, PrimitiveKind, SchemaNode};
 
 use crate::attestation::validate_attestation_shape;
@@ -342,7 +339,6 @@ impl fmt::Debug for DeltaStream {
 }
 
 struct ServerState {
-    bootstrap_authority: &'static ConsumerBootstrapAuthorityV1,
     instance: StoreInstanceId,
     protocol_epoch: u32,
     current: InputVersion,
@@ -553,8 +549,6 @@ impl Server {
         targets: Vec<TargetDefinition>,
         authoring_backend: Arc<dyn AuthoringBackend>,
     ) -> Result<Self, AttestationShapeError> {
-        let bootstrap_authority = consumer_bootstrap_authority_v1()
-            .map_err(|error| AttestationShapeError::BootstrapAuthorityUnavailable(error.0))?;
         let mut target_map = BTreeMap::new();
         for target in targets {
             validate_attestation_shape(
@@ -563,12 +557,6 @@ impl Server {
                 target.load_policy(),
                 target.policy_digest(),
             )?;
-            bootstrap_authority
-                .validate_boundary_rows(
-                    target.compiled_registry(),
-                    distill_core::attestation::BundleFormatVersion::V1,
-                )
-                .map_err(AttestationShapeError::Bootstrap)?;
             let name = target.name().to_owned();
             if target_map
                 .insert(
@@ -602,7 +590,6 @@ impl Server {
         views.insert(version, view);
         Ok(Self {
             inner: Arc::new(Mutex::new(ServerState {
-                bootstrap_authority,
                 instance,
                 protocol_epoch: PROTOCOL_VERSION,
                 current: version,
@@ -974,12 +961,6 @@ impl Server {
         replacements: Vec<TargetDefinition>,
         publish: impl FnOnce() -> Result<Commit, String>,
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        let bootstrap_authority = consumer_bootstrap_authority_v1().map_err(|error| {
-            CoordinatedCommitError::Publication(format!(
-                "bootstrap authority unavailable: {}",
-                error.0
-            ))
-        })?;
         let mut replacement_map = BTreeMap::new();
         for replacement in replacements {
             validate_attestation_shape(
@@ -989,13 +970,6 @@ impl Server {
                 replacement.policy_digest(),
             )
             .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
-            bootstrap_authority
-                .validate_boundary_rows(
-                    replacement.compiled_registry(),
-                    distill_core::attestation::BundleFormatVersion::V1,
-                )
-                .map_err(AttestationShapeError::Bootstrap)
-                .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
             let name = replacement.name().to_owned();
             if replacement_map.insert(name.clone(), replacement).is_some() {
                 return Err(CoordinatedCommitError::Publication(
@@ -1046,14 +1020,6 @@ impl Server {
             replacement.policy_digest(),
         )
         .map_err(AdminError::InvalidTargetAttestation)?;
-        state
-            .bootstrap_authority
-            .validate_boundary_rows(
-                replacement.compiled_registry(),
-                distill_core::attestation::BundleFormatVersion::V1,
-            )
-            .map_err(AttestationShapeError::Bootstrap)
-            .map_err(AdminError::InvalidTargetAttestation)?;
         let name = replacement.name().to_owned();
         let runtime = state
             .targets
@@ -1662,18 +1628,17 @@ fn validate_manifest_repair_bundle(bytes: &[u8]) -> Result<(), LineageRepairInva
             "SchemaLineageManifest entry must use format-v1 bootstrap lineage",
         ));
     }
-    let authority = consumer_bootstrap_authority_v1().map_err(|error| {
-        invalid(
-            LineageRepairInvalidCode::InvalidLineage,
-            &format!("bootstrap authority unavailable: {}", error.0),
-        )
-    })?;
+    let authority =
+        distill_core::attestation::bootstrap_control_logical_registry_v1().map_err(|error| {
+            invalid(
+                LineageRepairInvalidCode::InvalidLineage,
+                &format!("bootstrap authority unavailable: {error}"),
+            )
+        })?;
     let expected = authority
-        .rows()
-        .iter()
-        .find(|row| row.type_uuid == distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID)
-        .expect("sealed bootstrap table contains lineage manifest");
-    if manifest.schema_hash != expected.logical_hash {
+        .get(&distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID)
+        .expect("logical bootstrap authority contains lineage manifest");
+    if manifest.schema_hash != *expected {
         return Err(invalid(
             LineageRepairInvalidCode::InvalidLineage,
             "SchemaLineageManifest entry has the wrong sealed logical schema",

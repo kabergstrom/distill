@@ -1687,7 +1687,6 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
                 },
                 candidate: PipelineCandidateIdentity {
                     dylib_hash: [42; 32],
-                    compiled_types: CompiledAttestationDigest([43; 32]),
                     target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![])
                         .unwrap(),
                 },
@@ -2451,7 +2450,7 @@ fn typed_pipeline_diagnostic_codecs_reject_empty_and_noncanonical_tables() {
         cursor.set_logical_hash(&[3; 32]);
         let mut candidate = root.reborrow().init_candidate();
         candidate.set_dylib_hash(&[4; 32]);
-        candidate.set_compiled_types(&[5; 32]);
+        candidate.set_reserved_compiled_types(());
         candidate.init_target_rows(0);
         let mut mismatch = root.init_mismatches(1).get(0);
         mismatch.reborrow().init_type_uuid().set_bytes(&[7; 16]);

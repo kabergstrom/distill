@@ -1,4 +1,3 @@
-use distill_asset::AssetType;
 use distill_core::attestation::BOOTSTRAP_CONTROL_COUNT;
 use distill_core::id::TypeUuid;
 use distill_json::AuthoredValue;
@@ -179,29 +178,19 @@ fn tagged_schema() -> Schema {
 }
 
 #[test]
-fn schema_projection_matches_the_independently_compiled_descriptor() {
+fn schema_projection_produces_logical_registry_and_authenticated_wire() {
     let authority = ProjectSchemaAuthority::from_schema(project_schema(), [7; 32]).unwrap();
-    let observed = authority
-        .compiled_table()
-        .rows
-        .iter()
-        .find(|row| row.type_uuid == PROJECT_UUID)
-        .unwrap();
-
-    assert_eq!(observed, ProjectRow::descriptor().compiled_type);
-    assert_eq!(
-        authority.compiled_table().rows.len(),
-        BOOTSTRAP_CONTROL_COUNT + 1
-    );
     assert_eq!(authority.source_hash(), [7; 32]);
 
     let project = authority.project_type(PROJECT_UUID).unwrap();
     assert_eq!(project.schema_type, SchemaTypeId(0));
-    assert_eq!(project.logical_hash, observed.logical_hash);
     assert_eq!(
         project.logical_schema,
         *authority.registry().current(PROJECT_UUID).unwrap().0
     );
+    let logical_registry = authority.logical_registry().unwrap();
+    assert_eq!(logical_registry[&PROJECT_UUID], project.logical_hash);
+    assert_eq!(logical_registry.len(), BOOTSTRAP_CONTROL_COUNT + 1);
     assert_eq!(dswl_hash(&project.wire).unwrap(), project.layout_hash);
     let decoded = decode_dswl(&project.dswl_bytes).unwrap();
     assert_eq!(dswl_hash(&decoded).unwrap(), project.layout_hash);

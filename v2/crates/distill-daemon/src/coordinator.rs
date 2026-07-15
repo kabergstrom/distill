@@ -658,11 +658,7 @@ impl DaemonCoordinator {
         };
         let filesystem = Arc::new(Mutex::new(Some(filesystem)));
         let captured = Arc::clone(&filesystem);
-        let tag_epoch = schema_authority
-            .compiled_table()
-            .tag_annotation_epoch()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
-            .0;
+        let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
@@ -824,11 +820,7 @@ impl DaemonCoordinator {
                 "pipeline publication requires project schema authority".to_owned(),
             )
         })?;
-        let tag_epoch = authority
-            .compiled_table()
-            .tag_annotation_epoch()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
-            .0;
+        let tag_epoch = authority.source_hash();
         let asset_bundles = lock_store(&store)
             .all_asset_bundles()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
@@ -1008,8 +1000,7 @@ impl DaemonCoordinator {
         let authority = self.schema_authority();
         let tag_epoch = authority
             .as_ref()
-            .and_then(|authority| authority.compiled_table().tag_annotation_epoch().ok())
-            .map_or([0; 32], |epoch| epoch.0);
+            .map_or([0; 32], |authority| authority.source_hash());
         let pipeline = self.pipeline_snapshot();
         let build_targets = self
             .build_targets
@@ -1794,8 +1785,7 @@ pub(crate) fn publish_current_scan(
     let authority = coordinator.and_then(DaemonCoordinator::schema_authority);
     let tag_epoch = authority
         .as_ref()
-        .and_then(|authority| authority.compiled_table().tag_annotation_epoch().ok())
-        .map_or([0; 32], |epoch| epoch.0);
+        .map_or([0; 32], |authority| authority.source_hash());
     let fallback_bundles = lock_store(store)
         .all_asset_bundles()
         .map_err(|error| error.to_string())?;

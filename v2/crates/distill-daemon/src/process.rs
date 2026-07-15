@@ -52,8 +52,7 @@ impl DaemonProcess {
         config: DaemonConfig,
         authority: ProjectSchemaAuthority,
     ) -> Result<Self, DaemonProcessError> {
-        let targets =
-            config.target_definitions(authority.compiled_table(), authority.identity())?;
+        let targets = config.target_definitions(authority.identity())?;
         let coordinator = Arc::new(DaemonCoordinator::open(
             config.store_config(),
             config.asset_roots(),
@@ -402,14 +401,10 @@ impl ConfigWatch {
             Ok(authority) if input_changed => {
                 let authority = Arc::new(authority);
                 let requirements = candidate
-                    .candidate_requirements(
-                        authority.compiled_table(),
-                        authority.identity(),
-                        &authority.schema().source_hashes,
-                    )
+                    .candidate_requirements(&authority)
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
                 let targets = candidate
-                    .target_definitions(authority.compiled_table(), authority.identity())
+                    .target_definitions(authority.identity())
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
                 let build_targets = candidate
                     .build_targets(authority.identity())
