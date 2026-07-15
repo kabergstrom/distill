@@ -4,7 +4,6 @@
 //! folds, keys, validation, and trace revalidation.
 
 pub mod artifact_encode;
-pub mod cache;
 pub mod codegen;
 pub mod dslf;
 pub mod import;

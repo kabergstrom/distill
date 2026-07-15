@@ -5,8 +5,6 @@ use distill_build::query::AssetQuery;
 use distill_build::trace::*;
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash, LogicalHash, TypeUuid};
 use distill_migrate::FieldPath;
-use distill_schema::ngp_schema::{LogicalSchema, SchemaNode};
-use distill_store::pipeline::{AcceptedSchemaEpoch, LineageStamp};
 
 #[derive(Default)]
 struct Snapshot {
@@ -300,38 +298,6 @@ fn stable_failure_heals_when_observed_outcome_changes() {
         .reads
         .insert(asset, Observed::Ok(ContentHash([1; 32])));
     assert!(!revalidate(&trace, &snapshot));
-}
-
-#[test]
-fn failure_cause_grammar_is_checked() {
-    let local = StableFailureFingerprint::Local {
-        class: LocalFailureClass::Validator,
-        detail: [7; 32],
-    };
-    assert!(FailureRecord {
-        trace: vec![],
-        cause: FailureCause::Local(local)
-    }
-    .validate()
-    .is_ok());
-    assert!(FailureRecord {
-        trace: vec![],
-        cause: FailureCause::Op
-    }
-    .validate()
-    .is_err());
-    let op = TraceOp::Tool {
-        id: "shaderc".into(),
-        observed: Observed::Err(StableFailureFingerprint::MissingCapability {
-            key: CapabilityKey::Tool("shaderc".into()),
-        }),
-    };
-    assert!(FailureRecord {
-        trace: vec![op],
-        cause: FailureCause::Op
-    }
-    .validate()
-    .is_ok());
 }
 
 #[test]
@@ -632,128 +598,6 @@ fn successful_and_failed_control_reads_revalidate_and_heal() {
 }
 
 #[test]
-fn unreadable_migration_edge_is_terminal_and_never_an_empty_result() {
-    let asset = AssetUuid([15; 16]);
-    let subject = ControlSubject::Migration(asset);
-    let mut basis = AttemptedControlBasis::new();
-    assert_eq!(
-        basis.query(migration_query(), Observed::Ok([16; 32])),
-        Ok([16; 32])
-    );
-
-    let unreadable = control_failure_fingerprint(
-        ControlFailureSubject::Read(subject.clone()),
-        ControlFailureCode::Malformed,
-        Vec::new(),
-    )
-    .unwrap();
-    assert!(matches!(
-        basis.read(subject.clone(), Observed::Err(unreadable)),
-        Err(AttemptedControlBasisError::ObservedFailure(_))
-    ));
-    assert!(basis.is_stopped());
-    assert!(basis.trace().last().is_some_and(TraceOp::failed));
-    assert_eq!(
-        basis.read(
-            subject,
-            Observed::Ok(DecodedControlValue {
-                identity: ControlValueHash([17; 32]),
-                value: ControlValue::PackDefinition(PackDefinitionControlValue {
-                    roots: vec![],
-                    target: "unused-after-hard-stop".into(),
-                    zstd_level: 0,
-                    include_path_table: false,
-                }),
-            }),
-        ),
-        Err(AttemptedControlBasisError::HardStopped)
-    );
-    let trace = basis.into_trace().unwrap();
-    assert_eq!(
-        trace.len(),
-        2,
-        "the failed read remains in the attempted basis"
-    );
-}
-
-#[test]
-fn migration_control_reads_return_the_closed_fully_decoded_value() {
-    let asset = AssetUuid([31; 16]);
-    let from = LogicalHash([32; 32]);
-    let to = LogicalHash([33; 32]);
-    let lineage = |digest| LineageStamp {
-        epochs: vec![AcceptedSchemaEpoch {
-            digest,
-            forward_parent: None,
-        }],
-        cursor: 0,
-        chain: [34; 32],
-    };
-    let value = MigrationControlValue {
-        asset,
-        target_type_uuid: TypeUuid([35; 16]),
-        from_hash: from,
-        to_hash: to,
-        from_schema: LogicalSchema {
-            root: SchemaNode::Unit,
-        },
-        to_schema: LogicalSchema {
-            root: SchemaNode::String,
-        },
-        from_lineage: lineage(from),
-        to_lineage: lineage(to),
-        kind: MigrationControlKind::Function {
-            key: "upgrade".into(),
-        },
-    };
-    let mut basis = AttemptedControlBasis::new();
-    basis
-        .query(migration_query(), Observed::Ok([36; 32]))
-        .unwrap();
-    assert_eq!(
-        basis
-            .read(
-                ControlSubject::Migration(asset),
-                Observed::Ok(DecodedControlValue {
-                    identity: ControlValueHash([37; 32]),
-                    value: ControlValue::Migration(Box::new(value.clone())),
-                }),
-            )
-            .unwrap(),
-        ControlValue::Migration(Box::new(value))
-    );
-    assert_eq!(basis.trace().len(), 2);
-}
-
-#[test]
-fn a_control_value_with_the_wrong_brand_is_a_terminal_typed_failure() {
-    let asset = AssetUuid([41; 16]);
-    let mut basis = AttemptedControlBasis::new();
-    basis
-        .query(migration_query(), Observed::Ok([42; 32]))
-        .unwrap();
-    let error = basis
-        .read(
-            ControlSubject::Migration(asset),
-            Observed::Ok(DecodedControlValue {
-                identity: ControlValueHash([43; 32]),
-                value: ControlValue::PackDefinition(PackDefinitionControlValue {
-                    roots: vec![],
-                    target: "wrong-brand".into(),
-                    zstd_level: 0,
-                    include_path_table: false,
-                }),
-            }),
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        AttemptedControlBasisError::ObservedFailure(StableFailureFingerprint::Control(_))
-    ));
-    assert!(basis.is_stopped());
-}
-
-#[test]
 fn directory_rule_enumeration_is_distinct_control_trace_data() {
     let empty = [0; 32];
     let migrations = TraceOp::Control {
@@ -795,64 +639,4 @@ fn control_failure_entry_cardinality_is_closed_by_code() {
             code: ControlFailureCode::Missing,
         })
     );
-}
-
-#[test]
-fn load_inputs_preserves_one_interleaved_trace_and_terminal_failure_prefix() {
-    let asset = AssetUuid([51; 16]);
-    let subject = ControlSubject::Migration(asset);
-    let mut inputs = LoadInputs::new(7);
-    inputs
-        .record(TraceOp::Control {
-            query: migration_query(),
-            observed: Observed::Ok([52; 32]),
-        })
-        .unwrap();
-    inputs
-        .record(TraceOp::ControlRead {
-            subject: subject.clone(),
-            observed: Observed::Ok(ControlValueHash([53; 32])),
-        })
-        .unwrap();
-    inputs
-        .record(TraceOp::Capability {
-            key: CapabilityKey::MigrationFn("edge".into()),
-            observed: Observed::Ok([54; 32]),
-        })
-        .unwrap();
-    inputs
-        .record(TraceOp::Control {
-            query: ControlQuery::DirectoryImportRuleSet,
-            observed: Observed::Ok([55; 32]),
-        })
-        .unwrap();
-    assert!(matches!(inputs.trace()[0], TraceOp::Control { .. }));
-    assert!(matches!(inputs.trace()[1], TraceOp::ControlRead { .. }));
-    assert!(matches!(inputs.trace()[2], TraceOp::Capability { .. }));
-    assert!(matches!(inputs.trace()[3], TraceOp::Control { .. }));
-    assert_eq!(inputs.control_queries().count(), 2);
-    assert_eq!(inputs.control_reads().count(), 1);
-    assert_eq!(inputs.capabilities().count(), 1);
-    inputs.validate().unwrap();
-
-    let failure = control_failure_fingerprint(
-        ControlFailureSubject::Read(subject.clone()),
-        ControlFailureCode::Malformed,
-        Vec::new(),
-    )
-    .unwrap();
-    inputs
-        .record(TraceOp::ControlRead {
-            subject,
-            observed: Observed::Err(failure),
-        })
-        .unwrap();
-    assert_eq!(
-        inputs.record(TraceOp::Capability {
-            key: CapabilityKey::DefaultTable(TypeUuid([56; 16])),
-            observed: Observed::Ok([57; 32]),
-        }),
-        Err(LoadInputsError::TerminalFailureAlreadyRecorded)
-    );
-    inputs.validate().unwrap();
 }

@@ -378,12 +378,6 @@ pub fn control_failure_fingerprint(
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum FailureCause {
-    Op,
-    Local(StableFailureFingerprint),
-}
-
 /// Construct a local stable fingerprint from the closed DSLF v1 grammar.
 /// Human presentation text and optional catch-all fact bags are impossible.
 pub fn local_failure_fingerprint(facts: &DslfV1) -> Result<StableFailureFingerprint, DslfError> {
@@ -440,79 +434,6 @@ pub enum TraceOp {
         observed: Observed<ControlValueHash>,
     },
 }
-
-/// The exact consumed inputs of one `load_current` attempt. The single trace
-/// sequence is authoritative; typed slices are derived views so query, read,
-/// and capability interleaving can never be reconstructed incorrectly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadInputs {
-    pub migration_bundles: Vec<(BundleUuid, [u8; 32])>,
-    trace: Vec<TraceOp>,
-    pub planner_version: u32,
-    pub dylib_hash: Option<[u8; 32]>,
-    stopped: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadInputsError {
-    TerminalFailureAlreadyRecorded,
-}
-
-impl LoadInputs {
-    pub fn new(planner_version: u32) -> Self {
-        Self {
-            migration_bundles: Vec::new(),
-            trace: Vec::new(),
-            planner_version,
-            dylib_hash: None,
-            stopped: false,
-        }
-    }
-
-    pub fn record(&mut self, op: TraceOp) -> Result<(), LoadInputsError> {
-        if self.stopped {
-            return Err(LoadInputsError::TerminalFailureAlreadyRecorded);
-        }
-        self.stopped = op.failed();
-        self.trace.push(op);
-        Ok(())
-    }
-
-    pub fn record_pipeline_code(&mut self, dylib_hash: [u8; 32]) {
-        self.dylib_hash = Some(dylib_hash);
-    }
-
-    pub fn trace(&self) -> &[TraceOp] {
-        &self.trace
-    }
-
-    pub fn control_queries(&self) -> impl Iterator<Item = &TraceOp> {
-        self.trace
-            .iter()
-            .filter(|op| matches!(op, TraceOp::Control { .. }))
-    }
-
-    pub fn control_reads(&self) -> impl Iterator<Item = &TraceOp> {
-        self.trace
-            .iter()
-            .filter(|op| matches!(op, TraceOp::ControlRead { .. }))
-    }
-
-    pub fn capabilities(&self) -> impl Iterator<Item = &TraceOp> {
-        self.trace
-            .iter()
-            .filter(|op| matches!(op, TraceOp::Capability { .. }))
-    }
-
-    pub fn validate(&self) -> Result<(), LoadInputsError> {
-        let first_failure = self.trace.iter().position(TraceOp::failed);
-        if first_failure.is_some_and(|index| index + 1 != self.trace.len()) {
-            return Err(LoadInputsError::TerminalFailureAlreadyRecorded);
-        }
-        Ok(())
-    }
-}
-
 impl TraceOp {
     pub fn failed(&self) -> bool {
         match self {
@@ -529,117 +450,6 @@ impl TraceOp {
         }
     }
 }
-
-/// Construction errors for a coordinator's focused control attempted basis.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttemptedControlBasisError {
-    QueryRequired,
-    QueryAlreadyRecorded,
-    HardStopped,
-    ObservedFailure(StableFailureFingerprint),
-}
-
-/// A control operation sequence that cannot silently discard failed reads.
-/// Exactly one enumeration/query begins the attempt; every decoded read is
-/// appended through `read`, and the first stable failure is retained as the
-/// terminal op and hard-stops the attempt.
-#[derive(Debug, Default)]
-pub struct AttemptedControlBasis {
-    trace: Vec<TraceOp>,
-    has_query: bool,
-    stopped: bool,
-}
-
-impl AttemptedControlBasis {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn query(
-        &mut self,
-        query: ControlQuery,
-        observed: Observed<[u8; 32]>,
-    ) -> Result<[u8; 32], AttemptedControlBasisError> {
-        if self.stopped {
-            return Err(AttemptedControlBasisError::HardStopped);
-        }
-        if self.has_query {
-            return Err(AttemptedControlBasisError::QueryAlreadyRecorded);
-        }
-        self.has_query = true;
-        let result = match &observed {
-            Observed::Ok(hash) => Ok(*hash),
-            Observed::Err(failure) => {
-                self.stopped = true;
-                Err(AttemptedControlBasisError::ObservedFailure(failure.clone()))
-            }
-        };
-        self.trace.push(TraceOp::Control { query, observed });
-        result
-    }
-
-    pub fn read(
-        &mut self,
-        subject: ControlSubject,
-        observed: Observed<DecodedControlValue>,
-    ) -> Result<ControlValue, AttemptedControlBasisError> {
-        if !self.has_query {
-            return Err(AttemptedControlBasisError::QueryRequired);
-        }
-        if self.stopped {
-            return Err(AttemptedControlBasisError::HardStopped);
-        }
-
-        let (trace_observed, result) = match observed {
-            Observed::Ok(decoded) if decoded.value.matches_subject(&subject) => {
-                (Observed::Ok(decoded.identity), Ok(decoded.value))
-            }
-            Observed::Ok(_) => {
-                let failure = control_failure_fingerprint(
-                    ControlFailureSubject::Read(subject.clone()),
-                    ControlFailureCode::WrongBuiltInType,
-                    Vec::new(),
-                )
-                .expect("WrongBuiltInType carries no entry identities");
-                (
-                    Observed::Err(failure.clone()),
-                    Err(AttemptedControlBasisError::ObservedFailure(failure)),
-                )
-            }
-            Observed::Err(failure) => (
-                Observed::Err(failure.clone()),
-                Err(AttemptedControlBasisError::ObservedFailure(failure)),
-            ),
-        };
-        if result.is_err() {
-            self.stopped = true;
-        }
-        self.trace.push(TraceOp::ControlRead {
-            subject,
-            observed: trace_observed,
-        });
-        result
-    }
-
-    pub fn trace(&self) -> &[TraceOp] {
-        &self.trace
-    }
-
-    pub fn is_stopped(&self) -> bool {
-        self.stopped
-    }
-
-    /// Finalize both successful and failed attempts. A failed attempt still
-    /// returns its complete terminal-failure trace; only omission of the
-    /// required query is rejected.
-    pub fn into_trace(self) -> Result<Vec<TraceOp>, AttemptedControlBasisError> {
-        if !self.has_query {
-            return Err(AttemptedControlBasisError::QueryRequired);
-        }
-        Ok(self.trace)
-    }
-}
-
 pub trait TraceSource {
     fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>>;
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash>;
@@ -670,33 +480,6 @@ pub fn revalidate(trace: &[TraceOp], source: &impl TraceSource) -> bool {
         TraceOp::Control { query, observed } => &source.control(query) == observed,
         TraceOp::ControlRead { subject, observed } => &source.control_read(subject) == observed,
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailureRecord {
-    pub trace: Vec<TraceOp>,
-    pub cause: FailureCause,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureRecordError {
-    MissingTerminalOp,
-    TerminalOpDidNotFail,
-    LocalCauseIsNotLocal,
-}
-
-impl FailureRecord {
-    pub fn validate(&self) -> Result<(), FailureRecordError> {
-        match &self.cause {
-            FailureCause::Op => match self.trace.last() {
-                None => Err(FailureRecordError::MissingTerminalOp),
-                Some(op) if !op.failed() => Err(FailureRecordError::TerminalOpDidNotFail),
-                Some(_) => Ok(()),
-            },
-            FailureCause::Local(StableFailureFingerprint::Local { .. }) => Ok(()),
-            FailureCause::Local(_) => Err(FailureRecordError::LocalCauseIsNotLocal),
-        }
-    }
 }
 
 pub fn trace_digest(trace: &[TraceOp]) -> [u8; 32] {
