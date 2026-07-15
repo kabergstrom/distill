@@ -1965,6 +1965,43 @@ fn old_history_returns_resync_marker_and_future_cursor_is_typed_failure() {
 }
 
 #[test]
+fn slow_subscription_queue_is_bounded_by_a_resync_marker() {
+    let server = server_with(&[(1, false)]);
+    let hub = connect(&server, &[(1, false)]);
+    let watched = asset_id(1);
+    let install = hub
+        .subscribe(InputVersion(0), vec![watched], vec![])
+        .success()
+        .unwrap();
+    assert!(matches!(
+        install.deltas.next(),
+        Some(StreamEvent::InitialDelta { .. })
+    ));
+
+    for version in 1..=1025 {
+        commit_one(
+            &server,
+            set_asset(
+                watched,
+                StoredResolve::Failed {
+                    error: version.to_string(),
+                },
+                AssetDeltaState::Changed,
+            ),
+        );
+    }
+
+    assert!(matches!(
+        install.deltas.next(),
+        Some(StreamEvent::ResyncRequired {
+            oldest_available: InputVersion(1025),
+            ..
+        })
+    ));
+    assert!(install.deltas.next().is_none());
+}
+
+#[test]
 fn restart_required_names_sorted_unique_keys_without_advancing_version() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);

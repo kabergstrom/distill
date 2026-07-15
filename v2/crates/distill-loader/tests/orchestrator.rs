@@ -7,8 +7,8 @@ use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
     LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, PathResolveResult, PendingState,
-    PendingToken, ReqId, ResolveResult, RuntimeTarget, StorageError, TargetBindingState,
-    UpdateResult,
+    PendingToken, RegistrationError, ReqId, ResolveResult, RuntimeTarget, StorageError,
+    TargetBindingState, UpdateResult,
 };
 use distill_rpc::ServedLoadEdge;
 use distill_store::state::{InputVersion, StoreInstanceId};
@@ -394,6 +394,19 @@ fn register_ref_placeholder(loader: &mut Loader<MockIo>, epoch: u64) {
             distill_asset::placeholder!(RefPlaceholder, RefPlaceholder),
         )
         .unwrap();
+}
+
+#[test]
+fn successor_registration_cannot_overwrite_a_live_descriptor() {
+    let mut loader = Loader::new(mock_io());
+    let first = ModuleEpochToken::new(1);
+    register(&mut loader, 1, &first);
+    let second = ModuleEpochToken::new(2);
+
+    assert_eq!(
+        loader.register_types(GameModuleEpoch(2), second, [7; 32], &[A::descriptor()],),
+        Err(RegistrationError::DuplicateType(A::TYPE_UUID)),
+    );
 }
 
 fn resolve(loader: &mut Loader<MockIo>, asset_uuid: AssetUuid, hash: ContentHash) {

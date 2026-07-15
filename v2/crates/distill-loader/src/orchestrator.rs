@@ -339,6 +339,9 @@ impl<I: LoaderIO> Loader<I> {
             if !seen.insert(descriptor.type_uuid) {
                 return Err(RegistrationError::DuplicateType(descriptor.type_uuid));
             }
+            if self.descriptors.contains_key(&descriptor.type_uuid) {
+                return Err(RegistrationError::DuplicateType(descriptor.type_uuid));
+            }
             let size = u32::try_from(descriptor.size).map_err(|_| {
                 RegistrationError::InvalidDescriptor {
                     type_uuid: descriptor.type_uuid,

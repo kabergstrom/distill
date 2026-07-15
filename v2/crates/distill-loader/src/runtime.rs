@@ -156,6 +156,8 @@ impl RequestTracker {
             .0
             .checked_add(1)
             .ok_or(RequestError::Exhausted)?;
+        self.outstanding.clear();
+        self.newest.clear();
         Ok(self.connection)
     }
 

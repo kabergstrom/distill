@@ -83,8 +83,6 @@ struct EpochRecord {
     stored: BTreeSet<StoredAdoption>,
     descriptors: usize,
     placeholders: usize,
-    plans: usize,
-    fetches: usize,
 }
 
 #[derive(Debug, Default)]
@@ -113,8 +111,6 @@ impl RuntimeEpochs {
                 stored: BTreeSet::new(),
                 descriptors,
                 placeholders: 0,
-                plans: 0,
-                fetches: 0,
             },
         );
         Ok(())
@@ -161,14 +157,6 @@ impl RuntimeEpochs {
         self.resource(epoch, |record| record.placeholders += 1)
     }
 
-    pub fn record_plan(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
-        self.resource(epoch, |record| record.plans += 1)
-    }
-
-    pub fn record_fetch(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
-        self.resource(epoch, |record| record.fetches += 1)
-    }
-
     fn resource(
         &mut self,
         epoch: GameModuleEpoch,
@@ -185,17 +173,15 @@ impl RuntimeEpochs {
         Ok(())
     }
 
-    /// Fence new work immediately. Plans and in-flight fetches are failed and
-    /// forgotten while module code is still resident; descriptors and
-    /// placeholder thunks stay until all constructed values have been freed.
+    /// Fence new work immediately. Ephemeral fixup plans and fetched bytes do
+    /// not own module code; descriptors and placeholder thunks stay until all
+    /// constructed values have been freed.
     pub fn begin_module_drain(&mut self, epoch: GameModuleEpoch) -> Result<(), RuntimeEpochError> {
         let record = self
             .records
             .get_mut(&epoch)
             .ok_or(RuntimeEpochError::UnknownEpoch(epoch))?;
         record.draining = true;
-        record.plans = 0;
-        record.fetches = 0;
         Ok(())
     }
 
@@ -253,8 +239,6 @@ impl RuntimeEpochs {
                 && record.stored.is_empty()
                 && record.descriptors == 0
                 && record.placeholders == 0
-                && record.plans == 0
-                && record.fetches == 0
         })
     }
 

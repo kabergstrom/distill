@@ -101,6 +101,19 @@ fn manifest_rejects_corruption_and_truncation() {
 }
 
 #[test]
+fn manifest_bounds_authenticated_counts_before_allocating() {
+    let mut bytes = encode_manifest(&sample()).unwrap();
+    let target_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let archive_count = 12 + target_len + 32;
+    bytes[archive_count..archive_count + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let trailer = bytes.len() - 32;
+    let digest = *blake3::hash(&bytes[..trailer]).as_bytes();
+    bytes[trailer..].copy_from_slice(&digest);
+
+    assert_eq!(decode_manifest(&bytes), Err(ManifestError::Truncated));
+}
+
+#[test]
 fn artifact_header_crosscheck_authenticates_identity_and_dependency_assets() {
     let manifest = sample();
     let row = &manifest.assets[0];

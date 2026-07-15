@@ -12,6 +12,8 @@ use distill_schema::ngp_schema::{verify_snapshot, PrimitiveKind, SchemaNode};
 use crate::*;
 
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+const MAX_PENDING_STREAM_EVENTS: usize = 1024;
+const MAX_RETAINED_HISTORY_DELTAS: usize = 4096;
 
 #[derive(Clone)]
 pub struct Server {
@@ -2416,8 +2418,10 @@ impl Snapshot {
                     if let Some(error) = pipeline_failure(&self.view) {
                         outcome = Err(error);
                     }
-                    if let Ok(resolution) = &outcome {
-                        state.build_results.insert(key, resolution.clone());
+                    if key.basis == stamp(&state) {
+                        if let Ok(resolution) = &outcome {
+                            state.build_results.insert(key, resolution.clone());
+                        }
                     }
                     drop(state);
                     let completed = outcome.as_ref().map(|_| ()).map_err(Clone::clone);
@@ -3106,11 +3110,24 @@ fn advance_empty_version(state: &mut ServerState) {
     view.stamp = next_stamp;
     state.current = next;
     state.views.insert(next, Arc::new(view));
+    state.views.retain(|version, _| *version == next);
+    state.build_results.clear();
     state.history.push_back(HistoryDelta {
         stamp: next_stamp,
         assets: Vec::new(),
         paths: Vec::new(),
     });
+    prune_history(state);
+}
+
+fn prune_history(state: &mut ServerState) {
+    while state.history.len() > MAX_RETAINED_HISTORY_DELTAS {
+        let removed = state
+            .history
+            .pop_front()
+            .expect("history is over its bound");
+        state.oldest_available_cursor = removed.stamp.version;
+    }
 }
 
 fn notify_live_delta(state: &mut ServerState, delta: &HistoryDelta) {
@@ -3401,6 +3418,8 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
 
     state.current = next;
     state.views.insert(next, Arc::new(view));
+    state.views.retain(|version, _| *version == next);
+    state.build_results.clear();
     if pipeline_epoch_changed {
         state.pipeline_generation = state
             .pipeline_generation
@@ -3413,6 +3432,7 @@ fn commit_locked(state: &mut ServerState, commit: Commit) -> Result<SnapshotStam
         paths: path_deltas,
     };
     state.history.push_back(delta.clone());
+    prune_history(state);
     if pipeline_epoch_changed {
         notify_all_reconnect(state, ReconnectReason::PipelineEpochChanged);
     } else {
@@ -4210,6 +4230,25 @@ fn lock_connection(connection: &Arc<Mutex<ConnectionState>>) -> MutexGuard<'_, C
 }
 
 fn enqueue_event(connection: &mut ConnectionState, event: StreamEvent) {
+    if connection.queue.len() >= MAX_PENDING_STREAM_EVENTS {
+        let basis = event.basis().clone();
+        let terminal = matches!(
+            event,
+            StreamEvent::Asset {
+                event: AssetEvent::ReconnectRequired { .. },
+                ..
+            } | StreamEvent::ResyncRequired { .. }
+        );
+        connection.queue.clear();
+        if !terminal {
+            connection.queue.push_back(StreamEvent::ResyncRequired {
+                oldest_available: basis.snapshot.version,
+                basis,
+            });
+            connection.notify.notify_one();
+            return;
+        }
+    }
     connection.queue.push_back(event);
     connection.notify.notify_one();
 }

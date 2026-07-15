@@ -40,7 +40,7 @@ fn requests_are_fenced_by_generation_basis_and_connection_epoch() {
     assert_eq!(tracker.reconnect().unwrap(), ConnectionEpoch(2));
     assert_eq!(
         tracker.complete(old_connection, &basis(3)),
-        CompletionDisposition::WrongConnection
+        CompletionDisposition::UnknownOrRetired
     );
 }
 

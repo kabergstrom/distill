@@ -186,10 +186,10 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
     if r.u32()? != PACK_VERSION {
         return Err(ManifestError::Version);
     }
-    let target_len = r.u32()? as usize;
+    let target_len = usize::try_from(r.u32()?).map_err(|_| ManifestError::Truncated)?;
     let target = decode_target(r.take(target_len)?)?;
     let target_def_hash = r.a32()?;
-    let archive_count = r.u32()? as usize;
+    let archive_count = r.bounded_count(36)?;
     let mut archives = Vec::with_capacity(archive_count);
     for _ in 0..archive_count {
         archives.push(ArchiveRef {
@@ -199,13 +199,17 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<PackManifest, ManifestError> {
     }
     check_sorted(&archives, |v| v.generation)?;
 
-    let dir_count = r.u32()? as usize;
+    let dir_count = r.bounded_count(17)?;
     if !(4..=5).contains(&dir_count) {
         return Err(ManifestError::InvalidDirectory);
     }
     let mut dirs = Vec::with_capacity(dir_count);
     for _ in 0..dir_count {
-        dirs.push((r.u8()?, r.u64()? as usize, r.u64()? as usize));
+        dirs.push((
+            r.u8()?,
+            usize::try_from(r.u64()?).map_err(|_| ManifestError::InvalidDirectory)?,
+            usize::try_from(r.u64()?).map_err(|_| ManifestError::InvalidDirectory)?,
+        ));
     }
     let table_start = r.pos;
     let mut expected_kind = 1u8;
@@ -341,12 +345,12 @@ fn encode_paths(rows: &[PathRow]) -> Vec<u8> {
 
 fn decode_assets(bytes: &[u8]) -> Result<Vec<ManifestAssetRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.u32()? as usize;
+    let count = r.bounded_count(52)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let asset_uuid = AssetUuid(r.a16()?);
         let content_hash = ContentHash(r.a32()?);
-        let n = r.u32()? as usize;
+        let n = r.bounded_count(32)?;
         let mut load_deps = Vec::with_capacity(n);
         for _ in 0..n {
             load_deps.push(ManifestLoadEdge {
@@ -365,16 +369,16 @@ fn decode_assets(bytes: &[u8]) -> Result<Vec<ManifestAssetRow>, ManifestError> {
 }
 fn decode_encodings(bytes: &[u8]) -> Result<Vec<EncodingRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.u32()? as usize;
+    let count = r.bounded_count(40)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let content_hash = ContentHash(r.a32()?);
-        let bn = r.u32()? as usize;
+        let bn = r.bounded_count(32)?;
         let mut blocks = Vec::with_capacity(bn);
         for _ in 0..bn {
             blocks.push(EKey(r.a32()?));
         }
-        let nn = r.u32()? as usize;
+        let nn = r.bounded_count(32)?;
         let mut blobs = Vec::with_capacity(nn);
         for _ in 0..nn {
             blobs.push(EKey(r.a32()?));
@@ -389,7 +393,7 @@ fn decode_encodings(bytes: &[u8]) -> Result<Vec<EncodingRow>, ManifestError> {
 }
 fn decode_index(bytes: &[u8]) -> Result<Vec<IndexRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.u32()? as usize;
+    let count = r.bounded_count(52)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         rows.push(IndexRow {
@@ -405,11 +409,11 @@ fn decode_index(bytes: &[u8]) -> Result<Vec<IndexRow>, ManifestError> {
 }
 fn decode_wire_trees(bytes: &[u8]) -> Result<Vec<WireTreeRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.u32()? as usize;
+    let count = r.bounded_count(36)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let layout_hash = LayoutHash(r.a32()?);
-        let len = r.u32()? as usize;
+        let len = usize::try_from(r.u32()?).map_err(|_| ManifestError::Truncated)?;
         rows.push(WireTreeRow {
             layout_hash,
             bytes: r.take(len)?.to_vec(),
@@ -419,7 +423,7 @@ fn decode_wire_trees(bytes: &[u8]) -> Result<Vec<WireTreeRow>, ManifestError> {
 }
 fn decode_paths(bytes: &[u8]) -> Result<Vec<PathRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.u32()? as usize;
+    let count = r.bounded_count(20)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let path = r.string()?;
@@ -539,6 +543,18 @@ struct Reader<'a> {
     pos: usize,
 }
 impl<'a> Reader<'a> {
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
+    fn bounded_count(&mut self, minimum_row_bytes: usize) -> Result<usize, ManifestError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| ManifestError::Truncated)?;
+        if count > self.remaining() / minimum_row_bytes {
+            return Err(ManifestError::Truncated);
+        }
+        Ok(count)
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], ManifestError> {
         let end = self.pos.checked_add(n).ok_or(ManifestError::Truncated)?;
         let v = self
