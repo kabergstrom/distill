@@ -191,6 +191,7 @@ pub struct ScanSnapshot {
     pub files: Vec<ScannedFile>,
     pub bundles: Vec<ScannedBundle>,
     directory_identities: BTreeMap<(String, String), DirectoryObservation>,
+    symlink_aliases: BTreeMap<(String, String), PathBuf>,
 }
 
 impl ScanSnapshot {
@@ -214,6 +215,7 @@ impl ScanSnapshot {
                     left.identity == right.identity && left.physical_path == right.physical_path
                 })
             })
+            && self.symlink_aliases == other.symlink_aliases
     }
 }
 
@@ -474,7 +476,7 @@ impl RootedScanner {
     /// order. This is the startup/recovery path; ordinary live watcher batches
     /// use incremental path/subtree observation instead.
     pub fn scan(&self) -> Result<ScanSnapshot, ScanError> {
-        let roots = self.root_snapshot();
+        let roots = self.validated_root_snapshot()?;
         let stack = roots
             .values()
             .rev()
@@ -498,10 +500,19 @@ impl RootedScanner {
         baseline: &ScanSnapshot,
         event_paths: &[PathBuf],
     ) -> Result<Option<ScanSnapshot>, ScanError> {
-        let roots = self.root_snapshot();
+        let roots = self.validated_root_snapshot()?;
         let mut affected = BTreeSet::<(String, String)>::new();
         for event_path in event_paths {
             if let Some((root, path)) = event_key(&roots, event_path)? {
+                let mut canonical_event = roots[&root].canonical_path.clone();
+                for component in path.split('/').filter(|component| !component.is_empty()) {
+                    canonical_event.push(component);
+                }
+                for (alias, target) in &baseline.symlink_aliases {
+                    if target == &canonical_event || target.starts_with(&canonical_event) {
+                        affected.insert(alias.clone());
+                    }
+                }
                 affected.insert((root, path));
             }
         }
@@ -518,11 +529,14 @@ impl RootedScanner {
             });
             next.directory_identities
                 .retain(|(key_root, key_path), _| !path_matches(root, path, key_root, key_path));
+            next.symlink_aliases
+                .retain(|(key_root, key_path), _| !path_matches(root, path, key_root, key_path));
             if let Some(observed) = scan_logical_path(&roots, root, path)? {
                 next.files.extend(observed.files);
                 next.bundles.extend(observed.bundles);
                 next.directory_identities
                     .extend(observed.directory_identities);
+                next.symlink_aliases.extend(observed.symlink_aliases);
             }
         }
         sort_snapshot(&mut next);
@@ -531,7 +545,7 @@ impl RootedScanner {
     }
 
     pub fn read_identity_checked(&self, path: &Path) -> Result<Vec<u8>, ScanError> {
-        let roots = self.root_snapshot();
+        let roots = self.validated_root_snapshot()?;
         let Some(root) = roots
             .values()
             .filter_map(|root| {
@@ -578,6 +592,33 @@ impl RootedScanner {
             directory = DirectoryCapability::from_open_directory(opened.file, &display);
         }
         unreachable!("nonempty component walk returns at its final component")
+    }
+
+    fn validated_root_snapshot(&self) -> Result<BTreeMap<String, CanonicalRoot>, ScanError> {
+        let roots = self.root_snapshot();
+        for root in roots.values() {
+            let current_path = fs::canonicalize(&root.configured.path).map_err(|_| {
+                ScanError::RootUnavailable {
+                    root: root.configured.name.clone(),
+                    path: root.configured.path.clone(),
+                }
+            })?;
+            let retained = directory_metadata(&root.directory, &root.canonical_path)?;
+            let current = fs::metadata(&current_path).map_err(|source| ScanError::Io {
+                path: current_path.clone(),
+                source,
+            })?;
+            if current_path != root.canonical_path
+                || !current.is_dir()
+                || file_identity(&current) != file_identity(&retained)
+            {
+                return Err(ScanError::RootUnavailable {
+                    root: root.configured.name.clone(),
+                    path: root.configured.path.clone(),
+                });
+            }
+        }
+        Ok(roots)
     }
 }
 
@@ -711,6 +752,15 @@ fn observe_opened_file(
         size: metadata.len(),
         content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
     });
+    if is_symlink {
+        let target = fs::canonicalize(&physical).map_err(|source| ScanError::Io {
+            path: physical.clone(),
+            source,
+        })?;
+        snapshot
+            .symlink_aliases
+            .insert((root_name.to_owned(), normalized_path.clone()), target);
+    }
     if physical
         .extension()
         .and_then(|extension| extension.to_str())

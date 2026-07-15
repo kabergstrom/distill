@@ -20,6 +20,7 @@ use crate::scanner::RootedScanner;
 
 const DEFAULT_CAPACITY: usize = 65_536;
 const ROOT_RECONFIGURE_POLL: Duration = Duration::from_millis(40);
+const INCOMPLETE_RENAME_BATCH_LIMIT: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatcherRename {
@@ -53,6 +54,7 @@ pub struct WatcherQueue {
     paths: BTreeSet<PathBuf>,
     renames: Vec<WatcherRename>,
     rename_from: BTreeMap<usize, PathBuf>,
+    incomplete_rename_batches: u8,
 }
 
 impl Default for WatcherQueue {
@@ -74,6 +76,7 @@ impl WatcherQueue {
             paths: BTreeSet::new(),
             renames: Vec::new(),
             rename_from: BTreeMap::new(),
+            incomplete_rename_batches: 0,
         }
     }
 
@@ -106,6 +109,7 @@ impl WatcherQueue {
         self.paths.clear();
         self.renames.clear();
         self.rename_from.clear();
+        self.incomplete_rename_batches = 0;
         self.overflowed = true;
     }
 
@@ -115,8 +119,14 @@ impl WatcherQueue {
             WatcherAction::FullRescan => self.force_rescan(),
             WatcherAction::Batch(batch) => {
                 self.paths.extend(batch.paths);
-                for rename in batch.renames {
-                    self.push_rename(rename.from, rename.to);
+                // A failed older batch must remain before any events that
+                // arrived while it was being processed.
+                let mut restored = batch.renames;
+                restored.append(&mut self.renames);
+                self.renames = restored;
+                for rename in &self.renames {
+                    self.paths.insert(rename.from.clone());
+                    self.paths.insert(rename.to.clone());
                 }
                 self.check_capacity();
             }
@@ -144,15 +154,24 @@ impl WatcherQueue {
                 self.push_rename(event.paths[0].clone(), event.paths[1].clone());
             }
             EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                if let (Some(tracker), Some(path)) = (tracker, event.paths.first()) {
-                    self.rename_from.insert(tracker, path.clone());
+                match (tracker, event.paths.first()) {
+                    (Some(tracker), Some(path)) => {
+                        self.rename_from.insert(tracker, path.clone());
+                        self.incomplete_rename_batches = 0;
+                    }
+                    _ => self.force_rescan(),
                 }
             }
             EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-                if let (Some(tracker), Some(to)) = (tracker, event.paths.first()) {
-                    if let Some(from) = self.rename_from.remove(&tracker) {
-                        self.push_rename(from, to.clone());
-                    }
+                match (tracker, event.paths.first()) {
+                    (Some(tracker), Some(to)) => match self.rename_from.remove(&tracker) {
+                        Some(from) => {
+                            self.push_rename(from, to.clone());
+                            self.incomplete_rename_batches = 0;
+                        }
+                        None => self.force_rescan(),
+                    },
+                    _ => self.force_rescan(),
                 }
             }
             _ => {}
@@ -183,11 +202,19 @@ impl WatcherQueue {
             self.rename_from.clear();
             return WatcherAction::FullRescan;
         }
+        if !self.rename_from.is_empty() {
+            self.incomplete_rename_batches = self.incomplete_rename_batches.saturating_add(1);
+            if self.incomplete_rename_batches >= INCOMPLETE_RENAME_BATCH_LIMIT {
+                self.force_rescan();
+                return self.take_action();
+            }
+            return WatcherAction::None;
+        }
+        self.incomplete_rename_batches = 0;
         let batch = WatcherBatch {
             paths: std::mem::take(&mut self.paths).into_iter().collect(),
             renames: std::mem::take(&mut self.renames),
         };
-        self.rename_from.clear();
         if batch.is_empty() {
             WatcherAction::None
         } else {

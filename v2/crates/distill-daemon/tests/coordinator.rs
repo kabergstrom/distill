@@ -400,6 +400,52 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
 
 #[cfg(unix)]
 #[test]
+fn incremental_scan_poison_heals_when_observation_returns_to_last_good() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    assert_eq!(
+        coordinator.reconcile_full_scan().unwrap().version,
+        InputVersion(1)
+    );
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    let link = temp.path().join("assets/escape");
+    symlink(&outside, &link).unwrap();
+    assert_eq!(
+        coordinator
+            .reconcile_incremental(&WatcherBatch {
+                paths: vec![link.clone()],
+                renames: Vec::new(),
+            })
+            .unwrap()
+            .version,
+        InputVersion(2)
+    );
+
+    std::fs::remove_file(&link).unwrap();
+    assert_eq!(
+        coordinator
+            .reconcile_incremental(&WatcherBatch {
+                paths: vec![link],
+                renames: Vec::new(),
+            })
+            .unwrap()
+            .version,
+        InputVersion(3)
+    );
+    assert!(coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .version_poison()
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn directory_alias_publishes_configuration_poison_without_aborting_the_version() {
     use std::os::unix::fs::symlink;
 

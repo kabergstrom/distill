@@ -62,6 +62,63 @@ fn native_rename_pairs_retain_order_and_coalesce_paths() {
 }
 
 #[test]
+fn split_native_rename_is_retained_across_debounce_boundaries() {
+    let mut queue = WatcherQueue::new();
+    let from = PathBuf::from("/assets/a.txt");
+    let to = PathBuf::from("/assets/b.txt");
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(from.clone())
+            .set_tracker(17),
+    );
+    assert_eq!(queue.take_live_action(), WatcherAction::None);
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path(to.clone())
+            .set_tracker(17),
+    );
+    let WatcherAction::Batch(batch) = queue.take_live_action() else {
+        panic!("expected completed split rename")
+    };
+    assert_eq!(
+        batch.renames,
+        [distill_daemon::watcher::WatcherRename { from, to }]
+    );
+}
+
+#[test]
+fn unmatched_rename_destination_requires_recovery_scan() {
+    let mut queue = WatcherQueue::new();
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path("/assets/b.txt".into())
+            .set_tracker(17),
+    );
+    assert_eq!(queue.take_live_action(), WatcherAction::FullRescan);
+}
+
+#[test]
+fn requeued_older_rename_stays_before_newer_rename() {
+    let mut queue = WatcherQueue::new();
+    let older = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+        .add_path("/assets/a.txt".into())
+        .add_path("/assets/b.txt".into());
+    queue.push_native(older);
+    let failed = queue.take_live_action();
+    queue.push_native(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path("/assets/b.txt".into())
+            .add_path("/assets/c.txt".into()),
+    );
+    queue.requeue_action(failed);
+    let WatcherAction::Batch(batch) = queue.take_live_action() else {
+        panic!("expected retry batch")
+    };
+    assert_eq!(batch.renames[0].from, PathBuf::from("/assets/a.txt"));
+    assert_eq!(batch.renames[1].from, PathBuf::from("/assets/b.txt"));
+}
+
+#[test]
 fn bounded_event_overflow_discards_partial_paths() {
     let mut queue = WatcherQueue::with_capacity(1);
     queue.push_native(create("/assets/a.txt"));

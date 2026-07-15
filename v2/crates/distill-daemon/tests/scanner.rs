@@ -310,7 +310,7 @@ fn in_root_file_symlinks_are_identity_checked_and_reported() {
 
 #[cfg(unix)]
 #[test]
-fn retained_root_capability_cannot_be_redirected_by_path_replacement() {
+fn retained_root_capability_rejects_path_replacement() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -326,22 +326,53 @@ fn retained_root_capability_cannot_be_redirected_by_path_replacement() {
     std::fs::rename(&root, &retained).unwrap();
     symlink(&outside, &root).unwrap();
 
-    assert_eq!(
-        scanner
-            .read_identity_checked(&root.join("source.txt"))
-            .unwrap(),
-        b"trusted"
-    );
-    let scan = scanner.scan().unwrap();
-    let source = scan
-        .files
-        .iter()
-        .find(|file| file.normalized_path == "source.txt")
+    assert!(matches!(
+        scanner.read_identity_checked(&root.join("source.txt")),
+        Err(ScanError::RootUnavailable { .. })
+    ));
+    assert!(matches!(
+        scanner.scan(),
+        Err(ScanError::RootUnavailable { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_target_edit_reobserves_file_symlink_alias() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("source.txt");
+    let alias = root.join("alias.txt");
+    std::fs::write(&target, b"first").unwrap();
+    symlink(&target, &alias).unwrap();
+    let scanner = scanner(&temp);
+    let baseline = scanner.scan().unwrap();
+
+    std::fs::write(&target, b"second").unwrap();
+    let next = scanner
+        .scan_incremental(&baseline, std::slice::from_ref(&target))
+        .unwrap()
         .unwrap();
+    let expected = Some(distill_core::id::ContentHash(
+        *blake3::hash(b"second").as_bytes(),
+    ));
     assert_eq!(
-        source.content_hash,
-        Some(distill_core::id::ContentHash(
-            *blake3::hash(b"trusted").as_bytes()
-        ))
+        next.files
+            .iter()
+            .find(|file| file.normalized_path == "source.txt")
+            .unwrap()
+            .content_hash,
+        expected
+    );
+    assert_eq!(
+        next.files
+            .iter()
+            .find(|file| file.normalized_path == "alias.txt")
+            .unwrap()
+            .content_hash,
+        expected
     );
 }

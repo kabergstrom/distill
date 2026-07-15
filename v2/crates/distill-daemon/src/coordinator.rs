@@ -83,6 +83,7 @@ pub struct DaemonCoordinator {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
     scan_snapshot: Arc<Mutex<ScanSnapshot>>,
+    scan_healthy: AtomicBool,
     server: Server,
     lineage_destination: RwLock<LineageDestination>,
     authoring: Arc<AuthoringService>,
@@ -278,6 +279,7 @@ impl DaemonCoordinator {
             store,
             scanner,
             scan_snapshot,
+            scan_healthy: AtomicBool::new(true),
             server,
             lineage_destination: RwLock::new(lineage_destination),
             authoring: backend,
@@ -974,7 +976,10 @@ impl DaemonCoordinator {
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         match self.scanner.scan() {
             Ok(scan) => self.publish_scan(scan),
-            Err(error) => self.publish_scan_rejection(&error),
+            Err(error) => {
+                self.scan_healthy.store(false, Ordering::Release);
+                self.publish_scan_rejection(&error)
+            }
         }
     }
 
@@ -1003,27 +1008,34 @@ impl DaemonCoordinator {
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let baseline = lock_scan_snapshot(&self.scan_snapshot).clone();
+        let mut renames = Vec::new();
+        for rename in &batch.renames {
+            let from = self.scanner.event_path_key(&rename.from)?;
+            let to = self.scanner.event_path_key(&rename.to)?;
+            if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
+                if from_root == to_root {
+                    renames.push(LogicalRename {
+                        root_name: from_root,
+                        from_path,
+                        to_path,
+                    });
+                }
+            }
+        }
         match self.scanner.scan_incremental(&baseline, &batch.paths) {
             Ok(None) => Ok(self.server.current_stamp()),
-            Ok(Some(scan)) if scan.same_observation(&baseline) => Ok(self.server.current_stamp()),
-            Ok(Some(scan)) => {
-                let mut renames = Vec::new();
-                for rename in &batch.renames {
-                    let from = self.scanner.event_path_key(&rename.from)?;
-                    let to = self.scanner.event_path_key(&rename.to)?;
-                    if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
-                        if from_root == to_root {
-                            renames.push(LogicalRename {
-                                root_name: from_root,
-                                from_path,
-                                to_path,
-                            });
-                        }
-                    }
-                }
-                self.publish_scan_with_renames(scan, &renames)
+            Ok(Some(scan))
+                if scan.same_observation(&baseline)
+                    && renames.is_empty()
+                    && self.scan_healthy.load(Ordering::Acquire) =>
+            {
+                Ok(self.server.current_stamp())
             }
-            Err(error) => self.publish_scan_rejection(&error),
+            Ok(Some(scan)) => self.publish_scan_with_renames(scan, &renames),
+            Err(error) => {
+                self.scan_healthy.store(false, Ordering::Release);
+                self.publish_scan_rejection(&error)
+            }
         }
     }
 
@@ -1089,6 +1101,7 @@ impl DaemonCoordinator {
             })
             .map_err(CoordinatorError::Coordinated)?;
         *lock_scan_snapshot(&self.scan_snapshot) = published_snapshot;
+        self.scan_healthy.store(true, Ordering::Release);
         Ok(stamp)
     }
 
