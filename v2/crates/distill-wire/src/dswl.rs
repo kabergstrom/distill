@@ -62,6 +62,8 @@ pub enum DswlDecodeError {
     UnknownSlot(u8),
     UnknownEnumForm(u8),
     InvalidGeometry,
+    InvalidEnum,
+    DuplicateDiscriminant,
     BackRefOutOfRange,
     BackRefGeometry,
     DepthExceeded,
@@ -220,6 +222,7 @@ impl Decoder<'_> {
                     });
                 }
                 self.frames.pop();
+                validate_enum(form, size, &variants)?;
                 Ok(WireNode::Enum {
                     offset,
                     size,
@@ -280,6 +283,48 @@ impl Decoder<'_> {
             }
             other => Err(DswlDecodeError::UnknownNode(other)),
         }
+    }
+}
+
+fn validate_enum(
+    form: WireEnumForm,
+    size: u32,
+    variants: &[WireVariant],
+) -> Result<(), DswlDecodeError> {
+    if variants.is_empty() {
+        return Err(DswlDecodeError::InvalidEnum);
+    }
+    match form {
+        WireEnumForm::Single if variants.len() != 1 => Err(DswlDecodeError::InvalidEnum),
+        WireEnumForm::FullyFlat {
+            tag_offset,
+            tag_size,
+        } => {
+            if tag_size == 0
+                || tag_size > 16
+                || tag_offset
+                    .checked_add(u32::from(tag_size))
+                    .is_none_or(|end| end > size)
+            {
+                return Err(DswlDecodeError::InvalidEnum);
+            }
+            let mask = if tag_size == 16 {
+                u128::MAX
+            } else {
+                (1u128 << (u32::from(tag_size) * 8)) - 1
+            };
+            let mut discriminants = BTreeSet::new();
+            for variant in variants {
+                if variant.discriminant & !mask != 0 {
+                    return Err(DswlDecodeError::InvalidEnum);
+                }
+                if !discriminants.insert(variant.discriminant) {
+                    return Err(DswlDecodeError::DuplicateDiscriminant);
+                }
+            }
+            Ok(())
+        }
+        WireEnumForm::Single | WireEnumForm::Canonical => Ok(()),
     }
 }
 

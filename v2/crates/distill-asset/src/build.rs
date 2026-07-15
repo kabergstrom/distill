@@ -14,8 +14,8 @@ use distill_core::attestation::{
 use distill_core::id::{LogicalHash, TypeUuid};
 use distill_wire::dsnl::dsnl_hash;
 use distill_wire::native::{
-    CallbackPanic, CtorEntry, CtorId, CtorTable, DropId, DropTable, NativeField, NativeLayoutNode,
-    NativeVariant, SkipDefaultId, SkipEntry, SkipWriterTable,
+    validate_native_descriptor, CallbackPanic, CtorEntry, CtorId, CtorTable, DropId, DropTable,
+    NativeField, NativeLayoutNode, NativeVariant, SkipDefaultId, SkipEntry, SkipWriterTable,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -294,6 +294,15 @@ where
     let mut builder = LayoutBuilder::default();
     let root = T::layout(&mut builder, 0);
     let built = builder.finish(root);
+    validate_native_descriptor(
+        built.root,
+        checked_size::<T>(),
+        checked_align::<T>(),
+        built.ctors.entries.len(),
+        built.drops.entries.len(),
+        built.skips.entries.len(),
+    )
+    .expect("#[asset] generated a valid native descriptor");
     let mut registry_builder = RegistryExtrasBuilder::default();
     T::collect_registry_extras(&mut registry_builder, SchemaNodeId(0), Vec::new());
     registry_builder.fact(

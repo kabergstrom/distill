@@ -472,3 +472,36 @@ fn decoder_rejects_unknown_kinds_and_false_backref_geometry() {
     bytes[backref + 5] ^= 1;
     assert_eq!(decode_dswl(&bytes), Err(DswlDecodeError::BackRefGeometry));
 }
+
+#[test]
+fn decoder_rejects_invalid_fully_flat_discriminants() {
+    let make = |tag_size, a, b| {
+        wenum(
+            0,
+            4,
+            4,
+            WireEnumForm::FullyFlat {
+                tag_offset: 0,
+                tag_size,
+            },
+            vec![
+                wvariant("A", a, wstruct(0, 4, 4, vec![])),
+                wvariant("B", b, wstruct(0, 4, 4, vec![])),
+            ],
+        )
+    };
+    let duplicate = dswl_bytes(&make(1, 7, 7)).unwrap();
+    assert_eq!(
+        decode_dswl(&duplicate),
+        Err(DswlDecodeError::DuplicateDiscriminant)
+    );
+
+    let out_of_width = dswl_bytes(&make(1, 0, 256)).unwrap();
+    assert_eq!(
+        decode_dswl(&out_of_width),
+        Err(DswlDecodeError::InvalidEnum)
+    );
+
+    let zero_width = dswl_bytes(&make(0, 0, 1)).unwrap();
+    assert_eq!(decode_dswl(&zero_width), Err(DswlDecodeError::InvalidEnum));
+}

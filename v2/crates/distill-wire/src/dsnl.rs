@@ -27,6 +27,7 @@
 //! | skip    | 0x0C | — (measured align rides in the header; no writer id) |
 //! | backref | 0x0D | distance u32 (header offset = the slot's own origin; size and align = the referenced frame's, by rule) |
 //! | unit    | 0x0E | — (header size 0, align 1 by rule) |
+//! | option  | 0x0F | inner node (no ctor id; local typed construction) |
 
 use crate::measured::{MeasuredNativeNode, MeasuredNativeTagEncoding, MeasuredNativeVariantTag};
 use crate::native::{LayoutHashError, NativeLayoutNode, NativeTagEncoding, NativeVariantTag};
@@ -243,6 +244,18 @@ fn encode(
         } => {
             header(out, 0x09, offset, size, align);
             encode(inner, out, frames)?;
+        }
+        NativeLayoutNode::Option {
+            offset,
+            size,
+            align,
+            inner,
+            ctor: _,
+        } => {
+            header(out, 0x0F, offset, size, align);
+            frames.push((size, align));
+            encode(inner, out, frames)?;
+            frames.pop();
         }
         NativeLayoutNode::Str {
             offset,

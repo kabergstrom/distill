@@ -21,11 +21,18 @@ use crate::AssetType;
 
 pub use crate::defaults::DefaultNode;
 
-/// Implemented by generated asset records and the framework's closed
-/// set of serializable leaves/containers. The trait is public because
-/// proc-macro output in downstream crates calls it; implementations are
-/// an implementation detail and should normally come from `#[asset]`.
-pub trait AssetReflect: 'static {
+/// Implemented by generated asset records and the framework's closed set of
+/// serializable leaves/containers. The trait is public because proc-macro
+/// output in downstream crates calls it; implementations should normally come
+/// from `#[asset]`.
+///
+/// # Safety
+///
+/// `layout` must describe the exact Rust layout of `Self`, including every
+/// child type and callback table entry, and all emitted callbacks must operate
+/// on precisely the types and geometry named by that layout. An incorrect
+/// implementation can make the loader perform invalid raw-pointer operations.
+pub unsafe trait AssetReflect: 'static {
     /// Whether this key type uses JSON's object form for maps. This is a
     /// property of the type, not of the observed entries: an empty non-string
     /// map must still use the pair-array form.
@@ -112,7 +119,7 @@ fn logical_primitive(builder: &mut LogicalBuilder, name: &str) {
 
 macro_rules! unsigned {
     ($ty:ty, $kind:ident, $name:literal) => {
-        impl AssetReflect for $ty {
+        unsafe impl AssetReflect for $ty {
             fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
                 scalar::<Self>(offset, ScalarKind::$kind)
             }
@@ -134,7 +141,7 @@ macro_rules! unsigned {
 
 macro_rules! signed {
     ($ty:ty, $kind:ident, $name:literal) => {
-        impl AssetReflect for $ty {
+        unsafe impl AssetReflect for $ty {
             fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
                 scalar::<Self>(offset, ScalarKind::$kind)
             }
@@ -169,7 +176,7 @@ signed!(i32, I32, "i32");
 signed!(i64, I64, "i64");
 signed!(i128, I128, "i128");
 
-impl AssetReflect for bool {
+unsafe impl AssetReflect for bool {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         scalar::<Self>(offset, ScalarKind::Bool)
     }
@@ -187,7 +194,7 @@ impl AssetReflect for bool {
     }
 }
 
-impl AssetReflect for char {
+unsafe impl AssetReflect for char {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         scalar::<Self>(offset, ScalarKind::Char)
     }
@@ -207,7 +214,7 @@ impl AssetReflect for char {
 
 macro_rules! float {
     ($ty:ty, $kind:ident, $name:literal) => {
-        impl AssetReflect for $ty {
+        unsafe impl AssetReflect for $ty {
             fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
                 scalar::<Self>(offset, ScalarKind::$kind)
             }
@@ -229,7 +236,7 @@ macro_rules! float {
 
 float!(f64, F64, "f64");
 
-impl AssetReflect for f32 {
+unsafe impl AssetReflect for f32 {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         scalar::<Self>(offset, ScalarKind::F32)
     }
@@ -259,7 +266,7 @@ impl AssetReflect for f32 {
     }
 }
 
-impl AssetReflect for () {
+unsafe impl AssetReflect for () {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         NativeLayoutNode::Unit { offset }
     }
@@ -277,7 +284,7 @@ impl AssetReflect for () {
     }
 }
 
-impl AssetReflect for String {
+unsafe impl AssetReflect for String {
     const STRING_KEY: bool = true;
 
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
@@ -306,7 +313,7 @@ impl AssetReflect for String {
     }
 }
 
-impl AssetReflect for Blob {
+unsafe impl AssetReflect for Blob {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         NativeLayoutNode::Blob {
             offset,
@@ -336,7 +343,7 @@ impl AssetReflect for Blob {
     }
 }
 
-impl<T: AssetReflect> AssetReflect for Vec<T> {
+unsafe impl<T: AssetReflect> AssetReflect for Vec<T> {
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         let elem_node = T::layout(builder, 0);
         let elem = builder.leak_node(elem_node);
@@ -384,7 +391,7 @@ impl<T: AssetReflect> AssetReflect for Vec<T> {
     }
 }
 
-impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
+unsafe impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         let elem_node = T::layout(builder, 0);
         let elem = builder.leak_node(elem_node);
@@ -430,40 +437,22 @@ impl<T: AssetReflect, const N: usize> AssetReflect for [T; N] {
     }
 }
 
-impl<T: AssetReflect> AssetReflect for Option<T> {
+unsafe impl<T: AssetReflect> AssetReflect for Option<T> {
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
-        // Option has no general stable constructor/layout rule independent
-        // of its niche. Asset records should use it normally; source-walk's
-        // measured enum layout is authoritative. Here we conservatively
-        // describe the actual slot as an enum-shaped scalar-free record.
-        let none = builder.leak_node(NativeLayoutNode::Unit { offset: 0 });
-        let some_node = T::layout(builder, 0);
-        let some = builder.leak_node(some_node);
-        let variants = builder.leak_variants(vec![
-            distill_wire::native::NativeVariant {
-                name: "None",
-                declaration_index: 0,
-                node: none,
-                tag: distill_wire::native::NativeVariantTag::Niche { index: 0 },
-            },
-            distill_wire::native::NativeVariant {
-                name: "Some",
-                declaration_index: 1,
-                node: some,
-                tag: distill_wire::native::NativeVariantTag::Untagged,
-            },
-        ]);
-        NativeLayoutNode::Enum {
+        if let Some(backref) = builder.backref::<Self>(offset) {
+            return backref;
+        }
+        builder.push_frame::<Self>();
+        let inner_node = T::layout(builder, 0);
+        let inner = builder.leak_node(inner_node);
+        let ctor = builder.register_ctor::<Self>(crate::thunks::option_ctor::<T>());
+        builder.pop_frame::<Self>();
+        NativeLayoutNode::Option {
             offset,
             size: checked_size::<Self>(),
             align: checked_align::<Self>(),
-            tag: distill_wire::native::NativeTagEncoding::Niche {
-                offset: 0,
-                size: checked_size::<Self>().min(16) as u8,
-                niche_start: 0,
-            },
-            whole_drop: builder.register_drop_if_needed::<Self>(),
-            variants,
+            inner,
+            ctor,
         }
     }
     fn logical(builder: &mut LogicalBuilder) {
@@ -502,7 +491,7 @@ impl<T: AssetReflect> AssetReflect for Option<T> {
     }
 }
 
-impl<T: AssetReflect> AssetReflect for Box<T> {
+unsafe impl<T: AssetReflect> AssetReflect for Box<T> {
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         let inner_node = T::layout(builder, 0);
         let inner = builder.leak_node(inner_node);
@@ -539,7 +528,7 @@ impl<T: AssetReflect> AssetReflect for Box<T> {
     }
 }
 
-impl<T: AssetReflect> AssetReflect for Arc<T> {
+unsafe impl<T: AssetReflect> AssetReflect for Arc<T> {
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         let inner_node = T::layout(builder, 0);
         let inner = builder.leak_node(inner_node);
@@ -576,7 +565,7 @@ impl<T: AssetReflect> AssetReflect for Arc<T> {
     }
 }
 
-impl<T> AssetReflect for HashSet<T, DeterministicState>
+unsafe impl<T> AssetReflect for HashSet<T, DeterministicState>
 where
     T: AssetReflect + Eq + Hash,
 {
@@ -623,7 +612,7 @@ where
     }
 }
 
-impl<T> AssetReflect for BTreeSet<T>
+unsafe impl<T> AssetReflect for BTreeSet<T>
 where
     T: AssetReflect + Ord,
 {
@@ -669,7 +658,7 @@ where
     }
 }
 
-impl<K, V> AssetReflect for HashMap<K, V, DeterministicState>
+unsafe impl<K, V> AssetReflect for HashMap<K, V, DeterministicState>
 where
     K: AssetReflect + Eq + Hash,
     V: AssetReflect,
@@ -728,7 +717,7 @@ where
     }
 }
 
-impl<K, V> AssetReflect for BTreeMap<K, V>
+unsafe impl<K, V> AssetReflect for BTreeMap<K, V>
 where
     K: AssetReflect + Ord,
     V: AssetReflect,
@@ -785,7 +774,7 @@ where
     }
 }
 
-impl<T: AssetType> AssetReflect for AssetRef<T> {
+unsafe impl<T: AssetType> AssetReflect for AssetRef<T> {
     fn layout(_: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         // UUIDs are 16 unrestricted bytes; a fixed array node preserves
         // their exact native/wire geometry.
@@ -830,7 +819,7 @@ impl<T: AssetType> AssetReflect for AssetRef<T> {
     }
 }
 
-impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
+unsafe impl<T: AssetType> AssetReflect for WeakAssetRef<T> {
     fn layout(builder: &mut LayoutBuilder, offset: u32) -> NativeLayoutNode {
         <AssetRef<T> as AssetReflect>::layout(builder, offset)
     }

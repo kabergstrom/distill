@@ -16,7 +16,12 @@ use distill_wire::native::{
 };
 
 /// Implemented by `#[asset]`; never hand-written (§4).
-pub trait AssetType: 'static {
+///
+/// # Safety
+///
+/// `descriptor` must be the generated descriptor for exactly `Self`, and its
+/// UUID, layout, callbacks, encoder, and finalizer must all describe `Self`.
+pub unsafe trait AssetType: 'static {
     const TYPE_UUID: TypeUuid;
     /// The consuming binary's generated runtime descriptor — an
     /// associated fn, not a const, because the tables it borrows are

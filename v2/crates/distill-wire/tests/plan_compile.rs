@@ -803,6 +803,36 @@ fn canonical_wire_tag_switches_into_native_niche_writes() {
 }
 
 #[test]
+fn option_plan_uses_typed_construction_instead_of_native_tag_writes() {
+    let wire = wenum(
+        0,
+        8,
+        4,
+        WireEnumForm::Canonical,
+        vec![
+            wvariant("None", 0, wstruct(4, 0, 1, vec![])),
+            wvariant(
+                "Some",
+                0,
+                wstruct(4, 4, 4, vec![wfield("0", 0, wprim(0, ScalarKind::U32))]),
+            ),
+        ],
+    );
+    let native = noption(0, 8, 4, scalar(0, ScalarKind::U32), 7);
+    let compiled = compile_plans(&wire, &native).unwrap();
+    assert_eq!(compiled.arena.plans[0].ops.len(), 1);
+    assert!(matches!(
+        compiled.arena.plans[0].ops[0],
+        FixupOp::ConstructOption {
+            wire_tag: WireTagRead::CanonicalU32 { offset: 0 },
+            native: 0,
+            ctor: CtorId(7),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn fully_flat_wire_tag_reads_direct_values_in_name_sorted_order() {
     // Wire: fully-flat with declared discriminants; native: direct too.
     let wire = wenum(

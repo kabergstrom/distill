@@ -74,6 +74,22 @@ pub fn nenum(
     }
 }
 
+pub fn noption(
+    offset: u32,
+    size: u32,
+    align: u32,
+    inner: NativeLayoutNode,
+    ctor: u32,
+) -> NativeLayoutNode {
+    NativeLayoutNode::Option {
+        offset,
+        size,
+        align,
+        inner: leak(inner),
+        ctor: CtorId(ctor),
+    }
+}
+
 pub fn nvariant(
     name: &str,
     declaration_index: u32,

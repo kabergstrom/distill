@@ -369,6 +369,12 @@ unsafe fn once_begin<T>(_dst: *mut u8, len: u32) -> Result<CtorCursor, CallbackP
         state: Box::into_raw(b) as *mut (),
     })
 }
+unsafe fn maybe_begin<T>(_dst: *mut u8, len: u32) -> Result<CtorCursor, CallbackPanic> {
+    assert!(len <= 1, "Option uses len 0 or 1");
+    Ok(CtorCursor {
+        state: Box::into_raw(Box::new(Option::<T>::None)) as *mut (),
+    })
+}
 unsafe fn once_push<T>(cur: &mut CtorCursor, elem: *mut u8) -> Result<(), PushError> {
     *(cur.state as *mut Option<T>) = Some(std::ptr::read(elem as *const T));
     Ok(())
@@ -396,6 +402,30 @@ unsafe fn arc_finish<T>(cur: &mut CtorCursor, dst: *mut u8) -> Result<(), Callba
     cur.state = std::ptr::null_mut();
     std::ptr::write(dst as *mut Arc<T>, Arc::new(v));
     Ok(())
+}
+unsafe fn option_finish<T>(cur: &mut CtorCursor, dst: *mut u8) -> Result<(), CallbackPanic> {
+    let value = *Box::from_raw(cur.state as *mut Option<T>);
+    cur.state = std::ptr::null_mut();
+    std::ptr::write(dst as *mut Option<T>, value);
+    Ok(())
+}
+unsafe fn option_drop<T>(ptr: *mut u8) -> Result<(), CallbackPanic> {
+    std::ptr::drop_in_place(ptr as *mut Option<T>);
+    Ok(())
+}
+
+fn option_ctor<T>() -> CtorEntry {
+    CtorEntry {
+        begin: maybe_begin::<T>,
+        push: once_push::<T>,
+        elem_size: std::mem::size_of::<T>() as u32,
+        elem_align: std::mem::align_of::<T>() as u32,
+        key_offset: 0,
+        value_offset: 0,
+        finish: option_finish::<T>,
+        abort: once_abort::<T>,
+        drop_in_place: option_drop::<T>,
+    }
 }
 unsafe fn arc_drop<T>(ptr: *mut u8) -> Result<(), CallbackPanic> {
     log_event(format!("ctor_drop:arc<{}>", tname::<T>()));
@@ -1368,6 +1398,107 @@ fn canonical_wire_fixes_into_a_native_niche() {
     let fixed = vec![0u8; 16];
     let got: Option<Box<u32>> = run_value(&wire, &native, &fixed, &[], &env).unwrap();
     assert_eq!(got, None);
+}
+
+#[test]
+fn canonical_wire_constructs_opaque_option_without_native_tag_assumptions() {
+    let wire = wenum(
+        0,
+        8,
+        4,
+        WireEnumForm::Canonical,
+        vec![
+            wvariant("None", 0, wstruct(4, 0, 1, vec![])),
+            wvariant(
+                "Some",
+                0,
+                wstruct(4, 4, 4, vec![wfield("0", 0, wprim(0, ScalarKind::U32))]),
+            ),
+        ],
+    );
+    let native = noption(
+        0,
+        std::mem::size_of::<Option<u32>>() as u32,
+        std::mem::align_of::<Option<u32>>() as u32,
+        scalar(0, ScalarKind::U32),
+        0,
+    );
+    let env = make_env(vec![option_ctor::<u32>()], vec![], vec![]);
+
+    let none: Option<u32> = run_value(&wire, &native, &[0; 8], &[], &env).unwrap();
+    assert_eq!(none, None);
+
+    let mut fixed = [0u8; 8];
+    fixed[0] = 1;
+    fixed[4..8].copy_from_slice(&42u32.to_le_bytes());
+    let some: Option<u32> = run_value(&wire, &native, &fixed, &[], &env).unwrap();
+    assert_eq!(some, Some(42));
+}
+
+#[test]
+fn opaque_option_construction_composes_for_nested_options() {
+    let inner_wire = wenum(
+        0,
+        8,
+        4,
+        WireEnumForm::Canonical,
+        vec![
+            wvariant("None", 0, wstruct(4, 0, 1, vec![])),
+            wvariant(
+                "Some",
+                0,
+                wstruct(4, 4, 4, vec![wfield("0", 0, wprim(0, ScalarKind::U32))]),
+            ),
+        ],
+    );
+    let wire = wenum(
+        0,
+        12,
+        4,
+        WireEnumForm::Canonical,
+        vec![
+            wvariant("None", 0, wstruct(4, 0, 1, vec![])),
+            wvariant(
+                "Some",
+                0,
+                wstruct(4, 8, 4, vec![wfield("0", 0, inner_wire)]),
+            ),
+        ],
+    );
+    let inner_native = noption(
+        0,
+        std::mem::size_of::<Option<u32>>() as u32,
+        std::mem::align_of::<Option<u32>>() as u32,
+        scalar(0, ScalarKind::U32),
+        0,
+    );
+    let native = noption(
+        0,
+        std::mem::size_of::<Option<Option<u32>>>() as u32,
+        std::mem::align_of::<Option<Option<u32>>>() as u32,
+        inner_native,
+        1,
+    );
+    let env = make_env(
+        vec![option_ctor::<u32>(), option_ctor::<Option<u32>>()],
+        vec![],
+        vec![],
+    );
+
+    let none: Option<Option<u32>> = run_value(&wire, &native, &[0; 12], &[], &env).unwrap();
+    assert_eq!(none, None);
+
+    let mut some_none = [0u8; 12];
+    some_none[0] = 1;
+    let value: Option<Option<u32>> = run_value(&wire, &native, &some_none, &[], &env).unwrap();
+    assert_eq!(value, Some(None));
+
+    let mut some_some = [0u8; 12];
+    some_some[0] = 1;
+    some_some[4] = 1;
+    some_some[8..12].copy_from_slice(&7u32.to_le_bytes());
+    let value: Option<Option<u32>> = run_value(&wire, &native, &some_some, &[], &env).unwrap();
+    assert_eq!(value, Some(Some(7)));
 }
 
 /// Fully-flat wire enum: in-place u8 discriminants 7 (A) and 9 (B).

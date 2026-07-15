@@ -365,7 +365,7 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
     });
     let serializable_count = logical.len() as u32;
     Ok(quote! {
-        impl ::distill_asset::AssetReflect for #ident {
+        unsafe impl ::distill_asset::AssetReflect for #ident {
             fn layout(
                 builder: &mut ::distill_asset::build::LayoutBuilder,
                 offset: u32,
@@ -493,7 +493,7 @@ fn common_impls(
     quote! {
         #reflect_impl
 
-        impl ::distill_asset::AssetType for #ident {
+        unsafe impl ::distill_asset::AssetType for #ident {
             const TYPE_UUID: ::distill_asset::TypeUuid =
                 ::distill_asset::TypeUuid([#(#uuid),*]);
 
@@ -726,7 +726,7 @@ fn enum_reflect(
         quote!(::distill_asset::NativeTagEncoding::Direct { offset: 0, size: #tag_size })
     };
     Ok(quote! {
-        impl ::distill_asset::AssetReflect for #ident {
+        unsafe impl ::distill_asset::AssetReflect for #ident {
             fn layout(
                 builder: &mut ::distill_asset::build::LayoutBuilder,
                 offset: u32,

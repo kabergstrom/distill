@@ -45,7 +45,7 @@ unsafe fn encode_ref_placeholder(
     .map_err(|_| CallbackPanic)
 }
 
-impl AssetType for RefPlaceholder {
+unsafe impl AssetType for RefPlaceholder {
     const TYPE_UUID: TypeUuid = PLACEHOLDER_TYPE;
 
     fn descriptor() -> &'static AssetRuntimeDescriptor {

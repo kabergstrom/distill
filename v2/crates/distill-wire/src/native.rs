@@ -232,6 +232,16 @@ pub enum NativeLayoutNode {
         inner: &'static NativeLayoutNode,
         ctor: CtorId,
     },
+    /// `Option<T>` is constructed through a typed callback. Rust does not
+    /// expose a general stable way to measure the discriminant/niche geometry
+    /// of arbitrary `T`, so fixup never writes Option tag bytes directly.
+    Option {
+        offset: u32,
+        size: u32,
+        align: u32,
+        inner: &'static NativeLayoutNode,
+        ctor: CtorId,
+    },
     /// ConstructString/rollback built in.
     Str { offset: u32, size: u32, align: u32 },
     /// The §4 Blob native form.
@@ -267,12 +277,491 @@ impl NativeLayoutNode {
             | NativeLayoutNode::Map { offset, .. }
             | NativeLayoutNode::BoxPtr { offset, .. }
             | NativeLayoutNode::ArcPtr { offset, .. }
+            | NativeLayoutNode::Option { offset, .. }
             | NativeLayoutNode::Str { offset, .. }
             | NativeLayoutNode::Blob { offset, .. }
             | NativeLayoutNode::Skip { offset, .. }
             | NativeLayoutNode::BackRef { offset, .. }
             | NativeLayoutNode::Unit { offset } => offset,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDescriptorError {
+    pub detail: String,
+}
+
+impl std::fmt::Display for NativeDescriptorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for NativeDescriptorError {}
+
+fn invalid(detail: impl Into<String>) -> NativeDescriptorError {
+    NativeDescriptorError {
+        detail: detail.into(),
+    }
+}
+
+/// Validate the complete binary-local native descriptor before any plan is
+/// executed. This proves geometry and table-index safety; the exact semantic
+/// pairing of nodes and callbacks remains the contract of the unsafe
+/// descriptor generator.
+pub fn validate_native_descriptor(
+    root: &NativeLayoutNode,
+    root_size: u32,
+    root_align: u32,
+    ctor_count: usize,
+    drop_count: usize,
+    skip_count: usize,
+) -> Result<(), NativeDescriptorError> {
+    let mut context = ValidationContext {
+        ctor_count,
+        drop_count,
+        skip_count,
+        frames: Vec::new(),
+    };
+    let (offset, size, align) = context.geometry(root)?;
+    if offset != 0 || size != root_size || align != root_align {
+        return Err(invalid(format!(
+            "root geometry {offset}+{size}/{align} does not equal descriptor 0+{root_size}/{root_align}"
+        )));
+    }
+    context.node(root, None, "root")
+}
+
+struct ValidationContext {
+    ctor_count: usize,
+    drop_count: usize,
+    skip_count: usize,
+    frames: Vec<(u32, u32)>,
+}
+
+impl ValidationContext {
+    fn geometry(&self, node: &NativeLayoutNode) -> Result<(u32, u32, u32), NativeDescriptorError> {
+        Ok(match *node {
+            NativeLayoutNode::Scalar {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Struct {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Enum {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Array {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Vec {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Set {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Map {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::BoxPtr {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::ArcPtr {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Option {
+                offset,
+                size,
+                align,
+                ..
+            }
+            | NativeLayoutNode::Str {
+                offset,
+                size,
+                align,
+            }
+            | NativeLayoutNode::Blob {
+                offset,
+                size,
+                align,
+            }
+            | NativeLayoutNode::Skip {
+                offset,
+                size,
+                align,
+                ..
+            } => (offset, size, align),
+            NativeLayoutNode::BackRef { distance, offset } => {
+                let index = self
+                    .frames
+                    .len()
+                    .checked_sub(1 + distance as usize)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "backref distance {distance} exceeds {} native frames",
+                            self.frames.len()
+                        ))
+                    })?;
+                let (size, align) = self.frames[index];
+                (offset, size, align)
+            }
+            NativeLayoutNode::Unit { offset } => (offset, 0, 1),
+        })
+    }
+
+    fn header(
+        &self,
+        node: &NativeLayoutNode,
+        bound: Option<u32>,
+        path: &str,
+    ) -> Result<(u32, u32, u32), NativeDescriptorError> {
+        let (offset, size, align) = self.geometry(node)?;
+        if align == 0 || !align.is_power_of_two() {
+            return Err(invalid(format!(
+                "{path} alignment {align} is not a nonzero power of two"
+            )));
+        }
+        if offset % align != 0 {
+            return Err(invalid(format!(
+                "{path} offset {offset} is not aligned to {align}"
+            )));
+        }
+        if size % align != 0 {
+            return Err(invalid(format!(
+                "{path} size {size} is not a multiple of alignment {align}"
+            )));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| invalid(format!("{path} range overflows")))?;
+        if let Some(bound) = bound {
+            if end > bound {
+                return Err(invalid(format!(
+                    "{path} range {offset}..{end} exceeds frame {bound}"
+                )));
+            }
+        } else if offset != 0 {
+            return Err(invalid(format!(
+                "{path} standalone node has nonzero offset {offset}"
+            )));
+        }
+        Ok((offset, size, align))
+    }
+
+    fn table_index(
+        &self,
+        table: &'static str,
+        index: u32,
+        count: usize,
+        path: &str,
+    ) -> Result<(), NativeDescriptorError> {
+        if index as usize >= count {
+            return Err(invalid(format!(
+                "{path} names {table} table index {index}, but the table has {count} entries"
+            )));
+        }
+        Ok(())
+    }
+
+    fn node(
+        &mut self,
+        node: &NativeLayoutNode,
+        bound: Option<u32>,
+        path: &str,
+    ) -> Result<(), NativeDescriptorError> {
+        let (_, size, align) = self.header(node, bound, path)?;
+        match node {
+            NativeLayoutNode::Scalar { kind, .. } => {
+                let expected = scalar_geometry(*kind);
+                if (size, align) != expected {
+                    return Err(invalid(format!(
+                        "{path} scalar {kind:?} has geometry {size}/{align}, expected {}/{}",
+                        expected.0, expected.1
+                    )));
+                }
+            }
+            NativeLayoutNode::Struct {
+                whole_drop, fields, ..
+            } => {
+                if let Some(drop) = whole_drop {
+                    self.table_index("drop", drop.0, self.drop_count, path)?;
+                }
+                let mut names = std::collections::BTreeSet::new();
+                let mut declarations = std::collections::BTreeSet::new();
+                let mut occupied = Vec::new();
+                self.frames.push((size, align));
+                for field in fields.iter() {
+                    let normalized = unicode_normalization::UnicodeNormalization::nfc(field.name)
+                        .collect::<String>();
+                    if !names.insert(normalized) || !declarations.insert(field.declaration_index) {
+                        self.frames.pop();
+                        return Err(invalid(format!("{path} has duplicate field identity")));
+                    }
+                    let child_path = format!("{path}.{}", field.name);
+                    self.node(&field.node, Some(size), &child_path)?;
+                    let (offset, child_size, _) = self.geometry(&field.node)?;
+                    if child_size != 0 {
+                        occupied.push((offset, offset + child_size));
+                    }
+                }
+                self.frames.pop();
+                occupied.sort_unstable();
+                if occupied.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+                    return Err(invalid(format!("{path} has overlapping non-ZST fields")));
+                }
+            }
+            NativeLayoutNode::Enum {
+                tag,
+                whole_drop,
+                variants,
+                ..
+            } => {
+                if let Some(drop) = whole_drop {
+                    self.table_index("drop", drop.0, self.drop_count, path)?;
+                }
+                validate_native_enum(tag, variants, size, path)?;
+                self.frames.push((size, align));
+                for variant in variants.iter() {
+                    self.node(
+                        variant.node,
+                        Some(size),
+                        &format!("{path}::{}", variant.name),
+                    )?;
+                }
+                self.frames.pop();
+            }
+            NativeLayoutNode::Array {
+                len, stride, elem, ..
+            } => {
+                if elem.offset() != 0 {
+                    return Err(invalid(format!("{path} array element has nonzero origin")));
+                }
+                self.node(elem, Some(*stride), &format!("{path}[]"))?;
+                let (_, elem_size, elem_align) = self.geometry(elem)?;
+                if *stride < elem_size || *stride % elem_align != 0 || align < elem_align {
+                    return Err(invalid(format!(
+                        "{path} array stride/alignment is inconsistent"
+                    )));
+                }
+                if len.checked_mul(*stride) != Some(size) {
+                    return Err(invalid(format!(
+                        "{path} array length times stride does not equal size"
+                    )));
+                }
+            }
+            NativeLayoutNode::Vec { elem, ctor, .. } | NativeLayoutNode::Set { elem, ctor, .. } => {
+                self.table_index("ctor", ctor.0, self.ctor_count, path)?;
+                self.child_root(elem, path)?;
+            }
+            NativeLayoutNode::Map {
+                key, value, ctor, ..
+            } => {
+                self.table_index("ctor", ctor.0, self.ctor_count, path)?;
+                self.child_root(key, &format!("{path}.key"))?;
+                self.child_root(value, &format!("{path}.value"))?;
+            }
+            NativeLayoutNode::BoxPtr { inner, ctor, .. }
+            | NativeLayoutNode::ArcPtr { inner, ctor, .. } => {
+                self.table_index("ctor", ctor.0, self.ctor_count, path)?;
+                self.child_root(inner, path)?;
+            }
+            NativeLayoutNode::Option { inner, ctor, .. } => {
+                self.table_index("ctor", ctor.0, self.ctor_count, path)?;
+                self.frames.push((size, align));
+                self.child_root(inner, &format!("{path}.Some"))?;
+                self.frames.pop();
+            }
+            NativeLayoutNode::Str { .. } => {
+                let expected = (
+                    std::mem::size_of::<String>() as u32,
+                    std::mem::align_of::<String>() as u32,
+                );
+                if (size, align) != expected {
+                    return Err(invalid(format!(
+                        "{path} String geometry is not local String geometry"
+                    )));
+                }
+            }
+            NativeLayoutNode::Blob { .. } => {
+                let expected = (
+                    std::mem::size_of::<crate::exec::Blob>() as u32,
+                    std::mem::align_of::<crate::exec::Blob>() as u32,
+                );
+                if (size, align) != expected {
+                    return Err(invalid(format!(
+                        "{path} Blob geometry is not local Blob geometry"
+                    )));
+                }
+            }
+            NativeLayoutNode::Skip { writer, .. } => {
+                self.table_index("skip", writer.0, self.skip_count, path)?;
+            }
+            NativeLayoutNode::BackRef { .. } | NativeLayoutNode::Unit { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn child_root(
+        &mut self,
+        child: &NativeLayoutNode,
+        path: &str,
+    ) -> Result<(), NativeDescriptorError> {
+        if child.offset() != 0 {
+            return Err(invalid(format!("{path} child has nonzero origin")));
+        }
+        self.node(child, None, path)
+    }
+}
+
+fn scalar_geometry(kind: ScalarKind) -> (u32, u32) {
+    match kind {
+        ScalarKind::Bool | ScalarKind::U8 | ScalarKind::I8 => (1, 1),
+        ScalarKind::U16 | ScalarKind::I16 => (2, 2),
+        ScalarKind::Char | ScalarKind::U32 | ScalarKind::I32 | ScalarKind::F32 => (4, 4),
+        ScalarKind::U64 | ScalarKind::I64 | ScalarKind::F64 => (8, 8),
+        ScalarKind::U128 | ScalarKind::I128 => (
+            std::mem::size_of::<u128>() as u32,
+            std::mem::align_of::<u128>() as u32,
+        ),
+    }
+}
+
+fn validate_native_enum(
+    tag: &NativeTagEncoding,
+    variants: &[NativeVariant],
+    frame_size: u32,
+    path: &str,
+) -> Result<(), NativeDescriptorError> {
+    if variants.is_empty() {
+        return Err(invalid(format!("{path} enum has no variants")));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut declarations = std::collections::BTreeSet::new();
+    for variant in variants {
+        let normalized =
+            unicode_normalization::UnicodeNormalization::nfc(variant.name).collect::<String>();
+        if !names.insert(normalized) || !declarations.insert(variant.declaration_index) {
+            return Err(invalid(format!(
+                "{path} enum has duplicate variant identity"
+            )));
+        }
+    }
+    match tag {
+        NativeTagEncoding::Single => {
+            if variants.len() != 1 || !matches!(variants[0].tag, NativeVariantTag::Single) {
+                return Err(invalid(format!(
+                    "{path} single enum tag/variant shape disagrees"
+                )));
+            }
+        }
+        NativeTagEncoding::Direct { offset, size } => {
+            validate_tag_range(*offset, *size, frame_size, path)?;
+            let mut values = std::collections::BTreeSet::new();
+            let mask = width_mask(*size);
+            for variant in variants {
+                let NativeVariantTag::Direct { value } = variant.tag else {
+                    return Err(invalid(format!(
+                        "{path} direct enum has a non-direct variant tag"
+                    )));
+                };
+                if value & !mask != 0 || !values.insert(value) {
+                    return Err(invalid(format!(
+                        "{path} direct enum tag values are not unique/in-width"
+                    )));
+                }
+            }
+        }
+        NativeTagEncoding::Niche {
+            offset,
+            size,
+            niche_start,
+        } => {
+            validate_tag_range(*offset, *size, frame_size, path)?;
+            if niche_start & !width_mask(*size) != 0 {
+                return Err(invalid(format!(
+                    "{path} niche start does not fit its tag width"
+                )));
+            }
+            let mut indexes = std::collections::BTreeSet::new();
+            let mut untagged = 0usize;
+            for variant in variants {
+                match variant.tag {
+                    NativeVariantTag::Niche { index } => {
+                        if !indexes.insert(index) {
+                            return Err(invalid(format!("{path} repeats a niche index")));
+                        }
+                    }
+                    NativeVariantTag::Untagged => untagged += 1,
+                    _ => {
+                        return Err(invalid(format!(
+                            "{path} niche enum has an incompatible tag"
+                        )))
+                    }
+                }
+            }
+            if untagged != 1 {
+                return Err(invalid(format!(
+                    "{path} niche enum needs exactly one untagged variant"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tag_range(
+    offset: u32,
+    size: u8,
+    frame_size: u32,
+    path: &str,
+) -> Result<(), NativeDescriptorError> {
+    if size == 0 || size > 16 {
+        return Err(invalid(format!(
+            "{path} tag width {size} is outside 1..=16"
+        )));
+    }
+    if offset
+        .checked_add(u32::from(size))
+        .is_none_or(|end| end > frame_size)
+    {
+        return Err(invalid(format!("{path} tag exceeds its native frame")));
+    }
+    Ok(())
+}
+
+fn width_mask(size: u8) -> u128 {
+    if size == 16 {
+        u128::MAX
+    } else {
+        (1u128 << (u32::from(size) * 8)) - 1
     }
 }
 

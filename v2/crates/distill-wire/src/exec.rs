@@ -606,6 +606,17 @@ impl<'a> Executor<'a> {
                 } => {
                     self.construct_indirect(wire, dst, *wire_slot, *native, *inner, *ctor, depth)?;
                 }
+                FixupOp::ConstructOption {
+                    wire_tag,
+                    some_wire,
+                    native,
+                    some,
+                    ctor,
+                } => {
+                    self.construct_option(
+                        wire, dst, wire_tag, *some_wire, *native, *some, *ctor, depth,
+                    )?;
+                }
                 FixupOp::WriteSkipDefault { native, writer } => {
                     let entry = self.env.skips.entries.get(writer.0 as usize).ok_or(
                         ExecError::BadTableIndex {
@@ -708,6 +719,12 @@ impl<'a> Executor<'a> {
         let entry = self.ctor(ctor)?;
         let (off, len) = read_varref(wire, wire_slot)?;
         let m = self.meta(elem);
+        if entry.elem_size != m.native_size || entry.elem_align != m.native_align {
+            return Err(integrity(format!(
+                "sequence ctor element geometry {}/{} != plan geometry {}/{}",
+                entry.elem_size, entry.elem_align, m.native_size, m.native_align
+            )));
+        }
         let stride = m
             .wire_stride()
             .ok_or_else(|| integrity("sequence wire stride overflows"))?;
@@ -773,6 +790,31 @@ impl<'a> Executor<'a> {
         let (off, len) = read_varref(wire, wire_slot)?;
         let km = self.meta(key);
         let vm = self.meta(value);
+        let key_end = entry
+            .key_offset
+            .checked_add(km.native_size)
+            .ok_or_else(|| integrity("map ctor key range overflows"))?;
+        let value_end = entry
+            .value_offset
+            .checked_add(vm.native_size)
+            .ok_or_else(|| integrity("map ctor value range overflows"))?;
+        if entry.elem_align == 0
+            || !entry.elem_align.is_power_of_two()
+            || entry.key_offset % km.native_align != 0
+            || entry.value_offset % vm.native_align != 0
+            || entry.elem_align < km.native_align
+            || entry.elem_align < vm.native_align
+            || key_end > entry.elem_size
+            || value_end > entry.elem_size
+            || (km.native_size != 0
+                && vm.native_size != 0
+                && entry.key_offset < value_end
+                && entry.value_offset < key_end)
+        {
+            return Err(integrity(
+                "map ctor pair geometry is inconsistent with its plans",
+            ));
+        }
         let value_off = align_up(km.wire_size, vm.wire_align)
             .ok_or_else(|| integrity("map value offset overflows"))?;
         let pair_align = km.wire_align.max(vm.wire_align);
@@ -869,6 +911,12 @@ impl<'a> Executor<'a> {
         let entry = self.ctor(ctor)?;
         let (off, len) = read_varref(wire, wire_slot)?;
         let m = self.meta(inner);
+        if entry.elem_size != m.native_size || entry.elem_align != m.native_align {
+            return Err(integrity(format!(
+                "indirect ctor element geometry {}/{} != plan geometry {}/{}",
+                entry.elem_size, entry.elem_align, m.native_size, m.native_align
+            )));
+        }
         if len != m.wire_size {
             return Err(integrity(format!(
                 "Box/Arc VarRef len {len} != flattened pointee size {}",
@@ -891,6 +939,59 @@ impl<'a> Executor<'a> {
                 PushError::Panic(_) => ExecError::Callback { what: "ctor push" },
             })
         })();
+        self.seal(cursor, entry, dst.add(native as usize), ctor, result)
+    }
+
+    /// Construct an opaque `Option<T>` without inspecting or writing Rust's
+    /// native discriminant/niche representation. The typed ctor owns None/Some
+    /// formation; fixup only constructs a standalone `T` temporary for Some.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn construct_option(
+        &mut self,
+        wire: &[u8],
+        dst: *mut u8,
+        wire_tag: &WireTagRead,
+        some_wire: u32,
+        native: u32,
+        some: PlanId,
+        ctor: crate::native::CtorId,
+        depth: u32,
+    ) -> Result<(), ExecError> {
+        let index = read_wire_variant(wire, wire_tag, 2)?;
+        let entry = self.ctor(ctor)?;
+        let some_meta = self.meta(some);
+        if entry.elem_size != some_meta.native_size || entry.elem_align != some_meta.native_align {
+            return Err(integrity(format!(
+                "Option ctor element geometry {}/{} != plan geometry {}/{}",
+                entry.elem_size, entry.elem_align, some_meta.native_size, some_meta.native_align
+            )));
+        }
+        self.charge()?;
+        let mut cursor = (entry.begin)(dst.add(native as usize), index as u32)
+            .map_err(|_| ExecError::Callback { what: "ctor begin" })?;
+        let result = if index == 0 {
+            Ok(())
+        } else {
+            (|| {
+                self.charge()?;
+                let temp = Temp::new(entry.elem_size, entry.elem_align)?;
+                let mark = self.stack.len();
+                let start = some_wire as usize;
+                let end = start
+                    .checked_add(some_meta.wire_size as usize)
+                    .ok_or_else(|| integrity("Option::Some wire range overflows"))?;
+                let some_bytes = wire
+                    .get(start..end)
+                    .ok_or_else(|| integrity("Option::Some payload exceeds the wire frame"))?;
+                self.run_plan(some, some_bytes, temp.ptr, depth + 1)?;
+                let pushed = (entry.push)(&mut cursor, temp.ptr);
+                self.disarm_to(mark);
+                pushed.map_err(|error| match error {
+                    PushError::Duplicate => integrity("duplicate Option::Some payload"),
+                    PushError::Panic(_) => ExecError::Callback { what: "ctor push" },
+                })
+            })()
+        };
         self.seal(cursor, entry, dst.add(native as usize), ctor, result)
     }
 
@@ -941,39 +1042,7 @@ impl<'a> Executor<'a> {
         variants: &[(NativeTagWrite, PlanId)],
         depth: u32,
     ) -> Result<(), ExecError> {
-        let index = match wire_tag {
-            WireTagRead::CanonicalU32 { offset } => {
-                let end = *offset as usize + 4;
-                if end > wire.len() {
-                    return Err(integrity("canonical tag exceeds the frame"));
-                }
-                let v =
-                    u32::from_le_bytes(wire[*offset as usize..end].try_into().expect("4 bytes"));
-                if v as usize >= variants.len() {
-                    return Err(integrity(format!(
-                        "canonical tag {v} exceeds the {}-variant enum",
-                        variants.len()
-                    )));
-                }
-                v as usize
-            }
-            WireTagRead::Direct {
-                offset,
-                size,
-                values,
-            } => {
-                let end = *offset as usize + *size as usize;
-                if *size == 0 || *size > 16 || end > wire.len() {
-                    return Err(integrity("direct tag exceeds the frame"));
-                }
-                let mut raw = [0u8; 16];
-                raw[..*size as usize].copy_from_slice(&wire[*offset as usize..end]);
-                let raw = u128::from_le_bytes(raw);
-                values.iter().position(|v| *v == raw).ok_or_else(|| {
-                    integrity(format!("wire discriminant 0x{raw:X} matches no variant"))
-                })?
-            }
-        };
+        let index = read_wire_variant(wire, wire_tag, variants.len())?;
         let (write, plan) = &variants[index];
         // Variant plans are enum-relative on both sides and carry no
         // whole_drop of their own — the enum frame owns the value.
@@ -990,7 +1059,10 @@ impl<'a> Executor<'a> {
                 value,
             } => {
                 let bytes = value.to_le_bytes();
-                let size = (*size).min(16) as u64;
+                if *size == 0 || *size > 16 {
+                    return Err(integrity("native enum tag width is outside 1..=16"));
+                }
+                let size = u64::from(*size);
                 let native_offset = checked_native_range(
                     u64::from(native.base) + u64::from(*offset),
                     size,
@@ -1006,6 +1078,49 @@ impl<'a> Executor<'a> {
             NativeTagWrite::PayloadImplied | NativeTagWrite::None => {}
         }
         Ok(())
+    }
+}
+
+fn read_wire_variant(
+    wire: &[u8],
+    wire_tag: &WireTagRead,
+    variant_count: usize,
+) -> Result<usize, ExecError> {
+    match wire_tag {
+        WireTagRead::CanonicalU32 { offset } => {
+            let end = *offset as usize + 4;
+            if end > wire.len() {
+                return Err(integrity("canonical tag exceeds the frame"));
+            }
+            let value =
+                u32::from_le_bytes(wire[*offset as usize..end].try_into().expect("4 bytes"));
+            if value as usize >= variant_count {
+                return Err(integrity(format!(
+                    "canonical tag {value} exceeds the {variant_count}-variant enum"
+                )));
+            }
+            Ok(value as usize)
+        }
+        WireTagRead::Direct {
+            offset,
+            size,
+            values,
+        } => {
+            if values.len() != variant_count {
+                return Err(integrity("wire discriminant table length is not canonical"));
+            }
+            let end = *offset as usize + *size as usize;
+            if *size == 0 || *size > 16 || end > wire.len() {
+                return Err(integrity("direct tag exceeds the frame"));
+            }
+            let mut raw = [0u8; 16];
+            raw[..*size as usize].copy_from_slice(&wire[*offset as usize..end]);
+            let raw = u128::from_le_bytes(raw);
+            values
+                .iter()
+                .position(|value| *value == raw)
+                .ok_or_else(|| integrity(format!("wire discriminant 0x{raw:X} matches no variant")))
+        }
     }
 }
 

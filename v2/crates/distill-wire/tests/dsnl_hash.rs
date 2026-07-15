@@ -295,6 +295,25 @@ fn container_and_leaf_kinds_bytes_pinned() {
     assert_eq!(dsnl_bytes(&skip).unwrap(), expected); // and NO writer id
 }
 
+#[test]
+fn opaque_option_bytes_and_backref_frame_are_pinned() {
+    let node = noption(
+        0,
+        8,
+        8,
+        NativeLayoutNode::BackRef {
+            distance: 0,
+            offset: 0,
+        },
+        3,
+    );
+    let mut expected = Vec::new();
+    header(&mut expected, 0x0F, 0, 8, 8);
+    header(&mut expected, 0x0D, 0, 8, 8);
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(dsnl_bytes(&node).unwrap(), expected);
+}
+
 // --- exclusion rules ----------------------------------------------------------
 
 #[test]

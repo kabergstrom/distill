@@ -316,9 +316,12 @@ pub fn btree_map_ctor<K: Ord, V>() -> CtorEntry {
     }
 }
 
-unsafe fn option_begin<T>(_: *mut u8, _: u32) -> Result<CtorCursor, CallbackPanic> {
-    contained(|| CtorCursor {
-        state: Box::into_raw(Box::new(None::<T>)).cast(),
+unsafe fn option_begin<T>(_: *mut u8, len: u32) -> Result<CtorCursor, CallbackPanic> {
+    contained(|| {
+        assert!(len <= 1, "single-value ctor length exceeds one");
+        CtorCursor {
+            state: Box::into_raw(Box::new(None::<T>)).cast(),
+        }
     })
 }
 
@@ -361,6 +364,28 @@ unsafe fn arc_finish<T>(cur: &mut CtorCursor, dst: *mut u8) -> Result<(), Callba
         cur.state = std::ptr::null_mut();
         std::ptr::write(dst.cast::<Arc<T>>(), Arc::new(value));
     })
+}
+
+unsafe fn option_finish<T>(cur: &mut CtorCursor, dst: *mut u8) -> Result<(), CallbackPanic> {
+    contained(|| {
+        let value = *Box::from_raw(cur.state.cast::<Option<T>>());
+        cur.state = std::ptr::null_mut();
+        std::ptr::write(dst.cast::<Option<T>>(), value);
+    })
+}
+
+pub fn option_ctor<T>() -> CtorEntry {
+    CtorEntry {
+        begin: option_begin::<T>,
+        push: option_push::<T>,
+        elem_size: size_u32::<T>(),
+        elem_align: align_u32::<T>(),
+        key_offset: 0,
+        value_offset: 0,
+        finish: option_finish::<T>,
+        abort: abort_boxed::<Option<T>>,
+        drop_in_place: drop_in_place_thunk::<Option<T>>,
+    }
 }
 
 pub fn box_ctor<T>() -> CtorEntry {

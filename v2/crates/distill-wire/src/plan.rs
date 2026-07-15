@@ -93,6 +93,14 @@ pub enum FixupOp {
         inner: PlanId,
         ctor: CtorId,
     },
+    /// Semantic None/Some wire enum -> opaque typed `Option<T>` construction.
+    ConstructOption {
+        wire_tag: WireTagRead,
+        some_wire: u32,
+        native: u32,
+        some: PlanId,
+        ctor: CtorId,
+    },
     /// BlobRef → blob table.
     ConstructBlob {
         wire_slot: u32,
@@ -297,6 +305,7 @@ fn native_geom(n: &NativeLayoutNode) -> (u32, u32) {
         | NativeLayoutNode::Map { size, align, .. }
         | NativeLayoutNode::BoxPtr { size, align, .. }
         | NativeLayoutNode::ArcPtr { size, align, .. }
+        | NativeLayoutNode::Option { size, align, .. }
         | NativeLayoutNode::Str { size, align, .. }
         | NativeLayoutNode::Blob { size, align, .. }
         | NativeLayoutNode::Skip { size, align, .. } => (size, align),
@@ -326,6 +335,7 @@ fn needs_frame(n: &NativeLayoutNode) -> bool {
         | NativeLayoutNode::Map { .. }
         | NativeLayoutNode::BoxPtr { .. }
         | NativeLayoutNode::ArcPtr { .. }
+        | NativeLayoutNode::Option { .. }
         | NativeLayoutNode::Skip { .. }
         | NativeLayoutNode::BackRef { .. } => true,
         NativeLayoutNode::Array { elem, .. } => needs_frame(elem),
@@ -514,6 +524,9 @@ impl<'w, 'n> Compiler<'w, 'n> {
             }
             (WireNode::Enum { .. }, NativeLayoutNode::Enum { .. }) => {
                 self.walk_enum(w, n, w_at, n_at, acc)
+            }
+            (WireNode::Enum { .. }, NativeLayoutNode::Option { .. }) => {
+                self.walk_option(w, n, w_at, n_at, acc)
             }
             (
                 WireNode::Array {
@@ -728,6 +741,7 @@ impl<'w, 'n> Compiler<'w, 'n> {
                 (w_child, n_child),
                 (WireNode::Struct { .. }, NativeLayoutNode::Struct { .. })
                     | (WireNode::Enum { .. }, NativeLayoutNode::Enum { .. })
+                    | (WireNode::Enum { .. }, NativeLayoutNode::Option { .. })
             );
             if aggregate_pair && needs_frame(n_child) {
                 let plan = self.compile_frame(w_child, n_child)?;
@@ -908,6 +922,114 @@ impl<'w, 'n> Compiler<'w, 'n> {
         });
         Ok(())
     }
+
+    fn walk_option(
+        &mut self,
+        w: &'w WireNode,
+        n: &'n NativeLayoutNode,
+        w_at: u32,
+        n_at: u32,
+        acc: &mut Acc,
+    ) -> Result<(), PlanError> {
+        let (
+            WireNode::Enum {
+                form,
+                variants: wire_variants,
+                ..
+            },
+            NativeLayoutNode::Option { inner, ctor, .. },
+        ) = (w, n)
+        else {
+            unreachable!("walk_option called on enum/option pairs only");
+        };
+        if w_at != 0 || n_at != 0 {
+            return Err(mismatch("Option must compile as an origin-rooted frame"));
+        }
+
+        let mut variants = wire_variants
+            .iter()
+            .map(|variant| (nfc_of(&variant.name).into_owned(), variant))
+            .collect::<Vec<_>>();
+        variants.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        if variants.len() != 2 || variants[0].0 != "None" || variants[1].0 != "Some" {
+            return Err(mismatch(
+                "opaque native Option requires exactly the wire variants None and Some",
+            ));
+        }
+        if !empty_variant_payload(&variants[0].1.node) {
+            return Err(mismatch("Option::None wire payload is not empty"));
+        }
+        let (some_wire, some_at) = option_some_payload(&variants[1].1.node)?;
+        let wire_tag = wire_tag_for(form, &variants)?;
+
+        self.wire_frames.push(w);
+        self.native_frames.push(n);
+        let some = self.compile_frame(some_wire, inner);
+        self.wire_frames.pop();
+        self.native_frames.pop();
+
+        acc.constructs.push(FixupOp::ConstructOption {
+            wire_tag,
+            some_wire: some_at,
+            native: n_at,
+            some: some?,
+            ctor: *ctor,
+        });
+        Ok(())
+    }
+}
+
+fn empty_variant_payload(node: &WireNode) -> bool {
+    match node {
+        WireNode::Unit { .. } => true,
+        WireNode::Struct { fields, .. } => fields.is_empty(),
+        _ => false,
+    }
+}
+
+fn option_some_payload(node: &WireNode) -> Result<(&WireNode, u32), PlanError> {
+    match node {
+        WireNode::Struct { offset, fields, .. } if fields.len() == 1 => {
+            let field = &fields[0];
+            if nfc_of(&field.name) != "0" {
+                return Err(mismatch("Option::Some payload field is not tuple field 0"));
+            }
+            Ok((
+                &field.node,
+                add32(*offset, field.node.offset(), "Option::Some wire offset")?,
+            ))
+        }
+        WireNode::Struct { .. } => Err(mismatch(
+            "Option::Some wire payload must contain exactly tuple field 0",
+        )),
+        _ => Err(mismatch("Option::Some wire payload is not a struct")),
+    }
+}
+
+fn wire_tag_for(
+    form: &WireEnumForm,
+    variants: &[(String, &crate::wire::WireVariant)],
+) -> Result<WireTagRead, PlanError> {
+    match form {
+        WireEnumForm::Canonical => Ok(WireTagRead::CanonicalU32 { offset: 0 }),
+        WireEnumForm::FullyFlat {
+            tag_offset,
+            tag_size,
+        } => {
+            if *tag_size == 0 || *tag_size > 16 {
+                return Err(mismatch("fully-flat wire enum tag width is outside 1..=16"));
+            }
+            Ok(WireTagRead::Direct {
+                offset: *tag_offset,
+                size: *tag_size,
+                values: variants
+                    .iter()
+                    .map(|(_, variant)| variant.discriminant)
+                    .collect(),
+            })
+        }
+        WireEnumForm::Single => Err(mismatch("two-variant Option has single wire form")),
+    }
 }
 
 fn mul32(a: u32, b: u32, what: &'static str) -> Result<u32, PlanError> {
@@ -938,6 +1060,7 @@ fn native_kind_name(n: &NativeLayoutNode) -> &'static str {
         NativeLayoutNode::Map { .. } => "map",
         NativeLayoutNode::BoxPtr { .. } => "box",
         NativeLayoutNode::ArcPtr { .. } => "arc",
+        NativeLayoutNode::Option { .. } => "option",
         NativeLayoutNode::Str { .. } => "str",
         NativeLayoutNode::Blob { .. } => "blob",
         NativeLayoutNode::Skip { .. } => "skip",

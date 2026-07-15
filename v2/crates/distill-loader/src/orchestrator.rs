@@ -21,6 +21,7 @@ use distill_store::state::SnapshotStamp;
 use distill_wire::artifact::parse_artifact_parts;
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::{execute_fixup, ExecEnv, ExecError, ExecLimits};
+use distill_wire::native::validate_native_descriptor;
 use distill_wire::plan::{compile_plans, CompiledPlans, PlanId};
 
 use crate::component::{
@@ -61,6 +62,7 @@ pub enum RegistrationError {
     DuplicateType(TypeUuid),
     DuplicatePlaceholder(TypeUuid),
     PlaceholderTypeMismatch,
+    InvalidDescriptor { type_uuid: TypeUuid, detail: String },
     Attestation(crate::RuntimeAttestationError),
     Epoch(RuntimeEpochError),
 }
@@ -365,6 +367,30 @@ impl<I: LoaderIO> Loader<I> {
             if !seen.insert(descriptor.type_uuid) {
                 return Err(RegistrationError::DuplicateType(descriptor.type_uuid));
             }
+            let size = u32::try_from(descriptor.size).map_err(|_| {
+                RegistrationError::InvalidDescriptor {
+                    type_uuid: descriptor.type_uuid,
+                    detail: "native size exceeds u32".to_owned(),
+                }
+            })?;
+            let align = u32::try_from(descriptor.align).map_err(|_| {
+                RegistrationError::InvalidDescriptor {
+                    type_uuid: descriptor.type_uuid,
+                    detail: "native alignment exceeds u32".to_owned(),
+                }
+            })?;
+            validate_native_descriptor(
+                descriptor.native_layout,
+                size,
+                align,
+                descriptor.ctors.entries.len(),
+                descriptor.drops.entries.len(),
+                descriptor.skip_writers.entries.len(),
+            )
+            .map_err(|error| RegistrationError::InvalidDescriptor {
+                type_uuid: descriptor.type_uuid,
+                detail: error.to_string(),
+            })?;
         }
         let attestation =
             RuntimeAttestation::from_descriptors(epoch, target_definition_hash, descriptors)
@@ -2293,6 +2319,18 @@ fn construct_value(
     variable: &[u8],
     artifact: &FetchedArtifact,
 ) -> Result<ErasedValue, String> {
+    let root_meta = plans
+        .metas
+        .first()
+        .ok_or_else(|| "compiled fixup plans have no root".to_owned())?;
+    if root_meta.native_size as usize != descriptor.size
+        || root_meta.native_align as usize != descriptor.align
+    {
+        return Err(format!(
+            "root fixup geometry {}/{} does not match descriptor allocation {}/{}",
+            root_meta.native_size, root_meta.native_align, descriptor.size, descriptor.align
+        ));
+    }
     let layout = Layout::from_size_align(descriptor.size.max(1), descriptor.align)
         .map_err(|_| "descriptor has an invalid native allocation layout".to_owned())?;
     // Safety: `layout` is non-zero and validated above. The pointer is used
