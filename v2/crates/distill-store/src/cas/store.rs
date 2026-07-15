@@ -1,10 +1,10 @@
 //! Append/commit/read machinery for the log-structured CAS (§13).
 //!
 //! Write order (pinned): append the build's payload records first and
-//! one result record last, fsync the segment, then insert the index
-//! rows in one memo transaction. **The result record is the commit
-//! marker** — a crash after output 2 of 3 publishes nothing. Segment
-//! creation and deletion also fsync the directory.
+//! one result record last, fsync each touched segment in that order,
+//! then insert the index rows in one memo transaction. **The result
+//! record is the commit marker** — a crash after output 2 of 3 publishes
+//! nothing. Segment creation and deletion also fsync the directory.
 //!
 //! Ordinary commit groups roll as a unit. A record larger than the
 //! regular segment cap is instead written alone in a manifest-typed
@@ -243,12 +243,13 @@ impl Store {
         Ok(id)
     }
 
-    /// Append a group of encoded records to the active segment and fsync
-    /// once — the group's last record is its commit marker, so one
-    /// durable point suffices (§13). Returns (segment id, record start
-    /// offsets).
+    /// Append a group of encoded records and fsync each touched segment once,
+    /// in first-write order. The group's last record is its commit marker, so
+    /// the segment containing it is synced only after every earlier payload
+    /// segment is durable (§13). Returns (segment id, record start offsets).
     fn append_records(&mut self, encoded: &[Vec<u8>]) -> Result<Vec<(u64, u64)>, StoreError> {
         let mut locations = Vec::with_capacity(encoded.len());
+        let mut sync_order = Vec::new();
         for bytes in encoded {
             let len = bytes.len() as u64;
             let oversize = len > self.config.segment_size;
@@ -264,7 +265,9 @@ impl Store {
                 .open(&path)
                 .map_err(Self::io_err(&path))?;
             f.write_all(bytes).map_err(Self::io_err(&path))?;
-            f.sync_all().map_err(Self::io_err(&path))?;
+            if sync_order.last().copied() != Some(segment) {
+                sync_order.push(segment);
+            }
             if oversize {
                 // Dedicated: this segment is closed after exactly one
                 // record. The next regular append rolls a new regular
@@ -274,6 +277,14 @@ impl Store {
                 self.cas.active_len = offset + len;
             }
             locations.push((segment, offset));
+        }
+        for segment in sync_order {
+            let path = self.segment_path(segment);
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(Self::io_err(&path))?;
+            f.sync_all().map_err(Self::io_err(&path))?;
         }
         Ok(locations)
     }
@@ -347,10 +358,10 @@ impl Store {
         Ok(layout_hash)
     }
 
-    /// Commit one build result (§13): payloads first, the result record
-    /// last, one fsync, then one memo transaction inserting the extent
-    /// rows, the candidate-bucket row, and the verified derived-output
-    /// assertions. Advances only the memo sequence.
+    /// Commit one build result (§13): payloads first, the result record last,
+    /// one fsync per touched segment in record order, then one memo transaction
+    /// inserting the extent rows, the candidate-bucket row, and the verified
+    /// derived-output assertions. Advances only the memo sequence.
     pub fn commit_build(&mut self, commit: BuildCommit) -> Result<CommitReceipt, StoreError> {
         // Shape checks before any byte lands.
         if let CommitOutcome::Success { outputs, .. } = &commit.outcome {
