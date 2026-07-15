@@ -190,6 +190,36 @@ fn packfile_io_resolves_fetches_and_resolves_paths_under_one_basis() {
 }
 
 #[test]
+fn file_mount_keeps_blob_ranges_alive_through_the_archive_mapping() {
+    let (manifest, archive, runtime, _, content_hash) = fixture(true);
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("pack.manifest");
+    let archive_path = directory.path().join("pack-7.dpk");
+    std::fs::write(&manifest_path, manifest).unwrap();
+    std::fs::write(&archive_path, archive).unwrap();
+
+    let mut io = PackfileIO::mount_files(
+        &manifest_path,
+        std::slice::from_ref(&archive_path),
+        &runtime,
+    )
+    .unwrap();
+    let basis = io.begin_sweep();
+    io.fetch(ReqId(1), content_hash, &basis);
+    let artifact = match io.poll().pop() {
+        Some(IoEvent::Fetched { artifact, .. }) => artifact,
+        other => panic!("expected mapped artifact, got {other:?}"),
+    };
+
+    drop(io);
+    assert_eq!(
+        artifact.blobs[0].as_bytes(),
+        b"blob",
+        "the Blob's Arc retains its mapped archive after PackfileIO drops"
+    );
+}
+
+#[test]
 fn packfile_io_reattests_the_registered_runtime_before_progress() {
     let (manifest, archive, runtime, _, _) = fixture(true);
     let mut io = PackfileIO::mount(&manifest, vec![archive], &runtime).unwrap();

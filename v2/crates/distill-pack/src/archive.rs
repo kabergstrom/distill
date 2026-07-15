@@ -70,6 +70,24 @@ pub struct DecodedArchive {
     pub objects: BTreeMap<EKey, DecodedObject>,
 }
 
+/// Validated archive metadata without retaining any payload copy. PackfileIO
+/// keeps this beside an mmap and decodes structural frames on demand; blob
+/// extents remain ranges of the mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScannedObject {
+    pub kind: ArchiveObjectKind,
+    pub raw_len: u64,
+    pub location: ObjectLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScannedArchive {
+    pub generation: u32,
+    pub encoder: String,
+    pub zstd_level: i32,
+    pub objects: BTreeMap<EKey, ScannedObject>,
+}
+
 #[derive(Debug)]
 pub enum ArchiveError {
     TooShort,
@@ -162,7 +180,7 @@ fn encode_structural(raw: &[u8], level: i32) -> Result<Vec<u8>, ArchiveError> {
     Ok(encoder.finish()?)
 }
 
-fn decode_structural(stored: &[u8]) -> Result<Vec<u8>, ArchiveError> {
+pub(crate) fn decode_structural(stored: &[u8]) -> Result<Vec<u8>, ArchiveError> {
     if zstd::zstd_safe::get_dict_id_from_frame(stored).is_some() {
         return Err(ArchiveError::ExternalDictionary);
     }
@@ -214,6 +232,39 @@ fn write_object(
 }
 
 pub fn decode_archive(bytes: &[u8]) -> Result<DecodedArchive, ArchiveError> {
+    let scanned = scan_archive(bytes)?;
+    let mut objects = BTreeMap::new();
+    for (key, object) in scanned.objects {
+        let offset =
+            usize::try_from(object.location.offset).map_err(|_| ArchiveError::BadLength)?;
+        let len = usize::try_from(object.location.len).map_err(|_| ArchiveError::BadLength)?;
+        let stored = bytes
+            .get(offset..offset.checked_add(len).ok_or(ArchiveError::BadLength)?)
+            .ok_or(ArchiveError::Truncated)?
+            .to_vec();
+        let raw = match object.kind {
+            ArchiveObjectKind::Structural => decode_structural(&stored)?,
+            ArchiveObjectKind::Blob => stored.clone(),
+        };
+        objects.insert(
+            key,
+            DecodedObject {
+                kind: object.kind,
+                stored,
+                raw,
+                location: object.location,
+            },
+        );
+    }
+    Ok(DecodedArchive {
+        generation: scanned.generation,
+        encoder: scanned.encoder,
+        zstd_level: scanned.zstd_level,
+        objects,
+    })
+}
+
+pub(crate) fn scan_archive(bytes: &[u8]) -> Result<ScannedArchive, ArchiveError> {
     if bytes.len() < 8 + 4 + 4 + 4 + 32 {
         return Err(ArchiveError::TooShort);
     }
@@ -248,36 +299,33 @@ pub fn decode_archive(bytes: &[u8]) -> Result<DecodedArchive, ArchiveError> {
         let crc = r.u32()?;
         r.align16_zero()?;
         let offset = r.pos as u64;
-        let stored = r.take(stored_len)?.to_vec();
-        if crc32c(&stored) != crc {
+        let stored = r.take(stored_len)?;
+        if crc32c(stored) != crc {
             return Err(ArchiveError::Crc);
         }
-        if ekey(&stored) != key {
+        if ekey(stored) != key {
             return Err(ArchiveError::EKey);
         }
-        let raw = match kind {
+        match kind {
             ArchiveObjectKind::Structural => {
-                if raw_len as usize > STRUCTURAL_CHUNK_SIZE {
+                if raw_len > STRUCTURAL_CHUNK_SIZE as u64 {
                     return Err(ArchiveError::BadLength);
                 }
-                let raw = decode_structural(&stored)?;
+                let raw = decode_structural(stored)?;
                 if raw.len() as u64 != raw_len {
                     return Err(ArchiveError::BadLength);
                 }
-                raw
             }
             ArchiveObjectKind::Blob => {
                 if raw_len != stored.len() as u64 {
                     return Err(ArchiveError::BadLength);
                 }
-                stored.clone()
             }
-        };
+        }
         r.align16_zero()?;
-        let object = DecodedObject {
+        let object = ScannedObject {
             kind,
-            raw,
-            stored,
+            raw_len,
             location: ObjectLocation {
                 generation,
                 offset,
@@ -288,7 +336,7 @@ pub fn decode_archive(bytes: &[u8]) -> Result<DecodedArchive, ArchiveError> {
             return Err(ArchiveError::DuplicateEKey);
         }
     }
-    Ok(DecodedArchive {
+    Ok(ScannedArchive {
         generation,
         encoder,
         zstd_level,

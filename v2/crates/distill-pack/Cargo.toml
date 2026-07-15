@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+memmap2 = "0.7"
 zstd.workspace = true
 distill-core = { path = "../distill-core" }
 distill-bundle = { path = "../distill-bundle" }
@@ -14,3 +15,6 @@ distill-loader = { path = "../distill-loader" }
 distill-rpc = { path = "../distill-rpc" }
 distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }
+
+[dev-dependencies]
+tempfile = "3"

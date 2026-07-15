@@ -1,6 +1,7 @@
 //! Frozen pack realization of §15's `LoaderIO` boundary.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use distill_core::attestation::{
@@ -17,7 +18,9 @@ use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
 use distill_wire::exec::Blob;
 
-use crate::archive::{decode_archive, ArchiveError, ArchiveObjectKind, DecodedArchive, EKey};
+use crate::archive::{
+    decode_structural, scan_archive, ArchiveError, ArchiveObjectKind, EKey, ScannedArchive,
+};
 use crate::manifest::{
     decode_manifest, manifest_hash, verify_artifact_metadata, verify_attestation,
     verify_mounted_closure, ArtifactMetadata, ManifestError, PackManifest, PackTarget,
@@ -35,6 +38,10 @@ pub struct RuntimeAttestation {
 
 #[derive(Debug)]
 pub enum MountError {
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Manifest(ManifestError),
     Archive(ArchiveError),
     TargetMismatch,
@@ -74,11 +81,43 @@ impl From<ArtifactError> for MountError {
 
 pub struct PackfileIO {
     manifest: PackManifest,
-    archives: BTreeMap<u32, DecodedArchive>,
+    archives: BTreeMap<u32, MountedArchive>,
     basis: IoBasis,
     events: VecDeque<IoEvent>,
     runtime_target: PackTarget,
     bootstrap_authority: &'static ConsumerBootstrapAuthorityV1,
+}
+
+type ArchiveBacking = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+struct MountedArchive {
+    scanned: ScannedArchive,
+    backing: ArchiveBacking,
+}
+
+impl MountedArchive {
+    fn payload_range(&self, key: EKey) -> Result<(usize, usize), MountError> {
+        let object = self
+            .scanned
+            .objects
+            .get(&key)
+            .ok_or(MountError::MissingObject(key))?;
+        let offset =
+            usize::try_from(object.location.offset).map_err(|_| MountError::IndexMismatch(key))?;
+        let len =
+            usize::try_from(object.location.len).map_err(|_| MountError::IndexMismatch(key))?;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.backing.as_ref().as_ref().len())
+            .ok_or(MountError::IndexMismatch(key))?;
+        let _ = end;
+        Ok((offset, len))
+    }
+
+    fn payload(&self, key: EKey) -> Result<&[u8], MountError> {
+        let (offset, len) = self.payload_range(key)?;
+        Ok(&self.backing.as_ref().as_ref()[offset..offset + len])
+    }
 }
 
 impl PackfileIO {
@@ -87,16 +126,48 @@ impl PackfileIO {
         archive_files: Vec<Vec<u8>>,
         runtime: &RuntimeAttestation,
     ) -> Result<Self, MountError> {
+        let archive_files = archive_files
+            .into_iter()
+            .map(|bytes| Arc::new(bytes) as ArchiveBacking)
+            .collect();
+        Self::mount_backings(manifest_bytes, archive_files, runtime)
+    }
+
+    /// Mount immutable shipping files. Archive mappings remain alive through
+    /// every returned [`Blob`], so uncompressed blob extents are borrowed
+    /// directly rather than copied into the loader heap.
+    pub fn mount_files(
+        manifest_path: &Path,
+        archive_paths: &[PathBuf],
+        runtime: &RuntimeAttestation,
+    ) -> Result<Self, MountError> {
+        let manifest = map_file(manifest_path)?;
+        let archives = archive_paths
+            .iter()
+            .map(|path| map_file(path).map(|mapping| mapping as ArchiveBacking))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::mount_backings(manifest.as_ref(), archives, runtime)
+    }
+
+    fn mount_backings(
+        manifest_bytes: &[u8],
+        archive_files: Vec<ArchiveBacking>,
+        runtime: &RuntimeAttestation,
+    ) -> Result<Self, MountError> {
         let manifest = decode_manifest(manifest_bytes)?;
         Self::verify_runtime(&manifest, runtime)?;
 
         let mut archives = BTreeMap::new();
         let mut raw_hashes = BTreeMap::new();
-        for bytes in archive_files {
-            let decoded = decode_archive(&bytes)?;
-            let generation = decoded.generation;
-            let file_hash = *blake3::hash(&bytes).as_bytes();
-            if archives.insert(generation, decoded).is_some() {
+        for backing in archive_files {
+            let bytes = backing.as_ref().as_ref();
+            let scanned = scan_archive(bytes)?;
+            let generation = scanned.generation;
+            let file_hash = *blake3::hash(bytes).as_bytes();
+            if archives
+                .insert(generation, MountedArchive { scanned, backing })
+                .is_some()
+            {
                 return Err(MountError::DuplicateArchive(generation));
             }
             raw_hashes.insert(generation, file_hash);
@@ -184,7 +255,7 @@ impl PackfileIO {
 
 fn verify_index(
     manifest: &PackManifest,
-    archives: &BTreeMap<u32, DecodedArchive>,
+    archives: &BTreeMap<u32, MountedArchive>,
 ) -> Result<(), MountError> {
     let index: BTreeMap<_, _> = manifest
         .index
@@ -194,7 +265,7 @@ fn verify_index(
     for (key, location) in &index {
         let object = archives
             .get(&location.generation)
-            .and_then(|archive| archive.objects.get(key))
+            .and_then(|archive| archive.scanned.objects.get(key))
             .ok_or(MountError::MissingObject(*key))?;
         if object.location != *location {
             return Err(MountError::IndexMismatch(*key));
@@ -205,7 +276,7 @@ fn verify_index(
             let location = index.get(key).ok_or(MountError::MissingObject(*key))?;
             let object = archives
                 .get(&location.generation)
-                .and_then(|archive| archive.objects.get(key))
+                .and_then(|archive| archive.scanned.objects.get(key))
                 .ok_or(MountError::MissingObject(*key))?;
             if object.kind != ArchiveObjectKind::Structural {
                 return Err(MountError::ObjectKind(*key));
@@ -215,7 +286,7 @@ fn verify_index(
             let location = index.get(key).ok_or(MountError::MissingObject(*key))?;
             let object = archives
                 .get(&location.generation)
-                .and_then(|archive| archive.objects.get(key))
+                .and_then(|archive| archive.scanned.objects.get(key))
                 .ok_or(MountError::MissingObject(*key))?;
             if object.kind != ArchiveObjectKind::Blob {
                 return Err(MountError::ObjectKind(*key));
@@ -227,7 +298,7 @@ fn verify_index(
 
 fn decode_fetched(
     manifest: &PackManifest,
-    archives: &BTreeMap<u32, DecodedArchive>,
+    archives: &BTreeMap<u32, MountedArchive>,
     content_hash: ContentHash,
 ) -> Result<(FetchedArtifact, ArtifactMetadata), MountError> {
     let encoding_index = manifest
@@ -242,29 +313,46 @@ fn decode_fetched(
         .collect();
     let object = |key: EKey| {
         let location = index.get(&key).ok_or(MountError::MissingObject(key))?;
-        archives
+        let archive = archives
             .get(&location.generation)
-            .and_then(|archive| archive.objects.get(&key))
-            .ok_or(MountError::MissingObject(key))
+            .ok_or(MountError::MissingObject(key))?;
+        let object = archive
+            .scanned
+            .objects
+            .get(&key)
+            .ok_or(MountError::MissingObject(key))?;
+        Ok::<_, MountError>((archive, object))
     };
 
     let mut structural = Vec::new();
     for key in &encoding.blocks {
-        let value = object(*key)?;
+        let (archive, value) = object(*key)?;
         if value.kind != ArchiveObjectKind::Structural {
             return Err(MountError::ObjectKind(*key));
         }
-        structural.extend_from_slice(&value.raw);
+        let raw = decode_structural(archive.payload(*key)?)?;
+        if raw.len() as u64 != value.raw_len {
+            return Err(MountError::Archive(ArchiveError::BadLength));
+        }
+        structural.extend_from_slice(&raw);
     }
-    let mut blob_bytes = Vec::new();
+    let mut blob_ranges = Vec::new();
     for key in &encoding.blobs {
-        let value = object(*key)?;
+        let (archive, value) = object(*key)?;
         if value.kind != ArchiveObjectKind::Blob {
             return Err(MountError::ObjectKind(*key));
         }
-        blob_bytes.push(value.raw.clone());
+        let (offset, len) = archive.payload_range(*key)?;
+        blob_ranges.push((Arc::clone(&archive.backing), offset, len));
     }
-    let blob_refs: Vec<_> = blob_bytes.iter().map(Vec::as_slice).collect();
+    let blob_refs = encoding
+        .blobs
+        .iter()
+        .map(|key| {
+            let (archive, _) = object(*key)?;
+            archive.payload(*key)
+        })
+        .collect::<Result<Vec<_>, MountError>>()?;
     let parts = parse_artifact_parts(&structural, &blob_refs)?;
     if parts.content_hash != content_hash {
         return Err(MountError::ContentHash(content_hash));
@@ -286,13 +374,9 @@ fn decode_fetched(
         logical_hash: parts.logical_hash,
         load_deps: parts.load_deps.clone(),
     };
-    let blobs = blob_bytes
+    let blobs = blob_ranges
         .into_iter()
-        .map(|raw| {
-            let len = raw.len();
-            let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(raw);
-            Blob::new(backing, 0, len)
-        })
+        .map(|(backing, offset, len)| Blob::new(backing, offset, len))
         .collect();
     Ok((
         FetchedArtifact {
@@ -302,6 +386,22 @@ fn decode_fetched(
         },
         metadata,
     ))
+}
+
+fn map_file(path: &Path) -> Result<Arc<memmap2::Mmap>, MountError> {
+    let file = std::fs::File::open(path).map_err(|source| MountError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    // Pack files are immutable, content-addressed publications. Mapping the
+    // retained file descriptor therefore preserves the bytes authenticated by
+    // mount while allowing Blob to retain an Arc-backed range.
+    let mapping =
+        unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|source| MountError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(Arc::new(mapping))
 }
 
 impl LoaderIO for PackfileIO {
