@@ -1,7 +1,7 @@
 //! Snapshot-pinned lazy build execution and durable build-import caching.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 use distill_build::artifact_encode::{encode_artifact_value, ArtifactValueSpec, EncodedArtifact};
 use distill_build::dslf::{DslfV1, LocalFailureClass, MigrationPlanFailureV1};
@@ -18,10 +18,10 @@ use distill_build::pipeline::{
 use distill_build::query::{asset_query_result_hash, normalize_path, AssetQuery};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
-    control_failure_fingerprint, trace_payload_bytes, CapabilityKey, ControlFailureCode,
-    ControlFailureSubject, ControlQuery, ControlSubject, ControlValueHash, EntryRole,
-    MigrationControlKind, MigrationControlValue, Observed, StableFailureFingerprint, TraceOp,
-    TraceSource,
+    control_failure_fingerprint, revalidate, trace_payload_bytes, CapabilityKey,
+    ControlFailureCode, ControlFailureSubject, ControlQuery, ControlSubject, ControlValueHash,
+    EntryRole, MigrationControlKind, MigrationControlValue, Observed, StableFailureFingerprint,
+    TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::attestation::MIGRATION_TYPE_UUID;
@@ -53,9 +53,9 @@ use distill_wire::artifact::{parse_artifact, ARTIFACT_FORMAT_VERSION};
 
 use crate::callbacks::{
     CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
-    ProcessContextError, ProcessOutputs,
+    ProcessContextError, ProcessOutputs, ProcessorProducts,
 };
-use crate::coordinator::DaemonCoordinator;
+use crate::coordinator::{CooperativeJob, DaemonCoordinator};
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::migration_control::{self, MigrationDecodeError, MigrationHeader};
 use crate::scanner::RootedScanner;
@@ -93,12 +93,14 @@ impl PublishedTagIndex {
 
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
+    flights: Arc<StageFlightTable>,
 }
 
 impl CoordinatorBuildBackend {
     pub(crate) fn new(coordinator: &Arc<DaemonCoordinator>) -> Self {
         Self {
             coordinator: Arc::downgrade(coordinator),
+            flights: Arc::new(StageFlightTable::default()),
         }
     }
 }
@@ -111,11 +113,13 @@ impl BuildBackend for CoordinatorBuildBackend {
                 .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
                     operation: "build coordinator stopped".to_owned(),
                 })?;
-        let (result, poison) = coordinator.run_scheduled(WorkClass::Interactive, || {
-            let result = build(&coordinator, request);
-            let poison = coordinator.sync_runtime_pipeline_poison();
-            (result, poison)
-        });
+        let flights = Arc::clone(&self.flights);
+        let (result, poison) =
+            coordinator.run_scheduled_cooperative(WorkClass::Interactive, |job| {
+                let result = build_with_runtime(&coordinator, request, flights, job);
+                let poison = coordinator.sync_runtime_pipeline_poison();
+                (result, poison)
+            });
         match poison {
             Ok(Some(poison)) => {
                 return Err(RpcFailure::PipelineUnavailable(Box::new(
@@ -148,7 +152,7 @@ impl BuildBackend for CoordinatorBuildBackend {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BuildError {
     Drifted(DriftedInput),
     DepthExceeded { limit: usize, chain: Vec<AssetUuid> },
@@ -171,6 +175,258 @@ impl BuildError {
             message: message.into(),
             facts: Box::new(facts),
         }
+    }
+}
+
+#[derive(Clone)]
+enum SharedStageOutcome {
+    Success {
+        basis: distill_store::state::InputVersion,
+        products: ProcessorProducts,
+        encoded: Vec<EncodedNodeOutput>,
+        trace: Vec<TraceOp>,
+    },
+    Rejected {
+        basis: distill_store::state::InputVersion,
+        processor_id: String,
+        asset: AssetUuid,
+        code: u32,
+        message: String,
+        trace: Vec<TraceOp>,
+    },
+    Failed {
+        basis: distill_store::state::InputVersion,
+        error: BuildError,
+        trace: Vec<TraceOp>,
+    },
+    Incoherent {
+        basis: distill_store::state::InputVersion,
+        error: BuildError,
+    },
+}
+
+impl SharedStageOutcome {
+    fn basis(&self) -> distill_store::state::InputVersion {
+        match self {
+            Self::Success { basis, .. }
+            | Self::Rejected { basis, .. }
+            | Self::Failed { basis, .. }
+            | Self::Incoherent { basis, .. } => *basis,
+        }
+    }
+
+    fn trace(&self) -> Option<&[TraceOp]> {
+        match self {
+            Self::Success { trace, .. }
+            | Self::Rejected { trace, .. }
+            | Self::Failed { trace, .. } => Some(trace),
+            Self::Incoherent { .. } => None,
+        }
+    }
+}
+
+struct StageFlight {
+    owner: u64,
+    asset: AssetUuid,
+    completed: Mutex<Option<SharedStageOutcome>>,
+    wake: Condvar,
+}
+
+impl StageFlight {
+    fn new(owner: u64, asset: AssetUuid) -> Self {
+        Self {
+            owner,
+            asset,
+            completed: Mutex::new(None),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> SharedStageOutcome {
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while completed.is_none() {
+            completed = self
+                .wake
+                .wait(completed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        completed
+            .as_ref()
+            .expect("completed DSSI flight has an outcome")
+            .clone()
+    }
+
+    fn complete(&self, outcome: SharedStageOutcome) {
+        *self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+        self.wake.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct WaitEdge {
+    owner: u64,
+    ancestry: Vec<AssetUuid>,
+}
+
+#[derive(Default)]
+struct StageFlightState {
+    flights: BTreeMap<[u8; 32], Arc<StageFlight>>,
+    wait_for: BTreeMap<u64, WaitEdge>,
+}
+
+#[derive(Default)]
+struct StageFlightTable {
+    state: Mutex<StageFlightState>,
+}
+
+enum StageFlightAdmission {
+    Leader(StageFlightLeader),
+    Join(StageFlightWait),
+}
+
+impl StageFlightTable {
+    fn acquire(
+        self: &Arc<Self>,
+        key: [u8; 32],
+        asset: AssetUuid,
+        ancestry: &[AssetUuid],
+        job: u64,
+        basis: distill_store::state::InputVersion,
+    ) -> Result<StageFlightAdmission, BuildError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(flight) = state.flights.get(&key).cloned() else {
+            let flight = Arc::new(StageFlight::new(job, asset));
+            state.flights.insert(key, Arc::clone(&flight));
+            return Ok(StageFlightAdmission::Leader(StageFlightLeader {
+                table: Arc::clone(self),
+                key,
+                flight,
+                basis,
+                completed: false,
+            }));
+        };
+        if state.wait_for.contains_key(&job) {
+            return Err(BuildError::Infrastructure(format!(
+                "scheduler job {job} attempted two simultaneous DSSI joins"
+            )));
+        }
+
+        let mut cycle_assets = ancestry.to_vec();
+        cycle_assets.push(flight.asset);
+        let mut current = flight.owner;
+        let mut visited = BTreeSet::new();
+        while current != job {
+            if !visited.insert(current) {
+                return Err(BuildError::Infrastructure(
+                    "the global DSSI wait graph already contains a cycle".into(),
+                ));
+            }
+            let Some(edge) = state.wait_for.get(&current) else {
+                state.wait_for.insert(
+                    job,
+                    WaitEdge {
+                        owner: flight.owner,
+                        ancestry: cycle_assets,
+                    },
+                );
+                return Ok(StageFlightAdmission::Join(StageFlightWait {
+                    table: Arc::clone(self),
+                    waiter: job,
+                    flight,
+                }));
+            };
+            cycle_assets.extend_from_slice(&edge.ancestry);
+            current = edge.owner;
+        }
+        cycle_assets.sort_unstable();
+        cycle_assets.dedup();
+        Err(BuildError::Failed(format!(
+            "strong-reference cycle reaches assets {cycle_assets:?}"
+        )))
+    }
+
+    fn finish(&self, key: [u8; 32], flight: &Arc<StageFlight>, outcome: SharedStageOutcome) {
+        flight.complete(outcome);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .flights
+            .get(&key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, flight))
+        {
+            state.flights.remove(&key);
+        }
+    }
+
+    fn stop_waiting(&self, waiter: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait_for
+            .remove(&waiter);
+    }
+}
+
+struct StageFlightLeader {
+    table: Arc<StageFlightTable>,
+    key: [u8; 32],
+    flight: Arc<StageFlight>,
+    basis: distill_store::state::InputVersion,
+    completed: bool,
+}
+
+impl StageFlightLeader {
+    fn complete(mut self, outcome: SharedStageOutcome) -> SharedStageOutcome {
+        self.table.finish(self.key, &self.flight, outcome.clone());
+        self.completed = true;
+        outcome
+    }
+}
+
+impl Drop for StageFlightLeader {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.table.finish(
+            self.key,
+            &self.flight,
+            SharedStageOutcome::Incoherent {
+                basis: self.basis,
+                error: BuildError::Infrastructure("DSSI flight leader aborted".into()),
+            },
+        );
+    }
+}
+
+struct StageFlightWait {
+    table: Arc<StageFlightTable>,
+    waiter: u64,
+    flight: Arc<StageFlight>,
+}
+
+impl StageFlightWait {
+    fn wait(self, job: &CooperativeJob) -> SharedStageOutcome {
+        let outcome = job.park(|| self.flight.wait());
+        self.table.stop_waiting(self.waiter);
+        outcome
+    }
+}
+
+impl Drop for StageFlightWait {
+    fn drop(&mut self) {
+        self.table.stop_waiting(self.waiter);
     }
 }
 
@@ -208,6 +464,12 @@ struct BuildContext {
     visiting: BTreeSet<AssetUuid>,
     callback_chain: Vec<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodePublication>,
+    stage_runtime: Option<StageRuntime>,
+}
+
+struct StageRuntime {
+    flights: Arc<StageFlightTable>,
+    scheduled_job: Arc<CooperativeJob>,
 }
 
 #[derive(Clone)]
@@ -326,16 +588,13 @@ impl<'a> BuildProcessContext<'a> {
         self.abort(error, ProcessContextError::Failed(detail))
     }
 
-    fn finish(self) -> Result<(Vec<TraceOp>, bool), BuildError> {
-        if let Some(error) = self.fatal {
-            return Err(error);
-        }
-        if self.discarded {
-            return Err(BuildError::Infrastructure(
-                "processor attempted basis was discarded".to_owned(),
-            ));
-        }
-        Ok((self.trace, self.cacheable))
+    fn finish(self) -> (Vec<TraceOp>, bool, Option<BuildError>) {
+        let error = self.fatal.or_else(|| {
+            self.discarded.then(|| {
+                BuildError::Infrastructure("processor attempted basis was discarded".to_owned())
+            })
+        });
+        (self.trace, self.cacheable, error)
     }
 }
 
@@ -567,9 +826,11 @@ fn build_process_artifact(
     })
 }
 
-fn build(
+fn build_with_runtime(
     coordinator: &DaemonCoordinator,
     request: &BuildRequest,
+    flights: Arc<StageFlightTable>,
+    scheduled_job: Arc<CooperativeJob>,
 ) -> Result<BuildPublication, BuildError> {
     let authority = coordinator.schema_authority().ok_or_else(|| {
         BuildError::Failed("project schema authority is not published".to_owned())
@@ -664,6 +925,10 @@ fn build(
         visiting: BTreeSet::new(),
         callback_chain: Vec::new(),
         memo: BTreeMap::new(),
+        stage_runtime: Some(StageRuntime {
+            flights,
+            scheduled_job,
+        }),
     };
     let root = build_asset(&mut context, request.entry.uuid)?;
     ensure_build_basis(&context)?;
@@ -677,6 +942,17 @@ fn build(
         root_content_hash: selected.content_hash,
         artifacts: root.artifacts.into_values().collect(),
         wire_trees: root.wire_trees.into_values().collect(),
+    })
+}
+
+#[cfg(test)]
+fn build(
+    coordinator: &Arc<DaemonCoordinator>,
+    request: &BuildRequest,
+) -> Result<BuildPublication, BuildError> {
+    let flights = Arc::new(StageFlightTable::default());
+    coordinator.run_scheduled_cooperative(WorkClass::Interactive, |job| {
+        build_with_runtime(coordinator, request, flights, job)
     })
 }
 
@@ -781,6 +1057,7 @@ fn try_refine_published_tag_index(
             visiting: BTreeSet::new(),
             callback_chain: Vec::new(),
             memo: BTreeMap::new(),
+            stage_runtime: None,
         };
         for asset in assets {
             let indexed = index_one_tag_entry(&mut context, asset, tag_epoch);
@@ -1179,68 +1456,15 @@ fn process_chain(
     for stage in &chain.stages {
         let static_inputs = processor_static_inputs(context, loaded, stage, current_hash)?;
         let cached = hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?;
-        std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
-        let epoch = context
-            .pipeline
-            .epoch()
-            .map_err(|poison| BuildError::Failed(poison.to_string()))?
-            .clone();
-        let mut process_context = BuildProcessContext::new(
+        let (next_value, encoded) = run_coalesced_processor_stage(
             context,
-            loaded.meta.bundle,
-            loaded.entry.uuid,
-            stage.registration.outputs.clone(),
-        );
-        let outcome =
-            epoch.invoke_processor(&stage.registration.id, current_value, &mut process_context);
-        let (mut trace, cacheable) = process_context.finish()?;
-        let products = match outcome {
-            Ok(products) => products,
-            Err(CallbackInvokeError::Rejected(error)) => {
-                if cacheable {
-                    commit_processor_failure(
-                        context,
-                        loaded,
-                        stage,
-                        &static_inputs,
-                        &trace,
-                        error.code,
-                    )?;
-                }
-                return Err(BuildError::Failed(format!(
-                    "processor {:?} rejected asset {} with code {}: {}",
-                    stage.registration.id, loaded.entry.uuid, error.code, error.message
-                )));
-            }
-            Err(error) => return Err(BuildError::failed(error)),
-        };
-        let next_value = products.primary.clone().ok_or_else(|| {
-            BuildError::Failed(format!(
-                "processor {:?} omitted its primary output",
-                stage.registration.id
-            ))
-        })?;
-        let encoded =
-            encode_processor_products(context, loaded, chain, stage, &products, &mut trace)?;
-        if cacheable {
-            if let Some((cached_outputs, cached_debug)) = cached {
-                ensure_cached_stage_matches(
-                    &cached_outputs,
-                    &cached_debug,
-                    &encoded,
-                    &products.debug,
-                )?;
-            } else {
-                commit_processor_stage(
-                    context,
-                    loaded,
-                    &static_inputs,
-                    &trace,
-                    &encoded,
-                    &products.debug,
-                )?;
-            }
-        }
+            loaded,
+            chain,
+            stage,
+            &static_inputs,
+            current_value,
+            cached,
+        )?;
         let primary = encoded
             .iter()
             .find(|output| output.output_key.is_empty())
@@ -1261,6 +1485,229 @@ fn process_chain(
     let mut outputs = vec![final_primary.expect("nonempty chain has a final primary")];
     outputs.extend(extras.into_values());
     Ok(outputs)
+}
+
+fn run_coalesced_processor_stage(
+    context: &mut BuildContext,
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    stage: &PipelineStage,
+    static_inputs: &StaticInputs,
+    current_value: AuthoredValue,
+    cached: Option<HydratedProcessorStage>,
+) -> Result<(AuthoredValue, Vec<EncodedNodeOutput>), BuildError> {
+    let Some(runtime) = context.stage_runtime.as_ref() else {
+        let outcome = execute_processor_stage_flight(
+            context,
+            loaded,
+            chain,
+            stage,
+            static_inputs,
+            current_value,
+            cached.as_ref(),
+        );
+        return apply_shared_stage_outcome(outcome, cached.as_ref());
+    };
+    let key = static_inputs_digest(static_inputs);
+    let flights = Arc::clone(&runtime.flights);
+    let scheduled_job = Arc::clone(&runtime.scheduled_job);
+    let mut current_value = Some(current_value);
+    loop {
+        match flights.acquire(
+            key,
+            loaded.entry.uuid,
+            &context.callback_chain,
+            scheduled_job.id(),
+            context.basis,
+        )? {
+            StageFlightAdmission::Leader(leader) => {
+                let outcome = execute_processor_stage_flight(
+                    context,
+                    loaded,
+                    chain,
+                    stage,
+                    static_inputs,
+                    current_value
+                        .take()
+                        .expect("only a DSSI leader consumes the processor input"),
+                    cached.as_ref(),
+                );
+                return apply_shared_stage_outcome(leader.complete(outcome), cached.as_ref());
+            }
+            StageFlightAdmission::Join(wait) => {
+                let outcome = wait.wait(&scheduled_job);
+                if !joined_stage_outcome_matches(context, &outcome)? {
+                    continue;
+                }
+                return apply_shared_stage_outcome(outcome, cached.as_ref());
+            }
+        }
+    }
+}
+
+fn execute_processor_stage_flight(
+    context: &mut BuildContext,
+    loaded: &LoadedAsset,
+    chain: &PipelineChain,
+    stage: &PipelineStage,
+    static_inputs: &StaticInputs,
+    current_value: AuthoredValue,
+    cached: Option<&HydratedProcessorStage>,
+) -> SharedStageOutcome {
+    let attempted = (|| -> Result<SharedStageOutcome, BuildError> {
+        std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
+        let epoch = context
+            .pipeline
+            .epoch()
+            .map_err(|poison| BuildError::Failed(poison.to_string()))?
+            .clone();
+        let mut process_context = BuildProcessContext::new(
+            context,
+            loaded.meta.bundle,
+            loaded.entry.uuid,
+            stage.registration.outputs.clone(),
+        );
+        let outcome =
+            epoch.invoke_processor(&stage.registration.id, current_value, &mut process_context);
+        let (mut trace, cacheable, context_error) = process_context.finish();
+        if let Some(error) = context_error {
+            return Ok(shared_stage_failure(context.basis, error, trace));
+        }
+        let products = match outcome {
+            Ok(products) => products,
+            Err(CallbackInvokeError::Rejected(error)) => {
+                if cacheable {
+                    commit_processor_failure(
+                        context,
+                        loaded,
+                        stage,
+                        static_inputs,
+                        &trace,
+                        error.code,
+                    )?;
+                }
+                return Ok(SharedStageOutcome::Rejected {
+                    basis: context.basis,
+                    processor_id: stage.registration.id.clone(),
+                    asset: loaded.entry.uuid,
+                    code: error.code,
+                    message: error.message,
+                    trace,
+                });
+            }
+            Err(error) => return Err(BuildError::failed(error)),
+        };
+        if products.primary.is_none() {
+            return Ok(shared_stage_failure(
+                context.basis,
+                BuildError::Failed(format!(
+                    "processor {:?} omitted its primary output",
+                    stage.registration.id
+                )),
+                trace,
+            ));
+        }
+        let encoded =
+            match encode_processor_products(context, loaded, chain, stage, &products, &mut trace) {
+                Ok(encoded) => encoded,
+                Err(error) => return Ok(shared_stage_failure(context.basis, error, trace)),
+            };
+        if cacheable {
+            if let Some((cached_outputs, cached_debug)) = cached {
+                if let Err(error) = ensure_cached_stage_matches(
+                    cached_outputs,
+                    cached_debug,
+                    &encoded,
+                    &products.debug,
+                ) {
+                    return Ok(shared_stage_failure(context.basis, error, trace));
+                }
+            } else {
+                commit_processor_stage(
+                    context,
+                    loaded,
+                    static_inputs,
+                    &trace,
+                    &encoded,
+                    &products.debug,
+                )?;
+            }
+        }
+        Ok(SharedStageOutcome::Success {
+            basis: context.basis,
+            products,
+            encoded,
+            trace,
+        })
+    })();
+    attempted.unwrap_or_else(|error| SharedStageOutcome::Incoherent {
+        basis: context.basis,
+        error,
+    })
+}
+
+fn shared_stage_failure(
+    basis: distill_store::state::InputVersion,
+    error: BuildError,
+    trace: Vec<TraceOp>,
+) -> SharedStageOutcome {
+    match error {
+        error @ (BuildError::Failed(_) | BuildError::Migration { .. }) => {
+            SharedStageOutcome::Failed {
+                basis,
+                error,
+                trace,
+            }
+        }
+        error => SharedStageOutcome::Incoherent { basis, error },
+    }
+}
+
+fn joined_stage_outcome_matches(
+    context: &mut BuildContext,
+    outcome: &SharedStageOutcome,
+) -> Result<bool, BuildError> {
+    let Some(trace) = outcome.trace() else {
+        return Ok(outcome.basis() == context.basis);
+    };
+    preload_trace_reads(context, trace)?;
+    let source = capture_trace_source(context)?;
+    Ok(revalidate(trace, &source))
+}
+
+fn apply_shared_stage_outcome(
+    outcome: SharedStageOutcome,
+    cached: Option<&HydratedProcessorStage>,
+) -> Result<(AuthoredValue, Vec<EncodedNodeOutput>), BuildError> {
+    match outcome {
+        SharedStageOutcome::Success {
+            products, encoded, ..
+        } => {
+            if let Some((cached_outputs, cached_debug)) = cached {
+                ensure_cached_stage_matches(
+                    cached_outputs,
+                    cached_debug,
+                    &encoded,
+                    &products.debug,
+                )?;
+            }
+            let next = products.primary.ok_or_else(|| {
+                BuildError::Infrastructure("shared processor result omitted its primary".into())
+            })?;
+            Ok((next, encoded))
+        }
+        SharedStageOutcome::Rejected {
+            processor_id,
+            asset,
+            code,
+            message,
+            ..
+        } => Err(BuildError::Failed(format!(
+            "processor {processor_id:?} rejected asset {asset} with code {code}: {message}"
+        ))),
+        SharedStageOutcome::Failed { error, .. } => Err(error),
+        SharedStageOutcome::Incoherent { error, .. } => Err(error),
+    }
 }
 
 fn hydrate_complete_chain(
@@ -1433,9 +1880,15 @@ fn preload_persisted_reads(
         persisted_candidate_traces(&mut store, key_kind, static_key, asset)
             .map_err(BuildError::infrastructure)?
     };
-    let dependencies = traces
+    for trace in &traces {
+        preload_trace_reads(context, trace)?;
+    }
+    Ok(())
+}
+
+fn preload_trace_reads(context: &mut BuildContext, trace: &[TraceOp]) -> Result<(), BuildError> {
+    let dependencies = trace
         .iter()
-        .flat_map(|trace| trace.iter())
         .filter_map(|operation| match operation {
             TraceOp::Read {
                 asset,
@@ -3573,6 +4026,58 @@ mod tests {
     const DEPENDENCY_BUNDLE: BundleUuid = BundleUuid([79; 16]);
     const MIGRATION_ASSET: AssetUuid = AssetUuid([76; 16]);
     const MIGRATION_BUNDLE: BundleUuid = BundleUuid([77; 16]);
+
+    #[test]
+    fn dssi_wait_graph_rejects_cross_job_cycles_with_asset_diagnostics() {
+        let table = Arc::new(StageFlightTable::default());
+        let first_key = [1; 32];
+        let second_key = [2; 32];
+        let first_asset = AssetUuid([1; 16]);
+        let second_asset = AssetUuid([2; 16]);
+        let first = match table
+            .acquire(first_key, first_asset, &[first_asset], 1, InputVersion(1))
+            .unwrap()
+        {
+            StageFlightAdmission::Leader(leader) => leader,
+            StageFlightAdmission::Join(_) => panic!("the first DSSI caller is the leader"),
+        };
+        let second = match table
+            .acquire(
+                second_key,
+                second_asset,
+                &[second_asset],
+                2,
+                InputVersion(1),
+            )
+            .unwrap()
+        {
+            StageFlightAdmission::Leader(leader) => leader,
+            StageFlightAdmission::Join(_) => panic!("the first DSSI caller is the leader"),
+        };
+        let first_wait = match table
+            .acquire(second_key, second_asset, &[first_asset], 1, InputVersion(1))
+            .unwrap()
+        {
+            StageFlightAdmission::Join(wait) => wait,
+            StageFlightAdmission::Leader(_) => panic!("the second DSSI caller must join"),
+        };
+
+        let error = match table.acquire(first_key, first_asset, &[second_asset], 2, InputVersion(1))
+        {
+            Err(BuildError::Failed(error)) => error,
+            Err(other) => panic!("unexpected cycle error: {other:?}"),
+            Ok(_) => panic!("the cross-job DSSI cycle must be rejected"),
+        };
+        assert!(error.contains(&format!("{first_asset:?}")));
+        assert!(error.contains(&format!("{second_asset:?}")));
+
+        drop(first_wait);
+        drop(first);
+        drop(second);
+        let state = table.state.lock().unwrap();
+        assert!(state.flights.is_empty());
+        assert!(state.wait_for.is_empty());
+    }
 
     #[test]
     fn conservative_tag_index_preserves_exact_bundle_identity() {
