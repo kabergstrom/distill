@@ -20,6 +20,7 @@ pub mod importer;
 pub mod lineage_repair;
 mod migration_control;
 pub mod module_loader;
+pub mod module_sdk;
 mod operations;
 pub mod pack_command;
 mod pipeline_map;

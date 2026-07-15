@@ -1,0 +1,16 @@
+[package]
+name = "distill-pipeline-fixture"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+distill-daemon = { path = "../../.." }
+newgameplus-api-macros = { path = "../../../../../../../newgameplus/newgameplus-api-macros" }
+
+[build-dependencies]
+ngp-source-hash = { path = "../../../../../../../newgameplus/ngp-source-hash" }
