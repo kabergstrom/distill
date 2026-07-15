@@ -19,6 +19,7 @@ use rusqlite::OptionalExtension;
 
 use crate::db::{InputTxn, Store};
 use crate::error::StoreError;
+use crate::state::InputVersion;
 
 /// A process-local interned root id (§18) — never serialized beyond this
 /// store instance's disposable state.
@@ -75,6 +76,8 @@ pub struct DirtyEntry {
     pub path: String,
     /// `true` = the path exists (create/update); `false` = deleted.
     pub exists: bool,
+    /// Input version whose file observation this row represents.
+    pub observation: InputVersion,
 }
 
 /// One ordered rename event (§13's `rename_events`).
@@ -124,13 +127,15 @@ impl InputTxn<'_> {
         root: RootId,
         path: &str,
         state: &FileState,
+        observation: InputVersion,
     ) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO files(root_id, path, mtime, size, kind, content_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO files(root_id, path, mtime, size, kind, content_hash, observation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(root_id, path) DO UPDATE SET
                mtime = excluded.mtime, size = excluded.size,
-               kind = excluded.kind, content_hash = excluded.content_hash",
+               kind = excluded.kind, content_hash = excluded.content_hash,
+               observation = excluded.observation",
             rusqlite::params![
                 root.0,
                 path,
@@ -138,6 +143,7 @@ impl InputTxn<'_> {
                 state.size as i64,
                 state.kind.to_i64(),
                 state.content_hash.as_ref().map(|h| h.0.as_slice()),
+                observation.0 as i64,
             ],
         )?;
         Ok(())
@@ -153,41 +159,19 @@ impl InputTxn<'_> {
     }
 
     /// Queue pending work (§13's `dirty_files`).
-    pub fn push_dirty(&mut self, root: RootId, path: &str, exists: bool) -> Result<(), StoreError> {
+    pub fn push_dirty(
+        &mut self,
+        root: RootId,
+        path: &str,
+        exists: bool,
+        observation: InputVersion,
+    ) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO dirty_files(root_id, path, exists_flag) VALUES (?1, ?2, ?3)",
-            rusqlite::params![root.0, path, exists as i64],
+            "INSERT INTO dirty_files(root_id, path, exists_flag, observation)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![root.0, path, exists as i64, observation.0 as i64],
         )?;
         Ok(())
-    }
-
-    /// Consume up to `limit` dirty entries, oldest first, deleting them
-    /// in this same transaction — §14's dirty-queue discipline: a failed
-    /// consumer rolls the consumption back with its work.
-    pub fn take_dirty(&mut self, limit: usize) -> Result<Vec<DirtyEntry>, StoreError> {
-        let mut entries = Vec::new();
-        {
-            let mut stmt = self.txn.prepare(
-                "SELECT seq, root_id, path, exists_flag FROM dirty_files
-                 ORDER BY seq ASC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([limit as i64], |r| {
-                Ok(DirtyEntry {
-                    seq: r.get(0)?,
-                    root: RootId(r.get(1)?),
-                    path: r.get(2)?,
-                    exists: r.get::<_, i64>(3)? != 0,
-                })
-            })?;
-            for row in rows {
-                entries.push(row?);
-            }
-        }
-        for e in &entries {
-            self.txn
-                .execute("DELETE FROM dirty_files WHERE seq = ?1", [e.seq])?;
-        }
-        Ok(entries)
     }
 
     /// Append to the ordered rename log (§13's `rename_events`).
@@ -199,28 +183,42 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Consume the whole rename log in order, deleting it in this same
-    /// transaction.
-    pub fn take_renames(&mut self) -> Result<Vec<RenameEvent>, StoreError> {
-        let mut events = Vec::new();
-        {
-            let mut stmt = self.txn.prepare(
-                "SELECT seq, root_id, from_path, to_path FROM rename_events ORDER BY seq ASC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(RenameEvent {
-                    seq: r.get(0)?,
-                    root: RootId(r.get(1)?),
-                    from_path: r.get(2)?,
-                    to_path: r.get(3)?,
-                })
-            })?;
-            for row in rows {
-                events.push(row?);
+    /// Complete one captured watcher-work fold in this input transaction.
+    /// The dirty prefix is removed only when every path still has the exact
+    /// observation generation selected by the consumer. Rows appended after
+    /// the captured prefix survive.
+    pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<bool, StoreError> {
+        let mut latest = std::collections::BTreeMap::new();
+        for entry in &work.dirty {
+            latest.insert((entry.root, entry.path.as_str()), entry);
+        }
+        for ((root, path), entry) in latest {
+            let current = self
+                .txn
+                .query_row(
+                    "SELECT observation FROM files WHERE root_id = ?1 AND path = ?2",
+                    rusqlite::params![root.0, path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let matches = match (entry.exists, current) {
+                (true, Some(observation)) => observation as u64 == entry.observation.0,
+                (false, None) => true,
+                _ => false,
+            };
+            if !matches {
+                return Ok(false);
             }
         }
-        self.txn.execute("DELETE FROM rename_events", [])?;
-        Ok(events)
+        if let Some(last) = work.dirty.last() {
+            self.txn
+                .execute("DELETE FROM dirty_files WHERE seq <= ?1", [last.seq])?;
+        }
+        if let Some(last) = work.renames.last() {
+            self.txn
+                .execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
+        }
+        Ok(true)
     }
 }
 
@@ -231,7 +229,8 @@ impl Store {
         let mut dirty = Vec::new();
         {
             let mut statement = self.conn.prepare(
-                "SELECT seq, root_id, path, exists_flag FROM dirty_files ORDER BY seq ASC",
+                "SELECT seq, root_id, path, exists_flag, observation
+                 FROM dirty_files ORDER BY seq ASC",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DirtyEntry {
@@ -239,6 +238,7 @@ impl Store {
                     root: RootId(row.get(1)?),
                     path: row.get(2)?,
                     exists: row.get::<_, i64>(3)? != 0,
+                    observation: InputVersion(row.get::<_, i64>(4)? as u64),
                 })
             })?;
             for row in rows {
@@ -263,20 +263,6 @@ impl Store {
             }
         }
         Ok(PendingFileWork { dirty, renames })
-    }
-
-    /// Acknowledge only the captured sequence prefixes, without advancing the
-    /// input version. New rows appended after `work` was observed survive.
-    pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<(), StoreError> {
-        let transaction = self.conn.transaction()?;
-        if let Some(last) = work.dirty.last() {
-            transaction.execute("DELETE FROM dirty_files WHERE seq <= ?1", [last.seq])?;
-        }
-        if let Some(last) = work.renames.last() {
-            transaction.execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
-        }
-        transaction.commit()?;
-        Ok(())
     }
 
     /// Complete deterministic raw-tree projection used by startup

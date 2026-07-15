@@ -144,7 +144,15 @@ fn files_is_keyed_per_root() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "files"),
-        ["root_id", "path", "mtime", "size", "kind", "content_hash"]
+        [
+            "root_id",
+            "path",
+            "mtime",
+            "size",
+            "kind",
+            "content_hash",
+            "observation"
+        ]
     );
     assert_eq!(pk_columns(&conn, "files"), ["root_id", "path"]);
 }
@@ -418,7 +426,7 @@ fn dirty_queue_and_rename_log_are_ordered() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "dirty_files"),
-        ["seq", "root_id", "path", "exists_flag"]
+        ["seq", "root_id", "path", "exists_flag", "observation"]
     );
     assert_eq!(
         columns(&conn, "rename_events"),

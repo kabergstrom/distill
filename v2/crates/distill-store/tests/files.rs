@@ -3,8 +3,9 @@
 //! consumed dirty queue and rename log (§14's discipline).
 
 use distill_core::id::ContentHash;
-use distill_store::files::{DirtyEntry, FileKind, FileState, LogicalPathState};
-use distill_store::{Store, StoreConfig, StoreError};
+use distill_store::files::{FileKind, FileState, LogicalPathState};
+use distill_store::state::InputVersion;
+use distill_store::{Store, StoreConfig};
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -57,8 +58,8 @@ fn file_rows_roundtrip_and_are_keyed_per_root() {
         .input_transaction(|txn| {
             let main = txn.intern_root("main")?;
             let engine = txn.intern_root("engine")?;
-            txn.upsert_file(main, "tex/rock.bundle", &file_state(100))?;
-            txn.upsert_file(engine, "tex/rock.bundle", &file_state(200))?;
+            txn.upsert_file(main, "tex/rock.bundle", &file_state(100), InputVersion(1))?;
+            txn.upsert_file(engine, "tex/rock.bundle", &file_state(200), InputVersion(1))?;
             Ok((main, engine))
         })
         .unwrap();
@@ -90,8 +91,8 @@ fn upsert_replaces_and_remove_deletes() {
     let (root, _) = store
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
-            txn.upsert_file(root, "a.bundle", &file_state(1))?;
-            txn.upsert_file(root, "a.bundle", &file_state(2))?;
+            txn.upsert_file(root, "a.bundle", &file_state(1), InputVersion(1))?;
+            txn.upsert_file(root, "a.bundle", &file_state(2), InputVersion(1))?;
             Ok(root)
         })
         .unwrap();
@@ -125,7 +126,7 @@ fn logical_path_index_has_three_states() {
     let (main, _) = store
         .input_transaction(|txn| {
             let main = txn.intern_root("main")?;
-            txn.upsert_file(main, "tex/rock.bundle", &file_state(1))?;
+            txn.upsert_file(main, "tex/rock.bundle", &file_state(1), InputVersion(1))?;
             Ok(main)
         })
         .unwrap();
@@ -137,7 +138,7 @@ fn logical_path_index_has_three_states() {
     let (engine, _) = store
         .input_transaction(|txn| {
             let engine = txn.intern_root("engine")?;
-            txn.upsert_file(engine, "tex/rock.bundle", &file_state(2))?;
+            txn.upsert_file(engine, "tex/rock.bundle", &file_state(2), InputVersion(2))?;
             Ok(engine)
         })
         .unwrap();
@@ -167,81 +168,12 @@ fn logical_path_index_has_three_states() {
 // ---- dirty queue ----
 
 #[test]
-fn dirty_queue_is_fifo_and_consumed_transactionally() {
-    let (_d, mut store) = store();
-    let (root, _) = store
-        .input_transaction(|txn| {
-            let root = txn.intern_root("main")?;
-            txn.push_dirty(root, "a.bundle", true)?;
-            txn.push_dirty(root, "b.bundle", true)?;
-            txn.push_dirty(root, "c.bundle", false)?;
-            Ok(root)
-        })
-        .unwrap();
-
-    // A failed consumer transaction leaves the queue intact (§14: read
-    // dirty entries, do the work, clear entries in the same transaction).
-    let err = store
-        .input_transaction::<Vec<DirtyEntry>, _>(|txn| {
-            let taken = txn.take_dirty(10)?;
-            assert_eq!(taken.len(), 3);
-            Err(StoreError::Poisoned {
-                error: "consumer crashed".into(),
-            })
-        })
-        .unwrap_err();
-    assert!(matches!(err, StoreError::Poisoned { .. }));
-
-    let (taken, _) = store.input_transaction(|txn| txn.take_dirty(2)).unwrap();
-    assert_eq!(taken.len(), 2, "limit respected");
-    assert_eq!(taken[0].path, "a.bundle");
-    assert_eq!(taken[0].root, root);
-    assert!(taken[0].exists);
-    assert_eq!(taken[1].path, "b.bundle");
-
-    let (rest, _) = store.input_transaction(|txn| txn.take_dirty(10)).unwrap();
-    assert_eq!(rest.len(), 1);
-    assert_eq!(rest[0].path, "c.bundle");
-    assert!(!rest[0].exists, "deletes carry exists = false");
-
-    let (empty, _) = store.input_transaction(|txn| txn.take_dirty(10)).unwrap();
-    assert!(empty.is_empty());
-}
-
-// ---- rename log ----
-
-#[test]
-fn rename_log_is_ordered_and_consumed_transactionally() {
-    let (_d, mut store) = store();
-    let (root, _) = store
-        .input_transaction(|txn| {
-            let root = txn.intern_root("main")?;
-            txn.push_rename(root, "old.bundle", "mid.bundle")?;
-            txn.push_rename(root, "mid.bundle", "new.bundle")?;
-            Ok(root)
-        })
-        .unwrap();
-
-    let (events, _) = store.input_transaction(|txn| txn.take_renames()).unwrap();
-    assert_eq!(events.len(), 2);
-    // Order is the log order — rename chains must replay in sequence (§14).
-    assert_eq!(events[0].from_path, "old.bundle");
-    assert_eq!(events[0].to_path, "mid.bundle");
-    assert_eq!(events[1].from_path, "mid.bundle");
-    assert_eq!(events[1].to_path, "new.bundle");
-    assert_eq!(events[0].root, root);
-
-    let (empty, _) = store.input_transaction(|txn| txn.take_renames()).unwrap();
-    assert!(empty.is_empty(), "consumed");
-}
-
-#[test]
 fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
     let (_directory, mut store) = store();
     let (root, _) = store
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
-            transaction.push_dirty(root, "old.bundle", false)?;
+            transaction.push_dirty(root, "old.bundle", false, InputVersion(1))?;
             transaction.push_rename(root, "old.bundle", "new.bundle")?;
             Ok(root)
         })
@@ -252,19 +184,48 @@ fn pending_file_work_acknowledges_only_the_observed_sequence_prefix() {
 
     store
         .input_transaction(|transaction| {
-            transaction.push_dirty(root, "later.bundle", true)?;
+            transaction.push_dirty(root, "later.bundle", true, InputVersion(2))?;
             transaction.push_rename(root, "later.bundle", "last.bundle")
         })
         .unwrap();
     let version = store.input_version();
-    store.acknowledge_file_work(&observed).unwrap();
-    assert_eq!(store.input_version(), version, "acknowledgement is memo-side");
+    let (acknowledged, next) = store
+        .input_transaction(|transaction| transaction.acknowledge_file_work(&observed))
+        .unwrap();
+    assert!(acknowledged);
+    assert_eq!(next.0, version.0 + 1, "acknowledgement is input-versioned");
 
     let remaining = store.pending_file_work().unwrap();
     assert_eq!(remaining.dirty.len(), 1);
     assert_eq!(remaining.dirty[0].path, "later.bundle");
     assert_eq!(remaining.renames.len(), 1);
     assert_eq!(remaining.renames[0].to_path, "last.bundle");
+}
+
+#[test]
+fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
+    let (_directory, mut store) = store();
+    let (root, _) = store
+        .input_transaction(|transaction| {
+            let root = transaction.intern_root("main")?;
+            transaction.upsert_file(root, "source.txt", &file_state(1), InputVersion(1))?;
+            transaction.push_dirty(root, "source.txt", true, InputVersion(1))?;
+            Ok(root)
+        })
+        .unwrap();
+    let stale = store.pending_file_work().unwrap();
+    store
+        .input_transaction(|transaction| {
+            transaction.upsert_file(root, "source.txt", &file_state(2), InputVersion(2))?;
+            transaction.push_dirty(root, "source.txt", true, InputVersion(2))
+        })
+        .unwrap();
+
+    let (acknowledged, _) = store
+        .input_transaction(|transaction| transaction.acknowledge_file_work(&stale))
+        .unwrap();
+    assert!(!acknowledged);
+    assert_eq!(store.pending_file_work().unwrap().dirty.len(), 2);
 }
 
 // ---- clean watermark (§14) ----

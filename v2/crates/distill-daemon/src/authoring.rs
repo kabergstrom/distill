@@ -27,7 +27,7 @@ use distill_store::journal::{
 use distill_store::Store;
 
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
-use crate::importer::{RegisteredImporter, RegisteredImporters};
+use crate::importer::{ImportWatchIndex, RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
     unique_sibling, write_same_dir_temp, LineageRepairBackend, LineageRepairBackendInitError,
 };
@@ -46,6 +46,7 @@ pub struct AuthoringService {
     pub(crate) builtin_importers: RwLock<RegisteredImporters>,
     pub(crate) pipeline_importers: RwLock<RegisteredImporters>,
     pipeline_projection: RwLock<PipelineProjection>,
+    pub(crate) import_watch_index: Mutex<ImportWatchIndex>,
     tag_index_coordinator: RwLock<Weak<crate::coordinator::DaemonCoordinator>>,
 }
 
@@ -92,6 +93,7 @@ impl AuthoringService {
             builtin_importers: RwLock::new(BTreeMap::new()),
             pipeline_importers: RwLock::new(BTreeMap::new()),
             pipeline_projection: RwLock::new(PipelineProjection::default()),
+            import_watch_index: Mutex::new(ImportWatchIndex::default()),
             tag_index_coordinator: RwLock::new(Weak::new()),
         })
     }

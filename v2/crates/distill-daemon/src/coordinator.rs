@@ -28,7 +28,7 @@ use distill_rpc::{
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
-use distill_store::files::{DirtyEntry, FileKind, FileState, PendingFileWork};
+use distill_store::files::{FileKind, FileState, PendingFileWork};
 use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, ValidatedPipelineEpoch,
     VerifiedSchemaLineageManifest,
@@ -1261,11 +1261,11 @@ impl DaemonCoordinator {
     /// observing one of the transactionally queued dirty paths.
     pub fn reconcile_watched_imports_affected(
         &self,
-        dirty: &[DirtyEntry],
+        work: &PendingFileWork,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let pending = self
             .authoring
-            .watched_imports_affected_by(dirty)
+            .watched_imports_affected_by(&work.dirty, &work.renames)
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
         self.reconcile_watched_import_bundles(pending)
     }
@@ -1301,9 +1301,30 @@ impl DaemonCoordinator {
     }
 
     pub fn acknowledge_file_work(&self, work: &PendingFileWork) -> Result<(), CoordinatorError> {
-        lock_store(&self.store)
-            .acknowledge_file_work(work)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
+        if work.is_empty() {
+            return Ok(());
+        }
+        let base = self.server.current_stamp().version;
+        let store = Arc::clone(&self.store);
+        self.server
+            .coordinated_commit(base, || {
+                let mut store = lock_store(&store);
+                store
+                    .input_transaction(|transaction| {
+                        if transaction.acknowledge_file_work(work)? {
+                            Ok(())
+                        } else {
+                            Err(StoreError::InvalidConfiguration {
+                                error: "watcher work observation changed before acknowledgement"
+                                    .to_owned(),
+                            })
+                        }
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok(Commit::default())
+            })
+            .map(|_| ())
+            .map_err(CoordinatorError::Coordinated)
     }
 
     /// Discover and apply authored directory-import rules. Every generated
@@ -1314,6 +1335,24 @@ impl DaemonCoordinator {
             .authoring
             .directory_import_tasks()
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        self.reconcile_directory_import_tasks(tasks)
+    }
+
+    pub fn reconcile_directory_imports_affected(
+        &self,
+        work: &PendingFileWork,
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
+        let tasks = self
+            .authoring
+            .directory_import_tasks_affected_by(&work.dirty, &work.renames)
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        self.reconcile_directory_import_tasks(tasks)
+    }
+
+    fn reconcile_directory_import_tasks(
+        &self,
+        tasks: Vec<crate::importer::DirectoryImportTask>,
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let mut imported = Vec::with_capacity(tasks.len());
         for task in tasks {
             let base = self.server.current_stamp().version;
@@ -2443,6 +2482,14 @@ fn publish_scan(
         derived_outputs.clone(),
         &rpc_changed_bundles,
     )?;
+    let observation =
+        InputVersion(
+            base.0
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidConfiguration {
+                    error: "input version exhausted".to_owned(),
+                })?,
+        );
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
     store.input_transaction(|transaction| {
         let mut root_ids = BTreeMap::new();
@@ -2459,14 +2506,14 @@ fn publish_scan(
                 (*old_root == root && path == &file.normalized_path).then_some(old != &state)
             });
             if changed.unwrap_or(true) {
-                transaction.upsert_file(root, &file.normalized_path, &state)?;
-                transaction.push_dirty(root, &file.normalized_path, true)?;
+                transaction.upsert_file(root, &file.normalized_path, &state, observation)?;
+                transaction.push_dirty(root, &file.normalized_path, true, observation)?;
             }
         }
         for (root, path, _) in &old_files {
             if !scanned_keys.contains(&(*root, path.clone())) {
                 transaction.remove_file(*root, path)?;
-                transaction.push_dirty(*root, path, false)?;
+                transaction.push_dirty(*root, path, false, observation)?;
             }
         }
         transaction.set_clean_watermark(newest_mtime)?;
@@ -2659,6 +2706,14 @@ fn publish_incremental_scan(
         lineage_repair: Some(plan.lineage_repair.clone()),
         ..Commit::default()
     };
+    let observation =
+        InputVersion(
+            base.0
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidConfiguration {
+                    error: "input version exhausted".to_owned(),
+                })?,
+        );
     let mut changed_bundles = BTreeSet::new();
     if plan.version_poison.is_none() {
         for (bundle_uuid, source) in &plan.bundles {
@@ -2757,13 +2812,13 @@ fn publish_incremental_scan(
                 .or_insert(transaction.intern_root(&mutation.root_name)?);
             match &mutation.state {
                 Some(state) => {
-                    transaction.upsert_file(root, &mutation.path, state)?;
-                    transaction.push_dirty(root, &mutation.path, true)?;
+                    transaction.upsert_file(root, &mutation.path, state, observation)?;
+                    transaction.push_dirty(root, &mutation.path, true, observation)?;
                     newest_mtime = newest_mtime.max(state.mtime);
                 }
                 None => {
                     transaction.remove_file(root, &mutation.path)?;
-                    transaction.push_dirty(root, &mutation.path, false)?;
+                    transaction.push_dirty(root, &mutation.path, false, observation)?;
                 }
             }
         }

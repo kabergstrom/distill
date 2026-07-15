@@ -579,11 +579,16 @@ fn reconcile_imports(
     revalidate_all: bool,
 ) -> Result<(), CoordinatorError> {
     let work = coordinator.pending_file_work()?;
-    let reconcile = coordinator.reconcile_directory_imports().and_then(|_| {
+    let directories = if revalidate_all {
+        coordinator.reconcile_directory_imports()
+    } else {
+        coordinator.reconcile_directory_imports_affected(&work)
+    };
+    let reconcile = directories.and_then(|_| {
         if revalidate_all {
             coordinator.reconcile_watched_imports()
         } else {
-            coordinator.reconcile_watched_imports_affected(&work.dirty)
+            coordinator.reconcile_watched_imports_affected(&work)
         }
     });
     if reconcile.is_ok() {

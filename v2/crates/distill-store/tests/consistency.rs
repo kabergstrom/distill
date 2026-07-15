@@ -134,6 +134,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
                 },
+                distill_store::state::InputVersion(1),
             )?;
             txn.upsert_bundle(&BundleMeta {
                 bundle: BundleUuid([1u8; 16]),
@@ -231,6 +232,7 @@ fn wal_readers_only_observe_complete_input_versions() {
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
                 },
+                distill_store::state::InputVersion(1),
             )
         })
         .unwrap();
@@ -256,6 +258,7 @@ fn wal_readers_only_observe_complete_input_versions() {
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
                 },
+                distill_store::state::InputVersion(2),
             )
         })
         .unwrap();

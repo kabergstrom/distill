@@ -128,13 +128,13 @@ pub(crate) struct DirectoryImportTask {
     listing_dep: FileDep,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecodedDirectoryRules {
     listing: FileQuery,
     rules: Vec<DecodedDirectoryRule>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecodedDirectoryRule {
     id: distill_build::import::ImportRuleId,
     matches: FileQuery,
@@ -142,6 +142,32 @@ struct DecodedDirectoryRule {
     importer: String,
     settings: AuthoredValue,
     output: String,
+}
+
+#[derive(Debug, Clone)]
+struct WatchedImportIndexEntry {
+    root_name: String,
+    source_path: String,
+    basis: Vec<FileDep>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryRuleIndexEntry {
+    root_name: String,
+    source_path: String,
+    rules_bundle: BundleUuid,
+    rules_asset: AssetUuid,
+    rules: DecodedDirectoryRules,
+    listed: BTreeSet<RootedPath>,
+    groups: BTreeMap<(usize, RootedPath), BTreeSet<RootedPath>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ImportWatchIndex {
+    initialized: bool,
+    bundle_hashes: BTreeMap<(String, String), ContentHash>,
+    watched: BTreeMap<BundleUuid, WatchedImportIndexEntry>,
+    directories: BTreeMap<(BundleUuid, AssetUuid), DirectoryRuleIndexEntry>,
 }
 
 impl RegisteredImporter {
@@ -183,6 +209,161 @@ impl RegisteredImporter {
 }
 
 impl AuthoringService {
+    fn ensure_import_watch_index(
+        &self,
+        store: &Store,
+        index: &mut ImportWatchIndex,
+        capabilities: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<(), RpcFailure> {
+        if index.initialized {
+            return Ok(());
+        }
+        index.watched.clear();
+        index.directories.clear();
+        index.bundle_hashes.clear();
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+        for meta in store.all_bundles().map_err(invalid)? {
+            self.index_import_bundle(store, index, &mut backend, &meta)?;
+        }
+        validate_directory_rule_ids(index)?;
+        index.initialized = true;
+        Ok(())
+    }
+
+    fn refresh_dirty_import_index(
+        &self,
+        store: &Store,
+        index: &mut ImportWatchIndex,
+        capabilities: &BTreeMap<String, [u8; 32]>,
+        dirty: &[distill_store::files::DirtyEntry],
+    ) -> Result<(), RpcFailure> {
+        let mut keys = BTreeSet::new();
+        for entry in dirty {
+            if !entry.path.ends_with(".bundle") {
+                continue;
+            }
+            let Some(root_name) = store.root_name(entry.root).map_err(invalid)? else {
+                continue;
+            };
+            keys.insert((root_name, entry.path.clone()));
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let sources = {
+            let snapshot = self
+                .scan_snapshot
+                .lock()
+                .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
+            keys.iter()
+                .filter_map(|(root, path)| {
+                    snapshot
+                        .bundle_at(root, path)
+                        .map(|source| ((root.clone(), path.clone()), source))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let changed = keys
+            .into_iter()
+            .filter(|key| {
+                index.bundle_hashes.get(key).copied()
+                    != sources
+                        .get(key)
+                        .map(|source| ContentHash(source.file_hash.0))
+            })
+            .collect::<BTreeSet<_>>();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        index.watched.retain(|_, entry| {
+            !changed.contains(&(entry.root_name.clone(), entry.source_path.clone()))
+        });
+        index.directories.retain(|_, entry| {
+            !changed.contains(&(entry.root_name.clone(), entry.source_path.clone()))
+        });
+        for key in &changed {
+            index.bundle_hashes.remove(key);
+        }
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+        for (_key, source) in sources.into_iter().filter(|(key, _)| changed.contains(key)) {
+            let Ok(bundle) = &source.parsed else {
+                continue;
+            };
+            let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
+                continue;
+            };
+            self.index_import_bundle(store, index, &mut backend, &meta)?;
+        }
+        validate_directory_rule_ids(index)
+    }
+
+    fn index_import_bundle(
+        &self,
+        store: &Store,
+        index: &mut ImportWatchIndex,
+        backend: &mut RootedImportBackend<'_>,
+        meta: &BundleMeta,
+    ) -> Result<(), RpcFailure> {
+        let root_name = store
+            .root_name(meta.root)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("bundle root is not interned"))?;
+        let bundle = self.cached_bundle(store, meta)?;
+        index
+            .bundle_hashes
+            .insert((root_name.clone(), meta.path.clone()), meta.content_hash);
+        if let Ok(prior) = self.read_prior_import_cached(store, meta) {
+            if prior.model.record.watch {
+                let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
+                    Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
+                        Vec::new()
+                    }
+                    Some(failure) => decode_attempt_basis(&failure.basis)?,
+                    None => prior.model.record.read_set,
+                };
+                if !basis.is_empty() {
+                    index.watched.insert(
+                        meta.bundle,
+                        WatchedImportIndexEntry {
+                            root_name: root_name.clone(),
+                            source_path: meta.path.clone(),
+                            basis,
+                        },
+                    );
+                }
+            }
+        }
+        for entry in bundle
+            .assets
+            .values()
+            .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
+        {
+            let rules = decode_directory_rules(&entry.data)?;
+            let mut listed = backend
+                .enumerate(&rules.listing)
+                .map_err(|error| invalid(format!("directory listing failed: {error:?}")))?;
+            listed.sort_unstable();
+            listed.dedup();
+            let listed = listed.into_iter().collect::<BTreeSet<_>>();
+            let groups = directory_groups(&rules, &listed)?;
+            index.directories.insert(
+                (bundle.uuid, entry.uuid),
+                DirectoryRuleIndexEntry {
+                    root_name: root_name.clone(),
+                    source_path: meta.path.clone(),
+                    rules_bundle: bundle.uuid,
+                    rules_asset: entry.uuid,
+                    rules,
+                    listed,
+                    groups,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Return every watched bundle whose complete committed read-set no longer
     /// reproduces under the current rooted filesystem and importer-capability
     /// projection. The caller reruns these under the single-writer RPC CAS.
@@ -196,41 +377,47 @@ impl AuthoringService {
     pub(crate) fn watched_imports_affected_by(
         &self,
         dirty: &[distill_store::files::DirtyEntry],
+        renames: &[distill_store::files::RenameEvent],
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(Some(dirty))
+        self.watched_imports_needing_reimport_inner(Some((dirty, renames)))
     }
 
     fn watched_imports_needing_reimport_inner(
         &self,
-        dirty: Option<&[distill_store::files::DirtyEntry]>,
+        work: Option<(
+            &[distill_store::files::DirtyEntry],
+            &[distill_store::files::RenameEvent],
+        )>,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let store = self
             .store
             .lock()
             .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
         let capabilities = self.importer_capabilities()?;
+        let mut index = self
+            .import_watch_index
+            .lock()
+            .map_err(|_| invalid("import watch index mutex is poisoned"))?;
+        if work.is_none() {
+            index.initialized = false;
+        }
+        self.ensure_import_watch_index(&store, &mut index, &capabilities)?;
+        if let Some((dirty, _)) = work {
+            self.refresh_dirty_import_index(&store, &mut index, &capabilities, dirty)?;
+        }
         let mut pending = Vec::new();
-        for meta in store.all_bundles().map_err(invalid)? {
-            let prior = match self.read_prior_import_cached(&store, &meta) {
-                Ok(prior) => prior,
-                Err(_) => continue,
-            };
-            if !prior.model.record.watch {
+        for (bundle, indexed) in &index.watched {
+            let Some(meta) = store.bundle(*bundle).map_err(invalid)? else {
                 continue;
-            }
+            };
             let mut backend =
                 RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
-            let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
-                Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
-                    continue;
-                }
-                Some(failure) => decode_attempt_basis(&failure.basis)?,
-                None => prior.model.record.read_set.clone(),
-            };
-            if dirty.is_some_and(|dirty| !read_set_intersects_dirty(&basis, dirty)) {
+            if work.is_some_and(|(dirty, renames)| {
+                !read_set_intersects_work(&indexed.basis, dirty, renames)
+            }) {
                 continue;
             }
-            if !revalidate_read_set(&basis, &mut backend) {
+            if !revalidate_read_set(&indexed.basis, &mut backend) {
                 pending.push(meta.bundle);
             }
         }
@@ -240,83 +427,117 @@ impl AuthoringService {
     }
 
     pub(crate) fn directory_import_tasks(&self) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
+        self.directory_import_tasks_inner(None)
+    }
+
+    pub(crate) fn directory_import_tasks_affected_by(
+        &self,
+        dirty: &[distill_store::files::DirtyEntry],
+        renames: &[distill_store::files::RenameEvent],
+    ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
+        self.directory_import_tasks_inner(Some((dirty, renames)))
+    }
+
+    fn directory_import_tasks_inner(
+        &self,
+        work: Option<(
+            &[distill_store::files::DirtyEntry],
+            &[distill_store::files::RenameEvent],
+        )>,
+    ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
         let mut store = self
             .store
             .lock()
             .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
         let capabilities = self.importer_capabilities()?;
-        let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
-        let mut all_rule_ids = BTreeMap::<[u8; 16], BundleUuid>::new();
+        let backend = RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+        let mut index = self
+            .import_watch_index
+            .lock()
+            .map_err(|_| invalid("import watch index mutex is poisoned"))?;
+        if work.is_none() {
+            index.initialized = false;
+        }
+        self.ensure_import_watch_index(&store, &mut index, &capabilities)?;
+        let mut touched = BTreeSet::<(BundleUuid, AssetUuid, usize, RootedPath)>::new();
+        let mut touched_origins = BTreeSet::<StoredDirectoryOrigin>::new();
+        if let Some((dirty, renames)) = work {
+            let dirty_bundle_keys = dirty_bundle_keys(&store, dirty)?;
+            let changed_bundle_keys =
+                changed_bundle_keys(&index, &self.scan_snapshot, &dirty_bundle_keys)?;
+            let previous = index
+                .directories
+                .values()
+                .filter(|entry| {
+                    changed_bundle_keys
+                        .contains(&(entry.root_name.clone(), entry.source_path.clone()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for entry in &previous {
+                touch_all_directory_groups(entry, &mut touched, &mut touched_origins);
+            }
+            self.refresh_dirty_import_index(&store, &mut index, &capabilities, dirty)?;
+            for entry in index.directories.values() {
+                if changed_bundle_keys
+                    .contains(&(entry.root_name.clone(), entry.source_path.clone()))
+                {
+                    touch_all_directory_groups(entry, &mut touched, &mut touched_origins);
+                }
+            }
+            for entry in index.directories.values_mut() {
+                if changed_bundle_keys
+                    .contains(&(entry.root_name.clone(), entry.source_path.clone()))
+                {
+                    continue;
+                }
+                for rename in renames {
+                    update_directory_index_path(
+                        entry,
+                        &backend,
+                        &rename.from_path,
+                        &mut touched,
+                        &mut touched_origins,
+                    )?;
+                    update_directory_index_path(
+                        entry,
+                        &backend,
+                        &rename.to_path,
+                        &mut touched,
+                        &mut touched_origins,
+                    )?;
+                }
+                for dirty_entry in dirty {
+                    update_directory_index_path(
+                        entry,
+                        &backend,
+                        &dirty_entry.path,
+                        &mut touched,
+                        &mut touched_origins,
+                    )?;
+                }
+            }
+        } else {
+            for entry in index.directories.values() {
+                touch_all_directory_groups(entry, &mut touched, &mut touched_origins);
+            }
+        }
+
         let mut active_origins = BTreeSet::<StoredDirectoryOrigin>::new();
         let mut tasks = Vec::new();
-        let bundles = store.all_bundles().map_err(invalid)?;
-
-        for meta in &bundles {
-            let bundle = self.cached_bundle(&store, meta)?;
-            for entry in bundle
-                .assets
-                .values()
-                .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
-            {
-                let rules = decode_directory_rules(&entry.data)?;
-                for rule in &rules.rules {
-                    if let Some(prior) = all_rule_ids.insert(rule.id.0, bundle.uuid) {
-                        return Err(invalid(format!(
-                            "directory import rule {} is duplicated by bundles {prior} and {}",
-                            uuid_text(rule.id.0),
-                            bundle.uuid
-                        )));
-                    }
-                }
-                let mut listed = backend
-                    .enumerate(&rules.listing)
-                    .map_err(|error| invalid(format!("directory listing failed: {error:?}")))?;
-                listed.sort_unstable();
-                listed.dedup();
-                let listing_dep = FileDep::Listing {
-                    query: rules.listing.clone(),
-                    observed: Observed::Ok(file_query_result_hash(&listed)),
-                };
-                let mut groups = BTreeMap::<(usize, RootedPath), Vec<RootedPath>>::new();
-                for source in listed {
-                    let Some((index, rule)) = rules
-                        .rules
-                        .iter()
-                        .enumerate()
-                        .find(|(_, rule)| query_matches(&rule.matches, &source.path))
-                    else {
-                        continue;
-                    };
-                    let group = directory_group(rule.group, &source)?;
-                    groups.entry((index, group)).or_default().push(source);
-                }
-                for ((rule_index, group), mut sources) in groups {
-                    let rule = &rules.rules[rule_index];
-                    sources.sort_unstable();
-                    sources.dedup();
-                    let destination_path = render_directory_output(&rule.output, &group, &sources)?;
-                    let task = DirectoryImportTask {
-                        rules_bundle: bundle.uuid,
-                        rule: rule.id.clone(),
-                        group: group.clone(),
-                        importer: rule.importer.clone(),
-                        sources,
-                        settings: rule.settings.clone(),
-                        destination_root: group.root.0.clone(),
-                        destination_path,
-                        listing_dep: listing_dep.clone(),
-                    };
-                    active_origins.insert(StoredDirectoryOrigin {
-                        rules_bundle: task.rules_bundle,
-                        rule: distill_store::bundles::DirectoryRuleId(task.rule.0),
-                        group_root: task.group.root.0.clone(),
-                        group_path: task.group.path.clone(),
-                    });
-                    if self.directory_task_needs_run(&store, &task, &capabilities)? {
-                        tasks.push(task);
-                    }
-                }
+        for (bundle, asset, rule_index, group) in &touched {
+            let Some(entry) = index.directories.get(&(*bundle, *asset)) else {
+                continue;
+            };
+            let Some(sources) = entry.groups.get(&(*rule_index, group.clone())) else {
+                continue;
+            };
+            let task = indexed_directory_task(entry, *rule_index, group, sources)?;
+            let origin = directory_task_origin(&task);
+            active_origins.insert(origin.clone());
+            touched_origins.insert(origin);
+            if self.directory_task_needs_run(&store, &task, &capabilities)? {
+                tasks.push(task);
             }
         }
         tasks.sort_by(|left, right| {
@@ -335,7 +556,17 @@ impl AuthoringService {
                 )));
             }
         }
-        self.record_directory_orphans(&mut store, &bundles, &active_origins, &capabilities)?;
+        if work.is_none() {
+            let bundles = store.all_bundles().map_err(invalid)?;
+            self.record_directory_orphans(&mut store, &bundles, &active_origins, &capabilities)?;
+        } else {
+            self.record_directory_orphans_affected(
+                &mut store,
+                &touched_origins,
+                &active_origins,
+                &capabilities,
+            )?;
+        }
         Ok(tasks)
     }
 
@@ -389,6 +620,69 @@ impl AuthoringService {
                     memo_seq: store.memo_seq(),
                 })
                 .map_err(invalid)?;
+        }
+        Ok(())
+    }
+
+    fn record_directory_orphans_affected(
+        &self,
+        store: &mut Store,
+        touched: &BTreeSet<StoredDirectoryOrigin>,
+        active: &BTreeSet<StoredDirectoryOrigin>,
+        capabilities: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<(), RpcFailure> {
+        let orphaned = touched.difference(active).cloned().collect::<Vec<_>>();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+        let mut backend =
+            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+        for origin in orphaned {
+            for bundle in store
+                .bundles_owned_by(origin.rules_bundle)
+                .map_err(invalid)?
+            {
+                let Some(meta) = store.bundle(bundle).map_err(invalid)? else {
+                    continue;
+                };
+                if meta.origin.as_ref() != Some(&origin) {
+                    continue;
+                }
+                let prior = self.read_prior_import_cached(store, &meta)?;
+                let current_basis = prior
+                    .model
+                    .record
+                    .read_set
+                    .iter()
+                    .map(|dependency| observe_file_dep(dependency, &mut backend))
+                    .collect::<Vec<_>>();
+                let basis = encode_attempt_basis(&current_basis)?;
+                let message = format!(
+                    "directory import orphaned: rule {} no longer produces group {}:{}",
+                    origin.rule, origin.group_root, origin.group_path
+                );
+                if store
+                    .watched_import_failure(meta.bundle)
+                    .map_err(invalid)?
+                    .is_some_and(|failure| {
+                        failure.terminal == WatchedImportTerminal::DirectoryOrphan
+                            && failure.basis == basis
+                            && failure.message == message
+                    })
+                {
+                    continue;
+                }
+                store
+                    .record_watched_import_failure(&WatchedImportFailure {
+                        bundle: meta.bundle,
+                        attempted_input_version: store.input_version(),
+                        basis,
+                        terminal: WatchedImportTerminal::DirectoryOrphan,
+                        message,
+                        memo_seq: store.memo_seq(),
+                    })
+                    .map_err(invalid)?;
+            }
         }
         Ok(())
     }
@@ -1198,19 +1492,238 @@ fn decode_prior_import(bundle: Bundle) -> Result<PriorImport, RpcFailure> {
     })
 }
 
-fn read_set_intersects_dirty(
+fn read_set_intersects_work(
     read_set: &[FileDep],
     dirty: &[distill_store::files::DirtyEntry],
+    renames: &[distill_store::files::RenameEvent],
 ) -> bool {
     read_set.iter().any(|dependency| match dependency {
         FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
             dirty.iter().any(|entry| entry.path == *path)
+                || renames
+                    .iter()
+                    .any(|rename| rename.from_path == *path || rename.to_path == *path)
         }
         FileDep::Listing { query, .. } => {
             dirty.iter().any(|entry| query_matches(query, &entry.path))
+                || renames.iter().any(|rename| {
+                    query_matches(query, &rename.from_path) || query_matches(query, &rename.to_path)
+                })
         }
         FileDep::Capability { .. } => false,
     })
+}
+
+fn directory_groups(
+    rules: &DecodedDirectoryRules,
+    listed: &BTreeSet<RootedPath>,
+) -> Result<BTreeMap<(usize, RootedPath), BTreeSet<RootedPath>>, RpcFailure> {
+    let mut groups = BTreeMap::<(usize, RootedPath), BTreeSet<RootedPath>>::new();
+    for source in listed {
+        let Some((index, rule)) = rules
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| query_matches(&rule.matches, &source.path))
+        else {
+            continue;
+        };
+        let group = directory_group(rule.group, source)?;
+        groups
+            .entry((index, group))
+            .or_default()
+            .insert(source.clone());
+    }
+    Ok(groups)
+}
+
+fn dirty_bundle_keys(
+    store: &Store,
+    dirty: &[distill_store::files::DirtyEntry],
+) -> Result<BTreeSet<(String, String)>, RpcFailure> {
+    dirty
+        .iter()
+        .filter(|entry| entry.path.ends_with(".bundle"))
+        .filter_map(|entry| match store.root_name(entry.root) {
+            Ok(Some(root)) => Some(Ok((root, entry.path.clone()))),
+            Ok(None) => None,
+            Err(error) => Some(Err(invalid(error))),
+        })
+        .collect()
+}
+
+fn changed_bundle_keys(
+    index: &ImportWatchIndex,
+    snapshot: &Mutex<ScanSnapshot>,
+    keys: &BTreeSet<(String, String)>,
+) -> Result<BTreeSet<(String, String)>, RpcFailure> {
+    let snapshot = snapshot
+        .lock()
+        .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
+    Ok(keys
+        .iter()
+        .filter(|(root, path)| {
+            index
+                .bundle_hashes
+                .get(&(root.clone(), path.clone()))
+                .copied()
+                != snapshot
+                    .bundle_at(root, path)
+                    .map(|source| ContentHash(source.file_hash.0))
+        })
+        .cloned()
+        .collect())
+}
+
+fn directory_assignment(
+    rules: &DecodedDirectoryRules,
+    source: &RootedPath,
+) -> Result<Option<(usize, RootedPath)>, RpcFailure> {
+    let Some((index, rule)) = rules
+        .rules
+        .iter()
+        .enumerate()
+        .find(|(_, rule)| query_matches(&rule.matches, &source.path))
+    else {
+        return Ok(None);
+    };
+    Ok(Some((index, directory_group(rule.group, source)?)))
+}
+
+fn directory_origin(
+    entry: &DirectoryRuleIndexEntry,
+    rule_index: usize,
+    group: &RootedPath,
+) -> StoredDirectoryOrigin {
+    StoredDirectoryOrigin {
+        rules_bundle: entry.rules_bundle,
+        rule: distill_store::bundles::DirectoryRuleId(entry.rules.rules[rule_index].id.0),
+        group_root: group.root.0.clone(),
+        group_path: group.path.clone(),
+    }
+}
+
+fn touch_directory_group(
+    entry: &DirectoryRuleIndexEntry,
+    rule_index: usize,
+    group: &RootedPath,
+    touched: &mut BTreeSet<(BundleUuid, AssetUuid, usize, RootedPath)>,
+    origins: &mut BTreeSet<StoredDirectoryOrigin>,
+) {
+    touched.insert((
+        entry.rules_bundle,
+        entry.rules_asset,
+        rule_index,
+        group.clone(),
+    ));
+    origins.insert(directory_origin(entry, rule_index, group));
+}
+
+fn touch_all_directory_groups(
+    entry: &DirectoryRuleIndexEntry,
+    touched: &mut BTreeSet<(BundleUuid, AssetUuid, usize, RootedPath)>,
+    origins: &mut BTreeSet<StoredDirectoryOrigin>,
+) {
+    for (rule_index, group) in entry.groups.keys() {
+        touch_directory_group(entry, *rule_index, group, touched, origins);
+    }
+}
+
+fn update_directory_index_path(
+    entry: &mut DirectoryRuleIndexEntry,
+    backend: &RootedImportBackend<'_>,
+    path: &str,
+    touched: &mut BTreeSet<(BundleUuid, AssetUuid, usize, RootedPath)>,
+    origins: &mut BTreeSet<StoredDirectoryOrigin>,
+) -> Result<(), RpcFailure> {
+    let removed = entry
+        .listed
+        .iter()
+        .filter(|source| source.path == path)
+        .cloned()
+        .collect::<Vec<_>>();
+    for source in removed {
+        entry.listed.remove(&source);
+        if let Some((rule_index, group)) = directory_assignment(&entry.rules, &source)? {
+            touch_directory_group(entry, rule_index, &group, touched, origins);
+            let key = (rule_index, group);
+            let empty = entry.groups.get_mut(&key).is_some_and(|sources| {
+                sources.remove(&source);
+                sources.is_empty()
+            });
+            if empty {
+                entry.groups.remove(&key);
+            }
+        }
+    }
+    let added = backend
+        .matching_path(&entry.rules.listing, path)
+        .map_err(|error| invalid(format!("directory listing failed: {error:?}")))?;
+    for source in added {
+        if !entry.listed.insert(source.clone()) {
+            continue;
+        }
+        if let Some((rule_index, group)) = directory_assignment(&entry.rules, &source)? {
+            touch_directory_group(entry, rule_index, &group, touched, origins);
+            entry
+                .groups
+                .entry((rule_index, group))
+                .or_default()
+                .insert(source);
+        }
+    }
+    Ok(())
+}
+
+fn indexed_directory_task(
+    entry: &DirectoryRuleIndexEntry,
+    rule_index: usize,
+    group: &RootedPath,
+    sources: &BTreeSet<RootedPath>,
+) -> Result<DirectoryImportTask, RpcFailure> {
+    let rule = &entry.rules.rules[rule_index];
+    let sources = sources.iter().cloned().collect::<Vec<_>>();
+    let listed = entry.listed.iter().cloned().collect::<Vec<_>>();
+    let destination_path = render_directory_output(&rule.output, group, &sources)?;
+    Ok(DirectoryImportTask {
+        rules_bundle: entry.rules_bundle,
+        rule: rule.id.clone(),
+        group: group.clone(),
+        importer: rule.importer.clone(),
+        sources,
+        settings: rule.settings.clone(),
+        destination_root: group.root.0.clone(),
+        destination_path,
+        listing_dep: FileDep::Listing {
+            query: entry.rules.listing.clone(),
+            observed: Observed::Ok(file_query_result_hash(&listed)),
+        },
+    })
+}
+
+fn directory_task_origin(task: &DirectoryImportTask) -> StoredDirectoryOrigin {
+    StoredDirectoryOrigin {
+        rules_bundle: task.rules_bundle,
+        rule: distill_store::bundles::DirectoryRuleId(task.rule.0),
+        group_root: task.group.root.0.clone(),
+        group_path: task.group.path.clone(),
+    }
+}
+
+fn validate_directory_rule_ids(index: &ImportWatchIndex) -> Result<(), RpcFailure> {
+    let mut owners = BTreeMap::<[u8; 16], BundleUuid>::new();
+    for entry in index.directories.values() {
+        for rule in &entry.rules.rules {
+            if let Some(prior) = owners.insert(rule.id.0, entry.rules_bundle) {
+                return Err(invalid(format!(
+                    "directory import rule {} is duplicated by bundles {prior} and {}",
+                    uuid_text(rule.id.0),
+                    entry.rules_bundle
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct TracedImportContext<'a, 'b> {
@@ -1241,37 +1754,55 @@ impl AuthoringImportContext for TracedImportContext<'_, '_> {
 
 struct RootedImportBackend<'a> {
     scanner: &'a RootedScanner,
-    rows: ScanSnapshot,
+    rows: &'a Mutex<ScanSnapshot>,
     capabilities: &'a BTreeMap<String, [u8; 32]>,
 }
 
 impl<'a> RootedImportBackend<'a> {
     fn new(
         scanner: &'a RootedScanner,
-        snapshot: &Mutex<ScanSnapshot>,
+        snapshot: &'a Mutex<ScanSnapshot>,
         capabilities: &'a BTreeMap<String, [u8; 32]>,
     ) -> Self {
         Self {
             scanner,
-            rows: snapshot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            rows: snapshot,
             capabilities,
         }
     }
 
-    fn rows(&self) -> &ScanSnapshot {
-        &self.rows
+    fn matching_path(
+        &self,
+        query: &FileQuery,
+        path: &str,
+    ) -> Result<BTreeSet<RootedPath>, RawFileFailureClass> {
+        if !query_matches(query, path) {
+            return Ok(BTreeSet::new());
+        }
+        self.rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .files_at(path)
+            .into_iter()
+            .filter(|file| matches!(file.kind, ScannedFileKind::File | ScannedFileKind::Symlink))
+            .map(|file| {
+                RootedPath::new(&file.root_name, &file.normalized_path)
+                    .map_err(|_| RawFileFailureClass::OtherStable)
+            })
+            .collect()
     }
 }
 
 impl ImportBackend for RootedImportBackend<'_> {
     fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass> {
-        let rows = self.rows();
-        let matches = rows
-            .file_rows()
-            .filter(|file| file.normalized_path == path && file.content_hash.is_some())
+        let matches = self
+            .rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .files_at(path)
+            .into_iter()
+            .filter(|file| file.content_hash.is_some())
+            .cloned()
             .collect::<Vec<_>>();
         let [file] = matches.as_slice() else {
             return Err(if matches.is_empty() {
@@ -1288,6 +1819,9 @@ impl ImportBackend for RootedImportBackend<'_> {
             .scanner
             .read_identity_checked(&physical)
             .map_err(scan_failure)?;
+        if Some(ContentHash(*blake3::hash(&bytes).as_bytes())) != file.content_hash {
+            return Err(RawFileFailureClass::OtherStable);
+        }
         Ok((
             RootedPath::new(&file.root_name, path).map_err(|_| RawFileFailureClass::OtherStable)?,
             bytes,
@@ -1295,13 +1829,15 @@ impl ImportBackend for RootedImportBackend<'_> {
     }
 
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass> {
-        let rows = self.rows();
-        let roots = rows
-            .file_rows()
-            .filter(|file| file.normalized_path == path)
-            .map(|file| file.root_name.as_str())
+        let roots = self
+            .rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .files_at(path)
+            .into_iter()
+            .map(|file| file.root_name.clone())
             .collect::<BTreeSet<_>>();
-        match roots.iter().copied().collect::<Vec<_>>().as_slice() {
+        match roots.iter().collect::<Vec<_>>().as_slice() {
             [] => Ok(None),
             [root] => RootName::new(root)
                 .map(Some)
@@ -1317,7 +1853,10 @@ impl ImportBackend for RootedImportBackend<'_> {
             .map(|glob| Glob::new(glob).map(|glob| glob.compile_matcher()))
             .transpose()
             .map_err(|_| RawFileFailureClass::OtherStable)?;
-        let rows = self.rows();
+        let rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut results = Vec::new();
         for file in rows.file_rows() {
             if !matches!(file.kind, ScannedFileKind::File | ScannedFileKind::Symlink) {

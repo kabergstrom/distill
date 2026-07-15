@@ -189,6 +189,7 @@ pub struct ScannedBundle {
 #[derive(Debug, Clone, Default)]
 pub struct ScanSnapshot {
     pub files: BTreeMap<(String, String), ScannedFile>,
+    logical_roots: BTreeMap<String, BTreeSet<String>>,
     pub bundles: BTreeMap<(String, String), Arc<ScannedBundle>>,
     directory_identities: BTreeMap<(String, String), DirectoryObservation>,
     directory_by_identity: BTreeMap<FileIdentity, (String, String, PathBuf)>,
@@ -233,6 +234,15 @@ impl ScanSnapshot {
         self.files.values()
     }
 
+    pub(crate) fn files_at(&self, path: &str) -> Vec<&ScannedFile> {
+        self.logical_roots
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter_map(|root| self.files.get(&(root.clone(), path.to_owned())))
+            .collect()
+    }
+
     pub fn bundle_rows(&self) -> impl Iterator<Item = &ScannedBundle> {
         self.bundles.values().map(AsRef::as_ref)
     }
@@ -243,9 +253,18 @@ impl ScanSnapshot {
         self.bundles.iter()
     }
 
+    pub(crate) fn bundle_at(&self, root: &str, path: &str) -> Option<Arc<ScannedBundle>> {
+        self.bundles
+            .get(&(root.to_owned(), path.to_owned()))
+            .cloned()
+    }
+
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for affected in &delta.affected {
-            remove_matching(&mut self.files, affected);
+            for key in matching_keys(&self.files, affected) {
+                self.files.remove(&key);
+                remove_logical_root(&mut self.logical_roots, &key.1, &key.0);
+            }
             remove_matching(&mut self.bundles, affected);
             let removed_directories = matching_keys(&self.directory_identities, affected);
             for key in removed_directories {
@@ -260,7 +279,13 @@ impl ScanSnapshot {
                 }
             }
         }
-        self.files.extend(delta.observed.files);
+        for (key, file) in delta.observed.files {
+            self.logical_roots
+                .entry(key.1.clone())
+                .or_default()
+                .insert(key.0.clone());
+            self.files.insert(key, file);
+        }
         self.bundles.extend(delta.observed.bundles);
         for (key, observation) in delta.observed.directory_identities {
             self.directory_by_identity.insert(
@@ -1096,6 +1121,16 @@ fn remove_reverse_alias(
     }
 }
 
+fn remove_logical_root(logical: &mut BTreeMap<String, BTreeSet<String>>, path: &str, root: &str) {
+    let empty = logical.get_mut(path).is_some_and(|roots| {
+        roots.remove(root);
+        roots.is_empty()
+    });
+    if empty {
+        logical.remove(path);
+    }
+}
+
 fn validate_incremental_directory_aliases(
     baseline: &ScanSnapshot,
     affected: &[(String, String)],
@@ -1128,6 +1163,14 @@ fn validate_incremental_directory_aliases(
 }
 
 fn rebuild_reverse_indexes(snapshot: &mut ScanSnapshot) -> Result<(), ScanError> {
+    snapshot.logical_roots.clear();
+    for (root, path) in snapshot.files.keys() {
+        snapshot
+            .logical_roots
+            .entry(path.clone())
+            .or_default()
+            .insert(root.clone());
+    }
     snapshot.directory_by_identity.clear();
     for ((root, path), observed) in &snapshot.directory_identities {
         if let Some((first_root, first_path, first)) = snapshot.directory_by_identity.insert(
