@@ -69,7 +69,6 @@ unsafe impl AssetType for RefPlaceholder {
             AssetRuntimeDescriptor {
                 type_uuid: PLACEHOLDER_TYPE,
                 layout_digest: base.layout_digest,
-                fixup_identity: base.fixup_identity,
                 logical_hash: base.logical_hash,
                 build_only: false,
                 compiled_type,

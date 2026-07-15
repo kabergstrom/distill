@@ -68,26 +68,6 @@ struct RevisedShape {
     value: u32,
 }
 
-#[derive(Default)]
-struct SkipA(u32);
-
-#[derive(Default)]
-struct SkipB(u32);
-
-#[distill_asset_macro::asset(uuid = "30000000-0000-4000-8000-000000000001")]
-struct SkipShapeA {
-    value: u32,
-    #[asset(skip)]
-    cache: SkipA,
-}
-
-#[distill_asset_macro::asset(uuid = "30000000-0000-4000-8000-000000000002")]
-struct SkipShapeB {
-    value: u32,
-    #[asset(skip)]
-    cache: SkipB,
-}
-
 #[distill_asset_macro::asset(uuid = "40000000-0000-4000-8000-000000000001")]
 struct ReferenceTarget {
     value: u32,
@@ -141,7 +121,6 @@ fn macro_builds_a_self_consistent_runtime_descriptor() {
     assert_eq!(d.align, align_of::<Example>());
     assert!(d.build_only);
     assert_eq!(d.layout_digest, dsnl_hash(d.native_layout).unwrap());
-    assert_ne!(d.layout_digest, d.fixup_identity);
     assert!(std::ptr::eq(d, Example::descriptor()));
 
     let NativeLayoutNode::Struct { fields, .. } = d.native_layout else {
@@ -269,14 +248,6 @@ fn recursive_default_table_reuses_schema_node_ids_and_is_finite() {
         .nodes
         .iter()
         .any(|(node, path, _)| node.0 == 0 && path == &[PathStep::Field("child")]));
-}
-
-#[test]
-fn fixup_identity_commits_to_nominal_skip_table_assignments() {
-    let a = SkipShapeA::descriptor();
-    let b = SkipShapeB::descriptor();
-    assert_eq!(a.layout_digest, b.layout_digest);
-    assert_ne!(a.fixup_identity, b.fixup_identity);
 }
 
 #[test]

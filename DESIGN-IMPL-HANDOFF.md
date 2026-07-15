@@ -40,7 +40,8 @@ registration; `ModuleAbiIdentity` separately gates the host interface. Runtime
 compatibility is checked per authenticated artifact by terminal TypeUuid/DSLH
 and successful DSWL plan compilation against the live descriptor. Module epoch
 changes reconnect/resubscribe. Exact canonical target rows replace DSTS while
-per-target DSTG remains. Fix the generic `Option<T>` descriptor before removing
+per-target DSTG remains. DSFT is also removed: there is no cross-epoch plan
+cache, and any future epoch-local cache uses `(TypeUuid, LayoutHash)`. Fix the generic `Option<T>` descriptor before removing
 the currently compensating DSNL gates.
 
 **Memory constraints (from `MEMORY.md`):**

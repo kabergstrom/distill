@@ -38,9 +38,6 @@ pub struct AssetRuntimeDescriptor {
     /// Cross-binary measured layout digest (§5): registration,
     /// pack-mount (§16), and connect (§17) comparisons.
     pub layout_digest: [u8; 32],
-    /// Binary-local fixup-table identity (§5): the plan-cache key.
-    /// Never compared across binaries.
-    pub fixup_identity: [u8; 32],
     /// The logical hash this binary's type projects to — checked
     /// against artifact headers (§12: a mismatch is a registry
     /// disagreement, an error, never a migration trigger).

@@ -1,7 +1,6 @@
 //! Deterministic descriptor construction shared by all `#[asset]`
 //! expansions. One walk creates the native tree and every table ID;
-//! `DSNL` hashes the measured tree while `DSFT` additionally commits to
-//! the binary-local table assignment.
+//! `DSNL` hashes the measured tree for local descriptor diagnostics.
 
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -65,18 +64,6 @@ impl RegistryExtrasBuilder {
     }
 }
 
-enum AssignmentKind {
-    Ctor,
-    Drop,
-    Skip,
-}
-
-struct Assignment {
-    kind: AssignmentKind,
-    id: u32,
-    nominal: &'static str,
-}
-
 type DropThunk = unsafe fn(*mut u8) -> Result<(), CallbackPanic>;
 
 #[derive(Default)]
@@ -86,7 +73,6 @@ pub struct LayoutBuilder {
     skips: Vec<SkipEntry>,
     ctor_ids: HashMap<TypeId, CtorId>,
     drop_ids: HashMap<TypeId, DropId>,
-    assignments: Vec<Assignment>,
     frames: Vec<TypeId>,
 }
 
@@ -119,11 +105,6 @@ impl LayoutBuilder {
         let id = CtorId(checked_len(self.ctors.len()));
         self.ctors.push(entry);
         self.ctor_ids.insert(type_id, id);
-        self.assignments.push(Assignment {
-            kind: AssignmentKind::Ctor,
-            id: id.0,
-            nominal: std::any::type_name::<T>(),
-        });
         id
     }
 
@@ -138,22 +119,12 @@ impl LayoutBuilder {
         let id = DropId(checked_len(self.drops.len()));
         self.drops.push(crate::thunks::drop_in_place_thunk::<T>);
         self.drop_ids.insert(type_id, id);
-        self.assignments.push(Assignment {
-            kind: AssignmentKind::Drop,
-            id: id.0,
-            nominal: std::any::type_name::<T>(),
-        });
         Some(id)
     }
 
     pub fn register_skip<T: Default + 'static>(&mut self) -> SkipDefaultId {
         let id = SkipDefaultId(checked_len(self.skips.len()));
         self.skips.push(crate::thunks::skip_entry::<T>());
-        self.assignments.push(Assignment {
-            kind: AssignmentKind::Skip,
-            id: id.0,
-            nominal: std::any::type_name::<T>(),
-        });
         id
     }
 
@@ -173,11 +144,9 @@ impl LayoutBuilder {
     fn finish(self, root: NativeLayoutNode) -> BuiltLayout {
         let root = Box::leak(Box::new(root));
         let layout_digest = dsnl_hash(root).expect("#[asset] generated a valid DSNL tree");
-        let fixup_identity = fixup_identity(layout_digest, &self.assignments);
         BuiltLayout {
             root,
             layout_digest,
-            fixup_identity,
             ctors: Box::leak(Box::new(CtorTable {
                 entries: Box::leak(self.ctors.into_boxed_slice()),
             })),
@@ -194,30 +163,9 @@ impl LayoutBuilder {
 struct BuiltLayout {
     root: &'static NativeLayoutNode,
     layout_digest: [u8; 32],
-    fixup_identity: [u8; 32],
     ctors: &'static CtorTable,
     drops: &'static DropTable,
     skips: &'static SkipWriterTable,
-}
-
-fn fixup_identity(layout: [u8; 32], assignments: &[Assignment]) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"DSFT");
-    hash.update(&[1]);
-    hash.update(&layout);
-    hash.update(&(assignments.len() as u32).to_le_bytes());
-    for assignment in assignments {
-        hash.update(&[match assignment.kind {
-            AssignmentKind::Ctor => 0,
-            AssignmentKind::Drop => 1,
-            AssignmentKind::Skip => 2,
-        }]);
-        hash.update(&assignment.id.to_le_bytes());
-        let name = assignment.nominal.nfc().collect::<String>();
-        hash.update(&(name.len() as u32).to_le_bytes());
-        hash.update(name.as_bytes());
-    }
-    *hash.finalize().as_bytes()
 }
 
 #[derive(Default)]
@@ -324,7 +272,6 @@ where
     AssetRuntimeDescriptor {
         type_uuid: metadata.type_uuid,
         layout_digest: built.layout_digest,
-        fixup_identity: built.fixup_identity,
         logical_hash: compiled_type.logical_hash,
         build_only: metadata.build_only,
         compiled_type,

@@ -49,7 +49,8 @@ This section is the current authority for module/schema pairing and runtime
 asset compatibility. It supersedes every older clause in this document that
 requires `CompiledTypeRow`, `DSCA`, `DSLP`, `DSRE`, `RegistryExtrasV1`, a
 target-native bootstrap table, an accepted runtime type set, attestation
-expansion, or in-place Hub reattestation. Those names remain only in the
+expansion, in-place Hub reattestation, or the binary-local `DSFT` summary.
+Those names remain only in the
 historical review ledger until the implementation-removal milestone deletes
 their codecs and protocol fields.
 
@@ -71,6 +72,9 @@ There are three independent boundaries:
    `NativeLayoutNode`. Execution uses the size, alignment, ctor, drop, and skip
    tables from that same descriptor. Different producer and consumer native
    layouts are supported; DSNL equality is neither required nor sufficient.
+   There is no cross-epoch fixup-plan cache, so a second digest over local table
+   assignments adds no safety and is removed. A future cache must be scoped to
+   one live module epoch and keyed by `(TypeUuid, LayoutHash)`.
 3. **Target selection.** `DSTG` remains the compact commitment to one complete
    target definition and crosses RPC/build/pack boundaries. A candidate target
    set is stored and compared as its canonical sorted `(name, DSTG)` rows;
