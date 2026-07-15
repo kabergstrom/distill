@@ -111,11 +111,19 @@ mod tests {
     use super::*;
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
-    use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
+    use distill_schema::ngp_schema::LayoutIdentity;
 
     const SOURCE: TypeUuid = TypeUuid([1; 16]);
     const TERMINAL: TypeUuid = TypeUuid([2; 16]);
     const EXTRA: TypeUuid = TypeUuid([3; 16]);
+
+    fn test_layout_identity() -> LayoutIdentity {
+        LayoutIdentity {
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            rustc: "rustc test".into(),
+            algorithm_version: 1,
+        }
+    }
 
     fn target(os: TargetOs) -> Target {
         Target::new(
@@ -124,7 +132,7 @@ mod tests {
             BTreeSet::from([GraphicsApi::new("vulkan").unwrap()]),
             false,
             true,
-            consumer_compilation_identity_v1().clone(),
+            test_layout_identity(),
         )
         .unwrap()
     }

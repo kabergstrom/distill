@@ -50,9 +50,9 @@ asset compatibility. It supersedes every older clause in this document that
 requires `CompiledTypeRow`, `DSCA`, `DSLP`, `DSRE`, `RegistryExtrasV1`, a
 target-native bootstrap table, an accepted runtime type set, attestation
 expansion, in-place Hub reattestation, or the binary-local `DSFT` summary.
-Those names remain only in the
-historical review ledger until the implementation-removal milestone deletes
-their codecs and protocol fields.
+Those names remain only in superseded historical clauses and the review
+ledger; the current implementation contains none of their codecs or protocol
+fields.
 
 There are three independent boundaries:
 

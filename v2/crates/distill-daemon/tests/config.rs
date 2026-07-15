@@ -1,5 +1,13 @@
 use distill_daemon::config::{DaemonConfig, DaemonConfigError};
-use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
+use distill_schema::ngp_schema::LayoutIdentity;
+
+fn test_layout_identity() -> LayoutIdentity {
+    LayoutIdentity {
+        target_triple: "aarch64-apple-darwin".into(),
+        rustc: "rustc test".into(),
+        algorithm_version: 1,
+    }
+}
 
 fn valid_config(temp: &tempfile::TempDir) -> String {
     std::fs::create_dir_all(temp.path().join("assets")).unwrap();
@@ -55,9 +63,7 @@ fn parses_and_validates_the_complete_configuration_surface() {
     assert_eq!(config.assets.roots.len(), 1);
     assert_eq!(config.store_config().segment_size, 256 * 1024 * 1024);
     assert_eq!(config.store_config().cache_limit, 20 * 1024 * 1024 * 1024);
-    let definitions = config
-        .target_definitions(consumer_compilation_identity_v1())
-        .unwrap();
+    let definitions = config.target_definitions(&test_layout_identity()).unwrap();
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].name(), "dev");
 }
@@ -127,12 +133,8 @@ fn target_definition_hash_changes_for_a_bound_target_edit() {
     )
     .unwrap();
     assert_ne!(
-        a.target_definitions(consumer_compilation_identity_v1())
-            .unwrap()[0]
-            .definition_hash(),
-        b.target_definitions(consumer_compilation_identity_v1())
-            .unwrap()[0]
-            .definition_hash()
+        a.target_definitions(&test_layout_identity()).unwrap()[0].definition_hash(),
+        b.target_definitions(&test_layout_identity()).unwrap()[0].definition_hash()
     );
 }
 
@@ -141,7 +143,7 @@ fn targets_bind_layout_identity() {
     let temp = tempfile::tempdir().unwrap();
     let config =
         DaemonConfig::parse(temp.path().join("distill.toml"), &valid_config(&temp)).unwrap();
-    let first = consumer_compilation_identity_v1().clone();
+    let first = test_layout_identity();
     let mut second = first.clone();
     second.algorithm_version += 1;
 
@@ -161,7 +163,7 @@ fn rejects_target_without_an_exact_schema_compilation_layout() {
         .replace("arch = \"aarch64\"", "arch = \"x86_64\"");
     let config = DaemonConfig::parse(temp.path().join("distill.toml"), &source).unwrap();
     let error = config
-        .target_definitions(consumer_compilation_identity_v1())
+        .target_definitions(&test_layout_identity())
         .unwrap_err();
 
     assert!(matches!(error, DaemonConfigError::Target(_)));

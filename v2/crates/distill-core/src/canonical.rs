@@ -11,16 +11,12 @@
 
 use unicode_normalization::UnicodeNormalization;
 
-/// `CompilationIdentity` digest (§5).
-pub const DSCI: [u8; 4] = *b"DSCI";
+/// `LayoutIdentity` digest (§5).
+pub const DSLI: [u8; 4] = *b"DSLI";
 /// Host-interface `ModuleAbiIdentity` digest (§3, §5).
 pub const DSMA: [u8; 4] = *b"DSMA";
 /// Target-definition hash (§18).
 pub const DSTG: [u8; 4] = *b"DSTG";
-/// Candidate target-set identity (§5, §13, §18).
-/// Tag-annotation epoch — the exact compiled `#[asset(tag)]` projection
-/// (§5, §10).
-pub const DSTA: [u8; 4] = *b"DSTA";
 /// `StaticInputs` digest — the build-cache lookup key (§9).
 pub const DSSI: [u8; 4] = *b"DSSI";
 /// `TraceOp` sequences (§9).
@@ -28,13 +24,6 @@ pub const DSTR: [u8; 4] = *b"DSTR";
 /// Schema-lineage chain digest — a type's ordered schema-digest history
 /// (§6, §11, §13).
 pub const DSSL: [u8; 4] = *b"DSSL";
-/// Load-policy digest — sorted (type_uuid, build_only) pairs (§9, §13,
-/// §16).
-pub const DSLP: [u8; 4] = *b"DSLP";
-/// Compiled full semantic attestation (§3, §5).
-pub const DSCA: [u8; 4] = *b"DSCA";
-/// One type's canonical RegistryExtras v1 row table (§3, §5).
-pub const DSRE: [u8; 4] = *b"DSRE";
 /// Typed local deterministic-failure detail (§5, §9).
 pub const DSLF: [u8; 4] = *b"DSLF";
 /// Typed configuration-poison reason facts (§5, §13, §17).

@@ -3,7 +3,7 @@
 //! all-or-nothing, WAL readers only ever observe complete input
 //! versions, and the poison classifications compose.
 
-use distill_core::attestation::bootstrap_control_logical_registry_v1;
+use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::CanonicalTargetSet;
 use distill_core::tool::ToolCwdPolicy;

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use distill_core::attestation::bootstrap_control_logical_registry_v1;
+use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
     CleanupDisposition, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, DscpV1,

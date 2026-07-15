@@ -6,10 +6,17 @@ use distill_core::id::ContentHash;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
-use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
-use distill_schema::ngp_schema::{Schema, SchemaLayouts};
+use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
 use distill_store::state::{ConfigurationState, DscpV1, PipelineState};
 use distill_store::Store;
+
+fn test_layout_identity() -> LayoutIdentity {
+    LayoutIdentity {
+        target_triple: "aarch64-apple-darwin".into(),
+        rustc: "rustc test".into(),
+        algorithm_version: 1,
+    }
+}
 
 fn config_source(temp: &tempfile::TempDir) -> String {
     let assets = temp.path().join("assets");
@@ -64,7 +71,7 @@ fn write_schema(temp: &tempfile::TempDir, marker: &str) {
             .collect(),
         types: Vec::new(),
         layouts: vec![SchemaLayouts {
-            identity: consumer_compilation_identity_v1().clone(),
+            identity: test_layout_identity(),
             layouts: Vec::new(),
         }],
     };

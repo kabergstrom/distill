@@ -9,7 +9,6 @@ use std::sync::{
     Arc,
 };
 
-use distill_core::attestation::CompiledTypeRow;
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_wire::native::{
     CallbackPanic, CtorTable, DropTable, NativeLayoutNode, SkipWriterTable,
@@ -35,9 +34,6 @@ pub unsafe trait AssetType: 'static {
 /// these (§15).
 pub struct AssetRuntimeDescriptor {
     pub type_uuid: TypeUuid,
-    /// Cross-binary measured layout digest (§5): registration,
-    /// pack-mount (§16), and connect (§17) comparisons.
-    pub layout_digest: [u8; 32],
     /// The logical hash this binary's type projects to — checked
     /// against artifact headers (§12: a mismatch is a registry
     /// disagreement, an error, never a migration trigger).
@@ -47,9 +43,6 @@ pub struct AssetRuntimeDescriptor {
     /// §16). Deliberately absent from DSLH and DSNL (§5): policy is
     /// carried and compared, never hashed into layout identity.
     pub build_only: bool,
-    /// Complete shared semantic attestation row. Consumers use this exact
-    /// typed projection for module, pack, connect, and reattest gates.
-    pub compiled_type: &'static CompiledTypeRow,
     /// The measured native layout tree (§12), table ids annotated in
     /// place — the native-side input to fixup-plan compilation.
     pub native_layout: &'static NativeLayoutNode,

@@ -1,7 +1,5 @@
 //! DSCP v1 configuration-poison grammar and persistence pinning.
 
-use std::collections::BTreeSet;
-
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
@@ -11,7 +9,7 @@ use distill_store::state::{
     PlatformFileIdentity,
 };
 use distill_store::{Store, StoreConfig, StoreError};
-use ngp_schema::identity::CompilationIdentity;
+use ngp_schema::identity::LayoutIdentity;
 
 fn open() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -19,17 +17,10 @@ fn open() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-fn identity(target: &str, marker: u8) -> CompilationIdentity {
-    CompilationIdentity {
+fn identity(target: &str, marker: u8) -> LayoutIdentity {
+    LayoutIdentity {
         target_triple: target.to_owned(),
         rustc: format!("rustc 1.{marker}.0"),
-        source_fingerprint: [marker; 32],
-        features: BTreeSet::from([
-            ("z-package".to_owned(), "feat-b".to_owned()),
-            ("a-package".to_owned(), "feat-a".to_owned()),
-        ]),
-        cfgs: BTreeSet::from(["target_pointer_width=\"64\"".to_owned(), "unix".to_owned()]),
-        manifest_lock_hash: [marker.wrapping_add(1); 32],
         algorithm_version: u32::from(marker),
     }
 }
@@ -414,7 +405,7 @@ fn duplicate_lineage_entries_sort_and_deduplicate_complete_claimant_rows() {
 }
 
 #[test]
-fn compilation_identity_fields_are_part_of_the_typed_reason() {
+fn layout_identity_fields_are_part_of_the_typed_reason() {
     let expected = identity("aarch64-apple-darwin", 1);
     let observed = identity("x86_64-unknown-linux-gnu", 2);
     let a = DscpV1::UnsupportedTargetIdentity {
@@ -425,7 +416,7 @@ fn compilation_identity_fields_are_part_of_the_typed_reason() {
     let b = DscpV1::UnsupportedTargetIdentity {
         target: "ship".to_owned(),
         expected,
-        observed: CompilationIdentity {
+        observed: LayoutIdentity {
             algorithm_version: 99,
             ..observed
         },

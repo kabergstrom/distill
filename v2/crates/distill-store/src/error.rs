@@ -35,7 +35,7 @@ pub enum StoreError {
     InvalidPipelinePoison(crate::state::PipelinePoisonError),
     /// The checked-in DSB format authority could not be parsed. A binary
     /// built in this state cannot advertise bundle format v1 or reach Ready.
-    InvalidBootstrapSpec(distill_core::attestation::BootstrapSpecError),
+    InvalidBootstrapSpec(distill_core::bootstrap::BootstrapSpecError),
     /// A store-side epoch has invalid identity or registration metadata.
     InvalidPipelineEpoch { detail: &'static str },
     /// A candidate omitted or changed one of the five format-owned logical

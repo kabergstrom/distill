@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use distill_asset::{AssetReflect, AssetType};
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
+use distill_core::bootstrap::{
+    BootstrapControlSpecV1, BootstrapControlSymbol, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID,
+};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, TypeUuid};
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_daemon::lineage_repair::LineageRepairBackend;
@@ -14,36 +15,36 @@ use distill_rpc::{
     LineageRepairInspection, LineageRepairInvalidCode, LineageRepairStaleCode, LineageRepairState,
     OccupiedLineageDestinationKind,
 };
-use distill_schema::bootstrap_builtins_v1::{
-    AcceptedSchemaEpochV1, AcceptedTypeLineageV1, SchemaLineageManifestV1, TypeAuthorityStateV1,
-};
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
 use distill_store::{Store, StoreConfig};
 
 fn manifest_schema() -> LogicalSchema {
-    let bytes = distill_asset::build::logical_schema_bytes::<SchemaLineageManifestV1>();
-    let mut decoder = NodeDecoder {
-        bytes: &bytes,
-        at: 0,
-    };
-    let root = decoder.node();
-    assert_eq!(decoder.at, bytes.len());
-    LogicalSchema { root }
+    let row = manifest_row();
+    distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap()
+}
+
+fn manifest_row() -> distill_core::bootstrap::BootstrapControlSpecRowV1 {
+    BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
+        .unwrap()
 }
 
 fn manifest_data() -> AuthoredValue {
-    SchemaLineageManifestV1 {
-        types: BTreeMap::new(),
-    }
-    .to_authored()
+    AuthoredValue::Object(BTreeMap::from([(
+        "types".to_owned(),
+        AuthoredValue::Array(Vec::new()),
+    )]))
 }
 
 fn manifest_entry(asset: u8, data: AuthoredValue) -> AssetEntry {
-    let descriptor = SchemaLineageManifestV1::descriptor();
+    let row = manifest_row();
     AssetEntry {
         uuid: AssetUuid([asset; 16]),
-        type_uuid: SchemaLineageManifestV1::TYPE_UUID,
-        schema_hash: descriptor.logical_hash,
+        type_uuid: row.type_uuid,
+        schema_hash: row.logical_hash,
         lineage: EntryLineageV1::Bootstrap {
             bundle_format_version: 1,
         },
@@ -55,7 +56,7 @@ fn manifest_entry(asset: u8, data: AuthoredValue) -> AssetEntry {
 fn manifest_bundle(bundle: u8, asset: u8, local_id: &str) -> Vec<u8> {
     let schema = manifest_schema();
     let hash = node_hash(&schema.root).unwrap();
-    assert_eq!(hash, SchemaLineageManifestV1::descriptor().logical_hash);
+    assert_eq!(hash, manifest_row().logical_hash);
     distill_bundle::write_bundle(&Bundle {
         format_version: 1,
         uuid: BundleUuid([bundle; 16]),
@@ -349,20 +350,34 @@ fn durable_store_stamp_mismatch_is_stale_before_any_temp_or_target_write() {
 #[test]
 fn proposed_authority_rejects_bootstrap_types_inside_the_manifest_map() {
     let harness = Harness::new();
-    let data = SchemaLineageManifestV1 {
-        types: BTreeMap::from([(
-            SCHEMA_LINEAGE_MANIFEST_TYPE_UUID.0,
-            AcceptedTypeLineageV1 {
-                epochs: vec![AcceptedSchemaEpochV1 {
-                    digest: [1; 32],
-                    forward_parent: None,
-                }],
-                current: 0,
-                authority: TypeAuthorityStateV1::Active {},
-            },
-        )]),
-    }
-    .to_authored();
+    let bytes = |value: &[u8]| {
+        AuthoredValue::Array(
+            value
+                .iter()
+                .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
+                .collect(),
+        )
+    };
+    let epoch = AuthoredValue::Object(BTreeMap::from([
+        ("digest".to_owned(), bytes(&[1; 32])),
+        ("forward_parent".to_owned(), AuthoredValue::Null),
+    ]));
+    let authority = AuthoredValue::Object(BTreeMap::from([(
+        "Active".to_owned(),
+        AuthoredValue::Object(BTreeMap::new()),
+    )]));
+    let lineage = AuthoredValue::Object(BTreeMap::from([
+        ("authority".to_owned(), authority),
+        ("current".to_owned(), AuthoredValue::UInt(0)),
+        ("epochs".to_owned(), AuthoredValue::Array(vec![epoch])),
+    ]));
+    let data = AuthoredValue::Object(BTreeMap::from([(
+        "types".to_owned(),
+        AuthoredValue::Array(vec![AuthoredValue::Array(vec![
+            bytes(&SCHEMA_LINEAGE_MANIFEST_TYPE_UUID.0),
+            lineage,
+        ])]),
+    )]));
     let schema = manifest_schema();
     let hash = node_hash(&schema.root).unwrap();
     let bytes = distill_bundle::write_bundle(&Bundle {
@@ -386,93 +401,4 @@ fn proposed_authority_rejects_bootstrap_types_inside_the_manifest_map() {
         Err(LineageRepairBackendError::Invalid(invalid))
             if invalid.code == LineageRepairInvalidCode::BootstrapTypePresent
     ));
-}
-
-struct NodeDecoder<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl NodeDecoder<'_> {
-    fn node(&mut self) -> SchemaNode {
-        match self.u8() {
-            0x01 => SchemaNode::Primitive(PrimitiveKind::from_name(&self.string()).unwrap()),
-            0x02 => SchemaNode::Struct {
-                rev: self.u32(),
-                fields: self.rows(),
-            },
-            0x03 => SchemaNode::Enum {
-                rev: self.u32(),
-                variants: self.rows(),
-            },
-            0x04 => SchemaNode::Vec(Box::new(self.node())),
-            0x05 => {
-                let len = self.u64();
-                SchemaNode::Array {
-                    len,
-                    elem: Box::new(self.node()),
-                }
-            }
-            0x06 => SchemaNode::Option(Box::new(self.node())),
-            0x07 => {
-                let key = Box::new(self.node());
-                SchemaNode::Map {
-                    key,
-                    value: Box::new(self.node()),
-                }
-            }
-            0x08 => SchemaNode::String,
-            0x09 => SchemaNode::AssetRef(TypeUuid(self.fixed())),
-            0x0a => SchemaNode::WeakRef(TypeUuid(self.fixed())),
-            0x0b => SchemaNode::Blob,
-            0x0c => SchemaNode::BackRef(self.u32()),
-            0x0d => SchemaNode::Unit,
-            0x0e => SchemaNode::Set(Box::new(self.node())),
-            tag => panic!("unknown logical schema tag {tag}"),
-        }
-    }
-
-    fn rows(&mut self) -> Vec<(String, u32, SchemaNode)> {
-        (0..self.u32())
-            .map(|_| {
-                let name = self.string();
-                let rev = self.u32();
-                (name, rev, self.node())
-            })
-            .collect()
-    }
-
-    fn u8(&mut self) -> u8 {
-        let value = self.bytes[self.at];
-        self.at += 1;
-        value
-    }
-
-    fn u32(&mut self) -> u32 {
-        u32::from_le_bytes(self.take())
-    }
-
-    fn u64(&mut self) -> u64 {
-        u64::from_le_bytes(self.take())
-    }
-
-    fn string(&mut self) -> String {
-        let len = self.u32() as usize;
-        let value = std::str::from_utf8(&self.bytes[self.at..self.at + len])
-            .unwrap()
-            .to_owned();
-        self.at += len;
-        value
-    }
-
-    fn fixed<const N: usize>(&mut self) -> [u8; N] {
-        self.take()
-    }
-
-    fn take<const N: usize>(&mut self) -> [u8; N] {
-        let mut value = [0; N];
-        value.copy_from_slice(&self.bytes[self.at..self.at + N]);
-        self.at += N;
-        value
-    }
 }

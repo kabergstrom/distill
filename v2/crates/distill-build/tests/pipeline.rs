@@ -3,7 +3,15 @@ use std::collections::BTreeSet;
 use distill_build::outputs::OutputDecls;
 use distill_build::pipeline::*;
 use distill_core::id::TypeUuid;
-use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
+use distill_schema::ngp_schema::LayoutIdentity;
+
+fn test_layout_identity() -> LayoutIdentity {
+    LayoutIdentity {
+        target_triple: "x86_64-unknown-linux-gnu".into(),
+        rustc: "rustc test".into(),
+        algorithm_version: 1,
+    }
+}
 
 fn set<T: Ord>(v: impl IntoIterator<Item = T>) -> BTreeSet<T> {
     v.into_iter().collect()
@@ -31,7 +39,7 @@ fn target(apis: BTreeSet<GraphicsApi>) -> Result<Target, PipelineError> {
         apis,
         false,
         true,
-        consumer_compilation_identity_v1().clone(),
+        test_layout_identity(),
     )
 }
 

@@ -7,13 +7,8 @@ use distill_asset::{
     default_table, AssetHashMap, AssetReflect, AssetType, Blob, EncodeContainer, EncodeSink,
     PathStep,
 };
-use distill_core::attestation::{
-    verify_tag_annotation_epoch, CompiledTypeTable, ReferenceStrength, RegistryExtraFact,
-    RegistryPathStep,
-};
 use distill_core::id::{AssetUuid, TypeUuid};
 use distill_json::AuthoredValue;
-use distill_wire::dsnl::dsnl_hash;
 use distill_wire::native::NativeLayoutNode;
 
 #[derive(Default)]
@@ -120,7 +115,6 @@ fn macro_builds_a_self_consistent_runtime_descriptor() {
     assert_eq!(d.size, size_of::<Example>());
     assert_eq!(d.align, align_of::<Example>());
     assert!(d.build_only);
-    assert_eq!(d.layout_digest, dsnl_hash(d.native_layout).unwrap());
     assert!(std::ptr::eq(d, Example::descriptor()));
 
     let NativeLayoutNode::Struct { fields, .. } = d.native_layout else {
@@ -248,78 +242,4 @@ fn recursive_default_table_reuses_schema_node_ids_and_is_finite() {
         .nodes
         .iter()
         .any(|(node, path, _)| node.0 == 0 && path == &[PathStep::Field("child")]));
-}
-
-#[test]
-fn descriptor_exposes_typed_complete_registry_facts_and_finite_backrefs() {
-    let descriptor = SemanticFacts::descriptor();
-    let row = descriptor.compiled_type;
-    assert_eq!(row.type_uuid, descriptor.type_uuid);
-    assert_eq!(row.logical_hash, descriptor.logical_hash);
-    assert_eq!(row.native_layout_digest, descriptor.layout_digest);
-    assert!(row.build_only);
-    row.validate().unwrap();
-
-    let fact_at = |field: &str| {
-        row.registry_extras
-            .rows
-            .iter()
-            .find(|row| row.path == vec![RegistryPathStep::Field(field.to_owned())])
-    };
-    assert!(matches!(
-        fact_at("strong").map(|row| &row.fact),
-        Some(RegistryExtraFact::Reference {
-            strength: ReferenceStrength::Strong,
-            target,
-        }) if *target == ReferenceTarget::TYPE_UUID
-    ));
-    assert!(matches!(
-        fact_at("weak").map(|row| &row.fact),
-        Some(RegistryExtraFact::Reference {
-            strength: ReferenceStrength::Weak,
-            target,
-        }) if *target == ReferenceTarget::TYPE_UUID
-    ));
-    assert!(matches!(
-        fact_at("payload").map(|row| &row.fact),
-        Some(RegistryExtraFact::Blob)
-    ));
-    assert!(matches!(
-        fact_at("label").map(|row| &row.fact),
-        Some(RegistryExtraFact::Tag)
-    ));
-    assert!(row
-        .registry_extras
-        .rows
-        .iter()
-        .any(|row| matches!(row.fact, RegistryExtraFact::BuildOnly(true))));
-
-    let recursive = Recursive::descriptor().compiled_type;
-    assert!(recursive.registry_extras.rows.len() < 8);
-    assert!(recursive.registry_extras.rows.iter().any(
-        |row| matches!(row.fact, RegistryExtraFact::BackReference { target } if target.0 == 0)
-    ));
-}
-
-#[test]
-fn macro_tag_facts_derive_the_candidate_tag_annotation_epoch() {
-    let table = CompiledTypeTable::canonical(vec![
-        Example::descriptor().compiled_type.clone(),
-        SemanticFacts::descriptor().compiled_type.clone(),
-    ])
-    .unwrap();
-    let epoch = table.tag_annotation_epoch().unwrap();
-    verify_tag_annotation_epoch(&table.rows, epoch).unwrap();
-
-    let tagged_rows = table
-        .rows
-        .iter()
-        .flat_map(|row| row.registry_extras.rows.iter())
-        .filter(|row| matches!(row.fact, RegistryExtraFact::Tag))
-        .collect::<Vec<_>>();
-    assert_eq!(tagged_rows.len(), 1);
-    assert_eq!(
-        tagged_rows[0].path,
-        vec![RegistryPathStep::Field("label".to_owned())]
-    );
 }

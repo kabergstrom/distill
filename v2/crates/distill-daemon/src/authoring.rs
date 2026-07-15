@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
-use distill_core::attestation::is_bootstrap_control_type;
+use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{BundleUuid, ContentHash};
 use distill_rpc::{

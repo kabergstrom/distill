@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use distill_bundle::{parse_bundle, write_bundle, Bundle, BundleError as E, EntryLineageV1};
-use distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS;
+use distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS;
 use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
 use distill_json::AuthoredValue as V;
 use ngp_schema::{SchemaNode as N, SnapshotError};

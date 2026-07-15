@@ -20,7 +20,7 @@ use distill_build::trace::{
     RawFileSubject, StableFailureFingerprint,
 };
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
-use distill_core::attestation::{
+use distill_core::bootstrap::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BootstrapControlSymbol,
     DIRECTORY_IMPORT_RULES_TYPE_UUID, IMPORT_RECORD_TYPE_UUID,
 };
@@ -1448,8 +1448,7 @@ fn build_import_bundle(
         .find(|row| row.symbol == BootstrapControlSymbol::ImportRecord)
         .expect("closed bootstrap table contains ImportRecord");
     let record_schema =
-        crate::logical_node::decode_logical_schema_bytes(&record_row.logical_schema)
-            .map_err(invalid)?;
+        distill_schema::ngp_schema::node_from_bytes(&record_row.logical_schema).map_err(invalid)?;
     schemas.insert(record_row.logical_hash, record_schema);
     assets.insert(
         "$record".into(),

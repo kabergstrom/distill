@@ -17,14 +17,14 @@
 //! carries; residency is still expressed the spec's way (`Arc`), so pin
 //! counting composes when the module host wraps it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetError};
-use ngp_schema::identity::CompilationIdentity;
+use ngp_schema::identity::LayoutIdentity;
 
 /// Advanced by watcher batches + authoring ops — module/schema artifact
 /// swaps and config edits arrive as watcher events, so epoch rotation is
@@ -550,8 +550,8 @@ pub enum DscpV1 {
     },
     UnsupportedTargetIdentity {
         target: String,
-        expected: CompilationIdentity,
-        observed: CompilationIdentity,
+        expected: LayoutIdentity,
+        observed: LayoutIdentity,
     },
     DuplicateTargetName {
         normalized_name: String,
@@ -664,8 +664,8 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
             observed,
         } => {
             encoder.str(target);
-            encode_compilation_identity(encoder, expected);
-            encode_compilation_identity(encoder, observed);
+            encode_layout_identity(encoder, expected);
+            encode_layout_identity(encoder, observed);
         }
         DscpV1::DuplicateTargetName { normalized_name } => encoder.str(normalized_name),
         DscpV1::ConfigurationSourceUnavailable { path, failure } => {
@@ -748,16 +748,9 @@ fn encode_directory_alias_side(encoder: &mut CanonicalEncoder, side: &DirectoryA
     }
 }
 
-fn encode_compilation_identity(encoder: &mut CanonicalEncoder, identity: &CompilationIdentity) {
+fn encode_layout_identity(encoder: &mut CanonicalEncoder, identity: &LayoutIdentity) {
     encoder.str(&identity.target_triple);
     encoder.str(&identity.rustc);
-    encoder.raw(&identity.source_fingerprint);
-    encoder.set(identity.features.iter(), |encoder, (package, feature)| {
-        encoder.str(package);
-        encoder.str(feature);
-    });
-    encoder.set(identity.cfgs.iter(), |encoder, cfg| encoder.str(cfg));
-    encoder.raw(&identity.manifest_lock_hash);
     encoder.u32(identity.algorithm_version);
 }
 
@@ -875,29 +868,10 @@ impl<'a> DscpDecoder<'a> {
         })
     }
 
-    fn compilation_identity(&mut self) -> Result<CompilationIdentity, DscpError> {
-        let target_triple = self.string()?;
-        let rustc = self.string()?;
-        let source_fingerprint = self.array()?;
-        let mut features = BTreeSet::new();
-        for _ in 0..self.count(8)? {
-            if !features.insert((self.string()?, self.string()?)) {
-                return Err(DscpError::NonCanonical);
-            }
-        }
-        let mut cfgs = BTreeSet::new();
-        for _ in 0..self.count(4)? {
-            if !cfgs.insert(self.string()?) {
-                return Err(DscpError::NonCanonical);
-            }
-        }
-        Ok(CompilationIdentity {
-            target_triple,
-            rustc,
-            source_fingerprint,
-            features,
-            cfgs,
-            manifest_lock_hash: self.array()?,
+    fn layout_identity(&mut self) -> Result<LayoutIdentity, DscpError> {
+        Ok(LayoutIdentity {
+            target_triple: self.string()?,
+            rustc: self.string()?,
             algorithm_version: self.u32()?,
         })
     }
@@ -956,8 +930,8 @@ impl<'a> DscpDecoder<'a> {
             ConfigurationPoisonCode::UnsupportedTargetIdentity => {
                 DscpV1::UnsupportedTargetIdentity {
                     target: self.string()?,
-                    expected: self.compilation_identity()?,
-                    observed: self.compilation_identity()?,
+                    expected: self.layout_identity()?,
+                    observed: self.layout_identity()?,
                 }
             }
             ConfigurationPoisonCode::DuplicateTargetName => DscpV1::DuplicateTargetName {
@@ -1031,13 +1005,6 @@ fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
             values.push(target.as_str());
             for identity in [expected, observed] {
                 values.extend([identity.target_triple.as_str(), identity.rustc.as_str()]);
-                values.extend(
-                    identity
-                        .features
-                        .iter()
-                        .flat_map(|(package, feature)| [package.as_str(), feature.as_str()]),
-                );
-                values.extend(identity.cfgs.iter().map(String::as_str));
             }
         }
     }

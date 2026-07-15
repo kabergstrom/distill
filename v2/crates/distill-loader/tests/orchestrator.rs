@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
-use distill_asset::{
-    AssetRuntimeDescriptor, AssetType, CompiledTypeRow, EncodeSink, ErasedValue, ModuleEpochToken,
-};
+use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
@@ -56,23 +54,10 @@ unsafe impl AssetType for RefPlaceholder {
         static DESCRIPTOR: OnceLock<AssetRuntimeDescriptor> = OnceLock::new();
         DESCRIPTOR.get_or_init(|| {
             let base = A::descriptor();
-            static COMPILED_TYPE: OnceLock<CompiledTypeRow> = OnceLock::new();
-            let compiled_type = COMPILED_TYPE.get_or_init(|| {
-                CompiledTypeRow::new(
-                    PLACEHOLDER_TYPE,
-                    base.logical_hash,
-                    base.compiled_type.native_layout_digest,
-                    false,
-                    base.compiled_type.registry_extras.clone(),
-                )
-                .unwrap()
-            });
             AssetRuntimeDescriptor {
                 type_uuid: PLACEHOLDER_TYPE,
-                layout_digest: base.layout_digest,
                 logical_hash: base.logical_hash,
                 build_only: false,
-                compiled_type,
                 native_layout: base.native_layout,
                 size: base.size,
                 align: base.align,

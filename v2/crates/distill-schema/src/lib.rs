@@ -9,8 +9,6 @@
 pub use ngp_schema;
 
 pub mod authority;
-pub mod bootstrap_builtins_v1;
-pub mod bootstrap_gen_v1;
 pub mod registry;
 pub mod tags;
 

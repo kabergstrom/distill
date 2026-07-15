@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_core::attestation::bootstrap_control_logical_registry_v1;
+use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_core::tool::ToolCwdPolicy;
@@ -185,7 +185,7 @@ fn require_candidate(
 
 #[test]
 fn ready_requires_exact_bootstrap_logical_projection_and_manifest_omits_it() {
-    let type_uuid = distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
+    let type_uuid = distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS[0];
 
     let mut missing = raw_epoch(1, &[]);
     missing.schema_registry.remove(&type_uuid);

@@ -3,11 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use distill_asset::{ErasedValue, ModuleEpochPoisonCause, ModuleEpochToken};
-use distill_core::attestation::{
-    bootstrap_control_logical_registry_v1, CompiledTypeRow as CompiledTypeAttestation,
-    ReferenceStrength, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1, RegistryPathStep,
-    SchemaNodeId,
-};
+use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
@@ -234,7 +230,7 @@ fn durable_module_host(
     let types = requirements
         .schema_registry
         .iter()
-        .filter(|(type_uuid, _)| !distill_core::attestation::is_bootstrap_control_type(**type_uuid))
+        .filter(|(type_uuid, _)| !distill_core::bootstrap::is_bootstrap_control_type(**type_uuid))
         .map(|(type_uuid, logical_hash)| {
             (
                 *type_uuid,
@@ -263,9 +259,8 @@ fn durable_module_host(
 }
 
 fn requirements(tag: u8) -> CandidateRequirements {
-    let compiled = compiled_type(tag);
     let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
-    schema_registry.insert(compiled.type_uuid, compiled.logical_hash);
+    schema_registry.insert(TypeUuid([tag; 16]), LogicalHash([tag.wrapping_add(1); 32]));
     CandidateRequirements {
         module_abi: module_abi(tag),
         source_hashes: [("pipeline".to_owned(), format!("{tag:016x}"))]
@@ -301,25 +296,6 @@ fn fake_module(tag: u8, calls: Arc<Mutex<Calls>>) -> FakeModule {
         ignore_registration_errors: false,
         pin_sink: None,
     }
-}
-
-fn compiled_type(tag: u8) -> CompiledTypeAttestation {
-    CompiledTypeAttestation::new(
-        TypeUuid([tag; 16]),
-        LogicalHash([tag.wrapping_add(1); 32]),
-        [tag; 32],
-        false,
-        RegistryExtrasV1::canonical(vec![RegistryExtraRow {
-            node: SchemaNodeId(0),
-            path: vec![RegistryPathStep::Field("reference".into())],
-            fact: RegistryExtraFact::Reference {
-                strength: ReferenceStrength::Strong,
-                target: TypeUuid([tag.wrapping_add(2); 16]),
-            },
-        }])
-        .unwrap(),
-    )
-    .unwrap()
 }
 
 fn write_module(path: &Path, byte: u8) {

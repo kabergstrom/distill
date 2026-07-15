@@ -1,17 +1,11 @@
 //! Deterministic descriptor construction shared by all `#[asset]`
-//! expansions. One walk creates the native tree and every table ID;
-//! `DSNL` hashes the measured tree for local descriptor diagnostics.
+//! expansions. One walk creates the native tree and every table ID.
 
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use distill_core::attestation::{
-    AttestationError, CompiledTypeRow, RegistryExtraFact, RegistryExtraRow, RegistryExtrasV1,
-    RegistryPathStep, SchemaNodeId,
-};
 use distill_core::id::{LogicalHash, TypeUuid};
-use distill_wire::dsnl::dsnl_hash;
 use distill_wire::native::{
     validate_native_descriptor, CallbackPanic, CtorEntry, CtorId, CtorTable, DropId, DropTable,
     NativeField, NativeLayoutNode, NativeVariant, SkipDefaultId, SkipEntry, SkipWriterTable,
@@ -24,44 +18,6 @@ use crate::{AssetReflect, AssetRuntimeDescriptor, AssetType, EncodeSink, EpochTo
 pub struct AssetMetadata {
     pub type_uuid: TypeUuid,
     pub build_only: bool,
-}
-
-/// State for the macro-generated finite first-expansion DSRE walk. A repeated
-/// type produces a typed back-reference row instead of recursively unrolling.
-#[derive(Default)]
-pub struct RegistryExtrasBuilder {
-    nodes: HashMap<TypeId, SchemaNodeId>,
-    rows: Vec<RegistryExtraRow>,
-}
-
-impl RegistryExtrasBuilder {
-    pub fn enter<T: 'static>(
-        &mut self,
-        owner: SchemaNodeId,
-        path: Vec<RegistryPathStep>,
-    ) -> Option<SchemaNodeId> {
-        let type_id = TypeId::of::<T>();
-        if let Some(target) = self.nodes.get(&type_id).copied() {
-            self.fact(owner, path, RegistryExtraFact::BackReference { target });
-            return None;
-        }
-        let node = SchemaNodeId(checked_len(self.nodes.len()));
-        self.nodes.insert(type_id, node);
-        Some(node)
-    }
-
-    pub fn fact(
-        &mut self,
-        node: SchemaNodeId,
-        path: Vec<RegistryPathStep>,
-        fact: RegistryExtraFact,
-    ) {
-        self.rows.push(RegistryExtraRow { node, path, fact });
-    }
-
-    fn finish(self) -> Result<RegistryExtrasV1, AttestationError> {
-        RegistryExtrasV1::canonical(self.rows)
-    }
 }
 
 type DropThunk = unsafe fn(*mut u8) -> Result<(), CallbackPanic>;
@@ -143,10 +99,8 @@ impl LayoutBuilder {
 
     fn finish(self, root: NativeLayoutNode) -> BuiltLayout {
         let root = Box::leak(Box::new(root));
-        let layout_digest = dsnl_hash(root).expect("#[asset] generated a valid DSNL tree");
         BuiltLayout {
             root,
-            layout_digest,
             ctors: Box::leak(Box::new(CtorTable {
                 entries: Box::leak(self.ctors.into_boxed_slice()),
             })),
@@ -162,7 +116,6 @@ impl LayoutBuilder {
 
 struct BuiltLayout {
     root: &'static NativeLayoutNode,
-    layout_digest: [u8; 32],
     ctors: &'static CtorTable,
     drops: &'static DropTable,
     skips: &'static SkipWriterTable,
@@ -212,22 +165,13 @@ impl LogicalBuilder {
 }
 
 pub fn logical_hash<T: AssetReflect>() -> LogicalHash {
-    let bytes = logical_schema_bytes::<T>();
+    let mut builder = LogicalBuilder::default();
+    T::logical(&mut builder);
     let mut hash = blake3::Hasher::new();
     hash.update(b"DSLH");
     hash.update(&[1]);
-    hash.update(&bytes);
+    hash.update(&builder.bytes);
     LogicalHash(*hash.finalize().as_bytes())
-}
-
-/// Exact canonical logical SchemaGraph bytes emitted by the macro walk.
-///
-/// Format-release generators need the expanded bytes, not merely DSLH, so
-/// that the checked-in authority can be audited and independently rehashed.
-pub fn logical_schema_bytes<T: AssetReflect>() -> Vec<u8> {
-    let mut builder = LogicalBuilder::default();
-    T::logical(&mut builder);
-    builder.bytes
 }
 
 pub fn build_descriptor<T>(metadata: AssetMetadata) -> AssetRuntimeDescriptor
@@ -251,30 +195,10 @@ where
         built.skips.entries.len(),
     )
     .expect("#[asset] generated a valid native descriptor");
-    let mut registry_builder = RegistryExtrasBuilder::default();
-    T::collect_registry_extras(&mut registry_builder, SchemaNodeId(0), Vec::new());
-    registry_builder.fact(
-        SchemaNodeId(0),
-        Vec::new(),
-        RegistryExtraFact::BuildOnly(metadata.build_only),
-    );
-    let compiled_type = CompiledTypeRow::new(
-        metadata.type_uuid,
-        logical_hash::<T>(),
-        built.layout_digest,
-        metadata.build_only,
-        registry_builder
-            .finish()
-            .expect("#[asset] generated a canonical DSRE table"),
-    )
-    .expect("#[asset] generated a valid compiled-type row");
-    let compiled_type = Box::leak(Box::new(compiled_type));
     AssetRuntimeDescriptor {
         type_uuid: metadata.type_uuid,
-        layout_digest: built.layout_digest,
-        logical_hash: compiled_type.logical_hash,
+        logical_hash: logical_hash::<T>(),
         build_only: metadata.build_only,
-        compiled_type,
         native_layout: built.root,
         size: std::mem::size_of::<T>(),
         align: std::mem::align_of::<T>(),

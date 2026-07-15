@@ -6,8 +6,7 @@
 //! domain-prefixed and versioned.
 
 use distill_core::canonical::{
-    domain_digest, CanonicalEncoder, DSCA, DSCI, DSCP, DSCT, DSLF, DSLP, DSPP, DSRE, DSSI, DSSL,
-    DSTA, DSTG, DSTR, DSVP,
+    domain_digest, CanonicalEncoder, DSCP, DSCT, DSLF, DSLI, DSPP, DSSI, DSSL, DSTG, DSTR, DSVP,
 };
 
 fn enc(f: impl FnOnce(&mut CanonicalEncoder)) -> Vec<u8> {
@@ -135,34 +134,29 @@ fn fixed_arrays_encode_raw() {
 #[test]
 fn domain_digests_are_domain_and_version_separated() {
     let payload = |e: &mut CanonicalEncoder| e.str("x");
-    let a = domain_digest(DSCI, 1, payload);
+    let a = domain_digest(DSLI, 1, payload);
     let b = domain_digest(DSTG, 1, payload);
-    let c = domain_digest(DSCI, 2, payload);
+    let c = domain_digest(DSLI, 2, payload);
     assert_ne!(a, b, "different domain, same payload");
     assert_ne!(a, c, "same domain, different version");
     // Deterministic.
-    assert_eq!(a, domain_digest(DSCI, 1, payload));
+    assert_eq!(a, domain_digest(DSLI, 1, payload));
     // 32-byte blake3.
     assert_eq!(a.len(), 32);
 }
 
 #[test]
 fn all_domains_are_distinct() {
-    let ds = [
-        DSCI, DSTG, DSTA, DSSI, DSTR, DSSL, DSLP, DSCA, DSRE, DSLF, DSCP, DSVP, DSPP, DSCT,
-    ];
+    let ds = [DSLI, DSTG, DSSI, DSTR, DSSL, DSLF, DSCP, DSVP, DSPP, DSCT];
     for (i, a) in ds.iter().enumerate() {
         for b in &ds[i + 1..] {
             assert_ne!(a, b);
         }
     }
-    assert_eq!(&DSCI, b"DSCI");
+    assert_eq!(&DSLI, b"DSLI");
     assert_eq!(&DSTG, b"DSTG");
     assert_eq!(&DSSI, b"DSSI");
     assert_eq!(&DSTR, b"DSTR");
-    assert_eq!(&DSCA, b"DSCA");
-    assert_eq!(&DSRE, b"DSRE");
     assert_eq!(&DSLF, b"DSLF");
     assert_eq!(&DSCP, b"DSCP");
-    assert_eq!(&DSTA, b"DSTA");
 }

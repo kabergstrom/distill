@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
-use distill_core::attestation::{bootstrap_control_logical_registry_v1, is_bootstrap_control_type};
+use distill_core::bootstrap::{bootstrap_control_logical_registry_v1, is_bootstrap_control_type};
 use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
 pub use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};

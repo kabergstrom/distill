@@ -2503,7 +2503,7 @@ pub fn decode_schema_acceptance_required(
             .map_err(|error| capnp::Error::failed(error.message))?,
         );
         if previous.is_some_and(|prior| prior >= type_uuid)
-            || distill_core::attestation::is_bootstrap_control_type(type_uuid)
+            || distill_core::bootstrap::is_bootstrap_control_type(type_uuid)
         {
             return Err(capnp::Error::failed(
                 "schema mismatches are not strict non-bootstrap rows".to_owned(),

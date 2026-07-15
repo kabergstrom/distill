@@ -1415,7 +1415,7 @@ fn validate_manifest_repair_bundle(bytes: &[u8]) -> Result<(), LineageRepairInva
         ));
     }
     let mut manifests = bundle.assets.values().filter(|entry| {
-        entry.type_uuid == distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID
+        entry.type_uuid == distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID
     });
     let Some(manifest) = manifests.next() else {
         return Err(invalid(
@@ -1447,14 +1447,14 @@ fn validate_manifest_repair_bundle(bytes: &[u8]) -> Result<(), LineageRepairInva
         ));
     }
     let authority =
-        distill_core::attestation::bootstrap_control_logical_registry_v1().map_err(|error| {
+        distill_core::bootstrap::bootstrap_control_logical_registry_v1().map_err(|error| {
             invalid(
                 LineageRepairInvalidCode::InvalidLineage,
                 &format!("bootstrap authority unavailable: {error}"),
             )
         })?;
     let expected = authority
-        .get(&distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID)
+        .get(&distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID)
         .expect("logical bootstrap authority contains lineage manifest");
     if manifest.schema_hash != *expected {
         return Err(invalid(
@@ -1470,7 +1470,7 @@ fn validate_manifest_repair_bundle(bytes: &[u8]) -> Result<(), LineageRepairInva
     };
     if type_keys
         .iter()
-        .any(|type_uuid| distill_core::attestation::is_bootstrap_control_type(*type_uuid))
+        .any(|type_uuid| distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
     {
         return Err(invalid(
             LineageRepairInvalidCode::BootstrapTypePresent,
@@ -3568,7 +3568,7 @@ fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> Result<(), A
             let mut previous = None;
             for mismatch in &required.mismatches {
                 if previous.is_some_and(|uuid| uuid >= mismatch.type_uuid)
-                    || distill_core::attestation::is_bootstrap_control_type(mismatch.type_uuid)
+                    || distill_core::bootstrap::is_bootstrap_control_type(mismatch.type_uuid)
                     || mismatch.candidate == mismatch.manifest
                 {
                     return Err(invalid(

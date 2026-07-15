@@ -24,7 +24,7 @@ use distill_build::trace::{
     TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::attestation::MIGRATION_TYPE_UUID;
+use distill_core::bootstrap::MIGRATION_TYPE_UUID;
 use distill_core::id::{
     AssetUuid, BundleFileHash, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
 };
@@ -957,9 +957,8 @@ fn build_with_runtime(
             request.target
         ))
     })?;
-    let observed_target = distill_rpc::TargetDefinitionHash(
-        distill_build::keys::target_definition_hash(&target, &[]),
-    );
+    let observed_target =
+        distill_rpc::TargetDefinitionHash(distill_build::keys::target_definition_hash(&target));
     if observed_target != request.target_definition {
         return Err(BuildError::Drifted(request.drifted_input.clone()));
     }
@@ -1152,7 +1151,7 @@ fn try_refine_published_tag_index(
     let mut updates = Vec::with_capacity(assets.len());
     if let (Some(epoch), Some(target), Some(registry)) = (ready, target, registry) {
         let dylib_hash = epoch.dylib_hash();
-        let target_definition = distill_build::keys::target_definition_hash(&target, &[]);
+        let target_definition = distill_build::keys::target_definition_hash(&target);
         let mut context = BuildContext {
             store: Arc::clone(&store_handle),
             store_instance,
@@ -4083,7 +4082,6 @@ mod tests {
     use crate::callbacks::{
         PipelineProcessContext, PipelineProcessor, ProcessorError, ProcessorProducts,
     };
-    use distill_asset::{AssetReflect, AssetType};
     use distill_build::outputs::OutputDecls;
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_bundle::{EntryLineageV1, LineageStamp};
@@ -4093,14 +4091,10 @@ mod tests {
         AuthoringEntry, AuthoringEntryRole, AuthoringValue, Commit, InputVersion, TargetDefinition,
         TargetDefinitionHash,
     };
-    use distill_schema::bootstrap_builtins_v1::{
-        AcceptedSchemaEpochV1, AuthoredValueV1, FieldPathV1, LineageStampV1, MigrationKindV1,
-        MigrationOpV1, MigrationV1,
-    };
     use distill_schema::ngp_schema::{
         node_hash, snapshot_to_json, Field, FieldAttrs, FieldIdentifier, FieldLayout,
-        LogicalSchema, PrimitiveKind, PrimitiveType, Schema, SchemaLayouts, SchemaNode,
-        SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
+        LayoutIdentity, LogicalSchema, PrimitiveKind, PrimitiveType, Schema, SchemaLayouts,
+        SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
     };
     use distill_store::pipeline::{
         AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
@@ -4120,6 +4114,14 @@ mod tests {
     const DEPENDENCY_BUNDLE: BundleUuid = BundleUuid([79; 16]);
     const MIGRATION_ASSET: AssetUuid = AssetUuid([76; 16]);
     const MIGRATION_BUNDLE: BundleUuid = BundleUuid([77; 16]);
+
+    fn test_layout_identity() -> LayoutIdentity {
+        LayoutIdentity {
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            rustc: "rustc test".into(),
+            algorithm_version: 1,
+        }
+    }
 
     #[test]
     fn dssi_wait_graph_rejects_cross_job_cycles_with_asset_diagnostics() {
@@ -4261,8 +4263,7 @@ mod tests {
                     },
                 ],
                 layouts: vec![SchemaLayouts {
-                    identity: distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1()
-                        .clone(),
+                    identity: test_layout_identity(),
                     layouts: vec![
                         TypeLayout {
                             size: Some(1),
@@ -4357,8 +4358,7 @@ mod tests {
                     },
                 ],
                 layouts: vec![SchemaLayouts {
-                    identity: distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1()
-                        .clone(),
+                    identity: test_layout_identity(),
                     layouts: vec![
                         TypeLayout {
                             size: Some(2),
@@ -4399,6 +4399,159 @@ mod tests {
         TargetDefinition::new("dev", hash)
     }
 
+    fn authored_object(
+        fields: impl IntoIterator<Item = (impl Into<String>, AuthoredValue)>,
+    ) -> AuthoredValue {
+        AuthoredValue::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+        )
+    }
+
+    fn authored_variant(name: &str, fields: Vec<(&str, AuthoredValue)>) -> AuthoredValue {
+        authored_object([(name, authored_object(fields))])
+    }
+
+    fn authored_bytes(bytes: &[u8]) -> AuthoredValue {
+        AuthoredValue::Array(
+            bytes
+                .iter()
+                .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
+                .collect(),
+        )
+    }
+
+    fn authored_path(path: &FieldPath) -> AuthoredValue {
+        authored_object([(
+            "segments",
+            AuthoredValue::Array(
+                path.0
+                    .iter()
+                    .map(|segment| AuthoredValue::Str(segment.clone()))
+                    .collect(),
+            ),
+        )])
+    }
+
+    fn authored_neutral_value(value: &AuthoredValue) -> AuthoredValue {
+        match value {
+            AuthoredValue::Null => authored_variant("Null", vec![]),
+            AuthoredValue::Bool(value) => {
+                authored_variant("Bool", vec![("value", AuthoredValue::Bool(*value))])
+            }
+            AuthoredValue::Int(value) => {
+                authored_variant("Int", vec![("value", AuthoredValue::Int(*value))])
+            }
+            AuthoredValue::UInt(value) => {
+                authored_variant("UInt", vec![("value", AuthoredValue::UInt(*value))])
+            }
+            AuthoredValue::Float(value) => {
+                authored_variant("Float", vec![("value", AuthoredValue::Float(*value))])
+            }
+            AuthoredValue::Str(value) => {
+                authored_variant("Str", vec![("value", AuthoredValue::Str(value.clone()))])
+            }
+            AuthoredValue::Array(values) => authored_variant(
+                "Array",
+                vec![(
+                    "value",
+                    AuthoredValue::Array(values.iter().map(authored_neutral_value).collect()),
+                )],
+            ),
+            AuthoredValue::Object(values) => authored_variant(
+                "Object",
+                vec![(
+                    "value",
+                    AuthoredValue::Object(
+                        values
+                            .iter()
+                            .map(|(key, value)| (key.clone(), authored_neutral_value(value)))
+                            .collect(),
+                    ),
+                )],
+            ),
+            AuthoredValue::Blob(value) => {
+                authored_variant("Blob", vec![("value", AuthoredValue::Blob(value.clone()))])
+            }
+        }
+    }
+
+    fn authored_migration_op(op: &MigrationOp) -> AuthoredValue {
+        match op {
+            MigrationOp::DropField { at } => {
+                authored_variant("DropField", vec![("at", authored_path(at))])
+            }
+            MigrationOp::WriteValue { to, value } => authored_variant(
+                "WriteValue",
+                vec![
+                    ("to", authored_path(to)),
+                    ("value", authored_neutral_value(value)),
+                ],
+            ),
+            _ => panic!("test helper only encodes the migration operations used here"),
+        }
+    }
+
+    fn authored_lineage(epochs: &[AcceptedSchemaEpoch], cursor: u32) -> AuthoredValue {
+        authored_object([
+            (
+                "chain",
+                authored_bytes(&lineage_chain_digest(TYPE, epochs, cursor)),
+            ),
+            ("cursor", AuthoredValue::UInt(u128::from(cursor))),
+            (
+                "epochs",
+                AuthoredValue::Array(
+                    epochs
+                        .iter()
+                        .map(|epoch| {
+                            authored_object([
+                                ("digest", authored_bytes(&epoch.digest.0)),
+                                (
+                                    "forward_parent",
+                                    epoch.forward_parent.map_or(AuthoredValue::Null, |parent| {
+                                        AuthoredValue::UInt(u128::from(parent))
+                                    }),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+
+    fn migration_value(
+        old_hash: LogicalHash,
+        current_hash: LogicalHash,
+        old_epochs: &[AcceptedSchemaEpoch],
+        current_epochs: &[AcceptedSchemaEpoch],
+        kind: MigrationControlKind,
+    ) -> AuthoredValue {
+        let kind = match kind {
+            MigrationControlKind::Ops(ops) => authored_variant(
+                "Ops",
+                vec![(
+                    "ops",
+                    AuthoredValue::Array(ops.iter().map(authored_migration_op).collect()),
+                )],
+            ),
+            MigrationControlKind::Function { key } => {
+                authored_variant("Function", vec![("key", AuthoredValue::Str(key))])
+            }
+        };
+        authored_object([
+            ("from_hash", authored_bytes(&old_hash.0)),
+            ("from_lineage", authored_lineage(old_epochs, 0)),
+            ("kind", kind),
+            ("target_type_uuid", authored_bytes(&TYPE.0)),
+            ("to_hash", authored_bytes(&current_hash.0)),
+            ("to_lineage", authored_lineage(current_epochs, 1)),
+        ])
+    }
+
     fn custom_write_migration_bundle(
         old_hash: LogicalHash,
         old_schema: &LogicalSchema,
@@ -4410,21 +4563,15 @@ mod tests {
             old_schema,
             current_hash,
             current_schema,
-            MigrationKindV1::Ops {
-                ops: vec![
-                    MigrationOpV1::DropField {
-                        at: FieldPathV1 {
-                            segments: vec!["value".to_owned()],
-                        },
-                    },
-                    MigrationOpV1::WriteValue {
-                        to: FieldPathV1 {
-                            segments: vec!["value".to_owned()],
-                        },
-                        value: AuthoredValueV1::UInt { value: 42 },
-                    },
-                ],
-            },
+            MigrationControlKind::Ops(vec![
+                MigrationOp::DropField {
+                    at: FieldPath(vec!["value".to_owned()]),
+                },
+                MigrationOp::WriteValue {
+                    to: FieldPath(vec!["value".to_owned()]),
+                    value: AuthoredValue::UInt(42),
+                },
+            ]),
         )
     }
 
@@ -4433,7 +4580,7 @@ mod tests {
         old_schema: &LogicalSchema,
         current_hash: LogicalHash,
         current_schema: &LogicalSchema,
-        kind: MigrationKindV1,
+        kind: MigrationControlKind,
     ) -> Bundle {
         let old_epochs = vec![AcceptedSchemaEpoch {
             digest: old_hash,
@@ -4449,36 +4596,16 @@ mod tests {
                 forward_parent: Some(0),
             },
         ];
-        let migration = MigrationV1 {
-            target_type_uuid: TYPE.0,
-            from_hash: old_hash.0,
-            to_hash: current_hash.0,
-            from_lineage: LineageStampV1 {
-                epochs: vec![AcceptedSchemaEpochV1 {
-                    digest: old_hash.0,
-                    forward_parent: None,
-                }],
-                cursor: 0,
-                chain: lineage_chain_digest(TYPE, &old_epochs, 0),
-            },
-            to_lineage: LineageStampV1 {
-                epochs: current_epochs
-                    .iter()
-                    .map(|epoch| AcceptedSchemaEpochV1 {
-                        digest: epoch.digest.0,
-                        forward_parent: epoch.forward_parent,
-                    })
-                    .collect(),
-                cursor: 1,
-                chain: lineage_chain_digest(TYPE, &current_epochs, 1),
-            },
-            kind,
-        };
-        let migration_schema = crate::logical_node::decode_logical_schema_bytes(
-            &distill_asset::build::logical_schema_bytes::<MigrationV1>(),
-        )
-        .unwrap();
-        let migration_hash = MigrationV1::descriptor().logical_hash;
+        let migration = migration_value(old_hash, current_hash, &old_epochs, &current_epochs, kind);
+        let row = distill_core::bootstrap::BootstrapControlSpecV1::embedded()
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|row| row.symbol == distill_core::bootstrap::BootstrapControlSymbol::Migration)
+            .unwrap();
+        let migration_schema =
+            distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+        let migration_hash = row.logical_hash;
         Bundle {
             format_version: 1,
             uuid: MIGRATION_BUNDLE,
@@ -4492,13 +4619,13 @@ mod tests {
                 "migration".to_owned(),
                 AssetEntry {
                     uuid: MIGRATION_ASSET,
-                    type_uuid: MigrationV1::TYPE_UUID,
+                    type_uuid: row.type_uuid,
                     schema_hash: migration_hash,
                     lineage: EntryLineageV1::Bootstrap {
                         bundle_format_version: 1,
                     },
                     authoring_only: true,
-                    data: migration.to_authored(),
+                    data: migration,
                 },
             )]),
         }
@@ -4647,10 +4774,8 @@ mod tests {
             authority.identity().clone(),
         )
         .unwrap();
-        let target_hash = TargetDefinitionHash(distill_build::keys::target_definition_hash(
-            &build_target,
-            &[],
-        ));
+        let target_hash =
+            TargetDefinitionHash(distill_build::keys::target_definition_hash(&build_target));
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 StoreConfig::new(temp.path().join("state")),
@@ -4825,7 +4950,7 @@ mod tests {
             &old_schema,
             project.logical_hash,
             &project.logical_schema,
-            MigrationKindV1::Function {
+            MigrationControlKind::Function {
                 key: "upgrade".to_owned(),
             },
         );
@@ -4909,10 +5034,8 @@ mod tests {
             authority.identity().clone(),
         )
         .unwrap();
-        let target_hash = TargetDefinitionHash(distill_build::keys::target_definition_hash(
-            &build_target,
-            &[],
-        ));
+        let target_hash =
+            TargetDefinitionHash(distill_build::keys::target_definition_hash(&build_target));
         let epochs = vec![AcceptedSchemaEpoch {
             digest: project.logical_hash,
             forward_parent: None,

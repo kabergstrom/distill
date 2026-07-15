@@ -63,7 +63,7 @@ pub fn host_interface_closure_manifest() -> &'static [(&'static str, &'static [u
 }
 
 /// Exact `rustc -vV` of the compiler that built this resident host image.
-/// This is intentionally independent of the watched project's DSCI.
+/// This is intentionally independent of the watched project's DSLI.
 pub fn host_rustc_identity() -> &'static str {
     host_interface_closure::HOST_RUSTC_IDENTITY
 }

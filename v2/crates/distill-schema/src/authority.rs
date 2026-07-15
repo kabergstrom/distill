@@ -6,14 +6,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_core::attestation::BOOTSTRAP_CONTROL_TYPE_UUIDS;
+use distill_core::bootstrap::BOOTSTRAP_CONTROL_TYPE_UUIDS;
 use distill_core::id::{LayoutHash, LogicalHash, TypeUuid};
 use distill_wire::derive::derive_wire;
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::WireNode;
 use ngp_schema::classify::{classify, Class};
 use ngp_schema::{
-    CompilationIdentity, ExtractionError, Schema, SchemaTypeId, ASSET_REF_UUID, FIXED_STATE_UUID,
+    ExtractionError, LayoutIdentity, Schema, SchemaTypeId, ASSET_REF_UUID, FIXED_STATE_UUID,
     WEAK_ASSET_REF_UUID,
 };
 
@@ -23,7 +23,7 @@ use crate::SchemaRegistry;
 pub struct ProjectSchemaAuthority {
     schema: Schema,
     registry: SchemaRegistry,
-    identity: CompilationIdentity,
+    identity: LayoutIdentity,
     project_types: BTreeMap<TypeUuid, ProjectTypeAuthority>,
     source_hash: [u8; 32],
 }
@@ -124,7 +124,7 @@ impl ProjectSchemaAuthority {
         &self.registry
     }
 
-    pub fn identity(&self) -> &CompilationIdentity {
+    pub fn identity(&self) -> &LayoutIdentity {
         &self.identity
     }
 
@@ -139,7 +139,7 @@ impl ProjectSchemaAuthority {
     pub fn logical_registry(
         &self,
     ) -> Result<BTreeMap<TypeUuid, LogicalHash>, SchemaAuthorityError> {
-        let mut registry = distill_core::attestation::bootstrap_control_logical_registry_v1()
+        let mut registry = distill_core::bootstrap::bootstrap_control_logical_registry_v1()
             .map_err(|error| SchemaAuthorityError::Bootstrap(error.to_string()))?;
         registry.extend(
             self.project_types

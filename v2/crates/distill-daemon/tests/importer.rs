@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::attestation::{
+use distill_core::bootstrap::{
     BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
@@ -140,8 +140,7 @@ fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
         .into_iter()
         .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
         .unwrap();
-    let schema =
-        distill_daemon::logical_node::decode_logical_schema_bytes(&row.logical_schema).unwrap();
+    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
     let query = || {
         object([
             ("path_glob", AuthoredValue::Str("*.src".into())),

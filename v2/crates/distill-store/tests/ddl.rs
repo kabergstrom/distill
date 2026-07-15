@@ -267,8 +267,7 @@ fn schema_lineage_records_the_chain_with_generations_and_digests() {
 
 #[test]
 fn pipeline_state_row_shape() {
-    // §13: dylib content hash + the load-policy digest (+ poison per the
-    // staged-candidate publishable-failure rule).
+    // §13: module content identity plus typed poison/acceptance state.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
@@ -276,8 +275,6 @@ fn pipeline_state_row_shape() {
         [
             "id",
             "dylib_hash",
-            "load_policy_digest",
-            "compiled_types",
             "input_version",
             "poison_code",
             "poison_origin",
@@ -285,7 +282,6 @@ fn pipeline_state_row_shape() {
             "poison_identity",
             "poison_message",
             "acceptance_candidate_dylib_hash",
-            "acceptance_candidate_compiled_types",
             "acceptance_manifest_hash"
         ]
     );

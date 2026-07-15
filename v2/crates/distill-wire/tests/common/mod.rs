@@ -323,19 +323,14 @@ pub fn wblob_slot(offset: u32, size: u32) -> WireNode {
 // --- schema builders (ngp-schema model, §5) ----------------------------------
 
 use ngp_schema::{
-    CompilationIdentity, Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutView,
-    PrimitiveType, Schema, SchemaLayouts, SchemaTypeId, TagEncoding, TypeAttrs, TypeDef,
-    TypeLayout, TypePath,
+    Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, LayoutView, PrimitiveType,
+    Schema, SchemaLayouts, SchemaTypeId, TagEncoding, TypeAttrs, TypeDef, TypeLayout, TypePath,
 };
 
-pub fn test_identity() -> CompilationIdentity {
-    CompilationIdentity {
+pub fn test_identity() -> LayoutIdentity {
+    LayoutIdentity {
         target_triple: "test-triple".to_string(),
         rustc: "rustc test".to_string(),
-        source_fingerprint: [0; 32],
-        features: Default::default(),
-        cfgs: Default::default(),
-        manifest_lock_hash: [0; 32],
         algorithm_version: 1,
     }
 }

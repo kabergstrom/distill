@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use distill_core::attestation::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
+use distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
 use distill_core::id::{BundleFileHash, ContentHash};
 use distill_rpc::{
     LineageManifestClaimant, LineageRepairDestination, OccupiedLineageDestinationKind,

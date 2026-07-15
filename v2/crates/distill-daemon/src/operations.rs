@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_bundle::{Bundle, EntryLineageV1};
-use distill_core::attestation::is_bootstrap_control_type;
+use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;

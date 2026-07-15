@@ -14,7 +14,7 @@ use rayon::ThreadPool;
 
 use distill_build::pipeline::Target;
 use distill_bundle::{AssetEntry, Bundle};
-use distill_core::attestation::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
+use distill_core::bootstrap::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::lineage::AcceptedSchemaEpoch;
 use distill_json::AuthoredValue;
@@ -597,7 +597,7 @@ impl DaemonCoordinator {
             .schema_registry
             .keys()
             .copied()
-            .filter(|type_uuid| !distill_core::attestation::is_bootstrap_control_type(*type_uuid))
+            .filter(|type_uuid| !distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
             .collect::<Vec<_>>();
         let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
             Ok(prepared) => {

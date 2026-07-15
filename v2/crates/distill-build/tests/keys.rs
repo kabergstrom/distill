@@ -2,7 +2,15 @@ use distill_build::keys::*;
 use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
 use distill_build::trace::{Observed, TraceOp};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
-use distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1;
+use distill_schema::ngp_schema::LayoutIdentity;
+
+fn test_layout_identity() -> LayoutIdentity {
+    LayoutIdentity {
+        target_triple: "x86_64-unknown-linux-gnu".into(),
+        rustc: "rustc test".into(),
+        algorithm_version: 1,
+    }
+}
 
 fn statics() -> StaticInputs {
     StaticInputs {
@@ -104,7 +112,7 @@ fn target_definition_hash_includes_full_api_set() {
         [vk.clone()].into_iter().collect(),
         false,
         true,
-        consumer_compilation_identity_v1().clone(),
+        test_layout_identity(),
     )
     .unwrap();
     let b = Target::new(
@@ -113,19 +121,16 @@ fn target_definition_hash_includes_full_api_set() {
         [vk, gl].into_iter().collect(),
         false,
         true,
-        consumer_compilation_identity_v1().clone(),
+        test_layout_identity(),
     )
     .unwrap();
-    assert_ne!(
-        target_definition_hash(&a, &[]),
-        target_definition_hash(&b, &[])
-    );
+    assert_ne!(target_definition_hash(&a), target_definition_hash(&b));
 }
 
 #[test]
-fn target_definition_hash_binds_arch_options_and_compilation_identity() {
+fn target_definition_hash_binds_target_fields_and_layout_identity() {
     let api = [GraphicsApi::new("vulkan").unwrap()].into_iter().collect();
-    let identity = consumer_compilation_identity_v1().clone();
+    let identity = test_layout_identity();
     let base = Target::new(
         TargetOs::Linux,
         TargetArch::X86_64,
@@ -144,7 +149,7 @@ fn target_definition_hash_binds_arch_options_and_compilation_identity() {
             base.apis.clone(),
             false,
             true,
-            base.compilation_identity.clone(),
+            base.layout_identity.clone(),
         )
         .unwrap(),
         Target::new(
@@ -153,7 +158,7 @@ fn target_definition_hash_binds_arch_options_and_compilation_identity() {
             base.apis.clone(),
             true,
             true,
-            base.compilation_identity.clone(),
+            base.layout_identity.clone(),
         )
         .unwrap(),
         Target::new(
@@ -162,7 +167,7 @@ fn target_definition_hash_binds_arch_options_and_compilation_identity() {
             base.apis.clone(),
             false,
             false,
-            base.compilation_identity.clone(),
+            base.layout_identity.clone(),
         )
         .unwrap(),
         Target::new(
@@ -175,8 +180,8 @@ fn target_definition_hash_binds_arch_options_and_compilation_identity() {
         )
         .unwrap(),
     ];
-    let base_hash = target_definition_hash(&base, &[]);
+    let base_hash = target_definition_hash(&base);
     for variant in variants {
-        assert_ne!(base_hash, target_definition_hash(&variant, &[]));
+        assert_ne!(base_hash, target_definition_hash(&variant));
     }
 }

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::TypeUuid;
-use distill_schema::ngp_schema::CompilationIdentity;
+use distill_schema::ngp_schema::LayoutIdentity;
 
 use crate::outputs::OutputDecls;
 use crate::query::{normalize_identifier, IntakeError};
@@ -37,7 +37,7 @@ pub struct Target {
     pub apis: BTreeSet<GraphicsApi>,
     pub optimize: bool,
     pub debug_info: bool,
-    pub compilation_identity: CompilationIdentity,
+    pub layout_identity: LayoutIdentity,
 }
 
 impl Target {
@@ -47,7 +47,7 @@ impl Target {
         apis: BTreeSet<GraphicsApi>,
         optimize: bool,
         debug_info: bool,
-        compilation_identity: CompilationIdentity,
+        layout_identity: LayoutIdentity,
     ) -> Result<Self, PipelineError> {
         if apis.is_empty() {
             return Err(PipelineError::EmptyTargetApis);
@@ -58,7 +58,7 @@ impl Target {
             apis,
             optimize,
             debug_info,
-            compilation_identity,
+            layout_identity,
         })
     }
 }

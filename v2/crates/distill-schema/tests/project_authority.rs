@@ -1,9 +1,9 @@
-use distill_core::attestation::BOOTSTRAP_CONTROL_COUNT;
+use distill_core::bootstrap::BOOTSTRAP_CONTROL_COUNT;
 use distill_core::id::TypeUuid;
 use distill_json::AuthoredValue;
 use distill_schema::ngp_schema::{
-    Field, FieldAttrs, FieldIdentifier, FieldLayout, PrimitiveType, Schema, SchemaLayouts,
-    SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
+    Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, PrimitiveType, Schema,
+    SchemaLayouts, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
 };
 use distill_schema::{extract_search_tags, ProjectSchemaAuthority, SchemaAuthorityError};
 use distill_wire::dswl::{decode_dswl, dswl_hash};
@@ -12,6 +12,14 @@ use std::collections::BTreeMap;
 const PROJECT_UUID: TypeUuid = TypeUuid([
     0x91, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
 ]);
+
+fn test_layout_identity() -> LayoutIdentity {
+    LayoutIdentity {
+        target_triple: "x86_64-unknown-linux-gnu".into(),
+        rustc: "rustc test".into(),
+        algorithm_version: 1,
+    }
+}
 
 #[repr(C)]
 #[distill_asset::asset(uuid = "91112233-4455-4677-8899-aabbccddeeff")]
@@ -112,7 +120,7 @@ fn project_schema() -> Schema {
         source_hashes: Default::default(),
         types,
         layouts: vec![SchemaLayouts {
-            identity: distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1().clone(),
+            identity: test_layout_identity(),
             layouts,
         }],
     }
@@ -153,7 +161,7 @@ fn tagged_schema() -> Schema {
             },
         ],
         layouts: vec![SchemaLayouts {
-            identity: distill_schema::bootstrap_gen_v1::consumer_compilation_identity_v1().clone(),
+            identity: test_layout_identity(),
             layouts: vec![
                 TypeLayout {
                     size: Some(std::mem::size_of::<String>() as u64),
@@ -238,7 +246,7 @@ fn layout_tables_must_be_positionally_parallel_to_the_shared_model() {
 #[test]
 fn project_types_cannot_override_a_sealed_bootstrap_uuid() {
     let mut schema = project_schema();
-    schema.types[0].uuid = Some(distill_core::attestation::PACK_DEFINITION_TYPE_UUID);
+    schema.types[0].uuid = Some(distill_core::bootstrap::PACK_DEFINITION_TYPE_UUID);
     assert!(matches!(
         ProjectSchemaAuthority::from_schema(schema, [0; 32]),
         Err(SchemaAuthorityError::BootstrapTypeCollision { .. })

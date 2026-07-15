@@ -333,36 +333,6 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
         }
     });
     let defaults = logical.iter().map(default_collect_field);
-    let mut registry_fields: Vec<_> = fields.iter().collect();
-    registry_fields.sort_by_key(|field| field.name.nfc().collect::<String>().into_bytes());
-    let registry_fields = registry_fields.iter().map(|field| {
-        let name = &field.name;
-        let ty = &field.ty;
-        let tag = field.args.tag.then(|| {
-            quote! {
-                builder.fact(node, path.clone(), ::distill_asset::RegistryExtraFact::Tag);
-            }
-        });
-        if field.args.skip {
-            quote! {
-                builder.fact(
-                    node,
-                    vec![::distill_asset::RegistryPathStep::Field(#name.to_owned())],
-                    ::distill_asset::RegistryExtraFact::Skip,
-                );
-            }
-        } else {
-            quote! {
-                let path = vec![::distill_asset::RegistryPathStep::Field(#name.to_owned())];
-                #tag
-                <#ty as ::distill_asset::AssetReflect>::collect_registry_extras(
-                    builder,
-                    node,
-                    path,
-                );
-            }
-        }
-    });
     let serializable_count = logical.len() as u32;
     Ok(quote! {
         unsafe impl ::distill_asset::AssetReflect for #ident {
@@ -422,16 +392,6 @@ fn struct_reflect(ident: &Ident, fields: &[FieldInfo], rev: u32) -> syn::Result<
                 #(#defaults)*
             }
 
-            fn collect_registry_extras(
-                builder: &mut ::distill_asset::RegistryExtrasBuilder,
-                owner: ::distill_asset::RegistrySchemaNodeId,
-                path: ::std::vec::Vec<::distill_asset::RegistryPathStep>,
-            ) {
-                let Some(node) = builder.enter::<Self>(owner, path) else {
-                    return;
-                };
-                #(#registry_fields)*
-            }
         }
     })
 }
@@ -680,45 +640,6 @@ fn enum_reflect(
         .map(|(wire_index, variant)| enum_encode_arm(variant, wire_index as u32));
     let authored_arms = variants.iter().map(enum_authored_arm);
     let default_collect = variants.iter().map(enum_default_collect);
-    let registry_variants =
-        logical.iter().map(|variant| {
-            let variant_name = variant.ident.to_string();
-            let mut fields: Vec<_> = variant.fields.iter().collect();
-            fields.sort_by_key(|field| field.name.nfc().collect::<String>().into_bytes());
-            let fields = fields.iter().map(|field| {
-            let field_name = &field.name;
-            let ty = &field.ty;
-            let tag = field.args.tag.then(|| quote! {
-                builder.fact(node, path.clone(), ::distill_asset::RegistryExtraFact::Tag);
-            });
-            if field.args.skip {
-                quote! {
-                    builder.fact(
-                        node,
-                        vec![
-                            ::distill_asset::RegistryPathStep::Variant(#variant_name.to_owned()),
-                            ::distill_asset::RegistryPathStep::Field(#field_name.to_owned()),
-                        ],
-                        ::distill_asset::RegistryExtraFact::Skip,
-                    );
-                }
-            } else {
-                quote! {
-                    let path = vec![
-                        ::distill_asset::RegistryPathStep::Variant(#variant_name.to_owned()),
-                        ::distill_asset::RegistryPathStep::Field(#field_name.to_owned()),
-                    ];
-                    #tag
-                    <#ty as ::distill_asset::AssetReflect>::collect_registry_extras(
-                        builder,
-                        node,
-                        path,
-                    );
-                }
-            }
-        });
-            quote! { #(#fields)* }
-        });
     let variant_count = variants.len() as u32;
     let tag_encoding = if variants.len() == 1 {
         quote!(::distill_asset::NativeTagEncoding::Single)
@@ -782,16 +703,6 @@ fn enum_reflect(
                 #(#default_collect)*
             }
 
-            fn collect_registry_extras(
-                builder: &mut ::distill_asset::RegistryExtrasBuilder,
-                owner: ::distill_asset::RegistrySchemaNodeId,
-                path: ::std::vec::Vec<::distill_asset::RegistryPathStep>,
-            ) {
-                let Some(node) = builder.enter::<Self>(owner, path) else {
-                    return;
-                };
-                #(#registry_variants)*
-            }
         }
     })
 }
@@ -861,19 +772,18 @@ fn enum_layout_variant(variant: &VariantInfo, repr: &Ident, single: bool) -> Tok
     let repr_size = repr_size(repr) as u32;
     quote! {
         {
-            let mut cursor = 0u32;
+            // A multi-variant primitive-repr enum lays each variant out as a
+            // C-like frame beginning with the tag. Field offsets are enum-
+            // relative, so retain the tag prefix in this variant node rather
+            // than fabricating a separately shifted payload frame.
+            let mut cursor = if #single { 0u32 } else { #repr_size };
             let mut payload_align = 1u32;
             let mut fields = Vec::new();
             #(#field_layouts)*
             let payload_size = ::distill_asset::build::align_up(cursor, payload_align);
-            let payload_offset = if #single {
-                0
-            } else {
-                ::distill_asset::build::align_up(#repr_size, payload_align)
-            };
             let fields = builder.leak_fields(fields);
             let node = builder.leak_node(::distill_asset::NativeLayoutNode::Struct {
-                offset: payload_offset,
+                offset: 0,
                 size: payload_size,
                 align: payload_align,
                 whole_drop: None,

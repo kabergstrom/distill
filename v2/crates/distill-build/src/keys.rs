@@ -1,6 +1,6 @@
 //! DSBI/DSSI/DSIH key construction (§§8–9).
 
-use distill_core::canonical::{domain_digest, CanonicalEncoder, DSSI};
+use distill_core::canonical::{domain_digest, CanonicalEncoder, DSSI, DSTG};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 
 use crate::pipeline::{Target, TargetArch, TargetOs};
@@ -8,7 +8,6 @@ use crate::trace::{trace_digest, TraceOp};
 
 const DSBI: [u8; 4] = *b"DSBI";
 const DSIH: [u8; 4] = *b"DSIH";
-const DSTG: [u8; 4] = *b"DSTG";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputHash {
@@ -129,9 +128,8 @@ pub fn full_input_hash(inputs: &StaticInputs, trace: &[TraceOp]) -> [u8; 32] {
     })
 }
 
-/// Canonical target identity plus caller-provided target options (already
-/// canonical key/value pairs). Names are data, never config ordinals.
-pub fn target_definition_hash(target: &Target, options: &[(String, String)]) -> [u8; 32] {
+/// Canonical target identity. Names are data, never config ordinals.
+pub fn target_definition_hash(target: &Target) -> [u8; 32] {
     domain_digest(DSTG, 1, |e| {
         e.u8(match target.os {
             TargetOs::Linux => 0,
@@ -145,23 +143,9 @@ pub fn target_definition_hash(target: &Target, options: &[(String, String)]) -> 
         e.set(&target.apis, |e, api| e.str(&api.0));
         e.bool(target.optimize);
         e.bool(target.debug_info);
-        let identity = &target.compilation_identity;
+        let identity = &target.layout_identity;
         e.str(&identity.target_triple);
         e.str(&identity.rustc);
-        e.raw(&identity.source_fingerprint);
-        e.set(identity.features.iter(), |e, (package, feature)| {
-            e.str(package);
-            e.str(feature);
-        });
-        e.set(identity.cfgs.iter(), |e, cfg| e.str(cfg));
-        e.raw(&identity.manifest_lock_hash);
         e.u32(identity.algorithm_version);
-        let mut options = options.to_vec();
-        options.sort();
-        options.dedup();
-        e.seq(&options, |e, (key, value)| {
-            e.str(key);
-            e.str(value);
-        });
     })
 }

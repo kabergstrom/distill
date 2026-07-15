@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use distill_build::keys::target_definition_hash;
 use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
 use distill_rpc::{TargetDefinition, TargetDefinitionHash};
-use distill_schema::{ngp_schema::CompilationIdentity, ProjectSchemaAuthority};
+use distill_schema::{ngp_schema::LayoutIdentity, ProjectSchemaAuthority};
 use distill_store::config::{parse_byte_size, ConfigValidationError};
 use distill_store::state::{ConfigurationPathKey, DscpV1, OwnedPathKind, OwnedPathSide};
 use distill_store::StoreConfig;
@@ -353,12 +353,12 @@ impl DaemonConfig {
     /// explicitly named §22 gate; it cannot substitute a caller hash here.
     pub fn build_targets(
         &self,
-        identity: &CompilationIdentity,
+        identity: &LayoutIdentity,
     ) -> Result<BTreeMap<String, Target>, DaemonConfigError> {
         self.targets
             .iter()
             .map(|(name, target)| {
-                if !target_matches_compilation_identity(target, identity) {
+                if !target_matches_layout_identity(target, identity) {
                     return Err(DaemonConfigError::Target(format!(
                         "{name}: configured {:?}/{:?} does not match schema compilation target `{}`; cross-target layouts are not emitted yet",
                         target.os, target.arch, identity.target_triple
@@ -382,12 +382,12 @@ impl DaemonConfig {
     /// explicitly named §22 gate; it cannot substitute a caller hash here.
     pub fn target_definitions(
         &self,
-        identity: &CompilationIdentity,
+        identity: &LayoutIdentity,
     ) -> Result<Vec<TargetDefinition>, DaemonConfigError> {
         self.build_targets(identity)?
             .iter()
             .map(|(name, target)| {
-                let definition_hash = TargetDefinitionHash(target_definition_hash(target, &[]));
+                let definition_hash = TargetDefinitionHash(target_definition_hash(target));
                 Ok(TargetDefinition::new(name, definition_hash))
             })
             .collect()
@@ -416,10 +416,7 @@ impl DaemonConfig {
     }
 }
 
-fn target_matches_compilation_identity(
-    target: &TargetSection,
-    identity: &CompilationIdentity,
-) -> bool {
+fn target_matches_layout_identity(target: &TargetSection, identity: &LayoutIdentity) -> bool {
     let mut components = identity.target_triple.split('-');
     let Some(arch) = components.next() else {
         return false;

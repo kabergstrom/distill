@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::attestation::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
+use distill_core::bootstrap::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{BundleFileHash, ContentHash};
 use distill_json::AuthoredValue;

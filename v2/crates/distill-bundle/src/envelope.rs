@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use distill_core::attestation::{
+use distill_core::bootstrap::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS,
     IMPORT_RECORD_TYPE_UUID,
 };
