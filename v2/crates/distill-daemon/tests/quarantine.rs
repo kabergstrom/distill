@@ -138,7 +138,7 @@ fn admitted_replacement_uses_the_portable_no_replace_state_machine() {
 }
 
 #[test]
-fn codegen_group_recovery_commits_preimages_before_retirement() {
+fn codegen_group_recovery_requires_retained_output_authority() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let output = temp.path().join("generated");
@@ -168,15 +168,16 @@ fn codegen_group_recovery_commits_preimages_before_retirement() {
         .unwrap();
     let driver = QuarantineDriver::new([QuarantineRoot::new(&output, &quarantine)]).unwrap();
 
-    let publication = driver.admit_publication(&mut store).unwrap();
-    assert_eq!(
-        publication.recovered().len(),
-        1,
-        "the unfinished child was recovered before admission"
-    );
-    drop(publication);
-
-    assert_eq!(std::fs::read(target).unwrap(), b"pub mod shader;\n");
-    assert_eq!(store.codegen_outputs().unwrap(), outputs);
-    assert!(store.unfinished_publication_groups().unwrap().is_empty());
+    let error = match driver.admit_publication(&mut store) {
+        Ok(_) => panic!("ambient recovery unexpectedly admitted a codegen group"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.store_error(),
+        Some(StoreError::BadIntent { .. })
+    ));
+    assert!(!target.exists());
+    assert_eq!(std::fs::read(proposed).unwrap(), b"pub mod shader;\n");
+    assert!(store.codegen_outputs().unwrap().is_empty());
+    assert_eq!(store.unfinished_publication_groups().unwrap().len(), 1);
 }

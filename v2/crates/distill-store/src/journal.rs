@@ -150,7 +150,8 @@ struct RenameAsideIntent {
     state: RenameAsideState,
 }
 
-enum NoReplaceError {
+/// Result class for a journal filesystem's no-replace move primitive.
+pub enum NoReplaceMoveError {
     DestinationExists,
     Other(StoreError),
 }
@@ -158,7 +159,13 @@ enum NoReplaceError {
 /// Deliberately has no replace operation. Keeping the state machine generic
 /// over this capability both prevents an overwrite implementation and lets
 /// tests inject races at exact move boundaries on every supported host.
-trait RenameAsideFs {
+/// Filesystem authority used by the durable publication state machine.
+///
+/// Production normally uses the native pathname implementation. Callers
+/// retaining a directory capability (notably generated-source publication)
+/// provide a descriptor-relative implementation so recovery cannot escape
+/// that retained namespace.
+pub trait JournalFilesystem {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError>;
     fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError>;
     fn sync_file(&mut self, path: &Path) -> Result<(), StoreError>;
@@ -168,7 +175,11 @@ trait RenameAsideFs {
         source: &Path,
         destination_dir: &Path,
     ) -> Result<(), StoreError>;
-    fn move_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), NoReplaceError>;
+    fn move_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError>;
 }
 
 impl Store {
@@ -508,6 +519,38 @@ impl Store {
         self.reconcile_creation_with(intent_id, &mut filesystem)
     }
 
+    /// Resume a replacement through caller-supplied filesystem authority.
+    /// This is the same durable state machine as
+    /// [`Self::publish_journaled_replacement`]; only path resolution and the
+    /// no-replace primitive are supplied by the caller.
+    pub fn publish_journaled_replacement_with_filesystem(
+        &mut self,
+        intent_id: i64,
+        quarantine_dir: &Path,
+        filesystem: &mut dyn JournalFilesystem,
+    ) -> Result<RenameAsideOutcome, StoreError> {
+        self.publish_rename_aside_with(intent_id, quarantine_dir, filesystem)
+    }
+
+    /// Resume a deletion through caller-supplied filesystem authority.
+    pub fn reconcile_journaled_deletion_with_filesystem(
+        &mut self,
+        intent_id: i64,
+        quarantine_dir: &Path,
+        filesystem: &mut dyn JournalFilesystem,
+    ) -> Result<DeletionRecoveryOutcome, StoreError> {
+        self.reconcile_deletion_with(intent_id, quarantine_dir, filesystem)
+    }
+
+    /// Resume a creation through caller-supplied filesystem authority.
+    pub fn reconcile_journaled_creation_with_filesystem(
+        &mut self,
+        intent_id: i64,
+        filesystem: &mut dyn JournalFilesystem,
+    ) -> Result<CreationRecoveryOutcome, StoreError> {
+        self.reconcile_creation_with(intent_id, filesystem)
+    }
+
     /// Execute or resume §14's Windows rename-aside fallback.
     ///
     /// `MoveFileExW` is used without `MOVEFILE_REPLACE_EXISTING` for all
@@ -541,7 +584,7 @@ impl Store {
         self.reconcile_journaled_creation(intent_id)
     }
 
-    fn reconcile_deletion_with<F: RenameAsideFs>(
+    fn reconcile_deletion_with<F: JournalFilesystem + ?Sized>(
         &mut self,
         intent_id: i64,
         quarantine_dir: &Path,
@@ -628,10 +671,10 @@ impl Store {
                         )?;
                         return Ok(DeletionRecoveryOutcome::ConflictRestored);
                     }
-                    Err(NoReplaceError::DestinationExists) => {
+                    Err(NoReplaceMoveError::DestinationExists) => {
                         return Ok(DeletionRecoveryOutcome::RetryRequired)
                     }
-                    Err(NoReplaceError::Other(error)) => return Err(error),
+                    Err(NoReplaceMoveError::Other(error)) => return Err(error),
                 }
             }
 
@@ -650,7 +693,7 @@ impl Store {
                         RenameAsideState::TargetAsideDurable,
                     )?;
                 }
-                Err(NoReplaceError::DestinationExists) => {
+                Err(NoReplaceMoveError::DestinationExists) => {
                     let collision =
                         existing_hash(fs, intent_id, &aside, "deletion quarantine collision")?;
                     fs.sync_file(&aside)?;
@@ -665,7 +708,7 @@ impl Store {
                     )?;
                     aside = replacement;
                 }
-                Err(NoReplaceError::Other(error)) => return Err(error),
+                Err(NoReplaceMoveError::Other(error)) => return Err(error),
             }
         }
         Err(StoreError::BadIntent {
@@ -674,7 +717,7 @@ impl Store {
         })
     }
 
-    fn reconcile_creation_with<F: RenameAsideFs>(
+    fn reconcile_creation_with<F: JournalFilesystem + ?Sized>(
         &mut self,
         intent_id: i64,
         fs: &mut F,
@@ -713,12 +756,14 @@ impl Store {
                 self.retire_intent(intent_id)?;
                 Ok(CreationRecoveryOutcome::Installed)
             }
-            Err(NoReplaceError::DestinationExists) => Ok(CreationRecoveryOutcome::RetryRequired),
-            Err(NoReplaceError::Other(error)) => Err(error),
+            Err(NoReplaceMoveError::DestinationExists) => {
+                Ok(CreationRecoveryOutcome::RetryRequired)
+            }
+            Err(NoReplaceMoveError::Other(error)) => Err(error),
         }
     }
 
-    fn publish_rename_aside_with<F: RenameAsideFs>(
+    fn publish_rename_aside_with<F: JournalFilesystem + ?Sized>(
         &mut self,
         intent_id: i64,
         quarantine_dir: &Path,
@@ -796,8 +841,8 @@ impl Store {
                     }
                     match fs.move_no_replace(&intent.target, &aside) {
                         Ok(()) => {}
-                        Err(NoReplaceError::DestinationExists) => continue,
-                        Err(NoReplaceError::Other(error)) => return Err(error),
+                        Err(NoReplaceMoveError::DestinationExists) => continue,
+                        Err(NoReplaceMoveError::Other(error)) => return Err(error),
                     }
                     fs.sync_file(&aside)?;
                     sync_move_dirs(fs, &intent.target, &aside)?;
@@ -899,8 +944,8 @@ impl Store {
                                         &mut intent,
                                     )?;
                                 }
-                                Err(NoReplaceError::DestinationExists) => continue,
-                                Err(NoReplaceError::Other(error)) => return Err(error),
+                                Err(NoReplaceMoveError::DestinationExists) => continue,
+                                Err(NoReplaceMoveError::Other(error)) => return Err(error),
                             }
                         }
                         Some(reappeared) => {
@@ -949,7 +994,7 @@ impl Store {
                     }
                     match fs.move_no_replace(&intent.target, &intent.conflict) {
                         Ok(()) => {}
-                        Err(NoReplaceError::DestinationExists) => {
+                        Err(NoReplaceMoveError::DestinationExists) => {
                             let collision = existing_hash(
                                 fs,
                                 intent_id,
@@ -972,7 +1017,7 @@ impl Store {
                             intent.conflict = replacement;
                             continue;
                         }
-                        Err(NoReplaceError::Other(error)) => return Err(error),
+                        Err(NoReplaceMoveError::Other(error)) => return Err(error),
                     }
                     fs.sync_file(&intent.conflict)?;
                     sync_move_dirs(fs, &intent.target, &intent.conflict)?;
@@ -1013,10 +1058,10 @@ impl Store {
                                 )?;
                                 return Ok(RenameAsideOutcome::ConflictRestored);
                             }
-                            Err(NoReplaceError::DestinationExists) => {
+                            Err(NoReplaceMoveError::DestinationExists) => {
                                 return Ok(RenameAsideOutcome::RetryRequired)
                             }
-                            Err(NoReplaceError::Other(error)) => return Err(error),
+                            Err(NoReplaceMoveError::Other(error)) => return Err(error),
                         }
                     }
 
@@ -1141,7 +1186,7 @@ impl Store {
         Ok(())
     }
 
-    fn begin_reappeared_target<F: RenameAsideFs>(
+    fn begin_reappeared_target<F: JournalFilesystem + ?Sized>(
         &mut self,
         fs: &mut F,
         intent_id: i64,
@@ -1162,7 +1207,7 @@ impl Store {
         Ok(())
     }
 
-    fn available_conflict_path<F: RenameAsideFs>(
+    fn available_conflict_path<F: JournalFilesystem + ?Sized>(
         &self,
         fs: &mut F,
         intent_id: i64,
@@ -1585,13 +1630,16 @@ impl Store {
     }
 }
 
-fn read_hash<F: RenameAsideFs>(fs: &mut F, path: &Path) -> Result<Option<ContentHash>, StoreError> {
+fn read_hash<F: JournalFilesystem + ?Sized>(
+    fs: &mut F,
+    path: &Path,
+) -> Result<Option<ContentHash>, StoreError> {
     Ok(fs
         .read(path)?
         .map(|bytes| ContentHash(*blake3::hash(&bytes).as_bytes())))
 }
 
-fn existing_hash<F: RenameAsideFs>(
+fn existing_hash<F: JournalFilesystem + ?Sized>(
     fs: &mut F,
     intent_id: i64,
     path: &Path,
@@ -1603,7 +1651,7 @@ fn existing_hash<F: RenameAsideFs>(
     })
 }
 
-fn require_hash<F: RenameAsideFs>(
+fn require_hash<F: JournalFilesystem + ?Sized>(
     fs: &mut F,
     intent_id: i64,
     path: &Path,
@@ -1628,7 +1676,7 @@ fn hash_hex(hash: ContentHash) -> String {
     hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn sync_move_dirs<F: RenameAsideFs>(
+fn sync_move_dirs<F: JournalFilesystem + ?Sized>(
     fs: &mut F,
     source: &Path,
     destination: &Path,
@@ -1646,7 +1694,7 @@ fn sync_move_dirs<F: RenameAsideFs>(
 struct NativeRenameAsideFs;
 
 #[cfg(not(windows))]
-impl RenameAsideFs for NativeRenameAsideFs {
+impl JournalFilesystem for NativeRenameAsideFs {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -1686,14 +1734,18 @@ impl RenameAsideFs for NativeRenameAsideFs {
         ensure_same_filesystem(source, destination_dir)
     }
 
-    fn move_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), NoReplaceError> {
+    fn move_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError> {
         match std::fs::hard_link(source, destination) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(NoReplaceError::DestinationExists)
+                return Err(NoReplaceMoveError::DestinationExists)
             }
             Err(source) => {
-                return Err(NoReplaceError::Other(StoreError::Io {
+                return Err(NoReplaceMoveError::Other(StoreError::Io {
                     path: destination.to_path_buf(),
                     source,
                 }))
@@ -1701,7 +1753,7 @@ impl RenameAsideFs for NativeRenameAsideFs {
         }
         let source_path = source.to_path_buf();
         std::fs::remove_file(source).map_err(|source| {
-            NoReplaceError::Other(StoreError::Io {
+            NoReplaceMoveError::Other(StoreError::Io {
                 path: source_path,
                 source,
             })
@@ -1713,7 +1765,7 @@ impl RenameAsideFs for NativeRenameAsideFs {
 struct WindowsRenameAsideFs;
 
 #[cfg(windows)]
-impl RenameAsideFs for WindowsRenameAsideFs {
+impl JournalFilesystem for WindowsRenameAsideFs {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -1767,7 +1819,11 @@ impl RenameAsideFs for WindowsRenameAsideFs {
         ensure_same_filesystem(source, destination_dir)
     }
 
-    fn move_no_replace(&mut self, source: &Path, destination: &Path) -> Result<(), NoReplaceError> {
+    fn move_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError> {
         use std::os::windows::ffi::OsStrExt;
 
         #[link(name = "kernel32")]
@@ -1810,9 +1866,9 @@ impl RenameAsideFs for WindowsRenameAsideFs {
             source_error.raw_os_error(),
             Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS)
         ) {
-            return Err(NoReplaceError::DestinationExists);
+            return Err(NoReplaceMoveError::DestinationExists);
         }
-        Err(NoReplaceError::Other(StoreError::Io {
+        Err(NoReplaceMoveError::Other(StoreError::Io {
             path: destination.to_path_buf(),
             source: source_error,
         }))
@@ -1908,7 +1964,7 @@ mod rename_aside_tests {
         }
     }
 
-    impl RenameAsideFs for FakeFs {
+    impl JournalFilesystem for FakeFs {
         fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
             Ok(self.files.get(path).cloned())
         }
@@ -1946,7 +2002,7 @@ mod rename_aside_tests {
             &mut self,
             source: &Path,
             destination: &Path,
-        ) -> Result<(), NoReplaceError> {
+        ) -> Result<(), NoReplaceMoveError> {
             self.events.push(FsEvent::MoveNoReplace(
                 source.to_path_buf(),
                 destination.to_path_buf(),
@@ -1958,10 +2014,10 @@ mod rename_aside_tests {
                 self.files.insert(appeared_path, bytes);
             }
             if self.files.contains_key(destination) {
-                return Err(NoReplaceError::DestinationExists);
+                return Err(NoReplaceMoveError::DestinationExists);
             }
             let Some(bytes) = self.files.remove(source) else {
-                return Err(NoReplaceError::Other(StoreError::Io {
+                return Err(NoReplaceMoveError::Other(StoreError::Io {
                     path: source.to_path_buf(),
                     source: io::Error::new(io::ErrorKind::NotFound, "source missing"),
                 }));

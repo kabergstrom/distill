@@ -1,11 +1,12 @@
 //! Daemon orchestration over the store's durable displacement journal.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use distill_core::id::ContentHash;
 use distill_store::codegen::CodegenPublicationBasis;
 use distill_store::journal::{
-    JournalIntentPlan, PublicationGroup, PublicationGroupKind, RecoveredEdit,
+    JournalFilesystem, JournalIntentPlan, PublicationGroup, PublicationGroupKind, RecoveredEdit,
 };
 use distill_store::{Store, StoreError};
 
@@ -82,6 +83,7 @@ pub struct QuarantineDriver {
 pub struct PublicationDriver<'a> {
     quarantine: &'a QuarantineDriver,
     store: &'a mut Store,
+    filesystem: Option<&'a mut dyn JournalFilesystem>,
     recovered: Vec<(i64, RecoveryOutcome)>,
 }
 
@@ -201,13 +203,35 @@ impl QuarantineDriver {
     fn startup_reconcile(
         &self,
         store: &mut Store,
+        mut filesystem: Option<&mut dyn JournalFilesystem>,
     ) -> Result<Vec<(i64, RecoveryOutcome)>, QuarantineError> {
+        let groups = store.unfinished_publication_groups()?;
+        let codegen_children = groups
+            .iter()
+            .filter(|group| group.kind == PublicationGroupKind::Codegen)
+            .flat_map(|group| group.child_intents.iter().copied())
+            .collect::<BTreeSet<_>>();
         let intents = store.unretired_intents()?;
         let mut outcomes = Vec::new();
         for intent in intents {
             let target = PathBuf::from(&intent.target_path);
+            let descriptor_relative = codegen_children.contains(&intent.intent_id);
+            if descriptor_relative && filesystem.is_none() {
+                return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                    intent_id: intent.intent_id,
+                    detail: "codegen recovery requires its retained output-directory authority"
+                        .into(),
+                })));
+            }
             if intent.pre_image_hash.is_none() {
-                let outcome = store.reconcile_journaled_creation(intent.intent_id)?;
+                let outcome = if descriptor_relative {
+                    store.reconcile_journaled_creation_with_filesystem(
+                        intent.intent_id,
+                        filesystem.as_deref_mut().expect("checked above"),
+                    )?
+                } else {
+                    store.reconcile_journaled_creation(intent.intent_id)?
+                };
                 outcomes.push((intent.intent_id, RecoveryOutcome::Creation(outcome)));
                 continue;
             }
@@ -229,10 +253,26 @@ impl QuarantineDriver {
                     })?
             };
             if intent.temp_path.is_empty() {
-                let outcome = store.reconcile_journaled_deletion(intent.intent_id, quarantine)?;
+                let outcome = if descriptor_relative {
+                    store.reconcile_journaled_deletion_with_filesystem(
+                        intent.intent_id,
+                        quarantine,
+                        filesystem.as_deref_mut().expect("checked above"),
+                    )?
+                } else {
+                    store.reconcile_journaled_deletion(intent.intent_id, quarantine)?
+                };
                 outcomes.push((intent.intent_id, RecoveryOutcome::Deletion(outcome)));
             } else {
-                let outcome = store.publish_journaled_replacement(intent.intent_id, quarantine)?;
+                let outcome = if descriptor_relative {
+                    store.publish_journaled_replacement_with_filesystem(
+                        intent.intent_id,
+                        quarantine,
+                        filesystem.as_deref_mut().expect("checked above"),
+                    )?
+                } else {
+                    store.publish_journaled_replacement(intent.intent_id, quarantine)?
+                };
                 outcomes.push((intent.intent_id, RecoveryOutcome::Rewrite(outcome)));
             }
         }
@@ -242,7 +282,7 @@ impl QuarantineDriver {
                 detail: "startup recovery stopped before the intent became terminal".into(),
             })));
         }
-        for group in store.unfinished_publication_groups()? {
+        for group in groups {
             if group.kind == PublicationGroupKind::Codegen {
                 let basis = CodegenPublicationBasis::decode(&group.basis).map_err(|detail| {
                     QuarantineError::Store(Box::new(StoreError::BadIntent {
@@ -263,10 +303,27 @@ impl QuarantineDriver {
         &'a self,
         store: &'a mut Store,
     ) -> Result<PublicationDriver<'a>, QuarantineError> {
-        let recovered = self.startup_reconcile(store)?;
+        let recovered = self.startup_reconcile(store, None)?;
         Ok(PublicationDriver {
             quarantine: self,
             store,
+            filesystem: None,
+            recovered,
+        })
+    }
+
+    /// Reconcile and publish codegen groups through the retained output
+    /// directory instead of reopening their journaled absolute pathnames.
+    pub fn admit_codegen_publication<'a>(
+        &'a self,
+        store: &'a mut Store,
+        filesystem: &'a mut dyn JournalFilesystem,
+    ) -> Result<PublicationDriver<'a>, QuarantineError> {
+        let recovered = self.startup_reconcile(store, Some(filesystem))?;
+        Ok(PublicationDriver {
+            quarantine: self,
+            store,
+            filesystem: Some(filesystem),
             recovered,
         })
     }
@@ -335,9 +392,15 @@ impl PublicationDriver<'_> {
         target: &Path,
     ) -> Result<distill_store::journal::RenameAsideOutcome, QuarantineError> {
         let quarantine = self.quarantine.quarantine_for(target)?;
-        self.store
-            .publish_journaled_replacement(intent_id, quarantine)
-            .map_err(Into::into)
+        match self.filesystem.as_deref_mut() {
+            Some(filesystem) => self
+                .store
+                .publish_journaled_replacement_with_filesystem(intent_id, quarantine, filesystem),
+            None => self
+                .store
+                .publish_journaled_replacement(intent_id, quarantine),
+        }
+        .map_err(Into::into)
     }
 
     pub fn resume_group_delete(
@@ -346,18 +409,28 @@ impl PublicationDriver<'_> {
         target: &Path,
     ) -> Result<distill_store::journal::DeletionRecoveryOutcome, QuarantineError> {
         let quarantine = self.quarantine.quarantine_for(target)?;
-        self.store
-            .reconcile_journaled_deletion(intent_id, quarantine)
-            .map_err(Into::into)
+        match self.filesystem.as_deref_mut() {
+            Some(filesystem) => self
+                .store
+                .reconcile_journaled_deletion_with_filesystem(intent_id, quarantine, filesystem),
+            None => self
+                .store
+                .reconcile_journaled_deletion(intent_id, quarantine),
+        }
+        .map_err(Into::into)
     }
 
     pub fn resume_group_create(
         &mut self,
         intent_id: i64,
     ) -> Result<distill_store::journal::CreationRecoveryOutcome, QuarantineError> {
-        self.store
-            .reconcile_journaled_creation(intent_id)
-            .map_err(Into::into)
+        match self.filesystem.as_deref_mut() {
+            Some(filesystem) => self
+                .store
+                .reconcile_journaled_creation_with_filesystem(intent_id, filesystem),
+            None => self.store.reconcile_journaled_creation(intent_id),
+        }
+        .map_err(Into::into)
     }
 
     pub fn journaled_replace(
