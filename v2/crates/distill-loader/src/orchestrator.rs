@@ -608,7 +608,7 @@ impl<I: LoaderIO> Loader<I> {
         self.prune_released(storage);
         self.poll_pending(storage);
         for event in self.io.poll() {
-            self.handle_event(event)?;
+            self.handle_event(event, storage)?;
         }
         self.drain_epochs(storage)?;
         if self.attestation == ReattestationState::Required {
@@ -760,12 +760,21 @@ impl<I: LoaderIO> Loader<I> {
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         let released_set = released.iter().copied().collect::<BTreeSet<_>>();
+        self.cancel_pending_for_handles(storage, &released_set);
+        self.prune_released_slots(storage, released);
+    }
+
+    fn cancel_pending_for_handles(
+        &mut self,
+        storage: &mut dyn AssetStorage,
+        handles: &BTreeSet<HandleId>,
+    ) {
         let mut pending_index = 0;
         while pending_index < self.pending.len() {
             if self.pending[pending_index]
                 .updates
                 .iter()
-                .any(|update| released_set.contains(&update.handle))
+                .any(|update| handles.contains(&update.handle))
             {
                 let pending = self.pending.remove(pending_index);
                 self.rollback_updates(storage, pending.adoption, &pending.updates);
@@ -773,6 +782,58 @@ impl<I: LoaderIO> Loader<I> {
                 pending_index += 1;
             }
         }
+    }
+
+    fn detach_indirect_slots(
+        &mut self,
+        storage: &mut dyn AssetStorage,
+        paths: Option<&BTreeSet<String>>,
+    ) {
+        let ids = self
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| match &slot.binding {
+                Binding::Indirect { path, .. }
+                    if paths.is_none_or(|selected| selected.contains(path)) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        self.cancel_pending_for_handles(storage, &ids);
+        let mut detached = BTreeSet::new();
+        let mut unsubscribe = Vec::new();
+        for id in ids {
+            let slot = self.slots.get_mut(&id).expect("collected existing slot");
+            if let Some(uuid) = slot.subscribed_uuid.take() {
+                unsubscribe.push(uuid);
+            }
+            if let Binding::Indirect { resolved, .. } = &mut slot.binding {
+                if let Some(uuid) = resolved.take() {
+                    detached.insert(uuid);
+                }
+            }
+            slot.status = LoadStatus::Unloaded;
+        }
+        for uuid in unsubscribe {
+            self.io.unsubscribe(uuid);
+        }
+        for uuid in detached.iter().copied().collect::<Vec<_>>() {
+            if self.handles_for_uuid(uuid).is_empty() {
+                self.dirty.remove(&uuid);
+                if let Some(candidate) = self
+                    .sweep
+                    .as_mut()
+                    .and_then(|sweep| sweep.candidates.remove(&uuid))
+                {
+                    destroy_candidate_values(candidate.terminal);
+                }
+            }
+        }
+    }
+
+    fn prune_released_slots(&mut self, storage: &mut dyn AssetStorage, released: Vec<HandleId>) {
         for id in released {
             if let Some(placeholder) = self.injected_placeholders.remove(&id) {
                 let _ = placeholder.value.destroy();
@@ -914,7 +975,11 @@ impl<I: LoaderIO> Loader<I> {
         Ok(())
     }
 
-    fn handle_event(&mut self, event: IoEvent) -> Result<(), LoaderError> {
+    fn handle_event(
+        &mut self,
+        event: IoEvent,
+        storage: &mut dyn AssetStorage,
+    ) -> Result<(), LoaderError> {
         match event {
             IoEvent::ReconnectRequired { reason } => {
                 self.diagnostics
@@ -924,15 +989,17 @@ impl<I: LoaderIO> Loader<I> {
                         entry.state = ManifestState::Invalidated { last: content_hash };
                     }
                 }
+                let paths = self
+                    .slots
+                    .values()
+                    .filter_map(|slot| match &slot.binding {
+                        Binding::Indirect { path, .. } => Some(path.clone()),
+                        Binding::Direct(_) => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                self.detach_indirect_slots(storage, Some(&paths));
                 self.dirty.extend(self.held_uuids());
-                self.dirty_paths
-                    .extend(self.slots.values().filter_map(|slot| {
-                        if let Binding::Indirect { path, .. } = &slot.binding {
-                            Some(path.clone())
-                        } else {
-                            None
-                        }
-                    }));
+                self.dirty_paths.extend(paths);
                 self.block_for_reattest();
             }
             IoEvent::Reattested { attestation, basis } => {
@@ -982,21 +1049,9 @@ impl<I: LoaderIO> Loader<I> {
                         }
                     }
                 }
-                for path in paths {
-                    self.dirty_paths.insert(path.clone());
-                    for slot in self.slots.values_mut() {
-                        if let Binding::Indirect {
-                            path: slot_path,
-                            resolved,
-                        } = &mut slot.binding
-                        {
-                            if *slot_path == path {
-                                *resolved = None;
-                                slot.status = LoadStatus::Unloaded;
-                            }
-                        }
-                    }
-                }
+                let paths = paths.into_iter().collect::<BTreeSet<_>>();
+                self.detach_indirect_slots(storage, Some(&paths));
+                self.dirty_paths.extend(paths);
             }
             IoEvent::Resolved {
                 req,
@@ -1040,7 +1095,7 @@ impl<I: LoaderIO> Loader<I> {
                     self.diagnostics.push(LoaderDiagnostic::EventMismatch);
                     return Ok(());
                 }
-                self.accept_path(&path, result);
+                self.accept_path(&path, result, storage);
             }
             IoEvent::Fetched {
                 req,
@@ -1093,6 +1148,7 @@ impl<I: LoaderIO> Loader<I> {
                             PathResolveResult::Failed {
                                 error: message.clone(),
                             },
+                            storage,
                         );
                     }
                     _ => self.diagnostics.push(LoaderDiagnostic::EventMismatch),
@@ -1195,7 +1251,12 @@ impl<I: LoaderIO> Loader<I> {
         Ok(())
     }
 
-    fn accept_path(&mut self, path: &str, result: PathResolveResult) {
+    fn accept_path(
+        &mut self,
+        path: &str,
+        result: PathResolveResult,
+        storage: &mut dyn AssetStorage,
+    ) {
         let ids = self
             .slots
             .iter()
@@ -1203,21 +1264,32 @@ impl<I: LoaderIO> Loader<I> {
                 Binding::Indirect { path: value, .. } if value == path => Some(*id),
                 _ => None,
             })
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+        self.cancel_pending_for_handles(storage, &ids);
+        let mut retired = BTreeSet::new();
+        let mut unsubscribe = Vec::new();
         for id in ids {
             let slot = self.slots.get_mut(&id).expect("collected existing slot");
-            match result {
+            if let Some(uuid) = slot.subscribed_uuid.take() {
+                unsubscribe.push(uuid);
+            }
+            if let Binding::Indirect { resolved, .. } = &mut slot.binding {
+                if let Some(uuid) = resolved.take() {
+                    retired.insert(uuid);
+                }
+            }
+            match &result {
                 PathResolveResult::Resolved(uuid) => {
                     if let Binding::Indirect { resolved, .. } = &mut slot.binding {
-                        *resolved = Some(uuid);
+                        *resolved = Some(*uuid);
                     }
-                    self.manifest.entry(uuid).or_insert(ManifestEntry {
+                    self.manifest.entry(*uuid).or_insert(ManifestEntry {
                         state: ManifestState::Missing,
                         adopted_at: AdoptionId(0),
                     });
-                    self.dirty.insert(uuid);
+                    self.dirty.insert(*uuid);
                     if let Some(sweep) = &mut self.sweep {
-                        sweep.candidates.entry(uuid).or_insert(CandidateRecord {
+                        sweep.candidates.entry(*uuid).or_insert(CandidateRecord {
                             basis: sweep.basis.clone(),
                             resolve_issued: false,
                             expected_terminal_types: BTreeSet::new(),
@@ -1229,6 +1301,21 @@ impl<I: LoaderIO> Loader<I> {
                 | PathResolveResult::Unsupported
                 | PathResolveResult::Failed { .. } => {
                     slot.status = LoadStatus::Unloaded;
+                }
+            }
+        }
+        for uuid in unsubscribe {
+            self.io.unsubscribe(uuid);
+        }
+        for uuid in retired {
+            if self.handles_for_uuid(uuid).is_empty() {
+                self.dirty.remove(&uuid);
+                if let Some(candidate) = self
+                    .sweep
+                    .as_mut()
+                    .and_then(|sweep| sweep.candidates.remove(&uuid))
+                {
+                    destroy_candidate_values(candidate.terminal);
                 }
             }
         }

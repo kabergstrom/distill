@@ -91,7 +91,7 @@ enum Command {
     ResolvePath(ReqId, String, IoBasis),
     Subscribe(AssetUuid),
     SubscribePath(String),
-    Unsubscribe,
+    Unsubscribe(AssetUuid),
     UnsubscribePath,
 }
 
@@ -181,8 +181,7 @@ impl LoaderIO for MockIo {
     }
 
     fn unsubscribe(&mut self, uuid: AssetUuid) {
-        let _ = uuid;
-        self.commands.push(Command::Unsubscribe);
+        self.commands.push(Command::Unsubscribe(uuid));
     }
 
     fn subscribe_path(&mut self, path: &str) {
@@ -715,6 +714,126 @@ fn indirect_handle_rebinds_only_through_io_and_reconnect_blocks_old_completion()
     assert!(loader.io().commands.iter().any(
         |command| matches!(command, Command::Resolve(_, candidate, _) if *candidate == uuid(4))
     ));
+}
+
+#[test]
+fn reconnect_missing_detaches_loaded_indirect_uuid_and_subscription() {
+    let token = ModuleEpochToken::new(44);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 44, &token);
+    let path = "textures/rebound";
+    let old_uuid = uuid(44);
+    let handle = loader.add_ref_indirect::<A>(path).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (path_req, path_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: path_req,
+        path: path.to_owned(),
+        result: PathResolveResult::Resolved(old_uuid),
+        basis: path_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    let (hash, bytes) = artifact::<A>(old_uuid, &[]);
+    resolve(&mut loader, old_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, bytes);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+
+    let old_resolve_count = loader
+        .io()
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == old_uuid))
+        .count();
+    loader.io_mut().push(IoEvent::ReconnectRequired {
+        reason: distill_loader::ReconnectReason::StoreInstanceChanged,
+    });
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (new_path_req, new_path_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: new_path_req,
+        path: path.to_owned(),
+        result: PathResolveResult::Missing,
+        basis: new_path_basis,
+    });
+    loader.process(&mut storage).unwrap();
+
+    assert!(loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::Unsubscribe(uuid) if *uuid == old_uuid)));
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == old_uuid))
+            .count(),
+        old_resolve_count,
+        "the stale UUID must not be resolved again while its path says Missing"
+    );
+    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+}
+
+#[test]
+fn path_rebind_unsubscribes_old_uuid_before_subscribing_new_uuid() {
+    let token = ModuleEpochToken::new(45);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 45, &token);
+    let path = "textures/switch";
+    let first = uuid(45);
+    let second = uuid(46);
+    let _handle = loader.add_ref_indirect::<A>(path).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (first_req, first_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: first_req,
+        path: path.to_owned(),
+        result: PathResolveResult::Resolved(first),
+        basis: first_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert!(loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::Subscribe(uuid) if *uuid == first)));
+
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: Vec::new(),
+        paths: vec![path.to_owned()],
+    });
+    loader.process(&mut storage).unwrap();
+    let (second_req, second_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: second_req,
+        path: path.to_owned(),
+        result: PathResolveResult::Resolved(second),
+        basis: second_basis,
+    });
+    loader.process(&mut storage).unwrap();
+
+    let unsubscribe = loader
+        .io()
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::Unsubscribe(uuid) if *uuid == first))
+        .expect("old UUID must be unsubscribed");
+    let subscribe = loader
+        .io()
+        .commands
+        .iter()
+        .rposition(|command| matches!(command, Command::Subscribe(uuid) if *uuid == second))
+        .expect("new UUID must be subscribed");
+    assert!(unsubscribe < subscribe);
 }
 
 #[test]
