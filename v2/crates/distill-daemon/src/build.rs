@@ -35,12 +35,13 @@ use distill_migrate::{
     MigrationError, MigrationOp,
 };
 use distill_rpc::{
-    decode_asset_reference_query, decode_authoring_payload, ArtifactPayload, AssetReferenceQuery,
-    AuthoringMutation, BuildArtifactPublication, BuildBackend, BuildBackendOutcome,
-    BuildPublication, BuildRequest, BuildWireTree, BuildWorkClass, Commit, DriftedInput,
-    PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow, ServedLoadEdge,
+    decode_asset_reference_query, decode_authoring_payload, ArtifactLeaseBackend, ArtifactPayload,
+    AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication, BuildBackend,
+    BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree, BuildWorkClass, Commit,
+    DriftedInput, PipelineUnavailableDiagnostic, RpcFailure, ServedClosureRow, ServedLoadEdge,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
+use distill_store::artifacts::PinKind;
 use distill_store::bundles::{BundleMeta, EntryMeta, TagIndexUpdate};
 use distill_store::cas::record::{
     FailureCause as StoreFailureCause, FailureFingerprint as StoreFailureFingerprint, KeyKind,
@@ -94,6 +95,7 @@ impl PublishedTagIndex {
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
     flights: Arc<StageFlightTable>,
+    active_builds: Mutex<usize>,
 }
 
 impl CoordinatorBuildBackend {
@@ -101,12 +103,20 @@ impl CoordinatorBuildBackend {
         Self {
             coordinator: Arc::downgrade(coordinator),
             flights: Arc::new(StageFlightTable::default()),
+            active_builds: Mutex::new(0),
         }
     }
 }
 
 impl BuildBackend for CoordinatorBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        {
+            let mut active = self
+                .active_builds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *active = active.checked_add(1).expect("active build count exhausted");
+        }
         let coordinator =
             self.coordinator
                 .upgrade()
@@ -118,10 +128,10 @@ impl BuildBackend for CoordinatorBuildBackend {
             BuildWorkClass::Interactive => WorkClass::Interactive,
             BuildWorkClass::Batch => WorkClass::Batch,
         };
-        let request = request.clone();
+        let scheduled_request = request.clone();
         let job_coordinator = Arc::clone(&coordinator);
         let (result, poison) = coordinator.run_scheduled_cooperative(class, move |job| {
-            let result = build_with_runtime(&job_coordinator, &request, flights, job);
+            let result = build_with_runtime(&job_coordinator, &scheduled_request, flights, job);
             let poison = job_coordinator.sync_runtime_pipeline_poison();
             (result, poison)
         });
@@ -139,7 +149,26 @@ impl BuildBackend for CoordinatorBuildBackend {
             }
         }
         match result {
-            Ok(publication) => Ok(BuildBackendOutcome::Built(publication)),
+            Ok(publication) => {
+                let mut hashes = publication
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.content_hash.0)
+                    .collect::<Vec<_>>();
+                hashes.extend(publication.wire_trees.iter().map(|tree| tree.layout_hash.0));
+                coordinator
+                    .store()
+                    .lock()
+                    .map_err(|_| RpcFailure::AuthoringBackendUnavailable {
+                        operation: "pin completed build: durable store mutex is poisoned"
+                            .to_owned(),
+                    })?
+                    .pin(PinKind::InFlight, &build_pin_holder(request), &hashes)
+                    .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
+                        operation: format!("pin completed build: {error}"),
+                    })?;
+                Ok(BuildBackendOutcome::Built(publication))
+            }
             Err(BuildError::Drifted(input)) => Ok(BuildBackendOutcome::Drifted { input }),
             Err(BuildError::DepthExceeded { limit, chain }) => {
                 Err(RpcFailure::BuildDepthExceeded { limit, chain })
@@ -155,6 +184,87 @@ impl BuildBackend for CoordinatorBuildBackend {
             }
         }
     }
+
+    fn build_finished(&self, request: &BuildRequest) -> Result<(), RpcFailure> {
+        let mut active = self
+            .active_builds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active
+            .checked_sub(1)
+            .expect("build_finished called without a matching build");
+        let run_maintenance = *active == 0;
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            return Ok(());
+        };
+        let store_handle = coordinator.store();
+        let mut store =
+            store_handle
+                .lock()
+                .map_err(|_| RpcFailure::AuthoringBackendUnavailable {
+                    operation: "finish build: durable store mutex is poisoned".to_owned(),
+                })?;
+        store
+            .unpin_holder(PinKind::InFlight, &build_pin_holder(request))
+            .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
+                operation: format!("release completed build pin: {error}"),
+            })?;
+        if !run_maintenance {
+            return Ok(());
+        }
+        // Keep the zero-count gate locked through maintenance. A new build
+        // cannot read a candidate between the last activity check and an
+        // eviction that would otherwise treat it as unreferenced.
+        let sweep = store.enforce_cache_limit().map_err(|error| {
+            RpcFailure::AuthoringBackendUnavailable {
+                operation: format!("enforce CAS cache limit: {error}"),
+            }
+        })?;
+        if sweep.evicted != 0 {
+            store
+                .compact()
+                .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
+                    operation: format!("compact CAS after eviction: {error}"),
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl ArtifactLeaseBackend for CoordinatorBuildBackend {
+    fn pin_lease(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
+        let coordinator = self
+            .coordinator
+            .upgrade()
+            .ok_or_else(|| "build coordinator stopped".to_owned())?;
+        coordinator
+            .store()
+            .lock()
+            .map_err(|_| "durable store mutex is poisoned".to_owned())?
+            .pin(PinKind::Lease, &format!("rpc-lease-{holder}"), hashes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_lease(&self, holder: u64) {
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            return;
+        };
+        let store_handle = coordinator.store();
+        let Ok(mut store) = store_handle.lock() else {
+            return;
+        };
+        let _ = store.unpin_holder(PinKind::Lease, &format!("rpc-lease-{holder}"));
+    }
+}
+
+fn build_pin_holder(request: &BuildRequest) -> String {
+    format!(
+        "rpc-build-{:02x?}-{}-{}-{:02x?}",
+        request.basis.instance.0,
+        request.basis.version.0,
+        request.target,
+        request.requested_asset.0
+    )
 }
 
 #[derive(Debug, Clone)]

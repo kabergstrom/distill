@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 
 use tokio::sync::Notify;
@@ -22,11 +22,23 @@ pub struct Server {
     inner: Arc<Mutex<ServerState>>,
     authoring_backend: Arc<dyn AuthoringBackend>,
     build_backend: Arc<RwLock<Arc<dyn BuildBackend>>>,
+    lease_backend: Arc<RwLock<Arc<dyn ArtifactLeaseBackend>>>,
+    next_lease_id: Arc<AtomicU64>,
 }
 
 struct UnavailableAuthoringBackend;
 
 struct UnavailableBuildBackend;
+
+struct InMemoryArtifactLeases;
+
+impl ArtifactLeaseBackend for InMemoryArtifactLeases {
+    fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn release_lease(&self, _holder: u64) {}
+}
 
 impl BuildBackend for UnavailableBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
@@ -163,7 +175,7 @@ pub struct Snapshot {
     attestation_generation: u64,
     view: Arc<VersionView>,
     basis: RpcBasis,
-    lease_alive: Arc<AtomicBool>,
+    lease: Arc<ArtifactLease>,
 }
 
 #[derive(Clone)]
@@ -197,6 +209,58 @@ struct MetadataBinding {
     id: u64,
     store_instance: StoreInstanceId,
     protocol_epoch: u32,
+}
+
+struct ArtifactLease {
+    holder: u64,
+    backend: Arc<dyn ArtifactLeaseBackend>,
+    alive: Mutex<bool>,
+}
+
+impl ArtifactLease {
+    fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
+        let alive = self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*alive {
+            return Err(RpcFailure::LeaseExpired);
+        }
+        self.backend
+            .pin_lease(self.holder, hashes)
+            .map_err(|detail| RpcFailure::InvalidQuery {
+                detail: format!("cannot pin resolved artifact to snapshot lease: {detail}"),
+            })
+    }
+
+    fn alive(&self) -> bool {
+        *self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn expire(&self) {
+        let mut alive = self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::mem::replace(&mut *alive, false) {
+            self.backend.release_lease(self.holder);
+        }
+    }
+}
+
+impl Drop for ArtifactLease {
+    fn drop(&mut self) {
+        if *self
+            .alive
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            self.backend.release_lease(self.holder);
+        }
+    }
 }
 
 impl fmt::Debug for Server {
@@ -557,6 +621,8 @@ impl Server {
             })),
             authoring_backend,
             build_backend: Arc::new(RwLock::new(Arc::new(UnavailableBuildBackend))),
+            lease_backend: Arc::new(RwLock::new(Arc::new(InMemoryArtifactLeases))),
+            next_lease_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -566,6 +632,14 @@ impl Server {
     pub fn install_build_backend(&self, backend: Arc<dyn BuildBackend>) {
         *self
             .build_backend
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = backend;
+    }
+
+    /// Install the daemon CAS lease ledger before accepting client snapshots.
+    pub fn install_artifact_lease_backend(&self, backend: Arc<dyn ArtifactLeaseBackend>) {
+        *self
+            .lease_backend
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = backend;
     }
@@ -2660,7 +2734,7 @@ impl Snapshot {
     }
 
     pub fn expire_lease(&self) {
-        self.lease_alive.store(false, Ordering::Release);
+        self.lease.expire();
     }
 
     pub fn refresh(&self) -> RpcResult<Snapshot> {
@@ -2669,7 +2743,7 @@ impl Snapshot {
         if let Some(reason) = generation_fence(&state, &connection) {
             return RpcResult::ReconnectRequired { reason };
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        if !self.lease.alive() {
             return RpcResult::Failure(RpcFailure::LeaseExpired);
         }
         RpcResult::Success(snapshot_from(
@@ -2872,6 +2946,14 @@ impl Snapshot {
                             Ok(BuildResolution::Drifted(input))
                         }
                     });
+                    if let Ok(BuildResolution::Built(content_hash)) = &outcome {
+                        if let Err(error) = self.lease.pin(&[content_hash.0]) {
+                            outcome = Err(error);
+                        }
+                    }
+                    if let Err(error) = backend.build_finished(&request) {
+                        outcome = Err(error);
+                    }
                     let mut state = self.server.lock();
                     state.build_flights.remove(&key);
                     if let Some(error) = pipeline_failure(&self.view) {
@@ -2969,6 +3051,9 @@ impl Snapshot {
                             hash: content_hash,
                         });
                     };
+                    if let Err(error) = self.lease.pin(&[content_hash.0]) {
+                        return RpcResult::Failure(error);
+                    }
                     ResolveResult::Built { content_hash }
                 }
                 Some(VersionResolve::Drifted { input }) => ResolveResult::Drifted {
@@ -3066,7 +3151,7 @@ impl Snapshot {
                 got: self.attestation_generation,
             }));
         }
-        if !self.lease_alive.load(Ordering::Acquire) {
+        if !self.lease.alive() {
             return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
         }
         None
@@ -3446,7 +3531,15 @@ fn snapshot_from(
         attestation_generation: connection.attestation_generation,
         basis: basis_for(connection, view.stamp),
         view,
-        lease_alive: Arc::new(AtomicBool::new(true)),
+        lease: Arc::new(ArtifactLease {
+            holder: server.next_lease_id.fetch_add(1, Ordering::Relaxed),
+            backend: server
+                .lease_backend
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+            alive: Mutex::new(true),
+        }),
     }
 }
 

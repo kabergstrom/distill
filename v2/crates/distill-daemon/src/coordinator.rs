@@ -289,8 +289,9 @@ impl DaemonCoordinator {
     /// Attach this coordinator as the RPC server's production lazy-build
     /// authority after it has been placed in its final `Arc`.
     pub fn attach_build_backend(self: &Arc<Self>) {
-        self.server
-            .install_build_backend(Arc::new(crate::build::CoordinatorBuildBackend::new(self)));
+        let backend = Arc::new(crate::build::CoordinatorBuildBackend::new(self));
+        self.server.install_build_backend(backend.clone());
+        self.server.install_artifact_lease_backend(backend);
         self.authoring.attach_tag_index_coordinator(self);
     }
 

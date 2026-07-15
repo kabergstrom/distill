@@ -1708,6 +1708,22 @@ pub enum BuildBackendOutcome {
 /// implementations must not call back into the [`crate::Server`].
 pub trait BuildBackend: Send + Sync {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure>;
+
+    /// Notification that the server has either installed or rejected the
+    /// publication returned by [`Self::build`]. A durable backend uses this
+    /// boundary to release its in-flight CAS pins and run maintenance only
+    /// after the caller's lease has been pinned.
+    fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
+        Ok(())
+    }
+}
+
+/// Storage hook for §13's pin-before-response rule. The RPC crate owns lease
+/// lifetime while the daemon owns the durable CAS, so this deliberately small
+/// interface is the only coupling between them.
+pub trait ArtifactLeaseBackend: Send + Sync {
+    fn pin_lease(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String>;
+    fn release_lease(&self, holder: u64);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

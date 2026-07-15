@@ -207,6 +207,36 @@ struct DepthLimitedBuildBackend {
     calls: Mutex<usize>,
 }
 
+struct LifecycleBuildBackend {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl BuildBackend for LifecycleBuildBackend {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        RecordingBuildBackend::default().build(request)
+    }
+
+    fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
+        self.events.lock().unwrap().push("finish");
+        Ok(())
+    }
+}
+
+struct RecordingArtifactLeases {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl ArtifactLeaseBackend for RecordingArtifactLeases {
+    fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
+        self.events.lock().unwrap().push("pin");
+        Ok(())
+    }
+
+    fn release_lease(&self, _holder: u64) {
+        self.events.lock().unwrap().push("release");
+    }
+}
+
 impl BuildBackend for DepthLimitedBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
         *self.calls.lock().unwrap() += 1;
@@ -245,6 +275,67 @@ fn dependency_depth_exhaustion_is_typed_and_never_memoized() {
     assert_eq!(snapshot.resolve(entry.uuid), expected);
     assert_eq!(snapshot.resolve(entry.uuid), expected);
     assert_eq!(*backend.calls.lock().unwrap(), 2);
+}
+
+#[test]
+fn resolve_pins_before_build_release_and_snapshot_clones_share_one_lease() {
+    let server = server_with(&[(1, false)]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    server.install_build_backend(Arc::new(LifecycleBuildBackend {
+        events: Arc::clone(&events),
+    }));
+    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
+        events: Arc::clone(&events),
+    }));
+    let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
+    server
+        .commit(Commit {
+            assets: vec![set_asset(
+                entry.uuid,
+                StoredResolve::Drifted {
+                    input: DriftedInput::Asset(entry.uuid),
+                },
+                AssetDeltaState::Changed,
+            )],
+            authoring: vec![AuthoringMutation::Set(entry.clone())],
+            ..Commit::default()
+        })
+        .unwrap();
+    let snapshot = snapshot(&connect(&server, &[(1, false)]));
+    let clone = snapshot.clone();
+
+    assert!(matches!(
+        snapshot.resolve(entry.uuid),
+        RpcResult::Success(_)
+    ));
+    assert_eq!(
+        &events.lock().unwrap()[..2],
+        &["pin", "finish"],
+        "the caller lease must be durable before the in-flight pin is released"
+    );
+    drop(snapshot);
+    assert!(!events.lock().unwrap().contains(&"release"));
+    clone.expire_lease();
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "release")
+            .count(),
+        1
+    );
+    drop(clone);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| **event == "release")
+            .count(),
+        1,
+        "expiry and final drop release a shared lease only once"
+    );
 }
 
 #[test]
