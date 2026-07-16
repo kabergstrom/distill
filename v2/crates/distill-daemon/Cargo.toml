@@ -3,6 +3,11 @@ name = "distill-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
+
+[[bin]]
+name = "distilld"
+path = "src/bin/distill-daemon.rs"
 
 [dependencies]
 blake3 = { workspace = true }
@@ -18,6 +23,7 @@ distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
 globset = { workspace = true }
+libc = "0.2"
 notify = { workspace = true }
 ngp-module-host = { path = "../../../../newgameplus/ngp-module-host" }
 rayon = { workspace = true }

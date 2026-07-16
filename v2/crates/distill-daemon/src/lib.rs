@@ -15,6 +15,7 @@ pub mod callbacks;
 pub mod codegen;
 pub mod config;
 pub mod coordinator;
+pub mod dev;
 pub mod epoch;
 pub mod importer;
 pub mod lineage_repair;

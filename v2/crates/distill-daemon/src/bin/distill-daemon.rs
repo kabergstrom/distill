@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use distill_core::id::AssetUuid;
 use distill_daemon::config::DaemonConfig;
+use distill_daemon::dev::{DevLaunchConfig, DevSupervisor};
 use distill_daemon::pack_command::build_configured_pack;
 use distill_daemon::process::DaemonProcess;
 
@@ -10,20 +11,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(first) = args.next() else {
         return run_daemon(PathBuf::from("distill.toml"));
     };
+    if first == "dev" {
+        let daemon_config = args
+            .next()
+            .ok_or("usage: distilld dev <daemon-config> <development-launch-config>")?;
+        let launch_config = args
+            .next()
+            .ok_or("usage: distilld dev <daemon-config> <development-launch-config>")?;
+        if args.next().is_some() {
+            return Err("usage: distilld dev <daemon-config> <development-launch-config>".into());
+        }
+        let daemon_config = DaemonConfig::load(daemon_config)?;
+        let launch_config = DevLaunchConfig::load(launch_config)?;
+        return DevSupervisor::start(daemon_config, launch_config)
+            .run()
+            .map_err(Into::into);
+    }
     if first == "pack" {
-        let config_path = args.next().ok_or(
-            "usage: distill-daemon pack <config-path> <definition-uuid> <output-directory>",
-        )?;
-        let definition = args.next().ok_or(
-            "usage: distill-daemon pack <config-path> <definition-uuid> <output-directory>",
-        )?;
-        let destination = args.next().ok_or(
-            "usage: distill-daemon pack <config-path> <definition-uuid> <output-directory>",
-        )?;
+        let config_path = args
+            .next()
+            .ok_or("usage: distilld pack <config-path> <definition-uuid> <output-directory>")?;
+        let definition = args
+            .next()
+            .ok_or("usage: distilld pack <config-path> <definition-uuid> <output-directory>")?;
+        let destination = args
+            .next()
+            .ok_or("usage: distilld pack <config-path> <definition-uuid> <output-directory>")?;
         if args.next().is_some() {
             return Err(
-                "usage: distill-daemon pack <config-path> <definition-uuid> <output-directory>"
-                    .into(),
+                "usage: distilld pack <config-path> <definition-uuid> <output-directory>".into(),
             );
         }
         let definition: AssetUuid = definition
@@ -40,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.next().is_some() {
-        return Err("usage: distill-daemon [config-path]".into());
+        return Err("usage: distilld [config-path]".into());
     }
     run_daemon(PathBuf::from(first))
 }

@@ -206,6 +206,13 @@ impl DaemonProcess {
         lock(&self.last_background_error).clone()
     }
 
+    /// Whether a fatal watcher/coordinator failure has stopped the serving
+    /// loops. The development supervisor uses this to tear down its producer
+    /// children instead of remaining alive around a dead daemon.
+    pub fn has_stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     pub fn wait(self) -> ! {
         loop {
             thread::park();
