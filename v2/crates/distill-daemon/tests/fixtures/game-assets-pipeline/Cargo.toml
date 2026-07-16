@@ -9,12 +9,15 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+distill-asset = { path = "../../../../distill-asset" }
 distill-build = { path = "../../../../distill-build" }
 distill-core = { path = "../../../../distill-core" }
 distill-daemon = { path = "../../.." }
 distill-json = { path = "../../../../distill-json" }
 distill-schema = { path = "../../../../distill-schema" }
 newgameplus-api-macros = { path = "../../../../../../../newgameplus/newgameplus-api-macros" }
+newgameplus-assets = { path = "../../../../../../../newgameplus/newgameplus-assets" }
+rafx-shader-processor = { path = "../../../../../../../rafx/rafx-shader-processor" }
 
 [build-dependencies]
 ngp-source-hash = { path = "../../../../../../../newgameplus/ngp-source-hash" }

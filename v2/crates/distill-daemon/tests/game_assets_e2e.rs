@@ -38,11 +38,16 @@ const SETTINGS_TYPE: TypeUuid = TypeUuid([0x90; 16]);
 const TEXTURE_SOURCE_TYPE: TypeUuid = TypeUuid([0x91; 16]);
 const MESH_SOURCE_TYPE: TypeUuid = TypeUuid([0x92; 16]);
 const SHADER_SOURCE_TYPE: TypeUuid = TypeUuid([0x93; 16]);
-const COOKED_ASSET_TYPE: TypeUuid = TypeUuid([0x94; 16]);
 
-#[derive(Default)]
-#[distill_asset_macro::asset(uuid = "94949494-9494-9494-9494-949494949494")]
-struct CookedAsset {
+use newgameplus_assets::{CookedPipeline, MeshAsset, TextureAsset};
+
+#[repr(C)]
+struct FixtureSettings {
+    value: u8,
+}
+
+#[repr(C)]
+struct SourceValue {
     value: String,
 }
 
@@ -101,22 +106,32 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     )
     .unwrap();
     std::fs::write(
-        assets.join("shaders/basic.glsl"),
-        b"#include \"shaders/common.inc\"\nvoid main() {}\n",
+        assets.join("shaders/basic.comp"),
+        b"#version 450\n#include \"shaders/common.inc\"\nlayout(local_size_x=1, local_size_y=1, local_size_z=1) in;\nvoid main() { uint value = VALUE; }\n",
     )
     .unwrap();
-    std::fs::write(assets.join("shaders/common.inc"), b"const int VALUE = 1;\n").unwrap();
+    std::fs::write(
+        assets.join("shaders/common.inc"),
+        b"const uint VALUE = 1;\n",
+    )
+    .unwrap();
 
     let schema = fixture_schema(source_identity);
     let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 32]).unwrap();
-    assert_eq!(
-        authority
-            .project_type(COOKED_ASSET_TYPE)
-            .unwrap()
-            .logical_hash,
-        CookedAsset::descriptor().logical_hash,
-        "the fixture schema and typed game runtime must describe the same value",
-    );
+    for descriptor in [
+        TextureAsset::descriptor(),
+        MeshAsset::descriptor(),
+        CookedPipeline::descriptor(),
+    ] {
+        assert_eq!(
+            authority
+                .project_type(descriptor.type_uuid)
+                .unwrap()
+                .logical_hash,
+            descriptor.logical_hash,
+            "the pipeline schema and typed game runtime must describe the same terminal value",
+        );
+    }
     std::fs::write(
         temp.path().join("schema.json"),
         serde_json::to_vec(&schema).unwrap(),
@@ -147,25 +162,33 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     let mut live_loader =
         Loader::new(RpcIo::connect(process.rpc_address(), request.clone()).unwrap());
     register_runtime(&mut live_loader, target_hash, 1);
-    let texture_handle = live_loader.add_ref::<CookedAsset>(texture).unwrap();
-    let mesh_handle = live_loader.add_ref::<CookedAsset>(mesh).unwrap();
-    let shader_handle = live_loader.add_ref::<CookedAsset>(shader).unwrap();
+    let texture_handle = live_loader.add_ref::<TextureAsset>(texture).unwrap();
+    let mesh_handle = live_loader.add_ref::<MeshAsset>(mesh).unwrap();
+    let shader_handle = live_loader.add_ref::<CookedPipeline>(shader).unwrap();
     let mut live_storage = Storage::default();
     wait_for_loads(
         &mut live_loader,
         &mut live_storage,
-        [&texture_handle, &mesh_handle, &shader_handle],
+        &texture_handle,
+        &mesh_handle,
+        &shader_handle,
     );
     let baseline_updates = settle_loader(&mut live_loader, &mut live_storage);
     let baseline_commits = live_storage.commits.len();
     assert_eq!(baseline_updates, 3);
     assert_eq!(baseline_commits, 3);
+    assert_loaded_game_assets(
+        &live_storage,
+        texture_handle.id(),
+        mesh_handle.id(),
+        shader_handle.id(),
+    );
 
     let old_texture_hash = resolved_hash(process.coordinator().server().root(), &request, texture);
     let old_mesh_hash = resolved_hash(process.coordinator().server().root(), &request, mesh);
     let old_shader_hash = resolved_hash(process.coordinator().server().root(), &request, shader);
     let include_path = assets.join("shaders/common.inc");
-    std::fs::write(&include_path, b"const int VALUE = 2;\n").unwrap();
+    std::fs::write(&include_path, b"const uint VALUE = 2;\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let updated = std::fs::read(assets.join("game-assets.bundle"))
@@ -240,7 +263,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
             .collect(),
         target: "dev".into(),
         zstd_level: 1,
-        include_path_table: true,
+        include_path_table: false,
     };
     let pack_dir = tempfile::tempdir().unwrap();
     let output = build_publish_and_activate_pack(
@@ -256,6 +279,10 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     )
     .unwrap();
     assert_eq!(output.manifest.assets.len(), 3);
+    assert!(
+        output.manifest.paths.is_none(),
+        "production UUID loading must not depend on the optional path table"
+    );
 
     let pack_io = PackfileIO::mount_current(
         pack_dir.path(),
@@ -267,16 +294,75 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     .unwrap();
     let mut pack_loader = Loader::new(pack_io);
     register_runtime(&mut pack_loader, target_hash, 2);
-    let packed_texture = pack_loader.add_ref::<CookedAsset>(texture).unwrap();
-    let packed_mesh = pack_loader.add_ref::<CookedAsset>(mesh).unwrap();
-    let packed_shader = pack_loader.add_ref::<CookedAsset>(shader).unwrap();
+    let packed_texture = pack_loader.add_ref::<TextureAsset>(texture).unwrap();
+    let packed_mesh = pack_loader.add_ref::<MeshAsset>(mesh).unwrap();
+    let packed_shader = pack_loader.add_ref::<CookedPipeline>(shader).unwrap();
     let mut pack_storage = Storage::default();
     wait_for_loads(
         &mut pack_loader,
         &mut pack_storage,
-        [&packed_texture, &packed_mesh, &packed_shader],
+        &packed_texture,
+        &packed_mesh,
+        &packed_shader,
     );
     assert_eq!(pack_storage.commits.len(), 3);
+    assert_loaded_game_assets(
+        &pack_storage,
+        packed_texture.id(),
+        packed_mesh.id(),
+        packed_shader.id(),
+    );
+}
+
+fn assert_loaded_game_assets(
+    storage: &Storage,
+    texture_handle: HandleId,
+    mesh_handle: HandleId,
+    shader_handle: HandleId,
+) {
+    let value_for = |handle| {
+        storage
+            .values
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == handle)
+            .max_by_key(|((_, adoption), _)| *adoption)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("handle {handle:?} has no resident value"))
+    };
+    let texture = value_for(texture_handle)
+        .downcast_ref::<TextureAsset>()
+        .expect("texture terminal value used the wrong native type");
+    assert_eq!((texture.width, texture.height), (1, 1));
+    assert_eq!(texture.format, newgameplus_assets::FORMAT_R8G8B8A8_UNORM);
+    assert_eq!(texture.data, [255, 0, 0, 255]);
+
+    let mesh = value_for(mesh_handle)
+        .downcast_ref::<MeshAsset>()
+        .expect("mesh terminal value used the wrong native type");
+    assert_eq!(
+        mesh.vertex_channels,
+        newgameplus_assets::VERTEX_CHANNEL_POSITION
+    );
+    assert_eq!(mesh.index_stride, 2);
+    assert_eq!(mesh.vertices.len(), 3 * 16);
+    assert_eq!(mesh.indices, [0, 0, 1, 0, 2, 0]);
+
+    let shader = value_for(shader_handle)
+        .downcast_ref::<CookedPipeline>()
+        .expect("shader terminal value used the wrong native type");
+    let package: rafx_api::RafxPipelinePackage = bincode::deserialize(shader.cooked.as_bytes())
+        .expect("shader cooker did not emit a real Rafx pipeline package");
+    assert_eq!(package.shaders.len(), 1);
+    let stage = package.shaders[0].shader_package();
+    assert!(stage.vk.is_some(), "cooked package has no Vulkan shader");
+    assert!(
+        stage.vk_reflection.is_some(),
+        "cooked package has no Vulkan reflection"
+    );
+    assert!(
+        stage.metal.is_none(),
+        "Vulkan-only cook unexpectedly packaged Metal"
+    );
 }
 
 fn register_runtime<I: distill_loader::LoaderIO>(
@@ -289,7 +375,11 @@ fn register_runtime<I: distill_loader::LoaderIO>(
             GameModuleEpoch(epoch),
             ModuleEpochToken::new(epoch),
             target_hash,
-            &[CookedAsset::descriptor()],
+            &[
+                TextureAsset::descriptor(),
+                MeshAsset::descriptor(),
+                CookedPipeline::descriptor(),
+            ],
         )
         .unwrap();
 }
@@ -297,22 +387,25 @@ fn register_runtime<I: distill_loader::LoaderIO>(
 fn wait_for_loads<I: distill_loader::LoaderIO>(
     loader: &mut Loader<I>,
     storage: &mut Storage,
-    handles: [&distill_loader::Handle<CookedAsset>; 3],
+    texture: &distill_loader::Handle<TextureAsset>,
+    mesh: &distill_loader::Handle<MeshAsset>,
+    shader: &distill_loader::Handle<CookedPipeline>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         loader.process(storage).unwrap();
-        if handles
-            .iter()
-            .all(|handle| loader.status(handle) == LoadStatus::Loaded)
+        if loader.status(texture) == LoadStatus::Loaded
+            && loader.status(mesh) == LoadStatus::Loaded
+            && loader.status(shader) == LoadStatus::Loaded
         {
             return;
         }
         if Instant::now() >= deadline {
-            let statuses = handles
-                .iter()
-                .map(|handle| loader.status(handle))
-                .collect::<Vec<_>>();
+            let statuses = [
+                loader.status(texture),
+                loader.status(mesh),
+                loader.status(shader),
+            ];
             panic!(
                 "assets did not reach typed adoption: statuses={statuses:?}, target={:?}, diagnostics={:?}",
                 loader.target_binding_state(),
@@ -378,7 +471,7 @@ fn import_assets(process: &DaemonProcess, assets: &Path) -> [AssetUuid; 3] {
                         sources: vec![
                             "pixel.ppm".into(),
                             "triangle.obj".into(),
-                            "shaders/basic.glsl".into(),
+                            "shaders/basic.comp".into(),
                         ],
                         dest: "game-assets.bundle".into(),
                         settings: AuthoringValue {
@@ -453,74 +546,129 @@ fn fixture_source_identity(module: &Path) -> (String, String) {
 }
 
 fn fixture_schema(source_identity: (String, String)) -> Schema {
-    let mut types = vec![TypeDef {
-        id: SchemaTypeId(0),
-        kind: PrimitiveType::U8,
-        path: type_path("core", "u8"),
+    let leaf = |id, kind, krate, name| TypeDef {
+        id: SchemaTypeId(id),
+        kind,
+        path: type_path(krate, name),
         uuid: None,
         attrs: TypeAttrs::default(),
         fields: Vec::new(),
         generic_parameters: Vec::new(),
         generic_argument_ids: Vec::new(),
         has_default: true,
-    }];
-    types.push(TypeDef {
-        id: SchemaTypeId(1),
-        kind: PrimitiveType::Struct,
-        path: type_path("game_assets_fixture", "FixtureSettings"),
-        uuid: Some(SETTINGS_TYPE),
-        attrs: TypeAttrs {
-            build_only: true,
-            ..TypeAttrs::default()
+    };
+    let field = |name: &str, type_id: usize| Field {
+        id: FieldIdentifier::Name(name.into()),
+        type_id: SchemaTypeId(type_id),
+        attrs: FieldAttrs::default(),
+    };
+    let mut types = vec![
+        leaf(0, PrimitiveType::U8, "core", "u8"),
+        TypeDef {
+            id: SchemaTypeId(1),
+            kind: PrimitiveType::Struct,
+            path: type_path("game_assets_fixture", "FixtureSettings"),
+            uuid: Some(SETTINGS_TYPE),
+            attrs: TypeAttrs {
+                build_only: true,
+                ..TypeAttrs::default()
+            },
+            fields: vec![field("value", 0)],
+            generic_parameters: Vec::new(),
+            generic_argument_ids: Vec::new(),
+            has_default: true,
         },
-        fields: vec![Field {
-            id: FieldIdentifier::Name("value".into()),
-            type_id: SchemaTypeId(0),
-            attrs: FieldAttrs::default(),
-        }],
-        generic_parameters: Vec::new(),
-        generic_argument_ids: Vec::new(),
-        has_default: true,
-    });
-    types.push(TypeDef {
-        id: SchemaTypeId(2),
-        kind: PrimitiveType::String,
-        path: type_path("alloc", "String"),
-        uuid: None,
-        attrs: TypeAttrs::default(),
-        fields: Vec::new(),
-        generic_parameters: Vec::new(),
-        generic_argument_ids: Vec::new(),
-        has_default: true,
-    });
-    for (index, (name, uuid, build_only)) in [
-        ("TextureSource", TEXTURE_SOURCE_TYPE, false),
-        ("MeshSource", MESH_SOURCE_TYPE, false),
-        ("ShaderSource", SHADER_SOURCE_TYPE, false),
-        ("CookedAsset", COOKED_ASSET_TYPE, false),
+        leaf(2, PrimitiveType::String, "alloc", "String"),
+        leaf(3, PrimitiveType::U32, "core", "u32"),
+        TypeDef {
+            id: SchemaTypeId(4),
+            kind: PrimitiveType::Struct,
+            path: TypePath {
+                name: Some("Vec".into()),
+                containing_type: None,
+                modules: vec!["vec".into()],
+                krate: "alloc".into(),
+            },
+            uuid: None,
+            attrs: TypeAttrs::default(),
+            fields: Vec::new(),
+            generic_parameters: Vec::new(),
+            generic_argument_ids: vec![SchemaTypeId(0)],
+            has_default: true,
+        },
+        leaf(5, PrimitiveType::Struct, "distill_asset", "Blob"),
+    ];
+    for (index, (name, uuid)) in [
+        ("TextureSource", TEXTURE_SOURCE_TYPE),
+        ("MeshSource", MESH_SOURCE_TYPE),
+        ("ShaderSource", SHADER_SOURCE_TYPE),
     ]
     .into_iter()
     .enumerate()
     {
         types.push(TypeDef {
-            id: SchemaTypeId(index + 3),
+            id: SchemaTypeId(index + 6),
             kind: PrimitiveType::Struct,
             path: type_path("game_assets_fixture", name),
             uuid: Some(uuid),
-            attrs: TypeAttrs {
-                build_only,
-                ..TypeAttrs::default()
-            },
-            fields: vec![Field {
-                id: FieldIdentifier::Name("value".into()),
-                type_id: SchemaTypeId(2),
-                attrs: FieldAttrs::default(),
-            }],
+            attrs: TypeAttrs::default(),
+            fields: vec![field("value", 2)],
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
         });
     }
+    types.extend([
+        TypeDef {
+            id: SchemaTypeId(9),
+            kind: PrimitiveType::Struct,
+            path: type_path("newgameplus_assets", "TextureAsset"),
+            uuid: Some(TextureAsset::TYPE_UUID),
+            attrs: TypeAttrs::default(),
+            fields: vec![
+                field("width", 3),
+                field("height", 3),
+                field("format", 0),
+                field("data", 4),
+            ],
+            generic_parameters: Vec::new(),
+            generic_argument_ids: Vec::new(),
+            has_default: true,
+        },
+        TypeDef {
+            id: SchemaTypeId(10),
+            kind: PrimitiveType::Struct,
+            path: type_path("newgameplus_assets", "MeshAsset"),
+            uuid: Some(MeshAsset::TYPE_UUID),
+            attrs: TypeAttrs::default(),
+            fields: vec![
+                field("vertices", 4),
+                field("indices", 4),
+                field("vertex_channels", 3),
+                field("index_stride", 3),
+            ],
+            generic_parameters: Vec::new(),
+            generic_argument_ids: Vec::new(),
+            has_default: true,
+        },
+        TypeDef {
+            id: SchemaTypeId(11),
+            kind: PrimitiveType::Struct,
+            path: type_path("newgameplus_assets", "CookedPipeline"),
+            uuid: Some(CookedPipeline::TYPE_UUID),
+            attrs: TypeAttrs::default(),
+            fields: vec![Field {
+                attrs: FieldAttrs {
+                    blob: true,
+                    ..FieldAttrs::default()
+                },
+                ..field("cooked", 5)
+            }],
+            generic_parameters: Vec::new(),
+            generic_argument_ids: Vec::new(),
+            has_default: false,
+        },
+    ]);
     let string_layout = TypeLayout {
         size: Some(size_of::<String>() as u64),
         align: Some(align_of::<String>() as u64),
@@ -528,36 +676,112 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
         tag_encoding: None,
         fields: Vec::new(),
     };
-    let struct_layout = TypeLayout {
-        size: Some(size_of::<CookedAsset>() as u64),
-        align: Some(align_of::<CookedAsset>() as u64),
+    let source_layout = TypeLayout {
+        size: Some(size_of::<SourceValue>() as u64),
+        align: Some(align_of::<SourceValue>() as u64),
         layout_complete: true,
         tag_encoding: None,
         fields: vec![FieldLayout {
-            offset: Some(std::mem::offset_of!(CookedAsset, value) as u64),
+            offset: Some(std::mem::offset_of!(SourceValue, value) as u64),
             field_size: Some(size_of::<String>() as u64),
         }],
+    };
+    let terminal_layout = |size, align, fields| TypeLayout {
+        size: Some(size),
+        align: Some(align),
+        layout_complete: true,
+        tag_encoding: None,
+        fields,
     };
     Schema {
         source_hashes: BTreeMap::from([source_identity]),
         types,
         layouts: vec![SchemaLayouts {
             identity: host_layout_identity(),
-            layouts: std::iter::once(scalar_layout(1, 1))
-                .chain(std::iter::once(TypeLayout {
-                    size: Some(1),
-                    align: Some(1),
-                    layout_complete: true,
-                    tag_encoding: None,
-                    fields: vec![FieldLayout {
-                        offset: Some(0),
+            layouts: vec![
+                scalar_layout(1, 1),
+                terminal_layout(
+                    size_of::<FixtureSettings>() as u64,
+                    align_of::<FixtureSettings>() as u64,
+                    vec![FieldLayout {
+                        offset: Some(std::mem::offset_of!(FixtureSettings, value) as u64),
                         field_size: Some(1),
                     }],
-                }))
-                .chain(std::iter::once(string_layout))
-                .chain(std::iter::repeat_n(struct_layout, 4))
-                .collect(),
+                ),
+                string_layout,
+                scalar_layout(4, 4),
+                terminal_layout(
+                    size_of::<Vec<u8>>() as u64,
+                    align_of::<Vec<u8>>() as u64,
+                    Vec::new(),
+                ),
+                terminal_layout(
+                    size_of::<distill_asset::Blob>() as u64,
+                    align_of::<distill_asset::Blob>() as u64,
+                    Vec::new(),
+                ),
+                source_layout.clone(),
+                source_layout.clone(),
+                source_layout,
+                terminal_layout(
+                    size_of::<TextureAsset>() as u64,
+                    align_of::<TextureAsset>() as u64,
+                    vec![
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            width
+                        )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            height
+                        )),
+                        layout_field::<TextureAsset, u8>(std::mem::offset_of!(
+                            TextureAsset,
+                            format
+                        )),
+                        layout_field::<TextureAsset, Vec<u8>>(std::mem::offset_of!(
+                            TextureAsset,
+                            data
+                        )),
+                    ],
+                ),
+                terminal_layout(
+                    size_of::<MeshAsset>() as u64,
+                    align_of::<MeshAsset>() as u64,
+                    vec![
+                        layout_field::<MeshAsset, Vec<u8>>(std::mem::offset_of!(
+                            MeshAsset, vertices
+                        )),
+                        layout_field::<MeshAsset, Vec<u8>>(std::mem::offset_of!(
+                            MeshAsset, indices
+                        )),
+                        layout_field::<MeshAsset, u32>(std::mem::offset_of!(
+                            MeshAsset,
+                            vertex_channels
+                        )),
+                        layout_field::<MeshAsset, u32>(std::mem::offset_of!(
+                            MeshAsset,
+                            index_stride
+                        )),
+                    ],
+                ),
+                terminal_layout(
+                    size_of::<CookedPipeline>() as u64,
+                    align_of::<CookedPipeline>() as u64,
+                    vec![layout_field::<CookedPipeline, distill_asset::Blob>(
+                        std::mem::offset_of!(CookedPipeline, cooked),
+                    )],
+                ),
+            ],
         }],
+    }
+}
+
+fn layout_field<T, F>(offset: usize) -> FieldLayout {
+    let _ = std::marker::PhantomData::<T>;
+    FieldLayout {
+        offset: Some(offset as u64),
+        field_size: Some(size_of::<F>() as u64),
     }
 }
 
@@ -681,17 +905,7 @@ fn write_schema_seed(assets: &Path, authority: &ProjectSchemaAuthority) {
                     cursor: 0,
                 }),
                 authoring_only: true,
-                data: if *type_uuid == SETTINGS_TYPE {
-                    AuthoredValue::Object(BTreeMap::from([(
-                        "value".into(),
-                        AuthoredValue::UInt(0),
-                    )]))
-                } else {
-                    AuthoredValue::Object(BTreeMap::from([(
-                        "value".into(),
-                        AuthoredValue::Str(String::new()),
-                    )]))
-                },
+                data: schema_seed_value(*type_uuid),
             },
         );
     }
@@ -707,6 +921,33 @@ fn write_schema_seed(assets: &Path, authority: &ProjectSchemaAuthority) {
         distill_bundle::write_bundle(&bundle).unwrap(),
     )
     .unwrap();
+}
+
+fn schema_seed_value(type_uuid: TypeUuid) -> AuthoredValue {
+    let fields = if type_uuid == SETTINGS_TYPE {
+        BTreeMap::from([("value".into(), AuthoredValue::UInt(0))])
+    } else if [TEXTURE_SOURCE_TYPE, MESH_SOURCE_TYPE, SHADER_SOURCE_TYPE].contains(&type_uuid) {
+        BTreeMap::from([("value".into(), AuthoredValue::Str(String::new()))])
+    } else if type_uuid == TextureAsset::TYPE_UUID {
+        BTreeMap::from([
+            ("width".into(), AuthoredValue::UInt(0)),
+            ("height".into(), AuthoredValue::UInt(0)),
+            ("format".into(), AuthoredValue::UInt(0)),
+            ("data".into(), AuthoredValue::Array(Vec::new())),
+        ])
+    } else if type_uuid == MeshAsset::TYPE_UUID {
+        BTreeMap::from([
+            ("vertices".into(), AuthoredValue::Array(Vec::new())),
+            ("indices".into(), AuthoredValue::Array(Vec::new())),
+            ("vertex_channels".into(), AuthoredValue::UInt(0)),
+            ("index_stride".into(), AuthoredValue::UInt(0)),
+        ])
+    } else if type_uuid == CookedPipeline::TYPE_UUID {
+        BTreeMap::from([("cooked".into(), AuthoredValue::Blob(Vec::new()))])
+    } else {
+        panic!("missing schema seed for {type_uuid:?}")
+    };
+    AuthoredValue::Object(fields)
 }
 
 fn bytes(bytes: &[u8]) -> AuthoredValue {

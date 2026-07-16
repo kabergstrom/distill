@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use distill_asset::AssetType;
 use distill_build::import::ImportOutput;
 use distill_build::outputs::OutputDecls;
 use distill_build::pipeline::TargetSelector;
@@ -17,7 +18,6 @@ pub const SETTINGS_TYPE: TypeUuid = TypeUuid([0x90; 16]);
 pub const TEXTURE_SOURCE_TYPE: TypeUuid = TypeUuid([0x91; 16]);
 pub const MESH_SOURCE_TYPE: TypeUuid = TypeUuid([0x92; 16]);
 pub const SHADER_SOURCE_TYPE: TypeUuid = TypeUuid([0x93; 16]);
-pub const COOKED_ASSET_TYPE: TypeUuid = TypeUuid([0x94; 16]);
 
 #[derive(newgameplus_api_macros::NgpSourceIdentity)]
 pub struct SourceIdentity;
@@ -46,13 +46,143 @@ impl Kind {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn terminal_type(self) -> TypeUuid {
         match self {
-            Self::Texture => "texture",
-            Self::Mesh => "mesh",
-            Self::Shader => "shader",
+            Self::Texture => newgameplus_assets::TextureAsset::TYPE_UUID,
+            Self::Mesh => newgameplus_assets::MeshAsset::TYPE_UUID,
+            Self::Shader => newgameplus_assets::CookedPipeline::TYPE_UUID,
         }
     }
+}
+
+fn cook_texture(value: &str) -> Result<AuthoredValue, ProcessorError> {
+    let Some(hex) = value.strip_prefix("1x1:") else {
+        return Err(ProcessorError::new(10, "invalid imported PPM value"));
+    };
+    if hex.len() != 6 {
+        return Err(ProcessorError::new(11, "invalid imported PPM pixel"));
+    }
+    let mut data = Vec::with_capacity(4);
+    for offset in [0, 2, 4] {
+        data.push(
+            u8::from_str_radix(&hex[offset..offset + 2], 16)
+                .map_err(|error| ProcessorError::new(12, error.to_string()))?,
+        );
+    }
+    data.push(255);
+    Ok(AuthoredValue::Object(BTreeMap::from([
+        ("width".to_owned(), AuthoredValue::UInt(1)),
+        ("height".to_owned(), AuthoredValue::UInt(1)),
+        (
+            "format".to_owned(),
+            AuthoredValue::UInt(u128::from(
+                newgameplus_assets::FORMAT_R8G8B8A8_UNORM,
+            )),
+        ),
+        ("data".to_owned(), bytes_array(&data)),
+    ])))
+}
+
+fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
+    let mut positions = Vec::<[f32; 3]>::new();
+    let mut indices = Vec::<u16>::new();
+    for line in value.lines() {
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("v") => {
+                let mut position = [0.0; 3];
+                for component in &mut position {
+                    *component = words
+                        .next()
+                        .ok_or_else(|| ProcessorError::new(20, "OBJ vertex is incomplete"))?
+                        .parse()
+                        .map_err(|error: std::num::ParseFloatError| {
+                            ProcessorError::new(21, error.to_string())
+                        })?;
+                }
+                if words.next().is_some() {
+                    return Err(ProcessorError::new(22, "OBJ vertex has extra fields"));
+                }
+                positions.push(position);
+            }
+            Some("f") => {
+                let face = words
+                    .map(|word| {
+                        let position = word.split('/').next().unwrap_or_default();
+                        let one_based: usize = position.parse().map_err(
+                            |error: std::num::ParseIntError| {
+                                ProcessorError::new(23, error.to_string())
+                            },
+                        )?;
+                        let zero_based = one_based
+                            .checked_sub(1)
+                            .ok_or_else(|| ProcessorError::new(24, "OBJ indices are one-based"))?;
+                        u16::try_from(zero_based)
+                            .map_err(|_| ProcessorError::new(25, "OBJ index exceeds u16"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if face.len() != 3 {
+                    return Err(ProcessorError::new(26, "fixture OBJ faces must be triangles"));
+                }
+                indices.extend(face);
+            }
+            Some(_) | None => {}
+        }
+    }
+    if positions.is_empty()
+        || indices.is_empty()
+        || indices
+            .iter()
+            .any(|index| usize::from(*index) >= positions.len())
+    {
+        return Err(ProcessorError::new(27, "OBJ geometry is empty or out of range"));
+    }
+    let mut vertices = Vec::with_capacity(positions.len() * 16);
+    for position in positions {
+        for component in position {
+            vertices.extend_from_slice(&component.to_le_bytes());
+        }
+        vertices.extend_from_slice(&0_u32.to_le_bytes());
+    }
+    let indices = indices
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    Ok(AuthoredValue::Object(BTreeMap::from([
+        ("vertices".to_owned(), bytes_array(&vertices)),
+        ("indices".to_owned(), bytes_array(&indices)),
+        (
+            "vertex_channels".to_owned(),
+            AuthoredValue::UInt(u128::from(
+                newgameplus_assets::VERTEX_CHANNEL_POSITION,
+            )),
+        ),
+        ("index_stride".to_owned(), AuthoredValue::UInt(2)),
+    ])))
+}
+
+fn cook_shader(value: &str) -> Result<AuthoredValue, ProcessorError> {
+    let cooked = rafx_shader_processor::compile_vulkan_pipeline(
+        &[rafx_shader_processor::VulkanShaderStageSource {
+            virtual_path: "assets/basic.comp",
+            source: value,
+        }],
+        false,
+    )
+    .map_err(|error| ProcessorError::new(30, error.to_string()))?;
+    Ok(AuthoredValue::Object(BTreeMap::from([(
+        "cooked".to_owned(),
+        AuthoredValue::Blob(cooked),
+    )])))
+}
+
+fn bytes_array(bytes: &[u8]) -> AuthoredValue {
+    AuthoredValue::Array(
+        bytes
+            .iter()
+            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
+            .collect(),
+    )
 }
 
 struct GameAssetsImporter;
@@ -88,7 +218,7 @@ impl AuthoringImporter for GameAssetsImporter {
     ) -> Result<ImportOutput, AuthoringImporterError> {
         let texture = source_with_suffix(context, "pixel.ppm")?;
         let mesh = source_with_suffix(context, "triangle.obj")?;
-        let shader = source_with_suffix(context, "shaders/basic.glsl")?;
+        let shader = source_with_suffix(context, "shaders/basic.comp")?;
         let texture = parse_ppm(&context.read(&texture)?)?;
         let mesh = parse_triangle(&context.read(&mesh)?)?;
         let shader_bytes = context.read(&shader)?;
@@ -156,7 +286,7 @@ fn parse_triangle(bytes: &[u8]) -> Result<String, AuthoringImporterError> {
             "fixture mesh must contain three OBJ vertices and one face",
         ));
     }
-    Ok(format!("vertices={vertices};faces={faces}"))
+    Ok(source.to_owned())
 }
 
 fn parse_shader(
@@ -172,7 +302,10 @@ fn parse_shader(
     let include = context.read(include_path)?;
     let include = std::str::from_utf8(&include)
         .map_err(|error| AuthoringImporterError::rejected(32, error.to_string()))?;
-    Ok(format!("{}|{}", source.trim(), include.trim()))
+    Ok(source.replace(
+        &format!("#include \"{include_path}\""),
+        include.trim(),
+    ))
 }
 
 struct FixtureCook(Kind);
@@ -192,14 +325,13 @@ impl PipelineProcessor for FixtureCook {
                 "fixture source value must be a string",
             ));
         };
+        let value = match self.0 {
+            Kind::Texture => cook_texture(&value)?,
+            Kind::Mesh => cook_mesh(&value)?,
+            Kind::Shader => cook_shader(&value)?,
+        };
         Ok(ProcessorProducts {
-            primary: Some(ProcessorProduct::new(
-                COOKED_ASSET_TYPE,
-                AuthoredValue::Object(BTreeMap::from([(
-                    "value".to_owned(),
-                    AuthoredValue::Str(format!("cooked:{}:{value}", self.0.label())),
-                )])),
-            )),
+            primary: Some(ProcessorProduct::new(self.0.terminal_type(), value)),
             ..ProcessorProducts::default()
         })
     }
@@ -232,7 +364,7 @@ fn register(
                     input: kind.source_type(),
                     selector: TargetSelector::new(None, None)
                         .map_err(|error| ModuleCallError::new(format!("{error:?}")))?,
-                    outputs: OutputDecls::new(COOKED_ASSET_TYPE, Vec::new())
+                    outputs: OutputDecls::new(kind.terminal_type(), Vec::new())
                         .map_err(|error| ModuleCallError::new(format!("{error:?}")))?,
                 },
                 FixtureCook(kind),
