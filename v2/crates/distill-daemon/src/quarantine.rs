@@ -204,6 +204,7 @@ impl QuarantineDriver {
         &self,
         store: &mut Store,
         mut filesystem: Option<&mut dyn JournalFilesystem>,
+        recover_codegen: bool,
     ) -> Result<Vec<(i64, RecoveryOutcome)>, QuarantineError> {
         let groups = store.unfinished_publication_groups()?;
         let codegen_children = groups
@@ -216,6 +217,9 @@ impl QuarantineDriver {
         for intent in intents {
             let target = PathBuf::from(&intent.target_path);
             let codegen_owned = codegen_children.contains(&intent.intent_id);
+            if codegen_owned && !recover_codegen {
+                continue;
+            }
             if codegen_owned && filesystem.is_none() {
                 return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
                     intent_id: intent.intent_id,
@@ -275,13 +279,20 @@ impl QuarantineDriver {
                 outcomes.push((intent.intent_id, RecoveryOutcome::Rewrite(outcome)));
             }
         }
-        if let Some(pending) = store.unretired_intents()?.first() {
+        if let Some(pending) = store
+            .unretired_intents()?
+            .into_iter()
+            .find(|intent| recover_codegen || !codegen_children.contains(&intent.intent_id))
+        {
             return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
                 intent_id: pending.intent_id,
                 detail: "startup recovery stopped before the intent became terminal".into(),
             })));
         }
         for group in groups {
+            if group.kind == PublicationGroupKind::Codegen && !recover_codegen {
+                continue;
+            }
             if group.kind == PublicationGroupKind::Codegen {
                 let basis = CodegenPublicationBasis::decode(&group.basis).map_err(|detail| {
                     QuarantineError::Store(Box::new(StoreError::BadIntent {
@@ -296,13 +307,23 @@ impl QuarantineDriver {
         Ok(outcomes)
     }
 
+    /// Reconcile startup work that can be authorized by watched-root
+    /// ownership alone. Codegen groups remain pending until their output
+    /// directory has been independently validated.
+    pub(crate) fn reconcile_non_codegen(
+        &self,
+        store: &mut Store,
+    ) -> Result<Vec<(i64, RecoveryOutcome)>, QuarantineError> {
+        self.startup_reconcile(store, None, false)
+    }
+
     /// Reconcile unfinished work and mint the sole daemon mutation
     /// publication capability. Failure leaves publication unadmitted.
     pub fn admit_publication<'a>(
         &'a self,
         store: &'a mut Store,
     ) -> Result<PublicationDriver<'a>, QuarantineError> {
-        let recovered = self.startup_reconcile(store, None)?;
+        let recovered = self.startup_reconcile(store, None, true)?;
         Ok(PublicationDriver {
             quarantine: self,
             store,
@@ -318,7 +339,7 @@ impl QuarantineDriver {
         store: &'a mut Store,
         filesystem: &'a mut dyn JournalFilesystem,
     ) -> Result<PublicationDriver<'a>, QuarantineError> {
-        let recovered = self.startup_reconcile(store, Some(filesystem))?;
+        let recovered = self.startup_reconcile(store, Some(filesystem), true)?;
         Ok(PublicationDriver {
             quarantine: self,
             store,

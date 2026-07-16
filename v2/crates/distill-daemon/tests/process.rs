@@ -11,6 +11,7 @@ use distill_daemon::process::DaemonProcess;
 use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
 use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
 use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
+use distill_store::journal::{JournalIntentPlan, PublicationGroupKind};
 use distill_store::state::{ConfigurationState, DscpV1, PipelineState};
 use distill_store::Store;
 
@@ -170,6 +171,50 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
         !temp.path().join("generated").exists(),
         "disabled codegen must not create its output directory"
     );
+    drop(process);
+}
+
+#[test]
+fn startup_recovers_non_codegen_publication_before_the_initial_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(&temp);
+    let target = temp.path().join("assets/pending.txt");
+    let proposal = temp.path().join("assets/.pending.proposed");
+    let conflict = temp.path().join("assets/.pending.conflict");
+    std::fs::write(&target, b"old").unwrap();
+    let old_hash = ContentHash(*blake3::hash(b"old").as_bytes());
+    let new_hash = ContentHash(*blake3::hash(b"new").as_bytes());
+    {
+        let mut store = Store::open(config.store_config()).unwrap();
+        store
+            .record_publication_group(
+                PublicationGroupKind::AuthoringWrite,
+                b"interrupted authoring publication",
+                &[JournalIntentPlan {
+                    target_path: target.to_string_lossy().into_owned(),
+                    temp_path: proposal.to_string_lossy().into_owned(),
+                    conflict_path: conflict.to_string_lossy().into_owned(),
+                    pre_image_hash: Some(old_hash),
+                    proposed_hash: new_hash,
+                }],
+            )
+            .unwrap();
+        // The group is durable before the proposal temp exists.
+        std::fs::write(&proposal, b"new").unwrap();
+    }
+
+    let process = DaemonProcess::start(config).unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    let store = process.coordinator().store();
+    let store = store.lock().unwrap();
+    assert!(store.unfinished_publication_groups().unwrap().is_empty());
+    assert!(store
+        .all_files()
+        .unwrap()
+        .iter()
+        .any(|(_, path, state)| path == "pending.txt" && state.content_hash == Some(new_hash)));
+    drop(store);
     drop(process);
 }
 

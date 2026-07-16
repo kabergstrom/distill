@@ -29,7 +29,8 @@ use distill_store::Store;
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
 use crate::importer::{ImportWatchIndex, RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
-    unique_sibling, write_same_dir_temp, LineageRepairBackend, LineageRepairBackendInitError,
+    plan_same_dir_temp, unique_sibling, write_planned_temp, LineageRepairBackend,
+    LineageRepairBackendInitError,
 };
 use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::{QuarantineDriver, QuarantineError, QuarantineRoot};
@@ -90,6 +91,12 @@ impl AuthoringService {
                 DaemonOwnedDirectoryKind::Quarantine,
                 &root.quarantine_dir,
             )?;
+        }
+        {
+            let mut store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            quarantine.reconcile_non_codegen(&mut store)?;
         }
         let lineage = LineageRepairBackend::new(Arc::clone(&store), roots.clone())?;
         Ok(Self {
@@ -308,7 +315,7 @@ impl AuthoringService {
         require_base(&store, base)?;
         let temp = proposed
             .as_ref()
-            .map(|bytes| write_same_dir_temp(&target, bytes).map_err(invalid))
+            .map(|_| plan_same_dir_temp(&target).map_err(invalid))
             .transpose()?;
         let proposed_hash = proposed.as_ref().map_or_else(empty_hash, |bytes| {
             ContentHash(*blake3::hash(bytes).as_bytes())
@@ -326,20 +333,13 @@ impl AuthoringService {
         };
 
         let quarantine = self.quarantine_snapshot();
-        let mut publication = match quarantine.admit_publication(&mut store) {
-            Ok(publication) => publication,
-            Err(error) => {
-                remove_unjournaled_temp(temp.as_deref());
-                return Err(invalid(error));
-            }
-        };
-        let group = match publication.record_group(kind, basis, &[plan]) {
-            Ok(group) => group,
-            Err(error) => {
-                remove_unjournaled_temp(temp.as_deref());
-                return Err(invalid(error));
-            }
-        };
+        let mut publication = quarantine.admit_publication(&mut store).map_err(invalid)?;
+        let group = publication
+            .record_group(kind, basis, &[plan])
+            .map_err(invalid)?;
+        if let (Some(temp), Some(bytes)) = (temp.as_deref(), proposed.as_deref()) {
+            write_planned_temp(temp, bytes).map_err(invalid)?;
+        }
         let intent = group.child_intents[0];
         let installed = match (preimage, proposed.as_ref()) {
             (Some(_), Some(_)) => publication
@@ -737,12 +737,6 @@ fn path_text(path: &Path) -> Result<String, RpcFailure> {
             path.display()
         ))
     })
-}
-
-fn remove_unjournaled_temp(temp: Option<&Path>) {
-    if let Some(temp) = temp {
-        let _ = fs::remove_file(temp);
-    }
 }
 
 fn empty_hash() -> ContentHash {

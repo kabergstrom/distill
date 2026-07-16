@@ -462,3 +462,168 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
         InputVersion(3)
     );
 }
+
+#[test]
+fn disk_migration_reports_one_bundle_failure_and_still_rewrites_later_bundles() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let old_schema = LogicalSchema {
+        root: SchemaNode::Struct {
+            rev: 0,
+            fields: vec![(
+                "value".to_owned(),
+                0,
+                SchemaNode::Primitive(PrimitiveKind::U8),
+            )],
+        },
+    };
+    let new_schema = LogicalSchema {
+        root: SchemaNode::Struct {
+            rev: 0,
+            fields: vec![(
+                "value".to_owned(),
+                0,
+                SchemaNode::Primitive(PrimitiveKind::U16),
+            )],
+        },
+    };
+    let old_hash = node_hash(&old_schema.root).unwrap();
+    let new_hash = node_hash(&new_schema.root).unwrap();
+    let failing_bundle = BundleUuid([90; 16]);
+    let migrating_bundle = BundleUuid([91; 16]);
+    let failing_bytes = bundle(
+        failing_bundle,
+        AssetUuid([89; 16]),
+        REF_TYPE,
+        old_schema.clone(),
+        object([("value", AuthoredValue::UInt(3))]),
+    );
+    std::fs::write(assets.join("failing.bundle"), &failing_bytes).unwrap();
+
+    let mut migrating = distill_bundle::parse_bundle(&bundle(
+        migrating_bundle,
+        AssetUuid([92; 16]),
+        VALUE_TYPE,
+        old_schema.clone(),
+        object([("value", AuthoredValue::UInt(7))]),
+    ))
+    .unwrap();
+    let migration = distill_bundle::parse_bundle(&custom_migration_bundle(
+        old_hash,
+        &old_schema,
+        new_hash,
+        &new_schema,
+    ))
+    .unwrap();
+    migrating.schemas.extend(migration.schemas);
+    migrating.assets.extend(migration.assets);
+    std::fs::write(
+        assets.join("migrating.bundle"),
+        distill_bundle::write_bundle(&migrating).unwrap(),
+    )
+    .unwrap();
+
+    let coordinator = Arc::new(
+        DaemonCoordinator::open(
+            StoreConfig::new(temp.path().join(".distill")),
+            vec![AssetRoot::new(
+                "main",
+                &assets,
+                assets.join(".distill-displaced"),
+            )],
+            LineageDestination {
+                root: "main".into(),
+                path: "schema/schema-lineage.bundle".into(),
+            },
+            vec![target()],
+            64,
+        )
+        .unwrap(),
+    );
+    coordinator.attach_build_backend();
+    coordinator.reconcile_full_scan().unwrap();
+
+    let manifest = VerifiedSchemaLineageManifest::from_verified_source(
+        ContentHash([3; 32]),
+        SchemaLineageManifest {
+            types: BTreeMap::from([(
+                VALUE_TYPE,
+                AcceptedTypeLineage {
+                    epochs: vec![
+                        AcceptedSchemaEpoch {
+                            digest: old_hash,
+                            forward_parent: None,
+                        },
+                        AcceptedSchemaEpoch {
+                            digest: new_hash,
+                            forward_parent: Some(0),
+                        },
+                    ],
+                    current: 1,
+                    authority: TypeAuthorityState::Active,
+                },
+            )]),
+        },
+    );
+    let store = coordinator.store();
+    let new_snapshot = distill_schema::ngp_schema::snapshot_to_json(&new_schema).unwrap();
+    coordinator
+        .server()
+        .coordinated_commit(InputVersion(1), || {
+            store
+                .lock()
+                .unwrap()
+                .input_transaction(|transaction| {
+                    transaction.put_schema(new_hash, &new_snapshot)?;
+                    transaction.project_verified_lineage_manifest(&manifest)
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(Commit::default())
+        })
+        .unwrap();
+
+    let base = InputVersion(2);
+    let request = DiskMigrationRequest {
+        bundles: vec![failing_bundle, migrating_bundle],
+    };
+    let prepared = coordinator
+        .authoring_service()
+        .prepare_operation(
+            base,
+            &LongRunningOp::DiskMigration(request.encode().unwrap()),
+        )
+        .unwrap();
+    let completed = complete(prepared.publication, base);
+    let terminal_error = completed
+        .terminal_error
+        .as_deref()
+        .expect("the failed bundle is reported");
+    assert!(terminal_error.contains(&failing_bundle.to_string()));
+    assert!(terminal_error.contains("failing.bundle"));
+    assert!(terminal_error.contains("has no accepted lineage"));
+    assert!(!terminal_error.contains(&migrating_bundle.to_string()));
+    coordinator
+        .server()
+        .coordinated_commit(base, || Ok(completed.commit))
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(assets.join("failing.bundle")).unwrap(),
+        failing_bytes
+    );
+    let failed = distill_bundle::parse_bundle(&failing_bytes).unwrap();
+    assert_eq!(failed.assets["entry"].schema_hash, old_hash);
+    let migrated =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("migrating.bundle")).unwrap())
+            .unwrap();
+    assert_eq!(migrated.assets["entry"].schema_hash, new_hash);
+    assert_eq!(
+        migrated.assets["entry"].data,
+        object([("value", AuthoredValue::UInt(42))])
+    );
+    assert_eq!(
+        coordinator.store().lock().unwrap().input_version(),
+        InputVersion(3)
+    );
+}

@@ -646,13 +646,20 @@ impl Store {
             self.retire_intent(intent_id)?;
             return Ok(CreationRecoveryOutcome::Installed);
         }
+        // A publication group is durable before its proposal temp is
+        // created. A crash in that narrow window leaves a Prepared intent
+        // whose target was never touched; abandoning it is therefore safe.
+        if temp_hash.is_none() {
+            self.retire_intent(intent_id)?;
+            return Ok(CreationRecoveryOutcome::RetryRequired);
+        }
         if target_hash.is_some() {
             return Ok(CreationRecoveryOutcome::RetryRequired);
         }
         if temp_hash != Some(proposed) {
             return Err(StoreError::BadIntent {
                 intent_id,
-                detail: "creation proposal temp is missing or changed".into(),
+                detail: "creation proposal temp changed".into(),
             });
         }
         fs.sync_file(&temp)?;
@@ -687,6 +694,13 @@ impl Store {
         for _ in 0..16 {
             match intent.state {
                 RenameAsideState::Prepared => {
+                    // Recording the intent precedes creation of the proposal
+                    // temp. With no temp, this attempt cannot have performed
+                    // its first filesystem transition and is safe to abandon.
+                    if read_hash(fs, &intent.temp)?.is_none() {
+                        self.retire_intent(intent_id)?;
+                        return Ok(RenameAsideOutcome::RetryRequired);
+                    }
                     fs.create_dir_all(quarantine_dir)?;
                     if let Some(parent) = quarantine_dir.parent() {
                         fs.sync_dir(parent)?;

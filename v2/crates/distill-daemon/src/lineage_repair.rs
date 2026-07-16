@@ -128,7 +128,7 @@ impl LineageRepairBackend {
             }
         }
 
-        let temp = write_same_dir_temp(&target, proposed_bytes).map_err(failure)?;
+        let temp = plan_same_dir_temp(&target).map_err(failure)?;
         let proposed_hash = BundleFileHash::of_observed_bytes(proposed_bytes);
         let preimage = match destination {
             LineageRepairDestination::Absent => None,
@@ -159,6 +159,7 @@ impl LineageRepairBackend {
                 &[plan],
             )
             .map_err(failure)?;
+        write_planned_temp(&temp, proposed_bytes).map_err(failure)?;
         let outcome = if preimage.is_none() {
             publication
                 .resume_group_create(group.child_intents[0])
@@ -293,7 +294,7 @@ impl LineageRepairBackend {
                     ))
                 })?;
                 let replacement_hash = BundleFileHash::of_observed_bytes(&replacement);
-                let temp = write_same_dir_temp(&target, &replacement).map_err(failure)?;
+                let temp = plan_same_dir_temp(&target).map_err(failure)?;
                 if physical_claimants
                     .iter()
                     .any(|claimant| claimant == survivor)
@@ -302,6 +303,7 @@ impl LineageRepairBackend {
                 }
                 mutations.push(PlannedMutation::Replace {
                     target: target.clone(),
+                    proposed: replacement,
                     plan: JournalIntentPlan {
                         target_path: path_text(&target)?,
                         temp_path: path_text(&temp)?,
@@ -328,6 +330,11 @@ impl LineageRepairBackend {
                 &plans,
             )
             .map_err(failure)?;
+        for mutation in &mutations {
+            if let PlannedMutation::Replace { proposed, plan, .. } = mutation {
+                write_planned_temp(Path::new(&plan.temp_path), proposed).map_err(failure)?;
+            }
+        }
         let mut all_installed = true;
         for (mutation, intent_id) in mutations.iter().zip(&group.child_intents) {
             let terminal_success = match mutation {
@@ -653,6 +660,7 @@ fn validate_add_only_replacement(
 enum PlannedMutation {
     Replace {
         target: PathBuf,
+        proposed: Vec<u8>,
         plan: JournalIntentPlan,
     },
     Delete {
@@ -691,11 +699,10 @@ fn group_claimants(
     Ok(grouped)
 }
 
-pub(crate) fn write_same_dir_temp(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+pub(crate) fn plan_same_dir_temp(target: &Path) -> Result<PathBuf, String> {
     let parent = target
         .parent()
         .ok_or_else(|| "publication target has no parent directory".to_owned())?;
-    fs::create_dir_all(parent).map_err(|error| format!("create target directory: {error}"))?;
     let stem = target
         .file_name()
         .and_then(|name| name.to_str())
@@ -706,20 +713,40 @@ pub(crate) fn write_same_dir_temp(target: &Path, bytes: &[u8]) -> Result<PathBuf
             ".{stem}.distill-{}-{sequence}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
-            Ok(mut file) => {
-                file.write_all(bytes)
-                    .map_err(|error| format!("write proposed temp: {error}"))?;
-                file.sync_all()
-                    .map_err(|error| format!("sync proposed temp: {error}"))?;
-                FileDirSync::sync(parent)?;
-                return Ok(temp);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create proposed temp: {error}")),
+        match fs::symlink_metadata(&temp) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(temp),
+            Err(error) => return Err(format!("inspect proposed temp path: {error}")),
         }
     }
     Err("could not allocate a unique same-directory proposal temp".into())
+}
+
+pub(crate) fn write_planned_temp(temp: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = temp
+        .parent()
+        .ok_or_else(|| "publication temp has no parent directory".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| format!("create target directory: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp)
+        .map_err(|error| format!("create proposed temp: {error}"))?;
+    let result = file
+        .write_all(bytes)
+        .map_err(|error| format!("write proposed temp: {error}"))
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|error| format!("sync proposed temp: {error}"))
+        })
+        .and_then(|()| FileDirSync::sync(parent));
+    if let Err(error) = result {
+        drop(file);
+        let _ = fs::remove_file(temp);
+        let _ = FileDirSync::sync(parent);
+        return Err(error);
+    }
+    Ok(())
 }
 
 struct FileDirSync;

@@ -30,7 +30,7 @@ use crate::callbacks::{
     CallbackInvokeError, CodegenAsset, CodegenContextError, PipelineCodegenContext,
 };
 use crate::coordinator::DaemonCoordinator;
-use crate::lineage_repair::unique_sibling;
+use crate::lineage_repair::{plan_same_dir_temp, unique_sibling, write_planned_temp};
 use crate::quarantine::{QuarantineDriver, QuarantineRoot};
 use crate::scanner::{DaemonOwnedDirectoryKind, RootedScanner};
 
@@ -374,7 +374,7 @@ impl CodegenWorld<'_> {
                 change
                     .bytes
                     .as_deref()
-                    .map(|bytes| self.output.write_same_dir_temp(&change.target, bytes))
+                    .map(|_| self.output.plan_same_dir_temp(&change.target))
                     .transpose()?,
             );
         }
@@ -403,6 +403,11 @@ impl CodegenWorld<'_> {
         let group = publication
             .record_group(PublicationGroupKind::Codegen, &completion.encode(), &plans)
             .map_err(|error| error.to_string())?;
+        for (change, temp) in changes.iter().zip(&staged) {
+            if let (Some(bytes), Some(temp)) = (change.bytes.as_deref(), temp.as_deref()) {
+                self.output.write_planned_temp(temp, bytes)?;
+            }
+        }
         for (change, intent) in changes.iter().zip(&group.child_intents) {
             let installed = match (change.preimage, change.bytes.as_ref()) {
                 (Some(_), Some(_)) => publication
@@ -754,9 +759,21 @@ impl OutputDirectory {
         Ok(())
     }
 
-    fn write_same_dir_temp(&self, target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    fn plan_same_dir_temp(&self, target: &Path) -> Result<PathBuf, String> {
         self.verify()?;
-        crate::lineage_repair::write_same_dir_temp(target, bytes)
+        plan_same_dir_temp(target)
+    }
+
+    fn write_planned_temp(&self, temp: &Path, bytes: &[u8]) -> Result<(), String> {
+        self.verify()?;
+        write_planned_temp(temp, bytes)
+    }
+
+    #[cfg(test)]
+    fn write_same_dir_temp(&self, target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+        let temp = self.plan_same_dir_temp(target)?;
+        self.write_planned_temp(&temp, bytes)?;
+        Ok(temp)
     }
 
     fn read_owned_file(&self, target: &Path) -> Result<Vec<u8>, String> {

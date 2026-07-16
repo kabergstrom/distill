@@ -30,7 +30,7 @@ use distill_store::Store;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::build::CurrentLoadService;
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
-use crate::lineage_repair::{unique_sibling, write_same_dir_temp};
+use crate::lineage_repair::{plan_same_dir_temp, unique_sibling, write_planned_temp};
 use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::QuarantineDriver;
 use crate::scanner::RootedScanner;
@@ -66,15 +66,18 @@ impl AuthoringService {
                     kind: PublicationGroupKind::AuthoringWrite,
                     basis: encode_rename_basis(base, &request),
                     files: self.plan_rename_with_fixups(base, &request)?,
+                    failures: Vec::new(),
                 }
             }
             LongRunningOp::DiskMigration(payload) => {
                 let request = DiskMigrationRequest::decode(payload)
                     .map_err(|error| invalid(error.to_string()))?;
+                let (files, failures) = self.plan_disk_migration(base, &request)?;
                 PlannedOperation::Files {
                     kind: PublicationGroupKind::DiskMigration,
                     basis: encode_migration_basis(base, &request),
-                    files: self.plan_disk_migration(base, &request)?,
+                    files,
+                    failures,
                 }
             }
             LongRunningOp::Doctor(payload) => {
@@ -275,7 +278,7 @@ impl AuthoringService {
         &self,
         base: InputVersion,
         request: &DiskMigrationRequest,
-    ) -> Result<Vec<OperationFile>, RpcFailure> {
+    ) -> Result<(Vec<OperationFile>, Vec<String>), RpcFailure> {
         let coordinator = self
             .tag_index_coordinator()
             .ok_or_else(|| invalid("disk migration coordinator is unavailable"))?;
@@ -294,19 +297,23 @@ impl AuthoringService {
                 .map(|meta| {
                     let root = store
                         .root_name(meta.root)
-                        .map_err(invalid)?
-                        .ok_or_else(|| invalid("bundle root identity is missing"))?;
-                    Ok((meta, root))
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "bundle root identity is missing".to_owned());
+                    Ok::<_, String>((meta, root))
                 })
-                .collect::<Result<Vec<_>, RpcFailure>>()?
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(invalid)?
         };
+        let mut failures = Vec::new();
         if !requested.is_empty() {
             let present = all
                 .iter()
                 .map(|(meta, _)| meta.bundle)
                 .collect::<BTreeSet<_>>();
-            if let Some(missing) = requested.difference(&present).next() {
-                return Err(invalid(format!("cannot migrate unknown bundle {missing}")));
+            for missing in requested.difference(&present) {
+                failures.push(format!(
+                    "bundle {missing}: cannot migrate an unknown bundle"
+                ));
             }
         }
         let mut files = Vec::new();
@@ -314,53 +321,67 @@ impl AuthoringService {
             if !requested.is_empty() && !requested.contains(&meta.bundle) {
                 continue;
             }
-            let target = self
-                .scanner
-                .physical_path(&root, &meta.path)
-                .map_err(invalid)?;
-            let bytes = self
-                .scanner
-                .read_identity_checked(&target)
-                .map_err(invalid)?;
-            let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
-            if observed != meta.content_hash {
-                return Err(invalid(format!(
-                    "bundle {} changed since durable version {}",
-                    meta.path, base.0
-                )));
-            }
-            let mut bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
-            let load_bundle = bundle.clone();
-            let mut changed = false;
-            let mut migrated_schemas = BTreeMap::new();
-            for entry in bundle.assets.values_mut() {
-                if is_bootstrap_control_type(entry.type_uuid) {
-                    continue;
+            let result =
+                root.and_then(|root| self.plan_disk_migration_bundle(base, &loader, &meta, &root));
+            match result {
+                Ok(Some(file)) => files.push(file),
+                Ok(None) => {}
+                Err(error) => {
+                    failures.push(format!("bundle {} at {}: {error}", meta.bundle, meta.path))
                 }
-                let current = loader
-                    .load(entry, &load_bundle, &meta.path)
-                    .map_err(invalid)?;
-                if entry.schema_hash == current.schema_hash {
-                    continue;
-                }
-                entry.data = current.value;
-                entry.schema_hash = current.schema_hash;
-                entry.lineage = EntryLineageV1::Manifest(current.lineage);
-                migrated_schemas.insert(current.schema_hash, current.schema);
-                changed = true;
-            }
-            if changed {
-                bundle.schemas.extend(migrated_schemas);
-                let used = distill_bundle::referenced_schema_hashes(&bundle);
-                bundle.schemas.retain(|hash, _| used.contains(hash));
-                files.push(OperationFile::replace(
-                    target,
-                    observed,
-                    distill_bundle::write_bundle(&bundle).map_err(invalid)?,
-                ));
             }
         }
-        Ok(files)
+        Ok((files, failures))
+    }
+
+    fn plan_disk_migration_bundle(
+        &self,
+        base: InputVersion,
+        loader: &CurrentLoadService,
+        meta: &distill_store::bundles::BundleMeta,
+        root: &str,
+    ) -> Result<Option<OperationFile>, String> {
+        let target = self
+            .scanner
+            .physical_path(root, &meta.path)
+            .map_err(|error| error.to_string())?;
+        let bytes = self
+            .scanner
+            .read_identity_checked(&target)
+            .map_err(|error| error.to_string())?;
+        let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
+        if observed != meta.content_hash {
+            return Err(format!("changed since durable version {}", base.0));
+        }
+        let mut bundle = distill_bundle::parse_bundle(&bytes).map_err(|error| error.to_string())?;
+        let load_bundle = bundle.clone();
+        let mut changed = false;
+        let mut migrated_schemas = BTreeMap::new();
+        for entry in bundle.assets.values_mut() {
+            if is_bootstrap_control_type(entry.type_uuid) {
+                continue;
+            }
+            let current = loader.load(entry, &load_bundle, &meta.path)?;
+            if entry.schema_hash == current.schema_hash {
+                continue;
+            }
+            entry.data = current.value;
+            entry.schema_hash = current.schema_hash;
+            entry.lineage = EntryLineageV1::Manifest(current.lineage);
+            migrated_schemas.insert(current.schema_hash, current.schema);
+            changed = true;
+        }
+        if !changed {
+            return Ok(None);
+        }
+        bundle.schemas.extend(migrated_schemas);
+        let used = distill_bundle::referenced_schema_hashes(&bundle);
+        bundle.schemas.retain(|hash, _| used.contains(hash));
+        Ok(Some(OperationFile::replace(
+            target,
+            observed,
+            distill_bundle::write_bundle(&bundle).map_err(|error| error.to_string())?,
+        )))
     }
 }
 
@@ -380,6 +401,7 @@ enum PlannedOperation {
         kind: PublicationGroupKind,
         basis: Vec<u8>,
         files: Vec<OperationFile>,
+        failures: Vec<String>,
     },
     Doctor {
         request: DoctorRequest,
@@ -395,9 +417,14 @@ struct DeferredAuthoringOperation {
 impl DeferredOperation for DeferredAuthoringOperation {
     fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String> {
         match &self.planned {
-            PlannedOperation::Files { kind, basis, files } => {
-                self.runtime.publish_files(base, *kind, basis, files)
-            }
+            PlannedOperation::Files {
+                kind,
+                basis,
+                files,
+                failures,
+            } => self
+                .runtime
+                .publish_files(base, *kind, basis, files, failures),
             PlannedOperation::Doctor {
                 request,
                 build_requests,
@@ -413,9 +440,13 @@ impl OperationRuntime {
         kind: PublicationGroupKind,
         basis: &[u8],
         files: &[OperationFile],
+        initial_failures: &[String],
     ) -> Result<DeferredOperationResult, String> {
         if files.is_empty() {
-            return self.advance_empty(base, None);
+            return self.advance_empty(
+                base,
+                (!initial_failures.is_empty()).then(|| initial_failures.join("; ")),
+            );
         }
         let mut store = self
             .store
@@ -427,7 +458,7 @@ impl OperationRuntime {
             let temp = file
                 .proposed
                 .as_ref()
-                .map(|bytes| write_same_dir_temp(&file.target, bytes))
+                .map(|_| plan_same_dir_temp(&file.target))
                 .transpose()?;
             staged.push(temp);
         }
@@ -455,8 +486,13 @@ impl OperationRuntime {
         let group = publication
             .record_group(kind, basis, &plans)
             .map_err(|error| error.to_string())?;
-        let mut conflicts = Vec::new();
-        for ((file, intent), _temp) in files.iter().zip(&group.child_intents).zip(&staged) {
+        for (file, temp) in files.iter().zip(&staged) {
+            if let (Some(bytes), Some(temp)) = (file.proposed.as_deref(), temp.as_deref()) {
+                write_planned_temp(temp, bytes)?;
+            }
+        }
+        let mut failures = initial_failures.to_vec();
+        for (file, intent) in files.iter().zip(&group.child_intents) {
             let installed = match (&file.preimage, &file.proposed) {
                 (Some(_), Some(_)) => publication
                     .resume_group_replace(*intent, &file.target)
@@ -471,7 +507,7 @@ impl OperationRuntime {
             }
             .map_err(|error| error.to_string())?;
             if !installed {
-                conflicts.push(format!(
+                failures.push(format!(
                     "{} changed concurrently; its observed inode was preserved",
                     file.target.display()
                 ));
@@ -498,7 +534,7 @@ impl OperationRuntime {
         )?;
         Ok(DeferredOperationResult {
             commit,
-            terminal_error: (!conflicts.is_empty()).then(|| conflicts.join("; ")),
+            terminal_error: (!failures.is_empty()).then(|| failures.join("; ")),
         })
     }
 
@@ -641,6 +677,7 @@ impl OperationRuntime {
             PublicationGroupKind::SchemaRepair,
             &basis,
             &schema_repairs,
+            &[],
         )?;
         result.terminal_error = match (terminal_error, result.terminal_error) {
             (Some(left), Some(right)) => Some(format!("{left}; {right}")),
@@ -855,7 +892,16 @@ fn encode_schema_repair_basis(base: InputVersion, files: &[OperationFile]) -> Ve
 
 fn operation_summary(operation: &PlannedOperation) -> String {
     match operation {
-        PlannedOperation::Files { kind, files, .. } => format!("{kind:?}: {} file(s)", files.len()),
+        PlannedOperation::Files {
+            kind,
+            files,
+            failures,
+            ..
+        } => format!(
+            "{kind:?}: {} file(s), {} per-file failure(s)",
+            files.len(),
+            failures.len()
+        ),
         PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
     }
 }
