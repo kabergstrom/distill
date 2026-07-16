@@ -7,19 +7,22 @@ milestones._
 
 ## 1. Current state
 
-The Distill v2 implementation is present under `v2/` as a fifteen-package Rust
-workspace. The current implementation/review milestone is commit `5a4c226`
-(`Address final review and simplify filesystem model`). At that commit:
+The Distill v2 implementation is present under `v2/` as a sixteen-package Rust
+workspace, including its two real dynamic-module test fixtures. The current
+implementation/review milestone is commit `6e8d93f` (`Close rotated audit race
+conditions`). At that commit:
 
 - `cargo test --workspace --offline` passes, including integration, UI, and doc
   tests.
 - `cargo clippy --workspace --all-targets --offline -- -D warnings` passes.
 - `git diff --check` passes.
-- The final adversarial review findings have been addressed with regressions.
+- The complete texture/mesh/shader and schema-transition vertical suites pass.
+- Every confirmed CRITICAL/HIGH/MEDIUM adversarial-review finding is fixed with
+  a regression or rejected with concrete counterevidence.
 - The filesystem overengineering audit is folded into R37 and the code: no
   retained directory handles, descriptor-relative traversal, persisted
-  platform file identity, direct NT scanner, or daemon `libc` dependency
-  remains.
+  platform file identity, direct NT scanner, daemon `libc` dependency, or
+  separate Windows publication backend remains.
 
 Use the installed Rust toolchain directly:
 
@@ -30,7 +33,7 @@ cargo clippy --workspace --all-targets --offline -- -D warnings
 ```
 
 `cargo fmt --all` traverses external path dependencies and therefore attempts
-to format repositories that Distill does not own. Format the fifteen Distill
+to format repositories that Distill does not own. Format the sixteen Distill
 packages explicitly, or format only changed packages.
 
 Do not add `Co-Authored-By` lines. Commit coherent milestones as they become
@@ -58,7 +61,10 @@ model is the one in §§1–21 plus R34, R35, R36, and R37:
   table, cross-job wait graph, waiter-thread system, or cooperative parking
   layer.
 - Native watcher events preserve incremental workloads. Normal edits never
-  trigger a full tree scan or rehash of unrelated state.
+  trigger a full tree scan or rehash of unrelated state. Missing control files
+  are watched from their nearest existing ancestor; ancestor introduction or
+  replacement invalidates the exact control and rebuilds watch coverage before
+  reread, without an asset-root scan.
 - Filesystem scanning and codegen use the trusted local-workspace model:
   canonical configured paths, standard Rust filesystem APIs, and
   observe/revalidate/retry for ordinary concurrent edits and renames. They do
@@ -131,6 +137,7 @@ this Distill milestone.
 | `distill-rpc` | Loopback Cap'n Proto protocol, snapshots, resolve/fetch/subscribe, leases, target fencing |
 | `distill-daemon` | Watcher/scanner, config staging, module epochs, import/build orchestration, codegen, pack and doctor commands |
 | `distill-pipeline-fixture` | Real dynamic pipeline module used by module-host integration tests |
+| `distill-game-assets-pipeline-fixture` | Tiny PPM/OBJ/shader import and cook module used by the full game-asset vertical test |
 
 The final implementation pass closed these cross-cutting gaps:
 
@@ -164,6 +171,70 @@ The final implementation pass closed these cross-cutting gaps:
 - Capability changes revalidate only importer read sets that recorded a
   capability lookup. Directory folds invalidate only their group; lineage-only
   config changes do not scan authored roots.
+
+The closure milestone adds these end-to-end and durability guarantees:
+
+- A real daemon/RPC/typed-loader vertical test imports a 1x1 binary PPM
+  texture, one-triangle OBJ mesh, and include-bearing shader; adopts all three,
+  observes a native watcher include edit as one shader-only reload, then builds,
+  activates, mounts, and loads a pack containing all three assets.
+- The schema-transition metadata command remains available while ordinary Hub
+  connection is fenced by `SchemaAcceptanceRequired`. Accept, rollback, retire,
+  and reactivate requests are canonical and version-fenced; accepting the final
+  mismatch durably replaces the lineage manifest before promoting the retained
+  module candidate. A real dynamic-module vertical test covers acceptance and
+  promotion.
+- Filesystem publication records every child in an unarmed group, durably stages
+  all proposals, arms the group, and only then mutates user-visible paths.
+  Recovery aborts unarmed groups and retires armed parents only after every child
+  has a durable terminal outcome.
+- Supported Unix daemon hosts use one standard-library rename-aside/no-replace
+  protocol. Recovery never unlinks a new user target that raced an atomic save;
+  displaced prior content remains retained for explicit cleanup.
+- Disk migrations publish one independent journal group per bundle, so one
+  bundle's staging failure does not prevent later bundles from committing.
+- RPC subscriptions have one stream-level initial snapshot, later subscriptions
+  union names and replay retained history as ordinary deltas, and loader sweeps
+  remain scoped to the affected dependency component with an unchanged-content
+  cutoff before fetch/adoption.
+
+The adversarial closure review then fixed these failure paths:
+
+- Rollback and divergent reactivation—and only those reverse/divergent
+  cases—consume fully decoded, schema-closed,
+  lineage-checked migration proofs. Custom operations must be total and
+  disjoint, referenced functions must exist in the pending module, and asset
+  multiplicity is retained so duplicate edges remain ambiguous rather than
+  disappearing through endpoint deduplication.
+- References to retired types, including migration endpoints, publish a durable
+  `RetiredTypeReferenced` pipeline state and hold the affected bundle projection
+  waiting. A moved waiting bundle retains both its old and new paths so SQLite
+  and RPC projections cannot split. Migration diagnostics retain the offending
+  control asset UUID, not merely its endpoint schema hash. Explicit reactivation
+  flips authority and admits those waiting paths in the same stale-base-fenced
+  transaction.
+- Cleanup failure for an unpublished pipeline candidate is classified as
+  `CandidateOpen`/`CandidateCleanup`, safely leaks the affected module when
+  required, and remains durably visible instead of being discarded or
+  mislabeled as published-runtime poison.
+- Storage adoption failure rolls back the complete component, destroys every
+  unconsumed module-owned value, preserves last-good state, and freezes the
+  affected component. RPC transport loss enters bounded-backoff rebind,
+  bounds the complete handshake, remains independently cancellable during a
+  stalled peer, reinstalls subscriptions, and publishes `TargetBound` only after
+  recovery.
+- Native publication rejects symlinked entries and immediately revalidates its
+  rooted parents. Missing targets, atomic editor replacement, and late writes to
+  displaced open inodes all end in terminal no-clobber recovery rather than a
+  permanently pending journal child. Retained names include the durable store
+  instance, reserved-path collision accounting and replacement selection share
+  one crash-atomic transaction, and journal-owned proposal cleanup is
+  ownership/hash checked.
+- Missing control parents and parent-directory replacement invalidate the exact
+  descendant control and rebuild native coverage without scanning unrelated
+  asset roots. Recovery-scan errors finalize the queue rather than leaving it
+  armed. Dead Windows/portable daemon-host branches and the duplicate cleanup
+  wrapper were removed.
 
 The final review milestone additionally closes these concrete defects:
 
@@ -302,6 +373,17 @@ The final implementation sequence on the Distill repository is:
 - `a0684ac Simplify synchronous build scheduling`
 - `1f18b5f Close final implementation correctness gaps`
 - `5a4c226 Address final review and simplify filesystem model`
+- `b9aaa04 Refresh implementation handoff after final review`
+- `321f260 Harden CAS recovery and compaction`
+- `8c30754 Fix loader reload ownership and reconnection`
+- `b766932 Close module lifecycle and schema closure gaps`
+- `c7533e1 Fix incremental scan poison healing`
+- `24555c7 Remove duplicate module publication host`
+- `99654da Make authoring publication recovery total`
+- `963c54c Complete durable schema and asset workflows`
+- `236015b Close adversarial review failure paths`
+- `d888c11 Finish final review recovery edges`
+- `6e8d93f Close rotated audit race conditions`
 
 Earlier watcher milestones include:
 
@@ -331,19 +413,30 @@ brands, exact Cargo layout-dependency closure, or in-place reattestation.
 
 ## 10. Explicit non-goals and open boundaries
 
-The implementation is complete for the current supported phase. The current
-design explicitly leaves these boundaries open or deferred:
+The implementation is complete for the current supported phase. The remaining
+boundaries retain their exact §22 categories:
+
+**Open:**
 
 - **Authenticated remote transport:** RPC is validated loopback-only. Remote
   use requires an authenticated secure transport design, not a relaxed bind.
 - **Per-target source-walk layout emission:** current source-walk emits one
   host-target layout table. A target whose layout identity differs is rejected;
   cross-target cooking remains blocked until per-target emission exists.
-- Patch/compaction distribution tooling, the editor application, tuning
-  constants, process isolation, pack signing, QoS, shared multi-daemon caches,
-  and exotic filesystem support remain exactly as categorized in §22. CAS
-  compaction itself is implemented; “patch/compaction tooling” here means the
-  deferred pack/distribution product tooling.
+
+**Deferred by decision:**
+
+- Patch/compaction distribution tooling. CAS compaction itself is implemented;
+  this item is the deferred pack/distribution product workflow.
+- The editor application. The RPC surface is implemented; the editor UI is not
+  part of this phase.
+- Tuning constants such as debounce, segment/block sizes, and cache limits.
+
+**Descoped:**
+
+- Pipeline-code process isolation, RPC auth/TLS for the validated loopback-only
+  phase, pack signing, flow-control QoS, shared multi-daemon caches, and exotic
+  filesystem support.
 - **Adversarial local namespace races and Windows-host daemon support:** R37
   defines trusted developer workspaces and ordinary race revalidation. A future
   hostile-filesystem confinement guarantee or Windows-host support is new scope,
