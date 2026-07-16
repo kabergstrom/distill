@@ -235,6 +235,81 @@ fn an_unindexed_committed_group_is_adopted_on_reopen() {
 }
 
 #[test]
+fn recovery_checkpoints_cross_segment_groups_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = cfg(&dir);
+    config.segment_size = 256;
+    let mut store = Store::open(config.clone()).unwrap();
+    let bytes = vec![0x5a; 1024];
+    let hash = commit(&mut store, 11, &bytes);
+    drop(store);
+
+    let database_path = dir.path().join(".distill/meta.sqlite");
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "DELETE FROM cas_extents;
+             DELETE FROM result_candidates;
+             DELETE FROM derived_assertions;
+             UPDATE cas_segments SET indexed_len = 0;",
+        )
+        .unwrap();
+    let segment_ids: Vec<i64> = {
+        let mut statement = connection
+            .prepare("SELECT segment_id FROM cas_segments ORDER BY segment_id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert!(
+        segment_ids.len() >= 2,
+        "fixture must cross a segment boundary"
+    );
+    let fail_segment = segment_ids[1];
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_recovery_checkpoint
+             BEFORE UPDATE OF indexed_len ON cas_segments
+             WHEN NEW.segment_id = {fail_segment} AND NEW.indexed_len > 0
+             BEGIN SELECT RAISE(ABORT, 'injected recovery crash'); END;"
+        ))
+        .unwrap();
+    drop(connection);
+
+    assert!(Store::open(config.clone()).is_err());
+
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let advanced: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM cas_segments WHERE indexed_len != 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        advanced, 0,
+        "a failed recovery must not checkpoint an earlier payload segment"
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_recovery_checkpoint")
+        .unwrap();
+    drop(connection);
+
+    let mut store = Store::open(config).unwrap();
+    assert_eq!(store.cas_read(&hash).unwrap(), bytes);
+    assert_eq!(
+        store
+            .lookup_candidates(KeyKind::Processor, &[11; 32])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn generation_mismatch_discards_and_rebuilds_the_index() {
     // §13: CURRENT is the single authority — SQLite records the
     // generation it indexed, and a mismatch discards the SQLite artifact

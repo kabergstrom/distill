@@ -275,6 +275,22 @@ fn the_cache_limit_sweep_evicts_lru_first_and_skips_pinned() {
     assert_eq!(store.cas_read(&out3).unwrap(), vec![3u8; 1200]);
 }
 
+#[test]
+fn an_unowned_wire_tree_is_collected_even_below_the_cache_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let wire_bytes = dswl_bytes(&WireNode::Unit { offset: 0 }).unwrap();
+    let layout = store.put_wire_tree(&wire_bytes).unwrap();
+    assert_eq!(store.wire_tree_read(layout).unwrap(), wire_bytes);
+
+    let report = store.enforce_cache_limit().unwrap();
+    assert_eq!(report.evicted, 0);
+    assert!(matches!(
+        store.wire_tree_read(layout),
+        Err(StoreError::NotFound { .. })
+    ));
+}
+
 // ---- compaction ----
 
 #[test]
@@ -300,11 +316,10 @@ fn compaction_reclaims_dead_bytes_and_flips_the_generation() {
 
     // Everything live still reads; the bucket still resolves.
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
-    assert_eq!(
-        store.wire_tree_read(wire).unwrap(),
-        wire_bytes,
-        "wire trees survive"
-    );
+    assert!(matches!(
+        store.wire_tree_read(wire),
+        Err(StoreError::NotFound { .. })
+    ));
     let candidates = store
         .lookup_candidates(KeyKind::Processor, &[1u8; 32])
         .unwrap();
@@ -320,6 +335,45 @@ fn compaction_reclaims_dead_bytes_and_flips_the_generation() {
     let store = Store::open(cfg(&dir)).unwrap();
     assert!(!store.recovery_report().rebuilt_index);
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
+}
+
+#[test]
+fn compacted_duplicate_payload_precedes_every_surviving_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let (hash, _, first_digest) =
+        commit_with_aux(&mut store, 1, b"shared artifact", b"first debug");
+    let (duplicate, _, second_digest) =
+        commit_with_aux(&mut store, 2, b"shared artifact", b"second debug");
+    assert_eq!(hash, duplicate);
+    assert!(store
+        .evict_result(KeyKind::Processor, &[2; 32], &second_digest)
+        .unwrap());
+
+    store.compact().unwrap();
+    drop(store);
+
+    // Force the generation-mismatch recovery path that must be able to
+    // reconstruct the complete index from only the compacted log.
+    let current_path = dir.path().join(".distill/cas/CURRENT");
+    let current = std::fs::read_to_string(&current_path).unwrap();
+    let mut lines: Vec<_> = current.lines().map(str::to_owned).collect();
+    let generation = lines[0]
+        .strip_prefix("generation ")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    lines[0] = format!("generation {}", generation + 1);
+    std::fs::write(&current_path, lines.join("\n") + "\n").unwrap();
+
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    assert!(store.recovery_report().rebuilt_index);
+    assert_eq!(store.cas_read(&hash).unwrap(), b"shared artifact");
+    let candidates = store
+        .lookup_candidates(KeyKind::Processor, &[1; 32])
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].trace_digest, first_digest);
 }
 
 #[test]

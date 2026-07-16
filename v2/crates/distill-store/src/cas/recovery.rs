@@ -8,13 +8,14 @@
 //! nothing; duplicate content hashes keep the last and mark the rest
 //! garbage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use distill_core::id::AssetUuid;
+use distill_wire::artifact::{parse_artifact, ARTIFACT_MAGIC};
 
 use crate::cas::manifest;
 use crate::cas::record::{
-    decode_record, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN,
+    decode_record, Record, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN,
 };
 use crate::cas::store::{
     derived_row_matches, parse_segment_id, upsert_candidate, upsert_extent, CasInner, SegmentInfo,
@@ -144,223 +145,264 @@ impl Store {
         }
         report.removed_stray_segments.sort();
 
-        // 3. Scan each CURRENT segment forward from its last indexed
-        //    offset, adopting committed groups and truncating torn tails.
-        let segments = self.cas.segments.clone();
-        let mut memo_counter = self.memo_seq().0;
-        // Payload records seen in the unindexed region, keyed by content
-        // hash, valid until a result record covers them (last wins).
-        let mut pending: HashMap<[u8; 32], (u64, u64, u64)> = HashMap::new();
-        let mut seen_hashes: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        // 3. Scan every unindexed suffix first, then checkpoint all suffixes
+        //    in one SQLite transaction. A recovery crash can therefore never
+        //    advance an earlier segment past payloads whose result marker is
+        //    in a later segment.
+        struct ScanRange {
+            segment: SegmentInfo,
+            path: std::path::PathBuf,
+            start: u64,
+            file_len: u64,
+            valid_end: u64,
+        }
+        struct ScannedRecord {
+            segment: u64,
+            offset: u64,
+            payload_offset: u64,
+            encoded_len: u64,
+            content_hash: [u8; 32],
+            record: Record,
+            result: Option<ResultPayload>,
+        }
 
+        use rusqlite::OptionalExtension;
+        let segments = self.cas.segments.clone();
+        let mut ranges = Vec::with_capacity(segments.len());
+        let mut rebuild_for_cursor_drift = false;
         for segment in &segments {
-            let segment_id = segment.id;
-            let name = &segment.name;
-            let path = self.cas.dir.join(name);
-            use rusqlite::OptionalExtension;
-            let indexed: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT indexed_len FROM cas_segments WHERE segment_id = ?1",
-                    [segment_id as i64],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let mut indexed = indexed.unwrap_or(0) as u64;
+            let path = self.cas.dir.join(&segment.name);
             let file_len = std::fs::metadata(&path)
                 .map_err(|source| StoreError::Io {
                     path: path.clone(),
                     source,
                 })?
                 .len();
-            if indexed > file_len {
-                // The index claims more than the file holds — the two
-                // stores disagree below the generation level. Never
-                // trust them to agree on their own: rescan this segment
-                // from scratch after dropping its index rows.
-                let txn = self.conn.transaction()?;
-                txn.execute(
-                    "DELETE FROM cas_extents WHERE segment = ?1",
-                    [segment_id as i64],
-                )?;
-                txn.execute(
-                    "DELETE FROM result_candidates WHERE segment = ?1",
-                    [segment_id as i64],
-                )?;
-                txn.commit()?;
-                indexed = 0;
+            let start = self
+                .conn
+                .query_row(
+                    "SELECT indexed_len FROM cas_segments WHERE segment_id = ?1",
+                    [segment.id as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0) as u64;
+            rebuild_for_cursor_drift |= start > file_len;
+            ranges.push(ScanRange {
+                segment: segment.clone(),
+                path,
+                start,
+                file_len,
+                valid_end: start.min(file_len),
+            });
+        }
+        if rebuild_for_cursor_drift {
+            report.rebuilt_index = true;
+            let transaction = self.conn.transaction()?;
+            transaction.execute("DELETE FROM cas_extents", [])?;
+            transaction.execute("DELETE FROM result_candidates", [])?;
+            transaction.execute("DELETE FROM derived_assertions", [])?;
+            transaction.execute("DELETE FROM cas_segments", [])?;
+            meta_set_u64(&transaction, "cas_generation", self.cas.generation)?;
+            transaction.commit()?;
+            for range in &mut ranges {
+                range.start = 0;
+                range.valid_end = 0;
             }
-            if indexed == file_len {
+        }
+
+        let mut scanned = Vec::new();
+        let mut seen_hashes = HashSet::new();
+        for range in &mut ranges {
+            if range.start == range.file_len {
                 continue;
             }
-
-            let bytes = std::fs::read(&path).map_err(|source| StoreError::Io {
-                path: path.clone(),
+            let bytes = std::fs::read(&range.path).map_err(|source| StoreError::Io {
+                path: range.path.clone(),
                 source,
             })?;
-            let mut pos = indexed;
-            let mut valid_end = indexed;
-            let txn = self.conn.transaction()?;
-            while pos < file_len {
-                if segment.kind == manifest::SegmentKind::Oversize && pos > 0 {
+            let mut position = range.start;
+            while position < range.file_len {
+                if range.segment.kind == manifest::SegmentKind::Oversize && position > 0 {
                     break;
                 }
-                match decode_record(&bytes[pos as usize..], segment_id, pos) {
-                    Ok(decoded) => {
-                        let rec = &decoded.record;
-                        let payload_offset = pos
-                            + RECORD_HEADER_LEN as u64
-                            + rec.static_input_key.len() as u64
-                            + rec.output_key.len() as u64;
-                        match rec.kind {
-                            RecordKind::WireTree => {
-                                // Wire trees index from the scan like
-                                // every extent (§13): content-addressed
-                                // and idempotent; their lifecycle is the
-                                // observability rule, not result
-                                // coverage.
-                                if !seen_hashes.insert(decoded.content_hash) {
-                                    report.duplicate_payloads += 1;
-                                }
-                                upsert_extent(
-                                    &txn,
-                                    &decoded.content_hash,
-                                    segment_id,
-                                    payload_offset,
-                                    rec.payload.len() as u64,
-                                )?;
-                            }
-                            RecordKind::Result => {
-                                let Ok(payload) = ResultPayload::decode(&rec.payload) else {
-                                    // A result record whose payload does
-                                    // not parse is torn garbage: the
-                                    // commit marker never became valid.
-                                    break;
-                                };
-                                memo_counter += 1;
-                                report.adopted_results += 1;
-                                let mut covered: Vec<[u8; 32]> = Vec::new();
-                                if let ResultOutcome::Success { outputs, aux } = &payload.outcome {
-                                    for row in outputs {
-                                        covered.push(row.content_hash.0);
-                                    }
-                                    for row in aux {
-                                        covered.push(row.content_hash.0);
-                                    }
-                                }
-                                for hash in covered {
-                                    if let Some((seg, off, len)) = pending.remove(&hash) {
-                                        upsert_extent(&txn, &hash, seg, off, len)?;
-                                    }
-                                }
-                                upsert_candidate(
-                                    &txn,
-                                    payload.key_kind,
-                                    &crate::bundles::blob32(rec.static_input_key.clone()),
-                                    &payload.trace_digest(),
-                                    MemoSeq(memo_counter),
-                                    segment_id,
-                                    pos,
-                                    decoded.encoded_len,
-                                )?;
-                                // Re-verify derived assertions against
-                                // the namespace index — memo data, never
-                                // a claim (§9).
-                                if let ResultOutcome::Success { outputs, .. } = &payload.outcome {
-                                    for row in outputs {
-                                        if row.output_key.is_empty() {
-                                            continue;
-                                        }
-                                        let child = AssetUuid::v5(rec.asset_uuid, &row.output_key);
-                                        if derived_row_matches(
-                                            &txn,
-                                            child,
-                                            rec.asset_uuid,
-                                            &row.output_key,
-                                        )? {
-                                            txn.execute(
-                                                "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
-                                                 VALUES (?1, ?2, ?3, ?4)
-                                                 ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
-                                                rusqlite::params![
-                                                    child.0.as_slice(),
-                                                    rec.asset_uuid.0.as_slice(),
-                                                    row.output_key,
-                                                    memo_counter as i64,
-                                                ],
-                                            )?;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Import encoding / processor output /
-                                // debug: held pending until a committed
-                                // result covers them.
-                                if !seen_hashes.insert(decoded.content_hash) {
-                                    report.duplicate_payloads += 1;
-                                }
-                                if pending
-                                    .insert(
-                                        decoded.content_hash,
-                                        (segment_id, payload_offset, rec.payload.len() as u64),
-                                    )
-                                    .is_some()
-                                {
-                                    // last wins; the displaced entry was
-                                    // already counted as duplicate above.
-                                }
-                            }
-                        }
-                        pos += decoded.encoded_len;
-                        valid_end = pos;
+                let Ok(decoded) =
+                    decode_record(&bytes[position as usize..], range.segment.id, position)
+                else {
+                    break;
+                };
+                let result = if decoded.record.kind == RecordKind::Result {
+                    let Ok(payload) = ResultPayload::decode(&decoded.record.payload) else {
+                        break;
+                    };
+                    Some(payload)
+                } else {
+                    if !seen_hashes.insert(decoded.content_hash) {
+                        report.duplicate_payloads += 1;
                     }
-                    Err(_) => break,
+                    None
+                };
+                let payload_offset = position
+                    + RECORD_HEADER_LEN as u64
+                    + decoded.record.static_input_key.len() as u64
+                    + decoded.record.output_key.len() as u64;
+                let encoded_len = decoded.encoded_len;
+                scanned.push(ScannedRecord {
+                    segment: range.segment.id,
+                    offset: position,
+                    payload_offset,
+                    encoded_len,
+                    content_hash: decoded.content_hash,
+                    record: decoded.record,
+                    result,
+                });
+                position += encoded_len;
+                range.valid_end = position;
+            }
+        }
+
+        // Build global coverage before indexing. This accepts a compacted log
+        // whose selected duplicate payload appears after an older result, and
+        // it makes wire-tree ownership follow the artifacts that name it.
+        let mut last_payload = HashMap::new();
+        let mut covered = HashSet::new();
+        for (index, row) in scanned.iter().enumerate() {
+            if let Some(result) = &row.result {
+                if let ResultOutcome::Success { outputs, aux } = &result.outcome {
+                    covered.extend(outputs.iter().map(|output| output.content_hash.0));
+                    covered.extend(aux.iter().map(|auxiliary| auxiliary.content_hash.0));
+                }
+            } else {
+                last_payload.insert(row.content_hash, index);
+            }
+        }
+        let direct_outputs: Vec<_> = covered.iter().copied().collect();
+        for hash in direct_outputs {
+            let Some(index) = last_payload.get(&hash) else {
+                continue;
+            };
+            let bytes = &scanned[*index].record.payload;
+            if bytes.starts_with(&ARTIFACT_MAGIC) {
+                if let Ok(artifact) = parse_artifact(bytes) {
+                    covered.insert(artifact.layout_hash.0);
                 }
             }
-            txn.execute(
+        }
+        report.orphaned_payloads = last_payload
+            .keys()
+            .filter(|hash| !covered.contains(*hash))
+            .count();
+
+        let mut memo_counter = self.memo_seq().0;
+        let transaction = self.conn.transaction()?;
+        for (hash, index) in &last_payload {
+            if !covered.contains(hash) {
+                continue;
+            }
+            let row = &scanned[*index];
+            upsert_extent(
+                &transaction,
+                hash,
+                row.segment,
+                row.payload_offset,
+                row.record.payload.len() as u64,
+            )?;
+        }
+        for row in &scanned {
+            let Some(payload) = &row.result else {
+                continue;
+            };
+            memo_counter += 1;
+            report.adopted_results += 1;
+            upsert_candidate(
+                &transaction,
+                payload.key_kind,
+                &crate::bundles::blob32(row.record.static_input_key.clone()),
+                &payload.trace_digest(),
+                MemoSeq(memo_counter),
+                row.segment,
+                row.offset,
+                row.encoded_len,
+            )?;
+            if let ResultOutcome::Success { outputs, .. } = &payload.outcome {
+                for output in outputs {
+                    if output.output_key.is_empty() {
+                        continue;
+                    }
+                    let child = AssetUuid::v5(row.record.asset_uuid, &output.output_key);
+                    if derived_row_matches(
+                        &transaction,
+                        child,
+                        row.record.asset_uuid,
+                        &output.output_key,
+                    )? {
+                        transaction.execute(
+                            "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
+                             VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
+                            rusqlite::params![
+                                child.0.as_slice(),
+                                row.record.asset_uuid.0.as_slice(),
+                                output.output_key,
+                                memo_counter as i64,
+                            ],
+                        )?;
+                    }
+                }
+            }
+        }
+        for range in &ranges {
+            if range.start == range.file_len {
+                continue;
+            }
+            transaction.execute(
                 "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(segment_id) DO UPDATE SET
                    file_name = excluded.file_name, segment_kind = excluded.segment_kind,
                    indexed_len = excluded.indexed_len",
                 rusqlite::params![
-                    segment_id as i64,
-                    name,
-                    segment.kind as i64,
-                    valid_end as i64
+                    range.segment.id as i64,
+                    range.segment.name,
+                    range.segment.kind as i64,
+                    range.valid_end as i64,
                 ],
             )?;
-            meta_set_u64(&txn, "memo_seq", memo_counter)?;
-            txn.commit()?;
+        }
+        meta_set_u64(&transaction, "memo_seq", memo_counter)?;
+        transaction.commit()?;
 
-            if valid_end < file_len {
-                // Torn tail: truncate to the last valid record boundary.
-                report.truncated_tails.push((segment_id, valid_end));
-                let f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .map_err(|source| StoreError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                f.set_len(valid_end).map_err(|source| StoreError::Io {
-                    path: path.clone(),
+        for range in &ranges {
+            if range.valid_end >= range.file_len {
+                continue;
+            }
+            report
+                .truncated_tails
+                .push((range.segment.id, range.valid_end));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&range.path)
+                .map_err(|source| StoreError::Io {
+                    path: range.path.clone(),
                     source,
                 })?;
-                f.sync_all().map_err(|source| StoreError::Io {
-                    path: path.clone(),
+            file.set_len(range.valid_end)
+                .map_err(|source| StoreError::Io {
+                    path: range.path.clone(),
                     source,
                 })?;
-                if segments.last().map(|s| s.id) == Some(segment_id)
-                    && segment.kind == manifest::SegmentKind::Regular
-                {
-                    self.cas.active_len = valid_end;
-                }
+            file.sync_all().map_err(|source| StoreError::Io {
+                path: range.path.clone(),
+                source,
+            })?;
+            if segments.last().map(|segment| segment.id) == Some(range.segment.id)
+                && range.segment.kind == manifest::SegmentKind::Regular
+            {
+                self.cas.active_len = range.valid_end;
             }
         }
-        report.orphaned_payloads = pending.len();
         self.set_memo_seq(memo_counter);
+        report.orphaned_payloads += self.prune_unreferenced_extents()?;
 
         Ok(report)
     }

@@ -53,6 +53,63 @@ pub struct CompactionReport {
 }
 
 impl Store {
+    fn referenced_extent_hashes(&self) -> Result<HashSet<[u8; 32]>, StoreError> {
+        let candidates: Vec<(i64, i64, i64)> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT segment, offset, len FROM result_candidates")?;
+            let rows =
+                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut referenced = HashSet::new();
+        for (segment, offset, len) in candidates {
+            referenced.extend(self.result_unit_hashes(
+                segment as u64,
+                offset as u64,
+                len as u64,
+            )?);
+        }
+        let pinned: Vec<Vec<u8>> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DISTINCT content_hash FROM pins")?;
+            let rows = statement.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        referenced.extend(pinned.into_iter().map(crate::bundles::blob32));
+        Ok(referenced)
+    }
+
+    /// Remove payload extents that no committed result or explicit pin owns.
+    /// In particular, this retires a wire tree persisted immediately before a
+    /// build that never reached its result commit marker.
+    pub(crate) fn prune_unreferenced_extents(&mut self) -> Result<usize, StoreError> {
+        let referenced = self.referenced_extent_hashes()?;
+        let indexed: Vec<[u8; 32]> = {
+            let mut statement = self.conn.prepare("SELECT content_hash FROM cas_extents")?;
+            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            rows.map(|row| row.map(crate::bundles::blob32))
+                .collect::<Result<_, _>>()?
+        };
+        let unreferenced: Vec<_> = indexed
+            .into_iter()
+            .filter(|hash| !referenced.contains(hash))
+            .collect();
+        if unreferenced.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self.conn.transaction()?;
+        for hash in &unreferenced {
+            transaction.execute(
+                "DELETE FROM cas_extents WHERE content_hash = ?1",
+                [hash.as_slice()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(unreferenced.len())
+    }
+
     /// Register pins for a holder (§13's observability sources). Lease
     /// pins back `resolve`'s pin-before-response rule; manifest pins
     /// persist across restarts, the rest are ephemeral.
@@ -215,6 +272,7 @@ impl Store {
     /// bytes fit the cap. Pinned units are skipped — the observability
     /// rules are unaffected by the cap.
     pub fn enforce_cache_limit(&mut self) -> Result<EvictionSweep, StoreError> {
+        self.prune_unreferenced_extents()?;
         let live = |store: &Store| -> Result<u64, StoreError> {
             Ok(store
                 .conn
@@ -269,6 +327,7 @@ impl Store {
     /// generation, flip `CURRENT`, flip the index in one transaction,
     /// then delete the old segments.
     pub fn compact(&mut self) -> Result<CompactionReport, StoreError> {
+        self.prune_unreferenced_extents()?;
         let old_generation = self.cas.generation;
         let new_generation = old_generation + 1;
         let old_segments = self.cas.segments.clone();
@@ -334,71 +393,83 @@ impl Store {
         let mut candidate_moves: Vec<CandidateMove> = Vec::new();
         let mut records_copied = 0usize;
 
-        for old_segment in &old_segments {
-            let seg_id = old_segment.id;
-            let path = self.cas.dir.join(&old_segment.name);
-            let data = std::fs::read(&path).map_err(|source| StoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let mut pos: u64 = 0;
-            while (pos as usize) < data.len() {
-                let decoded = decode_record(&data[pos as usize..], seg_id, pos)?;
-                let rec = &decoded.record;
-                let payload_offset = pos
-                    + RECORD_HEADER_LEN as u64
-                    + rec.static_input_key.len() as u64
-                    + rec.output_key.len() as u64;
-                let live = match rec.kind {
-                    RecordKind::Result => live_results.contains_key(&(seg_id, pos)),
-                    _ => live_extents.get(&decoded.content_hash) == Some(&(seg_id, payload_offset)),
-                };
-                if live {
-                    let oversize = decoded.encoded_len > self.config.segment_size;
-                    let kind = if oversize {
-                        SegmentKind::Oversize
+        // Payload records precede every result in the compacted generation.
+        // This keeps the log independently rebuildable even when a surviving
+        // result refers to the later of two duplicate payload occurrences.
+        for copy_results in [false, true] {
+            for old_segment in &old_segments {
+                let seg_id = old_segment.id;
+                let path = self.cas.dir.join(&old_segment.name);
+                let data = std::fs::read(&path).map_err(|source| StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let mut pos: u64 = 0;
+                while (pos as usize) < data.len() {
+                    let decoded = decode_record(&data[pos as usize..], seg_id, pos)?;
+                    let rec = &decoded.record;
+                    let payload_offset = pos
+                        + RECORD_HEADER_LEN as u64
+                        + rec.static_input_key.len() as u64
+                        + rec.output_key.len() as u64;
+                    let is_result = rec.kind == RecordKind::Result;
+                    let live = if is_result {
+                        live_results.contains_key(&(seg_id, pos))
                     } else {
-                        SegmentKind::Regular
+                        live_extents.get(&decoded.content_hash) == Some(&(seg_id, payload_offset))
                     };
-                    let roll = oversize
-                        || match new_segments.last() {
-                            None => true,
-                            Some(s) => {
-                                s.kind != SegmentKind::Regular
-                                    || (!s.bytes.is_empty()
-                                        && s.bytes.len() as u64 + decoded.encoded_len
-                                            > self.config.segment_size)
-                            }
+                    if live && is_result == copy_results {
+                        let oversize = decoded.encoded_len > self.config.segment_size;
+                        let kind = if oversize {
+                            SegmentKind::Oversize
+                        } else {
+                            SegmentKind::Regular
                         };
-                    if roll {
-                        new_segments.push(NewSegment {
-                            id: next_id,
-                            kind,
-                            bytes: Vec::new(),
-                        });
-                        next_id += 1;
-                    }
-                    let dst = new_segments.last_mut().expect("destination segment");
-                    let new_offset = dst.bytes.len() as u64;
-                    dst.bytes.extend_from_slice(
-                        &data[pos as usize..(pos + decoded.encoded_len) as usize],
-                    );
-                    records_copied += 1;
-                    match rec.kind {
-                        RecordKind::Result => {
-                            let key = live_results[&(seg_id, pos)].clone();
-                            candidate_moves.push((key, (dst.id, new_offset, decoded.encoded_len)));
+                        let roll = oversize
+                            || match new_segments.last() {
+                                None => true,
+                                Some(s) => {
+                                    s.kind != SegmentKind::Regular
+                                        || (!s.bytes.is_empty()
+                                            && s.bytes.len() as u64 + decoded.encoded_len
+                                                > self.config.segment_size)
+                                }
+                            };
+                        if roll {
+                            new_segments.push(NewSegment {
+                                id: next_id,
+                                kind,
+                                bytes: Vec::new(),
+                            });
+                            next_id += 1;
                         }
-                        _ => {
-                            let new_payload_offset = new_offset
-                                + RECORD_HEADER_LEN as u64
-                                + rec.static_input_key.len() as u64
-                                + rec.output_key.len() as u64;
-                            extent_moves.push((decoded.content_hash, dst.id, new_payload_offset));
+                        let dst = new_segments.last_mut().expect("destination segment");
+                        let new_offset = dst.bytes.len() as u64;
+                        dst.bytes.extend_from_slice(
+                            &data[pos as usize..(pos + decoded.encoded_len) as usize],
+                        );
+                        records_copied += 1;
+                        match rec.kind {
+                            RecordKind::Result => {
+                                let key = live_results[&(seg_id, pos)].clone();
+                                candidate_moves
+                                    .push((key, (dst.id, new_offset, decoded.encoded_len)));
+                            }
+                            _ => {
+                                let new_payload_offset = new_offset
+                                    + RECORD_HEADER_LEN as u64
+                                    + rec.static_input_key.len() as u64
+                                    + rec.output_key.len() as u64;
+                                extent_moves.push((
+                                    decoded.content_hash,
+                                    dst.id,
+                                    new_payload_offset,
+                                ));
+                            }
                         }
                     }
+                    pos += decoded.encoded_len;
                 }
-                pos += decoded.encoded_len;
             }
         }
 
