@@ -9,6 +9,7 @@ use distill_daemon::scanner::{
 use distill_json::AuthoredValue;
 use distill_rpc::{LineageRepairDestination, OccupiedLineageDestinationKind};
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
+use distill_store::state::{PlatformPathBytes, ScanSubject};
 
 fn ordinary_bundle() -> Vec<u8> {
     let type_uuid = TypeUuid([71; 16]);
@@ -255,7 +256,7 @@ fn same_canonical_directory_under_two_roots_is_never_tiebroken() {
     .unwrap();
 
     assert!(matches!(
-        scanner.lineage_claimants(),
+        scanner.scan(),
         Err(ScanError::DirectoryAlias { .. })
     ));
 }
@@ -271,7 +272,7 @@ fn symlinked_directory_cannot_escape_configured_roots() {
     symlink(outside.path(), temp.path().join("assets/escape")).unwrap();
 
     assert!(matches!(
-        scanner.lineage_claimants(),
+        scanner.scan(),
         Err(ScanError::SymlinkEscape { .. })
     ));
 }
@@ -417,6 +418,80 @@ fn distinct_native_names_that_normalize_together_are_rejected() {
             ..
         }) if normalized_path == "caf\u{e9}.txt" && claims.len() == 2
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn incremental_native_spelling_rename_replaces_the_old_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    let decomposed = root.join("cafe\u{301}.txt");
+    let precomposed = root.join("caf\u{e9}.txt");
+    std::fs::write(&decomposed, b"contents").unwrap();
+    let scanner = scanner(&temp);
+    let baseline = scanner.scan().unwrap();
+
+    std::fs::rename(&decomposed, &precomposed).unwrap();
+    let updated = scanner
+        .scan_incremental(&baseline, &[decomposed, precomposed])
+        .unwrap()
+        .unwrap();
+
+    let rows = updated.file_rows().collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].normalized_path, "caf\u{e9}.txt");
+    assert_eq!(
+        rows[0].raw_relative_path,
+        PlatformPathBytes::Unix("caf\u{e9}.txt".as_bytes().to_vec())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn incremental_new_normalized_claim_reopens_the_baseline_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    let decomposed = root.join("cafe\u{301}.txt");
+    let precomposed = root.join("caf\u{e9}.txt");
+    std::fs::write(&decomposed, b"decomposed").unwrap();
+    let scanner = scanner(&temp);
+    let baseline = scanner.scan().unwrap();
+
+    std::fs::write(&precomposed, b"precomposed").unwrap();
+    assert!(matches!(
+        scanner.scan_incremental(&baseline, &[precomposed]),
+        Err(ScanError::SameRootNormalizedPathCollision { claims, .. })
+            if claims.len() == 2
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_error_path_maps_to_exact_subject_under_symlinked_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real-assets");
+    let configured = temp.path().join("assets");
+    std::fs::create_dir_all(real.join("nested")).unwrap();
+    symlink(&real, &configured).unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new(
+        "main",
+        &configured,
+        real.join(".distill-displaced"),
+    )])
+    .unwrap();
+    let canonical = std::fs::canonicalize(&real).unwrap();
+
+    assert_eq!(
+        scanner.scan_subject(&canonical.join("nested/unreadable")),
+        Some(ScanSubject::Subtree {
+            root_name: "main".into(),
+            raw_relative_path: PlatformPathBytes::Unix(b"nested/unreadable".to_vec()),
+        })
+    );
 }
 
 #[cfg(target_os = "linux")]

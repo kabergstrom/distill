@@ -173,7 +173,38 @@ fn missing_manifest_creation_is_no_replace_rescan_proven_and_store_durable() {
         bytes
     );
     assert_eq!(harness.store.lock().unwrap().input_version().0, 1);
-    assert_eq!(harness.scanner().lineage_claimants().unwrap().len(), 1);
+    assert_eq!(
+        harness.scanner().scan().unwrap().lineage_claimants().len(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_manifest_reattestation_does_not_scan_unrelated_subtrees() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    let bytes = manifest_bundle(1, 2, "lineage");
+    let outside = harness._temp.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, harness.root.join("unrelated-escape")).unwrap();
+    let basis = harness.inspection(LineageRepairState::Missing {
+        configured_root: "main".into(),
+        configured_path: "control/lineage.bundle".into(),
+        destination: LineageRepairDestination::Absent,
+    });
+
+    let commit = harness
+        .backend
+        .prepare_create_missing_lineage(&basis, &bytes)
+        .unwrap();
+
+    assert_eq!(commit.configuration, Some(ConfigurationStatus::Ready));
+    assert_eq!(
+        std::fs::read(harness.root.join("control/lineage.bundle")).unwrap(),
+        bytes
+    );
 }
 
 #[test]
@@ -244,7 +275,7 @@ fn duplicate_repair_keeps_the_explicit_survivor_and_quarantines_other_file() {
     std::fs::write(harness.root.join("a.bundle"), manifest_bundle(10, 11, "a")).unwrap();
     std::fs::write(harness.root.join("b.bundle"), manifest_bundle(12, 13, "b")).unwrap();
     let scanner = harness.scanner();
-    let claimants = scanner.lineage_claimants().unwrap();
+    let claimants = scanner.scan().unwrap().lineage_claimants();
     let survivor = claimants[0].clone();
     let removed_path = claimants[1].normalized_path.clone();
     let basis = harness.inspection(LineageRepairState::Duplicate {
@@ -257,7 +288,7 @@ fn duplicate_repair_keeps_the_explicit_survivor_and_quarantines_other_file() {
         .unwrap();
 
     assert_eq!(commit.configuration, Some(ConfigurationStatus::Ready));
-    assert_eq!(scanner.lineage_claimants().unwrap(), [survivor]);
+    assert_eq!(scanner.scan().unwrap().lineage_claimants(), [survivor]);
     assert!(!harness.root.join(removed_path).exists());
     assert_eq!(harness.store.lock().unwrap().input_version().0, 1);
 }
@@ -280,7 +311,7 @@ fn colocated_duplicate_entries_are_rewritten_injectively() {
     let target = harness.root.join("both.bundle");
     std::fs::write(&target, distill_bundle::write_bundle(&bundle).unwrap()).unwrap();
     let scanner = harness.scanner();
-    let claimants = scanner.lineage_claimants().unwrap();
+    let claimants = scanner.scan().unwrap().lineage_claimants();
     let survivor = claimants[1].clone();
     let basis = harness.inspection(LineageRepairState::Duplicate {
         claimants: claimants.clone(),
@@ -291,7 +322,7 @@ fn colocated_duplicate_entries_are_rewritten_injectively() {
         .prepare_resolve_duplicate_lineage(&basis, &survivor)
         .unwrap();
 
-    let remaining = scanner.lineage_claimants().unwrap();
+    let remaining = scanner.scan().unwrap().lineage_claimants();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].asset, survivor.asset);
     assert_ne!(remaining[0].file_hash, survivor.file_hash);

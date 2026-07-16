@@ -560,6 +560,49 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
 
 #[cfg(unix)]
 #[test]
+fn configuration_scan_rejection_preserves_existing_version_poison() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    let real = assets.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let (bytes, _, _) = ordinary_bundle();
+    std::fs::write(assets.join("first.bundle"), &bytes).unwrap();
+    std::fs::write(assets.join("second.bundle"), &bytes).unwrap();
+    let coordinator = coordinator(&temp);
+    coordinator.reconcile_full_scan().unwrap();
+    let initial = coordinator
+        .store()
+        .lock()
+        .unwrap()
+        .version_poison()
+        .unwrap()
+        .unwrap();
+
+    let alias = assets.join("alias");
+    symlink(&real, &alias).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![alias],
+            renames: Vec::new(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        coordinator
+            .store()
+            .lock()
+            .unwrap()
+            .version_poison()
+            .unwrap()
+            .unwrap(),
+        initial
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn directory_alias_publishes_configuration_poison_without_aborting_the_version() {
     use std::os::unix::fs::symlink;
 

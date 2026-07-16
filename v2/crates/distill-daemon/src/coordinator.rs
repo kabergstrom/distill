@@ -487,6 +487,25 @@ impl DaemonCoordinator {
             .and_then(|pending| pending.rejection.version.clone())
     }
 
+    fn configuration_without_source_poison(
+        &self,
+    ) -> Result<(ConfigurationStatus, Option<LineageRepairState>), CoordinatorError> {
+        let scan_poison = self
+            .scan_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|pending| pending.rejection.configuration.clone());
+        let index = lock_scan_projection(&self.scan_projection);
+        indexed_lineage_projection(
+            &index,
+            &self.scanner,
+            &self.lineage_destination(),
+            scan_poison,
+        )
+        .map(|(configuration, repair, _)| (configuration, repair))
+    }
+
     fn lineage_destination(&self) -> LineageDestination {
         self.lineage_destination
             .read()
@@ -976,6 +995,9 @@ impl DaemonCoordinator {
         poison: PipelinePoison,
         heal_configuration: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
+        let healed_configuration = heal_configuration
+            .then(|| self.configuration_without_source_poison())
+            .transpose()?;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
         let diagnostic = poison.clone();
@@ -999,14 +1021,27 @@ impl DaemonCoordinator {
             store
                 .input_transaction(|transaction| {
                     transaction.publish_pipeline_poison(&diagnostic)?;
-                    if heal_configuration {
-                        transaction.publish_configuration_ready(generation)?;
+                    match healed_configuration
+                        .as_ref()
+                        .map(|(configuration, _)| configuration)
+                    {
+                        Some(ConfigurationStatus::Ready) => {
+                            transaction.publish_configuration_ready(generation)?
+                        }
+                        Some(ConfigurationStatus::Poisoned(poison)) => transaction
+                            .publish_configuration_poison(&poison.detail, &poison.message)?,
+                        None => {}
                     }
                     Ok(())
                 })
                 .map_err(|error| error.to_string())?;
             Ok(Commit {
-                configuration: heal_configuration.then_some(ConfigurationStatus::Ready),
+                configuration: healed_configuration
+                    .as_ref()
+                    .map(|(configuration, _)| configuration.clone()),
+                lineage_repair: healed_configuration
+                    .as_ref()
+                    .map(|(_, repair)| repair.clone()),
                 pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
                 pipeline_epoch_changed: true,
                 ..Commit::default()
@@ -1052,7 +1087,7 @@ impl DaemonCoordinator {
             Ok(scan) => self.publish_scan(scan),
             Err(error) => {
                 self.scan_healthy.store(false, Ordering::Release);
-                self.publish_scan_rejection(&error)
+                self.publish_scan_rejection(&error, true)
             }
         }
     }
@@ -1153,7 +1188,7 @@ impl DaemonCoordinator {
             Err(error) => {
                 drop(baseline);
                 self.scan_healthy.store(false, Ordering::Release);
-                return self.publish_scan_rejection(&error);
+                return self.publish_scan_rejection(&error, heals_pending_rejection);
             }
         };
         let healed_rejection = heals_pending_rejection
@@ -1370,11 +1405,80 @@ impl DaemonCoordinator {
         Ok(stamp)
     }
 
-    fn publish_scan_rejection(&self, error: &ScanError) -> Result<SnapshotStamp, CoordinatorError> {
-        let rejection = classify_scan_rejection(&self.scanner, error)?;
+    fn publish_scan_rejection(
+        &self,
+        error: &ScanError,
+        replaces_pending: bool,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        let observed_rejection = classify_scan_rejection(&self.scanner, error)?;
+        let previous_pending = self
+            .scan_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let rejection = if replaces_pending {
+            observed_rejection
+        } else {
+            select_scan_rejection(
+                previous_pending
+                    .as_ref()
+                    .map(|pending| pending.rejection.clone())
+                    .into_iter()
+                    .chain([observed_rejection]),
+            )?
+        };
+        let mut subjects = self.scanner.rejection_subjects(error);
+        if !replaces_pending {
+            if let Some(previous) = &previous_pending {
+                subjects.extend(previous.subjects.iter().cloned());
+            }
+        }
+        subjects.sort_unstable();
+        subjects.dedup();
         let pending = PendingScanRejection {
             rejection: rejection.clone(),
-            subjects: self.scanner.rejection_subjects(error),
+            subjects,
+        };
+        let indexed_version = lock_scan_projection(&self.scan_projection).version_poison()?;
+        let durable_version = lock_store(&self.store)
+            .version_poison()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let baseline_version = match (indexed_version, durable_version) {
+            (Some(indexed), Some(durable)) if indexed.identity == durable.identity => Some(durable),
+            (indexed, _) => indexed,
+        };
+        let version = VersionPoison::select_canonical(
+            baseline_version
+                .into_iter()
+                .chain(rejection.version.clone()),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let source_configuration = self
+            .configuration_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let external_configuration = ConfigurationPoison::select_canonical(
+            source_configuration
+                .into_iter()
+                .chain(rejection.configuration.clone()),
+        )
+        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let (configuration, lineage_repair) = if self.scan_initialized.load(Ordering::Acquire) {
+            let index = lock_scan_projection(&self.scan_projection);
+            let (configuration, repair, _) = indexed_lineage_projection(
+                &index,
+                &self.scanner,
+                &self.lineage_destination(),
+                external_configuration,
+            )?;
+            (configuration, repair)
+        } else {
+            (
+                external_configuration
+                    .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Poisoned),
+                None,
+            )
         };
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
@@ -1388,23 +1492,6 @@ impl DaemonCoordinator {
                         store.input_version()
                     ));
                 }
-                let source_configuration = self
-                    .configuration_poison
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let configuration = ConfigurationPoison::select_canonical(
-                    source_configuration
-                        .into_iter()
-                        .chain(rejection.configuration.clone()),
-                )
-                .map_err(|error| error.to_string())?;
-                let previous_scan_configuration = self
-                    .scan_rejection
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .is_some_and(|pending| pending.rejection.configuration.is_some());
                 let generation = match store
                     .configuration_state()
                     .map_err(|error| error.to_string())?
@@ -1416,26 +1503,21 @@ impl DaemonCoordinator {
                 };
                 store
                     .input_transaction(|transaction| {
-                        transaction.set_version_poisons(rejection.version.clone())?;
-                        if let Some(configuration) = &configuration {
-                            transaction.publish_configuration_poison(
-                                &configuration.detail,
-                                &configuration.message,
-                            )?;
-                        } else if previous_scan_configuration {
-                            transaction.publish_configuration_ready(generation)?;
+                        transaction.set_version_poisons(version.clone())?;
+                        match &configuration {
+                            ConfigurationStatus::Ready => {
+                                transaction.publish_configuration_ready(generation)?
+                            }
+                            ConfigurationStatus::Poisoned(poison) => transaction
+                                .publish_configuration_poison(&poison.detail, &poison.message)?,
                         }
                         Ok(())
                     })
                     .map_err(|error| error.to_string())?;
                 let commit = Commit {
-                    configuration: configuration
-                        .clone()
-                        .map(ConfigurationStatus::Poisoned)
-                        .or_else(|| {
-                            previous_scan_configuration.then_some(ConfigurationStatus::Ready)
-                        }),
-                    version_poison: Some(rejection.version.clone()),
+                    configuration: Some(configuration.clone()),
+                    version_poison: Some(version.clone()),
+                    lineage_repair: Some(lineage_repair.clone()),
                     ..Commit::default()
                 };
                 Ok(commit)
@@ -1597,6 +1679,23 @@ struct PendingScanRejection {
     subjects: Vec<PathBuf>,
 }
 
+fn select_scan_rejection(
+    rejections: impl IntoIterator<Item = ScanRejection>,
+) -> Result<ScanRejection, CoordinatorError> {
+    let rejections = rejections.into_iter().collect::<Vec<_>>();
+    let version =
+        VersionPoison::select_canonical(rejections.iter().filter_map(|item| item.version.clone()))
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+    let configuration = ConfigurationPoison::select_canonical(
+        rejections.into_iter().filter_map(|item| item.configuration),
+    )
+    .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+    Ok(ScanRejection {
+        version,
+        configuration,
+    })
+}
+
 fn classify_scan_rejection(
     scanner: &RootedScanner,
     error: &ScanError,
@@ -1606,18 +1705,7 @@ fn classify_scan_rejection(
             .iter()
             .map(|error| classify_scan_rejection(scanner, error))
             .collect::<Result<Vec<_>, _>>()?;
-        let version = VersionPoison::select_canonical(
-            classified.iter().filter_map(|item| item.version.clone()),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let configuration = ConfigurationPoison::select_canonical(
-            classified.into_iter().filter_map(|item| item.configuration),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        return Ok(ScanRejection {
-            version,
-            configuration,
-        });
+        return select_scan_rejection(classified);
     }
     if let ScanError::InvalidPhysicalPath {
         root_name,
@@ -1712,7 +1800,9 @@ fn classify_scan_rejection(
                 _ => ScanFailureCode::IoDataLoss,
             },
         ),
-        ScanError::RootUnavailable { .. } => (None, ScanFailureCode::NotFound),
+        ScanError::RootUnavailable { path, .. } => {
+            (Some(path.as_path()), ScanFailureCode::NotFound)
+        }
         ScanError::NonRegularFile { path } => {
             (Some(path.as_path()), ScanFailureCode::InvalidFileType)
         }

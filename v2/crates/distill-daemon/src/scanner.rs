@@ -374,6 +374,30 @@ impl ScanSnapshot {
         self.diagnostics.values()
     }
 
+    pub fn lineage_claimants(&self) -> Vec<LineageManifestClaimant> {
+        let mut claimants = Vec::new();
+        for bundle in self.bundles.values() {
+            let Ok(parsed) = &bundle.parsed else {
+                continue;
+            };
+            for (local_id, entry) in &parsed.assets {
+                if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
+                    claimants.push(LineageManifestClaimant {
+                        root_name: bundle.root_name.clone(),
+                        normalized_path: bundle.normalized_path.clone(),
+                        bundle: parsed.uuid,
+                        local_id: local_id.clone(),
+                        asset: entry.uuid,
+                        file_hash: bundle.file_hash,
+                    });
+                }
+            }
+        }
+        claimants.sort();
+        claimants.dedup();
+        claimants
+    }
+
     pub(crate) fn bundle_entries(
         &self,
     ) -> impl Iterator<Item = (&(String, String), &Arc<ScannedBundle>)> {
@@ -724,19 +748,27 @@ impl RootedScanner {
     /// Locate an observed physical error beneath its configured root and
     /// preserve the platform's exact relative path units for DSVP.
     pub fn scan_subject(&self, path: &Path) -> Option<distill_store::state::ScanSubject> {
-        self.root_snapshot().values().find_map(|root| {
-            let relative = path.strip_prefix(&root.configured.path).ok()?;
-            if relative.as_os_str().is_empty() {
-                Some(distill_store::state::ScanSubject::Root {
-                    root_name: root.configured.name.clone(),
-                })
-            } else {
-                Some(distill_store::state::ScanSubject::Subtree {
-                    root_name: root.configured.name.clone(),
-                    raw_relative_path: platform_path_bytes(relative),
-                })
-            }
-        })
+        self.root_snapshot()
+            .values()
+            .filter_map(|root| {
+                path.strip_prefix(&root.configured.path)
+                    .or_else(|_| path.strip_prefix(&root.canonical_path))
+                    .ok()
+                    .map(|relative| (root, relative))
+            })
+            .max_by_key(|(root, _)| root.canonical_path.components().count())
+            .map(|(root, relative)| {
+                if relative.as_os_str().is_empty() {
+                    distill_store::state::ScanSubject::Root {
+                        root_name: root.configured.name.clone(),
+                    }
+                } else {
+                    distill_store::state::ScanSubject::Subtree {
+                        root_name: root.configured.name.clone(),
+                        raw_relative_path: platform_path_bytes(relative),
+                    }
+                }
+            })
     }
 
     pub fn first_root_subject(&self) -> Option<distill_store::state::ScanSubject> {
@@ -854,30 +886,6 @@ impl RootedScanner {
         }
     }
 
-    pub fn lineage_claimants(&self) -> Result<Vec<LineageManifestClaimant>, ScanError> {
-        let mut claimants = Vec::new();
-        for bundle in self.scan()?.bundles.into_values() {
-            let Ok(parsed) = &bundle.parsed else {
-                continue;
-            };
-            for (local_id, entry) in &parsed.assets {
-                if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
-                    claimants.push(LineageManifestClaimant {
-                        root_name: bundle.root_name.clone(),
-                        normalized_path: bundle.normalized_path.clone(),
-                        bundle: parsed.uuid,
-                        local_id: local_id.clone(),
-                        asset: entry.uuid,
-                        file_hash: bundle.file_hash,
-                    });
-                }
-            }
-        }
-        claimants.sort();
-        claimants.dedup();
-        Ok(claimants)
-    }
-
     /// Enumerate the complete raw namespace in deterministic `(root, path)`
     /// order. This is the startup/recovery path; ordinary live watcher batches
     /// use incremental path/subtree observation instead.
@@ -922,7 +930,7 @@ impl RootedScanner {
         // Keep the native physical spelling alongside its normalized logical
         // identity.  Reopening from the latter is incorrect on filesystems
         // where NFC-equivalent names are distinct.
-        let mut affected = BTreeMap::<(String, String), Option<PathBuf>>::new();
+        let mut affected = BTreeMap::<(String, String), BTreeSet<PathBuf>>::new();
         for event_path in event_paths {
             if let Some((root, path)) = event_key(&roots, event_path)? {
                 let mut canonical_event = roots[&root].canonical_path.clone();
@@ -930,9 +938,16 @@ impl RootedScanner {
                     canonical_event.push(component);
                 }
                 for alias in aliases_affected_by(&baseline.aliases_by_target, &canonical_event) {
-                    affected.entry(alias).or_insert(None);
+                    affected.entry(alias).or_default();
                 }
-                affected.insert((root, path), Some(event_path.clone()));
+                let key = (root, path);
+                let physical = affected.entry(key.clone()).or_default();
+                physical.insert(event_path.clone());
+                if let Some(previous) = baseline.files.get(&key) {
+                    if let Some(relative) = platform_path(&previous.raw_relative_path) {
+                        physical.insert(roots[&key.0].canonical_path.join(relative));
+                    }
+                }
             }
         }
         if affected.is_empty() {
@@ -943,32 +958,26 @@ impl RootedScanner {
         let mut observed = ScanSnapshot::default();
         let mut errors = Vec::new();
         for (root, path) in &affected {
-            let result = match physical
-                .get(&(root.clone(), path.clone()))
-                .and_then(Option::as_deref)
-            {
-                Some(event_path) => scan_event_path(&roots, &daemon_owned, root, path, event_path),
-                None => scan_logical_path(&roots, &daemon_owned, root, path),
-            };
-            let partial = match result {
-                Ok(partial) => partial,
-                Err(ScanError::Multiple(mut nested)) => {
-                    errors.append(&mut nested);
-                    continue;
+            let event_paths = &physical[&(root.clone(), path.clone())];
+            if event_paths.is_empty() {
+                collect_incremental_observation(
+                    scan_logical_path(&roots, &daemon_owned, root, path),
+                    &mut observed,
+                    &mut errors,
+                );
+            } else {
+                for event_path in event_paths {
+                    collect_incremental_observation(
+                        scan_event_path(&roots, &daemon_owned, root, path, event_path),
+                        &mut observed,
+                        &mut errors,
+                    );
                 }
-                Err(error) => {
-                    errors.push(error);
-                    continue;
-                }
-            };
-            if let Some(partial) = partial {
-                merge_scan_snapshot(&mut observed, partial);
             }
         }
         if !errors.is_empty() {
             return Err(combine_scan_errors(errors));
         }
-        validate_incremental_physical_collisions(baseline, &observed)?;
         rebuild_reverse_indexes(&mut observed)?;
         validate_incremental_directory_aliases(baseline, &affected, &observed)?;
         Ok(Some(ScanDelta { affected, observed }))
@@ -1312,6 +1321,49 @@ fn combine_scan_errors(errors: Vec<ScanError>) -> ScanError {
         other.pop().expect("one combined scan error")
     } else {
         ScanError::Multiple(other)
+    }
+}
+
+fn collect_incremental_observation(
+    result: Result<Option<ScanSnapshot>, ScanError>,
+    observed: &mut ScanSnapshot,
+    errors: &mut Vec<ScanError>,
+) {
+    match result {
+        Ok(Some(partial)) => {
+            for (key, current) in &partial.files {
+                let Some(previous) = observed
+                    .files
+                    .get(key)
+                    .filter(|previous| previous.raw_relative_path != current.raw_relative_path)
+                else {
+                    continue;
+                };
+                let (Some(previous_hash), Some(current_hash)) =
+                    (previous.content_hash, current.content_hash)
+                else {
+                    continue;
+                };
+                errors.push(ScanError::SameRootNormalizedPathCollision {
+                    root_name: key.0.clone(),
+                    normalized_path: key.1.clone(),
+                    claims: vec![
+                        PhysicalPathClaim {
+                            raw_relative_path: previous.raw_relative_path.clone(),
+                            file_hash: BundleFileHash(previous_hash.0),
+                        },
+                        PhysicalPathClaim {
+                            raw_relative_path: current.raw_relative_path.clone(),
+                            file_hash: BundleFileHash(current_hash.0),
+                        },
+                    ],
+                });
+            }
+            merge_scan_snapshot(observed, partial);
+        }
+        Ok(None) => {}
+        Err(ScanError::Multiple(mut nested)) => errors.append(&mut nested),
+        Err(error) => errors.push(error),
     }
 }
 
@@ -1744,44 +1796,6 @@ fn validate_incremental_directory_aliases(
                 second: observation.physical_path.clone(),
             });
         }
-    }
-    Ok(())
-}
-
-fn validate_incremental_physical_collisions(
-    baseline: &ScanSnapshot,
-    observed: &ScanSnapshot,
-) -> Result<(), ScanError> {
-    for (key, current) in &observed.files {
-        let Some(previous) = baseline
-            .files
-            .get(key)
-            .filter(|previous| previous.raw_relative_path != current.raw_relative_path)
-        else {
-            continue;
-        };
-        let (Some(previous_hash), Some(current_hash)) =
-            (previous.content_hash, current.content_hash)
-        else {
-            continue;
-        };
-        let mut claims = vec![
-            PhysicalPathClaim {
-                raw_relative_path: previous.raw_relative_path.clone(),
-                file_hash: BundleFileHash(previous_hash.0),
-            },
-            PhysicalPathClaim {
-                raw_relative_path: current.raw_relative_path.clone(),
-                file_hash: BundleFileHash(current_hash.0),
-            },
-        ];
-        claims.sort();
-        claims.dedup();
-        return Err(ScanError::SameRootNormalizedPathCollision {
-            root_name: key.0.clone(),
-            normalized_path: key.1.clone(),
-            claims,
-        });
     }
     Ok(())
 }

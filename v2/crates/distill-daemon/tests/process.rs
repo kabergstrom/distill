@@ -301,7 +301,7 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
 }
 
 #[test]
-fn valid_configuration_with_malformed_schema_heals_only_configuration_authority() {
+fn valid_configuration_with_malformed_schema_retains_lineage_configuration_poison() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     let config_path = temp.path().join("distill.toml");
@@ -331,16 +331,21 @@ fn valid_configuration_with_malformed_schema_heals_only_configuration_authority(
             let store = store.lock().unwrap();
             matches!(
                 store.configuration_state().unwrap(),
-                ConfigurationState::Ready(_)
+                ConfigurationState::Poisoned { reason, .. }
+                    if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
             ) && matches!(
                 store.pipeline_state().unwrap(),
                 Some(PipelineState::Poisoned { error, .. })
                     if error.message.contains("schema authority")
             )
         },
-        "valid configuration did not heal independently of malformed schema",
+        "valid configuration erased independent lineage configuration poison",
     );
-    assert!(process.last_background_error().is_none());
+    assert!(
+        process.last_background_error().is_none(),
+        "background reconciliation failed: {:?}",
+        process.last_background_error()
+    );
 }
 
 #[test]

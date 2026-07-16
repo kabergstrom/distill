@@ -31,7 +31,7 @@ use distill_store::journal::{
 use distill_store::Store;
 
 use crate::quarantine::{PublicationDriver, QuarantineDriver, QuarantineError, QuarantineRoot};
-use crate::scanner::{AssetRoot, RootedScanner, ScanError};
+use crate::scanner::{AssetRoot, RootedScanner, ScanError, ScanSnapshot};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +58,19 @@ impl LineageRepairBackend {
             scanner,
             quarantine,
         })
+    }
+
+    fn reattest_lineage_claimants(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<LineageManifestClaimant>, LineageRepairBackendError> {
+        let baseline = ScanSnapshot::default();
+        let observed = self
+            .scanner
+            .scan_incremental(&baseline, paths)
+            .map_err(failure)?
+            .unwrap_or(baseline);
+        Ok(observed.lineage_claimants())
     }
 
     fn create_missing(
@@ -90,19 +103,16 @@ impl LineageRepairBackend {
         if &observed != destination {
             return Err(stale(basis, destination_stale_code(destination, &observed)));
         }
-        if !self
-            .scanner
-            .lineage_claimants()
-            .map_err(failure)?
-            .is_empty()
-        {
-            return Err(stale(basis, LineageRepairStaleCode::ClaimantChanged));
-        }
-
         let target = self
             .scanner
             .physical_path(configured_root, configured_path)
             .map_err(failure)?;
+        if !self
+            .reattest_lineage_claimants(std::slice::from_ref(&target))?
+            .is_empty()
+        {
+            return Err(stale(basis, LineageRepairStaleCode::ClaimantChanged));
+        }
         if let LineageRepairDestination::Occupied { kind, .. } = destination {
             if *kind == distill_rpc::OccupiedLineageDestinationKind::CanonicalBundle {
                 let old_bytes = self
@@ -172,7 +182,7 @@ impl LineageRepairBackend {
             asset: proposed.entry.uuid,
             file_hash: proposed_hash,
         };
-        if self.scanner.lineage_claimants().map_err(failure)? != [expected] {
+        if self.reattest_lineage_claimants(std::slice::from_ref(&target))? != [expected] {
             retire_if_terminal(&mut publication, group.group_id)?;
             return Err(stale(basis, LineageRepairStaleCode::ClaimantChanged));
         }
@@ -205,7 +215,15 @@ impl LineageRepairBackend {
             .quarantine
             .admit_publication(&mut store)
             .map_err(failure)?;
-        if self.scanner.lineage_claimants().map_err(failure)? != *claimants {
+        let claimant_paths = claimants
+            .iter()
+            .map(|claimant| {
+                self.scanner
+                    .physical_path(&claimant.root_name, &claimant.normalized_path)
+                    .map_err(failure)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if self.reattest_lineage_claimants(&claimant_paths)? != *claimants {
             return Err(stale(basis, LineageRepairStaleCode::ClaimantChanged));
         }
 
@@ -327,7 +345,7 @@ impl LineageRepairBackend {
             retire_if_terminal(&mut publication, group.group_id)?;
             return Err(stale(basis, LineageRepairStaleCode::PreimageChanged));
         }
-        if self.scanner.lineage_claimants().map_err(failure)? != [expected_survivor] {
+        if self.reattest_lineage_claimants(&claimant_paths)? != [expected_survivor] {
             retire_if_terminal(&mut publication, group.group_id)?;
             return Err(stale(basis, LineageRepairStaleCode::ClaimantChanged));
         }
