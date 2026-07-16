@@ -1,0 +1,20 @@
+[package]
+name = "distill-game-assets-pipeline-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+distill-build = { path = "../../../../distill-build" }
+distill-core = { path = "../../../../distill-core" }
+distill-daemon = { path = "../../.." }
+distill-json = { path = "../../../../distill-json" }
+distill-schema = { path = "../../../../distill-schema" }
+newgameplus-api-macros = { path = "../../../../../../../newgameplus/newgameplus-api-macros" }
+
+[build-dependencies]
+ngp-source-hash = { path = "../../../../../../../newgameplus/ngp-source-hash" }

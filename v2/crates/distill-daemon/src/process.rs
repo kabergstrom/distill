@@ -130,7 +130,18 @@ impl DaemonProcess {
         coordinator.sweep_displaced_retention(unix_seconds())?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let last_background_error = Arc::new(Mutex::new(None));
+        let recovery_diagnostic = [
+            coordinator
+                .authoring_service()
+                .take_startup_recovery_diagnostic(),
+            codegen.take_startup_recovery_diagnostic(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let last_background_error = Arc::new(Mutex::new(
+            (!recovery_diagnostic.is_empty()).then(|| recovery_diagnostic.join("; ")),
+        ));
         if let Err(error) = codegen.run(&coordinator) {
             *lock(&last_background_error) = Some(error);
         }

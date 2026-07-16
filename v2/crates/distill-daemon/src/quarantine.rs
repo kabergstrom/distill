@@ -1,14 +1,18 @@
 //! Daemon orchestration over the store's durable displacement journal.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use distill_core::id::ContentHash;
 use distill_store::codegen::CodegenPublicationBasis;
 use distill_store::journal::{
-    JournalFilesystem, JournalIntentPlan, PublicationGroup, PublicationGroupKind, RecoveredEdit,
+    JournalFilesystem, JournalIntentPlan, PublicationGroup, PublicationGroupKind,
+    PublicationGroupState, RecoveredEdit,
 };
 use distill_store::{Store, StoreError};
+
+use crate::lineage_repair::{plan_same_dir_temp, unique_sibling, write_planned_temp};
+use crate::operations::SchemaTransitionJournalBasis;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineRoot {
@@ -84,21 +88,59 @@ pub struct PublicationDriver<'a> {
     quarantine: &'a QuarantineDriver,
     store: &'a mut Store,
     filesystem: Option<&'a mut dyn JournalFilesystem>,
-    recovered: Vec<(i64, RecoveryOutcome)>,
+    recovered: Vec<RecoveredPublication>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryOutcome {
+    AbandonedUnarmed,
+    TerminalFailure,
     Rewrite(distill_store::journal::RenameAsideOutcome),
     Deletion(distill_store::journal::DeletionRecoveryOutcome),
     Creation(distill_store::journal::CreationRecoveryOutcome),
 }
 
-#[cfg(windows)]
-pub type WindowsPublicationDriver<'a> = PublicationDriver<'a>;
+impl RecoveryOutcome {
+    pub fn is_material_failure(self) -> bool {
+        match self {
+            Self::AbandonedUnarmed | Self::TerminalFailure => true,
+            Self::Rewrite(outcome) => {
+                outcome != distill_store::journal::RenameAsideOutcome::Installed
+            }
+            Self::Deletion(outcome) => {
+                outcome != distill_store::journal::DeletionRecoveryOutcome::Deleted
+            }
+            Self::Creation(outcome) => {
+                outcome != distill_store::journal::CreationRecoveryOutcome::Installed
+            }
+        }
+    }
+}
 
-#[cfg(windows)]
-pub type WindowsRecoveryOutcome = RecoveryOutcome;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredPublication {
+    pub intent_id: i64,
+    pub group_kind: Option<PublicationGroupKind>,
+    pub target_path: PathBuf,
+    pub outcome: RecoveryOutcome,
+}
+
+pub(crate) fn material_recovery_diagnostic(recovered: &[RecoveredPublication]) -> Option<String> {
+    let failures = recovered
+        .iter()
+        .filter(|recovered| recovered.outcome.is_material_failure())
+        .map(|recovered| {
+            format!(
+                "recovered {:?} publication for {} (intent {}): {:?}",
+                recovered.group_kind,
+                recovered.target_path.display(),
+                recovered.intent_id,
+                recovered.outcome
+            )
+        })
+        .collect::<Vec<_>>();
+    (!failures.is_empty()).then(|| failures.join("; "))
+}
 
 impl QuarantineDriver {
     pub fn new(roots: impl IntoIterator<Item = QuarantineRoot>) -> Result<Self, QuarantineError> {
@@ -131,71 +173,6 @@ impl QuarantineDriver {
         Self::new(self.roots.iter().cloned().chain(std::iter::once(root)))
     }
 
-    /// Record a deletion intent, rename the inode to its intent-ID-derived
-    /// quarantine name, verify the displaced bytes, then retire the intent.
-    /// The store restores mismatched bytes and returns a typed conflict.
-    pub fn journaled_delete(
-        &self,
-        store: &mut Store,
-        target: &Path,
-        expected_preimage: ContentHash,
-    ) -> Result<PathBuf, QuarantineError> {
-        let quarantine = self.quarantine_for(target)?;
-        let conflict = target.with_extension("distill-conflict");
-        let intent_id = store.record_intent(
-            &target.to_string_lossy(),
-            "",
-            &conflict.to_string_lossy(),
-            Some(expected_preimage),
-            ContentHash(*blake3::hash(b"").as_bytes()),
-        )?;
-        match store.reconcile_journaled_deletion(intent_id, quarantine)? {
-            distill_store::journal::DeletionRecoveryOutcome::Deleted => store
-                .quarantined_entries()?
-                .into_iter()
-                .find(|entry| entry.intent_id == intent_id && !entry.restored)
-                .map(|entry| entry.path)
-                .ok_or_else(|| {
-                    QuarantineError::Store(Box::new(StoreError::BadIntent {
-                        intent_id,
-                        detail: "completed deletion has no retained displacement".into(),
-                    }))
-                }),
-            distill_store::journal::DeletionRecoveryOutcome::ConflictRestored => Err(
-                QuarantineError::Store(Box::new(StoreError::DeleteConflict {
-                    intent_id,
-                    expected: expected_preimage.0,
-                    actual: *blake3::hash(&std::fs::read(target).map_err(|source| {
-                        StoreError::Io {
-                            path: target.to_path_buf(),
-                            source,
-                        }
-                    })?)
-                    .as_bytes(),
-                })),
-            ),
-            distill_store::journal::DeletionRecoveryOutcome::RetryRequired => {
-                Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
-                    intent_id,
-                    detail: "journaled deletion stopped after a concurrent target appeared".into(),
-                })))
-            }
-        }
-    }
-
-    /// Attach a rewrite/swap displacement to an already journaled intent.
-    pub fn quarantine_displaced(
-        &self,
-        store: &mut Store,
-        intent_id: i64,
-        displaced_file: &Path,
-    ) -> Result<PathBuf, QuarantineError> {
-        let quarantine = self.quarantine_for(displaced_file)?;
-        store
-            .quarantine_displaced(intent_id, displaced_file, quarantine)
-            .map_err(Into::into)
-    }
-
     /// Resume every unfinished mutation before admitting any new publication.
     /// Durable states after `Prepared` recover from their
     /// journaled physical paths; root mapping is consulted only for an intent
@@ -205,15 +182,42 @@ impl QuarantineDriver {
         store: &mut Store,
         mut filesystem: Option<&mut dyn JournalFilesystem>,
         recover_codegen: bool,
-    ) -> Result<Vec<(i64, RecoveryOutcome)>, QuarantineError> {
+    ) -> Result<Vec<RecoveredPublication>, QuarantineError> {
         let groups = store.unfinished_publication_groups()?;
+        let group_by_child = groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .child_intents
+                    .iter()
+                    .map(move |intent| (*intent, group.kind))
+            })
+            .collect::<BTreeMap<_, _>>();
         let codegen_children = groups
             .iter()
             .filter(|group| group.kind == PublicationGroupKind::Codegen)
             .flat_map(|group| group.child_intents.iter().copied())
             .collect::<BTreeSet<_>>();
-        let intents = store.unretired_intents()?;
         let mut outcomes = Vec::new();
+        let mut recorded = BTreeSet::new();
+        for group in &groups {
+            if group.state != PublicationGroupState::Unarmed
+                || (group.kind == PublicationGroupKind::Codegen && !recover_codegen)
+            {
+                continue;
+            }
+            for child in store.publication_group_child_results(group.group_id)? {
+                recorded.insert(child.intent_id);
+                outcomes.push(RecoveredPublication {
+                    intent_id: child.intent_id,
+                    group_kind: Some(group.kind),
+                    target_path: PathBuf::from(child.target_path),
+                    outcome: RecoveryOutcome::AbandonedUnarmed,
+                });
+            }
+            store.abort_unarmed_publication_group(group.group_id)?;
+        }
+        let intents = store.unretired_intents()?;
         for intent in intents {
             let target = PathBuf::from(&intent.target_path);
             let codegen_owned = codegen_children.contains(&intent.intent_id);
@@ -235,7 +239,13 @@ impl QuarantineDriver {
                 } else {
                     store.reconcile_journaled_creation(intent.intent_id)?
                 };
-                outcomes.push((intent.intent_id, RecoveryOutcome::Creation(outcome)));
+                recorded.insert(intent.intent_id);
+                outcomes.push(RecoveredPublication {
+                    intent_id: intent.intent_id,
+                    group_kind: group_by_child.get(&intent.intent_id).copied(),
+                    target_path: target,
+                    outcome: RecoveryOutcome::Creation(outcome),
+                });
                 continue;
             }
             let quarantine = if intent.rename_aside_state
@@ -250,8 +260,7 @@ impl QuarantineDriver {
                     .ok_or_else(|| {
                         QuarantineError::Store(Box::new(StoreError::BadIntent {
                             intent_id: intent.intent_id,
-                            detail: "post-Prepared Windows intent has no journaled aside path"
-                                .into(),
+                            detail: "post-Prepared intent has no journaled aside path".into(),
                         }))
                     })?
             };
@@ -265,7 +274,13 @@ impl QuarantineDriver {
                 } else {
                     store.reconcile_journaled_deletion(intent.intent_id, quarantine)?
                 };
-                outcomes.push((intent.intent_id, RecoveryOutcome::Deletion(outcome)));
+                recorded.insert(intent.intent_id);
+                outcomes.push(RecoveredPublication {
+                    intent_id: intent.intent_id,
+                    group_kind: group_by_child.get(&intent.intent_id).copied(),
+                    target_path: target,
+                    outcome: RecoveryOutcome::Deletion(outcome),
+                });
             } else {
                 let outcome = if codegen_owned {
                     store.publish_journaled_replacement_with_filesystem(
@@ -276,7 +291,13 @@ impl QuarantineDriver {
                 } else {
                     store.publish_journaled_replacement(intent.intent_id, quarantine)?
                 };
-                outcomes.push((intent.intent_id, RecoveryOutcome::Rewrite(outcome)));
+                recorded.insert(intent.intent_id);
+                outcomes.push(RecoveredPublication {
+                    intent_id: intent.intent_id,
+                    group_kind: group_by_child.get(&intent.intent_id).copied(),
+                    target_path: target,
+                    outcome: RecoveryOutcome::Rewrite(outcome),
+                });
             }
         }
         if let Some(pending) = store
@@ -290,10 +311,35 @@ impl QuarantineDriver {
             })));
         }
         for group in groups {
+            if group.state == PublicationGroupState::Unarmed {
+                continue;
+            }
+            if group.kind == PublicationGroupKind::SchemaTransition {
+                self.recover_schema_transition_group(store, &group)?;
+                continue;
+            }
             if group.kind == PublicationGroupKind::Codegen && !recover_codegen {
                 continue;
             }
-            if group.kind == PublicationGroupKind::Codegen {
+            let children = store.publication_group_child_results(group.group_id)?;
+            for child in children
+                .iter()
+                .filter(|child| child.terminal_success != Some(true))
+            {
+                if recorded.insert(child.intent_id) {
+                    outcomes.push(RecoveredPublication {
+                        intent_id: child.intent_id,
+                        group_kind: Some(group.kind),
+                        target_path: PathBuf::from(&child.target_path),
+                        outcome: RecoveryOutcome::TerminalFailure,
+                    });
+                }
+            }
+            if group.kind == PublicationGroupKind::Codegen
+                && children
+                    .iter()
+                    .all(|child| child.terminal_success == Some(true))
+            {
                 let basis = CodegenPublicationBasis::decode(&group.basis).map_err(|detail| {
                     QuarantineError::Store(Box::new(StoreError::BadIntent {
                         intent_id: group.group_id,
@@ -307,13 +353,131 @@ impl QuarantineDriver {
         Ok(outcomes)
     }
 
+    fn recover_schema_transition_group(
+        &self,
+        store: &mut Store,
+        group: &PublicationGroup,
+    ) -> Result<(), QuarantineError> {
+        let basis = SchemaTransitionJournalBasis::decode(&group.basis).map_err(|detail| {
+            QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail,
+            }))
+        })?;
+        let current = store
+            .schema_manifest_basis()?
+            .ok_or_else(|| {
+                QuarantineError::Store(Box::new(StoreError::BadIntent {
+                    intent_id: group.group_id,
+                    detail: "schema-transition recovery has no durable manifest basis".into(),
+                }))
+            })?
+            .manifest_hash;
+        if current != basis.old_manifest_hash && current != basis.proposed_manifest_hash {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail: "durable manifest matches neither side of the schema transition".into(),
+            })));
+        }
+        let target_bytes = std::fs::read(&basis.target).map_err(|source| {
+            QuarantineError::Store(Box::new(StoreError::Io {
+                path: basis.target.clone(),
+                source,
+            }))
+        })?;
+        let target_hash = ContentHash(*blake3::hash(&target_bytes).as_bytes());
+        if target_hash == current {
+            store.retire_publication_group(group.group_id)?;
+            return Ok(());
+        }
+        if current != basis.old_manifest_hash || target_hash != basis.proposed_manifest_hash {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail:
+                    "schema-transition file and durable authority do not form a recoverable pair"
+                        .into(),
+            })));
+        }
+        let [child] = group.child_intents.as_slice() else {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail: "schema transition must have exactly one journal child".into(),
+            })));
+        };
+        let displaced = store
+            .quarantined_entries()?
+            .into_iter()
+            .find(|entry| {
+                entry.intent_id == *child
+                    && entry.ordinal == 0
+                    && entry.content_hash == basis.old_manifest_hash
+            })
+            .ok_or_else(|| {
+                QuarantineError::Store(Box::new(StoreError::BadIntent {
+                    intent_id: group.group_id,
+                    detail: "schema-transition recovery lost its retained manifest preimage".into(),
+                }))
+            })?;
+        let old_bytes = std::fs::read(&displaced.path).map_err(|source| {
+            QuarantineError::Store(Box::new(StoreError::Io {
+                path: displaced.path.clone(),
+                source,
+            }))
+        })?;
+        if ContentHash(*blake3::hash(&old_bytes).as_bytes()) != basis.old_manifest_hash {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail: "retained schema-manifest preimage hash changed".into(),
+            })));
+        }
+
+        let temp = plan_same_dir_temp(&basis.target).map_err(|detail| {
+            QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail,
+            }))
+        })?;
+        let reverse_plan = JournalIntentPlan {
+            target_path: basis.target.to_string_lossy().into_owned(),
+            temp_path: temp.to_string_lossy().into_owned(),
+            conflict_path: unique_sibling(&basis.target, "schema-recovery-conflict")
+                .to_string_lossy()
+                .into_owned(),
+            pre_image_hash: Some(basis.proposed_manifest_hash),
+            proposed_hash: basis.old_manifest_hash,
+        };
+        let reverse = store.record_publication_group(
+            PublicationGroupKind::SchemaTransition,
+            &group.basis,
+            &[reverse_plan],
+        )?;
+        write_planned_temp(&temp, &old_bytes).map_err(|detail| {
+            QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: reverse.group_id,
+                detail,
+            }))
+        })?;
+        store.arm_publication_group(reverse.group_id)?;
+        let quarantine = self.quarantine_for(&basis.target)?;
+        let outcome = store.publish_journaled_replacement(reverse.child_intents[0], quarantine)?;
+        if outcome != distill_store::journal::RenameAsideOutcome::Installed {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: reverse.group_id,
+                detail: "schema-transition recovery could not restore the retained preimage".into(),
+            })));
+        }
+        store.retire_publication_group(reverse.group_id)?;
+        store.retire_publication_group(group.group_id)?;
+        Ok(())
+    }
+
     /// Reconcile startup work that can be authorized by watched-root
     /// ownership alone. Codegen groups remain pending until their output
     /// directory has been independently validated.
     pub(crate) fn reconcile_non_codegen(
         &self,
         store: &mut Store,
-    ) -> Result<Vec<(i64, RecoveryOutcome)>, QuarantineError> {
+    ) -> Result<Vec<RecoveredPublication>, QuarantineError> {
         self.startup_reconcile(store, None, false)
     }
 
@@ -323,7 +487,7 @@ impl QuarantineDriver {
         &'a self,
         store: &'a mut Store,
     ) -> Result<PublicationDriver<'a>, QuarantineError> {
-        let recovered = self.startup_reconcile(store, None, true)?;
+        let recovered = self.startup_reconcile(store, None, false)?;
         Ok(PublicationDriver {
             quarantine: self,
             store,
@@ -348,14 +512,6 @@ impl QuarantineDriver {
         })
     }
 
-    #[cfg(windows)]
-    pub fn admit_windows_publication<'a>(
-        &'a self,
-        store: &'a mut Store,
-    ) -> Result<WindowsPublicationDriver<'a>, QuarantineError> {
-        self.admit_publication(store)
-    }
-
     pub fn doctor_verify(&self, store: &Store) -> Result<Vec<RecoveredEdit>, QuarantineError> {
         store.verify_quarantine().map_err(Into::into)
     }
@@ -366,7 +522,7 @@ impl QuarantineDriver {
 }
 
 impl PublicationDriver<'_> {
-    pub fn recovered(&self) -> &[(i64, RecoveryOutcome)] {
+    pub fn recovered(&self) -> &[RecoveredPublication] {
         &self.recovered
     }
 
@@ -387,6 +543,12 @@ impl PublicationDriver<'_> {
             .map_err(Into::into)
     }
 
+    pub fn arm_group(&mut self, group_id: i64) -> Result<(), QuarantineError> {
+        self.store
+            .arm_publication_group(group_id)
+            .map_err(Into::into)
+    }
+
     /// Install the durable preimage map after every Codegen child mutation is
     /// terminal, then retire the parent. Startup recovery performs the same
     /// idempotent sequence for a crash between these two steps.
@@ -399,6 +561,17 @@ impl PublicationDriver<'_> {
             return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
                 intent_id: group.group_id,
                 detail: "codegen completion basis does not match its publication group".into(),
+            })));
+        }
+        if !self
+            .store
+            .publication_group_child_results(group.group_id)?
+            .iter()
+            .all(|child| child.terminal_success == Some(true))
+        {
+            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
+                intent_id: group.group_id,
+                detail: "codegen publication has an unsuccessful child".into(),
             })));
         }
         self.store.apply_codegen_publication_basis(basis)?;
@@ -452,63 +625,95 @@ impl PublicationDriver<'_> {
         }
         .map_err(Into::into)
     }
+}
 
-    pub fn journaled_replace(
-        &mut self,
-        target: &Path,
-        proposed_temp: &Path,
-        expected_preimage: ContentHash,
-        proposed_hash: ContentHash,
-    ) -> Result<distill_store::journal::RenameAsideOutcome, QuarantineError> {
-        let quarantine = self.quarantine.quarantine_for(target)?;
-        let conflict = target.with_extension("distill-conflict");
-        let intent_id = self.store.record_intent(
-            &target.to_string_lossy(),
-            &proposed_temp.to_string_lossy(),
-            &conflict.to_string_lossy(),
-            Some(expected_preimage),
-            proposed_hash,
-        )?;
-        self.store
-            .publish_journaled_replacement(intent_id, quarantine)
-            .map_err(Into::into)
+#[cfg(test)]
+mod schema_transition_recovery_tests {
+    use super::*;
+    use distill_store::pipeline::{SchemaLineageManifest, VerifiedSchemaLineageManifest};
+    use distill_store::StoreConfig;
+
+    fn hash(bytes: &[u8]) -> ContentHash {
+        ContentHash(*blake3::hash(bytes).as_bytes())
     }
 
-    pub fn journaled_delete(
-        &mut self,
-        target: &Path,
-        expected_preimage: ContentHash,
-    ) -> Result<distill_store::journal::DeletionRecoveryOutcome, QuarantineError> {
-        let quarantine = self.quarantine.quarantine_for(target)?;
-        let conflict = target.with_extension("distill-conflict");
-        let intent_id = self.store.record_intent(
-            &target.to_string_lossy(),
-            "",
-            &conflict.to_string_lossy(),
-            Some(expected_preimage),
-            ContentHash(*blake3::hash(b"").as_bytes()),
-        )?;
-        self.store
-            .reconcile_journaled_deletion(intent_id, quarantine)
-            .map_err(Into::into)
+    fn interrupted_transition(store_already_committed: bool) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("assets");
+        let quarantine_path = root.join(".displaced");
+        std::fs::create_dir_all(&quarantine_path).unwrap();
+        let target = root.join("lineage.bundle");
+        let old_bytes = b"old manifest bytes";
+        let proposed_bytes = b"proposed manifest bytes";
+        let old_hash = hash(old_bytes);
+        let proposed_hash = hash(proposed_bytes);
+        std::fs::write(&target, old_bytes).unwrap();
+
+        let mut store = Store::open(StoreConfig::new(tempdir.path().join("state"))).unwrap();
+        let projected_hash = if store_already_committed {
+            proposed_hash
+        } else {
+            old_hash
+        };
+        store
+            .input_transaction(|transaction| {
+                transaction.project_verified_lineage_manifest(
+                    &VerifiedSchemaLineageManifest::from_verified_source(
+                        projected_hash,
+                        SchemaLineageManifest::default(),
+                    ),
+                )
+            })
+            .unwrap();
+        let driver = QuarantineDriver::new([QuarantineRoot::new(&root, &quarantine_path)]).unwrap();
+        let proposal_temp = plan_same_dir_temp(&target).unwrap();
+        let basis = SchemaTransitionJournalBasis {
+            base: store.input_version(),
+            target: target.clone(),
+            old_manifest_hash: old_hash,
+            proposed_manifest_hash: proposed_hash,
+        };
+        let group = store
+            .record_publication_group(
+                PublicationGroupKind::SchemaTransition,
+                &basis.encode().unwrap(),
+                &[JournalIntentPlan {
+                    target_path: target.to_string_lossy().into_owned(),
+                    temp_path: proposal_temp.to_string_lossy().into_owned(),
+                    conflict_path: unique_sibling(&target, "conflict")
+                        .to_string_lossy()
+                        .into_owned(),
+                    pre_image_hash: Some(old_hash),
+                    proposed_hash,
+                }],
+            )
+            .unwrap();
+        write_planned_temp(&proposal_temp, proposed_bytes).unwrap();
+        store.arm_publication_group(group.group_id).unwrap();
+        assert_eq!(
+            store
+                .publish_journaled_replacement(group.child_intents[0], &quarantine_path)
+                .unwrap(),
+            distill_store::journal::RenameAsideOutcome::Installed
+        );
+
+        driver.reconcile_non_codegen(&mut store).unwrap();
+        let expected = if store_already_committed {
+            proposed_bytes.as_slice()
+        } else {
+            old_bytes.as_slice()
+        };
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert!(store.unfinished_publication_groups().unwrap().is_empty());
     }
 
-    pub fn journaled_create(
-        &mut self,
-        target: &Path,
-        proposed_temp: &Path,
-        proposed_hash: ContentHash,
-    ) -> Result<distill_store::journal::CreationRecoveryOutcome, QuarantineError> {
-        let conflict = target.with_extension("distill-conflict");
-        let intent_id = self.store.record_intent(
-            &target.to_string_lossy(),
-            &proposed_temp.to_string_lossy(),
-            &conflict.to_string_lossy(),
-            None,
-            proposed_hash,
-        )?;
-        self.store
-            .reconcile_journaled_creation(intent_id)
-            .map_err(Into::into)
+    #[test]
+    fn interrupted_schema_transition_restores_preimage_when_store_is_old() {
+        interrupted_transition(false);
+    }
+
+    #[test]
+    fn interrupted_schema_transition_keeps_proposal_when_store_committed() {
+        interrupted_transition(true);
     }
 }

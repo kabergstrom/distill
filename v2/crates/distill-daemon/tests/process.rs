@@ -178,15 +178,16 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
 fn startup_recovers_non_codegen_publication_before_the_initial_scan() {
     let temp = tempfile::tempdir().unwrap();
     let config = config(&temp);
-    let target = temp.path().join("assets/pending.txt");
-    let proposal = temp.path().join("assets/.pending.proposed");
-    let conflict = temp.path().join("assets/.pending.conflict");
+    let assets = std::fs::canonicalize(temp.path().join("assets")).unwrap();
+    let target = assets.join("pending.txt");
+    let proposal = assets.join(".pending.proposed");
+    let conflict = assets.join(".pending.conflict");
     std::fs::write(&target, b"old").unwrap();
     let old_hash = ContentHash(*blake3::hash(b"old").as_bytes());
     let new_hash = ContentHash(*blake3::hash(b"new").as_bytes());
     {
         let mut store = Store::open(config.store_config()).unwrap();
-        store
+        let group = store
             .record_publication_group(
                 PublicationGroupKind::AuthoringWrite,
                 b"interrupted authoring publication",
@@ -201,6 +202,7 @@ fn startup_recovers_non_codegen_publication_before_the_initial_scan() {
             .unwrap();
         // The group is durable before the proposal temp exists.
         std::fs::write(&proposal, b"new").unwrap();
+        store.arm_publication_group(group.group_id).unwrap();
     }
 
     let process = DaemonProcess::start(config).unwrap();
@@ -216,6 +218,54 @@ fn startup_recovers_non_codegen_publication_before_the_initial_scan() {
         .any(|(_, path, state)| path == "pending.txt" && state.content_hash == Some(new_hash)));
     drop(store);
     drop(process);
+}
+
+#[test]
+fn startup_surfaces_an_abandoned_unarmed_authoring_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(&temp);
+    let target = temp.path().join("assets/never-published.txt");
+    let proposal = temp.path().join("assets/.never-published.proposed");
+    let proposed_hash = ContentHash(*blake3::hash(b"new").as_bytes());
+    {
+        let mut store = Store::open(config.store_config()).unwrap();
+        store
+            .record_publication_group(
+                PublicationGroupKind::AuthoringWrite,
+                b"interrupted unarmed publication",
+                &[JournalIntentPlan {
+                    target_path: target.to_string_lossy().into_owned(),
+                    temp_path: proposal.to_string_lossy().into_owned(),
+                    conflict_path: temp
+                        .path()
+                        .join("assets/.never-published.conflict")
+                        .to_string_lossy()
+                        .into_owned(),
+                    pre_image_hash: None,
+                    proposed_hash,
+                }],
+            )
+            .unwrap();
+    }
+
+    let process = DaemonProcess::start(config).unwrap();
+
+    let diagnostic = process
+        .last_background_error()
+        .expect("material startup recovery is surfaced");
+    assert!(diagnostic.contains("AuthoringWrite"));
+    assert!(diagnostic.contains("never-published.txt"));
+    assert!(diagnostic.contains("AbandonedUnarmed"));
+    assert!(!target.exists());
+    assert!(!proposal.exists());
+    assert!(process
+        .coordinator()
+        .store()
+        .lock()
+        .unwrap()
+        .unfinished_publication_groups()
+        .unwrap()
+        .is_empty());
 }
 
 #[cfg(unix)]
@@ -274,13 +324,33 @@ fn startup_runs_the_journaled_displacement_retention_sweep() {
     let retained = {
         let mut store = Store::open(config.store_config()).unwrap();
         let driver = QuarantineDriver::new([QuarantineRoot::new(&assets, &quarantine)]).unwrap();
-        driver
-            .journaled_delete(
-                &mut store,
-                &target,
-                ContentHash(*blake3::hash(b"old").as_bytes()),
+        let mut publication = driver.admit_publication(&mut store).unwrap();
+        let group = publication
+            .record_group(
+                PublicationGroupKind::AuthoringWrite,
+                b"retention test",
+                &[JournalIntentPlan {
+                    target_path: target.to_string_lossy().into_owned(),
+                    temp_path: String::new(),
+                    conflict_path: assets.join("old.conflict").to_string_lossy().into_owned(),
+                    pre_image_hash: Some(ContentHash(*blake3::hash(b"old").as_bytes())),
+                    proposed_hash: ContentHash(*blake3::hash(b"").as_bytes()),
+                }],
             )
+            .unwrap();
+        publication.arm_group(group.group_id).unwrap();
+        publication
+            .resume_group_delete(group.child_intents[0], &target)
+            .unwrap();
+        publication.retire_group(group.group_id).unwrap();
+        drop(publication);
+        store
+            .quarantined_entries()
             .unwrap()
+            .into_iter()
+            .find(|entry| entry.intent_id == group.child_intents[0])
+            .unwrap()
+            .path
     };
     std::thread::sleep(Duration::from_millis(1_100));
 

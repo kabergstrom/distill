@@ -27,5 +27,7 @@ tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+distill-asset-macro = { path = "../distill-asset-macro" }
+distill-loader = { path = "../distill-loader" }
 serde_json = "1"
 tempfile = "3"

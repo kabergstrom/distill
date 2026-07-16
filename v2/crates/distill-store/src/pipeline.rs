@@ -2039,6 +2039,13 @@ fn coverage_error(
 }
 
 impl Store {
+    /// Exact verified source-manifest basis currently projected into the
+    /// disposable store tables. Schema-transition coordinators use this as a
+    /// read-only stale precondition before touching the authored manifest.
+    pub fn schema_manifest_basis(&self) -> Result<Option<SchemaManifestBasis>, StoreError> {
+        manifest_basis(&self.conn)
+    }
+
     /// Persist the first poison discovered in an already-published module
     /// epoch without minting a new input version. This is a narrow monotonic
     /// runtime-lifecycle transition, guarded by the exact dylib identity.

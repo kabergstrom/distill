@@ -544,6 +544,23 @@ impl schema::metadata_hub::Server for MetadataHubService {
             Ok(())
         }
     }
+
+    fn schema_transition(
+        self: capnp::capability::Rc<Self>,
+        params: schema::metadata_hub::SchemaTransitionParams,
+        mut results: schema::metadata_hub::SchemaTransitionResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            let params = params.get()?;
+            let payload: Arc<[u8]> = Arc::from(params.get_payload()?);
+            write_metadata_progress_result(
+                results.get().init_result(),
+                self.hub
+                    .schema_transition(InputVersion(params.get_base()), payload),
+            );
+            Ok(())
+        }
+    }
 }
 
 struct HubService {
@@ -1686,6 +1703,11 @@ fn decode_long_running_op(
         schema::long_running_op::Which::Doctor(payload) => Ok(crate::LongRunningOp::Doctor(
             payload.map_err(authoring_decode_error)?.to_vec().into(),
         )),
+        schema::long_running_op::Which::SchemaTransition(payload) => {
+            Ok(crate::LongRunningOp::SchemaTransition(
+                payload.map_err(authoring_decode_error)?.to_vec().into(),
+            ))
+        }
     }
 }
 
@@ -3362,6 +3384,38 @@ fn write_progress_result(
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
         }
         RpcResult::Failure(error) => {
+            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_metadata_progress_result(
+    mut result: schema::progress_call::Builder<'_>,
+    outcome: MetadataCall<ProgressStream>,
+) {
+    match outcome {
+        MetadataCall::Success(stream) => {
+            let client: schema::progress_stream::Client =
+                capnp_rpc::new_client(ProgressStreamService {
+                    stream: Mutex::new(stream),
+                });
+            result.set_success(client);
+        }
+        MetadataCall::ReconnectRequired { reason } => match reason {
+            MetadataReconnectReason::StoreInstanceChanged => write_reconnect(
+                result.init_reconnect_required(),
+                crate::ReconnectReason::StoreInstanceChanged,
+            ),
+            MetadataReconnectReason::ProtocolEpochChanged => write_reconnect(
+                result.init_reconnect_required(),
+                crate::ReconnectReason::ProtocolEpochChanged,
+            ),
+        },
+        MetadataCall::LeaseFailure => write_lease_failure(
+            result.init_lease_failure(),
+            "metadata capability lease expired",
+        ),
+        MetadataCall::Error(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
     }

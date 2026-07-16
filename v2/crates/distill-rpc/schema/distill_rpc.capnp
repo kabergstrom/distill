@@ -649,6 +649,7 @@ struct LongRunningOp {
     renameWithFixups @0 :Data;
     diskMigration @1 :Data;
     doctor @2 :Data;
+    schemaTransition @3 :Data;
   }
 }
 
@@ -948,6 +949,7 @@ interface MetadataHub {
   authoringSnapshot @1 () -> (result :MetadataAuthoringSnapshotCall);
   diagnostics @2 () -> (result :MetadataDiagnosticsCall);
   fetch @3 (hash :Data) -> (result :MetadataChunkStreamCall);
+  schemaTransition @4 (base :UInt64, payload :Data) -> (result :ProgressCall);
 }
 
 interface MetadataSnapshot {

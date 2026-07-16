@@ -642,7 +642,8 @@ impl AuthoringBackend for RecordingAuthoringBackend {
         let payload = match operation {
             LongRunningOp::RenameWithFixups(payload)
             | LongRunningOp::DiskMigration(payload)
-            | LongRunningOp::Doctor(payload) => payload.clone(),
+            | LongRunningOp::Doctor(payload)
+            | LongRunningOp::SchemaTransition(payload) => payload.clone(),
         };
         Ok(PreparedOperationCommit::immediate(
             Commit::default(),
@@ -1165,6 +1166,109 @@ fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_versio
         healed.resolve_path("bundle-1.asset"),
         MetadataNamespaceCall::Success(PathResolveResult::Resolved(entry.uuid))
     );
+}
+
+#[test]
+fn metadata_schema_transition_is_reachable_while_target_connect_is_blocked_and_fenced() {
+    let backend = Arc::new(RecordingAuthoringBackend::default());
+    let server = Server::new_with_authoring_backend(
+        StoreInstanceId([9; 16]),
+        vec![target_with(7, &[(1, false)])],
+        backend.clone(),
+    )
+    .unwrap();
+    let required = SchemaAcceptanceRequired {
+        manifest: SchemaManifestBasis {
+            manifest_hash: content_hash(41),
+            current_cursors: BTreeMap::new(),
+        },
+        candidate: PipelineCandidateIdentity {
+            dylib_hash: [42; 32],
+            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
+        },
+        mismatches: vec![SchemaRegistryMismatch {
+            type_uuid: type_id(1),
+            candidate: Some(LogicalHash([45; 32])),
+            manifest: None,
+        }],
+    };
+    server
+        .commit(Commit {
+            pipeline: Some(PipelineDiagnostic::SchemaAcceptanceRequired(
+                required.clone(),
+            )),
+            ..Commit::default()
+        })
+        .unwrap();
+    assert!(matches!(
+        server.root().connect(request_for(7, 0, &[(1, false)])),
+        ConnectOutcome::PipelineUnavailable(
+            PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(observed)
+        ) if observed == required
+    ));
+
+    let metadata = server
+        .root()
+        .metadata(PROTOCOL_VERSION)
+        .connected()
+        .unwrap()
+        .hub;
+    let payload: Arc<[u8]> = Arc::from(&b"schema-transition-cas"[..]);
+    assert!(matches!(
+        metadata.schema_transition(InputVersion(0), Arc::clone(&payload)),
+        MetadataCall::Error(RpcFailure::StaleInputVersion {
+            expected: InputVersion(1),
+            got: InputVersion(0),
+        })
+    ));
+    assert!(backend.operations.lock().unwrap().is_empty());
+
+    let progress = metadata
+        .schema_transition(InputVersion(1), Arc::clone(&payload))
+        .success()
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        progress.iter().map(|event| event.state).collect::<Vec<_>>(),
+        vec![
+            AuthoringProgressState::Started,
+            AuthoringProgressState::Running,
+            AuthoringProgressState::Completed,
+        ]
+    );
+    assert_eq!(server.current_stamp().version, InputVersion(2));
+    assert_eq!(
+        *backend.operations.lock().unwrap(),
+        vec![LongRunningOp::SchemaTransition(payload)]
+    );
+
+    let mut fenced = metadata
+        .schema_transition(
+            InputVersion(2),
+            Arc::from(&b"must-not-publish-after-fence"[..]),
+        )
+        .success()
+        .unwrap();
+    assert_eq!(
+        fenced.next().unwrap().state,
+        AuthoringProgressState::Started
+    );
+    assert_eq!(
+        fenced.next().unwrap().state,
+        AuthoringProgressState::Running
+    );
+    server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
+    let fenced_version = server.current_stamp().version;
+    let terminal = fenced.next().unwrap();
+    assert_eq!(terminal.state, AuthoringProgressState::Failed);
+    assert!(String::from_utf8_lossy(&terminal.payload).contains("ProtocolEpochChanged"));
+    assert_eq!(server.current_stamp().version, fenced_version);
+    assert!(matches!(
+        metadata.schema_transition(InputVersion(2), Arc::from(&b"fenced"[..])),
+        MetadataCall::ReconnectRequired {
+            reason: MetadataReconnectReason::ProtocolEpochChanged,
+        }
+    ));
 }
 
 #[test]
@@ -2117,13 +2221,12 @@ fn repeated_subscribe_unions_names_on_one_stream_and_unsubscribe_removes_them() 
         .subscribe(InputVersion(0), vec![second], vec![])
         .success()
         .unwrap();
-    match first_install.deltas.next().unwrap() {
-        StreamEvent::InitialDelta { deltas, .. } => {
-            assert_eq!(deltas.len(), 1);
-            assert_eq!(deltas[0].assets, vec![(second, AssetDeltaState::Deleted)]);
-        }
-        other => panic!("expected initial delta, got {other:?}"),
-    }
+    assert!(matches!(
+        first_install.deltas.next(),
+        Some(StreamEvent::Delta(Delta { basis, assets, .. }))
+            if basis.snapshot.version == InputVersion(1)
+                && assets == vec![(second, AssetDeltaState::Deleted)]
+    ));
     assert!(second_install.deltas.next().is_none());
 
     assert_eq!(hub.unsubscribe(vec![first], vec![]), RpcResult::Success(()));
@@ -2625,6 +2728,86 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
     assert_eq!(
         DoctorRequest::decode(&[1, 99]),
         Err(OperationPayloadError::InvalidTag(99))
+    );
+
+    let manifest = SchemaManifestBasis {
+        manifest_hash: ContentHash([31; 32]),
+        current_cursors: BTreeMap::from([
+            (TypeUuid([1; 16]), LogicalHash([41; 32])),
+            (TypeUuid([2; 16]), LogicalHash([42; 32])),
+        ]),
+    };
+    let candidate = PipelineCandidateIdentity {
+        dylib_hash: [51; 32],
+        target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![
+            distill_core::target_set::TargetSetRow {
+                name: "editor".to_owned(),
+                target_definition_hash: [61; 32],
+            },
+            distill_core::target_set::TargetSetRow {
+                name: "runtime".to_owned(),
+                target_definition_hash: [62; 32],
+            },
+        ])
+        .unwrap(),
+    };
+    for action in [
+        SchemaTransitionAction::Accept {
+            requested: LogicalHash([71; 32]),
+        },
+        SchemaTransitionAction::Rollback {
+            target: LogicalHash([72; 32]),
+        },
+        SchemaTransitionAction::Retire {
+            control_basis: SnapshotStamp {
+                instance: StoreInstanceId([73; 16]),
+                version: InputVersion(74),
+            },
+        },
+        SchemaTransitionAction::Reactivate,
+    ] {
+        let request = SchemaTransitionRequest {
+            manifest: manifest.clone(),
+            candidate: candidate.clone(),
+            type_uuid: TypeUuid([75; 16]),
+            action,
+        };
+        let encoded = request.encode().unwrap();
+        assert_eq!(SchemaTransitionRequest::decode(&encoded).unwrap(), request);
+    }
+
+    let noncanonical_candidate = SchemaTransitionRequest {
+        manifest: manifest.clone(),
+        candidate: PipelineCandidateIdentity {
+            dylib_hash: [51; 32],
+            target_set: distill_core::target_set::CanonicalTargetSet {
+                rows: candidate.target_set.rows.iter().cloned().rev().collect(),
+            },
+        },
+        type_uuid: TypeUuid([75; 16]),
+        action: SchemaTransitionAction::Reactivate,
+    };
+    assert_eq!(
+        noncanonical_candidate.encode(),
+        Err(OperationPayloadError::NonCanonicalOrder)
+    );
+
+    let canonical = SchemaTransitionRequest {
+        manifest,
+        candidate,
+        type_uuid: TypeUuid([75; 16]),
+        action: SchemaTransitionAction::Reactivate,
+    }
+    .encode()
+    .unwrap();
+    let mut noncanonical_cursors = canonical.to_vec();
+    const CURSORS_OFFSET: usize = 1 + 1 + 32 + 4;
+    let (first, second) =
+        noncanonical_cursors[CURSORS_OFFSET..CURSORS_OFFSET + 96].split_at_mut(48);
+    first.swap_with_slice(second);
+    assert_eq!(
+        SchemaTransitionRequest::decode(&noncanonical_cursors),
+        Err(OperationPayloadError::NonCanonicalOrder)
     );
 }
 

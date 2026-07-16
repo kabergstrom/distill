@@ -33,7 +33,9 @@ use crate::lineage_repair::{
     LineageRepairBackendInitError,
 };
 use crate::pipeline_map::PipelineProjection;
-use crate::quarantine::{QuarantineDriver, QuarantineError, QuarantineRoot};
+use crate::quarantine::{
+    material_recovery_diagnostic, QuarantineDriver, QuarantineError, QuarantineRoot,
+};
 use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanError, ScanSnapshot};
 
 pub struct AuthoringService {
@@ -49,6 +51,7 @@ pub struct AuthoringService {
     pipeline_projection: RwLock<PipelineProjection>,
     pub(crate) import_watch_index: Mutex<ImportWatchIndex>,
     tag_index_coordinator: RwLock<Weak<crate::coordinator::DaemonCoordinator>>,
+    startup_recovery_diagnostic: Mutex<Option<String>>,
 }
 
 pub(crate) struct AuthoringFilesystemCandidate {
@@ -92,12 +95,13 @@ impl AuthoringService {
                 &root.quarantine_dir,
             )?;
         }
-        {
+        let startup_recovery_diagnostic = {
             let mut store = store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            quarantine.reconcile_non_codegen(&mut store)?;
-        }
+            let recovered = quarantine.reconcile_non_codegen(&mut store)?;
+            material_recovery_diagnostic(&recovered)
+        };
         let lineage = LineageRepairBackend::new(Arc::clone(&store), roots.clone())?;
         Ok(Self {
             store,
@@ -112,7 +116,15 @@ impl AuthoringService {
             pipeline_projection: RwLock::new(PipelineProjection::default()),
             import_watch_index: Mutex::new(ImportWatchIndex::default()),
             tag_index_coordinator: RwLock::new(Weak::new()),
+            startup_recovery_diagnostic: Mutex::new(startup_recovery_diagnostic),
         })
+    }
+
+    pub(crate) fn take_startup_recovery_diagnostic(&self) -> Option<String> {
+        self.startup_recovery_diagnostic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     pub(crate) fn attach_tag_index_coordinator(
@@ -340,6 +352,7 @@ impl AuthoringService {
         if let (Some(temp), Some(bytes)) = (temp.as_deref(), proposed.as_deref()) {
             write_planned_temp(temp, bytes).map_err(invalid)?;
         }
+        publication.arm_group(group.group_id).map_err(invalid)?;
         let intent = group.child_intents[0];
         let installed = match (preimage, proposed.as_ref()) {
             (Some(_), Some(_)) => publication

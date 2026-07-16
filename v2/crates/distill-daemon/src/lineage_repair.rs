@@ -160,6 +160,7 @@ impl LineageRepairBackend {
             )
             .map_err(failure)?;
         write_planned_temp(&temp, proposed_bytes).map_err(failure)?;
+        publication.arm_group(group.group_id).map_err(failure)?;
         let outcome = if preimage.is_none() {
             publication
                 .resume_group_create(group.child_intents[0])
@@ -335,6 +336,7 @@ impl LineageRepairBackend {
                 write_planned_temp(Path::new(&plan.temp_path), proposed).map_err(failure)?;
             }
         }
+        publication.arm_group(group.group_id).map_err(failure)?;
         let mut all_installed = true;
         for (mutation, intent_id) in mutations.iter().zip(&group.child_intents) {
             let terminal_success = match mutation {

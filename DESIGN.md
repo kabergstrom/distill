@@ -157,16 +157,16 @@ directories (one per watched root, one beside each daemon-owned output
 directory), entries named by the journal's unique **intent IDs**;
 `.distill/` holds only the journal and metadata, which reference the
 physical locations — which retains
-every inode an exchange, deletion, or swap-back displaces for a
+every inode a rewrite, deletion, or conflict restoration displaces for a
 configured window — bytes a
 concurrent in-place writer may still be writing through an open
 descriptor. Their loss never loses
 content — recovery without them degrades to §14's conservative rule (nothing
 unclassified is ever deleted; unexplained files are preserved under named
-conflict or quarantine paths) — but while an exchange is in flight the
+conflict or quarantine paths) — but while publication is in flight the
 journal is the crash-recovery record, fsynced before the first rename,
 and until retention expires the quarantined inode is the last holder of
-any edit that raced the exchange.
+any edit that raced publication.
 
 ## 3. Architecture
 
@@ -1859,7 +1859,7 @@ For an `Absent` basis it journals an atomic **no-replace** creation. For an
 occupied canonical bundle it requires the replacement to preserve every
 non-manifest entry byte-for-byte and to differ only by adding exactly one
 canonical manifest entry; its exact preimage is retained in quarantine and the
-replacement is installed with the same exchange/no-replace protocol as §14.
+replacement is installed with the same rename-aside/no-clobber protocol as §14.
 For an occupied opaque file it first renames the exact hashed raw preimage
 no-replace into per-filesystem quarantine, preserving those bytes under a
 recoverable journal name, and only then installs the proposed canonical bundle
@@ -5528,18 +5528,34 @@ v2 improvements over v1's tracker:
   immediately before mutation and reject symlinked destination entries; drift
   fails or retries without publishing state. A Windows cook target does not by
   itself promise that the daemon is supported as a Windows host process.
-- **Swap-verify-or-swap-back publication.** Every daemon rewrite of an
+- **Journaled rename-aside publication.** Every daemon rewrite of an
   authored file (adoption, watched imports, disk migration, rename
-  fixups — and §20's generated source files) publishes by **journal,
-  then exchange, then verify**. First a **write-intent journal** entry —
+  fixups — and §20's generated source files) publishes by journaled
+  rename-aside, verification, and no-clobber install. A multi-file operation first records one
+  durable parent publication group and all child write intents in the
+  `Unarmed` state. While unarmed, no child filesystem mutation is legal;
+  startup may therefore abandon the complete group without executing even a
+  deletion child. The daemon writes and fsyncs every non-empty proposal temp,
+  then durably changes the parent to `Armed` before resuming any child. Each
+  child records terminal success or failure with its retirement, and the
+  parent retires only after every child is terminal. Operation-specific
+  metadata may advance only from the complete child result set (for example,
+  codegen installs the proposed ownership map only if every child succeeded).
+  This group gate closes the crash window between recording a multi-path plan
+  and producing all bytes needed to execute it.
+
+  Each child **write-intent journal** entry —
   the target path, the temp path, the conflict path that would be used,
   the expected pre-image hash, and the proposed content hash — is
   written to daemon state and **fsynced before the first rename** of the
-  protocol; only then: write temp, atomically **exchange** temp ↔
-  target (`renameat2(RENAME_EXCHANGE)` / macOS `renamex_np(RENAME_SWAP)`),
-  hash the displaced bytes, compare against the recorded pre-image —
-  match: done, but the displaced inode is **never unlinked**: it moves
-  into the **quarantine directory for its filesystem** — the daemon
+  protocol. The daemon writes and fsyncs the proposal temp, then atomically
+  renames the user-visible target to the journal-reserved, intent-ID-derived
+  aside path. That destination is private to the journal under R37's trusted
+  local-workspace boundary; an occupied reserved path is classified and
+  replanned rather than overwritten. The daemon fsyncs the moved file and its
+  directories, records the durable transition, hashes the displaced bytes,
+  and compares them against the recorded pre-image. The aside is the
+  **quarantine entry for its filesystem** — the daemon
   keeps one per watched root, and one beside each daemon-owned output
   directory (`rs_mod_path`, §20), each daemon-owned, on the *same
   filesystem* as the inodes it receives (a rename can carry a live
@@ -5555,87 +5571,71 @@ v2 improvements over v1's tracker:
   only the journal and metadata — and the inode is retained for the
   configured window
   (`displaced_retention_days`, §18 — default 7 days), destroyed only by
-  journaled retention expiry or explicit `doctor clean`; mismatch: a
-  concurrent edit was displaced,
-  so restore it (the user's bytes win) and report the conflict — and
-  the swap-back's own displaced object, the daemon's *proposed* inode,
-  takes the same quarantine protocol under its intent ID rather than an
-  unlink: it was briefly exposed at the target, so another process may
-  already hold it open, and "daemon bytes" never means "safe to destroy
-  while possibly held". Quarantine is what extends the no-silent-loss
+  journaled retention expiry or explicit `doctor clean`.
+
+  If the aside hash matches, the proposal temp is installed at the absent
+  target with an atomic no-clobber hard link; the daemon-owned temp name is
+  then removed and the file and directories are fsynced. A crash between link
+  and temp-name removal is recovered by recognizing the proposal at both names
+  and completing daemon-temp cleanup. If the target reappears first, it is
+  atomically renamed to a separately journal-reserved conflict path and never
+  overwritten. The verified pre-image is restored by an atomic no-clobber hard
+  link from its aside path to the absent target. The aside name remains in
+  quarantine, is marked restored, and remains covered by verification and
+  retention. A second reappearance wins and stops or retries restoration.
+  Quarantine is what extends the no-silent-loss
   guarantee to **in-place writers holding open descriptors**: the
-  post-exchange hash proves only what the inode held at that instant —
+  post-rename hash proves only what the inode held at that instant —
   an editor writing through a descriptor it already holds can land bytes
   after verification, and those late bytes land in the quarantined inode
   and survive. Startup reconciliation re-hashes every quarantined file
   and surfaces any that no longer matches its journal entry as a
-  **recovered-edit diagnostic** naming the origin path. Restoration itself re-verifies: **every**
-  exchange's displaced object is hashed, and the daemon unlinks nothing
-  that was ever exposed at the target — its own proposed bytes
-  included, which quarantine under their intent ID once displaced;
-  direct deletion is reserved for never-exposed temp files that some
-  retired intent names as daemon-authored — if a still-newer save landed on the target
-  mid-conflict, exchanging back blindly would displace *that* edit into
-  the temp path, so any displaced bytes that are neither the daemon's
-  own nor the expected pre-image are preserved under a named conflict
-  path and the operation retries or stops; nothing unverified is ever
-  deleted. A check-then-rename discipline
-  would leave a window where an external save lands between check and
-  rename and is destroyed; the exchange makes the displaced bytes
-  inspectable *after* the atomic step. Stated precisely, the guarantee
+  **recovered-edit diagnostic** naming the origin path. Restoration re-verifies
+  the retained pre-image, and any unknown or reappeared bytes are preserved at
+  a named conflict path; nothing unverified is deleted. Target-to-aside and
+  target-to-conflict moves are one atomic `std::fs::rename` from a user-visible
+  name to a journal-reserved unique name. They are never implemented as
+  `hard_link(source, destination)` followed by `remove_file(source)`, because an
+  ordinary editor save could replace the source between those calls and be
+  unlinked. Hard-link-plus-remove is used only for daemon-owned proposal temps.
+  Stated precisely, the guarantee
   is: **every displacement is journaled under its intent ID and
   retained per policy** — nothing is ever destroyed silently or
   anonymously; destruction happens only by journaled retention expiry
   or explicit `doctor clean`, both of which name what they remove.
   Within the retention window every raced edit is recoverable; after
-  it, the journal still records that — and what — was
-  displaced. Windows has no exchange primitive, so it uses a separately
-  pinned **journaled rename-aside state machine**, never a replace-style
-  rename. The durable states are `Prepared` (journal and proposed temp
-  fsynced), `Aside` (target atomically renamed to the intent's aside path and
-  the containing directory flushed), `PreimageVerified` (aside hash equals
-  the journaled pre-image), `Installed` (proposed temp atomically installed at
-  the absent target by a no-replace primitive and directory flushed), and
-  `Quarantined`/`Committed` (aside moved to intent-ID quarantine, both
-  directories flushed, then journal retirement flushed). Each transition is
-  recorded and the journal flushed before the next filesystem mutation.
-  Installation uses Windows rename/link semantics that fail if the target
-  exists; an overwrite/replace flag or API is nonconforming.
-
-  If the target reappears after `Aside`, no install occurs. The proposed temp
-  remains named by the live intent. Before moving anything else, recovery
-  journals and flushes a conflict transition that preserves the newly appeared
-  target at the intent's conflict path (using no-replace; a collision allocates
-  and journals another unique intent path). It then restores the verified
-  pre-image from aside to target only by another atomic no-replace operation
-  and flushes the directory. If a second writer recreates target first, both
-  existing objects remain in place/named, the intent stops or retries from a
-  fresh observation, and nothing is overwritten. The same rule applies if the
-  aside hash mismatches: preserve it as a named raced edit and do not install.
+  it, the journal still records that — and what — was displaced. The durable
+  states are `Prepared`, `AsideJournaled`, `TargetAsideDurable`,
+  `PreimageVerifiedDurable`, `ConflictJournaled`, `ConflictPreservedDurable`,
+  `PreimageRestoredDurable`, and `ProposedInstalledDurable`. Each state journals
+  authority before its next filesystem mutation and records completion only
+  after the affected file and directories are flushed. This is the sole daemon
+  publication protocol on supported Unix hosts. Windows remains a cook target,
+  not a daemon host.
 
   Startup recovery resumes solely from the durable state plus hashes of target,
   temp, aside, conflict, and quarantine. In `Prepared` it either begins the
-  no-replace aside or retires untouched; in `Aside`/`PreimageVerified` it
+  reserved aside or retires untouched; in the aside/verified states it
   classifies any reappeared target before install; in `Installed` it verifies
-  target equals proposed bytes before quarantining aside; and in every state an
-  unknown byte sequence is moved only through a journaled no-replace conflict
+  target equals proposed bytes while retaining aside; and in every state an
+  unknown byte sequence is moved only through a journaled reserved conflict
   transition. File flush precedes every publication that relies on file bytes;
   directory flush follows every rename/link and precedes the next durable-state
   advance. Thus crash recovery yields a named pre-image, proposal, and every
   raced target without any conforming overwrite primitive. **Deletion** (Asset CRUD's bundle delete, §17, and any
-  daemon-initiated delete) is the same exchange-and-verify family,
+  daemon-initiated delete) is the same rename-aside-and-verify family,
   never a bare unlink: a check-then-unlink would destroy an external
   save landing between the operation's base-version check and the
-  unlink — precisely the TOCTOU the exchange closes for rewrites. The
+  unlink — precisely the TOCTOU the atomic rename-aside closes for rewrites. The
   journal entry records the expected pre-image; the file is atomically
   **renamed into its root's quarantine under the intent's ID**, the
   displaced bytes are hashed and compared — match: the intent retires
   and the deletion publishes, the quarantined inode retained per the
   window above; mismatch: the displaced bytes are restored to the
-  original path and the operation fails as a conflict, exactly like a
+  original path by a no-clobber retained-aside link and the operation fails as a conflict, exactly like a
   rewrite conflict. **Creation** (a new bundle from import, an editor, or §6's
   Missing-lineage repair) has no
-  target to exchange: it publishes by atomic no-replace linkage
+  target to move aside: it publishes by atomic no-replace linkage
   (`O_CREAT | O_EXCL` semantics, temp linked into place) — if the
   destination appeared externally in the meantime, both objects are
   preserved under conflict naming and the operation stops or retries,
@@ -5654,7 +5654,7 @@ v2 improvements over v1's tracker:
   **unclassified file is never deleted**: at worst it moves to a
   quarantine location and is named in diagnostics, with the intent
   retiring only once every named path is accounted for. Without the
-  journal, a crash between exchange and verify would leave displaced
+  journal, a crash between rename-aside and verify would leave displaced
   user bytes at an anonymous temp path that any cleanup pass could
   destroy — so **temp cleanup is journal-driven**: the daemon deletes
   only temp files some retired intent names as its own, never "stray"
@@ -6631,7 +6631,15 @@ metadata inspection, diagnostics, immutable CAS fetches, and authoring
 inspection. It binds only StoreInstanceId and protocol epoch and remains
 available while configuration or pipeline state is poisoned. It does not run
 migration, tag extraction, terminal projection, target-dependent work, or
-pipeline callbacks.
+pipeline callbacks. Its one mutation is the closed
+`schemaTransition(base, payload) -> ProgressCall` recovery command. That
+method can submit only the canonical `SchemaTransitionRequest` payload, never
+an arbitrary `LongRunningOp`; it fences the StoreInstanceId, protocol epoch,
+and exact input-version base both before preparation and at terminal
+publication. This narrow exception is necessary because
+`SchemaAcceptanceRequired` deliberately prevents acquiring a target-bound Hub.
+It does not expose general authoring, import, disk migration, doctor, or
+rename operations through the poison-safe capability.
 
 `Root.lineageRepair` is a separate narrow local capability available only
 while the current configuration poison is MissingLineageManifest or
@@ -6690,13 +6698,16 @@ serves the authenticated typed load edges with the payload. Wire trees are
 looked up by LayoutHash, returned as canonical DSWL bytes, and rehashed by the
 consumer.
 
-Subscriptions are cursor-bound. Installation at `installed >= since`
-atomically returns the ordered initial delta covering `(since, installed]`
-for the newly subscribed assets and paths, followed by ordered deltas. A cursor
-older than retained history yields `resyncRequired`; a watcher-coverage loss
-yields `restartRequired`; a bound epoch change yields
-`reconnectRequired`. No notification is the authority for a fence—the server
-checks the fence on every call.
+Subscriptions are cursor-bound and one connection owns one ordered delta
+stream. Its first installation at `installed >= since` atomically returns the
+stream's single initial delta covering `(since, installed]` for the newly
+subscribed assets and paths. Later installations union more names into that
+same stream and replay their retained history as ordinary ordered deltas;
+they never enqueue a second stream-level initial event. A cursor older than
+retained history yields `resyncRequired`; a watcher-coverage loss yields
+`restartRequired`; a bound epoch change yields `reconnectRequired`. No
+notification is the authority for a fence—the server checks the fence on every
+call.
 
 Authoring methods carry an InputVersion base precondition. A stale base returns
 a typed conflict without mutation. Long-running operations expose ordered,
@@ -6725,8 +6736,8 @@ compatibility at the artifact actually being loaded.
 # design; remote access is a named open item, §22).
 address = "127.0.0.1:9999"
 state_path = ".distill/"
-# Displaced-inode quarantine retention (§14): every inode an exchange,
-# deletion, or swap-back displaces is retained in its filesystem's
+# Displaced-inode quarantine retention (§14): every inode a rewrite,
+# deletion, or conflict restoration displaces is retained in its filesystem's
 # quarantine directory (per watched root / per daemon-owned output dir)
 # under the write-intent journal's intent ID for this window;
 # destruction is journaled retention expiry or explicit `doctor clean`.
@@ -7044,18 +7055,18 @@ outcome }`: the pinned input/configuration basis, the complete outcome-bearing
 dependency trace (query membership, hits, misses, and failures), and either
 the proposed full file batch or a typed failure. The coordinator revalidates
 that basis and every trace observation **immediately before** publishing the
-trace/result and before beginning any §14 exchange. If anything differs —
+trace/result and before beginning any §14 publication. If anything differs —
 including newly discovered membership, a previously missed dependency, or an
 event consumed while generation ran — it discards the whole proposed batch
 and outcome and requeues against the newest basis. No stale trace is published,
-and no exchange starts from bytes computed for a mismatched basis.
+and no filesystem mutation starts from bytes computed for a mismatched basis.
 
 Generated files are **daemon-owned, declared so**: `rs_mod_path` names a
 directory whose generated `<pipeline>.rs` files and `mod.rs` chain
 belong to the codegen service — a hand edit there is a conflict to
 surface, never content to merge. Every write publishes by §14's full
 protocol, generated sources being authored-tree files like any other:
-write-intent journal, then atomic exchange, then displaced-byte
+write-intent journal, then atomic rename-aside, then displaced-byte
 verification against the recorded pre-image (the previously generated
 bytes), the displaced inode quarantined in the output directory's
 same-filesystem quarantine under its journal-assigned intent ID (§14)
@@ -7118,6 +7129,16 @@ ordinary §10 dependency kinds.
    migration bundles, `doctor`.
 4. **Shipping + editor**: packfile build/patch tooling, PackfileIO, editor-
    facing RPC surface.
+
+Phase completion is proven by one vertical game-content smoke suite, not only
+by synthetic payload tests. The fixture imports a tiny image, a single-triangle
+mesh, and shader source with an included file; its test pipeline module owns
+the deliberately small format parsing and cooking logic. The resulting typed
+artifacts pass through daemon build, loopback RPC resolve/fetch, loader
+adoption, and pack build/publish/mount. Editing the shader include must
+invalidate and reload only the dependent shader closure through the normal
+incremental watcher path. This is an integration fixture, not a requirement to
+put production image codecs, mesh optimization, or shader compilers in core.
 
 ## 22. Resolved Decisions, Risks & Deferrals
 
@@ -7496,8 +7517,8 @@ ordinary §10 dependency kinds.
   a shared `ngp-source-hash` identity match. It does not crawl the workspace or
   maintain a separate source-staleness mode.
 - **Concurrent writes** (§17, §14): version-preconditioned, rejected on
-  mismatch; per-file publication is swap-verify-or-swap-back (atomic
-  exchange, verify the displaced bytes, restore on conflict) under one
+  mismatch; per-file publication is rename-aside, verify, and no-clobber
+  install/restore under one
   invariant — the daemon only ever deletes bytes it authored; anything
   unverified is preserved as a named conflict file; creation publishes
   by atomic no-replace linkage with the same conflict discipline.
@@ -7782,16 +7803,15 @@ ordinary §10 dependency kinds.
 - **Authored-file replacement journals its intent** (§2, §14, §17, §20):
   a write-intent record — target, temp, and conflict paths, expected
   pre-image hash, proposed content hash — is fsynced before the first
-  rename of every exchange (the Windows rename-aside window included);
+  rename of the sole rename-aside protocol;
   startup reconciles every unfinished intent by hashing what sits at
   each named path, an unclassified file is never deleted — quarantined
   and named in diagnostics at worst — and temp cleanup is journal-driven,
-  so no cleanup pass can destroy displaced user bytes. (Refined in R27:
-  Windows uses a durable Prepared→Aside→Verified→Installed→Quarantined
-  rename-aside state machine; install and restore are atomic no-replace,
-  reappeared targets/proposals/preimages are journaled and conflict-preserved,
-  every rename has directory-flush recovery, and no overwrite primitive
-  conforms.)
+  so no cleanup pass can destroy displaced user bytes. Install is atomic
+  no-clobber from a daemon temp; restore links from and retains the verified
+  aside; reappeared targets/proposals/preimages are journaled and
+  conflict-preserved; every rename/link has directory-flush recovery; and no
+  overwrite primitive conforms.
 - **Bundle-visible root identity is a typed name** (§6, §8):
   `RootName(String)` — the normalized root name — is what
   `RootedPath.root`, `FileDep::Probe.observed`, and everything in
@@ -7998,7 +8018,7 @@ ordinary §10 dependency kinds.
 - **Generated sources publish like bundles** (§14, §20): `rs_mod_path`
   is declared daemon-owned for generated files, and every
   `.rs`/`mod.rs` write runs §14's full protocol — intent journal,
-  atomic exchange, displaced-byte verification against the last
+  atomic rename-aside, displaced-byte verification against the last
   generated bytes — so a concurrent hand or build-tool edit is
   restored and reported as a conflict, never lost to check-then-write.
 - **Configuration changes are input events** (§13, §18): the daemon
@@ -8044,7 +8064,7 @@ ordinary §10 dependency kinds.
   the accepted-set policy projection/digest/generation when its runtime set
   changes.)
 - **Displaced inodes are quarantined, never unlinked** (§2, §14, §18,
-  §20): after exchange + verify, the displaced pre-image is retained at
+  §20): after rename-aside + verify, the displaced pre-image is retained at
   `.distill/displaced/<content-hash>` (journal-recorded) for
   `displaced_retention_days` (default 7), removed only by retention
   expiry or `doctor clean` — an in-place writer's post-verification
@@ -8054,7 +8074,7 @@ ordinary §10 dependency kinds.
   the rule. (Refined in R21: the content-hash naming and `.distill/`
   location are superseded — quarantine entries are named by
   journal-assigned intent IDs in per-filesystem daemon-owned quarantine
-  directories, and swap-back-displaced proposed inodes quarantine too,
+  directories, and conflict-restored preimages retain their aside names,
   §14.)
 - **Traces are outcome-bearing** (§9, §13, §15): every `TraceOp`
   records `Observed<T> = Ok(T) | Err(StableFailureFingerprint)` — a
@@ -8321,7 +8341,7 @@ ordinary §10 dependency kinds.
   historical DSTR tag 4 `ToolLaunch` is permanently reserved/rejected, and
   the successful/missing Tool observation is tag 10. The field is `tool_hash`,
   the aggregate DSCT identity; transience is unchanged.)
-- **Deletion is exchange-and-verify too** (§2, §14, §17): whole-bundle
+- **Deletion is rename-aside-and-verify too** (§2, §14, §17): whole-bundle
   deletion was a bare unlink behind a base-version check — exactly the
   TOCTOU the replacement protocol closes for rewrites. Every deletion
   (Asset CRUD and daemon-initiated) now publishes by journaled rename
@@ -8338,8 +8358,8 @@ ordinary §10 dependency kinds.
   root, one per daemon-owned output directory, identity-excluded from
   scanning as the declared exception to §18's disjointness rule —
   `.distill/` keeps only the journal, which references the physical
-  locations; swap-back-displaced proposed inodes take the same
-  protocol, never unlinked while possibly held open; and the
+  locations; restored preimages retain their aside names under the same
+  protocol; and the
   no-silent-loss claim is restated honestly: every displacement is
   journaled and retained per policy, destroyed only by journaled
   retention expiry or explicit `doctor clean`.
@@ -8621,7 +8641,7 @@ ordinary §10 dependency kinds.
 - **Codegen publication revalidates an outcome-bearing basis** (§20): every
   attempt returns its pinned basis, complete hit/miss/failure trace, and
   proposed batch or typed failure. The coordinator revalidates immediately
-  before trace/result publication and before exchange; mismatch discards the
+  before trace/result publication and before filesystem mutation; mismatch discards the
   whole attempt and requeues, closing discovered-dependency lost wakeups.
 - **Placeholder dependencies are visited to a same-basis fixpoint** (§4,
   §15): each minted placeholder runs through the generated encode visitor and
@@ -8976,9 +8996,10 @@ ordinary §10 dependency kinds.
   only pure metadata snapshot/refresh, authoring inspection, typed diagnostics,
   and immutable CAS fetch — never resolve/build, mutation, subscription,
   pipeline-dependent query, pack roots, or `last_good` substitution.
-- **Windows authored publication is no-replace and crash-total** (§§2, 14,
-  17): a durable rename-aside state machine flushes journal/file/directories at
-  every transition; install and preimage restore are atomic no-replace. Any
+- **Authored publication is no-overwrite and crash-total** (§§2, 14, 17): the
+  supported Unix daemon hosts use one durable rename-aside state machine that
+  flushes journal/file/directories at every transition; install is atomic
+  no-clobber from a daemon temp and restore links from the retained aside. Any
   target that reappears is journaled and conflict-preserved alongside the temp
   and verified aside before stop/retry, and no overwrite primitive conforms.
 - **Bootstrap controls have one closed authority exception** (§§2–3, 5–6,
@@ -9311,8 +9332,9 @@ ordinary §10 dependency kinds.
   adversarial local namespace races are outside the contract. Retained directory
   handles, descriptor-relative traversal, and persisted platform file identities
   are removed. Windows remains a supported cook target, not an implied daemon-host
-  platform promise. R35's fully incremental post-startup workload invariant is
-  unchanged.
+  platform promise. Supported Unix daemon hosts use §14's single standard-API
+  rename-aside protocol; there is no separate exchange/Windows publication
+  implementation. R35's fully incremental post-startup workload invariant is unchanged.
 <!-- R37_LEDGER_END -->
 
 ### Open — remaining

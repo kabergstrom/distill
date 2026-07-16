@@ -330,7 +330,8 @@ impl AuthoringBackend for RecordingAuthoringBackend {
         let payload = match operation {
             LongRunningOp::RenameWithFixups(payload)
             | LongRunningOp::DiskMigration(payload)
-            | LongRunningOp::Doctor(payload) => payload.clone(),
+            | LongRunningOp::Doctor(payload)
+            | LongRunningOp::SchemaTransition(payload) => payload.clone(),
         };
         Ok(PreparedOperationCommit::immediate(
             Commit::default(),
@@ -1531,7 +1532,13 @@ async fn wire_rejects_wrong_hash_and_uuid_widths_as_typed_results() {
 async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
     LocalSet::new()
         .run_until(async {
-            let server = server();
+            let backend = Arc::new(RecordingAuthoringBackend::default());
+            let server = Server::new_with_authoring_backend(
+                StoreInstanceId([9; 16]),
+                vec![target()],
+                backend.clone(),
+            )
+            .unwrap();
             let required = SchemaAcceptanceRequired {
                 manifest: SchemaManifestBasis {
                     manifest_hash: ContentHash([41; 32]),
@@ -1573,6 +1580,52 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
                     PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(observed)
                 ) if observed == required
             ));
+
+            let metadata = match client.metadata(PROTOCOL_VERSION).await.unwrap() {
+                RemoteMetadataOutcome::Connected { hub, .. } => hub,
+                _ => panic!("expected unbound metadata capability"),
+            };
+            let mut transition = metadata.schema_transition_request();
+            transition.get().set_base(1);
+            transition
+                .get()
+                .set_payload(b"metadata-schema-transition-cas");
+            let transition = transition.send().promise.await.unwrap();
+            let progress = match transition
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::progress_call::Which::Success(progress) => progress.unwrap(),
+                _ => panic!("expected schema-transition progress capability"),
+            };
+            for expected in [
+                schema::AuthoringProgressState::Started,
+                schema::AuthoringProgressState::Running,
+                schema::AuthoringProgressState::Completed,
+            ] {
+                let event = progress.next_request().send().promise.await.unwrap();
+                assert_eq!(
+                    event
+                        .get()
+                        .unwrap()
+                        .get_progress()
+                        .unwrap()
+                        .get_state()
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(server.current_stamp().version, InputVersion(2));
+            assert_eq!(
+                *backend.operations.lock().unwrap(),
+                vec![LongRunningOp::SchemaTransition(Arc::from(
+                    &b"metadata-schema-transition-cas"[..]
+                ))]
+            );
 
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
@@ -1750,6 +1803,48 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                     .unwrap(),
                 schema::AuthoringProgressState::Cancelled
             );
+
+            let mut schema_transition = hub.operation_request();
+            schema_transition.get().set_base(4);
+            schema_transition
+                .get()
+                .reborrow()
+                .init_operation()
+                .set_schema_transition(b"schema-transition-cas");
+            let schema_transition = schema_transition.send().promise.await.unwrap();
+            let schema_transition = match schema_transition
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap()
+            {
+                schema::progress_call::Which::Success(progress) => progress.unwrap(),
+                _ => panic!("expected schema-transition progress capability"),
+            };
+            for expected in [
+                schema::AuthoringProgressState::Started,
+                schema::AuthoringProgressState::Running,
+                schema::AuthoringProgressState::Completed,
+            ] {
+                let event = schema_transition
+                    .next_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    event
+                        .get()
+                        .unwrap()
+                        .get_progress()
+                        .unwrap()
+                        .get_state()
+                        .unwrap(),
+                    expected
+                );
+            }
             assert_eq!(backend.imports.lock().unwrap().len(), 1);
             assert_eq!(
                 backend.imports.lock().unwrap()[0].settings.blobs[0].as_ref(),
@@ -1764,6 +1859,7 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 vec![
                     LongRunningOp::Doctor(Arc::from(&b"verify-cas"[..])),
                     LongRunningOp::Doctor(Arc::from(&b"cancel-me"[..])),
+                    LongRunningOp::SchemaTransition(Arc::from(&b"schema-transition-cas"[..])),
                 ]
             );
 

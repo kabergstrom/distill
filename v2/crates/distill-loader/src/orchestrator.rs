@@ -317,6 +317,11 @@ impl EncodeSink for ContainedEncodeSink<'_> {
 
 enum CandidateTerminal {
     Pending,
+    Unchanged {
+        content_hash: ContentHash,
+        type_uuid: TypeUuid,
+        load_deps: Vec<AssetUuid>,
+    },
     Built {
         content_hash: ContentHash,
         fetched: bool,
@@ -873,8 +878,39 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let basis = self.io.begin_sweep();
+        let held = self.held_uuids();
+        let affected = if self.dirty_paths.is_empty() {
+            let current = self.current_graph();
+            let mut affected = self
+                .dirty
+                .intersection(&held)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            loop {
+                let before = affected.len();
+                for (parent, children) in &current {
+                    if affected.contains(parent)
+                        || children.iter().any(|child| affected.contains(child))
+                    {
+                        if held.contains(parent) {
+                            affected.insert(*parent);
+                        }
+                        affected.extend(children.intersection(&held).copied());
+                    }
+                }
+                if affected.len() == before {
+                    break;
+                }
+            }
+            affected
+        } else {
+            // Path resolution can change which UUID a handle owns, so retain
+            // the conservative sweep until the path result identifies the
+            // affected current/new component.
+            held
+        };
         let mut candidates = BTreeMap::new();
-        for uuid in self.held_uuids() {
+        for uuid in affected {
             candidates.insert(
                 uuid,
                 CandidateRecord {
@@ -1162,6 +1198,15 @@ impl<I: LoaderIO> Loader<I> {
                 .get(handle)
                 .is_some_and(|slot| slot.current.is_some())
         });
+        let unchanged = match &result {
+            ResolveResult::Built { content_hash } => self
+                .manifest
+                .get(&uuid)
+                .and_then(|entry| last_good_hash(&entry.state))
+                .filter(|last| last == content_hash)
+                .and_then(|_| self.current_asset_shape(uuid)),
+            _ => None,
+        };
         let Some(candidate) = self
             .sweep
             .as_mut()
@@ -1173,6 +1218,22 @@ impl<I: LoaderIO> Loader<I> {
             ResolveResult::Built { content_hash } => {
                 if candidate.basis != event_basis {
                     self.restart_sweep();
+                    return Ok(());
+                }
+                if let Some((type_uuid, load_deps)) = unchanged {
+                    candidate.terminal = CandidateTerminal::Unchanged {
+                        content_hash,
+                        type_uuid,
+                        load_deps,
+                    };
+                    if let Some(entry) = self.manifest.get_mut(&uuid) {
+                        entry.state = ManifestState::Current { content_hash };
+                    }
+                    for handle in self.handles_for_uuid(uuid) {
+                        if let Some(slot) = self.slots.get_mut(&handle) {
+                            slot.status = LoadStatus::Loaded;
+                        }
+                    }
                     return Ok(());
                 }
                 candidate.terminal = CandidateTerminal::Built {
@@ -1689,7 +1750,27 @@ impl<I: LoaderIO> Loader<I> {
                 _ => {}
             }
         }
-        for (uuid, expected_terminal_types) in dependencies {
+        let current = self.current_graph();
+        let held = self.held_uuids();
+        let mut affected = dependencies.keys().copied().collect::<BTreeSet<_>>();
+        loop {
+            let before = affected.len();
+            for (parent, children) in &current {
+                if affected.contains(parent)
+                    || children.iter().any(|child| affected.contains(child))
+                {
+                    if held.contains(parent) {
+                        affected.insert(*parent);
+                    }
+                    affected.extend(children.intersection(&held).copied());
+                }
+            }
+            if affected.len() == before {
+                break;
+            }
+        }
+        for uuid in affected {
+            let expected_terminal_types = dependencies.remove(&uuid).unwrap_or_default();
             if self.handles_for_uuid(uuid).is_empty() {
                 let (id, lease) = self.new_slot(None, Binding::Direct(uuid))?;
                 if let Some(slot) = self.slots.get_mut(&id) {
@@ -1734,7 +1815,7 @@ impl<I: LoaderIO> Loader<I> {
         {
             return Ok(());
         }
-        let held = self.held_uuids();
+        let held = sweep.candidates.keys().copied().collect::<BTreeSet<_>>();
         let current = self.current_graph();
         let candidates = sweep
             .candidates
@@ -1811,6 +1892,7 @@ impl<I: LoaderIO> Loader<I> {
     fn candidate_complete(&self, candidate: &CandidateRecord) -> bool {
         match &candidate.terminal {
             CandidateTerminal::Pending => false,
+            CandidateTerminal::Unchanged { .. } => true,
             CandidateTerminal::Built {
                 fetched,
                 type_uuid,
@@ -1849,10 +1931,11 @@ impl<I: LoaderIO> Loader<I> {
 
     fn candidate_deps(&self, candidate: &CandidateRecord) -> Vec<AssetUuid> {
         match &candidate.terminal {
+            CandidateTerminal::Unchanged { load_deps, .. } => load_deps.clone(),
             CandidateTerminal::Built {
-                load_deps: Some(value),
+                load_deps: Some(load_deps),
                 ..
-            } => value.clone(),
+            } => load_deps.clone(),
             CandidateTerminal::Deleted {
                 strong_references, ..
             } => strong_references.keys().copied().collect(),
@@ -1862,7 +1945,10 @@ impl<I: LoaderIO> Loader<I> {
 
     fn candidate_outcome(&self, uuid: AssetUuid, candidate: &CandidateRecord) -> CandidateOutcome {
         match &candidate.terminal {
-            CandidateTerminal::Built {
+            CandidateTerminal::Unchanged {
+                type_uuid: actual, ..
+            }
+            | CandidateTerminal::Built {
                 type_uuid: Some(actual),
                 ..
             } if candidate
@@ -1877,7 +1963,8 @@ impl<I: LoaderIO> Loader<I> {
                     ),
                 }
             }
-            CandidateTerminal::Built { content_hash, .. } => CandidateOutcome::Ready {
+            CandidateTerminal::Unchanged { content_hash, .. }
+            | CandidateTerminal::Built { content_hash, .. } => CandidateOutcome::Ready {
                 content_hash: *content_hash,
             },
             CandidateTerminal::Failed(error) => CandidateOutcome::Failed {
@@ -1901,6 +1988,13 @@ impl<I: LoaderIO> Loader<I> {
         members: Vec<AssetUuid>,
         storage: &mut dyn AssetStorage,
     ) -> Result<(), LoaderError> {
+        if members.iter().all(|uuid| {
+            sweep.candidates.get(uuid).is_some_and(|candidate| {
+                matches!(candidate.terminal, CandidateTerminal::Unchanged { .. })
+            })
+        }) {
+            return Ok(());
+        }
         let adoption = self.mint_adoption()?;
         let mut updates = Vec::new();
         for uuid in members {
@@ -2006,6 +2100,7 @@ impl<I: LoaderIO> Loader<I> {
                     }
                 }
                 CandidateTerminal::Pending
+                | CandidateTerminal::Unchanged { .. }
                 | CandidateTerminal::Failed(_)
                 | CandidateTerminal::Missing
                 | CandidateTerminal::Built { .. } => {}
@@ -2181,7 +2276,9 @@ impl<I: LoaderIO> Loader<I> {
     }
 
     fn restart_sweep(&mut self) {
-        self.dirty.extend(self.held_uuids());
+        if let Some(sweep) = &self.sweep {
+            self.dirty.extend(sweep.candidates.keys().copied());
+        }
         self.abandon_sweep();
     }
 
@@ -2196,6 +2293,24 @@ impl<I: LoaderIO> Loader<I> {
             }
         }
         graph
+    }
+
+    fn current_asset_shape(&self, uuid: AssetUuid) -> Option<(TypeUuid, Vec<AssetUuid>)> {
+        let handles = self.handles_for_uuid(uuid);
+        if handles.is_empty() {
+            return None;
+        }
+        let mut type_uuid = None;
+        let mut load_deps = BTreeSet::new();
+        for handle in handles {
+            let current = self.slots.get(&handle)?.current.as_ref()?;
+            if type_uuid.is_some_and(|observed| observed != current.type_uuid) {
+                return None;
+            }
+            type_uuid = Some(current.type_uuid);
+            load_deps.extend(current.load_deps.iter().copied());
+        }
+        Some((type_uuid?, load_deps.into_iter().collect()))
     }
 
     fn held_uuids(&self) -> BTreeSet<AssetUuid> {
@@ -2302,7 +2417,10 @@ fn destroy_candidate_values(terminal: CandidateTerminal) {
         CandidateTerminal::Built { values, .. } | CandidateTerminal::Deleted { values, .. } => {
             values
         }
-        CandidateTerminal::Pending | CandidateTerminal::Failed(_) | CandidateTerminal::Missing => {
+        CandidateTerminal::Pending
+        | CandidateTerminal::Unchanged { .. }
+        | CandidateTerminal::Failed(_)
+        | CandidateTerminal::Missing => {
             return;
         }
     };

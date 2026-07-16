@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -255,6 +255,7 @@ CREATE TABLE write_intents (
     proposed_hash   BLOB NOT NULL,
     rename_aside_state INTEGER NOT NULL DEFAULT 0
         CHECK (rename_aside_state IN (0, 1, 2, 3, 4, 5, 6, 7)),
+    terminal_success INTEGER CHECK (terminal_success IN (0, 1)),
     retired         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE displaced (
@@ -272,8 +273,9 @@ CREATE TABLE displaced (
 );
 CREATE TABLE publication_groups (
     group_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        INTEGER NOT NULL CHECK (kind IN (1, 2, 3, 4, 5, 6)),
+    kind        INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 8),
     basis       BLOB NOT NULL,
+    state       INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
     retired     INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
 );
 CREATE TABLE publication_group_children (
@@ -490,6 +492,29 @@ impl Store {
         input_txn.txn.commit()?;
         self.input_version = version.0;
         Ok((out, version))
+    }
+
+    /// Run the same exact-basis validation surface as an input transaction,
+    /// then roll every database mutation back. Coordinators use this before a
+    /// journaled filesystem swap when the authoritative store transition is
+    /// intentionally checked a second time in the publishing transaction.
+    pub fn preview_input_transaction<T, F>(&mut self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
+    {
+        let base_stamp = self.stamp();
+        let version = InputVersion(self.input_version + 1);
+        let state_path = self.config.state_path.clone();
+        let txn = self.conn.transaction()?;
+        let mut input_txn = InputTxn {
+            txn,
+            base_stamp,
+            version,
+            state_path,
+        };
+        let out = f(&mut input_txn)?;
+        input_txn.txn.rollback()?;
+        Ok(out)
     }
 
     /// Attach memo state to an input basis without advancing any input

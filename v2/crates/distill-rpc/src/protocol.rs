@@ -14,7 +14,7 @@ pub use distill_store::state::{
 };
 pub use distill_store::RetiredTypeReference;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -575,6 +575,7 @@ pub enum LongRunningOp {
     RenameWithFixups(Arc<[u8]>),
     DiskMigration(Arc<[u8]>),
     Doctor(Arc<[u8]>),
+    SchemaTransition(Arc<[u8]>),
 }
 
 /// Canonical request carried by [`LongRunningOp::RenameWithFixups`].  The
@@ -604,6 +605,30 @@ pub enum DoctorRequest {
     /// sweep.
     Clean,
     RebuildIndexes,
+}
+
+/// Canonical request carried by [`LongRunningOp::SchemaTransition`]. Every
+/// action repeats the complete manifest and pending-candidate basis reported
+/// by [`SchemaAcceptanceRequired`], so a command cannot be consumed by a
+/// different manifest revision or staged module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaTransitionRequest {
+    pub manifest: SchemaManifestBasis,
+    pub candidate: PipelineCandidateIdentity,
+    pub type_uuid: TypeUuid,
+    pub action: SchemaTransitionAction,
+}
+
+/// The four explicit schema-authority transitions. Ordinary acceptance and
+/// rollback name the exact candidate digest to select. Retirement additionally
+/// carries the metadata/control snapshot that established its negative proof;
+/// reactivation selects the named pending candidate's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaTransitionAction {
+    Accept { requested: LogicalHash },
+    Rollback { target: LogicalHash },
+    Retire { control_basis: SnapshotStamp },
+    Reactivate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,10 +731,137 @@ impl DoctorRequest {
     }
 }
 
+impl SchemaTransitionRequest {
+    pub fn encode(&self) -> Result<Arc<[u8]>, OperationPayloadError> {
+        distill_core::target_set::CanonicalTargetSet::from_canonical(
+            self.candidate.target_set.rows.clone(),
+        )
+        .map_err(|_| OperationPayloadError::NonCanonicalOrder)?;
+        let cursor_count = u32::try_from(self.manifest.current_cursors.len())
+            .map_err(|_| OperationPayloadError::CountOverflow)?;
+        let target_count = u32::try_from(self.candidate.target_set.rows.len())
+            .map_err(|_| OperationPayloadError::CountOverflow)?;
+
+        let mut bytes = vec![1, self.action.tag()];
+        bytes.extend_from_slice(&self.manifest.manifest_hash.0);
+        bytes.extend_from_slice(&cursor_count.to_le_bytes());
+        for (type_uuid, logical_hash) in &self.manifest.current_cursors {
+            bytes.extend_from_slice(&type_uuid.0);
+            bytes.extend_from_slice(&logical_hash.0);
+        }
+        bytes.extend_from_slice(&self.candidate.dylib_hash);
+        bytes.extend_from_slice(&target_count.to_le_bytes());
+        for target in &self.candidate.target_set.rows {
+            encode_operation_text_checked(&mut bytes, &target.name)?;
+            bytes.extend_from_slice(&target.target_definition_hash);
+        }
+        bytes.extend_from_slice(&self.type_uuid.0);
+        match self.action {
+            SchemaTransitionAction::Accept { requested } => bytes.extend_from_slice(&requested.0),
+            SchemaTransitionAction::Rollback { target } => bytes.extend_from_slice(&target.0),
+            SchemaTransitionAction::Retire { control_basis } => {
+                bytes.extend_from_slice(&control_basis.instance.0);
+                bytes.extend_from_slice(&control_basis.version.0.to_le_bytes());
+            }
+            SchemaTransitionAction::Reactivate => {}
+        }
+        Ok(Arc::from(bytes))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
+        let mut reader = OperationPayloadReader::new(bytes)?;
+        let action_tag = reader.u8()?;
+        let manifest_hash = ContentHash(reader.array()?);
+        let cursor_count =
+            usize::try_from(reader.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
+        if cursor_count > reader.remaining() / 48 {
+            return Err(OperationPayloadError::CountOverflow);
+        }
+        let mut current_cursors = BTreeMap::new();
+        let mut prior_type_uuid = None;
+        for _ in 0..cursor_count {
+            let type_uuid = TypeUuid(reader.array()?);
+            if prior_type_uuid.is_some_and(|prior| prior >= type_uuid) {
+                return Err(OperationPayloadError::NonCanonicalOrder);
+            }
+            let logical_hash = LogicalHash(reader.array()?);
+            current_cursors.insert(type_uuid, logical_hash);
+            prior_type_uuid = Some(type_uuid);
+        }
+
+        let dylib_hash = reader.array()?;
+        let target_count =
+            usize::try_from(reader.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
+        if target_count > reader.remaining() / 36 {
+            return Err(OperationPayloadError::CountOverflow);
+        }
+        let mut target_rows = Vec::with_capacity(target_count);
+        for _ in 0..target_count {
+            target_rows.push(distill_core::target_set::TargetSetRow {
+                name: reader.text()?,
+                target_definition_hash: reader.array()?,
+            });
+        }
+        let target_set = distill_core::target_set::CanonicalTargetSet::from_canonical(target_rows)
+            .map_err(|_| OperationPayloadError::NonCanonicalOrder)?;
+        let type_uuid = TypeUuid(reader.array()?);
+        let action = match action_tag {
+            1 => SchemaTransitionAction::Accept {
+                requested: LogicalHash(reader.array()?),
+            },
+            2 => SchemaTransitionAction::Rollback {
+                target: LogicalHash(reader.array()?),
+            },
+            3 => SchemaTransitionAction::Retire {
+                control_basis: SnapshotStamp {
+                    instance: StoreInstanceId(reader.array()?),
+                    version: InputVersion(reader.u64()?),
+                },
+            },
+            4 => SchemaTransitionAction::Reactivate,
+            tag => return Err(OperationPayloadError::InvalidTag(tag)),
+        };
+        reader.finish()?;
+        Ok(Self {
+            manifest: SchemaManifestBasis {
+                manifest_hash,
+                current_cursors,
+            },
+            candidate: PipelineCandidateIdentity {
+                dylib_hash,
+                target_set,
+            },
+            type_uuid,
+            action,
+        })
+    }
+}
+
+impl SchemaTransitionAction {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Accept { .. } => 1,
+            Self::Rollback { .. } => 2,
+            Self::Retire { .. } => 3,
+            Self::Reactivate => 4,
+        }
+    }
+}
+
 fn encode_operation_text(bytes: &mut Vec<u8>, text: &str) {
     let len = u32::try_from(text.len()).expect("operation text exceeds the RPC message limit");
     bytes.extend_from_slice(&len.to_le_bytes());
     bytes.extend_from_slice(text.as_bytes());
+}
+
+fn encode_operation_text_checked(
+    bytes: &mut Vec<u8>,
+    text: &str,
+) -> Result<(), OperationPayloadError> {
+    let len = u32::try_from(text.len()).map_err(|_| OperationPayloadError::CountOverflow)?;
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+    Ok(())
 }
 
 struct OperationPayloadReader<'a> {
@@ -757,6 +909,10 @@ impl<'a> OperationPayloadReader<'a> {
 
     fn u32(&mut self) -> Result<u32, OperationPayloadError> {
         Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, OperationPayloadError> {
+        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn text(&mut self) -> Result<String, OperationPayloadError> {

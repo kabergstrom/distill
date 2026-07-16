@@ -11,20 +11,29 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_bundle::{Bundle, EntryLineageV1};
-use distill_core::bootstrap::is_bootstrap_control_type;
+use distill_core::bootstrap::{
+    is_bootstrap_control_type, MIGRATION_TYPE_UUID, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID,
+};
 use distill_core::canonical::CanonicalEncoder;
-use distill_core::id::ContentHash;
+use distill_core::id::{ContentHash, LogicalHash};
+use distill_core::lineage::AcceptedSchemaEpoch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AuthoringProgressEvent, AuthoringProgressState, BuildRequest, Commit, DeferredOperation,
     DeferredOperationResult, DiskMigrationRequest, DoctorRequest, InputVersion, LongRunningOp,
-    PreparedOperationCommit, RenameWithFixupsRequest, RpcFailure,
+    PreparedOperationCommit, RenameWithFixupsRequest, RpcFailure, SchemaTransitionAction,
+    SchemaTransitionRequest,
 };
 use distill_schema::ngp_schema::SchemaNode;
 use distill_store::journal::{
     CreationRecoveryOutcome, DeletionRecoveryOutcome, JournalIntentPlan, PublicationGroupKind,
     RenameAsideOutcome,
 };
+use distill_store::pipeline::{
+    AcceptedTypeLineage, ReverseMigrationEdge, SchemaLineageManifest, TypeAuthorityState,
+    VerifiedSchemaLineageManifest,
+};
+use distill_store::state::PipelineState;
 use distill_store::Store;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
@@ -32,7 +41,7 @@ use crate::build::CurrentLoadService;
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
 use crate::lineage_repair::{plan_same_dir_temp, unique_sibling, write_planned_temp};
 use crate::pipeline_map::PipelineProjection;
-use crate::quarantine::QuarantineDriver;
+use crate::quarantine::{material_recovery_diagnostic, QuarantineDriver};
 use crate::scanner::RootedScanner;
 
 impl AuthoringService {
@@ -105,6 +114,13 @@ impl AuthoringService {
                     request,
                     build_requests,
                 }
+            }
+            LongRunningOp::SchemaTransition(payload) => {
+                let request = SchemaTransitionRequest::decode(payload)
+                    .map_err(|error| invalid(error.to_string()))?;
+                PlannedOperation::SchemaTransition(Box::new(
+                    self.plan_schema_transition(base, request)?,
+                ))
             }
         };
         let running_payload = operation_summary(&planned);
@@ -383,6 +399,124 @@ impl AuthoringService {
             distill_bundle::write_bundle(&bundle).map_err(|error| error.to_string())?,
         )))
     }
+
+    fn plan_schema_transition(
+        &self,
+        base: InputVersion,
+        request: SchemaTransitionRequest,
+    ) -> Result<PlannedSchemaTransition, RpcFailure> {
+        let coordinator = self
+            .tag_index_coordinator()
+            .ok_or_else(|| invalid("schema-transition coordinator is unavailable"))?;
+        let candidate_digest = coordinator
+            .pending_schema_digest(&request.candidate, request.type_uuid)
+            .map_err(invalid)?;
+        {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            require_base(&store, base)?;
+            if store.schema_manifest_basis().map_err(invalid)?.as_ref() != Some(&request.manifest) {
+                return Err(invalid("schema transition manifest basis is stale"));
+            }
+            let required = match store.pipeline_state().map_err(invalid)? {
+                Some(PipelineState::SchemaAcceptanceRequired { required, .. }) => required,
+                _ => return Err(invalid("no pipeline candidate awaits schema acceptance")),
+            };
+            if required.manifest != request.manifest || required.candidate != request.candidate {
+                return Err(invalid("schema transition candidate basis is stale"));
+            }
+            if let SchemaTransitionAction::Retire { control_basis } = request.action {
+                if control_basis != store.stamp() {
+                    return Err(invalid("schema retirement control snapshot is stale"));
+                }
+            }
+        }
+
+        let snapshot = self
+            .scan_snapshot
+            .lock()
+            .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
+        let claimants = snapshot.lineage_claimants();
+        let [claimant] = claimants.as_slice() else {
+            return Err(invalid(
+                "schema transition requires exactly one lineage-manifest claimant",
+            ));
+        };
+        if ContentHash(claimant.file_hash.0) != request.manifest.manifest_hash {
+            return Err(invalid("lineage-manifest file hash is stale"));
+        }
+        let source = snapshot
+            .bundle_at(&claimant.root_name, &claimant.normalized_path)
+            .ok_or_else(|| invalid("lineage-manifest bundle is absent from the pinned scan"))?;
+        let mut bundle = source
+            .parsed
+            .as_ref()
+            .map_err(|error| invalid(format!("lineage-manifest bundle is invalid: {error}")))?
+            .clone();
+        if bundle.uuid != claimant.bundle {
+            return Err(invalid("lineage-manifest bundle identity changed"));
+        }
+        let entry = bundle
+            .assets
+            .get_mut(&claimant.local_id)
+            .ok_or_else(|| invalid("lineage-manifest entry disappeared"))?;
+        if entry.uuid != claimant.asset || entry.type_uuid != SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
+            return Err(invalid("lineage-manifest claimant identity changed"));
+        }
+        let current = crate::coordinator::decode_lineage_manifest(
+            &entry.data,
+            request.manifest.manifest_hash,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let next = proposed_schema_manifest(&current, &request, candidate_digest)?;
+        let proposed_data = encode_schema_manifest(&next);
+        entry.data = proposed_data.clone();
+        let proposed_bytes = distill_bundle::write_bundle(&bundle).map_err(invalid)?;
+        let proposed_hash = ContentHash(*blake3::hash(&proposed_bytes).as_bytes());
+        let proposed = crate::coordinator::decode_lineage_manifest(&proposed_data, proposed_hash)
+            .map_err(|error| invalid(error.to_string()))?;
+        let target = self
+            .scanner
+            .physical_path(&claimant.root_name, &claimant.normalized_path)
+            .map_err(invalid)?;
+
+        let mut live_schema_hashes = BTreeSet::new();
+        let mut reverse_edges = BTreeSet::new();
+        for source in snapshot.bundle_rows() {
+            let Ok(bundle) = &source.parsed else {
+                continue;
+            };
+            for migration in bundle
+                .assets
+                .values()
+                .filter(|entry| entry.type_uuid == MIGRATION_TYPE_UUID)
+            {
+                let header = crate::migration_control::decode_header(&migration.data)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if header.target_type_uuid == request.type_uuid {
+                    live_schema_hashes.insert(header.from_hash);
+                    live_schema_hashes.insert(header.to_hash);
+                    reverse_edges.insert((header.from_hash, header.to_hash));
+                }
+            }
+        }
+        drop(snapshot);
+
+        Ok(PlannedSchemaTransition {
+            request,
+            target,
+            preimage: ContentHash(claimant.file_hash.0),
+            proposed_bytes,
+            proposed,
+            live_schema_hashes: live_schema_hashes.into_iter().collect(),
+            reverse_edges: reverse_edges
+                .into_iter()
+                .map(|(from, to)| ReverseMigrationEdge { from, to })
+                .collect(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -407,6 +541,89 @@ enum PlannedOperation {
         request: DoctorRequest,
         build_requests: Result<Vec<BuildRequest>, String>,
     },
+    SchemaTransition(Box<PlannedSchemaTransition>),
+}
+
+pub(crate) struct PlannedSchemaTransition {
+    pub(crate) request: SchemaTransitionRequest,
+    pub(crate) target: PathBuf,
+    pub(crate) preimage: ContentHash,
+    pub(crate) proposed_bytes: Vec<u8>,
+    pub(crate) proposed: VerifiedSchemaLineageManifest,
+    pub(crate) live_schema_hashes: Vec<LogicalHash>,
+    pub(crate) reverse_edges: Vec<ReverseMigrationEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaTransitionJournalBasis {
+    pub(crate) base: InputVersion,
+    pub(crate) target: PathBuf,
+    pub(crate) old_manifest_hash: ContentHash,
+    pub(crate) proposed_manifest_hash: ContentHash,
+}
+
+impl SchemaTransitionJournalBasis {
+    const MAGIC: [u8; 4] = *b"DSST";
+    const VERSION: u8 = 1;
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
+        let target = self
+            .target
+            .to_str()
+            .ok_or_else(|| "schema-transition journal path is not lossless UTF-8".to_owned())?;
+        let target_len = u32::try_from(target.len())
+            .map_err(|_| "schema-transition journal path exceeds u32".to_owned())?;
+        let mut bytes = Vec::with_capacity(4 + 1 + 8 + 32 + 32 + 4 + target.len());
+        bytes.extend_from_slice(&Self::MAGIC);
+        bytes.push(Self::VERSION);
+        bytes.extend_from_slice(&self.base.0.to_le_bytes());
+        bytes.extend_from_slice(&self.old_manifest_hash.0);
+        bytes.extend_from_slice(&self.proposed_manifest_hash.0);
+        bytes.extend_from_slice(&target_len.to_le_bytes());
+        bytes.extend_from_slice(target.as_bytes());
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
+        const PREFIX: usize = 4 + 1 + 8 + 32 + 32 + 4;
+        if bytes.len() < PREFIX || bytes[..4] != Self::MAGIC || bytes[4] != Self::VERSION {
+            return Err("schema-transition journal basis has invalid framing".to_owned());
+        }
+        let base = InputVersion(u64::from_le_bytes(
+            bytes[5..13]
+                .try_into()
+                .expect("schema-transition base is fixed width"),
+        ));
+        let old_manifest_hash = ContentHash(
+            bytes[13..45]
+                .try_into()
+                .expect("schema-transition old hash is fixed width"),
+        );
+        let proposed_manifest_hash = ContentHash(
+            bytes[45..77]
+                .try_into()
+                .expect("schema-transition proposed hash is fixed width"),
+        );
+        let target_len = usize::try_from(u32::from_le_bytes(
+            bytes[77..81]
+                .try_into()
+                .expect("schema-transition target length is fixed width"),
+        ))
+        .map_err(|_| "schema-transition target length overflows usize".to_owned())?;
+        if bytes.len() != PREFIX + target_len {
+            return Err(
+                "schema-transition journal basis has trailing or truncated bytes".to_owned(),
+            );
+        }
+        let target = std::str::from_utf8(&bytes[PREFIX..])
+            .map_err(|_| "schema-transition journal path is not UTF-8".to_owned())?;
+        Ok(Self {
+            base,
+            target: PathBuf::from(target),
+            old_manifest_hash,
+            proposed_manifest_hash,
+        })
+    }
 }
 
 struct DeferredAuthoringOperation {
@@ -429,11 +646,25 @@ impl DeferredOperation for DeferredAuthoringOperation {
                 request,
                 build_requests,
             } => self.runtime.run_doctor(base, *request, build_requests),
+            PlannedOperation::SchemaTransition(planned) => {
+                self.runtime.publish_schema_transition(base, planned)
+            }
         }
     }
 }
 
 impl OperationRuntime {
+    fn publish_schema_transition(
+        &self,
+        base: InputVersion,
+        planned: &PlannedSchemaTransition,
+    ) -> Result<DeferredOperationResult, String> {
+        self.tag_index_coordinator
+            .upgrade()
+            .ok_or_else(|| "schema-transition coordinator stopped".to_owned())?
+            .publish_schema_transition(base, planned, &self.quarantine)
+    }
+
     fn publish_files(
         &self,
         base: InputVersion,
@@ -442,6 +673,9 @@ impl OperationRuntime {
         files: &[OperationFile],
         initial_failures: &[String],
     ) -> Result<DeferredOperationResult, String> {
+        if kind == PublicationGroupKind::DiskMigration {
+            return self.publish_disk_migration_files(base, basis, files, initial_failures);
+        }
         if files.is_empty() {
             return self.advance_empty(
                 base,
@@ -491,6 +725,9 @@ impl OperationRuntime {
                 write_planned_temp(temp, bytes)?;
             }
         }
+        publication
+            .arm_group(group.group_id)
+            .map_err(|error| error.to_string())?;
         let mut failures = initial_failures.to_vec();
         for (file, intent) in files.iter().zip(&group.child_intents) {
             let installed = match (&file.preimage, &file.proposed) {
@@ -536,6 +773,148 @@ impl OperationRuntime {
             commit,
             terminal_error: (!failures.is_empty()).then(|| failures.join("; ")),
         })
+    }
+
+    /// Disk migration is explicitly best-effort per bundle. Each planned
+    /// replacement receives its own journal group so a conflict or local
+    /// publication failure cannot strand later bundles behind an
+    /// operation-wide parent. Every attempted path is rescanned together at
+    /// the original base: conflicts may expose a user edit even when our
+    /// proposal was not installed, while successful replacements still land
+    /// in the one input-version commit returned to RPC.
+    fn publish_disk_migration_files(
+        &self,
+        base: InputVersion,
+        basis: &[u8],
+        files: &[OperationFile],
+        initial_failures: &[String],
+    ) -> Result<DeferredOperationResult, String> {
+        if files.is_empty() {
+            return self.advance_empty(
+                base,
+                (!initial_failures.is_empty()).then(|| initial_failures.join("; ")),
+            );
+        }
+
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "store mutex is poisoned".to_owned())?;
+        require_base(&store, base).map_err(|error| format!("{error:?}"))?;
+        let mut failures = initial_failures.to_vec();
+        let mut attempted_paths = Vec::with_capacity(files.len());
+        for file in files {
+            attempted_paths.push(file.target.clone());
+            match self.publish_one_migration_file(&mut store, basis, file) {
+                Ok(true) => {}
+                Ok(false) => failures.push(format!(
+                    "{} changed concurrently; its observed inode was preserved",
+                    file.target.display()
+                )),
+                Err(error) => {
+                    failures.push(format!(
+                        "{} could not be published: {error}",
+                        file.target.display()
+                    ));
+                    // The failed attempt may have stopped at any journal or
+                    // filesystem state. Reconcile that single-child group to
+                    // a terminal state before admitting the next bundle.
+                    match self.quarantine.admit_publication(&mut store) {
+                        Ok(recovery) => {
+                            if let Some(diagnostic) =
+                                material_recovery_diagnostic(recovery.recovered())
+                            {
+                                failures.push(diagnostic);
+                            }
+                        }
+                        Err(recovery_error) => {
+                            failures.push(format!(
+                                "publication recovery stopped later bundles: {recovery_error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        drop(store);
+
+        let commit = publish_incremental_paths(
+            &self.scanner,
+            &self.scan_snapshot,
+            &attempted_paths,
+            &self.lineage_destination,
+            &self.store,
+            base,
+            &self.pipeline_projection,
+            self.tag_index_coordinator.upgrade().as_deref(),
+        )?;
+        Ok(DeferredOperationResult {
+            commit,
+            terminal_error: (!failures.is_empty()).then(|| failures.join("; ")),
+        })
+    }
+
+    fn publish_one_migration_file(
+        &self,
+        store: &mut Store,
+        basis: &[u8],
+        file: &OperationFile,
+    ) -> Result<bool, String> {
+        let temp = file
+            .proposed
+            .as_ref()
+            .map(|_| plan_same_dir_temp(&file.target))
+            .transpose()?;
+        let plan = JournalIntentPlan {
+            target_path: path_text(&file.target)?,
+            temp_path: temp
+                .as_deref()
+                .map(path_text)
+                .transpose()?
+                .unwrap_or_default(),
+            conflict_path: path_text(&unique_sibling(&file.target, "conflict"))?,
+            pre_image_hash: file.preimage,
+            proposed_hash: file.proposed_hash(),
+        };
+        let mut publication = self
+            .quarantine
+            .admit_publication(store)
+            .map_err(|error| error.to_string())?;
+        let group = publication
+            .record_group(PublicationGroupKind::DiskMigration, basis, &[plan])
+            .map_err(|error| error.to_string())?;
+        if let (Some(bytes), Some(temp)) = (file.proposed.as_deref(), temp.as_deref()) {
+            let parent = temp
+                .parent()
+                .ok_or_else(|| "migration proposal temp has no parent directory".to_owned())?;
+            let metadata = fs::symlink_metadata(parent)
+                .map_err(|error| format!("migration proposal directory changed: {error}"))?;
+            if !metadata.file_type().is_dir() {
+                return Err("migration proposal parent is no longer a directory".to_owned());
+            }
+            write_planned_temp(temp, bytes)?;
+        }
+        publication
+            .arm_group(group.group_id)
+            .map_err(|error| error.to_string())?;
+        let installed = match (&file.preimage, &file.proposed) {
+            (Some(_), Some(_)) => publication
+                .resume_group_replace(group.child_intents[0], &file.target)
+                .map(|outcome| outcome == RenameAsideOutcome::Installed),
+            (Some(_), None) => publication
+                .resume_group_delete(group.child_intents[0], &file.target)
+                .map(|outcome| outcome == DeletionRecoveryOutcome::Deleted),
+            (None, Some(_)) => publication
+                .resume_group_create(group.child_intents[0])
+                .map(|outcome| outcome == CreationRecoveryOutcome::Installed),
+            (None, None) => unreachable!("operation file always changes an inode"),
+        }
+        .map_err(|error| error.to_string())?;
+        publication
+            .retire_group(group.group_id)
+            .map_err(|error| error.to_string())?;
+        Ok(installed)
     }
 
     fn run_doctor(
@@ -758,6 +1137,191 @@ fn rewrite_bundle_path_references(
     Ok(changed)
 }
 
+fn proposed_schema_manifest(
+    current: &VerifiedSchemaLineageManifest,
+    request: &SchemaTransitionRequest,
+    candidate_digest: Option<LogicalHash>,
+) -> Result<SchemaLineageManifest, RpcFailure> {
+    let mut next = current.manifest().clone();
+    match request.action {
+        SchemaTransitionAction::Accept { requested } => {
+            if candidate_digest != Some(requested) {
+                return Err(invalid(
+                    "acceptance digest does not match the pending candidate",
+                ));
+            }
+            match next.types.get_mut(&request.type_uuid) {
+                Some(lineage) => {
+                    if !matches!(lineage.authority, TypeAuthorityState::Active) {
+                        return Err(invalid(
+                            "ordinary acceptance cannot reactivate a retired type",
+                        ));
+                    }
+                    if lineage.epochs.iter().any(|epoch| epoch.digest == requested) {
+                        return Err(invalid("an accepted digest requires explicit rollback"));
+                    }
+                    let parent = lineage.current;
+                    lineage.epochs.push(AcceptedSchemaEpoch {
+                        digest: requested,
+                        forward_parent: Some(parent),
+                    });
+                    lineage.current = u32::try_from(lineage.epochs.len() - 1)
+                        .map_err(|_| invalid("accepted schema history exceeds u32"))?;
+                }
+                None => {
+                    next.types.insert(
+                        request.type_uuid,
+                        AcceptedTypeLineage {
+                            epochs: vec![AcceptedSchemaEpoch {
+                                digest: requested,
+                                forward_parent: None,
+                            }],
+                            current: 0,
+                            authority: TypeAuthorityState::Active,
+                        },
+                    );
+                }
+            }
+        }
+        SchemaTransitionAction::Rollback { target } => {
+            if candidate_digest != Some(target) {
+                return Err(invalid(
+                    "rollback digest does not match the pending candidate",
+                ));
+            }
+            let lineage = next
+                .types
+                .get_mut(&request.type_uuid)
+                .ok_or_else(|| invalid("rollback type has no accepted lineage"))?;
+            let position = lineage
+                .epochs
+                .iter()
+                .position(|epoch| epoch.digest == target)
+                .ok_or_else(|| invalid("rollback target is not accepted"))?;
+            lineage.current =
+                u32::try_from(position).map_err(|_| invalid("rollback target exceeds u32"))?;
+        }
+        SchemaTransitionAction::Retire { .. } => {
+            if candidate_digest.is_some() {
+                return Err(invalid("retirement candidate still includes the type"));
+            }
+            let lineage = next
+                .types
+                .get_mut(&request.type_uuid)
+                .ok_or_else(|| invalid("retirement type has no accepted lineage"))?;
+            lineage.authority = TypeAuthorityState::Retired {
+                retired_from: lineage.current,
+            };
+        }
+        SchemaTransitionAction::Reactivate => {
+            let requested =
+                candidate_digest.ok_or_else(|| invalid("reactivation candidate omits the type"))?;
+            let lineage = next
+                .types
+                .get_mut(&request.type_uuid)
+                .ok_or_else(|| invalid("reactivation type has no retained lineage"))?;
+            if !matches!(lineage.authority, TypeAuthorityState::Retired { .. }) {
+                return Err(invalid("reactivation type is already active"));
+            }
+            match lineage
+                .epochs
+                .iter()
+                .position(|epoch| epoch.digest == requested)
+            {
+                Some(position) => {
+                    lineage.current = u32::try_from(position)
+                        .map_err(|_| invalid("reactivation cursor exceeds u32"))?;
+                }
+                None => {
+                    let parent = lineage.current;
+                    lineage.epochs.push(AcceptedSchemaEpoch {
+                        digest: requested,
+                        forward_parent: Some(parent),
+                    });
+                    lineage.current = u32::try_from(lineage.epochs.len() - 1)
+                        .map_err(|_| invalid("reactivated schema history exceeds u32"))?;
+                }
+            }
+            lineage.authority = TypeAuthorityState::Active;
+        }
+    }
+    Ok(next)
+}
+
+fn encode_schema_manifest(manifest: &SchemaLineageManifest) -> AuthoredValue {
+    AuthoredValue::Object(BTreeMap::from([(
+        "types".to_owned(),
+        AuthoredValue::Array(
+            manifest
+                .types
+                .iter()
+                .map(|(type_uuid, lineage)| {
+                    let authority = match lineage.authority {
+                        TypeAuthorityState::Active => AuthoredValue::Object(BTreeMap::from([(
+                            "Active".to_owned(),
+                            AuthoredValue::Object(BTreeMap::new()),
+                        )])),
+                        TypeAuthorityState::Retired { retired_from } => {
+                            AuthoredValue::Object(BTreeMap::from([(
+                                "Retired".to_owned(),
+                                AuthoredValue::Object(BTreeMap::from([(
+                                    "retired_from".to_owned(),
+                                    AuthoredValue::UInt(u128::from(retired_from)),
+                                )])),
+                            )]))
+                        }
+                    };
+                    AuthoredValue::Array(vec![
+                        authored_bytes(&type_uuid.0),
+                        AuthoredValue::Object(BTreeMap::from([
+                            ("authority".to_owned(), authority),
+                            (
+                                "current".to_owned(),
+                                AuthoredValue::UInt(u128::from(lineage.current)),
+                            ),
+                            (
+                                "epochs".to_owned(),
+                                AuthoredValue::Array(
+                                    lineage
+                                        .epochs
+                                        .iter()
+                                        .map(|epoch| {
+                                            AuthoredValue::Object(BTreeMap::from([
+                                                (
+                                                    "digest".to_owned(),
+                                                    authored_bytes(&epoch.digest.0),
+                                                ),
+                                                (
+                                                    "forward_parent".to_owned(),
+                                                    epoch.forward_parent.map_or(
+                                                        AuthoredValue::Null,
+                                                        |parent| {
+                                                            AuthoredValue::UInt(u128::from(parent))
+                                                        },
+                                                    ),
+                                                ),
+                                            ]))
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                        ])),
+                    ])
+                })
+                .collect(),
+        ),
+    )]))
+}
+
+fn authored_bytes(bytes: &[u8]) -> AuthoredValue {
+    AuthoredValue::Array(
+        bytes
+            .iter()
+            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
+            .collect(),
+    )
+}
+
 fn rewrite_value(
     schema: &SchemaNode,
     value: &mut AuthoredValue,
@@ -903,6 +1467,9 @@ fn operation_summary(operation: &PlannedOperation) -> String {
             failures.len()
         ),
         PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
+        PlannedOperation::SchemaTransition(planned) => {
+            format!("schema transition {:?}", planned.request.action)
+        }
     }
 }
 

@@ -188,6 +188,55 @@ struct ServerOperationCompletion {
     publication: Mutex<Option<PreparedOperationPublication>>,
 }
 
+struct MetadataServerSchemaTransitionCompletion {
+    server: Server,
+    binding: Arc<MetadataBinding>,
+    base: InputVersion,
+    publication: Mutex<Option<PreparedOperationPublication>>,
+}
+
+impl ProgressCompletion for MetadataServerSchemaTransitionCompletion {
+    fn complete(&self) -> Result<(), String> {
+        let publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .ok_or_else(|| "schema transition is already terminal".to_owned())?;
+        let mut state = self.server.lock();
+        if let Some(reason) = metadata_fence(&state, &self.binding) {
+            return Err(format!(
+                "schema transition lost its metadata binding: {reason:?}"
+            ));
+        }
+        if state.current != self.base {
+            return Err(format!(
+                "schema transition lost its input basis: expected {:?}, observed {:?}",
+                self.base, state.current
+            ));
+        }
+        let (commit, terminal_error) = match publication {
+            PreparedOperationPublication::Immediate(commit) => (*commit, None),
+            PreparedOperationPublication::Deferred(operation) => {
+                let completed = operation.complete(self.base)?;
+                (completed.commit, completed.terminal_error)
+            }
+        };
+        commit_locked(&mut state, commit)
+            .map(|_| ())
+            .map_err(|error| format!("schema-transition commit rejected: {error:?}"))?;
+        terminal_error.map_or(Ok(()), Err)
+    }
+
+    fn cancel(&self) -> bool {
+        self.publication
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .is_some()
+    }
+}
+
 impl ProgressCompletion for ServerOperationCompletion {
     fn complete(&self) -> Result<(), String> {
         let publication = self
@@ -2183,6 +2232,67 @@ impl MetadataHub {
             Err(error) => MetadataCall::Error(error),
         }
     }
+
+    /// Execute the one mutation needed to leave
+    /// `SchemaAcceptanceRequired`. This intentionally lives on the unbound
+    /// metadata capability because no target-bound Hub can be acquired while
+    /// that diagnostic is current; it does not expose the general operation
+    /// surface.
+    pub fn schema_transition(
+        &self,
+        base: InputVersion,
+        payload: Arc<[u8]>,
+    ) -> MetadataCall<ProgressStream> {
+        {
+            let state = self.server.lock();
+            if let Some(reason) = metadata_fence(&state, &self.binding) {
+                return MetadataCall::ReconnectRequired { reason };
+            }
+            if state.current != base {
+                return MetadataCall::Error(RpcFailure::StaleInputVersion {
+                    expected: state.current,
+                    got: base,
+                });
+            }
+        }
+
+        let prepared = match self
+            .server
+            .authoring_backend
+            .prepare_operation(base, &LongRunningOp::SchemaTransition(payload))
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return MetadataCall::Error(error),
+        };
+        if let Err(detail) = validate_progress(&prepared.progress) {
+            return MetadataCall::Error(RpcFailure::InvalidAuthoringRequest { detail });
+        }
+
+        {
+            let state = self.server.lock();
+            if let Some(reason) = metadata_fence(&state, &self.binding) {
+                return MetadataCall::ReconnectRequired { reason };
+            }
+            if state.current != base {
+                return MetadataCall::Error(RpcFailure::StaleInputVersion {
+                    expected: state.current,
+                    got: base,
+                });
+            }
+        }
+
+        MetadataCall::Success(ProgressStream {
+            events: prepared.progress.into(),
+            next_sequence: 0,
+            terminal_seen: false,
+            completion: Arc::new(MetadataServerSchemaTransitionCompletion {
+                server: self.server.clone(),
+                binding: self.binding.clone(),
+                base,
+                publication: Mutex::new(Some(prepared.publication)),
+            }),
+        })
+    }
 }
 
 impl MetadataSnapshot {
@@ -2792,7 +2902,7 @@ impl Hub {
                     oldest_available: state.oldest_available_cursor,
                 },
             );
-        } else {
+        } else if first_install {
             let deltas = state
                 .history
                 .iter()
@@ -2808,6 +2918,16 @@ impl Hub {
                     deltas,
                 },
             );
+        } else {
+            let deltas = state
+                .history
+                .iter()
+                .filter(|delta| delta.stamp.version > since && delta.stamp.version <= installed)
+                .filter_map(|delta| filtered_delta(delta, &new_assets, &new_paths, &connection))
+                .collect::<Vec<_>>();
+            for delta in deltas {
+                enqueue_event(&mut connection, StreamEvent::Delta(delta));
+            }
         }
         connection.stream_installed = true;
         if first_install && !state.restart_required_keys.is_empty() {

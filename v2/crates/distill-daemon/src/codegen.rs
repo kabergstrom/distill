@@ -41,6 +41,7 @@ pub struct CodegenService {
     output: Option<OutputDirectory>,
     coordinator: CodegenCoordinator,
     last_attempted: Option<InputVersion>,
+    startup_recovery_diagnostic: Option<String>,
 }
 
 impl CodegenService {
@@ -63,11 +64,12 @@ impl CodegenService {
         } else {
             None
         };
-        let service = Self {
+        let mut service = Self {
             enabled,
             output,
             coordinator: CodegenCoordinator::default(),
             last_attempted: None,
+            startup_recovery_diagnostic: None,
         };
         let retained_output = service
             .output
@@ -92,9 +94,13 @@ impl CodegenService {
             }
         }
         if pending_codegen {
-            service.recover(daemon)?;
+            service.startup_recovery_diagnostic = service.recover(daemon)?;
         }
         Ok(service)
+    }
+
+    pub(crate) fn take_startup_recovery_diagnostic(&mut self) -> Option<String> {
+        self.startup_recovery_diagnostic.take()
     }
 
     /// Run at most once for the current input version. A stale attempt is not
@@ -176,7 +182,7 @@ impl CodegenService {
         }
     }
 
-    fn recover(&self, daemon: &DaemonCoordinator) -> Result<(), String> {
+    fn recover(&self, daemon: &DaemonCoordinator) -> Result<Option<String>, String> {
         let output = self
             .output
             .as_ref()
@@ -192,8 +198,9 @@ impl CodegenService {
         let publication = quarantine
             .admit_codegen_publication(&mut store, &mut filesystem)
             .map_err(|error| error.to_string())?;
+        let diagnostic = crate::quarantine::material_recovery_diagnostic(publication.recovered());
         drop(publication);
-        Ok(())
+        Ok(diagnostic)
     }
 }
 
@@ -408,6 +415,9 @@ impl CodegenWorld<'_> {
                 self.output.write_planned_temp(temp, bytes)?;
             }
         }
+        publication
+            .arm_group(group.group_id)
+            .map_err(|error| error.to_string())?;
         for (change, intent) in changes.iter().zip(&group.child_intents) {
             let installed = match (change.preimage, change.bytes.as_ref()) {
                 (Some(_), Some(_)) => publication
@@ -901,6 +911,28 @@ impl<'a> OutputJournalFilesystem<'a> {
         }
         Ok(())
     }
+
+    fn validate_move_source_and_destination(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError> {
+        self.validate_path(source)
+            .and_then(|()| self.validate_path(destination))
+            .map_err(NoReplaceMoveError::Other)?;
+        let source_metadata = fs::symlink_metadata(source).map_err(|source_error| {
+            NoReplaceMoveError::Other(StoreError::Io {
+                path: source.to_path_buf(),
+                source: source_error,
+            })
+        })?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(NoReplaceMoveError::Other(
+                self.invalid_path(source, "move source is not a real regular file"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl JournalFilesystem for OutputJournalFilesystem<'_> {
@@ -1033,25 +1065,36 @@ impl JournalFilesystem for OutputJournalFilesystem<'_> {
         Ok(())
     }
 
-    fn move_no_replace(
+    fn rename_target_to_reserved(
         &mut self,
         source: &Path,
         destination: &Path,
     ) -> Result<(), NoReplaceMoveError> {
-        self.validate_path(source)
-            .and_then(|()| self.validate_path(destination))
-            .map_err(NoReplaceMoveError::Other)?;
-        let source_metadata = fs::symlink_metadata(source).map_err(|source_error| {
+        self.validate_move_source_and_destination(source, destination)?;
+        match fs::symlink_metadata(destination) {
+            Ok(_) => return Err(NoReplaceMoveError::DestinationExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source_error) => {
+                return Err(NoReplaceMoveError::Other(StoreError::Io {
+                    path: destination.to_path_buf(),
+                    source: source_error,
+                }))
+            }
+        }
+        fs::rename(source, destination).map_err(|source_error| {
             NoReplaceMoveError::Other(StoreError::Io {
-                path: source.to_path_buf(),
+                path: destination.to_path_buf(),
                 source: source_error,
             })
-        })?;
-        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-            return Err(NoReplaceMoveError::Other(
-                self.invalid_path(source, "move source is not a real regular file"),
-            ));
-        }
+        })
+    }
+
+    fn install_temp_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError> {
+        self.validate_move_source_and_destination(source, destination)?;
         match fs::hard_link(source, destination) {
             Ok(()) => fs::remove_file(source).map_err(|source_error| {
                 NoReplaceMoveError::Other(StoreError::Io {
@@ -1068,46 +1111,52 @@ impl JournalFilesystem for OutputJournalFilesystem<'_> {
             })),
         }
     }
+
+    fn remove_daemon_temp(&mut self, path: &Path) -> Result<(), StoreError> {
+        self.validate_path(path)?;
+        let metadata = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(self.invalid_path(path, "proposal temp is not a real regular file"));
+        }
+        fs::remove_file(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn restore_retained_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError> {
+        self.validate_move_source_and_destination(source, destination)?;
+        fs::hard_link(source, destination).map_err(|source_error| {
+            if source_error.kind() == std::io::ErrorKind::AlreadyExists {
+                NoReplaceMoveError::DestinationExists
+            } else {
+                NoReplaceMoveError::Other(StoreError::Io {
+                    path: destination.to_path_buf(),
+                    source: source_error,
+                })
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows { volume: u64, index: u64 },
-    #[cfg(not(any(unix, windows)))]
-    Portable { len: u64, modified_nanos: u128 },
+struct FileIdentity {
+    device: u64,
+    inode: u64,
 }
 
-#[cfg(unix)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
-    FileIdentity::Unix {
+    FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    }
-}
-
-#[cfg(windows)]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt;
-    FileIdentity::Windows {
-        volume: u64::from(metadata.volume_serial_number().unwrap_or(0)),
-        index: metadata.file_index().unwrap_or(0),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos());
-    FileIdentity::Portable {
-        len: metadata.len(),
-        modified_nanos,
     }
 }
 
@@ -1411,6 +1460,116 @@ mod tests {
         assert!(!outside.join("mod.rs").exists());
     }
 
+    #[test]
+    fn pre_temp_crash_abandons_codegen_group_without_publishing_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _scanner, output, quarantine) = publication_world(&temp);
+        let target = output.path.join("mod.rs");
+        let proposal = output.path.join(".mod.proposed");
+        let proposed_hash = ContentHash(*blake3::hash(b"pub mod shader;\n").as_bytes());
+        let group = {
+            let mut store = store.lock().unwrap();
+            let basis = CodegenPublicationBasis::new(
+                store.input_version(),
+                BTreeMap::new(),
+                BTreeMap::from([("mod.rs".to_owned(), proposed_hash)]),
+            );
+            store
+                .record_publication_group(
+                    PublicationGroupKind::Codegen,
+                    &basis.encode(),
+                    &[JournalIntentPlan {
+                        target_path: path_text(&target).unwrap(),
+                        temp_path: path_text(&proposal).unwrap(),
+                        conflict_path: path_text(&unique_sibling(&target, "conflict")).unwrap(),
+                        pre_image_hash: None,
+                        proposed_hash,
+                    }],
+                )
+                .unwrap()
+        };
+
+        let mut store = store.lock().unwrap();
+        let mut filesystem = OutputJournalFilesystem::new(&output);
+        let publication = quarantine
+            .admit_codegen_publication(&mut store, &mut filesystem)
+            .unwrap();
+
+        assert_eq!(publication.recovered().len(), 1);
+        assert_eq!(
+            publication.recovered()[0].outcome,
+            crate::quarantine::RecoveryOutcome::AbandonedUnarmed
+        );
+        drop(publication);
+        assert!(!target.exists());
+        assert!(!proposal.exists());
+        assert!(store.codegen_outputs().unwrap().is_empty());
+        assert!(store.unfinished_publication_groups().unwrap().is_empty());
+        assert_eq!(
+            store
+                .publication_group_child_results(group.group_id)
+                .unwrap()[0]
+                .terminal_success,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn armed_codegen_conflict_retains_previous_ownership_and_reports_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _scanner, output, quarantine) = publication_world(&temp);
+        let target = output.path.join("mod.rs");
+        let proposal = output.path.join(".mod.proposed");
+        fs::write(&target, b"user file\n").unwrap();
+        fs::write(&proposal, b"pub mod shader;\n").unwrap();
+        let proposed_hash = ContentHash(*blake3::hash(b"pub mod shader;\n").as_bytes());
+        let group = {
+            let mut store = store.lock().unwrap();
+            let basis = CodegenPublicationBasis::new(
+                store.input_version(),
+                BTreeMap::new(),
+                BTreeMap::from([("mod.rs".to_owned(), proposed_hash)]),
+            );
+            let group = store
+                .record_publication_group(
+                    PublicationGroupKind::Codegen,
+                    &basis.encode(),
+                    &[JournalIntentPlan {
+                        target_path: path_text(&target).unwrap(),
+                        temp_path: path_text(&proposal).unwrap(),
+                        conflict_path: path_text(&unique_sibling(&target, "conflict")).unwrap(),
+                        pre_image_hash: None,
+                        proposed_hash,
+                    }],
+                )
+                .unwrap();
+            store.arm_publication_group(group.group_id).unwrap();
+            group
+        };
+
+        let mut store = store.lock().unwrap();
+        let mut filesystem = OutputJournalFilesystem::new(&output);
+        let publication = quarantine
+            .admit_codegen_publication(&mut store, &mut filesystem)
+            .unwrap();
+
+        assert!(publication
+            .recovered()
+            .iter()
+            .any(|recovered| recovered.outcome.is_material_failure()));
+        drop(publication);
+        assert_eq!(fs::read(&target).unwrap(), b"user file\n");
+        assert!(store.codegen_outputs().unwrap().is_empty());
+        assert!(store.unfinished_publication_groups().unwrap().is_empty());
+        assert_eq!(
+            store
+                .publication_group_child_results(group.group_id)
+                .unwrap()[0]
+                .terminal_success,
+            Some(false)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn codegen_recovery_rejects_output_path_replacement() {
@@ -1430,7 +1589,7 @@ mod tests {
                 BTreeMap::new(),
                 outputs.clone(),
             );
-            store
+            let group = store
                 .record_publication_group(
                     PublicationGroupKind::Codegen,
                     &basis.encode(),
@@ -1443,6 +1602,7 @@ mod tests {
                     }],
                 )
                 .unwrap();
+            store.arm_publication_group(group.group_id).unwrap();
         }
 
         let retained = temp.path().join("retained-generated");

@@ -165,7 +165,7 @@ fn publication_error_does_not_install_trace_or_partial_state() {
     }
     impl CodegenPublisher<u64> for Failing {
         fn publish(&mut self, _: &u64, _: &[GeneratedFile]) -> Result<(), PublicationError> {
-            Err(PublicationError::new("exchange conflict"))
+            Err(PublicationError::new("publication conflict"))
         }
     }
 

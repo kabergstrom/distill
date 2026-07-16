@@ -464,10 +464,13 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
 }
 
 #[test]
-fn disk_migration_reports_one_bundle_failure_and_still_rewrites_later_bundles() {
+fn disk_migration_temp_failure_does_not_block_later_bundles() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
-    std::fs::create_dir_all(&assets).unwrap();
+    let failing_dir = assets.join("first");
+    let migrating_dir = assets.join("second");
+    std::fs::create_dir_all(&failing_dir).unwrap();
+    std::fs::create_dir_all(&migrating_dir).unwrap();
     let old_schema = LogicalSchema {
         root: SchemaNode::Struct {
             rev: 0,
@@ -495,11 +498,11 @@ fn disk_migration_reports_one_bundle_failure_and_still_rewrites_later_bundles() 
     let failing_bytes = bundle(
         failing_bundle,
         AssetUuid([89; 16]),
-        REF_TYPE,
+        VALUE_TYPE,
         old_schema.clone(),
         object([("value", AuthoredValue::UInt(3))]),
     );
-    std::fs::write(assets.join("failing.bundle"), &failing_bytes).unwrap();
+    std::fs::write(failing_dir.join("failing.bundle"), &failing_bytes).unwrap();
 
     let mut migrating = distill_bundle::parse_bundle(&bundle(
         migrating_bundle,
@@ -519,7 +522,7 @@ fn disk_migration_reports_one_bundle_failure_and_still_rewrites_later_bundles() 
     migrating.schemas.extend(migration.schemas);
     migrating.assets.extend(migration.assets);
     std::fs::write(
-        assets.join("migrating.bundle"),
+        migrating_dir.join("migrating.bundle"),
         distill_bundle::write_bundle(&migrating).unwrap(),
     )
     .unwrap();
@@ -594,14 +597,22 @@ fn disk_migration_reports_one_bundle_failure_and_still_rewrites_later_bundles() 
             &LongRunningOp::DiskMigration(request.encode().unwrap()),
         )
         .unwrap();
+    // Remove the first proposal's parent after read-only planning. Creating
+    // its same-directory temp now fails before the group is armed. The
+    // original bytes remain safely named in the backup directory, and the
+    // independent second group must still publish and commit.
+    let failing_backup = temp.path().join("first-backup");
+    std::fs::rename(&failing_dir, &failing_backup).unwrap();
     let completed = complete(prepared.publication, base);
     let terminal_error = completed
         .terminal_error
         .as_deref()
         .expect("the failed bundle is reported");
-    assert!(terminal_error.contains(&failing_bundle.to_string()));
     assert!(terminal_error.contains("failing.bundle"));
-    assert!(terminal_error.contains("has no accepted lineage"));
+    assert!(
+        terminal_error.contains("could not be published"),
+        "unexpected terminal error: {terminal_error}"
+    );
     assert!(!terminal_error.contains(&migrating_bundle.to_string()));
     coordinator
         .server()
@@ -609,15 +620,20 @@ fn disk_migration_reports_one_bundle_failure_and_still_rewrites_later_bundles() 
         .unwrap();
 
     assert_eq!(
-        std::fs::read(assets.join("failing.bundle")).unwrap(),
+        std::fs::read(failing_backup.join("failing.bundle")).unwrap(),
         failing_bytes
     );
+    assert!(!failing_dir.join("failing.bundle").exists());
     let failed = distill_bundle::parse_bundle(&failing_bytes).unwrap();
     assert_eq!(failed.assets["entry"].schema_hash, old_hash);
-    let migrated =
-        distill_bundle::parse_bundle(&std::fs::read(assets.join("migrating.bundle")).unwrap())
-            .unwrap();
-    assert_eq!(migrated.assets["entry"].schema_hash, new_hash);
+    let migrated = distill_bundle::parse_bundle(
+        &std::fs::read(migrating_dir.join("migrating.bundle")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        migrated.assets["entry"].schema_hash, new_hash,
+        "later bundle was not installed; terminal error: {terminal_error}"
+    );
     assert_eq!(
         migrated.assets["entry"].data,
         object([("value", AuthoredValue::UInt(42))])

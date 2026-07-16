@@ -501,6 +501,111 @@ fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
 }
 
 #[test]
+fn unchanged_delta_cuts_off_before_fetch_and_does_not_sweep_unrelated_assets() {
+    let token = ModuleEpochToken::new(2);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 2, &token);
+    let changed = uuid(2);
+    let unrelated = uuid(3);
+    let changed_handle = loader.add_ref::<A>(changed).unwrap();
+    let unrelated_handle = loader.add_ref::<B>(unrelated).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (changed_hash, changed_artifact) = artifact::<A>(changed, &[]);
+    let (unrelated_hash, unrelated_artifact) = artifact::<B>(unrelated, &[]);
+    resolve(&mut loader, changed, changed_hash);
+    resolve(&mut loader, unrelated, unrelated_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, changed_hash, changed_artifact);
+    fetched(&mut loader, unrelated_hash, unrelated_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.updates.len(), 2);
+
+    let resolve_count = |loader: &Loader<MockIo>, asset| {
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == asset))
+            .count()
+    };
+    let fetches_before = loader
+        .io()
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::Fetch(..)))
+        .count();
+    let changed_resolves_before = resolve_count(&loader, changed);
+    let unrelated_resolves_before = resolve_count(&loader, unrelated);
+
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: vec![(changed, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(resolve_count(&loader, changed), changed_resolves_before + 1);
+    assert_eq!(
+        resolve_count(&loader, unrelated),
+        unrelated_resolves_before,
+        "a disconnected held asset must not enter the affected sweep"
+    );
+
+    resolve(&mut loader, changed, changed_hash);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Fetch(..)))
+            .count(),
+        fetches_before,
+        "a held content hash is an early cutoff before fetch"
+    );
+    assert_eq!(storage.updates.len(), 2);
+    assert_eq!(storage.commits.len(), 2);
+    assert_eq!(loader.status(&changed_handle), LoadStatus::Loaded);
+    assert_eq!(loader.status(&unrelated_handle), LoadStatus::Loaded);
+
+    let changed_resolves_before_drift = resolve_count(&loader, changed);
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(2),
+        assets: vec![(changed, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    let (stale_req, stale_basis) = loader.io().resolve_for(changed);
+    let fresh_basis = basis_with(10);
+    loader.io_mut().basis = fresh_basis.clone();
+    loader.io_mut().push(IoEvent::Resolved {
+        req: stale_req,
+        uuid: changed,
+        result: ResolveResult::Drifted {
+            input: distill_loader::DriftedInput::Asset(changed),
+            current: stamp(3),
+        },
+        basis: stale_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        resolve_count(&loader, changed),
+        changed_resolves_before_drift + 2
+    );
+    assert_eq!(loader.io().resolve_for(changed).1, fresh_basis);
+    assert_eq!(
+        resolve_count(&loader, unrelated),
+        unrelated_resolves_before,
+        "drift retry must preserve the affected sweep instead of dirtying every held asset"
+    );
+    assert!(!loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { members, .. } if members.contains(&unrelated)
+    )));
+}
+
+#[test]
 fn strong_reference_cycle_is_rejected_before_any_member_is_adopted() {
     let token = ModuleEpochToken::new(40);
     let mut loader = Loader::new(mock_io());

@@ -1,0 +1,771 @@
+use std::collections::BTreeMap;
+use std::mem::{align_of, size_of};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
+use distill_build::keys::target_definition_hash;
+use distill_build::query::AssetQuery;
+use distill_build::trace::PackDefinitionControlValue;
+use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
+use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
+use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
+use distill_daemon::config::DaemonConfig;
+use distill_daemon::process::DaemonProcess;
+use distill_json::AuthoredValue;
+use distill_loader::{
+    AdoptionId, AssetStorage, GameModuleEpoch, HandleId, LoadStatus, Loader, LoaderDiagnostic,
+    PendingState, PendingToken, RpcIo, StorageError, UpdateResult,
+};
+use distill_pack::builder::{build_publish_and_activate_pack, PackBuildTarget};
+use distill_pack::{PackfileIO, RuntimeTarget as PackRuntimeTarget};
+use distill_rpc::{
+    AuthoringBackend, AuthoringValue, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
+    TargetDefinitionHash,
+};
+use distill_schema::ngp_schema::{
+    Field, FieldAttrs, FieldIdentifier, FieldLayout, LayoutIdentity, PrimitiveType, Schema,
+    SchemaLayouts, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
+};
+use distill_schema::ProjectSchemaAuthority;
+use distill_store::state::PipelineState;
+use distill_wire::native::CallbackPanic;
+
+const SETTINGS_TYPE: TypeUuid = TypeUuid([0x90; 16]);
+const TEXTURE_SOURCE_TYPE: TypeUuid = TypeUuid([0x91; 16]);
+const MESH_SOURCE_TYPE: TypeUuid = TypeUuid([0x92; 16]);
+const SHADER_SOURCE_TYPE: TypeUuid = TypeUuid([0x93; 16]);
+const COOKED_ASSET_TYPE: TypeUuid = TypeUuid([0x94; 16]);
+
+#[derive(Default)]
+#[distill_asset_macro::asset(uuid = "94949494-9494-9494-9494-949494949494")]
+struct CookedAsset {
+    value: String,
+}
+
+#[derive(Default)]
+struct Storage {
+    values: BTreeMap<(HandleId, AdoptionId), ErasedValue>,
+    updates: Vec<(HandleId, AdoptionId)>,
+    commits: Vec<(HandleId, AdoptionId)>,
+}
+
+impl AssetStorage for Storage {
+    fn update(
+        &mut self,
+        _type_uuid: TypeUuid,
+        handle: HandleId,
+        value: ErasedValue,
+        adoption: AdoptionId,
+    ) -> Result<UpdateResult, StorageError> {
+        self.updates.push((handle, adoption));
+        self.values.insert((handle, adoption), value);
+        Ok(UpdateResult::Ready)
+    }
+
+    fn poll(&mut self, _token: PendingToken) -> PendingState {
+        PendingState::Ready
+    }
+
+    fn commit(&mut self, _type_uuid: TypeUuid, handle: HandleId, adoption: AdoptionId) {
+        self.commits.push((handle, adoption));
+    }
+
+    fn free(
+        &mut self,
+        _type_uuid: TypeUuid,
+        handle: HandleId,
+        adoption: AdoptionId,
+    ) -> Result<(), CallbackPanic> {
+        if let Some(value) = self.values.remove(&(handle, adoption)) {
+            value.destroy()?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
+    let module = build_pipeline_fixture();
+    let source_identity = fixture_source_identity(&module);
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(assets.join("shaders")).unwrap();
+    std::fs::write(assets.join("pixel.ppm"), b"P6\n1 1\n255\n\xff\x00\x00").unwrap();
+    std::fs::write(
+        assets.join("triangle.obj"),
+        b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+    )
+    .unwrap();
+    std::fs::write(
+        assets.join("shaders/basic.glsl"),
+        b"#include \"shaders/common.inc\"\nvoid main() {}\n",
+    )
+    .unwrap();
+    std::fs::write(assets.join("shaders/common.inc"), b"const int VALUE = 1;\n").unwrap();
+
+    let schema = fixture_schema(source_identity);
+    let authority = ProjectSchemaAuthority::from_schema(schema.clone(), [0x51; 32]).unwrap();
+    assert_eq!(
+        authority
+            .project_type(COOKED_ASSET_TYPE)
+            .unwrap()
+            .logical_hash,
+        CookedAsset::descriptor().logical_hash,
+        "the fixture schema and typed game runtime must describe the same value",
+    );
+    std::fs::write(
+        temp.path().join("schema.json"),
+        serde_json::to_vec(&schema).unwrap(),
+    )
+    .unwrap();
+    write_lineage_manifest(&assets, &authority);
+    write_schema_seed(&assets, &authority);
+    let config = write_config(&temp, &module, authority.identity());
+    let process = DaemonProcess::start(config).unwrap();
+    let pipeline_state = process
+        .coordinator()
+        .store()
+        .lock()
+        .unwrap()
+        .pipeline_state()
+        .unwrap();
+    assert!(
+        matches!(pipeline_state, Some(PipelineState::Ready(_))),
+        "fixture pipeline did not become ready: {pipeline_state:?}"
+    );
+
+    let [texture, mesh, shader] = import_assets(&process, &assets);
+
+    let target = process.coordinator().build_target("dev").unwrap();
+    let target_hash = target_definition_hash(&target);
+    let request = ConnectRequest::new("dev", TargetDefinitionHash(target_hash));
+
+    let mut live_loader =
+        Loader::new(RpcIo::connect(process.rpc_address(), request.clone()).unwrap());
+    register_runtime(&mut live_loader, target_hash, 1);
+    let texture_handle = live_loader.add_ref::<CookedAsset>(texture).unwrap();
+    let mesh_handle = live_loader.add_ref::<CookedAsset>(mesh).unwrap();
+    let shader_handle = live_loader.add_ref::<CookedAsset>(shader).unwrap();
+    let mut live_storage = Storage::default();
+    wait_for_loads(
+        &mut live_loader,
+        &mut live_storage,
+        [&texture_handle, &mesh_handle, &shader_handle],
+    );
+    let baseline_updates = settle_loader(&mut live_loader, &mut live_storage);
+    let baseline_commits = live_storage.commits.len();
+    assert_eq!(baseline_updates, 3);
+    assert_eq!(baseline_commits, 3);
+
+    let old_texture_hash = resolved_hash(process.coordinator().server().root(), &request, texture);
+    let old_mesh_hash = resolved_hash(process.coordinator().server().root(), &request, mesh);
+    let old_shader_hash = resolved_hash(process.coordinator().server().root(), &request, shader);
+    let include_path = assets.join("shaders/common.inc");
+    std::fs::write(&include_path, b"const int VALUE = 2;\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let updated = std::fs::read(assets.join("game-assets.bundle"))
+            .ok()
+            .and_then(|bytes| distill_bundle::parse_bundle(&bytes).ok())
+            .is_some_and(|reimported| {
+                matches!(
+                    &reimported.assets["shader"].data,
+                    AuthoredValue::Object(fields)
+                        if matches!(fields.get("value"), Some(AuthoredValue::Str(value)) if value.contains("VALUE = 2"))
+                )
+            });
+        if updated {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native watcher did not trigger shader-include reimport"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let new_texture_hash = resolved_hash(process.coordinator().server().root(), &request, texture);
+    let new_mesh_hash = resolved_hash(process.coordinator().server().root(), &request, mesh);
+    let new_shader_hash = resolved_hash(process.coordinator().server().root(), &request, shader);
+    assert_eq!(old_texture_hash, new_texture_hash);
+    assert_eq!(old_mesh_hash, new_mesh_hash);
+    assert_ne!(old_shader_hash, new_shader_hash);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_storage.commits.len() == baseline_commits {
+        live_loader.process(&mut live_storage).unwrap();
+        if Instant::now() >= deadline {
+            panic!(
+                "live typed loader did not adopt the shader-only update: diagnostics={:?}",
+                live_loader.take_diagnostics()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(live_storage.updates.len(), 4);
+    assert_eq!(live_storage.commits.len(), 4);
+    assert_eq!(live_storage.updates[3].0, shader_handle.id());
+    assert_eq!(live_storage.commits[3].0, shader_handle.id());
+    assert_ne!(live_storage.updates[3].0, texture_handle.id());
+    assert_ne!(live_storage.updates[3].0, mesh_handle.id());
+    assert_eq!(live_loader.status(&texture_handle), LoadStatus::Loaded);
+    assert_eq!(live_loader.status(&mesh_handle), LoadStatus::Loaded);
+    assert_eq!(live_loader.status(&shader_handle), LoadStatus::Loaded);
+    let diagnostics = live_loader.take_diagnostics();
+    assert!(!diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { members, .. }
+            if members.contains(&texture) || members.contains(&mesh)
+    )));
+
+    let hub = match process
+        .coordinator()
+        .server()
+        .root()
+        .connect(request.clone())
+    {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("pack connection failed: {other:?}"),
+    };
+    let snapshot = hub.snapshot().success().unwrap();
+    let definition = PackDefinitionControlValue {
+        roots: [texture, mesh, shader]
+            .into_iter()
+            .map(|uuid| AssetQuery {
+                uuid: Some(uuid),
+                ..AssetQuery::default()
+            })
+            .collect(),
+        target: "dev".into(),
+        zstd_level: 1,
+        include_path_table: true,
+    };
+    let pack_dir = tempfile::tempdir().unwrap();
+    let output = build_publish_and_activate_pack(
+        pack_dir.path(),
+        &definition,
+        &PackBuildTarget {
+            name: "dev".into(),
+            definition_hash: target_hash,
+        },
+        "game-assets-smoke",
+        &snapshot,
+        &hub,
+    )
+    .unwrap();
+    assert_eq!(output.manifest.assets.len(), 3);
+
+    let pack_io = PackfileIO::mount_current(
+        pack_dir.path(),
+        &PackRuntimeTarget {
+            target: "dev".into(),
+            target_def_hash: target_hash,
+        },
+    )
+    .unwrap();
+    let mut pack_loader = Loader::new(pack_io);
+    register_runtime(&mut pack_loader, target_hash, 2);
+    let packed_texture = pack_loader.add_ref::<CookedAsset>(texture).unwrap();
+    let packed_mesh = pack_loader.add_ref::<CookedAsset>(mesh).unwrap();
+    let packed_shader = pack_loader.add_ref::<CookedAsset>(shader).unwrap();
+    let mut pack_storage = Storage::default();
+    wait_for_loads(
+        &mut pack_loader,
+        &mut pack_storage,
+        [&packed_texture, &packed_mesh, &packed_shader],
+    );
+    assert_eq!(pack_storage.commits.len(), 3);
+}
+
+fn register_runtime<I: distill_loader::LoaderIO>(
+    loader: &mut Loader<I>,
+    target_hash: [u8; 32],
+    epoch: u64,
+) {
+    loader
+        .register_types(
+            GameModuleEpoch(epoch),
+            ModuleEpochToken::new(epoch),
+            target_hash,
+            &[CookedAsset::descriptor()],
+        )
+        .unwrap();
+}
+
+fn wait_for_loads<I: distill_loader::LoaderIO>(
+    loader: &mut Loader<I>,
+    storage: &mut Storage,
+    handles: [&distill_loader::Handle<CookedAsset>; 3],
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        loader.process(storage).unwrap();
+        if handles
+            .iter()
+            .all(|handle| loader.status(handle) == LoadStatus::Loaded)
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let statuses = handles
+                .iter()
+                .map(|handle| loader.status(handle))
+                .collect::<Vec<_>>();
+            panic!(
+                "assets did not reach typed adoption: statuses={statuses:?}, target={:?}, diagnostics={:?}",
+                loader.target_binding_state(),
+                loader.take_diagnostics()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn settle_loader<I: distill_loader::LoaderIO>(
+    loader: &mut Loader<I>,
+    storage: &mut Storage,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stable_since = Instant::now();
+    let mut observed = storage.updates.len();
+    loop {
+        loader.process(storage).unwrap();
+        if storage.updates.len() != observed {
+            observed = storage.updates.len();
+            stable_since = Instant::now();
+        }
+        if Instant::now().duration_since(stable_since) >= Duration::from_millis(100) {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live loader did not reach a quiescent baseline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn resolved_hash(
+    root: distill_rpc::Root,
+    request: &ConnectRequest,
+    asset: AssetUuid,
+) -> ContentHash {
+    let hub = match root.connect(request.clone()) {
+        ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("resolve connection failed: {other:?}"),
+    };
+    let snapshot = hub.snapshot().success().unwrap();
+    match snapshot.resolve(asset).success().unwrap().value {
+        ResolveResult::Built { content_hash } => content_hash,
+        other => panic!("asset did not build: {other:?}"),
+    }
+}
+
+fn import_assets(process: &DaemonProcess, assets: &Path) -> [AssetUuid; 3] {
+    let coordinator = process.coordinator();
+    let base = coordinator.server().current_stamp().version;
+    let backend = Arc::clone(coordinator.authoring_service());
+    coordinator
+        .server()
+        .coordinated_commit(base, || {
+            let prepared = backend
+                .prepare_import(
+                    base,
+                    &ImportRequest {
+                        importer: "fixture-game-assets".into(),
+                        sources: vec![
+                            "pixel.ppm".into(),
+                            "triangle.obj".into(),
+                            "shaders/basic.glsl".into(),
+                        ],
+                        dest: "game-assets.bundle".into(),
+                        settings: AuthoringValue {
+                            canonical_value: Arc::from(&b"{\"value\":0}"[..]),
+                            blobs: Vec::new(),
+                        },
+                        watch: true,
+                        root: "main".into(),
+                    },
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            Ok(prepared.commit)
+        })
+        .unwrap();
+    let bundle =
+        distill_bundle::parse_bundle(&std::fs::read(assets.join("game-assets.bundle")).unwrap())
+            .unwrap();
+    [
+        bundle.assets["texture"].uuid,
+        bundle.assets["mesh"].uuid,
+        bundle.assets["shader"].uuid,
+    ]
+}
+
+fn build_pipeline_fixture() -> PathBuf {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap();
+    let target_dir = workspace.join("target/game-assets-pipeline-fixture");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(workspace)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .args([
+            "build",
+            "--offline",
+            "-p",
+            "distill-game-assets-pipeline-fixture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    target_dir
+        .join("debug")
+        .join(if cfg!(target_os = "windows") {
+            "distill_game_assets_pipeline_fixture.dll"
+        } else if cfg!(target_os = "macos") {
+            "libdistill_game_assets_pipeline_fixture.dylib"
+        } else {
+            "libdistill_game_assets_pipeline_fixture.so"
+        })
+}
+
+fn fixture_source_identity(module: &Path) -> (String, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let staged =
+        ngp_module_host::stage_copy_to(module, &temp.path().join(module.file_name().unwrap()))
+            .unwrap();
+    // SAFETY: this exact test fixture was compiled immediately above from the
+    // current workspace and is opened only to read its bounded identity export.
+    let library = unsafe { ngp_module_host::HostedLibrary::open(staged) }.unwrap();
+    // SAFETY: the fixture derives the shared source-identity export contract.
+    let identity = unsafe { ngp_module_host::read_source_identity(&library) }.unwrap();
+    library.close();
+    (identity.crate_name, identity.source_hash)
+}
+
+fn fixture_schema(source_identity: (String, String)) -> Schema {
+    let mut types = vec![TypeDef {
+        id: SchemaTypeId(0),
+        kind: PrimitiveType::U8,
+        path: type_path("core", "u8"),
+        uuid: None,
+        attrs: TypeAttrs::default(),
+        fields: Vec::new(),
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        has_default: true,
+    }];
+    types.push(TypeDef {
+        id: SchemaTypeId(1),
+        kind: PrimitiveType::Struct,
+        path: type_path("game_assets_fixture", "FixtureSettings"),
+        uuid: Some(SETTINGS_TYPE),
+        attrs: TypeAttrs {
+            build_only: true,
+            ..TypeAttrs::default()
+        },
+        fields: vec![Field {
+            id: FieldIdentifier::Name("value".into()),
+            type_id: SchemaTypeId(0),
+            attrs: FieldAttrs::default(),
+        }],
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        has_default: true,
+    });
+    types.push(TypeDef {
+        id: SchemaTypeId(2),
+        kind: PrimitiveType::String,
+        path: type_path("alloc", "String"),
+        uuid: None,
+        attrs: TypeAttrs::default(),
+        fields: Vec::new(),
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        has_default: true,
+    });
+    for (index, (name, uuid, build_only)) in [
+        ("TextureSource", TEXTURE_SOURCE_TYPE, false),
+        ("MeshSource", MESH_SOURCE_TYPE, false),
+        ("ShaderSource", SHADER_SOURCE_TYPE, false),
+        ("CookedAsset", COOKED_ASSET_TYPE, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        types.push(TypeDef {
+            id: SchemaTypeId(index + 3),
+            kind: PrimitiveType::Struct,
+            path: type_path("game_assets_fixture", name),
+            uuid: Some(uuid),
+            attrs: TypeAttrs {
+                build_only,
+                ..TypeAttrs::default()
+            },
+            fields: vec![Field {
+                id: FieldIdentifier::Name("value".into()),
+                type_id: SchemaTypeId(2),
+                attrs: FieldAttrs::default(),
+            }],
+            generic_parameters: Vec::new(),
+            generic_argument_ids: Vec::new(),
+            has_default: true,
+        });
+    }
+    let string_layout = TypeLayout {
+        size: Some(size_of::<String>() as u64),
+        align: Some(align_of::<String>() as u64),
+        layout_complete: true,
+        tag_encoding: None,
+        fields: Vec::new(),
+    };
+    let struct_layout = TypeLayout {
+        size: Some(size_of::<CookedAsset>() as u64),
+        align: Some(align_of::<CookedAsset>() as u64),
+        layout_complete: true,
+        tag_encoding: None,
+        fields: vec![FieldLayout {
+            offset: Some(std::mem::offset_of!(CookedAsset, value) as u64),
+            field_size: Some(size_of::<String>() as u64),
+        }],
+    };
+    Schema {
+        source_hashes: BTreeMap::from([source_identity]),
+        types,
+        layouts: vec![SchemaLayouts {
+            identity: host_layout_identity(),
+            layouts: std::iter::once(scalar_layout(1, 1))
+                .chain(std::iter::once(TypeLayout {
+                    size: Some(1),
+                    align: Some(1),
+                    layout_complete: true,
+                    tag_encoding: None,
+                    fields: vec![FieldLayout {
+                        offset: Some(0),
+                        field_size: Some(1),
+                    }],
+                }))
+                .chain(std::iter::once(string_layout))
+                .chain(std::iter::repeat_n(struct_layout, 4))
+                .collect(),
+        }],
+    }
+}
+
+fn scalar_layout(size: u64, align: u64) -> TypeLayout {
+    TypeLayout {
+        size: Some(size),
+        align: Some(align),
+        layout_complete: true,
+        tag_encoding: None,
+        fields: Vec::new(),
+    }
+}
+
+fn type_path(krate: &str, name: &str) -> TypePath {
+    TypePath {
+        name: Some(name.into()),
+        containing_type: None,
+        modules: Vec::new(),
+        krate: krate.into(),
+    }
+}
+
+fn host_layout_identity() -> LayoutIdentity {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        other => panic!("unsupported test architecture {other}"),
+    };
+    let target_triple = match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        other => panic!("unsupported test OS {other}"),
+    };
+    LayoutIdentity {
+        target_triple,
+        rustc: "rustc game-assets-e2e".into(),
+        algorithm_version: 1,
+    }
+}
+
+fn write_lineage_manifest(assets: &Path, authority: &ProjectSchemaAuthority) {
+    let row = BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
+        .unwrap();
+    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    let types = authority
+        .project_types()
+        .iter()
+        .map(|(type_uuid, project)| {
+            AuthoredValue::Array(vec![
+                bytes(&type_uuid.0),
+                AuthoredValue::Object(BTreeMap::from([
+                    (
+                        "authority".into(),
+                        AuthoredValue::Object(BTreeMap::from([(
+                            "Active".into(),
+                            AuthoredValue::Object(BTreeMap::new()),
+                        )])),
+                    ),
+                    ("current".into(), AuthoredValue::UInt(0)),
+                    (
+                        "epochs".into(),
+                        AuthoredValue::Array(vec![AuthoredValue::Object(BTreeMap::from([
+                            ("digest".into(), bytes(&project.logical_hash.0)),
+                            ("forward_parent".into(), AuthoredValue::Null),
+                        ]))]),
+                    ),
+                ])),
+            ])
+        })
+        .collect();
+    let bundle = Bundle {
+        format_version: 1,
+        uuid: BundleUuid([0xa1; 16]),
+        primary: None,
+        schemas: BTreeMap::from([(row.logical_hash, schema)]),
+        assets: BTreeMap::from([(
+            "manifest".into(),
+            AssetEntry {
+                uuid: AssetUuid([0xa2; 16]),
+                type_uuid: row.type_uuid,
+                schema_hash: row.logical_hash,
+                lineage: EntryLineageV1::Bootstrap {
+                    bundle_format_version: 1,
+                },
+                authoring_only: true,
+                data: AuthoredValue::Object(BTreeMap::from([(
+                    "types".into(),
+                    AuthoredValue::Array(types),
+                )])),
+            },
+        )]),
+    };
+    let path = assets.join("schema/schema-lineage.bundle");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, distill_bundle::write_bundle(&bundle).unwrap()).unwrap();
+}
+
+fn write_schema_seed(assets: &Path, authority: &ProjectSchemaAuthority) {
+    let mut schemas = BTreeMap::new();
+    let mut entries = BTreeMap::new();
+    for (index, (type_uuid, project)) in authority.project_types().iter().enumerate() {
+        schemas.insert(project.logical_hash, project.logical_schema.clone());
+        let epochs = vec![AcceptedSchemaEpoch {
+            digest: project.logical_hash,
+            forward_parent: None,
+        }];
+        entries.insert(
+            format!("schema-{index}"),
+            AssetEntry {
+                uuid: AssetUuid([0xb0 + index as u8; 16]),
+                type_uuid: *type_uuid,
+                schema_hash: project.logical_hash,
+                lineage: EntryLineageV1::Manifest(LineageStamp {
+                    chain: lineage_chain_digest(*type_uuid, &epochs, 0),
+                    epochs,
+                    cursor: 0,
+                }),
+                authoring_only: true,
+                data: if *type_uuid == SETTINGS_TYPE {
+                    AuthoredValue::Object(BTreeMap::from([(
+                        "value".into(),
+                        AuthoredValue::UInt(0),
+                    )]))
+                } else {
+                    AuthoredValue::Object(BTreeMap::from([(
+                        "value".into(),
+                        AuthoredValue::Str(String::new()),
+                    )]))
+                },
+            },
+        );
+    }
+    let bundle = Bundle {
+        format_version: 1,
+        uuid: BundleUuid([0xaf; 16]),
+        primary: None,
+        schemas,
+        assets: entries,
+    };
+    std::fs::write(
+        assets.join("schema/project-schema-cache.bundle"),
+        distill_bundle::write_bundle(&bundle).unwrap(),
+    )
+    .unwrap();
+}
+
+fn bytes(bytes: &[u8]) -> AuthoredValue {
+    AuthoredValue::Array(
+        bytes
+            .iter()
+            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
+            .collect(),
+    )
+}
+
+fn write_config(
+    temp: &tempfile::TempDir,
+    module: &Path,
+    identity: &LayoutIdentity,
+) -> DaemonConfig {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "linux",
+        "windows" => "windows",
+        other => panic!("unsupported test OS {other}"),
+    };
+    let config = format!(
+        r#"
+[daemon]
+address = "127.0.0.1:0"
+state_path = "{}"
+[assets]
+roots = {{ main = "{}" }}
+schema_path = "{}"
+lineage_manifest = {{ root = "main", path = "schema/schema-lineage.bundle" }}
+[modules]
+pipeline_dylib = "{}"
+[targets.dev]
+os = "{}"
+arch = "{}"
+apis = ["vulkan"]
+optimize = false
+[codegen]
+rs_mod_path = "{}"
+auto_codegen = false
+[pipeline]
+parallelism = 2
+max_dependency_depth = 64
+batch_reserved_workers = 1
+[cas]
+segment_size = "1MiB"
+cache_limit = "16MiB"
+"#,
+        temp.path().join("state").display(),
+        temp.path().join("assets").display(),
+        temp.path().join("schema.json").display(),
+        module.display(),
+        os,
+        std::env::consts::ARCH,
+        temp.path().join("generated").display(),
+    );
+    assert_eq!(&host_layout_identity(), identity);
+    let path = temp.path().join("distill.toml");
+    std::fs::write(&path, config).unwrap();
+    DaemonConfig::load(path).unwrap()
+}

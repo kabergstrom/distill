@@ -243,6 +243,93 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
 }
 
 #[test]
+fn rpc_io_accepts_multiple_asset_subscriptions_on_one_delta_stream() {
+    let Fixture {
+        server,
+        request,
+        asset: first,
+        ..
+    } = fixture();
+    let second = AssetUuid([9; 16]);
+    server
+        .commit(Commit {
+            assets: vec![AssetMutation::Set {
+                uuid: second,
+                resolution: StoredResolve::Deleted,
+                delta: AssetDeltaState::Deleted,
+            }],
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let first = listener.accept_one().await.unwrap();
+            let second = listener.accept_one().await.unwrap();
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        });
+    });
+
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    io.bind_target(target);
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+
+    io.subscribe(first);
+    io.subscribe(second);
+    // This synchronous command is queued after both subscriptions and proves
+    // that both installs completed before the live commit below.
+    io.begin_sweep();
+    server
+        .commit(Commit {
+            assets: vec![
+                AssetMutation::Set {
+                    uuid: first,
+                    resolution: StoredResolve::Deleted,
+                    delta: AssetDeltaState::Changed,
+                },
+                AssetMutation::Set {
+                    uuid: second,
+                    resolution: StoredResolve::Deleted,
+                    delta: AssetDeltaState::Restored,
+                },
+            ],
+            ..Commit::default()
+        })
+        .unwrap();
+
+    let events = poll_until(&mut io, 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        IoEvent::Delta { assets, .. }
+            if assets == &vec![
+                (first, distill_loader::AssetDeltaState::Changed),
+                (second, distill_loader::AssetDeltaState::Restored),
+            ]
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, IoEvent::ConnectionError { .. })));
+
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
     let Fixture {
         server,

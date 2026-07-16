@@ -14,7 +14,7 @@ use crate::bundles::blob32;
 use crate::db::Store;
 use crate::error::StoreError;
 
-/// Durable lower bound for §14's Windows rename-aside fallback.
+/// Durable lower bound for §14's rename-aside publication protocol.
 ///
 /// Every filesystem transition is preceded by the journaled `*Journaled`
 /// state and followed by a directory sync before its `*Durable` state is
@@ -52,8 +52,8 @@ impl RenameAsideState {
     }
 }
 
-/// Terminal or deliberately stopped result of the Windows no-replace
-/// fallback. `RetryRequired` means every observed object remains at a path
+/// Terminal or deliberately stopped result of the no-overwrite rename-aside
+/// protocol. `RetryRequired` means every observed object remains at a path
 /// named by the unretired intent; no overwrite was attempted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameAsideOutcome {
@@ -85,6 +85,7 @@ pub struct WriteIntent {
     pub proposed_hash: ContentHash,
     pub quarantine_paths: Vec<PathBuf>,
     pub rename_aside_state: RenameAsideState,
+    pub terminal_success: Option<bool>,
     pub retired: bool,
 }
 
@@ -120,6 +121,14 @@ pub enum PublicationGroupKind {
     DiskMigration = 5,
     Codegen = 6,
     SchemaRepair = 7,
+    SchemaTransition = 8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum PublicationGroupState {
+    Unarmed = 0,
+    Armed = 1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +147,15 @@ pub struct PublicationGroup {
     /// Canonical operation-specific basis, retained in full rather than only
     /// by digest so startup diagnostics can name every promised pre-image.
     pub basis: Vec<u8>,
+    pub state: PublicationGroupState,
     pub child_intents: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationChildResult {
+    pub intent_id: i64,
+    pub target_path: String,
+    pub terminal_success: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -151,7 +168,8 @@ struct RenameAsideIntent {
     state: RenameAsideState,
 }
 
-/// Result class for a journal filesystem's no-replace move primitive.
+/// Result class for a journal filesystem mutation that may not clobber its
+/// destination.
 pub enum NoReplaceMoveError {
     DestinationExists,
     Other(StoreError),
@@ -176,7 +194,27 @@ pub trait JournalFilesystem {
         source: &Path,
         destination_dir: &Path,
     ) -> Result<(), StoreError>;
-    fn move_no_replace(
+    /// Atomically move a user-visible target to a journal-reserved unique
+    /// aside or conflict path. The trusted-workspace contract makes the
+    /// reserved destination private to this journal intent.
+    fn rename_target_to_reserved(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError>;
+    /// Install a daemon-owned proposal temp without clobbering a target that
+    /// appeared after planning. The source is safe to unlink after linking.
+    fn install_temp_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError>;
+    /// Remove a still-named daemon proposal after recovery proves that the
+    /// same proposed bytes were already installed at the target.
+    fn remove_daemon_temp(&mut self, path: &Path) -> Result<(), StoreError>;
+    /// Restore a retained preimage without clobbering a reappeared target.
+    /// The retained source remains named in quarantine after the link.
+    fn restore_retained_no_replace(
         &mut self,
         source: &Path,
         destination: &Path,
@@ -201,7 +239,7 @@ impl Store {
         }
         let txn = self.conn.transaction()?;
         txn.execute(
-            "INSERT INTO publication_groups(kind, basis, retired) VALUES (?1, ?2, 0)",
+            "INSERT INTO publication_groups(kind, basis, state, retired) VALUES (?1, ?2, 0, 0)",
             rusqlite::params![kind as i64, basis],
         )?;
         let group_id = txn.last_insert_rowid();
@@ -232,13 +270,14 @@ impl Store {
             group_id,
             kind,
             basis: basis.to_vec(),
+            state: PublicationGroupState::Unarmed,
             child_intents,
         })
     }
 
     pub fn unfinished_publication_groups(&self) -> Result<Vec<PublicationGroup>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT group_id, kind, basis FROM publication_groups
+            "SELECT group_id, kind, basis, state FROM publication_groups
              WHERE retired = 0 ORDER BY group_id",
         )?;
         let rows = stmt
@@ -247,11 +286,12 @@ impl Store {
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut groups = Vec::with_capacity(rows.len());
-        for (group_id, raw_kind, basis) in rows {
+        for (group_id, raw_kind, basis, raw_state) in rows {
             let kind = match raw_kind {
                 1 => PublicationGroupKind::LineageCreate,
                 2 => PublicationGroupKind::LineageDuplicate,
@@ -260,10 +300,21 @@ impl Store {
                 5 => PublicationGroupKind::DiskMigration,
                 6 => PublicationGroupKind::Codegen,
                 7 => PublicationGroupKind::SchemaRepair,
+                8 => PublicationGroupKind::SchemaTransition,
                 _ => {
                     return Err(StoreError::BadIntent {
                         intent_id: group_id,
                         detail: format!("publication group has unknown kind {raw_kind}"),
+                    })
+                }
+            };
+            let state = match raw_state {
+                0 => PublicationGroupState::Unarmed,
+                1 => PublicationGroupState::Armed,
+                _ => {
+                    return Err(StoreError::BadIntent {
+                        intent_id: group_id,
+                        detail: format!("publication group has unknown state {raw_state}"),
                     })
                 }
             };
@@ -284,10 +335,84 @@ impl Store {
                 group_id,
                 kind,
                 basis,
+                state,
                 child_intents,
             });
         }
         Ok(groups)
+    }
+
+    /// Make a complete proposal set executable only after every non-empty
+    /// proposal temp has been written and fsynced by the caller.
+    pub fn arm_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE publication_groups SET state = 1
+             WHERE group_id = ?1 AND state = 0 AND retired = 0",
+            [group_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::BadIntent {
+                intent_id: group_id,
+                detail: "publication group is missing, retired, or already armed".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// An unarmed group has performed no child mutation. Retire every child
+    /// as an abandoned attempt in one durable transaction, including children
+    /// such as deletions that do not have a proposal temp.
+    pub fn abort_unarmed_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
+        let transaction = self.conn.transaction()?;
+        let state: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT state, retired FROM publication_groups WHERE group_id = ?1",
+                [group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if state != Some((PublicationGroupState::Unarmed as i64, 0)) {
+            return Err(StoreError::BadIntent {
+                intent_id: group_id,
+                detail: "only an unfinished unarmed publication group may be aborted".into(),
+            });
+        }
+        transaction.execute(
+            "UPDATE write_intents SET terminal_success = 0, retired = 1
+             WHERE intent_id IN (
+                 SELECT intent_id FROM publication_group_children WHERE group_id = ?1
+             ) AND retired = 0",
+            [group_id],
+        )?;
+        transaction.execute(
+            "UPDATE publication_groups SET retired = 1 WHERE group_id = ?1",
+            [group_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn publication_group_child_results(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<PublicationChildResult>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT w.intent_id, w.target_path, w.terminal_success
+             FROM publication_group_children c
+             JOIN write_intents w ON w.intent_id = c.intent_id
+             WHERE c.group_id = ?1 ORDER BY c.ordinal",
+        )?;
+        let rows = statement
+            .query_map([group_id], |row| {
+                Ok(PublicationChildResult {
+                    intent_id: row.get(0)?,
+                    target_path: row.get(1)?,
+                    terminal_success: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        rows
     }
 
     /// Retire a parent only after every named child reached a terminal durable
@@ -295,6 +420,20 @@ impl Store {
     /// healed input version; retirement merely proves no filesystem work is
     /// left implicit.
     pub fn retire_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
+        let state: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT state FROM publication_groups WHERE group_id = ?1 AND retired = 0",
+                [group_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if state != Some(PublicationGroupState::Armed as i64) {
+            return Err(StoreError::BadIntent {
+                intent_id: group_id,
+                detail: "only an armed publication group may retire normally".into(),
+            });
+        }
         let pending: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM publication_group_children c
              JOIN write_intents w ON w.intent_id = c.intent_id
@@ -322,140 +461,59 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_intent(
-        &mut self,
-        target_path: &str,
-        temp_path: &str,
-        conflict_path: &str,
-        pre_image_hash: Option<ContentHash>,
-        proposed_hash: ContentHash,
-    ) -> Result<i64, StoreError> {
-        self.conn.execute(
-            "INSERT INTO write_intents(target_path, temp_path, conflict_path,
-                                       pre_image_hash, proposed_hash, retired)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-            rusqlite::params![
-                target_path,
-                temp_path,
-                conflict_path,
-                pre_image_hash.as_ref().map(|h| h.0.as_slice()),
-                proposed_hash.0.as_slice(),
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    fn ensure_unretired_intent(&self, intent_id: i64) -> Result<(), StoreError> {
-        let exists: Option<i64> = self
+    fn ensure_intent_group_armed(&self, intent_id: i64) -> Result<(), StoreError> {
+        let state: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM write_intents WHERE intent_id = ?1 AND retired = 0",
+                "SELECT g.state FROM publication_group_children c
+                 JOIN publication_groups g ON g.group_id = c.group_id
+                 WHERE c.intent_id = ?1 AND g.retired = 0",
                 [intent_id],
-                |r| r.get(0),
+                |row| row.get(0),
             )
             .optional()?;
-        if exists.is_none() {
+        if state != Some(PublicationGroupState::Armed as i64) {
             return Err(StoreError::BadIntent {
                 intent_id,
-                detail: "no unretired intent with this id".to_owned(),
+                detail: "publication child has no unfinished armed parent group".into(),
             });
         }
         Ok(())
     }
 
-    /// Journal then move one displaced inode into the caller's
-    /// same-filesystem quarantine directory. A second displacement under
-    /// one intent receives a numeric suffix (swap-back's proposed inode).
-    pub fn quarantine_displaced(
-        &mut self,
-        intent_id: i64,
-        displaced_file: &Path,
-        quarantine_dir: &Path,
-    ) -> Result<PathBuf, StoreError> {
-        self.ensure_unretired_intent(intent_id)?;
-        let io = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source: std::io::Error| StoreError::Io { path, source }
-        };
-        std::fs::create_dir_all(quarantine_dir).map_err(io(quarantine_dir))?;
-        ensure_same_filesystem(displaced_file, quarantine_dir)?;
-        let bytes = std::fs::read(displaced_file).map_err(io(displaced_file))?;
-        let hash = ContentHash(*blake3::hash(&bytes).as_bytes());
-        let ordinal: u32 = self.conn.query_row(
-            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM displaced WHERE intent_id = ?1",
-            [intent_id],
-            |r| r.get(0),
-        )?;
-        let name = if ordinal == 0 {
-            format!("intent-{intent_id}")
-        } else {
-            format!("intent-{intent_id}-{ordinal}")
-        };
-        let qpath = quarantine_dir.join(name);
-        if qpath.exists() {
-            return Err(StoreError::BadIntent {
-                intent_id,
-                detail: format!("quarantine destination already exists: {}", qpath.display()),
-            });
-        }
-        let now = now_secs();
-        // The physical destination is durable journal state before the
-        // rename. A crash after this row is exactly an unfinished intent
-        // for startup reconciliation to classify.
-        self.conn.execute(
-            "INSERT INTO displaced(intent_id, ordinal, content_hash, origin_path,
-                                   quarantine_path, quarantined_at, restored)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            rusqlite::params![
-                intent_id,
-                ordinal,
-                hash.0.as_slice(),
-                displaced_file.to_string_lossy(),
-                qpath.to_string_lossy(),
-                now,
-            ],
-        )?;
-        std::fs::rename(displaced_file, &qpath).map_err(io(&qpath))?;
-        crate::cas::manifest::fsync_dir(quarantine_dir)?;
-        Ok(qpath)
-    }
-
-    /// Execute or resume the portable no-replace replacement state machine.
+    /// Execute or resume the supported-Unix rename-aside replacement state machine.
     /// Every move preserves a destination that appeared after the basis CAS;
     /// the exact pre-image and any raced target remain journal-addressable.
+    #[cfg(unix)]
     pub fn publish_journaled_replacement(
         &mut self,
         intent_id: i64,
         quarantine_dir: &Path,
     ) -> Result<RenameAsideOutcome, StoreError> {
-        #[cfg(windows)]
-        let mut filesystem = WindowsRenameAsideFs;
-        #[cfg(not(windows))]
+        self.ensure_intent_group_armed(intent_id)?;
         let mut filesystem = NativeRenameAsideFs;
         self.publish_rename_aside_with(intent_id, quarantine_dir, &mut filesystem)
     }
 
     /// Resume a journaled deletion on every supported host.
+    #[cfg(unix)]
     pub fn reconcile_journaled_deletion(
         &mut self,
         intent_id: i64,
         quarantine_dir: &Path,
     ) -> Result<DeletionRecoveryOutcome, StoreError> {
-        #[cfg(windows)]
-        let mut filesystem = WindowsRenameAsideFs;
-        #[cfg(not(windows))]
+        self.ensure_intent_group_armed(intent_id)?;
         let mut filesystem = NativeRenameAsideFs;
         self.reconcile_deletion_with(intent_id, quarantine_dir, &mut filesystem)
     }
 
     /// Resume a journaled no-replace creation on every supported host.
+    #[cfg(unix)]
     pub fn reconcile_journaled_creation(
         &mut self,
         intent_id: i64,
     ) -> Result<CreationRecoveryOutcome, StoreError> {
-        #[cfg(windows)]
-        let mut filesystem = WindowsRenameAsideFs;
-        #[cfg(not(windows))]
+        self.ensure_intent_group_armed(intent_id)?;
         let mut filesystem = NativeRenameAsideFs;
         self.reconcile_creation_with(intent_id, &mut filesystem)
     }
@@ -470,6 +528,7 @@ impl Store {
         quarantine_dir: &Path,
         filesystem: &mut dyn JournalFilesystem,
     ) -> Result<RenameAsideOutcome, StoreError> {
+        self.ensure_intent_group_armed(intent_id)?;
         self.publish_rename_aside_with(intent_id, quarantine_dir, filesystem)
     }
 
@@ -480,6 +539,7 @@ impl Store {
         quarantine_dir: &Path,
         filesystem: &mut dyn JournalFilesystem,
     ) -> Result<DeletionRecoveryOutcome, StoreError> {
+        self.ensure_intent_group_armed(intent_id)?;
         self.reconcile_deletion_with(intent_id, quarantine_dir, filesystem)
     }
 
@@ -489,6 +549,7 @@ impl Store {
         intent_id: i64,
         filesystem: &mut dyn JournalFilesystem,
     ) -> Result<CreationRecoveryOutcome, StoreError> {
+        self.ensure_intent_group_armed(intent_id)?;
         self.reconcile_creation_with(intent_id, filesystem)
     }
 
@@ -562,13 +623,24 @@ impl Store {
                     if fs.read(&target)?.is_some() {
                         return Ok(DeletionRecoveryOutcome::RetryRequired);
                     }
-                    self.retire_intent(intent_id)?;
+                    self.retire_intent_with_outcome(intent_id, true)?;
                     return Ok(DeletionRecoveryOutcome::Deleted);
                 }
-                if fs.read(&target)?.is_some() {
-                    return Ok(DeletionRecoveryOutcome::RetryRequired);
+                match read_hash(fs, &target)? {
+                    Some(target_hash) if target_hash == actual => {
+                        fs.sync_file(&target)?;
+                        fs.sync_dir(target.parent().unwrap_or_else(|| Path::new(".")))?;
+                        self.finish_rename_aside_terminal(
+                            intent_id,
+                            RenameAsideState::PreimageRestoredDurable,
+                            true,
+                        )?;
+                        return Ok(DeletionRecoveryOutcome::ConflictRestored);
+                    }
+                    Some(_) => return Ok(DeletionRecoveryOutcome::RetryRequired),
+                    None => {}
                 }
-                match fs.move_no_replace(&aside, &target) {
+                match fs.restore_retained_no_replace(&aside, &target) {
                     Ok(()) => {
                         fs.sync_file(&target)?;
                         sync_move_dirs(fs, &aside, &target)?;
@@ -590,7 +662,7 @@ impl Store {
                 intent_id,
                 detail: "journaled deletion displacement and target are both missing".into(),
             })?;
-            match fs.move_no_replace(&target, &aside) {
+            match fs.rename_target_to_reserved(&target, &aside) {
                 Ok(()) => {
                     fs.sync_file(&aside)?;
                     sync_move_dirs(fs, &target, &aside)?;
@@ -640,20 +712,28 @@ impl Store {
         let proposed = self.intent_proposed_hash(intent_id)?;
         let target_hash = read_hash(fs, &target)?;
         let temp_hash = read_hash(fs, &temp)?;
+        if target_hash == Some(proposed) && temp_hash == Some(proposed) {
+            fs.sync_file(&target)?;
+            fs.remove_daemon_temp(&temp)?;
+            sync_move_dirs(fs, &temp, &target)?;
+            self.retire_intent_with_outcome(intent_id, true)?;
+            return Ok(CreationRecoveryOutcome::Installed);
+        }
         if target_hash == Some(proposed) && temp_hash.is_none() {
             fs.sync_file(&target)?;
             fs.sync_dir(target.parent().unwrap_or_else(|| Path::new(".")))?;
-            self.retire_intent(intent_id)?;
+            self.retire_intent_with_outcome(intent_id, true)?;
             return Ok(CreationRecoveryOutcome::Installed);
         }
         // A publication group is durable before its proposal temp is
         // created. A crash in that narrow window leaves a Prepared intent
         // whose target was never touched; abandoning it is therefore safe.
         if temp_hash.is_none() {
-            self.retire_intent(intent_id)?;
+            self.retire_intent_with_outcome(intent_id, false)?;
             return Ok(CreationRecoveryOutcome::RetryRequired);
         }
         if target_hash.is_some() {
+            self.retire_intent_with_outcome(intent_id, false)?;
             return Ok(CreationRecoveryOutcome::RetryRequired);
         }
         if temp_hash != Some(proposed) {
@@ -663,15 +743,16 @@ impl Store {
             });
         }
         fs.sync_file(&temp)?;
-        match fs.move_no_replace(&temp, &target) {
+        match fs.install_temp_no_replace(&temp, &target) {
             Ok(()) => {
                 fs.sync_file(&target)?;
                 sync_move_dirs(fs, &temp, &target)?;
                 require_hash(fs, intent_id, &target, proposed, "installed creation")?;
-                self.retire_intent(intent_id)?;
+                self.retire_intent_with_outcome(intent_id, true)?;
                 Ok(CreationRecoveryOutcome::Installed)
             }
             Err(NoReplaceMoveError::DestinationExists) => {
+                self.retire_intent_with_outcome(intent_id, false)?;
                 Ok(CreationRecoveryOutcome::RetryRequired)
             }
             Err(NoReplaceMoveError::Other(error)) => Err(error),
@@ -698,7 +779,7 @@ impl Store {
                     // temp. With no temp, this attempt cannot have performed
                     // its first filesystem transition and is safe to abandon.
                     if read_hash(fs, &intent.temp)?.is_none() {
-                        self.retire_intent(intent_id)?;
+                        self.retire_intent_with_outcome(intent_id, false)?;
                         return Ok(RenameAsideOutcome::RetryRequired);
                     }
                     fs.create_dir_all(quarantine_dir)?;
@@ -722,6 +803,16 @@ impl Store {
                             detail: "rename-aside target is missing before the first move"
                                 .to_owned(),
                         })?;
+                    // The preimage CAS belongs inside the journaled state
+                    // machine immediately before its first filesystem
+                    // mutation. A user edit that landed after planning stays
+                    // at the target; it must not be renamed aside and leave
+                    // an unrecoverable armed child that blocks later
+                    // independent publications.
+                    if observed != intent.expected_preimage {
+                        self.retire_intent_with_outcome(intent_id, false)?;
+                        return Ok(RenameAsideOutcome::RetryRequired);
+                    }
                     if fs.read(&aside)?.is_some() {
                         return Err(StoreError::BadIntent {
                             intent_id,
@@ -761,7 +852,7 @@ impl Store {
                                 .to_owned(),
                         });
                     }
-                    match fs.move_no_replace(&intent.target, &aside) {
+                    match fs.rename_target_to_reserved(&intent.target, &aside) {
                         Ok(()) => {}
                         Err(NoReplaceMoveError::DestinationExists) => continue,
                         Err(NoReplaceMoveError::Other(error)) => return Err(error),
@@ -820,6 +911,17 @@ impl Store {
 
                     // A crash may happen after the successful no-replace
                     // install and directory sync but before its state commit.
+                    if target_hash == Some(intent.proposed) && temp_hash == Some(intent.proposed) {
+                        fs.sync_file(&intent.target)?;
+                        fs.remove_daemon_temp(&intent.temp)?;
+                        sync_move_dirs(fs, &intent.temp, &intent.target)?;
+                        self.finish_rename_aside_terminal(
+                            intent_id,
+                            RenameAsideState::ProposedInstalledDurable,
+                            false,
+                        )?;
+                        return Ok(RenameAsideOutcome::Installed);
+                    }
                     if target_hash == Some(intent.proposed) && temp_hash.is_none() {
                         fs.sync_file(&intent.target)?;
                         sync_move_dirs(fs, &intent.temp, &intent.target)?;
@@ -841,7 +943,7 @@ impl Store {
                                             .to_owned(),
                                 });
                             }
-                            match fs.move_no_replace(&intent.temp, &intent.target) {
+                            match fs.install_temp_no_replace(&intent.temp, &intent.target) {
                                 Ok(()) => {
                                     fs.sync_file(&intent.target)?;
                                     sync_move_dirs(fs, &intent.temp, &intent.target)?;
@@ -914,7 +1016,7 @@ impl Store {
                                 .to_owned(),
                         });
                     }
-                    match fs.move_no_replace(&intent.target, &intent.conflict) {
+                    match fs.rename_target_to_reserved(&intent.target, &intent.conflict) {
                         Ok(()) => {}
                         Err(NoReplaceMoveError::DestinationExists) => {
                             let collision = existing_hash(
@@ -959,10 +1061,23 @@ impl Store {
                         if aside_hash != intent.expected_preimage {
                             return Ok(RenameAsideOutcome::RetryRequired);
                         }
-                        if fs.read(&intent.target)?.is_some() {
-                            return Ok(RenameAsideOutcome::RetryRequired);
+                        match read_hash(fs, &intent.target)? {
+                            Some(target_hash) if target_hash == aside_hash => {
+                                fs.sync_file(&intent.target)?;
+                                fs.sync_dir(
+                                    intent.target.parent().unwrap_or_else(|| Path::new(".")),
+                                )?;
+                                self.finish_rename_aside_terminal(
+                                    intent_id,
+                                    RenameAsideState::PreimageRestoredDurable,
+                                    true,
+                                )?;
+                                return Ok(RenameAsideOutcome::ConflictRestored);
+                            }
+                            Some(_) => return Ok(RenameAsideOutcome::RetryRequired),
+                            None => {}
                         }
-                        match fs.move_no_replace(&aside, &intent.target) {
+                        match fs.restore_retained_no_replace(&aside, &intent.target) {
                             Ok(()) => {
                                 fs.sync_file(&intent.target)?;
                                 sync_move_dirs(fs, &aside, &intent.target)?;
@@ -1275,11 +1390,16 @@ impl Store {
                 [intent_id],
             )?;
         }
-        let retire = state == RenameAsideState::ProposedInstalledDurable;
+        let retire = matches!(
+            state,
+            RenameAsideState::ProposedInstalledDurable | RenameAsideState::PreimageRestoredDurable
+        );
+        let terminal_success = retire.then_some(!restored).map(i64::from);
         let updated = transaction.execute(
-            "UPDATE write_intents SET rename_aside_state = ?2, retired = ?3
+            "UPDATE write_intents
+             SET rename_aside_state = ?2, terminal_success = ?3, retired = ?4
              WHERE intent_id = ?1 AND retired = 0",
-            rusqlite::params![intent_id, state as i64, i64::from(retire)],
+            rusqlite::params![intent_id, state as i64, terminal_success, i64::from(retire)],
         )?;
         if updated != 1 {
             return Err(StoreError::BadIntent {
@@ -1371,10 +1491,15 @@ impl Store {
             })
     }
 
-    pub fn retire_intent(&mut self, intent_id: i64) -> Result<(), StoreError> {
+    fn retire_intent_with_outcome(
+        &mut self,
+        intent_id: i64,
+        success: bool,
+    ) -> Result<(), StoreError> {
         let n = self.conn.execute(
-            "UPDATE write_intents SET retired = 1 WHERE intent_id = ?1 AND retired = 0",
-            [intent_id],
+            "UPDATE write_intents SET terminal_success = ?2, retired = 1
+             WHERE intent_id = ?1 AND retired = 0",
+            rusqlite::params![intent_id, i64::from(success)],
         )?;
         if n == 0 {
             return Err(StoreError::BadIntent {
@@ -1388,7 +1513,8 @@ impl Store {
     pub fn unretired_intents(&self) -> Result<Vec<WriteIntent>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT intent_id, target_path, temp_path, conflict_path,
-                    pre_image_hash, proposed_hash, rename_aside_state, retired
+                    pre_image_hash, proposed_hash, rename_aside_state,
+                    terminal_success, retired
              FROM write_intents WHERE retired = 0 ORDER BY intent_id",
         )?;
         let raw = stmt
@@ -1401,12 +1527,13 @@ impl Store {
                     r.get::<_, Option<Vec<u8>>>(4)?,
                     r.get::<_, Vec<u8>>(5)?,
                     r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)? != 0,
+                    r.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+                    r.get::<_, i64>(8)? != 0,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::with_capacity(raw.len());
-        for (id, target, temp, conflict, pre, proposed, state, retired) in raw {
+        for (id, target, temp, conflict, pre, proposed, state, terminal_success, retired) in raw {
             let mut paths = self.conn.prepare(
                 "SELECT quarantine_path FROM displaced WHERE intent_id = ?1 ORDER BY ordinal",
             )?;
@@ -1423,6 +1550,7 @@ impl Store {
                 proposed_hash: ContentHash(blob32(proposed)),
                 quarantine_paths,
                 rename_aside_state: RenameAsideState::from_db(id, state)?,
+                terminal_success,
                 retired,
             });
         }
@@ -1470,7 +1598,7 @@ impl Store {
         Ok(self
             .displacement_history()?
             .into_iter()
-            .filter(|e| !e.restored && e.cleaned_at.is_none())
+            .filter(|entry| entry.cleaned_at.is_none())
             .collect())
     }
 
@@ -1612,10 +1740,10 @@ fn sync_move_dirs<F: JournalFilesystem + ?Sized>(
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 struct NativeRenameAsideFs;
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 impl JournalFilesystem for NativeRenameAsideFs {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
         match std::fs::read(path) {
@@ -1656,7 +1784,30 @@ impl JournalFilesystem for NativeRenameAsideFs {
         ensure_same_filesystem(source, destination_dir)
     }
 
-    fn move_no_replace(
+    fn rename_target_to_reserved(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), NoReplaceMoveError> {
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => return Err(NoReplaceMoveError::DestinationExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(NoReplaceMoveError::Other(StoreError::Io {
+                    path: destination.to_path_buf(),
+                    source,
+                }))
+            }
+        }
+        std::fs::rename(source, destination).map_err(|source| {
+            NoReplaceMoveError::Other(StoreError::Io {
+                path: destination.to_path_buf(),
+                source,
+            })
+        })
+    }
+
+    fn install_temp_no_replace(
         &mut self,
         source: &Path,
         destination: &Path,
@@ -1681,119 +1832,29 @@ impl JournalFilesystem for NativeRenameAsideFs {
             })
         })
     }
-}
 
-#[cfg(windows)]
-struct WindowsRenameAsideFs;
-
-#[cfg(windows)]
-impl JournalFilesystem for WindowsRenameAsideFs {
-    fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
-    }
-
-    fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError> {
-        std::fs::create_dir_all(path).map_err(|source| StoreError::Io {
+    fn remove_daemon_temp(&mut self, path: &Path) -> Result<(), StoreError> {
+        std::fs::remove_file(path).map_err(|source| StoreError::Io {
             path: path.to_path_buf(),
             source,
         })
     }
 
-    fn sync_file(&mut self, path: &Path) -> Result<(), StoreError> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-    }
-
-    fn sync_dir(&mut self, path: &Path) -> Result<(), StoreError> {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-    }
-
-    fn ensure_same_filesystem(
-        &mut self,
-        source: &Path,
-        destination_dir: &Path,
-    ) -> Result<(), StoreError> {
-        ensure_same_filesystem(source, destination_dir)
-    }
-
-    fn move_no_replace(
+    fn restore_retained_no_replace(
         &mut self,
         source: &Path,
         destination: &Path,
     ) -> Result<(), NoReplaceMoveError> {
-        use std::os::windows::ffi::OsStrExt;
-
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn MoveFileExW(
-                existing_file_name: *const u16,
-                new_file_name: *const u16,
-                flags: u32,
-            ) -> i32;
-        }
-
-        const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-        const ERROR_FILE_EXISTS: i32 = 80;
-        const ERROR_ALREADY_EXISTS: i32 = 183;
-
-        let source_wide = source
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let destination_wide = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        // No MOVEFILE_REPLACE_EXISTING flag: the kernel must fail rather
-        // than displace a destination that appeared after the aside.
-        let moved = unsafe {
-            MoveFileExW(
-                source_wide.as_ptr(),
-                destination_wide.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if moved != 0 {
-            return Ok(());
-        }
-        let source_error = std::io::Error::last_os_error();
-        if matches!(
-            source_error.raw_os_error(),
-            Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS)
-        ) {
-            return Err(NoReplaceMoveError::DestinationExists);
-        }
-        Err(NoReplaceMoveError::Other(StoreError::Io {
-            path: destination.to_path_buf(),
-            source: source_error,
-        }))
+        std::fs::hard_link(source, destination).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                NoReplaceMoveError::DestinationExists
+            } else {
+                NoReplaceMoveError::Other(StoreError::Io {
+                    path: destination.to_path_buf(),
+                    source,
+                })
+            }
+        })
     }
 }
 
@@ -1828,13 +1889,6 @@ fn ensure_same_filesystem(source: &Path, quarantine: &Path) -> Result<(), StoreE
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn ensure_same_filesystem(_source: &Path, _quarantine: &Path) -> Result<(), StoreError> {
-    // Windows' rename below remains the definitive same-volume check;
-    // the platform fallback preserves the file as a named conflict.
-    Ok(())
-}
-
 #[cfg(test)]
 mod rename_aside_tests {
     use std::collections::BTreeMap;
@@ -1854,7 +1908,9 @@ mod rename_aside_tests {
     struct FakeFs {
         files: BTreeMap<PathBuf, Vec<u8>>,
         before_move: BTreeMap<(PathBuf, PathBuf), (PathBuf, Vec<u8>)>,
+        after_reserved_move: BTreeMap<(PathBuf, PathBuf), (PathBuf, Vec<u8>)>,
         fail_sync_after_move: Option<(PathBuf, PathBuf)>,
+        fail_after_temp_link: Option<(PathBuf, PathBuf)>,
         fail_next_sync: bool,
         events: Vec<FsEvent>,
     }
@@ -1881,8 +1937,67 @@ mod rename_aside_tests {
             self.fail_sync_after_move = Some((source.into(), destination.into()));
         }
 
+        fn fail_after_temp_link(
+            &mut self,
+            source: impl Into<PathBuf>,
+            destination: impl Into<PathBuf>,
+        ) {
+            self.fail_after_temp_link = Some((source.into(), destination.into()));
+        }
+
+        fn inject_after_reserved_move(
+            &mut self,
+            source: impl Into<PathBuf>,
+            destination: impl Into<PathBuf>,
+            appeared_path: impl Into<PathBuf>,
+            bytes: &[u8],
+        ) {
+            self.after_reserved_move.insert(
+                (source.into(), destination.into()),
+                (appeared_path.into(), bytes.to_vec()),
+            );
+        }
+
         fn bytes(&self, path: impl AsRef<Path>) -> Option<&[u8]> {
             self.files.get(path.as_ref()).map(Vec::as_slice)
+        }
+
+        fn apply_move(
+            &mut self,
+            source: &Path,
+            destination: &Path,
+            retain_source: bool,
+        ) -> Result<(), NoReplaceMoveError> {
+            self.events.push(FsEvent::MoveNoReplace(
+                source.to_path_buf(),
+                destination.to_path_buf(),
+            ));
+            if let Some((appeared_path, bytes)) = self
+                .before_move
+                .remove(&(source.to_path_buf(), destination.to_path_buf()))
+            {
+                self.files.insert(appeared_path, bytes);
+            }
+            if self.files.contains_key(destination) {
+                return Err(NoReplaceMoveError::DestinationExists);
+            }
+            let Some(bytes) = self.files.get(source).cloned() else {
+                return Err(NoReplaceMoveError::Other(StoreError::Io {
+                    path: source.to_path_buf(),
+                    source: io::Error::new(io::ErrorKind::NotFound, "source missing"),
+                }));
+            };
+            if !retain_source {
+                self.files.remove(source);
+            }
+            self.files.insert(destination.to_path_buf(), bytes);
+            if self.fail_sync_after_move.as_ref()
+                == Some(&(source.to_path_buf(), destination.to_path_buf()))
+            {
+                self.fail_sync_after_move = None;
+                self.fail_next_sync = true;
+            }
+            Ok(())
         }
     }
 
@@ -1920,38 +2035,55 @@ mod rename_aside_tests {
             Ok(())
         }
 
-        fn move_no_replace(
+        fn rename_target_to_reserved(
             &mut self,
             source: &Path,
             destination: &Path,
         ) -> Result<(), NoReplaceMoveError> {
-            self.events.push(FsEvent::MoveNoReplace(
-                source.to_path_buf(),
-                destination.to_path_buf(),
-            ));
+            self.apply_move(source, destination, false)?;
             if let Some((appeared_path, bytes)) = self
-                .before_move
+                .after_reserved_move
                 .remove(&(source.to_path_buf(), destination.to_path_buf()))
             {
                 self.files.insert(appeared_path, bytes);
             }
-            if self.files.contains_key(destination) {
-                return Err(NoReplaceMoveError::DestinationExists);
-            }
-            let Some(bytes) = self.files.remove(source) else {
-                return Err(NoReplaceMoveError::Other(StoreError::Io {
-                    path: source.to_path_buf(),
-                    source: io::Error::new(io::ErrorKind::NotFound, "source missing"),
-                }));
-            };
-            self.files.insert(destination.to_path_buf(), bytes);
-            if self.fail_sync_after_move.as_ref()
+            Ok(())
+        }
+
+        fn install_temp_no_replace(
+            &mut self,
+            source: &Path,
+            destination: &Path,
+        ) -> Result<(), NoReplaceMoveError> {
+            if self.fail_after_temp_link.as_ref()
                 == Some(&(source.to_path_buf(), destination.to_path_buf()))
             {
-                self.fail_sync_after_move = None;
-                self.fail_next_sync = true;
+                self.fail_after_temp_link = None;
+                self.apply_move(source, destination, true)?;
+                return Err(NoReplaceMoveError::Other(StoreError::Io {
+                    path: source.to_path_buf(),
+                    source: io::Error::other("injected crash after temp link"),
+                }));
             }
-            Ok(())
+            self.apply_move(source, destination, false)
+        }
+
+        fn remove_daemon_temp(&mut self, path: &Path) -> Result<(), StoreError> {
+            self.files
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| StoreError::Io {
+                    path: path.to_path_buf(),
+                    source: io::Error::new(io::ErrorKind::NotFound, "temp missing"),
+                })
+        }
+
+        fn restore_retained_no_replace(
+            &mut self,
+            source: &Path,
+            destination: &Path,
+        ) -> Result<(), NoReplaceMoveError> {
+            self.apply_move(source, destination, true)
         }
     }
 
@@ -1974,15 +2106,21 @@ mod rename_aside_tests {
         let temp = PathBuf::from("root/.asset.bundle.tmp");
         let conflict = PathBuf::from("root/asset.bundle.conflict");
         let quarantine = PathBuf::from("root/.quarantine");
-        let intent_id = store
-            .record_intent(
-                &target.to_string_lossy(),
-                &temp.to_string_lossy(),
-                &conflict.to_string_lossy(),
-                Some(ContentHash(*blake3::hash(b"preimage").as_bytes())),
-                ContentHash(*blake3::hash(b"proposed").as_bytes()),
+        let group = store
+            .record_publication_group(
+                PublicationGroupKind::AuthoringWrite,
+                b"test replacement",
+                &[JournalIntentPlan {
+                    target_path: target.to_string_lossy().into_owned(),
+                    temp_path: temp.to_string_lossy().into_owned(),
+                    conflict_path: conflict.to_string_lossy().into_owned(),
+                    pre_image_hash: Some(ContentHash(*blake3::hash(b"preimage").as_bytes())),
+                    proposed_hash: ContentHash(*blake3::hash(b"proposed").as_bytes()),
+                }],
             )
             .unwrap();
+        store.arm_publication_group(group.group_id).unwrap();
+        let intent_id = group.child_intents[0];
         let aside = quarantine.join(format!("intent-{intent_id}"));
         let mut fs = FakeFs::default();
         fs.put(&target, b"preimage");
@@ -2043,12 +2181,76 @@ mod rename_aside_tests {
             fixture.fs.bytes(&fixture.temp),
             Some(b"proposed".as_slice())
         );
-        assert_eq!(fixture.fs.bytes(&fixture.aside), None);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"preimage".as_slice())
+        );
         assert_eq!(
             persisted_state(&fixture.store, fixture.intent_id),
-            (RenameAsideState::PreimageRestoredDurable, false)
+            (RenameAsideState::PreimageRestoredDurable, true)
         );
         assert_eq!(fixture.store.displacement_history().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn preimage_drift_before_the_first_move_retires_without_displacing_the_edit() {
+        let mut fixture = fixture();
+        fixture.fs.put(&fixture.target, b"user edit");
+
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::RetryRequired);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.target),
+            Some(b"user edit".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.temp),
+            Some(b"proposed".as_slice())
+        );
+        assert_eq!(fixture.fs.bytes(&fixture.aside), None);
+        assert!(!fixture
+            .fs
+            .events
+            .iter()
+            .any(|event| matches!(event, FsEvent::MoveNoReplace(_, _))));
+        assert_eq!(
+            persisted_state(&fixture.store, fixture.intent_id),
+            (RenameAsideState::Prepared, true)
+        );
+    }
+
+    #[test]
+    fn atomic_save_after_reserved_rename_is_preserved_not_unlinked() {
+        let mut fixture = fixture();
+        fixture.fs.inject_after_reserved_move(
+            &fixture.target,
+            &fixture.aside,
+            &fixture.target,
+            b"atomic editor save",
+        );
+
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::ConflictRestored);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.target),
+            Some(b"preimage".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.conflict),
+            Some(b"atomic editor save".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"preimage".as_slice())
+        );
     }
 
     #[test]
@@ -2231,6 +2433,44 @@ mod rename_aside_tests {
     }
 
     #[test]
+    fn recovery_cleans_a_temp_left_linked_after_proposal_install() {
+        let mut fixture = fixture();
+        fixture
+            .fs
+            .fail_after_temp_link(&fixture.temp, &fixture.target);
+
+        assert!(fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .is_err());
+        assert_eq!(
+            persisted_state(&fixture.store, fixture.intent_id),
+            (RenameAsideState::PreimageVerifiedDurable, false)
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.target),
+            Some(b"proposed".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.temp),
+            Some(b"proposed".as_slice())
+        );
+
+        assert_eq!(
+            fixture
+                .store
+                .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs,)
+                .unwrap(),
+            RenameAsideOutcome::Installed
+        );
+        assert_eq!(fixture.fs.bytes(&fixture.temp), None);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.target),
+            Some(b"proposed".as_slice())
+        );
+    }
+
+    #[test]
     fn recovery_resumes_when_crash_precedes_conflict_directory_sync() {
         let mut fixture = fixture();
         fixture.fs.inject_before_move(
@@ -2298,7 +2538,10 @@ mod rename_aside_tests {
             fixture.fs.bytes(&fixture.target),
             Some(b"preimage".as_slice())
         );
-        assert_eq!(fixture.fs.bytes(&fixture.aside), None);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"preimage".as_slice())
+        );
         assert_eq!(
             fixture.fs.bytes(&fixture.temp),
             Some(b"proposed".as_slice())
@@ -2315,7 +2558,7 @@ mod rename_aside_tests {
         assert_eq!(outcome, RenameAsideOutcome::ConflictRestored);
         assert_eq!(
             persisted_state(&fixture.store, fixture.intent_id),
-            (RenameAsideState::PreimageRestoredDurable, false)
+            (RenameAsideState::PreimageRestoredDurable, true)
         );
     }
 
@@ -2423,31 +2666,6 @@ mod rename_aside_tests {
     }
 
     #[test]
-    fn mismatched_aside_is_preserved_and_never_restored_or_installed() {
-        let mut fixture = fixture();
-        fixture.fs.put(&fixture.target, b"raced target bytes");
-
-        let outcome = fixture
-            .store
-            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
-            .unwrap();
-        assert_eq!(outcome, RenameAsideOutcome::RetryRequired);
-        assert_eq!(fixture.fs.bytes(&fixture.target), None);
-        assert_eq!(
-            fixture.fs.bytes(&fixture.aside),
-            Some(b"raced target bytes".as_slice())
-        );
-        assert_eq!(
-            fixture.fs.bytes(&fixture.temp),
-            Some(b"proposed".as_slice())
-        );
-        assert_eq!(
-            persisted_state(&fixture.store, fixture.intent_id),
-            (RenameAsideState::TargetAsideDurable, false)
-        );
-    }
-
-    #[test]
     fn moved_bytes_are_file_flushed_before_move_directories() {
         let mut fixture = fixture();
         let outcome = fixture
@@ -2540,8 +2758,11 @@ mod rename_aside_tests {
             raced.fs.bytes(&raced.target),
             Some(b"external changed bytes".as_slice())
         );
-        assert_eq!(raced.fs.bytes(&raced.aside), None);
-        assert!(!persisted_state(&raced.store, raced.intent_id).1);
+        assert_eq!(
+            raced.fs.bytes(&raced.aside),
+            Some(b"external changed bytes".as_slice())
+        );
+        assert!(persisted_state(&raced.store, raced.intent_id).1);
 
         let mut reappeared = fixture();
         reappeared
@@ -2608,6 +2829,36 @@ mod rename_aside_tests {
         assert_eq!(created.fs.bytes(&created.temp), None);
         assert!(persisted_state(&created.store, created.intent_id).1);
 
+        let mut linked = fixture();
+        linked.fs.files.remove(&linked.target);
+        linked
+            .store
+            .conn
+            .execute(
+                "UPDATE write_intents SET pre_image_hash = NULL WHERE intent_id = ?1",
+                [linked.intent_id],
+            )
+            .unwrap();
+        linked.fs.fail_after_temp_link(&linked.temp, &linked.target);
+        assert!(linked
+            .store
+            .reconcile_creation_with(linked.intent_id, &mut linked.fs)
+            .is_err());
+        assert_eq!(
+            linked.fs.bytes(&linked.target),
+            Some(b"proposed".as_slice())
+        );
+        assert_eq!(linked.fs.bytes(&linked.temp), Some(b"proposed".as_slice()));
+        assert_eq!(
+            linked
+                .store
+                .reconcile_creation_with(linked.intent_id, &mut linked.fs)
+                .unwrap(),
+            CreationRecoveryOutcome::Installed
+        );
+        assert_eq!(linked.fs.bytes(&linked.temp), None);
+        assert!(persisted_state(&linked.store, linked.intent_id).1);
+
         let mut collision = fixture();
         collision
             .store
@@ -2631,6 +2882,6 @@ mod rename_aside_tests {
             collision.fs.bytes(&collision.temp),
             Some(b"proposed".as_slice())
         );
-        assert!(!persisted_state(&collision.store, collision.intent_id).1);
+        assert!(persisted_state(&collision.store, collision.intent_id).1);
     }
 }

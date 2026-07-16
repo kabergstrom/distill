@@ -1,4 +1,4 @@
-//! §14's daemon-state pieces of swap-verify-or-swap-back publication:
+//! §14's daemon-state pieces of journaled rename-aside publication:
 //! the write-intent journal (fsynced before the first rename), the
 //! per-filesystem displaced-inode quarantine under intent-ID names, the
 //! recovered-edit check, journal-driven temp cleanup, and the retention
@@ -6,8 +6,8 @@
 
 use distill_core::id::ContentHash;
 use distill_store::journal::{
-    CreationRecoveryOutcome, JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome,
-    RenameAsideState,
+    CreationRecoveryOutcome, JournalIntentPlan, PublicationGroup, PublicationGroupKind,
+    RenameAsideOutcome, RenameAsideState,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -20,15 +20,78 @@ fn hash(bytes: &[u8]) -> ContentHash {
 }
 
 fn record(store: &mut Store, n: u8) -> i64 {
-    store
-        .record_intent(
-            &format!("assets/tex/{n}.bundle"),
-            &format!("assets/tex/.{n}.bundle.tmp"),
-            &format!("assets/tex/{n}.bundle.conflict"),
-            Some(hash(b"pre-image bytes")),
-            hash(b"proposed bytes"),
-        )
-        .unwrap()
+    let group = record_group(
+        store,
+        JournalIntentPlan {
+            target_path: format!("assets/tex/{n}.bundle"),
+            temp_path: format!("assets/tex/.{n}.bundle.tmp"),
+            conflict_path: format!("assets/tex/{n}.bundle.conflict"),
+            pre_image_hash: Some(hash(b"pre-image bytes")),
+            proposed_hash: hash(b"proposed bytes"),
+        },
+        true,
+    );
+    group.child_intents[0]
+}
+
+fn record_group(store: &mut Store, plan: JournalIntentPlan, armed: bool) -> PublicationGroup {
+    let group = store
+        .record_publication_group(PublicationGroupKind::AuthoringWrite, b"test basis", &[plan])
+        .unwrap();
+    if armed {
+        store.arm_publication_group(group.group_id).unwrap();
+    }
+    group
+}
+
+fn record_paths(
+    store: &mut Store,
+    target: &std::path::Path,
+    temp: &std::path::Path,
+    conflict: &std::path::Path,
+    pre_image_hash: Option<ContentHash>,
+    proposed_hash: ContentHash,
+) -> PublicationGroup {
+    record_group(
+        store,
+        JournalIntentPlan {
+            target_path: target.to_string_lossy().into_owned(),
+            temp_path: temp.to_string_lossy().into_owned(),
+            conflict_path: conflict.to_string_lossy().into_owned(),
+            pre_image_hash,
+            proposed_hash,
+        },
+        true,
+    )
+}
+
+fn publish_replacement(
+    store: &mut Store,
+    dir: &tempfile::TempDir,
+    name: &str,
+    old: &[u8],
+    new: &[u8],
+) -> (i64, std::path::PathBuf, std::path::PathBuf) {
+    let root = dir.path().join("asset-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join(format!("{name}.bundle"));
+    let temp = root.join(format!(".{name}.proposed"));
+    let conflict = root.join(format!("{name}.conflict"));
+    std::fs::write(&target, old).unwrap();
+    std::fs::write(&temp, new).unwrap();
+    let group = record_paths(store, &target, &temp, &conflict, Some(hash(old)), hash(new));
+    let intent = group.child_intents[0];
+    assert_eq!(
+        store
+            .publish_journaled_replacement(intent, &quarantine_dir(dir))
+            .unwrap(),
+        RenameAsideOutcome::Installed
+    );
+    (
+        intent,
+        quarantine_dir(dir).join(format!("intent-{intent}")),
+        target,
+    )
 }
 
 fn quarantine_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
@@ -56,6 +119,7 @@ fn intents_persist_with_their_full_shape() {
     assert_eq!(intent.proposed_hash, hash(b"proposed bytes"));
     assert!(intent.quarantine_paths.is_empty());
     assert_eq!(intent.rename_aside_state, RenameAsideState::Prepared);
+    assert_eq!(intent.terminal_success, None);
     assert!(!intent.retired);
 }
 
@@ -126,19 +190,33 @@ fn parent_cannot_retire_until_every_child_is_terminal() {
         store.retire_publication_group(group.group_id),
         Err(StoreError::BadIntent { .. })
     ));
-    store.retire_intent(group.child_intents[0]).unwrap();
+    store.arm_publication_group(group.group_id).unwrap();
+    assert_eq!(
+        store
+            .reconcile_journaled_creation(group.child_intents[0])
+            .unwrap(),
+        CreationRecoveryOutcome::RetryRequired
+    );
     store.retire_publication_group(group.group_id).unwrap();
     assert!(store.unfinished_publication_groups().unwrap().is_empty());
 }
 
 #[test]
 fn creation_intents_have_no_pre_image() {
-    // §14: creation has no target to exchange — no pre-image.
+    // §14: creation has no target to move aside — no pre-image.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    store
-        .record_intent("a.bundle", ".a.tmp", "a.conflict", None, hash(b"new"))
-        .unwrap();
+    record_group(
+        &mut store,
+        JournalIntentPlan {
+            target_path: "a.bundle".into(),
+            temp_path: ".a.tmp".into(),
+            conflict_path: "a.conflict".into(),
+            pre_image_hash: None,
+            proposed_hash: hash(b"new"),
+        },
+        false,
+    );
     assert_eq!(store.unretired_intents().unwrap()[0].pre_image_hash, None);
 }
 
@@ -155,36 +233,18 @@ fn unfinished_intents_survive_restart_for_crash_reconciliation() {
 
 #[test]
 fn quarantine_moves_the_displaced_inode_under_an_intent_id_on_its_filesystem() {
-    // §14: the displaced inode is never unlinked — it moves to
-    // .distill/displaced/<content-hash>, recorded in the journal entry
-    // before the intent retires.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let id = record(&mut store, 1);
-
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let displaced_src = root.join("displaced-bytes.tmp");
-    std::fs::write(&displaced_src, b"the users late edit").unwrap();
-    let qdir = quarantine_dir(&dir);
-    let qpath = store
-        .quarantine_displaced(id, &displaced_src, &qdir)
-        .unwrap();
+    let (id, qpath, _target) =
+        publish_replacement(&mut store, &dir, "one", b"the users late edit", b"new");
 
     assert_eq!(
         qpath.file_name().unwrap().to_string_lossy(),
         format!("intent-{id}")
     );
-    assert!(qpath.starts_with(&qdir));
+    assert!(qpath.starts_with(quarantine_dir(&dir)));
     assert!(qpath.is_file());
     assert_eq!(std::fs::read(&qpath).unwrap(), b"the users late edit");
-    assert!(!displaced_src.exists(), "moved, not copied");
-
-    // Recorded on the intent before it retires.
-    let intent = &store.unretired_intents().unwrap()[0];
-    assert_eq!(intent.quarantine_paths, [qpath]);
-
-    store.retire_intent(id).unwrap();
     assert!(store.unretired_intents().unwrap().is_empty());
 }
 
@@ -192,19 +252,11 @@ fn quarantine_moves_the_displaced_inode_under_an_intent_id_on_its_filesystem() {
 fn identical_bytes_from_distinct_intents_never_alias_inodes() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let a = record(&mut store, 1);
-    let b = record(&mut store, 2);
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let src1 = root.join("one.tmp");
-    let src2 = root.join("two.tmp");
-    std::fs::write(&src1, b"same displaced bytes").unwrap();
-    std::fs::write(&src2, b"same displaced bytes").unwrap();
-    let qdir = quarantine_dir(&dir);
-    let q1 = store.quarantine_displaced(a, &src1, &qdir).unwrap();
-    let q2 = store.quarantine_displaced(b, &src2, &qdir).unwrap();
+    let (_a, q1, _) =
+        publish_replacement(&mut store, &dir, "one", b"same displaced bytes", b"new one");
+    let (_b, q2, _) =
+        publish_replacement(&mut store, &dir, "two", b"same displaced bytes", b"new two");
     assert_ne!(q1, q2, "intent identity preserves two equal-content inodes");
-    assert!(!src2.exists());
     assert_eq!(store.quarantined_entries().unwrap().len(), 2);
 }
 
@@ -213,13 +265,7 @@ fn journal_apis_reject_unknown_intents() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     assert!(matches!(
-        store.retire_intent(99),
-        Err(StoreError::BadIntent { intent_id: 99, .. })
-    ));
-    let src = dir.path().join("x.tmp");
-    std::fs::write(&src, b"bytes").unwrap();
-    assert!(matches!(
-        store.quarantine_displaced(99, &src, &quarantine_dir(&dir)),
+        store.publish_journaled_replacement(99, &quarantine_dir(&dir)),
         Err(StoreError::BadIntent { intent_id: 99, .. })
     ));
 }
@@ -230,9 +276,19 @@ fn temp_cleanup_is_journal_driven() {
     // as its own, never "stray" files by pattern.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let a = record(&mut store, 1);
+    let a = record_group(
+        &mut store,
+        JournalIntentPlan {
+            target_path: "assets/tex/1.bundle".into(),
+            temp_path: "assets/tex/.1.bundle.tmp".into(),
+            conflict_path: "assets/tex/1.bundle.conflict".into(),
+            pre_image_hash: Some(hash(b"pre-image bytes")),
+            proposed_hash: hash(b"proposed bytes"),
+        },
+        false,
+    );
     let _b = record(&mut store, 2); // stays unretired
-    store.retire_intent(a).unwrap();
+    store.abort_unarmed_publication_group(a.group_id).unwrap();
 
     assert_eq!(
         store.journal_owned_temp_paths().unwrap(),
@@ -249,14 +305,13 @@ fn startup_verification_surfaces_recovered_edits() {
     // writer's late bytes landed in the quarantined inode and survived.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let id = record(&mut store, 1);
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let src = root.join("displaced.tmp");
-    std::fs::write(&src, b"original displaced bytes").unwrap();
-    let qpath = store
-        .quarantine_displaced(id, &src, &quarantine_dir(&dir))
-        .unwrap();
+    let (_id, qpath, target) = publish_replacement(
+        &mut store,
+        &dir,
+        "verify",
+        b"original displaced bytes",
+        b"new bytes",
+    );
 
     // Untampered: quiet.
     assert!(store.verify_quarantine().unwrap().is_empty());
@@ -266,7 +321,7 @@ fn startup_verification_surfaces_recovered_edits() {
     std::fs::write(&qpath, b"late bytes from an open descriptor").unwrap();
     let diags = store.verify_quarantine().unwrap();
     assert_eq!(diags.len(), 1);
-    assert_eq!(diags[0].origin_path, src.to_string_lossy());
+    assert_eq!(diags[0].origin_path, target.to_string_lossy());
     assert_eq!(diags[0].expected, hash(b"original displaced bytes"));
     assert_eq!(
         diags[0].actual,
@@ -288,17 +343,8 @@ fn the_retention_sweep_removes_only_expired_entries() {
     let mut config = cfg(&dir);
     config.displaced_retention_days = 7;
     let mut store = Store::open(config).unwrap();
-    let a = record(&mut store, 1);
-    let b = record(&mut store, 2);
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let src1 = root.join("old.tmp");
-    let src2 = root.join("new.tmp");
-    std::fs::write(&src1, b"old displaced").unwrap();
-    std::fs::write(&src2, b"new displaced").unwrap();
-    let qdir = quarantine_dir(&dir);
-    let q_old = store.quarantine_displaced(a, &src1, &qdir).unwrap();
-    let q_new = store.quarantine_displaced(b, &src2, &qdir).unwrap();
+    let (a, q_old, _) = publish_replacement(&mut store, &dir, "old", b"old displaced", b"old new");
+    let (_b, q_new, _) = publish_replacement(&mut store, &dir, "new", b"new displaced", b"new new");
 
     // Backdate the first entry beyond the window (directly in the DB —
     // the sweep trusts quarantined_at).
@@ -330,14 +376,13 @@ fn the_retention_sweep_removes_only_expired_entries() {
 fn doctor_clean_removes_fresh_entries_but_keeps_named_audit_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let intent = record(&mut store, 7);
-    let root = dir.path().join("asset-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let source = root.join("fresh.tmp");
-    std::fs::write(&source, b"fresh displacement").unwrap();
-    let quarantined = store
-        .quarantine_displaced(intent, &source, &quarantine_dir(&dir))
-        .unwrap();
+    let (_intent, quarantined, _) = publish_replacement(
+        &mut store,
+        &dir,
+        "fresh",
+        b"fresh displacement",
+        b"new bytes",
+    );
 
     assert_eq!(store.clean_all_displaced(1234).unwrap(), 1);
     assert!(!quarantined.exists());
@@ -358,15 +403,15 @@ fn native_journaled_replacement_installs_no_replace_and_retains_the_preimage() {
     std::fs::write(&target, b"old manifest").unwrap();
     std::fs::write(&temp, b"new manifest").unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let intent = store
-        .record_intent(
-            target.to_str().unwrap(),
-            temp.to_str().unwrap(),
-            conflict.to_str().unwrap(),
-            Some(hash(b"old manifest")),
-            hash(b"new manifest"),
-        )
-        .unwrap();
+    let group = record_paths(
+        &mut store,
+        &target,
+        &temp,
+        &conflict,
+        Some(hash(b"old manifest")),
+        hash(b"new manifest"),
+    );
+    let intent = group.child_intents[0];
 
     assert_eq!(
         store
@@ -392,15 +437,15 @@ fn native_creation_recovery_is_no_replace_and_restart_resumable() {
     let temp = root.join(".manifest.proposed");
     std::fs::write(&temp, b"first manifest").unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let intent = store
-        .record_intent(
-            target.to_str().unwrap(),
-            temp.to_str().unwrap(),
-            root.join("manifest.conflict").to_str().unwrap(),
-            None,
-            hash(b"first manifest"),
-        )
-        .unwrap();
+    let group = record_paths(
+        &mut store,
+        &target,
+        &temp,
+        &root.join("manifest.conflict"),
+        None,
+        hash(b"first manifest"),
+    );
+    let intent = group.child_intents[0];
     drop(store);
 
     let mut store = Store::open(cfg(&dir)).unwrap();
@@ -421,15 +466,15 @@ fn prepared_creation_without_a_temp_is_safely_abandoned() {
     let target = root.join("manifest.bundle");
     let temp = root.join(".manifest.proposed");
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let intent = store
-        .record_intent(
-            target.to_str().unwrap(),
-            temp.to_str().unwrap(),
-            root.join("manifest.conflict").to_str().unwrap(),
-            None,
-            hash(b"first manifest"),
-        )
-        .unwrap();
+    let group = record_paths(
+        &mut store,
+        &target,
+        &temp,
+        &root.join("manifest.conflict"),
+        None,
+        hash(b"first manifest"),
+    );
+    let intent = group.child_intents[0];
 
     assert_eq!(
         store.reconcile_journaled_creation(intent).unwrap(),
@@ -449,15 +494,15 @@ fn prepared_replacement_without_a_temp_leaves_the_target_untouched() {
     let temp = root.join(".manifest.proposed");
     std::fs::write(&target, b"old manifest").unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
-    let intent = store
-        .record_intent(
-            target.to_str().unwrap(),
-            temp.to_str().unwrap(),
-            root.join("manifest.conflict").to_str().unwrap(),
-            Some(hash(b"old manifest")),
-            hash(b"new manifest"),
-        )
-        .unwrap();
+    let group = record_paths(
+        &mut store,
+        &target,
+        &temp,
+        &root.join("manifest.conflict"),
+        Some(hash(b"old manifest")),
+        hash(b"new manifest"),
+    );
+    let intent = group.child_intents[0];
 
     assert_eq!(
         store

@@ -22,8 +22,9 @@ use distill_rpc::{
     AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
     AuthoringValue, Commit, ConfigurationPoison, ConfigurationStatus, CoordinatedCommitError,
     DerivedOutputEntry, DerivedOutputMutation, DriftedInput, LineageManifestClaimant,
-    LineageRepairState, PathMutation, PipelineDiagnostic, Server, SnapshotStamp, StoredResolve,
-    TargetDefinition, VersionPoison, VersionPoisonV1,
+    LineageRepairState, PathMutation, PipelineCandidateIdentity, PipelineDiagnostic,
+    SchemaTransitionAction, Server, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison,
+    VersionPoisonV1,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
@@ -31,9 +32,10 @@ use distill_store::bundles::{
 };
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileKind, FileState, PendingFileWork};
+use distill_store::journal::{JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome};
 use distill_store::pipeline::{
-    AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, ValidatedPipelineEpoch,
-    VerifiedSchemaLineageManifest,
+    AcceptedTypeLineage, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
+    TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
@@ -49,9 +51,13 @@ use crate::epoch::{
     stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
     UnloadOutcome,
 };
-use crate::lineage_repair::LineageRepairBackendInitError;
+use crate::lineage_repair::{
+    plan_same_dir_temp, unique_sibling, write_planned_temp, LineageRepairBackendInitError,
+};
 use crate::module_loader::DynamicPipelineModuleLoader;
+use crate::operations::{PlannedSchemaTransition, SchemaTransitionJournalBasis};
 use crate::pipeline_map::PipelineProjection;
+use crate::quarantine::QuarantineDriver;
 use crate::scanner::{
     AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanDiagnostic, ScanError,
     ScanSnapshot, ScannedBundle, ScannedFileKind,
@@ -110,7 +116,12 @@ struct OperationalRuntime {
 struct CoordinatedPipelineRuntime {
     host: ModuleHost,
     loader: DynamicPipelineModuleLoader,
-    pending: Option<PipelineEpoch>,
+    pending: Option<PendingPipelineEpoch>,
+}
+
+struct PendingPipelineEpoch {
+    loaded: PipelineEpoch,
+    stored: ValidatedPipelineEpoch,
 }
 
 enum ConfigurationPipelinePublication {
@@ -123,7 +134,7 @@ enum ConfigurationPipelinePublication {
 
 fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) {
     if let Some(pending) = runtime.pending.take() {
-        let _ = runtime.host.discard_unpublished(pending);
+        let _ = runtime.host.discard_unpublished(pending.loaded);
     }
 }
 
@@ -766,7 +777,7 @@ impl DaemonCoordinator {
                             .expect("candidate importer metadata was prevalidated");
                     }
                     (
-                        ConfigurationPipelinePublication::Epoch { .. },
+                        ConfigurationPipelinePublication::Epoch { epoch, .. },
                         Some(prepared),
                         PipelineDiagnostic::SchemaAcceptanceRequired(_),
                     ) => {
@@ -779,7 +790,10 @@ impl DaemonCoordinator {
                         )
                         .expect("schema-acceptance fence is valid");
                         runtime.host.install_poison(fence);
-                        runtime.pending = Some(prepared);
+                        runtime.pending = Some(PendingPipelineEpoch {
+                            loaded: prepared,
+                            stored: epoch.clone(),
+                        });
                         authoring.install_pipeline_importers(BTreeMap::new());
                     }
                     (
@@ -939,7 +953,10 @@ impl DaemonCoordinator {
                     )
                     .expect("schema-acceptance fence is a valid candidate poison");
                     runtime.host.install_poison(fence);
-                    runtime.pending = Some(candidate);
+                    runtime.pending = Some(PendingPipelineEpoch {
+                        loaded: candidate,
+                        stored: stored.clone(),
+                    });
                     self.authoring.install_pipeline_importers(BTreeMap::new());
                     PipelineDiagnostic::SchemaAcceptanceRequired(required)
                 }
@@ -988,6 +1005,184 @@ impl DaemonCoordinator {
         poison: PipelinePoison,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         self.publish_pipeline_rejection_inner(poison, true)
+    }
+
+    pub(crate) fn pending_schema_digest(
+        &self,
+        candidate: &PipelineCandidateIdentity,
+        type_uuid: TypeUuid,
+    ) -> Result<Option<LogicalHash>, String> {
+        let runtime = lock_pipeline(&self.pipeline);
+        let pending = runtime
+            .pending
+            .as_ref()
+            .ok_or_else(|| "no loaded pipeline candidate awaits schema acceptance".to_owned())?;
+        let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
+            .map_err(|error| error.to_string())?;
+        if &actual != candidate {
+            return Err("loaded schema candidate identity is stale".to_owned());
+        }
+        Ok(pending.stored.schema_registry.get(&type_uuid).copied())
+    }
+
+    pub(crate) fn publish_schema_transition(
+        &self,
+        base: InputVersion,
+        planned: &PlannedSchemaTransition,
+        quarantine: &QuarantineDriver,
+    ) -> Result<distill_rpc::DeferredOperationResult, String> {
+        // Keep the exact unpublished candidate reserved through durable
+        // manifest replacement, rescan, and promotion. Ordinary pipeline
+        // staging takes the same mutex, so it cannot replace the candidate
+        // between the store CAS and live installation.
+        let mut runtime = lock_pipeline(&self.pipeline);
+        let (candidate, tools, prepared_importers) = {
+            let pending = runtime.pending.as_ref().ok_or_else(|| {
+                "no loaded pipeline candidate awaits schema acceptance".to_owned()
+            })?;
+            let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
+                .map_err(|error| error.to_string())?;
+            if actual != planned.request.candidate {
+                return Err("loaded schema candidate identity is stale".to_owned());
+            }
+            let importers = self
+                .authoring
+                .prepare_pipeline_importers(EpochAuthoringImporter::all(&pending.loaded))
+                .map_err(|error| format!("candidate importer metadata is invalid: {error:?}"))?;
+            (
+                pending.stored.clone(),
+                pending.loaded.tool_epoch(),
+                importers,
+            )
+        };
+        let transition = IncrementalSchemaTransition {
+            planned,
+            candidate: &candidate,
+            tools: &tools,
+        };
+
+        let temp = plan_same_dir_temp(&planned.target)?;
+        let plan = JournalIntentPlan {
+            target_path: planned
+                .target
+                .to_str()
+                .ok_or_else(|| "schema manifest path is not lossless UTF-8".to_owned())?
+                .to_owned(),
+            temp_path: temp
+                .to_str()
+                .ok_or_else(|| "schema manifest temp path is not lossless UTF-8".to_owned())?
+                .to_owned(),
+            conflict_path: unique_sibling(&planned.target, "conflict")
+                .to_str()
+                .ok_or_else(|| "schema manifest conflict path is not lossless UTF-8".to_owned())?
+                .to_owned(),
+            pre_image_hash: Some(planned.preimage),
+            proposed_hash: planned.proposed.manifest_hash(),
+        };
+        let group_id = {
+            let mut store = lock_store(&self.store);
+            if store.input_version() != base
+                || store
+                    .schema_manifest_basis()
+                    .map_err(|error| error.to_string())?
+                    .as_ref()
+                    != Some(&planned.request.manifest)
+            {
+                return Err("schema transition durable basis is stale".to_owned());
+            }
+            store
+                .preview_input_transaction(|transaction| {
+                    apply_schema_transition(transaction, &transition).map(|_| ())
+                })
+                .map_err(|error| error.to_string())?;
+            let mut publication = quarantine
+                .admit_publication(&mut store)
+                .map_err(|error| error.to_string())?;
+            let basis = SchemaTransitionJournalBasis {
+                base,
+                target: planned.target.clone(),
+                old_manifest_hash: planned.preimage,
+                proposed_manifest_hash: planned.proposed.manifest_hash(),
+            }
+            .encode()?;
+            let group = publication
+                .record_group(PublicationGroupKind::SchemaTransition, &basis, &[plan])
+                .map_err(|error| error.to_string())?;
+            write_planned_temp(&temp, &planned.proposed_bytes)?;
+            publication
+                .arm_group(group.group_id)
+                .map_err(|error| error.to_string())?;
+            let outcome = publication
+                .resume_group_replace(group.child_intents[0], &planned.target)
+                .map_err(|error| error.to_string())?;
+            if outcome != RenameAsideOutcome::Installed {
+                publication
+                    .retire_group(group.group_id)
+                    .map_err(|error| error.to_string())?;
+                return Err(
+                    "schema manifest changed concurrently; its bytes were preserved".to_owned(),
+                );
+            }
+            group.group_id
+        };
+
+        let projection = self.authoring.pipeline_projection();
+        let commit = publish_incremental_paths_with_schema_transition(
+            &self.scanner,
+            &self.scan_snapshot,
+            std::slice::from_ref(&planned.target),
+            &self
+                .lineage_destination
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &self.store,
+            base,
+            &projection,
+            Some(self),
+            Some(&transition),
+        )?;
+
+        let mut terminal_errors = Vec::new();
+        if let Err(error) = lock_store(&self.store).retire_publication_group(group_id) {
+            terminal_errors.push(format!(
+                "schema transition committed but journal retirement failed: {error}"
+            ));
+        }
+
+        if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
+            match runtime.pending.take() {
+                Some(pending) => {
+                    match PipelineCandidateIdentity::try_from(pending.stored.epoch()) {
+                        Ok(actual) if actual == planned.request.candidate => {
+                            runtime.host.install_ready(pending.loaded);
+                            self.authoring
+                                .install_pipeline_importers(prepared_importers);
+                        }
+                        Ok(_) => {
+                            runtime.pending = Some(pending);
+                            terminal_errors.push(
+                                "schema transition committed but the reserved candidate identity changed"
+                                    .to_owned(),
+                            );
+                        }
+                        Err(error) => {
+                            runtime.pending = Some(pending);
+                            terminal_errors.push(format!(
+                                "schema transition committed but the reserved candidate identity became invalid: {error}"
+                            ));
+                        }
+                    }
+                }
+                None => terminal_errors.push(
+                    "schema transition committed but the reserved candidate disappeared".to_owned(),
+                ),
+            }
+        }
+
+        Ok(distill_rpc::DeferredOperationResult {
+            commit,
+            terminal_error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
+        })
     }
 
     fn publish_pipeline_rejection_inner(
@@ -1264,6 +1459,7 @@ impl DaemonCoordinator {
                 &renames,
                 &projection,
                 tag_epoch,
+                None,
             )
             .map_err(|error| error.to_string())?;
             if let Some(authority) = authority {
@@ -3187,6 +3383,72 @@ struct DurableBundleBasis {
     assets: BTreeSet<AssetUuid>,
 }
 
+struct IncrementalSchemaTransition<'a> {
+    planned: &'a PlannedSchemaTransition,
+    candidate: &'a ValidatedPipelineEpoch,
+    tools: &'a BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
+}
+
+fn apply_schema_transition(
+    transaction: &mut distill_store::db::InputTxn<'_>,
+    transition: &IncrementalSchemaTransition<'_>,
+) -> Result<PipelineDiagnostic, StoreError> {
+    let request = &transition.planned.request;
+    match request.action {
+        SchemaTransitionAction::Accept { requested } => {
+            transaction.accept_schema_candidate(
+                transition.candidate,
+                &request.manifest,
+                &transition.planned.proposed,
+                request.type_uuid,
+                requested,
+            )?;
+        }
+        SchemaTransitionAction::Rollback { target } => {
+            transaction.rollback_schema_candidate(
+                transition.candidate,
+                &request.manifest,
+                &transition.planned.proposed,
+                SchemaRollbackRequest {
+                    type_uuid: request.type_uuid,
+                    target,
+                    live_schema_hashes: &transition.planned.live_schema_hashes,
+                    reverse_edges: &transition.planned.reverse_edges,
+                },
+            )?;
+        }
+        SchemaTransitionAction::Retire { control_basis } => {
+            transaction.retire_schema_candidate(
+                transition.candidate,
+                &request.manifest,
+                control_basis,
+                &transition.planned.proposed,
+                request.type_uuid,
+                &transition.planned.live_schema_hashes,
+            )?;
+        }
+        SchemaTransitionAction::Reactivate => {
+            transaction.reactivate_schema_candidate(
+                transition.candidate,
+                &request.manifest,
+                &transition.planned.proposed,
+                SchemaReactivationRequest {
+                    type_uuid: request.type_uuid,
+                    live_schema_hashes: &transition.planned.live_schema_hashes,
+                    reverse_edges: &transition.planned.reverse_edges,
+                },
+            )?;
+        }
+    }
+    transaction
+        .pipeline_acceptance_requirement(transition.candidate)
+        .map(|required| {
+            required.map_or(PipelineDiagnostic::Ready, |required| {
+                PipelineDiagnostic::SchemaAcceptanceRequired(required)
+            })
+        })
+}
+
 #[allow(clippy::too_many_arguments)] // The transaction receives each independently pinned publication authority.
 fn publish_incremental_scan(
     store: &Arc<Mutex<Store>>,
@@ -3197,6 +3459,7 @@ fn publish_incremental_scan(
     renames: &[LogicalRename],
     projection: &PipelineProjection,
     tag_epoch: [u8; 32],
+    schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<Commit, StoreError> {
     let file_mutations = incremental_file_mutations(baseline, delta);
     let mut store = lock_store(store);
@@ -3413,7 +3676,19 @@ fn publish_incremental_scan(
                 transaction.publish_configuration_poison(&poison.detail, &poison.message)?;
             }
         }
-        if let Some(manifest) = &plan.lineage_manifest {
+        if let Some(transition) = schema_transition {
+            if plan.lineage_manifest.as_ref() != Some(&transition.planned.proposed) {
+                return Err(StoreError::InvalidConfiguration {
+                    error: "incremental scan did not reproduce the planned schema manifest"
+                        .to_owned(),
+                });
+            }
+            commit.pipeline = Some(apply_schema_transition(transaction, transition)?);
+            if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
+                transaction.publish_tool_epoch(transition.tools)?;
+            }
+            commit.pipeline_epoch_changed = true;
+        } else if let Some(manifest) = &plan.lineage_manifest {
             transaction.project_verified_lineage_manifest(manifest)?;
         }
         if plan.version_poison.is_none() {
@@ -3585,6 +3860,31 @@ pub(crate) fn publish_incremental_paths(
     projection: &PipelineProjection,
     coordinator: Option<&DaemonCoordinator>,
 ) -> Result<Commit, String> {
+    publish_incremental_paths_with_schema_transition(
+        scanner,
+        scan_snapshot,
+        paths,
+        lineage_destination,
+        store,
+        base,
+        projection,
+        coordinator,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_incremental_paths_with_schema_transition(
+    scanner: &RootedScanner,
+    scan_snapshot: &Mutex<ScanSnapshot>,
+    paths: &[PathBuf],
+    lineage_destination: &LineageDestination,
+    store: &Arc<Mutex<Store>>,
+    base: InputVersion,
+    projection: &PipelineProjection,
+    coordinator: Option<&DaemonCoordinator>,
+    schema_transition: Option<&IncrementalSchemaTransition<'_>>,
+) -> Result<Commit, String> {
     let mut baseline = scan_snapshot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3626,6 +3926,7 @@ pub(crate) fn publish_incremental_paths(
             &[],
             projection,
             tag_epoch,
+            schema_transition,
         ) {
             Ok(commit) => commit,
             Err(error) => {
@@ -3635,24 +3936,26 @@ pub(crate) fn publish_incremental_paths(
                 return Err(error.to_string());
             }
         };
-        if let Some(authority) = authority {
-            let affected = commit_affected_asset_bundles(&commit);
-            if !affected.is_empty() {
-                let targets = coordinator
-                    .build_targets
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                crate::build::refine_published_tag_index_incremental(
-                    Arc::clone(store),
-                    scanner.clone(),
-                    authority,
-                    coordinator.pipeline_snapshot(),
-                    &targets,
-                    coordinator.operational_configuration().max_dependency_depth,
-                    &affected,
-                )
-                .apply_incremental(&mut commit);
+        if schema_transition.is_none() {
+            if let Some(authority) = authority {
+                let affected = commit_affected_asset_bundles(&commit);
+                if !affected.is_empty() {
+                    let targets = coordinator
+                        .build_targets
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    crate::build::refine_published_tag_index_incremental(
+                        Arc::clone(store),
+                        scanner.clone(),
+                        authority,
+                        coordinator.pipeline_snapshot(),
+                        &targets,
+                        coordinator.operational_configuration().max_dependency_depth,
+                        &affected,
+                    )
+                    .apply_incremental(&mut commit);
+                }
             }
         }
         baseline.apply_delta(delta);
@@ -3660,6 +3963,10 @@ pub(crate) fn publish_incremental_paths(
             index.clear_published_pending();
         }
         return Ok(commit);
+    }
+
+    if schema_transition.is_some() {
+        return Err("schema transition requires the live daemon coordinator".to_owned());
     }
 
     let mut scan = baseline.clone();
@@ -3963,7 +4270,7 @@ fn skeleton_failure(error: &distill_bundle::BundleError) -> SkeletonFailureCode 
     }
 }
 
-fn decode_lineage_manifest(
+pub(crate) fn decode_lineage_manifest(
     value: &AuthoredValue,
     hash: ContentHash,
 ) -> Result<VerifiedSchemaLineageManifest, CoordinatorError> {

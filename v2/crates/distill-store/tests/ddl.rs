@@ -438,7 +438,7 @@ fn dirty_queue_and_rename_log_are_ordered() {
 fn write_intent_journal_shape() {
     // §14: target path, temp path, conflict path, expected pre-image
     // hash and proposed content hash. Physical quarantine locations are
-    // one-to-many rows keyed by intent identity, so swap-back objects
+    // one-to-many rows keyed by intent identity, so retained pre-images
     // cannot alias the original displaced inode.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
@@ -452,6 +452,7 @@ fn write_intent_journal_shape() {
             "pre_image_hash",
             "proposed_hash",
             "rename_aside_state",
+            "terminal_success",
             "retired"
         ]
     );
@@ -478,7 +479,7 @@ fn multi_path_publication_parent_names_its_basis_and_children() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "publication_groups"),
-        ["group_id", "kind", "basis", "retired"]
+        ["group_id", "kind", "basis", "state", "retired"]
     );
     assert_eq!(
         columns(&conn, "publication_group_children"),
