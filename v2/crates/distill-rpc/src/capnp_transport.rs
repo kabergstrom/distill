@@ -2640,22 +2640,22 @@ pub fn decode_retired_type_referenced(
                         .map_err(|error| capnp::Error::failed(error.message))?,
                 ))
             }
-            schema::retired_type_reference::Which::MigrationEndpoint(hash) => {
-                crate::RetiredTypeReference::MigrationEndpoint(crate::LogicalHash(
-                    decode_hash(hash?, "retiredType.reference.migrationEndpoint")
+            schema::retired_type_reference::Which::MigrationEndpoint(asset) => {
+                crate::RetiredTypeReference::MigrationEndpoint(AssetUuid(
+                    decode_uuid(asset?, "retiredType.reference.migrationEndpoint")
                         .map_err(|error| capnp::Error::failed(error.message))?,
                 ))
             }
         };
-        let mut encoded = Vec::with_capacity(33);
+        let mut encoded = Vec::with_capacity(17);
         match reference {
             crate::RetiredTypeReference::Asset(asset) => {
                 encoded.push(1);
                 encoded.extend_from_slice(&asset.0);
             }
-            crate::RetiredTypeReference::MigrationEndpoint(hash) => {
+            crate::RetiredTypeReference::MigrationEndpoint(asset) => {
                 encoded.push(2);
-                encoded.extend_from_slice(&hash.0);
+                encoded.extend_from_slice(&asset.0);
             }
         }
         if previous.as_ref().is_some_and(|prior| prior >= &encoded) {
@@ -2944,8 +2944,8 @@ fn write_retired_type_referenced(
             crate::RetiredTypeReference::Asset(asset) => {
                 row.reborrow().init_asset().set_bytes(&asset.0)
             }
-            crate::RetiredTypeReference::MigrationEndpoint(endpoint) => {
-                row.set_migration_endpoint(&endpoint.0)
+            crate::RetiredTypeReference::MigrationEndpoint(asset) => {
+                row.set_migration_endpoint(&asset.0)
             }
         }
     }

@@ -821,6 +821,8 @@ fn retired_reference_diagnostic_round_trips_and_heals_to_last_good() {
         .unwrap()
         .manifest_hash;
     let asset = AssetUuid([71; 16]);
+    let migration_a = AssetUuid([72; 16]);
+    let migration_b = AssetUuid([73; 16]);
     store
         .input_transaction(|txn| {
             let error = distill_store::state::RetiredTypeReferenced {
@@ -832,7 +834,8 @@ fn retired_reference_diagnostic_round_trips_and_heals_to_last_good() {
                 type_uuid: T,
                 references: vec![
                     RetiredTypeReference::Asset(asset),
-                    RetiredTypeReference::MigrationEndpoint(h(9)),
+                    RetiredTypeReference::MigrationEndpoint(migration_a),
+                    RetiredTypeReference::MigrationEndpoint(migration_b),
                 ],
             };
             txn.publish_retired_type_referenced(&error)
@@ -847,7 +850,8 @@ fn retired_reference_diagnostic_round_trips_and_heals_to_last_good() {
                 error.references,
                 [
                     RetiredTypeReference::Asset(asset),
-                    RetiredTypeReference::MigrationEndpoint(h(9)),
+                    RetiredTypeReference::MigrationEndpoint(migration_a),
+                    RetiredTypeReference::MigrationEndpoint(migration_b),
                 ]
             );
             assert!(last_good.is_some());
@@ -929,15 +933,16 @@ fn retirement_requires_exact_control_basis_and_blocks_later_type_references() {
     ));
     assert_eq!(store.stamp(), retired_stamp);
 
+    let migration = AssetUuid([10; 16]);
     let err = store
-        .input_transaction(|txn| txn.ensure_migration_endpoint_type_active(T, h(9)))
+        .input_transaction(|txn| txn.ensure_migration_endpoint_type_active(T, migration))
         .unwrap_err();
     assert!(matches!(
         err,
         StoreError::RetiredTypeReferenced {
             type_uuid: T,
             reference: RetiredTypeReference::MigrationEndpoint(endpoint),
-        } if endpoint == h(9)
+        } if endpoint == migration
     ));
     assert_eq!(store.stamp(), retired_stamp);
 }

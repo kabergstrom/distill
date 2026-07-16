@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use distill_bundle::{Bundle, EntryLineageV1};
+use distill_bundle::{Bundle, EntryLineageV1, LineageStamp};
 use distill_core::bootstrap::{
     is_bootstrap_control_type, MIGRATION_TYPE_UUID, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID,
 };
@@ -499,6 +499,11 @@ impl AuthoringService {
         let mut live_schema_hashes = BTreeSet::new();
         let mut reverse_edges = Vec::new();
         let mut waiting_paths = BTreeSet::new();
+        let require_full_migration_proof = transition_requires_reverse_proof(
+            request.action,
+            candidate_digest,
+            accepted_lineage.as_ref(),
+        );
         if !matches!(request.action, SchemaTransitionAction::Accept { .. }) {
             for source in snapshot.bundle_rows() {
                 let Ok(bundle) = &source.parsed else {
@@ -521,11 +526,7 @@ impl AuthoringService {
                     waits_for_type = true;
                     live_schema_hashes.insert(header.from_hash);
                     live_schema_hashes.insert(header.to_hash);
-                    if matches!(
-                        request.action,
-                        SchemaTransitionAction::Rollback { .. }
-                            | SchemaTransitionAction::Reactivate
-                    ) {
+                    if require_full_migration_proof {
                         let accepted = accepted_lineage.as_ref().ok_or_else(|| {
                             invalid(
                                 "rollback/reactivation proof target has no accepted lineage authority",
@@ -568,6 +569,97 @@ impl AuthoringService {
             reverse_edges,
             waiting_paths: waiting_paths.into_iter().collect(),
         })
+    }
+}
+
+fn transition_requires_reverse_proof(
+    action: SchemaTransitionAction,
+    candidate_digest: Option<LogicalHash>,
+    accepted: Option<&LineageStamp>,
+) -> bool {
+    match action {
+        SchemaTransitionAction::Rollback { .. } => true,
+        SchemaTransitionAction::Reactivate => {
+            let (Some(candidate_digest), Some(accepted)) = (candidate_digest, accepted) else {
+                return false;
+            };
+            let Some(target) = accepted
+                .epochs
+                .iter()
+                .position(|epoch| epoch.digest == candidate_digest)
+                .and_then(|position| u32::try_from(position).ok())
+            else {
+                // A genuinely new digest appends through the ordinary forward
+                // rule and has no reverse-edge proof to establish.
+                return false;
+            };
+            target != accepted.cursor
+                && !lineage_is_ancestor(&accepted.epochs, accepted.cursor, target)
+        }
+        SchemaTransitionAction::Accept { .. } | SchemaTransitionAction::Retire { .. } => false,
+    }
+}
+
+fn lineage_is_ancestor(epochs: &[AcceptedSchemaEpoch], ancestor: u32, descendant: u32) -> bool {
+    let mut cursor = Some(descendant);
+    while let Some(index) = cursor {
+        if index == ancestor {
+            return true;
+        }
+        cursor = epochs
+            .get(index as usize)
+            .and_then(|epoch| epoch.forward_parent);
+    }
+    false
+}
+
+#[cfg(test)]
+mod transition_proof_tests {
+    use super::*;
+
+    fn hash(byte: u8) -> LogicalHash {
+        LogicalHash([byte; 32])
+    }
+
+    fn accepted(rows: &[(u8, Option<u32>)], cursor: u32) -> LineageStamp {
+        LineageStamp {
+            epochs: rows
+                .iter()
+                .map(|(digest, forward_parent)| AcceptedSchemaEpoch {
+                    digest: hash(*digest),
+                    forward_parent: *forward_parent,
+                })
+                .collect(),
+            cursor,
+            chain: [0; 32],
+        }
+    }
+
+    #[test]
+    fn only_rollback_and_divergent_reactivation_require_reverse_proof() {
+        let forward = accepted(&[(1, None), (2, Some(0)), (3, Some(1))], 0);
+        assert!(!transition_requires_reverse_proof(
+            SchemaTransitionAction::Reactivate,
+            Some(hash(9)),
+            Some(&forward),
+        ));
+        assert!(!transition_requires_reverse_proof(
+            SchemaTransitionAction::Reactivate,
+            Some(hash(3)),
+            Some(&forward),
+        ));
+
+        let divergent = accepted(&[(1, None), (2, Some(0)), (3, Some(0))], 2);
+        assert!(transition_requires_reverse_proof(
+            SchemaTransitionAction::Reactivate,
+            Some(hash(2)),
+            Some(&divergent),
+        ));
+        assert!(transition_requires_reverse_proof(
+            SchemaTransitionAction::Rollback { target: hash(1) },
+            Some(hash(1)),
+            Some(&divergent),
+        ));
     }
 }
 

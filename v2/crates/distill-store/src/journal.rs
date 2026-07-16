@@ -615,14 +615,7 @@ impl Store {
                 self.retire_intent_with_outcome(intent_id, false)?;
                 return Ok(DeletionRecoveryOutcome::RetryRequired);
             };
-            self.journal_rename_aside_displacement(
-                intent_id,
-                0,
-                observed,
-                &target,
-                &aside,
-                RenameAsideState::AsideJournaled,
-            )?;
+            self.journal_rename_aside_displacement(intent_id, 0, observed, &target, &aside)?;
         }
 
         for _ in 0..16 {
@@ -842,20 +835,23 @@ impl Store {
                         self.retire_intent_with_outcome(intent_id, false)?;
                         return Ok(RenameAsideOutcome::RetryRequired);
                     }
+                    let mut reserved_collision = None;
                     if let Some(collision) = read_hash(fs, &aside)? {
                         fs.sync_file(&aside)?;
                         fs.sync_dir(aside.parent().unwrap_or_else(|| Path::new(".")))?;
                         let replacement = self.available_conflict_path(fs, intent_id, &aside)?;
-                        self.record_reserved_path_collision(intent_id, &aside, collision)?;
+                        reserved_collision = Some((aside, collision));
                         aside = replacement;
                     }
-                    self.journal_rename_aside_displacement(
+                    self.journal_rename_aside_displacement_with_collision(
                         intent_id,
                         0,
                         observed,
                         &intent.target,
                         &aside,
-                        RenameAsideState::AsideJournaled,
+                        reserved_collision
+                            .as_ref()
+                            .map(|(path, hash)| (path.as_path(), *hash)),
                     )?;
                     intent.state = RenameAsideState::AsideJournaled;
                 }
@@ -1204,35 +1200,6 @@ impl Store {
         quarantine_dir.join(format!("intent-{}-{intent_id}", self.instance_id()))
     }
 
-    /// A retained quarantine directory can outlive disposable daemon state.
-    /// Account for a reserved-name collision before selecting a fresh aside;
-    /// the colliding bytes remain exactly where they were found.
-    fn record_reserved_path_collision(
-        &mut self,
-        intent_id: i64,
-        path: &Path,
-        content_hash: ContentHash,
-    ) -> Result<(), StoreError> {
-        let ordinal: u32 = self.conn.query_row(
-            "SELECT COALESCE(MAX(ordinal) + 1, 2) FROM displaced WHERE intent_id = ?1",
-            [intent_id],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "INSERT INTO displaced(intent_id, ordinal, content_hash, origin_path,
-                                    quarantine_path, quarantined_at, restored)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0)",
-            rusqlite::params![
-                intent_id,
-                ordinal,
-                content_hash.0.as_slice(),
-                path.to_string_lossy(),
-                now_secs(),
-            ],
-        )?;
-        Ok(())
-    }
-
     /// An in-place writer can change the displaced inode after the target was
     /// atomically renamed aside. The changed inode is the newest user object:
     /// restore it no-clobber (after preserving any reappeared target) and
@@ -1291,9 +1258,60 @@ impl Store {
         content_hash: ContentHash,
         origin: &Path,
         destination: &Path,
-        state: RenameAsideState,
     ) -> Result<(), StoreError> {
+        self.journal_rename_aside_displacement_with_collision(
+            intent_id,
+            ordinal,
+            content_hash,
+            origin,
+            destination,
+            None,
+        )
+    }
+
+    /// A retained quarantine directory can outlive disposable daemon state.
+    /// Persist its occupied reserved name in the same transaction that selects
+    /// ordinal zero and advances the intent, so a crash can expose both rows or
+    /// neither row but can never strand the reserved name between them.
+    fn journal_rename_aside_displacement_with_collision(
+        &mut self,
+        intent_id: i64,
+        ordinal: u32,
+        content_hash: ContentHash,
+        origin: &Path,
+        destination: &Path,
+        reserved_collision: Option<(&Path, ContentHash)>,
+    ) -> Result<(), StoreError> {
+        let state = match ordinal {
+            0 => RenameAsideState::AsideJournaled,
+            1 => RenameAsideState::ConflictJournaled,
+            _ => {
+                return Err(StoreError::BadIntent {
+                    intent_id,
+                    detail: format!("invalid no-replace displacement ordinal {ordinal}"),
+                });
+            }
+        };
         let transaction = self.conn.transaction()?;
+        if let Some((path, collision_hash)) = reserved_collision {
+            let collision_ordinal: u32 = transaction.query_row(
+                "SELECT COALESCE(MAX(ordinal) + 1, 2) FROM displaced WHERE intent_id = ?1",
+                [intent_id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO displaced(intent_id, ordinal, content_hash, origin_path,
+                                        quarantine_path, quarantined_at, restored)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0)",
+                rusqlite::params![
+                    intent_id,
+                    collision_ordinal,
+                    collision_hash.0.as_slice(),
+                    path.to_string_lossy(),
+                    now_secs(),
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO displaced(intent_id, ordinal, content_hash, origin_path,
                                    quarantine_path, quarantined_at, restored)
@@ -1345,7 +1363,6 @@ impl Store {
             observed,
             &intent.target,
             &destination,
-            RenameAsideState::ConflictJournaled,
         )?;
         intent.conflict = destination;
         intent.state = RenameAsideState::ConflictJournaled;
@@ -2729,6 +2746,63 @@ mod rename_aside_tests {
     }
 
     #[test]
+    fn reserved_collision_and_replacement_journal_roll_back_together() {
+        let mut fixture = fixture();
+        fixture
+            .fs
+            .put(&fixture.aside, b"retained by an older store");
+        fixture
+            .store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_ordinal_zero_insert
+                 BEFORE INSERT ON displaced WHEN NEW.ordinal = 0
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected crash boundary');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .is_err());
+        assert_eq!(
+            persisted_state(&fixture.store, fixture.intent_id),
+            (RenameAsideState::Prepared, false)
+        );
+        let displacement_count: i64 = fixture
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM displaced WHERE intent_id = ?1",
+                [fixture.intent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(displacement_count, 0);
+
+        fixture
+            .store
+            .conn
+            .execute_batch("DROP TRIGGER fail_ordinal_zero_insert")
+            .unwrap();
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::Installed);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"retained by an older store".as_slice())
+        );
+        let history = fixture.store.displacement_history().unwrap();
+        assert_eq!(history.iter().filter(|entry| entry.ordinal == 0).count(), 1);
+        assert_eq!(history.iter().filter(|entry| entry.ordinal == 2).count(), 1);
+    }
+
+    #[test]
     fn atomic_save_after_reserved_rename_is_preserved_not_unlinked() {
         let mut fixture = fixture();
         fixture.fs.inject_after_reserved_move(
@@ -3105,7 +3179,6 @@ mod rename_aside_tests {
                 ContentHash(*blake3::hash(b"preimage").as_bytes()),
                 &fixture.target,
                 &fixture.aside,
-                RenameAsideState::AsideJournaled,
             )
             .unwrap();
 

@@ -4773,15 +4773,15 @@ fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> Result<(), A
             }
             let mut previous: Option<Vec<u8>> = None;
             for reference in &retired.references {
-                let mut encoded = Vec::with_capacity(33);
+                let mut encoded = Vec::with_capacity(17);
                 match reference {
                     RetiredTypeReference::Asset(uuid) => {
                         encoded.push(1);
                         encoded.extend_from_slice(&uuid.0);
                     }
-                    RetiredTypeReference::MigrationEndpoint(hash) => {
+                    RetiredTypeReference::MigrationEndpoint(asset) => {
                         encoded.push(2);
-                        encoded.extend_from_slice(&hash.0);
+                        encoded.extend_from_slice(&asset.0);
                     }
                 }
                 if previous.as_ref().is_some_and(|prior| prior >= &encoded) {

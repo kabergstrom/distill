@@ -345,6 +345,8 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
         })
         .unwrap();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let (stalled_ready_tx, stalled_ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_stall_tx, release_stall_rx) = std::sync::mpsc::channel();
     let root = server.root();
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -362,8 +364,10 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
             drop(listener);
 
             let failed_listener = tokio::net::TcpListener::bind(address).await.unwrap();
-            let (failed, _) = failed_listener.accept().await.unwrap();
-            drop(failed);
+            stalled_ready_tx.send(()).unwrap();
+            let (stalled, _) = failed_listener.accept().await.unwrap();
+            release_stall_rx.recv().unwrap();
+            drop(stalled);
             drop(failed_listener);
 
             let listener = StagedListener::bind(root, &address.to_string())
@@ -393,14 +397,24 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
             reason: distill_loader::ReconnectReason::LeaseExpired
         }
     )));
+    stalled_ready_rx.recv().unwrap();
     io.bind_target(target);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(4);
     let mut reconnect_events = Vec::new();
+    let mut release_stall_tx = Some(release_stall_tx);
     while !reconnect_events
         .iter()
         .any(|event| matches!(event, IoEvent::TargetBound { .. }))
     {
         reconnect_events.extend(io.poll());
+        if reconnect_events
+            .iter()
+            .any(|event| matches!(event, IoEvent::TargetRejected { .. }))
+        {
+            if let Some(release) = release_stall_tx.take() {
+                release.send(()).unwrap();
+            }
+        }
         assert!(
             Instant::now() < deadline,
             "RpcIO did not retry its failed target bind: {reconnect_events:?}"
@@ -431,6 +445,70 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
 
     drop(io);
     server_thread.join().unwrap();
+}
+
+#[test]
+fn rpc_io_drop_interrupts_a_stalled_reconnect() {
+    let Fixture {
+        server, request, ..
+    } = fixture();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let (stalled_ready_tx, stalled_ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (stalled_tx, stalled_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            address_tx.send(address).unwrap();
+            let initial = listener.accept_one().await.unwrap();
+            let first_rebind = listener.accept_one().await.unwrap();
+            drop(listener);
+
+            let stalled_listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            stalled_ready_tx.send(()).unwrap();
+            let (stalled, _) = stalled_listener.accept().await.unwrap();
+            stalled_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(stalled);
+            drop(stalled_listener);
+
+            initial.await.unwrap().unwrap();
+            first_rebind.await.unwrap().unwrap();
+        });
+    });
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    io.bind_target(target.clone());
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+
+    stalled_ready_rx.recv().unwrap();
+    io.bind_target(target);
+    stalled_rx.recv().unwrap();
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+    let drop_thread = std::thread::spawn(move || {
+        drop(io);
+        dropped_tx.send(()).unwrap();
+    });
+    let dropped_promptly = dropped_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+
+    release_tx.send(()).unwrap();
+    drop_thread.join().unwrap();
+    server_thread.join().unwrap();
+    assert!(
+        dropped_promptly,
+        "RpcIO drop waited for the stalled reconnect timeout"
+    );
 }
 
 fn poll_until(io: &mut RpcIo, minimum: usize) -> Vec<IoEvent> {

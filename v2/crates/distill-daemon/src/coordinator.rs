@@ -3233,8 +3233,7 @@ fn retired_waiting_projection<'a>(
                     })?;
                 if retired_types.contains(&header.target_type_uuid) {
                     let target = references.entry(header.target_type_uuid).or_default();
-                    target.insert(RetiredTypeReference::MigrationEndpoint(header.from_hash));
-                    target.insert(RetiredTypeReference::MigrationEndpoint(header.to_hash));
+                    target.insert(RetiredTypeReference::MigrationEndpoint(entry.uuid));
                     bundle_waits = true;
                 }
             }
@@ -3630,6 +3629,21 @@ struct DurableBundleBasis {
     assets: BTreeSet<AssetUuid>,
 }
 
+fn preserve_waiting_bundle_paths(
+    waiting: &mut RetiredWaitingProjection,
+    durable_bundles: &BTreeMap<BundleUuid, DurableBundleBasis>,
+) {
+    for bundle in &waiting.bundles {
+        if let Some(path) = durable_bundles
+            .get(bundle)
+            .and_then(|basis| basis.summary.as_ref())
+            .map(|summary| &summary.path)
+        {
+            waiting.paths.insert(path.clone());
+        }
+    }
+}
+
 struct IncrementalSchemaTransition<'a> {
     planned: &'a PlannedSchemaTransition,
     candidate: &'a ValidatedPipelineEpoch,
@@ -3807,7 +3821,7 @@ fn publish_incremental_scan(
         next.apply_delta(delta.clone());
         complete_waiting_scan = Some(next);
     }
-    let waiting = match manifest_hash {
+    let mut waiting = match manifest_hash {
         Some(manifest_hash) => retired_waiting_projection(
             complete_waiting_scan.as_ref().map_or_else(
                 || {
@@ -3825,6 +3839,13 @@ fn publish_incremental_scan(
         )?,
         None => None,
     };
+    if let Some(waiting) = &mut waiting {
+        // A waiting bundle may have moved. Its new path is in the observed
+        // projection, while the old path is part of the last published bundle
+        // projection. Hold both so RPC and SQLite preserve the same complete
+        // last-good view until reactivation admits the move atomically.
+        preserve_waiting_bundle_paths(waiting, &durable_bundles);
+    }
     let mut changed_bundles = BTreeSet::new();
     if plan.version_poison.is_none() {
         for (bundle_uuid, source) in &plan.bundles {
@@ -4811,6 +4832,125 @@ mod scheduler_tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn waiting_bundle_move_holds_both_old_and_new_paths() {
+        let bundle = BundleUuid([41; 16]);
+        let mut waiting = RetiredWaitingProjection {
+            error: StoredRetiredTypeReferenced {
+                manifest_hash: ContentHash([42; 32]),
+                basis: SnapshotStamp {
+                    instance: distill_store::state::StoreInstanceId([43; 16]),
+                    version: InputVersion(7),
+                },
+                type_uuid: TypeUuid([44; 16]),
+                references: vec![RetiredTypeReference::Asset(AssetUuid([45; 16]))],
+            },
+            bundles: BTreeSet::from([bundle]),
+            paths: BTreeSet::from(["new/location.bundle".to_owned()]),
+            assets: BTreeSet::new(),
+        };
+        let durable = BTreeMap::from([(
+            bundle,
+            DurableBundleBasis {
+                summary: Some(BundleSummary {
+                    root_name: "main".to_owned(),
+                    path: "old/location.bundle".to_owned(),
+                    format_version: 1,
+                    content_hash: ContentHash([46; 32]),
+                    origin: None,
+                }),
+                assets: BTreeSet::new(),
+            },
+        )]);
+
+        preserve_waiting_bundle_paths(&mut waiting, &durable);
+
+        assert_eq!(
+            waiting.paths,
+            BTreeSet::from([
+                "new/location.bundle".to_owned(),
+                "old/location.bundle".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn retired_migration_diagnostics_preserve_control_asset_multiplicity() {
+        fn bytes<const N: usize>(value: [u8; N]) -> AuthoredValue {
+            AuthoredValue::Array(
+                value
+                    .into_iter()
+                    .map(|byte| AuthoredValue::UInt(u128::from(byte)))
+                    .collect(),
+            )
+        }
+
+        let retired_type = TypeUuid([51; 16]);
+        let migration_a = AssetUuid([52; 16]);
+        let migration_b = AssetUuid([53; 16]);
+        let from = LogicalHash([54; 32]);
+        let to = LogicalHash([55; 32]);
+        let migration_value = || {
+            AuthoredValue::Object(BTreeMap::from([
+                ("from_hash".to_owned(), bytes(from.0)),
+                ("from_lineage".to_owned(), AuthoredValue::Null),
+                ("kind".to_owned(), AuthoredValue::Null),
+                ("target_type_uuid".to_owned(), bytes(retired_type.0)),
+                ("to_hash".to_owned(), bytes(to.0)),
+                ("to_lineage".to_owned(), AuthoredValue::Null),
+            ]))
+        };
+        let migration_entry = |uuid| AssetEntry {
+            uuid,
+            type_uuid: distill_core::bootstrap::MIGRATION_TYPE_UUID,
+            schema_hash: LogicalHash([56; 32]),
+            lineage: distill_bundle::EntryLineageV1::Bootstrap {
+                bundle_format_version: 1,
+            },
+            authoring_only: true,
+            data: migration_value(),
+        };
+        let bundle_uuid = BundleUuid([57; 16]);
+        let source = ScannedBundle {
+            root_name: "main".to_owned(),
+            normalized_path: "migrations.bundle".to_owned(),
+            file_hash: BundleFileHash([58; 32]),
+            bytes: Vec::new(),
+            parsed: Ok(Bundle {
+                format_version: 1,
+                uuid: bundle_uuid,
+                primary: None,
+                schemas: BTreeMap::new(),
+                assets: BTreeMap::from([
+                    ("a".to_owned(), migration_entry(migration_a)),
+                    ("b".to_owned(), migration_entry(migration_b)),
+                ]),
+            }),
+            namespace_skeleton: None,
+        };
+
+        let waiting = retired_waiting_projection(
+            [&source],
+            &BTreeSet::from([retired_type]),
+            ContentHash([59; 32]),
+            SnapshotStamp {
+                instance: distill_store::state::StoreInstanceId([60; 16]),
+                version: InputVersion(8),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            waiting.error.references,
+            [
+                RetiredTypeReference::MigrationEndpoint(migration_a),
+                RetiredTypeReference::MigrationEndpoint(migration_b),
+            ]
+        );
+        assert_eq!(waiting.bundles, BTreeSet::from([bundle_uuid]));
+    }
 
     #[test]
     fn prepared_candidate_error_cleanup_uses_the_explicit_unload_path() {

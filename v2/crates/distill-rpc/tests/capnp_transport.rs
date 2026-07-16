@@ -2113,7 +2113,7 @@ fn typed_pipeline_diagnostic_codecs_reject_empty_and_noncanonical_tables() {
             .get(0)
             .init_asset()
             .set_bytes(&[13; 16]);
-        references.get(1).set_migration_endpoint(&[14; 32]);
+        references.get(1).set_migration_endpoint(&[14; 16]);
     }
     let retired = distill_rpc::capnp_transport::decode_retired_type_referenced(
         retired_message
@@ -2121,7 +2121,13 @@ fn typed_pipeline_diagnostic_codecs_reject_empty_and_noncanonical_tables() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(retired.references.len(), 2);
+    assert_eq!(
+        retired.references,
+        [
+            distill_rpc::RetiredTypeReference::Asset(AssetUuid([13; 16])),
+            distill_rpc::RetiredTypeReference::MigrationEndpoint(AssetUuid([14; 16])),
+        ]
+    );
 
     let mut duplicate = capnp::message::Builder::new_default();
     {

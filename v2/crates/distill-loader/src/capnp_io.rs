@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
-use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot};
+use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSubscription};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
 use distill_rpc::{AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, StreamEvent};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::admission::{Admission, FetchAdmission};
 use crate::io::{
@@ -36,6 +36,7 @@ const COMPLETION_CHANNEL_CAPACITY: usize = 256;
 const IN_FLIGHT_REQUEST_LIMIT: usize = 256;
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
@@ -70,6 +71,7 @@ impl std::error::Error for RpcIoInitError {}
 
 pub struct RpcIo {
     commands: mpsc::Sender<Command>,
+    shutdown: watch::Sender<bool>,
     events: mpsc::Receiver<Completion>,
     pending: Vec<IoEvent>,
     delivered_fetches: Vec<FetchPermit>,
@@ -88,11 +90,22 @@ impl RpcIo {
         config: RpcIoConfig,
     ) -> Result<Self, RpcIoInitError> {
         let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let (event_tx, events) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
         let (init_tx, init_rx) = sync_mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("distill-rpc-io".into())
-            .spawn(move || run_thread(address, request, config, command_rx, event_tx, init_tx))
+            .spawn(move || {
+                run_thread(
+                    address,
+                    request,
+                    config,
+                    command_rx,
+                    shutdown_rx,
+                    event_tx,
+                    init_tx,
+                )
+            })
             .map_err(|error| RpcIoInitError::Unavailable(error.to_string()))?;
         let basis = match init_rx.recv() {
             Ok(Ok(basis)) => basis,
@@ -109,6 +122,7 @@ impl RpcIo {
         };
         Ok(Self {
             commands,
+            shutdown,
             events,
             pending: Vec::new(),
             delivered_fetches: Vec::new(),
@@ -131,7 +145,7 @@ impl Drop for RpcIo {
         self.delivered_fetches.clear();
         let (_closed_sender, replacement) = mpsc::channel(1);
         drop(std::mem::replace(&mut self.events, replacement));
-        let _ = self.commands.blocking_send(Command::Shutdown);
+        let _ = self.shutdown.send(true);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -268,7 +282,6 @@ enum Command {
     UnsubscribeAsset(AssetUuid),
     SubscribePath(String),
     UnsubscribePath(String),
-    Shutdown,
 }
 
 fn run_thread(
@@ -276,6 +289,7 @@ fn run_thread(
     request: ConnectRequest,
     config: RpcIoConfig,
     commands: mpsc::Receiver<Command>,
+    shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<Completion>,
     init: sync_mpsc::SyncSender<Result<IoBasis, RpcIoInitError>>,
 ) {
@@ -339,6 +353,7 @@ fn run_thread(
             hub,
             snapshot,
             commands,
+            shutdown,
             events,
             subscriptions: Rc::new(RefCell::new(Subscriptions::default())),
             delta_task: None,
@@ -365,6 +380,7 @@ struct Driver {
     hub: RemoteHub,
     snapshot: RemoteSnapshot,
     commands: mpsc::Receiver<Command>,
+    shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<Completion>,
     subscriptions: Rc<RefCell<Subscriptions>>,
     delta_task: Option<tokio::task::JoinHandle<()>>,
@@ -390,24 +406,55 @@ struct Subscriptions {
 
 impl Driver {
     async fn run(mut self) {
-        loop {
+        'driver: loop {
+            if *self.shutdown.borrow() {
+                break;
+            }
             let retry_at = self.rebind.as_ref().map(|rebind| rebind.next_attempt);
-            let command = if let Some(retry_at) = retry_at {
+            let wake = if let Some(retry_at) = retry_at {
                 tokio::select! {
-                    command = self.commands.recv() => command,
-                    () = tokio::time::sleep_until(retry_at) => {
-                        self.attempt_reconnect().await;
-                        continue;
-                    }
+                    biased;
+                    _ = self.shutdown.changed() => DriverWake::Shutdown,
+                    command = self.commands.recv() => DriverWake::Command(command),
+                    () = tokio::time::sleep_until(retry_at) => DriverWake::Reconnect,
                 }
             } else {
-                self.commands.recv().await
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.changed() => DriverWake::Shutdown,
+                    command = self.commands.recv() => DriverWake::Command(command),
+                }
             };
-            let Some(command) = command else {
-                break;
-            };
-            if !self.handle(command).await {
-                break;
+            match wake {
+                DriverWake::Shutdown => break,
+                DriverWake::Command(Some(command)) => {
+                    if !self.handle(command).await {
+                        break;
+                    }
+                }
+                DriverWake::Command(None) => break,
+                DriverWake::Reconnect => {
+                    let timed_out = {
+                        let mut shutdown = self.shutdown.clone();
+                        let attempt = tokio::time::timeout(
+                            RECONNECT_ATTEMPT_TIMEOUT,
+                            self.attempt_reconnect(),
+                        );
+                        tokio::pin!(attempt);
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.changed() => break 'driver,
+                            result = &mut attempt => result.is_err(),
+                        }
+                    };
+                    if timed_out {
+                        self.defer_reconnect(format!(
+                            "RPC reconnection attempt timed out after {} ms",
+                            RECONNECT_ATTEMPT_TIMEOUT.as_millis(),
+                        ))
+                        .await;
+                    }
+                }
             }
         }
         if let Some(task) = self.delta_task.take() {
@@ -548,7 +595,6 @@ impl Driver {
                     self.unsubscribe(Vec::new(), vec![path]).await;
                 }
             }
-            Command::Shutdown => return false,
         }
         true
     }
@@ -603,16 +649,39 @@ impl Driver {
                 return;
             }
         };
+        let (assets, paths) = {
+            let subscriptions = self.subscriptions.borrow();
+            (
+                subscriptions.assets.iter().copied().collect::<Vec<_>>(),
+                subscriptions.paths.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let subscription = if assets.is_empty() && paths.is_empty() {
+            None
+        } else {
+            match hub
+                .subscribe(snapshot.basis().snapshot.version, assets, paths)
+                .await
+            {
+                Ok(RemoteCall::Success(subscription)) => Some(subscription),
+                Ok(call) => {
+                    self.defer_reconnect(remote_message(call)).await;
+                    return;
+                }
+                Err(error) => {
+                    self.defer_reconnect(error.to_string()).await;
+                    return;
+                }
+            }
+        };
         if let Some(task) = self.delta_task.take() {
             task.abort();
         }
         self.client = client;
         self.hub = hub;
         self.snapshot = snapshot;
-        if !self.restart_subscription().await {
-            self.defer_reconnect("RPC subscription restoration failed".into())
-                .await;
-            return;
+        if let Some(subscription) = subscription {
+            self.install_delta_stream(subscription);
         }
         self.rebind = None;
         self.publish_target_bound(target).await;
@@ -643,24 +712,6 @@ impl Driver {
         .await;
     }
 
-    async fn restart_subscription(&mut self) -> bool {
-        if let Some(task) = self.delta_task.take() {
-            task.abort();
-        }
-        let (assets, paths) = {
-            let subscriptions = self.subscriptions.borrow();
-            (
-                subscriptions.assets.iter().copied().collect::<Vec<_>>(),
-                subscriptions.paths.iter().cloned().collect::<Vec<_>>(),
-            )
-        };
-        if !assets.is_empty() || !paths.is_empty() {
-            self.subscribe(assets, paths).await
-        } else {
-            true
-        }
-    }
-
     fn basis_matches(&self, basis: &IoBasis) -> bool {
         io_basis(self.snapshot.basis()) == *basis
     }
@@ -671,51 +722,9 @@ impl Driver {
             .subscribe(self.snapshot.basis().snapshot.version, assets, paths)
             .await
         {
-            Ok(RemoteCall::Success(mut subscription)) => {
+            Ok(RemoteCall::Success(subscription)) => {
                 if self.delta_task.is_none() {
-                    let events = self.events.clone();
-                    let subscriptions = Rc::clone(&self.subscriptions);
-                    self.delta_task = Some(tokio::task::spawn_local(async move {
-                        loop {
-                            match subscription.next().await {
-                                Ok(Some(event)) => {
-                                    let filtered = {
-                                        let subscriptions = subscriptions.borrow();
-                                        stream_events(
-                                            event,
-                                            &subscriptions.assets,
-                                            &subscriptions.paths,
-                                        )
-                                    };
-                                    for event in filtered {
-                                        if !send_event(&events, event).await {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    let _ = send_event(
-                                        &events,
-                                        IoEvent::ReconnectRequired {
-                                            reason: ReconnectReason::LeaseExpired,
-                                        },
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                Err(_error) => {
-                                    let _ = send_event(
-                                        &events,
-                                        IoEvent::ReconnectRequired {
-                                            reason: ReconnectReason::LeaseExpired,
-                                        },
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }));
+                    self.install_delta_stream(subscription);
                 }
                 true
             }
@@ -736,6 +745,38 @@ impl Driver {
         }
     }
 
+    fn install_delta_stream(&mut self, mut subscription: RemoteSubscription) {
+        let events = self.events.clone();
+        let subscriptions = Rc::clone(&self.subscriptions);
+        self.delta_task = Some(tokio::task::spawn_local(async move {
+            loop {
+                match subscription.next().await {
+                    Ok(Some(event)) => {
+                        let filtered = {
+                            let subscriptions = subscriptions.borrow();
+                            stream_events(event, &subscriptions.assets, &subscriptions.paths)
+                        };
+                        for event in filtered {
+                            if !send_event(&events, event).await {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = send_event(
+                            &events,
+                            IoEvent::ReconnectRequired {
+                                reason: ReconnectReason::LeaseExpired,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
     async fn unsubscribe(&self, assets: Vec<AssetUuid>, paths: Vec<String>) {
         match self.hub.unsubscribe(assets, paths).await {
             Ok(RemoteCall::Success(())) => {}
@@ -753,6 +794,12 @@ impl Driver {
             }
         }
     }
+}
+
+enum DriverWake {
+    Command(Option<Command>),
+    Reconnect,
+    Shutdown,
 }
 
 async fn resolve_event(

@@ -883,7 +883,7 @@ impl InputTxn<'_> {
         for (position, reference) in error.references.iter().enumerate() {
             let (kind, subject): (i64, &[u8]) = match reference {
                 RetiredTypeReference::Asset(asset) => (1, &asset.0),
-                RetiredTypeReference::MigrationEndpoint(hash) => (2, &hash.0),
+                RetiredTypeReference::MigrationEndpoint(asset) => (2, &asset.0),
             };
             self.txn.execute(
                 "INSERT INTO pipeline_retired_references(position, reference_kind, subject)
@@ -1283,11 +1283,11 @@ impl InputTxn<'_> {
     pub fn ensure_migration_endpoint_type_active(
         &self,
         type_uuid: TypeUuid,
-        endpoint: LogicalHash,
+        migration_asset: AssetUuid,
     ) -> Result<(), StoreError> {
         self.ensure_type_reference_active(
             type_uuid,
-            RetiredTypeReference::MigrationEndpoint(endpoint),
+            RetiredTypeReference::MigrationEndpoint(migration_asset),
         )
     }
 
@@ -2371,8 +2371,8 @@ impl Store {
                                 subject,
                                 "retired asset reference",
                             )?))),
-                            2 => Ok(RetiredTypeReference::MigrationEndpoint(LogicalHash(
-                                exact_blob32(subject, "retired migration endpoint")?,
+                            2 => Ok(RetiredTypeReference::MigrationEndpoint(AssetUuid(
+                                exact_blob16(subject, "retired Migration asset reference")?,
                             ))),
                             _ => Err(invalid_manifest(
                                 None,

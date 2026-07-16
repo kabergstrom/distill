@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RetiredTypeReference {
     Asset(distill_core::id::AssetUuid),
-    MigrationEndpoint(distill_core::id::LogicalHash),
+    MigrationEndpoint(distill_core::id::AssetUuid),
 }
 
 #[derive(Debug)]
@@ -353,9 +353,9 @@ impl fmt::Display for StoreError {
                     f,
                     "asset {asset} references retired schema authority {type_uuid}; explicit reactivation is required"
                 ),
-                RetiredTypeReference::MigrationEndpoint(endpoint) => write!(
+                RetiredTypeReference::MigrationEndpoint(asset) => write!(
                     f,
-                    "migration endpoint {endpoint} references retired schema authority {type_uuid}; explicit reactivation is required"
+                    "Migration asset {asset} references retired schema authority {type_uuid}; explicit reactivation is required"
                 ),
             },
             StoreError::InvalidAuthorityTransition { type_uuid, detail } => {
