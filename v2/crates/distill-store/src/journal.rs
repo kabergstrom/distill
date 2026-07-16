@@ -857,6 +857,22 @@ impl Store {
                 }
                 RenameAsideState::AsideJournaled => {
                     if let Some(actual) = read_hash(fs, &aside)? {
+                        let journaled = self.displacement_hash(intent_id, 0)?;
+                        if actual != journaled && fs.read(&intent.target)?.is_some() {
+                            fs.sync_file(&aside)?;
+                            fs.sync_dir(aside.parent().unwrap_or_else(|| Path::new(".")))?;
+                            let replacement =
+                                self.available_conflict_path(fs, intent_id, &aside)?;
+                            self.preserve_displacement_path_collision(
+                                intent_id,
+                                0,
+                                &aside,
+                                &replacement,
+                                actual,
+                            )?;
+                            aside = replacement;
+                            continue;
+                        }
                         fs.sync_file(&aside)?;
                         sync_move_dirs(fs, &intent.target, &aside)?;
                         self.finish_journaled_move(
@@ -1295,7 +1311,8 @@ impl Store {
         let transaction = self.conn.transaction()?;
         if let Some((path, collision_hash)) = reserved_collision {
             let collision_ordinal: u32 = transaction.query_row(
-                "SELECT COALESCE(MAX(ordinal) + 1, 2) FROM displaced WHERE intent_id = ?1",
+                "SELECT COALESCE(MAX(CASE WHEN ordinal >= 2 THEN ordinal END) + 1, 2)
+                 FROM displaced WHERE intent_id = ?1",
                 [intent_id],
                 |row| row.get(0),
             )?;
@@ -1427,7 +1444,8 @@ impl Store {
             });
         }
         let next_ordinal: u32 = transaction.query_row(
-            "SELECT COALESCE(MAX(ordinal) + 1, 2) FROM displaced WHERE intent_id = ?1",
+            "SELECT COALESCE(MAX(CASE WHEN ordinal >= 2 THEN ordinal END) + 1, 2)
+             FROM displaced WHERE intent_id = ?1",
             [intent_id],
             |row| row.get(0),
         )?;
@@ -2800,6 +2818,53 @@ mod rename_aside_tests {
         let history = fixture.store.displacement_history().unwrap();
         assert_eq!(history.iter().filter(|entry| entry.ordinal == 0).count(), 1);
         assert_eq!(history.iter().filter(|entry| entry.ordinal == 2).count(), 1);
+    }
+
+    #[test]
+    fn post_journal_ordinal_zero_collision_is_preserved_before_replanning() {
+        let mut fixture = fixture();
+        fixture.fs.inject_before_move(
+            &fixture.target,
+            &fixture.aside,
+            &fixture.aside,
+            b"foreign retained bytes",
+        );
+        fixture.fs.inject_before_move(
+            &fixture.temp,
+            &fixture.target,
+            &fixture.target,
+            b"external save",
+        );
+
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::ConflictRestored);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.target),
+            Some(b"preimage".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.conflict),
+            Some(b"external save".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"foreign retained bytes".as_slice())
+        );
+        let history = fixture.store.displacement_history().unwrap();
+        let displaced = history.iter().find(|entry| entry.ordinal == 0).unwrap();
+        let reappeared = history.iter().find(|entry| entry.ordinal == 1).unwrap();
+        let collision = history.iter().find(|entry| entry.ordinal == 2).unwrap();
+        assert_ne!(displaced.path, fixture.aside);
+        assert_eq!(reappeared.path, fixture.conflict);
+        assert_eq!(collision.path, fixture.aside);
+        assert_eq!(
+            fixture.fs.bytes(&displaced.path),
+            Some(b"preimage".as_slice())
+        );
     }
 
     #[test]

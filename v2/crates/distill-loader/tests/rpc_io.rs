@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{
-    IoBasis, IoEvent, LoaderIO, ReqId, ResolveResult, RpcIo, RpcIoConfig, RuntimeTarget,
+    IoBasis, IoEvent, LoaderIO, ManifestHash, ReqId, ResolveResult, RpcIo, RpcIoConfig,
+    RuntimeTarget,
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
@@ -509,6 +510,92 @@ fn rpc_io_drop_interrupts_a_stalled_reconnect() {
         dropped_promptly,
         "RpcIO drop waited for the stalled reconnect timeout"
     );
+}
+
+#[test]
+fn rpc_io_full_completion_channel_does_not_cancel_candidate_publication() {
+    let Fixture {
+        server,
+        request,
+        asset,
+        ..
+    } = fixture();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let (candidate_connected_tx, candidate_connected_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let initial = listener.accept_one().await.unwrap();
+            let first_bind = listener.accept_one().await.unwrap();
+            let candidate = listener.accept_one().await.unwrap();
+            candidate_connected_tx.send(()).unwrap();
+            for connection in [initial, first_bind, candidate] {
+                connection.await.unwrap().unwrap();
+            }
+        });
+    });
+    let first_target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    io.bind_target(first_target);
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+
+    let stale_basis = IoBasis::Pack {
+        manifest: ManifestHash([0; 32]),
+    };
+    for request_id in 0..256 {
+        io.resolve(ReqId(request_id), asset, &stale_basis);
+    }
+    let candidate_target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(2),
+        target_definition_hash: TARGET_HASH,
+    };
+    io.bind_target(candidate_target.clone());
+    candidate_connected_rx.recv().unwrap();
+
+    // Leave the candidate's TargetBound blocked longer than the peer timeout.
+    // The old ordering committed the candidate inside that timeout, canceled
+    // this acknowledgment, cleared rebind, and therefore never retried it.
+    std::thread::sleep(Duration::from_millis(2_200));
+    let mut published = io.poll();
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| matches!(event, IoEvent::RequestError { .. }))
+            .count(),
+        256
+    );
+    assert!(!published
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetRejected { .. })));
+    if !published.iter().any(|event| {
+        matches!(
+            event,
+            IoEvent::TargetBound { target, .. } if target == &candidate_target
+        )
+    }) {
+        published.extend(poll_until(&mut io, 1));
+    }
+    assert!(published.iter().any(|event| matches!(
+        event,
+        IoEvent::TargetBound { target, .. } if target == &candidate_target
+    )));
+    assert!(!published
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetRejected { .. })));
+
+    drop(io);
+    server_thread.join().unwrap();
 }
 
 fn poll_until(io: &mut RpcIo, minimum: usize) -> Vec<IoEvent> {

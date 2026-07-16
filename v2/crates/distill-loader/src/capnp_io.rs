@@ -398,6 +398,14 @@ struct RebindState {
     reported: bool,
 }
 
+struct ReconnectCandidate {
+    target: RuntimeTarget,
+    client: CapnpClient,
+    hub: RemoteHub,
+    snapshot: RemoteSnapshot,
+    subscription: Option<RemoteSubscription>,
+}
+
 #[derive(Default)]
 struct Subscriptions {
     assets: BTreeSet<AssetUuid>,
@@ -434,25 +442,35 @@ impl Driver {
                 }
                 DriverWake::Command(None) => break,
                 DriverWake::Reconnect => {
-                    let timed_out = {
+                    let target = self
+                        .rebind
+                        .as_ref()
+                        .expect("reconnect wake requires pending state")
+                        .target
+                        .clone();
+                    let attempt = {
                         let mut shutdown = self.shutdown.clone();
                         let attempt = tokio::time::timeout(
                             RECONNECT_ATTEMPT_TIMEOUT,
-                            self.attempt_reconnect(),
+                            self.prepare_reconnect(target),
                         );
                         tokio::pin!(attempt);
                         tokio::select! {
                             biased;
                             _ = shutdown.changed() => break 'driver,
-                            result = &mut attempt => result.is_err(),
+                            result = &mut attempt => result,
                         }
                     };
-                    if timed_out {
-                        self.defer_reconnect(format!(
-                            "RPC reconnection attempt timed out after {} ms",
-                            RECONNECT_ATTEMPT_TIMEOUT.as_millis(),
-                        ))
-                        .await;
+                    match attempt {
+                        Ok(Ok(candidate)) => self.commit_reconnect(candidate).await,
+                        Ok(Err(message)) => self.defer_reconnect(message).await,
+                        Err(_) => {
+                            self.defer_reconnect(format!(
+                                "RPC reconnection attempt timed out after {} ms",
+                                RECONNECT_ATTEMPT_TIMEOUT.as_millis(),
+                            ))
+                            .await;
+                        }
                     }
                 }
             }
@@ -611,43 +629,21 @@ impl Driver {
         });
     }
 
-    async fn attempt_reconnect(&mut self) {
-        let Some(target) = self.rebind.as_ref().map(|state| state.target.clone()) else {
-            return;
-        };
+    async fn prepare_reconnect(&self, target: RuntimeTarget) -> Result<ReconnectCandidate, String> {
         let request = connect_request(&self.target, &target);
-        let client = match CapnpClient::connect_local(self.address).await {
-            Ok(client) => client,
-            Err(error) => {
-                self.defer_reconnect(error.to_string()).await;
-                return;
-            }
-        };
-        let outcome = match client.connect(&request).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.defer_reconnect(error.to_string()).await;
-                return;
-            }
-        };
-        let hub = match RemoteHub::connected(outcome) {
-            Ok(hub) => hub,
-            Err(outcome) => {
-                self.defer_reconnect(format!("RPC reconnection rejected: {outcome:?}"))
-                    .await;
-                return;
-            }
-        };
+        let client = CapnpClient::connect_local(self.address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let outcome = client
+            .connect(&request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let hub = RemoteHub::connected(outcome)
+            .map_err(|outcome| format!("RPC reconnection rejected: {outcome:?}"))?;
         let snapshot = match hub.snapshot().await {
             Ok(RemoteCall::Success(snapshot)) => snapshot,
-            Ok(call) => {
-                self.defer_reconnect(remote_message(call)).await;
-                return;
-            }
-            Err(error) => {
-                self.defer_reconnect(error.to_string()).await;
-                return;
-            }
+            Ok(call) => return Err(remote_message(call)),
+            Err(error) => return Err(error.to_string()),
         };
         let (assets, paths) = {
             let subscriptions = self.subscriptions.borrow();
@@ -664,27 +660,42 @@ impl Driver {
                 .await
             {
                 Ok(RemoteCall::Success(subscription)) => Some(subscription),
-                Ok(call) => {
-                    self.defer_reconnect(remote_message(call)).await;
-                    return;
-                }
-                Err(error) => {
-                    self.defer_reconnect(error.to_string()).await;
-                    return;
-                }
+                Ok(call) => return Err(remote_message(call)),
+                Err(error) => return Err(error.to_string()),
             }
         };
+
+        Ok(ReconnectCandidate {
+            target,
+            client,
+            hub,
+            snapshot,
+            subscription,
+        })
+    }
+
+    async fn commit_reconnect(&mut self, candidate: ReconnectCandidate) {
+        let target_bound = IoEvent::TargetBound {
+            target: candidate.target,
+            basis: io_basis(candidate.snapshot.basis()),
+        };
+        // Queue the acknowledgment while the previous connection and durable
+        // rebind state still own the driver. A full completion channel may
+        // delay this local publication, but it is not a failed peer handshake
+        // and must not consume the reconnect timeout or expose candidate state.
+        if !send_event(&self.events, target_bound).await {
+            return;
+        }
         if let Some(task) = self.delta_task.take() {
             task.abort();
         }
-        self.client = client;
-        self.hub = hub;
-        self.snapshot = snapshot;
-        if let Some(subscription) = subscription {
+        self.client = candidate.client;
+        self.hub = candidate.hub;
+        self.snapshot = candidate.snapshot;
+        if let Some(subscription) = candidate.subscription {
             self.install_delta_stream(subscription);
         }
         self.rebind = None;
-        self.publish_target_bound(target).await;
     }
 
     async fn defer_reconnect(&mut self, message: String) {
@@ -699,17 +710,6 @@ impl Driver {
             state.next_attempt = tokio::time::Instant::now() + state.backoff;
             state.backoff = state.backoff.saturating_mul(2).min(RECONNECT_MAX_BACKOFF);
         }
-    }
-
-    async fn publish_target_bound(&self, target: RuntimeTarget) {
-        let _ = send_event(
-            &self.events,
-            IoEvent::TargetBound {
-                target,
-                basis: io_basis(self.snapshot.basis()),
-            },
-        )
-        .await;
     }
 
     fn basis_matches(&self, basis: &IoBasis) -> bool {

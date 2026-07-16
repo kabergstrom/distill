@@ -3644,6 +3644,57 @@ fn preserve_waiting_bundle_paths(
     }
 }
 
+fn include_reactivation_durable_paths(
+    paths: &mut BTreeMap<String, BTreeSet<AssetUuid>>,
+    scan: &ScanSnapshot,
+    durable_bundles: &BTreeMap<BundleUuid, DurableBundleBasis>,
+) {
+    for path in durable_bundles
+        .values()
+        .filter_map(|basis| basis.summary.as_ref().map(|summary| summary.path.clone()))
+    {
+        paths.entry(path.clone()).or_insert_with(|| {
+            scan.bundle_rows()
+                .filter(|source| source.normalized_path == path)
+                .filter_map(|source| source.parsed.as_ref().ok())
+                .filter_map(|bundle| {
+                    bundle
+                        .primary
+                        .as_ref()
+                        .map(|primary| bundle.assets[primary].uuid)
+                })
+                .collect()
+        });
+    }
+}
+
+fn append_path_mutations(
+    commit: &mut Commit,
+    current_paths: &BTreeMap<String, BTreeSet<AssetUuid>>,
+    old_paths: &BTreeMap<String, BTreeSet<AssetUuid>>,
+    waiting: Option<&RetiredWaitingProjection>,
+) {
+    for (path, current) in current_paths {
+        if waiting.is_some_and(|waiting| waiting.paths.contains(path)) {
+            continue;
+        }
+        let old = &old_paths[path];
+        if old == current {
+            continue;
+        }
+        if current.is_empty() {
+            commit
+                .paths
+                .push(PathMutation::Remove { path: path.clone() });
+        } else {
+            commit.paths.push(PathMutation::Set {
+                path: path.clone(),
+                candidates: current.clone(),
+            });
+        }
+    }
+}
+
 struct IncrementalSchemaTransition<'a> {
     planned: &'a PlannedSchemaTransition,
     candidate: &'a ValidatedPipelineEpoch,
@@ -3762,11 +3813,6 @@ fn publish_incremental_scan(
         let assets = store.asset_ids_in_bundle(*bundle)?;
         durable_bundles.insert(*bundle, DurableBundleBasis { summary, assets });
     }
-    let old_paths = plan
-        .paths
-        .keys()
-        .map(|path| Ok((path.clone(), store.path_assets(path)?)))
-        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     let old_derived = plan
         .derived_outputs
         .keys()
@@ -3846,6 +3892,25 @@ fn publish_incremental_scan(
         // last-good view until reactivation admits the move atomically.
         preserve_waiting_bundle_paths(waiting, &durable_bundles);
     }
+    let mut path_projections = plan.paths.clone();
+    if schema_transition.is_some_and(|transition| {
+        matches!(
+            transition.planned.request.action,
+            SchemaTransitionAction::Reactivate
+        )
+    }) {
+        include_reactivation_durable_paths(
+            &mut path_projections,
+            complete_waiting_scan
+                .as_ref()
+                .expect("schema transition constructed a complete scan"),
+            &durable_bundles,
+        );
+    }
+    let old_paths = path_projections
+        .keys()
+        .map(|path| Ok((path.clone(), store.path_assets(path)?)))
+        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     let mut changed_bundles = BTreeSet::new();
     if plan.version_poison.is_none() {
         for (bundle_uuid, source) in &plan.bundles {
@@ -3930,28 +3995,7 @@ fn publish_incremental_scan(
                     .push(AuthoringMutation::Remove { uuid: *asset });
             }
         }
-        for (path, current) in &plan.paths {
-            if waiting
-                .as_ref()
-                .is_some_and(|waiting| waiting.paths.contains(path))
-            {
-                continue;
-            }
-            let old = &old_paths[path];
-            if old == current {
-                continue;
-            }
-            if current.is_empty() {
-                commit
-                    .paths
-                    .push(PathMutation::Remove { path: path.clone() });
-            } else {
-                commit.paths.push(PathMutation::Set {
-                    path: path.clone(),
-                    candidates: current.clone(),
-                });
-            }
-        }
+        append_path_mutations(&mut commit, &path_projections, &old_paths, waiting.as_ref());
         for (child, current) in &plan.derived_outputs {
             let old = old_derived[child].as_ref();
             if waiting.as_ref().is_some_and(|waiting| {
@@ -4873,6 +4917,75 @@ mod scheduler_tests {
                 "old/location.bundle".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn reactivation_removes_durable_old_path_and_sets_observed_new_path() {
+        let bundle_uuid = BundleUuid([61; 16]);
+        let asset = AssetUuid([62; 16]);
+        let old_path = "old/location.bundle".to_owned();
+        let new_path = "new/location.bundle".to_owned();
+        let bundle = Bundle {
+            format_version: 1,
+            uuid: bundle_uuid,
+            primary: Some("primary".to_owned()),
+            schemas: BTreeMap::new(),
+            assets: BTreeMap::from([(
+                "primary".to_owned(),
+                AssetEntry {
+                    uuid: asset,
+                    type_uuid: TypeUuid([63; 16]),
+                    schema_hash: LogicalHash([64; 32]),
+                    lineage: distill_bundle::EntryLineageV1::Bootstrap {
+                        bundle_format_version: 1,
+                    },
+                    authoring_only: false,
+                    data: AuthoredValue::Null,
+                },
+            )]),
+        };
+        let mut scan = ScanSnapshot::default();
+        scan.bundles.insert(
+            ("main".to_owned(), new_path.clone()),
+            Arc::new(ScannedBundle {
+                root_name: "main".to_owned(),
+                normalized_path: new_path.clone(),
+                file_hash: BundleFileHash([65; 32]),
+                bytes: Vec::new(),
+                parsed: Ok(bundle),
+                namespace_skeleton: None,
+            }),
+        );
+        let durable = BTreeMap::from([(
+            bundle_uuid,
+            DurableBundleBasis {
+                summary: Some(BundleSummary {
+                    root_name: "main".to_owned(),
+                    path: old_path.clone(),
+                    format_version: 1,
+                    content_hash: ContentHash([66; 32]),
+                    origin: None,
+                }),
+                assets: BTreeSet::from([asset]),
+            },
+        )]);
+        let mut current_paths = BTreeMap::from([(new_path.clone(), BTreeSet::from([asset]))]);
+
+        include_reactivation_durable_paths(&mut current_paths, &scan, &durable);
+        let old_paths = BTreeMap::from([
+            (old_path.clone(), BTreeSet::from([asset])),
+            (new_path.clone(), BTreeSet::new()),
+        ]);
+        let mut commit = Commit::default();
+        append_path_mutations(&mut commit, &current_paths, &old_paths, None);
+
+        assert!(commit.paths.contains(&PathMutation::Remove {
+            path: old_path.clone(),
+        }));
+        assert!(commit.paths.contains(&PathMutation::Set {
+            path: new_path,
+            candidates: BTreeSet::from([asset]),
+        }));
     }
 
     #[test]
