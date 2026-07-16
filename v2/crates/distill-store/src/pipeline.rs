@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use distill_core::bootstrap::{bootstrap_control_logical_registry_v1, is_bootstrap_control_type};
-use distill_core::id::{ContentHash, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 pub use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_core::tool::{
@@ -22,8 +22,8 @@ use crate::db::{InputTxn, Store};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::state::{
     InputVersion, PipelineCandidateIdentity, PipelineEpoch, PipelinePoison, PipelineState,
-    Registration, RegistrationKind, SchemaAcceptanceRequired, SchemaManifestBasis,
-    SchemaRegistryMismatch,
+    Registration, RegistrationKind, RetiredTypeReferenced, SchemaAcceptanceRequired,
+    SchemaManifestBasis, SchemaRegistryMismatch,
 };
 
 /// One package member supplied at the registration boundary.
@@ -552,6 +552,10 @@ impl VerifiedSchemaLineageManifest {
 /// validation. Automatic diffs are deliberately absent from this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReverseMigrationEdge {
+    /// The authored Migration asset that supplied this edge. Keeping identity
+    /// and multiplicity is required: two assets with the same endpoints are an
+    /// ambiguity, not one deduplicated edge.
+    pub asset: AssetUuid,
     pub from: LogicalHash,
     pub to: LogicalHash,
 }
@@ -699,7 +703,11 @@ impl InputTxn<'_> {
                poison_identity = NULL,
                poison_message = NULL,
                acceptance_candidate_dylib_hash = NULL,
-               acceptance_manifest_hash = NULL",
+               acceptance_manifest_hash = NULL,
+               retired_manifest_hash = NULL,
+               retired_basis_instance = NULL,
+               retired_basis_version = NULL,
+               retired_type_uuid = NULL",
             rusqlite::params![epoch.dylib_hash.as_slice(), self.version().0 as i64,],
         )?;
         self.txn.execute("DELETE FROM registrations", [])?;
@@ -723,6 +731,8 @@ impl InputTxn<'_> {
         replace_target_set(&self.txn, false, &epoch.target_set)?;
         self.txn
             .execute("DELETE FROM pipeline_candidate_target_set", [])?;
+        self.txn
+            .execute("DELETE FROM pipeline_retired_references", [])?;
         Ok(())
     }
 
@@ -747,7 +757,11 @@ impl InputTxn<'_> {
                poison_identity = NULL,
                poison_message = NULL,
                acceptance_candidate_dylib_hash = excluded.acceptance_candidate_dylib_hash,
-               acceptance_manifest_hash = excluded.acceptance_manifest_hash",
+               acceptance_manifest_hash = excluded.acceptance_manifest_hash,
+               retired_manifest_hash = NULL,
+               retired_basis_instance = NULL,
+               retired_basis_version = NULL,
+               retired_type_uuid = NULL",
             rusqlite::params![
                 self.version().0 as i64,
                 epoch.dylib_hash.as_slice(),
@@ -769,6 +783,8 @@ impl InputTxn<'_> {
                     .current_cursors
             )
         );
+        self.txn
+            .execute("DELETE FROM pipeline_retired_references", [])?;
         Ok(())
     }
 
@@ -795,7 +811,11 @@ impl InputTxn<'_> {
                poison_identity = excluded.poison_identity,
                poison_message = excluded.poison_message,
                acceptance_candidate_dylib_hash = NULL,
-               acceptance_manifest_hash = NULL",
+               acceptance_manifest_hash = NULL,
+               retired_manifest_hash = NULL,
+               retired_basis_instance = NULL,
+               retired_basis_version = NULL,
+               retired_type_uuid = NULL",
             rusqlite::params![
                 self.version().0 as i64,
                 poison.code as u16,
@@ -809,7 +829,88 @@ impl InputTxn<'_> {
             .execute("DELETE FROM pipeline_candidate_schema_registry", [])?;
         self.txn
             .execute("DELETE FROM pipeline_candidate_target_set", [])?;
+        self.txn
+            .execute("DELETE FROM pipeline_retired_references", [])?;
         Ok(())
+    }
+
+    /// Publish the deterministic authority-unavailable state for bytes waiting
+    /// on explicit reactivation. The last-good dylib and any already staged
+    /// candidate remain residency/basis records but are never served as Ready.
+    pub fn publish_retired_type_referenced(
+        &mut self,
+        error: &RetiredTypeReferenced,
+    ) -> Result<(), StoreError> {
+        if error.references.is_empty()
+            || !error.references.windows(2).all(|pair| pair[0] < pair[1])
+            || error.basis.version != self.version()
+            || error.basis.instance != self.base_stamp().instance
+        {
+            return Err(StoreError::InvalidConfiguration {
+                error: "RetiredTypeReferenced is empty, noncanonical, or has the wrong publication basis"
+                    .to_owned(),
+            });
+        }
+        self.txn.execute(
+            "INSERT INTO pipeline_state(
+                 id, dylib_hash, input_version,
+                 poison_code, poison_origin, poison_cleanup, poison_identity, poison_message,
+                 acceptance_candidate_dylib_hash, acceptance_manifest_hash,
+                 retired_manifest_hash, retired_basis_instance, retired_basis_version,
+                 retired_type_uuid
+             ) VALUES (0, NULL, ?1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               input_version = excluded.input_version,
+               poison_code = NULL,
+               poison_origin = NULL,
+               poison_cleanup = NULL,
+               poison_identity = NULL,
+               poison_message = NULL,
+               retired_manifest_hash = excluded.retired_manifest_hash,
+               retired_basis_instance = excluded.retired_basis_instance,
+               retired_basis_version = excluded.retired_basis_version,
+               retired_type_uuid = excluded.retired_type_uuid",
+            rusqlite::params![
+                self.version().0 as i64,
+                error.manifest_hash.0.as_slice(),
+                error.basis.instance.0.as_slice(),
+                error.basis.version.0 as i64,
+                error.type_uuid.0.as_slice(),
+            ],
+        )?;
+        self.txn
+            .execute("DELETE FROM pipeline_retired_references", [])?;
+        for (position, reference) in error.references.iter().enumerate() {
+            let (kind, subject): (i64, &[u8]) = match reference {
+                RetiredTypeReference::Asset(asset) => (1, &asset.0),
+                RetiredTypeReference::MigrationEndpoint(hash) => (2, &hash.0),
+            };
+            self.txn.execute(
+                "INSERT INTO pipeline_retired_references(position, reference_kind, subject)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![position as i64, kind, subject],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove a healed retired-reference overlay while preserving the staged
+    /// candidate or last-good epoch beneath it.
+    pub fn clear_retired_type_referenced(&mut self) -> Result<bool, StoreError> {
+        let changed = self.txn.execute(
+            "UPDATE pipeline_state SET
+               retired_manifest_hash = NULL,
+               retired_basis_instance = NULL,
+               retired_basis_version = NULL,
+               retired_type_uuid = NULL
+             WHERE id = 0 AND retired_type_uuid IS NOT NULL",
+            [],
+        )? != 0;
+        if changed {
+            self.txn
+                .execute("DELETE FROM pipeline_retired_references", [])?;
+        }
+        Ok(changed)
     }
 
     /// Publish a package snapshot or explicit ambient toolchain identity.
@@ -1766,6 +1867,12 @@ fn exact_blob32(bytes: Vec<u8>, name: &str) -> Result<[u8; 32], StoreError> {
         .map_err(|_| invalid_manifest(None, &format!("{name} is not exactly 32 bytes")))
 }
 
+fn exact_blob16(bytes: Vec<u8>, name: &str) -> Result<[u8; 16], StoreError> {
+    bytes
+        .try_into()
+        .map_err(|_| invalid_manifest(None, &format!("{name} must contain exactly 16 bytes")))
+}
+
 fn type_lineage(
     conn: &rusqlite::Connection,
     type_uuid: TypeUuid,
@@ -1930,8 +2037,17 @@ fn validate_rollback_coverage(
         .enumerate()
         .map(|(index, epoch)| (epoch.digest, index as u32))
         .collect();
-    let mut outgoing: BTreeMap<LogicalHash, Vec<LogicalHash>> = BTreeMap::new();
+    let mut seen_assets = BTreeSet::new();
+    let mut outgoing: BTreeMap<LogicalHash, Vec<(AssetUuid, LogicalHash)>> = BTreeMap::new();
     for edge in reverse_edges {
+        if !seen_assets.insert(edge.asset) {
+            return Err(coverage_error(
+                type_uuid,
+                target,
+                edge.from,
+                "the same Migration asset was supplied more than once",
+            ));
+        }
         if !positions.contains_key(&edge.from) || !positions.contains_key(&edge.to) {
             return Err(coverage_error(
                 type_uuid,
@@ -1940,7 +2056,10 @@ fn validate_rollback_coverage(
                 "a supplied reverse edge endpoint is not an accepted epoch",
             ));
         }
-        outgoing.entry(edge.from).or_default().push(edge.to);
+        outgoing
+            .entry(edge.from)
+            .or_default()
+            .push((edge.asset, edge.to));
     }
 
     let old_current = lineage.epochs[lineage.current as usize].digest;
@@ -1987,7 +2106,7 @@ fn validate_rollback_coverage(
                     "custom reverse path is ambiguous",
                 ));
             }
-            cursor = next[0];
+            cursor = next[0].1;
         }
     }
     Ok(())
@@ -2039,6 +2158,28 @@ fn coverage_error(
 }
 
 impl Store {
+    /// Retained authority rows currently excluded from the active pipeline
+    /// registry. Coordinators use this to classify waiting scan references
+    /// before opening an input transaction.
+    pub fn retired_type_uuids(&self) -> Result<BTreeSet<TypeUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT type_uuid FROM schema_lineage_current WHERE authority = 1")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| Ok(TypeUuid(exact_blob16(row?, "retired type UUID")?)))
+            .collect();
+        rows
+    }
+
+    /// Exact still-staged candidate identity, including while a
+    /// RetiredTypeReferenced diagnostic is the published unavailable state.
+    pub fn pending_schema_candidate_identity(
+        &self,
+    ) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
+        pending_candidate_identity(&self.conn)
+    }
+
     /// Exact verified source-manifest basis currently projected into the
     /// disposable store tables. Schema-transition coordinators use this as a
     /// read-only stale precondition before touching the authored manifest.
@@ -2126,6 +2267,10 @@ impl Store {
             Option<String>,
             Option<Vec<u8>>,
             Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<Vec<u8>>,
         );
         let row: Option<StateRow> = self
             .conn
@@ -2133,7 +2278,9 @@ impl Store {
                 "SELECT dylib_hash, poison_code, poison_origin, poison_cleanup,
                         poison_identity, poison_message,
                         acceptance_candidate_dylib_hash,
-                        acceptance_manifest_hash
+                        acceptance_manifest_hash,
+                        retired_manifest_hash, retired_basis_instance,
+                        retired_basis_version, retired_type_uuid
                  FROM pipeline_state WHERE id = 0",
                 [],
                 |r| {
@@ -2146,6 +2293,10 @@ impl Store {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
                     ))
                 },
             )
@@ -2159,6 +2310,10 @@ impl Store {
             poison_message,
             candidate_dylib,
             stored_manifest_hash,
+            retired_manifest_hash,
+            retired_basis_instance,
+            retired_basis_version,
+            retired_type_uuid,
         )) = row
         else {
             return Ok(None);
@@ -2193,6 +2348,74 @@ impl Store {
         };
 
         let has_candidate = candidate_dylib.is_some() || stored_manifest_hash.is_some();
+        let retired = match (
+            retired_manifest_hash,
+            retired_basis_instance,
+            retired_basis_version,
+            retired_type_uuid,
+        ) {
+            (None, None, None, None) => None,
+            (Some(manifest), Some(instance), Some(version), Some(type_uuid)) => {
+                let mut statement = self.conn.prepare(
+                    "SELECT reference_kind, subject FROM pipeline_retired_references
+                     ORDER BY position",
+                )?;
+                let references = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })?
+                    .map(|row| {
+                        let (kind, subject) = row?;
+                        match kind {
+                            1 => Ok(RetiredTypeReference::Asset(AssetUuid(exact_blob16(
+                                subject,
+                                "retired asset reference",
+                            )?))),
+                            2 => Ok(RetiredTypeReference::MigrationEndpoint(LogicalHash(
+                                exact_blob32(subject, "retired migration endpoint")?,
+                            ))),
+                            _ => Err(invalid_manifest(
+                                None,
+                                "retired reference has an unknown kind",
+                            )),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, StoreError>>()?;
+                let version = u64::try_from(version).map_err(|_| {
+                    invalid_manifest(None, "retired reference basis version is negative")
+                })?;
+                let error = RetiredTypeReferenced {
+                    manifest_hash: ContentHash(exact_blob32(
+                        manifest,
+                        "retired reference manifest hash",
+                    )?),
+                    basis: crate::state::SnapshotStamp {
+                        instance: crate::state::StoreInstanceId(exact_blob16(
+                            instance,
+                            "retired reference store instance",
+                        )?),
+                        version: InputVersion(version),
+                    },
+                    type_uuid: TypeUuid(exact_blob16(type_uuid, "retired type UUID")?),
+                    references,
+                };
+                if error.references.is_empty()
+                    || !error.references.windows(2).all(|pair| pair[0] < pair[1])
+                {
+                    return Err(invalid_manifest(
+                        Some(error.type_uuid),
+                        "retired references are empty or noncanonical",
+                    ));
+                }
+                Some(error)
+            }
+            _ => {
+                return Err(invalid_manifest(
+                    None,
+                    "retired-reference pipeline columns are incomplete",
+                ));
+            }
+        };
         let poison = match (
             poison_code,
             poison_origin,
@@ -2231,11 +2454,17 @@ impl Store {
             }
         };
 
-        if poison.is_some() && has_candidate {
+        if poison.is_some() && (has_candidate || retired.is_some()) {
             return Err(invalid_manifest(
                 None,
                 "pipeline state is both poisoned and schema-acceptance-required",
             ));
+        }
+        if let Some(error) = retired {
+            return Ok(Some(PipelineState::RetiredTypeReferenced {
+                error,
+                last_good: epoch,
+            }));
         }
         if has_candidate {
             let candidate = pending_candidate_identity(&self.conn)?.ok_or_else(|| {

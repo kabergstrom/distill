@@ -348,6 +348,7 @@ struct CandidateRecord {
 struct Sweep {
     basis: IoBasis,
     candidates: BTreeMap<AssetUuid, CandidateRecord>,
+    pending_paths: BTreeSet<String>,
 }
 
 struct PendingUpdate {
@@ -364,6 +365,13 @@ struct PendingUpdate {
 struct PendingComponent {
     adoption: AdoptionId,
     updates: Vec<PendingUpdate>,
+    members: Vec<AssetUuid>,
+    basis: IoBasis,
+}
+
+enum StageComponentOutcome {
+    Staged,
+    Failed { uuid: AssetUuid, error: String },
 }
 
 pub struct Loader<I: LoaderIO> {
@@ -878,37 +886,7 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let basis = self.io.begin_sweep();
-        let held = self.held_uuids();
-        let affected = if self.dirty_paths.is_empty() {
-            let current = self.current_graph();
-            let mut affected = self
-                .dirty
-                .intersection(&held)
-                .copied()
-                .collect::<BTreeSet<_>>();
-            loop {
-                let before = affected.len();
-                for (parent, children) in &current {
-                    if affected.contains(parent)
-                        || children.iter().any(|child| affected.contains(child))
-                    {
-                        if held.contains(parent) {
-                            affected.insert(*parent);
-                        }
-                        affected.extend(children.intersection(&held).copied());
-                    }
-                }
-                if affected.len() == before {
-                    break;
-                }
-            }
-            affected
-        } else {
-            // Path resolution can change which UUID a handle owns, so retain
-            // the conservative sweep until the path result identifies the
-            // affected current/new component.
-            held
-        };
+        let affected = self.current_components_from(&self.dirty);
         let mut candidates = BTreeMap::new();
         for uuid in affected {
             candidates.insert(
@@ -922,7 +900,11 @@ impl<I: LoaderIO> Loader<I> {
                 },
             );
         }
-        self.sweep = Some(Sweep { basis, candidates });
+        self.sweep = Some(Sweep {
+            basis,
+            candidates,
+            pending_paths: self.dirty_paths.clone(),
+        });
         Ok(())
     }
 
@@ -1032,8 +1014,9 @@ impl<I: LoaderIO> Loader<I> {
                         Binding::Direct(_) => None,
                     })
                     .collect::<BTreeSet<_>>();
+                let held = self.held_uuids();
                 self.detach_indirect_slots(storage, Some(&paths));
-                self.dirty.extend(self.held_uuids());
+                self.dirty.extend(held);
                 self.dirty_paths.extend(paths);
                 self.block_for_target_binding();
             }
@@ -1075,7 +1058,17 @@ impl<I: LoaderIO> Loader<I> {
                     }
                 }
                 let paths = paths.into_iter().collect::<BTreeSet<_>>();
+                let old_path_assets = self
+                    .slots
+                    .values()
+                    .filter_map(|slot| match &slot.binding {
+                        Binding::Indirect { path, resolved } if paths.contains(path) => *resolved,
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                let old_components = self.current_components_from(&old_path_assets);
                 self.detach_indirect_slots(storage, Some(&paths));
+                self.dirty.extend(old_components);
                 self.dirty_paths.extend(paths);
             }
             IoEvent::Resolved {
@@ -1119,6 +1112,9 @@ impl<I: LoaderIO> Loader<I> {
                 }) {
                     self.diagnostics.push(LoaderDiagnostic::EventMismatch);
                     return Ok(());
+                }
+                if let Some(sweep) = &mut self.sweep {
+                    sweep.pending_paths.remove(&path);
                 }
                 self.accept_path(&path, result, storage);
             }
@@ -1168,6 +1164,9 @@ impl<I: LoaderIO> Loader<I> {
                         self.fail_content_candidate(content_hash, &basis, message.clone());
                     }
                     Some((OutstandingPurpose::ResolvePath, RequestOwner::Path(path))) => {
+                        if let Some(sweep) = &mut self.sweep {
+                            sweep.pending_paths.remove(&path);
+                        }
                         self.accept_path(
                             &path,
                             PathResolveResult::Failed {
@@ -1317,6 +1316,7 @@ impl<I: LoaderIO> Loader<I> {
             .collect::<BTreeSet<_>>();
         self.cancel_pending_for_handles(storage, &ids);
         let mut retired = BTreeSet::new();
+        let mut rebound = BTreeSet::new();
         let mut unsubscribe = Vec::new();
         for id in ids {
             let slot = self.slots.get_mut(&id).expect("collected existing slot");
@@ -1338,21 +1338,26 @@ impl<I: LoaderIO> Loader<I> {
                         adopted_at: AdoptionId(0),
                     });
                     self.dirty.insert(*uuid);
-                    if let Some(sweep) = &mut self.sweep {
-                        sweep.candidates.entry(*uuid).or_insert(CandidateRecord {
-                            basis: sweep.basis.clone(),
-                            resolve_issued: false,
-                            expected_terminal_types: BTreeSet::new(),
-                            load_expectations: PlaceholderReferences::new(),
-                            terminal: CandidateTerminal::Pending,
-                        });
-                    }
+                    rebound.insert(*uuid);
                 }
                 PathResolveResult::Missing
                 | PathResolveResult::Unsupported
                 | PathResolveResult::Failed { .. } => {
                     slot.status = LoadStatus::Unloaded;
                 }
+            }
+        }
+        let rebound_components = self.current_components_from(&rebound);
+        if let Some(sweep) = &mut self.sweep {
+            let basis = sweep.basis.clone();
+            for uuid in rebound_components {
+                sweep.candidates.entry(uuid).or_insert(CandidateRecord {
+                    basis: basis.clone(),
+                    resolve_issued: false,
+                    expected_terminal_types: BTreeSet::new(),
+                    load_expectations: PlaceholderReferences::new(),
+                    terminal: CandidateTerminal::Pending,
+                });
             }
         }
         for uuid in unsubscribe {
@@ -1808,10 +1813,11 @@ impl<I: LoaderIO> Loader<I> {
         let Some(sweep) = &self.sweep else {
             return Ok(());
         };
-        if sweep
-            .candidates
-            .values()
-            .any(|candidate| !self.candidate_complete(candidate))
+        if !sweep.pending_paths.is_empty()
+            || sweep
+                .candidates
+                .values()
+                .any(|candidate| !self.candidate_complete(candidate))
         {
             return Ok(());
         }
@@ -1875,7 +1881,19 @@ impl<I: LoaderIO> Loader<I> {
         for decision in decisions {
             match decision {
                 AdoptionDecision::Ready { members, .. } => {
-                    self.stage_component(&mut sweep, members, storage)?;
+                    match self.stage_component(&mut sweep, &members, storage) {
+                        Ok(StageComponentOutcome::Staged) => {}
+                        Ok(StageComponentOutcome::Failed { uuid, error }) => {
+                            let failures = vec![(uuid, MemberFailure::Failed(error))];
+                            self.freeze_component(&mut sweep, &members, &failures);
+                            self.diagnostics
+                                .push(LoaderDiagnostic::ComponentPoisoned { members, failures });
+                        }
+                        Err(error) => {
+                            destroy_sweep_values(sweep);
+                            return Err(error);
+                        }
+                    }
                 }
                 AdoptionDecision::Poisoned { members, failures } => {
                     self.freeze_component(&mut sweep, &members, &failures);
@@ -1985,19 +2003,19 @@ impl<I: LoaderIO> Loader<I> {
     fn stage_component(
         &mut self,
         sweep: &mut Sweep,
-        members: Vec<AssetUuid>,
+        members: &[AssetUuid],
         storage: &mut dyn AssetStorage,
-    ) -> Result<(), LoaderError> {
+    ) -> Result<StageComponentOutcome, LoaderError> {
         if members.iter().all(|uuid| {
             sweep.candidates.get(uuid).is_some_and(|candidate| {
                 matches!(candidate.terminal, CandidateTerminal::Unchanged { .. })
             })
         }) {
-            return Ok(());
+            return Ok(StageComponentOutcome::Staged);
         }
         let adoption = self.mint_adoption()?;
         let mut updates = Vec::new();
-        for uuid in members {
+        for uuid in members.iter().copied() {
             let Some(candidate) = sweep.candidates.get_mut(&uuid) else {
                 continue;
             };
@@ -2013,7 +2031,14 @@ impl<I: LoaderIO> Loader<I> {
                         let value = values
                             .remove(&handle)
                             .expect("component readiness checked every handle value");
-                        let epoch = self.ensure_descriptor(*type_uuid)?.epoch;
+                        let epoch = match self.ensure_descriptor(*type_uuid) {
+                            Ok(descriptor) => descriptor.epoch,
+                            Err(error) => {
+                                let _ = value.destroy();
+                                self.rollback_updates(storage, adoption, &updates);
+                                return Err(error);
+                            }
+                        };
                         let stored = StoredAdoption {
                             type_uuid: *type_uuid,
                             handle,
@@ -2021,6 +2046,7 @@ impl<I: LoaderIO> Loader<I> {
                         };
                         if let Err(error) = self.epochs.record_adoption(epoch, stored) {
                             let _ = value.destroy();
+                            self.rollback_updates(storage, adoption, &updates);
                             return Err(LoaderError::RuntimeEpoch(error));
                         }
                         let token = match storage.update(*type_uuid, handle, value, adoption) {
@@ -2032,9 +2058,14 @@ impl<I: LoaderIO> Loader<I> {
                                     let _ = self.epochs.release_adoption(epoch, stored);
                                 }
                                 self.rollback_updates(storage, adoption, &updates);
-                                self.diagnostics
-                                    .push(LoaderDiagnostic::Storage { handle, error });
-                                return Ok(());
+                                self.diagnostics.push(LoaderDiagnostic::Storage {
+                                    handle,
+                                    error: error.clone(),
+                                });
+                                return Ok(StageComponentOutcome::Failed {
+                                    uuid,
+                                    error: format!("asset storage update failed: {error:?}"),
+                                });
                             }
                         };
                         updates.push(PendingUpdate {
@@ -2063,7 +2094,14 @@ impl<I: LoaderIO> Loader<I> {
                             .and_then(|slot| slot.current.as_ref())
                             .map(|current| current.type_uuid)
                             .expect("placeholder applies only to a prior live value");
-                        let epoch = self.ensure_descriptor(type_uuid)?.epoch;
+                        let epoch = match self.ensure_descriptor(type_uuid) {
+                            Ok(descriptor) => descriptor.epoch,
+                            Err(error) => {
+                                let _ = value.destroy();
+                                self.rollback_updates(storage, adoption, &updates);
+                                return Err(error);
+                            }
+                        };
                         let stored = StoredAdoption {
                             type_uuid,
                             handle,
@@ -2071,6 +2109,7 @@ impl<I: LoaderIO> Loader<I> {
                         };
                         if let Err(error) = self.epochs.record_adoption(epoch, stored) {
                             let _ = value.destroy();
+                            self.rollback_updates(storage, adoption, &updates);
                             return Err(LoaderError::RuntimeEpoch(error));
                         }
                         let token = match storage.update(type_uuid, handle, value, adoption) {
@@ -2082,9 +2121,14 @@ impl<I: LoaderIO> Loader<I> {
                                     let _ = self.epochs.release_adoption(epoch, stored);
                                 }
                                 self.rollback_updates(storage, adoption, &updates);
-                                self.diagnostics
-                                    .push(LoaderDiagnostic::Storage { handle, error });
-                                return Ok(());
+                                self.diagnostics.push(LoaderDiagnostic::Storage {
+                                    handle,
+                                    error: error.clone(),
+                                });
+                                return Ok(StageComponentOutcome::Failed {
+                                    uuid,
+                                    error: format!("asset storage update failed: {error:?}"),
+                                });
                             }
                         };
                         updates.push(PendingUpdate {
@@ -2109,9 +2153,14 @@ impl<I: LoaderIO> Loader<I> {
         if updates.iter().all(|update| update.token.is_none()) {
             self.commit_updates(storage, adoption, updates);
         } else {
-            self.pending.push(PendingComponent { adoption, updates });
+            self.pending.push(PendingComponent {
+                adoption,
+                updates,
+                members: members.to_vec(),
+                basis: sweep.basis.clone(),
+            });
         }
-        Ok(())
+        Ok(StageComponentOutcome::Staged)
     }
 
     fn poll_pending(&mut self, storage: &mut dyn AssetStorage) {
@@ -2134,9 +2183,25 @@ impl<I: LoaderIO> Loader<I> {
             if let Some((handle, epoch, error)) = failed {
                 self.observe_storage_error(&error, epoch);
                 let pending = self.pending.remove(index);
+                let failed_uuid = pending
+                    .updates
+                    .iter()
+                    .find(|update| update.handle == handle)
+                    .map(|update| update.uuid)
+                    .or_else(|| pending.members.first().copied())
+                    .expect("pending component has at least one member");
                 self.rollback_updates(storage, pending.adoption, &pending.updates);
+                let failures = vec![(
+                    failed_uuid,
+                    MemberFailure::Failed(format!("asset storage readiness failed: {error:?}")),
+                )];
+                self.apply_component_failure(&pending.members, &failures, &pending.basis);
                 self.diagnostics
                     .push(LoaderDiagnostic::Storage { handle, error });
+                self.diagnostics.push(LoaderDiagnostic::ComponentPoisoned {
+                    members: pending.members,
+                    failures,
+                });
             } else if all_ready {
                 let pending = self.pending.remove(index);
                 self.commit_updates(storage, pending.adoption, pending.updates);
@@ -2225,9 +2290,30 @@ impl<I: LoaderIO> Loader<I> {
         members: &[AssetUuid],
         failures: &[(AssetUuid, MemberFailure)],
     ) {
+        let basis = sweep.basis.clone();
         for uuid in members {
             if let Some(candidate) = sweep.candidates.remove(uuid) {
                 destroy_candidate_values(candidate.terminal);
+            }
+        }
+        self.apply_component_failure(members, failures, &basis);
+    }
+
+    fn apply_component_failure(
+        &mut self,
+        members: &[AssetUuid],
+        failures: &[(AssetUuid, MemberFailure)],
+        basis: &IoBasis,
+    ) {
+        for uuid in members {
+            for handle in self.handles_for_uuid(*uuid) {
+                if let Some(slot) = self.slots.get_mut(&handle) {
+                    slot.status = if slot.current.is_some() {
+                        LoadStatus::Loaded
+                    } else {
+                        LoadStatus::Unloaded
+                    };
+                }
             }
         }
         for (uuid, failure) in failures {
@@ -2238,24 +2324,11 @@ impl<I: LoaderIO> Loader<I> {
             match failure {
                 MemberFailure::Failed(error) => {
                     if let Some(hash) = last_good_hash(&entry.state) {
-                        if let Some(stamp) = self
-                            .sweep
-                            .as_ref()
-                            .and_then(|sweep| sweep.basis.rpc_snapshot())
-                        {
+                        if let Some(stamp) = basis.rpc_snapshot() {
                             entry.state = ManifestState::StaleLastGood {
                                 content_hash: hash,
                                 error: error.clone(),
                                 built_from: stamp,
-                            };
-                        }
-                    }
-                    for handle in self.handles_for_uuid(*uuid) {
-                        if let Some(slot) = self.slots.get_mut(&handle) {
-                            slot.status = if slot.current.is_some() {
-                                LoadStatus::Loaded
-                            } else {
-                                LoadStatus::Unloaded
                             };
                         }
                     }
@@ -2293,6 +2366,28 @@ impl<I: LoaderIO> Loader<I> {
             }
         }
         graph
+    }
+
+    fn current_components_from(&self, seeds: &BTreeSet<AssetUuid>) -> BTreeSet<AssetUuid> {
+        let current = self.current_graph();
+        let held = self.held_uuids();
+        let mut affected = seeds.intersection(&held).copied().collect::<BTreeSet<_>>();
+        loop {
+            let before = affected.len();
+            for (parent, children) in &current {
+                if affected.contains(parent)
+                    || children.iter().any(|child| affected.contains(child))
+                {
+                    if held.contains(parent) {
+                        affected.insert(*parent);
+                    }
+                    affected.extend(children.intersection(&held).copied());
+                }
+            }
+            if affected.len() == before {
+                return affected;
+            }
+        }
     }
 
     fn current_asset_shape(&self, uuid: AssetUuid) -> Option<(TypeUuid, Vec<AssetUuid>)> {
@@ -2426,6 +2521,12 @@ fn destroy_candidate_values(terminal: CandidateTerminal) {
     };
     for value in values.into_values() {
         let _ = value.destroy();
+    }
+}
+
+fn destroy_sweep_values(sweep: Sweep) {
+    for candidate in sweep.candidates.into_values() {
+        destroy_candidate_values(candidate.terminal);
     }
 }
 

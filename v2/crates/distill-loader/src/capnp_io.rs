@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc as sync_mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
@@ -33,6 +34,8 @@ const DEFAULT_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 256;
 const COMPLETION_CHANNEL_CAPACITY: usize = 256;
 const IN_FLIGHT_REQUEST_LIMIT: usize = 256;
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
@@ -339,6 +342,7 @@ fn run_thread(
             events,
             subscriptions: Rc::new(RefCell::new(Subscriptions::default())),
             delta_task: None,
+            rebind: None,
             fetch_admission: FetchAdmission::new(
                 config.fetch_memory_budget,
                 config.spool_threshold,
@@ -364,10 +368,18 @@ struct Driver {
     events: mpsc::Sender<Completion>,
     subscriptions: Rc<RefCell<Subscriptions>>,
     delta_task: Option<tokio::task::JoinHandle<()>>,
+    rebind: Option<RebindState>,
     fetch_admission: FetchAdmission,
     request_slots: std::sync::Arc<tokio::sync::Semaphore>,
     fetch_slot: std::sync::Arc<tokio::sync::Semaphore>,
     spool_directory: Option<PathBuf>,
+}
+
+struct RebindState {
+    target: RuntimeTarget,
+    next_attempt: tokio::time::Instant,
+    backoff: Duration,
+    reported: bool,
 }
 
 #[derive(Default)]
@@ -378,7 +390,22 @@ struct Subscriptions {
 
 impl Driver {
     async fn run(mut self) {
-        while let Some(command) = self.commands.recv().await {
+        loop {
+            let retry_at = self.rebind.as_ref().map(|rebind| rebind.next_attempt);
+            let command = if let Some(retry_at) = retry_at {
+                tokio::select! {
+                    command = self.commands.recv() => command,
+                    () = tokio::time::sleep_until(retry_at) => {
+                        self.attempt_reconnect().await;
+                        continue;
+                    }
+                }
+            } else {
+                self.commands.recv().await
+            };
+            let Some(command) = command else {
+                break;
+            };
             if !self.handle(command).await {
                 break;
             }
@@ -390,7 +417,7 @@ impl Driver {
 
     async fn handle(&mut self, command: Command) -> bool {
         match command {
-            Command::BindTarget(target) => self.reconnect(target).await,
+            Command::BindTarget(target) => self.begin_reconnect(target),
             Command::BeginSweep { reply } => {
                 let basis = match self.snapshot.refresh().await {
                     Ok(RemoteCall::Success(snapshot)) => {
@@ -401,11 +428,11 @@ impl Driver {
                         let _ = send_event(&self.events, connection_event(call)).await;
                         None
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         let _ = send_event(
                             &self.events,
-                            IoEvent::ConnectionError {
-                                message: error.to_string(),
+                            IoEvent::ReconnectRequired {
+                                reason: ReconnectReason::LeaseExpired,
                             },
                         )
                         .await;
@@ -499,25 +526,25 @@ impl Driver {
             }
             Command::SubscribeAsset(uuid) => {
                 let inserted = self.subscriptions.borrow_mut().assets.insert(uuid);
-                if inserted {
-                    self.subscribe(vec![uuid], Vec::new()).await;
+                if inserted && self.rebind.is_none() {
+                    let _ = self.subscribe(vec![uuid], Vec::new()).await;
                 }
             }
             Command::UnsubscribeAsset(uuid) => {
                 let removed = self.subscriptions.borrow_mut().assets.remove(&uuid);
-                if removed {
+                if removed && self.rebind.is_none() {
                     self.unsubscribe(vec![uuid], Vec::new()).await;
                 }
             }
             Command::SubscribePath(path) => {
                 let inserted = self.subscriptions.borrow_mut().paths.insert(path.clone());
-                if inserted {
-                    self.subscribe(Vec::new(), vec![path]).await;
+                if inserted && self.rebind.is_none() {
+                    let _ = self.subscribe(Vec::new(), vec![path]).await;
                 }
             }
             Command::UnsubscribePath(path) => {
                 let removed = self.subscriptions.borrow_mut().paths.remove(&path);
-                if removed {
+                if removed && self.rebind.is_none() {
                     self.unsubscribe(Vec::new(), vec![path]).await;
                 }
             }
@@ -526,67 +553,53 @@ impl Driver {
         true
     }
 
-    async fn reconnect(&mut self, target: RuntimeTarget) {
+    fn begin_reconnect(&mut self, target: RuntimeTarget) {
+        if let Some(task) = self.delta_task.take() {
+            task.abort();
+        }
+        self.rebind = Some(RebindState {
+            target,
+            next_attempt: tokio::time::Instant::now(),
+            backoff: RECONNECT_INITIAL_BACKOFF,
+            reported: false,
+        });
+    }
+
+    async fn attempt_reconnect(&mut self) {
+        let Some(target) = self.rebind.as_ref().map(|state| state.target.clone()) else {
+            return;
+        };
         let request = connect_request(&self.target, &target);
         let client = match CapnpClient::connect_local(self.address).await {
             Ok(client) => client,
             Err(error) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::TargetRejected {
-                        message: error.to_string(),
-                    },
-                )
-                .await;
+                self.defer_reconnect(error.to_string()).await;
                 return;
             }
         };
         let outcome = match client.connect(&request).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::TargetRejected {
-                        message: error.to_string(),
-                    },
-                )
-                .await;
+                self.defer_reconnect(error.to_string()).await;
                 return;
             }
         };
         let hub = match RemoteHub::connected(outcome) {
             Ok(hub) => hub,
             Err(outcome) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::TargetRejected {
-                        message: format!("RPC reconnection rejected: {outcome:?}"),
-                    },
-                )
-                .await;
+                self.defer_reconnect(format!("RPC reconnection rejected: {outcome:?}"))
+                    .await;
                 return;
             }
         };
         let snapshot = match hub.snapshot().await {
             Ok(RemoteCall::Success(snapshot)) => snapshot,
             Ok(call) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::TargetRejected {
-                        message: remote_message(call),
-                    },
-                )
-                .await;
+                self.defer_reconnect(remote_message(call)).await;
                 return;
             }
             Err(error) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::TargetRejected {
-                        message: error.to_string(),
-                    },
-                )
-                .await;
+                self.defer_reconnect(error.to_string()).await;
                 return;
             }
         };
@@ -596,8 +609,27 @@ impl Driver {
         self.client = client;
         self.hub = hub;
         self.snapshot = snapshot;
-        self.restart_subscription().await;
+        if !self.restart_subscription().await {
+            self.defer_reconnect("RPC subscription restoration failed".into())
+                .await;
+            return;
+        }
+        self.rebind = None;
         self.publish_target_bound(target).await;
+    }
+
+    async fn defer_reconnect(&mut self, message: String) {
+        let report = self
+            .rebind
+            .as_mut()
+            .is_some_and(|state| !std::mem::replace(&mut state.reported, true));
+        if report {
+            let _ = send_event(&self.events, IoEvent::TargetRejected { message }).await;
+        }
+        if let Some(state) = &mut self.rebind {
+            state.next_attempt = tokio::time::Instant::now() + state.backoff;
+            state.backoff = state.backoff.saturating_mul(2).min(RECONNECT_MAX_BACKOFF);
+        }
     }
 
     async fn publish_target_bound(&self, target: RuntimeTarget) {
@@ -611,7 +643,7 @@ impl Driver {
         .await;
     }
 
-    async fn restart_subscription(&mut self) {
+    async fn restart_subscription(&mut self) -> bool {
         if let Some(task) = self.delta_task.take() {
             task.abort();
         }
@@ -623,7 +655,9 @@ impl Driver {
             )
         };
         if !assets.is_empty() || !paths.is_empty() {
-            self.subscribe(assets, paths).await;
+            self.subscribe(assets, paths).await
+        } else {
+            true
         }
     }
 
@@ -631,7 +665,7 @@ impl Driver {
         io_basis(self.snapshot.basis()) == *basis
     }
 
-    async fn subscribe(&mut self, assets: Vec<AssetUuid>, paths: Vec<String>) {
+    async fn subscribe(&mut self, assets: Vec<AssetUuid>, paths: Vec<String>) -> bool {
         match self
             .hub
             .subscribe(self.snapshot.basis().snapshot.version, assets, paths)
@@ -669,11 +703,11 @@ impl Driver {
                                     .await;
                                     return;
                                 }
-                                Err(error) => {
+                                Err(_error) => {
                                     let _ = send_event(
                                         &events,
-                                        IoEvent::ConnectionError {
-                                            message: error.to_string(),
+                                        IoEvent::ReconnectRequired {
+                                            reason: ReconnectReason::LeaseExpired,
                                         },
                                     )
                                     .await;
@@ -683,18 +717,21 @@ impl Driver {
                         }
                     }));
                 }
+                true
             }
             Ok(call) => {
                 let _ = send_event(&self.events, connection_event(call)).await;
+                false
             }
-            Err(error) => {
+            Err(_error) => {
                 let _ = send_event(
                     &self.events,
-                    IoEvent::ConnectionError {
-                        message: error.to_string(),
+                    IoEvent::ReconnectRequired {
+                        reason: ReconnectReason::LeaseExpired,
                     },
                 )
                 .await;
+                false
             }
         }
     }

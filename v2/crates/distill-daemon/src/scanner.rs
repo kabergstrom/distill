@@ -545,13 +545,9 @@ struct OpenedChild {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum FileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows { volume_serial: u64, file_index: u64 },
-    #[cfg(not(any(unix, windows)))]
-    Portable { len: u64, modified_nanos: u128 },
+struct FileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 impl RootedScanner {
@@ -2088,7 +2084,6 @@ fn canonicalize_roots(
     Ok(roots)
 }
 
-#[cfg(unix)]
 fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
     use std::os::unix::ffi::OsStrExt;
     distill_store::state::PlatformPathBytes::Unix(path.as_os_str().as_bytes().to_vec())
@@ -2107,43 +2102,12 @@ fn raw_relative_path(
     platform_path_bytes(relative)
 }
 
-#[cfg(unix)]
 fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     match raw {
         PlatformPathBytes::Unix(bytes) => Some(PathBuf::from(OsString::from_vec(bytes.clone()))),
         PlatformPathBytes::Windows(_) => None,
     }
-}
-
-#[cfg(windows)]
-fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    match raw {
-        PlatformPathBytes::Windows(units) => Some(PathBuf::from(OsString::from_wide(units))),
-        PlatformPathBytes::Unix(_) => None,
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
-    match raw {
-        PlatformPathBytes::Unix(bytes) => {
-            Some(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
-        }
-        PlatformPathBytes::Windows(_) => None,
-    }
-}
-
-#[cfg(windows)]
-fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
-    use std::os::windows::ffi::OsStrExt;
-    distill_store::state::PlatformPathBytes::Windows(path.as_os_str().encode_wide().collect())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
-    distill_store::state::PlatformPathBytes::Unix(path.to_string_lossy().as_bytes().to_vec())
 }
 
 fn modified_nanos(metadata: &Metadata) -> i64 {
@@ -2202,18 +2166,7 @@ fn normalize_scanned_component(
 ) -> Result<String, ScanError> {
     normalize_component(component).map_err(|_| {
         let failure = if component.to_str().is_none() {
-            #[cfg(unix)]
-            {
-                PhysicalPathFailureCode::InvalidUnixUtf8
-            }
-            #[cfg(windows)]
-            {
-                PhysicalPathFailureCode::UnpairedWindowsUtf16
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                PhysicalPathFailureCode::ForbiddenCharacter
-            }
+            PhysicalPathFailureCode::InvalidUnixUtf8
         } else {
             let text = component.to_string_lossy();
             if text.is_empty() {
@@ -2234,27 +2187,14 @@ fn normalize_scanned_component(
     })
 }
 
-#[cfg(unix)]
 fn os_sort_key(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     value.as_bytes().to_vec()
 }
 
-#[cfg(windows)]
-fn os_sort_key(value: &std::ffi::OsStr) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-    value.encode_wide().flat_map(u16::to_le_bytes).collect()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn os_sort_key(value: &std::ffi::OsStr) -> Vec<u8> {
-    value.to_string_lossy().as_bytes().to_vec()
-}
-
-#[cfg(unix)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
-    FileIdentity::Unix {
+    FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
     }
@@ -2262,26 +2202,4 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
 
 fn file_identity_from_file(_file: &File, metadata: &Metadata) -> std::io::Result<FileIdentity> {
     Ok(file_identity(metadata))
-}
-
-#[cfg(windows)]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt;
-    FileIdentity::Windows {
-        volume_serial: u64::from(metadata.volume_serial_number().unwrap_or(0)),
-        file_index: metadata.file_index().unwrap_or(0),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos());
-    FileIdentity::Portable {
-        len: metadata.len(),
-        modified_nanos,
-    }
 }

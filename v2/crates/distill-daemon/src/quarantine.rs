@@ -350,6 +350,12 @@ impl QuarantineDriver {
             }
             store.retire_publication_group(group.group_id)?;
         }
+        store.cleanup_retired_non_codegen_proposal_temps()?;
+        if recover_codegen {
+            store.cleanup_retired_codegen_proposal_temps_with_filesystem(
+                filesystem.expect("codegen recovery checked output filesystem authority"),
+            )?;
+        }
         Ok(outcomes)
     }
 
@@ -514,10 +520,6 @@ impl QuarantineDriver {
 
     pub fn doctor_verify(&self, store: &Store) -> Result<Vec<RecoveredEdit>, QuarantineError> {
         store.verify_quarantine().map_err(Into::into)
-    }
-
-    pub fn doctor_clean(&self, store: &mut Store, now_secs: i64) -> Result<usize, QuarantineError> {
-        store.sweep_displaced(now_secs).map_err(Into::into)
     }
 }
 

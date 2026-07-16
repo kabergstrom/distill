@@ -33,6 +33,7 @@ use distill_core::bootstrap::MIGRATION_TYPE_UUID;
 use distill_core::id::{
     AssetUuid, BundleFileHash, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
 };
+#[cfg(test)]
 use distill_core::lineage::lineage_chain_digest;
 use distill_json::AuthoredValue;
 use distill_migrate::{
@@ -3929,11 +3930,24 @@ fn capture_migration_controls(
                     MigrationDecodeError::SchemaClosure(detail) => {
                         (ControlFailureCode::SchemaClosure, detail)
                     }
+                    MigrationDecodeError::Invalid(detail) => {
+                        (ControlFailureCode::Malformed, detail)
+                    }
                 })
                 .and_then(|value| {
-                    validate_migration_control_lineage(store, &value)
+                    let accepted = store
+                        .current_lineage_stamp(value.target_type_uuid)
+                        .map_err(|error| (ControlFailureCode::Malformed, error.to_string()))?
+                        .ok_or_else(|| {
+                            (
+                                ControlFailureCode::Malformed,
+                                "Migration target type has no accepted lineage authority"
+                                    .to_owned(),
+                            )
+                        })?;
+                    migration_control::validate_lineage(&value, &accepted)
                         .map(|()| value)
-                        .map_err(|detail| (ControlFailureCode::Malformed, detail))
+                        .map_err(|error| (ControlFailureCode::Malformed, error.to_string()))
                 })
         };
         let (observed, value) = match decoded {
@@ -3965,53 +3979,6 @@ fn capture_migration_controls(
         );
     }
     Ok(records)
-}
-
-fn validate_migration_control_lineage(
-    store: &Store,
-    value: &MigrationControlValue,
-) -> Result<(), String> {
-    if value.from_hash == value.to_hash {
-        return Err("Migration edge endpoints must differ".to_owned());
-    }
-    let accepted = store
-        .current_lineage_stamp(value.target_type_uuid)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Migration target type has no accepted lineage authority".to_owned())?;
-    validate_endpoint_stamp(
-        value.target_type_uuid,
-        value.from_hash,
-        &value.from_lineage,
-        &accepted,
-        "from",
-    )?;
-    validate_endpoint_stamp(
-        value.target_type_uuid,
-        value.to_hash,
-        &value.to_lineage,
-        &accepted,
-        "to",
-    )
-}
-
-fn validate_endpoint_stamp(
-    type_uuid: TypeUuid,
-    hash: LogicalHash,
-    stamp: &distill_bundle::LineageStamp,
-    accepted: &distill_bundle::LineageStamp,
-    endpoint: &str,
-) -> Result<(), String> {
-    if stamp.epochs.is_empty()
-        || stamp.epochs.len() > accepted.epochs.len()
-        || stamp.epochs != accepted.epochs[..stamp.epochs.len()]
-        || stamp.selected_digest() != Some(hash)
-        || stamp.chain != lineage_chain_digest(type_uuid, &stamp.epochs, stamp.cursor)
-    {
-        return Err(format!(
-            "Migration {endpoint} lineage is not a verified accepted prefix"
-        ));
-    }
-    Ok(())
 }
 
 impl StoreTraceSource {

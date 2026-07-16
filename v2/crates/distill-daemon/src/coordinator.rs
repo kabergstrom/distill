@@ -40,10 +40,11 @@ use distill_store::pipeline::{
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
-    PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
+    PipelineState as StoredPipelineState, ReadableBundleSource,
+    RetiredTypeReferenced as StoredRetiredTypeReferenced, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
-use distill_store::{Store, StoreConfig, StoreError};
+use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
 
 use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
@@ -132,18 +133,33 @@ enum ConfigurationPipelinePublication {
     Poison(PipelinePoison),
 }
 
-fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) {
+fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) -> Option<PipelinePoison> {
     if let Some(pending) = runtime.pending.take() {
-        let _ = runtime.host.discard_unpublished(pending.loaded);
+        runtime.host.discard_unpublished(pending.loaded)
+    } else {
+        None
     }
 }
 
 fn discard_prepared(
     runtime: &mut CoordinatedPipelineRuntime,
     prepared: &mut Option<PipelineEpoch>,
-) {
+) -> Option<PipelinePoison> {
     if let Some(prepared) = prepared.take() {
-        let _ = runtime.host.discard_unpublished(prepared);
+        runtime.host.discard_unpublished(prepared)
+    } else {
+        None
+    }
+}
+
+fn record_cleanup_failure(slot: &Mutex<Option<PipelinePoison>>, failure: Option<PipelinePoison>) {
+    if let Some(failure) = failure {
+        let mut slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
     }
 }
 
@@ -658,14 +674,20 @@ impl DaemonCoordinator {
                         let stored = match stored_pipeline_epoch(&prepared, &requirements) {
                             Ok(stored) => stored,
                             Err(error) => {
-                                let _ = runtime.host.discard_unpublished(prepared);
+                                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                                    drop(runtime);
+                                    return self.publish_pipeline_rejection(poison);
+                                }
                                 return Err(CoordinatorError::InvalidManifest(error.to_string()));
                             }
                         };
                         if let Err(error) = self.authoring.prepare_pipeline_importers(
                             EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
                         ) {
-                            let _ = runtime.host.discard_unpublished(prepared);
+                            if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                                drop(runtime);
+                                return self.publish_pipeline_rejection(poison);
+                            }
                             return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
                         }
                         let tools = prepared.tool_epoch();
@@ -693,7 +715,10 @@ impl DaemonCoordinator {
         ) {
             Ok(index) => index,
             Err(error) => {
-                discard_prepared(&mut runtime, &mut prepared_epoch);
+                if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
                 return Err(error);
             }
         };
@@ -706,11 +731,16 @@ impl DaemonCoordinator {
         let fallback_bundles = match lock_store(&store).all_asset_bundles() {
             Ok(bundles) => bundles,
             Err(error) => {
-                discard_prepared(&mut runtime, &mut prepared_epoch);
+                if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
                 return Err(CoordinatorError::InvalidManifest(error.to_string()));
             }
         };
         let authoring = Arc::clone(&self.authoring);
+        let cleanup_failure = Arc::new(Mutex::new(None));
+        let captured_cleanup_failure = Arc::clone(&cleanup_failure);
         let result = self
             .server
             .coordinated_replace_target_set(base, targets, || {
@@ -770,7 +800,10 @@ impl DaemonCoordinator {
                         PipelineDiagnostic::Ready,
                     ) => {
                         let importers = EpochAuthoringImporter::all(&prepared);
-                        discard_pending(&mut runtime);
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            discard_pending(&mut runtime),
+                        );
                         runtime.host.install_ready(prepared);
                         authoring
                             .replace_pipeline_importers(importers)
@@ -779,9 +812,13 @@ impl DaemonCoordinator {
                     (
                         ConfigurationPipelinePublication::Epoch { epoch, .. },
                         Some(prepared),
-                        PipelineDiagnostic::SchemaAcceptanceRequired(_),
+                        PipelineDiagnostic::SchemaAcceptanceRequired(_)
+                        | PipelineDiagnostic::RetiredTypeReferenced(_),
                     ) => {
-                        discard_pending(&mut runtime);
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            discard_pending(&mut runtime),
+                        );
                         let fence = PipelinePoison::new(
                             PipelinePoisonCode::CandidateValidation,
                             PipelinePoisonOrigin::CandidateOpen,
@@ -801,17 +838,27 @@ impl DaemonCoordinator {
                         Some(prepared),
                         PipelineDiagnostic::Poisoned(error),
                     ) => {
-                        let _ = runtime.host.discard_unpublished(prepared);
-                        discard_pending(&mut runtime);
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            runtime.host.discard_unpublished(prepared),
+                        );
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            discard_pending(&mut runtime),
+                        );
                         runtime.host.install_poison(error);
                         authoring.install_pipeline_importers(BTreeMap::new());
                     }
                     (
                         ConfigurationPipelinePublication::Poison(poison),
                         None,
-                        PipelineDiagnostic::Poisoned(_),
+                        PipelineDiagnostic::Poisoned(_)
+                        | PipelineDiagnostic::RetiredTypeReferenced(_),
                     ) => {
-                        discard_pending(&mut runtime);
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            discard_pending(&mut runtime),
+                        );
                         runtime.host.install_poison(poison.clone());
                         authoring.install_pipeline_importers(BTreeMap::new());
                     }
@@ -833,9 +880,23 @@ impl DaemonCoordinator {
                 Ok(commit)
             });
         match result {
-            Ok(stamp) => Ok(stamp),
+            Ok(stamp) => {
+                let poison = cleanup_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(poison) = poison {
+                    drop(runtime);
+                    self.publish_pipeline_rejection(poison)
+                } else {
+                    Ok(stamp)
+                }
+            }
             Err(error) => {
-                discard_prepared(&mut runtime, &mut prepared_epoch);
+                if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
                 Err(CoordinatorError::Coordinated(error))
             }
         }
@@ -866,7 +927,10 @@ impl DaemonCoordinator {
         let stored = match stored_pipeline_epoch(&prepared, &requirements) {
             Ok(stored) => stored,
             Err(error) => {
-                let _ = runtime.host.discard_unpublished(prepared);
+                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
                 return Err(CoordinatorError::InvalidManifest(error.to_string()));
             }
         };
@@ -876,7 +940,10 @@ impl DaemonCoordinator {
                     prepared.importer_descriptors(),
                 ))
         {
-            let _ = runtime.host.discard_unpublished(prepared);
+            if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                drop(runtime);
+                return self.publish_pipeline_rejection(poison);
+            }
             return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
         }
         let store = Arc::clone(&self.store);
@@ -884,7 +951,10 @@ impl DaemonCoordinator {
         let authority = match self.schema_authority() {
             Some(authority) => authority,
             None => {
-                let _ = runtime.host.discard_unpublished(prepared);
+                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
                 return Err(CoordinatorError::InvalidManifest(
                     "pipeline publication requires project schema authority".to_owned(),
                 ));
@@ -894,7 +964,10 @@ impl DaemonCoordinator {
         let asset_bundles = match lock_store(&store).all_asset_bundles() {
             Ok(bundles) => bundles,
             Err(error) => {
-                let _ = runtime.host.discard_unpublished(prepared);
+                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
                 return Err(CoordinatorError::InvalidManifest(error.to_string()));
             }
         };
@@ -907,6 +980,8 @@ impl DaemonCoordinator {
         let scanner = self.scanner.clone();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let mut prepared = Some(prepared);
+        let cleanup_failure = Arc::new(Mutex::new(None));
+        let captured_cleanup_failure = Arc::clone(&cleanup_failure);
         let result = self.server.coordinated_commit(base, || {
             let mut durable = lock_store(&store);
             if durable.input_version() != base {
@@ -936,7 +1011,10 @@ impl DaemonCoordinator {
             {
                 None => {
                     let importers = EpochAuthoringImporter::all(&candidate);
-                    discard_pending(&mut runtime);
+                    record_cleanup_failure(
+                        &captured_cleanup_failure,
+                        discard_pending(&mut runtime),
+                    );
                     runtime.host.install_ready(candidate);
                     self.authoring
                         .replace_pipeline_importers(importers)
@@ -944,7 +1022,10 @@ impl DaemonCoordinator {
                     PipelineDiagnostic::Ready
                 }
                 Some(required) => {
-                    discard_pending(&mut runtime);
+                    record_cleanup_failure(
+                        &captured_cleanup_failure,
+                        discard_pending(&mut runtime),
+                    );
                     let fence = PipelinePoison::new(
                         PipelinePoisonCode::CandidateValidation,
                         PipelinePoisonOrigin::CandidateOpen,
@@ -979,10 +1060,24 @@ impl DaemonCoordinator {
             Ok(commit)
         });
         match result {
-            Ok(stamp) => Ok(stamp),
+            Ok(stamp) => {
+                let poison = cleanup_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(poison) = poison {
+                    drop(runtime);
+                    self.publish_pipeline_rejection(poison)
+                } else {
+                    Ok(stamp)
+                }
+            }
             Err(error) => {
                 if let Some(candidate) = prepared.take() {
-                    let _ = runtime.host.discard_unpublished(candidate);
+                    if let Some(poison) = runtime.host.discard_unpublished(candidate) {
+                        drop(runtime);
+                        return self.publish_pipeline_rejection(poison);
+                    }
                 }
                 Err(CoordinatorError::Coordinated(error))
             }
@@ -1007,11 +1102,11 @@ impl DaemonCoordinator {
         self.publish_pipeline_rejection_inner(poison, true)
     }
 
-    pub(crate) fn pending_schema_digest(
+    pub(crate) fn pending_schema_transition_context(
         &self,
         candidate: &PipelineCandidateIdentity,
         type_uuid: TypeUuid,
-    ) -> Result<Option<LogicalHash>, String> {
+    ) -> Result<(Option<LogicalHash>, BTreeSet<String>), String> {
         let runtime = lock_pipeline(&self.pipeline);
         let pending = runtime
             .pending
@@ -1022,7 +1117,14 @@ impl DaemonCoordinator {
         if &actual != candidate {
             return Err("loaded schema candidate identity is stale".to_owned());
         }
-        Ok(pending.stored.schema_registry.get(&type_uuid).copied())
+        Ok((
+            pending.stored.schema_registry.get(&type_uuid).copied(),
+            pending
+                .loaded
+                .migration_function_keys()
+                .into_iter()
+                .collect(),
+        ))
     }
 
     pub(crate) fn publish_schema_transition(
@@ -1127,10 +1229,14 @@ impl DaemonCoordinator {
         };
 
         let projection = self.authoring.pipeline_projection();
+        let mut transition_paths = planned.waiting_paths.clone();
+        transition_paths.push(planned.target.clone());
+        transition_paths.sort();
+        transition_paths.dedup();
         let commit = publish_incremental_paths_with_schema_transition(
             &self.scanner,
             &self.scan_snapshot,
-            std::slice::from_ref(&planned.target),
+            &transition_paths,
             &self
                 .lineage_destination
                 .read()
@@ -1245,7 +1351,10 @@ impl DaemonCoordinator {
         match result {
             Ok(stamp) => {
                 let mut runtime = lock_pipeline(&self.pipeline);
-                discard_pending(&mut runtime);
+                if let Some(cleanup) = discard_pending(&mut runtime) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection_inner(cleanup, false);
+                }
                 runtime.host.install_poison(poison);
                 self.authoring.install_pipeline_importers(BTreeMap::new());
                 if heal_configuration {
@@ -1296,8 +1405,19 @@ impl DaemonCoordinator {
     ) -> Result<SnapshotStamp, CoordinatorError> {
         loop {
             lock_watcher(watcher).arm_scan();
-            let stamp = self.reconcile_full_scan()?;
-            match lock_watcher(watcher).finish_scan() {
+            let scan = self.reconcile_full_scan();
+            let action = lock_watcher(watcher).finish_scan();
+            let stamp = match scan {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    // Always release scan ownership. Preserve anything that
+                    // arrived while traversal was active so a caller that
+                    // retries can still reconcile the complete event union.
+                    lock_watcher(watcher).requeue_action(action);
+                    return Err(error);
+                }
+            };
+            match action {
                 WatcherAction::None => return Ok(stamp),
                 WatcherAction::Batch(batch) => return self.reconcile_incremental(&batch),
                 WatcherAction::FullRescan => continue,
@@ -3068,6 +3188,79 @@ struct BundleSummary {
     origin: Option<distill_store::bundles::DirectoryOrigin>,
 }
 
+struct RetiredWaitingProjection {
+    error: StoredRetiredTypeReferenced,
+    bundles: BTreeSet<BundleUuid>,
+    paths: BTreeSet<String>,
+    assets: BTreeSet<AssetUuid>,
+}
+
+fn retired_waiting_projection<'a>(
+    sources: impl IntoIterator<Item = &'a ScannedBundle>,
+    retired_types: &BTreeSet<TypeUuid>,
+    manifest_hash: ContentHash,
+    basis: SnapshotStamp,
+) -> Result<Option<RetiredWaitingProjection>, StoreError> {
+    if retired_types.is_empty() {
+        return Ok(None);
+    }
+    let mut references = BTreeMap::<TypeUuid, BTreeSet<RetiredTypeReference>>::new();
+    let mut bundles = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut assets = BTreeSet::new();
+    for source in sources {
+        let Ok(bundle) = &source.parsed else {
+            continue;
+        };
+        let mut bundle_waits = false;
+        for entry in bundle.assets.values() {
+            if retired_types.contains(&entry.type_uuid) {
+                references
+                    .entry(entry.type_uuid)
+                    .or_default()
+                    .insert(RetiredTypeReference::Asset(entry.uuid));
+                bundle_waits = true;
+            }
+            if entry.type_uuid == distill_core::bootstrap::MIGRATION_TYPE_UUID {
+                let header =
+                    crate::migration_control::decode_header(&entry.data).map_err(|error| {
+                        StoreError::InvalidConfiguration {
+                            error: format!(
+                                "cannot classify retired Migration reference {}: {error}",
+                                entry.uuid
+                            ),
+                        }
+                    })?;
+                if retired_types.contains(&header.target_type_uuid) {
+                    let target = references.entry(header.target_type_uuid).or_default();
+                    target.insert(RetiredTypeReference::MigrationEndpoint(header.from_hash));
+                    target.insert(RetiredTypeReference::MigrationEndpoint(header.to_hash));
+                    bundle_waits = true;
+                }
+            }
+        }
+        if bundle_waits {
+            bundles.insert(bundle.uuid);
+            paths.insert(source.normalized_path.clone());
+            assets.extend(bundle.assets.values().map(|entry| entry.uuid));
+        }
+    }
+    let Some((type_uuid, references)) = references.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some(RetiredWaitingProjection {
+        error: StoredRetiredTypeReferenced {
+            manifest_hash,
+            basis,
+            type_uuid,
+            references: references.into_iter().collect(),
+        },
+        bundles,
+        paths,
+        assets,
+    }))
+}
+
 impl BundleSummary {
     fn rpc_equivalent(&self, other: &Self) -> bool {
         self.path == other.path
@@ -3204,14 +3397,6 @@ fn publish_scan(
             })?;
     }
 
-    let mut commit = rpc_commit(
-        &candidate,
-        &old_asset_bundles,
-        &old_paths,
-        projection,
-        derived_outputs.clone(),
-        &rpc_changed_bundles,
-    )?;
     let observation =
         InputVersion(
             base.0
@@ -3220,7 +3405,50 @@ fn publish_scan(
                     error: "input version exhausted".to_owned(),
                 })?,
         );
+    let manifest_hash = candidate
+        .lineage_manifest
+        .as_ref()
+        .map(VerifiedSchemaLineageManifest::manifest_hash)
+        .or(store
+            .schema_manifest_basis()?
+            .map(|basis| basis.manifest_hash));
+    let waiting = match manifest_hash {
+        Some(manifest_hash) => retired_waiting_projection(
+            candidate.scan.bundle_rows(),
+            &store.retired_type_uuids()?,
+            manifest_hash,
+            SnapshotStamp {
+                instance: store.instance_id(),
+                version: observation,
+            },
+        )?,
+        None => None,
+    };
+    let waiting_bundles = waiting
+        .as_ref()
+        .map_or_else(BTreeSet::new, |waiting| waiting.bundles.clone());
+    let publishable_changed_bundles = changed_bundles
+        .difference(&waiting_bundles)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let rpc_publishable_bundles = rpc_changed_bundles
+        .difference(&waiting_bundles)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut commit = rpc_commit(
+        &candidate,
+        &old_asset_bundles,
+        &old_paths,
+        projection,
+        derived_outputs.clone(),
+        &rpc_publishable_bundles,
+        &waiting_bundles,
+    )?;
+    if waiting.is_some() {
+        commit.derived_outputs = None;
+    }
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
+    let mut healed_retired = false;
     store.input_transaction(|transaction| {
         let mut root_ids = BTreeMap::new();
         let mut scanned_keys = BTreeSet::new();
@@ -3248,8 +3476,10 @@ fn publish_scan(
         }
         transaction.set_clean_watermark(newest_mtime)?;
         transaction.set_version_poisons(candidate.version_poison.clone())?;
-        transaction.clear_derived_outputs()?;
-        if candidate.version_poison.is_none() {
+        if waiting.is_none() {
+            transaction.clear_derived_outputs()?;
+        }
+        if candidate.version_poison.is_none() && waiting.is_none() {
             for (child, output) in &derived_outputs {
                 transaction.set_derived_output(*child, output.parent, &output.output_key)?;
             }
@@ -3281,11 +3511,24 @@ fn publish_scan(
             }
             None => {}
         }
+        if let Some(waiting) = &waiting {
+            transaction.publish_retired_type_referenced(&waiting.error)?;
+            next_pipeline =
+                PipelineDiagnostic::RetiredTypeReferenced(distill_rpc::RetiredTypeReferenced {
+                    manifest_hash: BundleFileHash(waiting.error.manifest_hash.0),
+                    basis: waiting.error.basis,
+                    type_uuid: waiting.error.type_uuid,
+                    references: waiting.error.references.clone(),
+                });
+            commit.pipeline_epoch_changed = true;
+        } else if pipeline.is_none() {
+            healed_retired = transaction.clear_retired_type_referenced()?;
+        }
 
         if candidate.version_poison.is_none() {
             for bundle in old_bundle_summaries.keys() {
                 if !current_bundle_summaries.contains_key(bundle)
-                    || changed_bundles.contains(bundle)
+                    || publishable_changed_bundles.contains(bundle)
                 {
                     transaction.remove_bundle(*bundle)?;
                 }
@@ -3294,7 +3537,7 @@ fn publish_scan(
                 let Ok(bundle) = &source.parsed else {
                     continue;
                 };
-                if !changed_bundles.contains(&bundle.uuid) {
+                if !publishable_changed_bundles.contains(&bundle.uuid) {
                     continue;
                 }
                 let root = *root_ids
@@ -3339,7 +3582,7 @@ fn publish_scan(
                 }
             }
             for poison in candidate.bundle_poisons.values() {
-                if !changed_bundles.contains(&poison.bundle) {
+                if !publishable_changed_bundles.contains(&poison.bundle) {
                     continue;
                 }
                 let root = *root_ids
@@ -3366,6 +3609,10 @@ fn publish_scan(
         }
         Ok(())
     })?;
+    if healed_retired {
+        next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
+        commit.pipeline_epoch_changed = true;
+    }
     commit.pipeline = Some(next_pipeline);
     Ok(commit)
 }
@@ -3511,9 +3758,14 @@ fn publish_incremental_scan(
         .keys()
         .map(|child| Ok((*child, store.derived_output_row(*child)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
+    let stored_pipeline = store.pipeline_state()?;
+    let was_retired = matches!(
+        stored_pipeline,
+        Some(StoredPipelineState::RetiredTypeReferenced { .. })
+    );
     let mut commit = Commit {
         configuration: Some(plan.configuration.clone()),
-        pipeline: Some(pipeline_diagnostic(store.pipeline_state()?)),
+        pipeline: Some(pipeline_diagnostic(stored_pipeline)),
         version_poison: Some(plan.version_poison.clone()),
         lineage_repair: Some(plan.lineage_repair.clone()),
         tag_poisons: Some(BTreeMap::new()),
@@ -3527,9 +3779,61 @@ fn publish_incremental_scan(
                     error: "input version exhausted".to_owned(),
                 })?,
         );
+    let mut retired_types = store.retired_type_uuids()?;
+    if schema_transition.is_some_and(|transition| {
+        matches!(
+            transition.planned.request.action,
+            SchemaTransitionAction::Reactivate
+        )
+    }) {
+        retired_types.remove(
+            &schema_transition
+                .expect("reactivation transition is present")
+                .planned
+                .request
+                .type_uuid,
+        );
+    }
+    let manifest_hash = plan
+        .lineage_manifest
+        .as_ref()
+        .map(VerifiedSchemaLineageManifest::manifest_hash)
+        .or(store
+            .schema_manifest_basis()?
+            .map(|basis| basis.manifest_hash));
+    let mut complete_waiting_scan = None;
+    if was_retired || schema_transition.is_some() {
+        let mut next = baseline.clone();
+        next.apply_delta(delta.clone());
+        complete_waiting_scan = Some(next);
+    }
+    let waiting = match manifest_hash {
+        Some(manifest_hash) => retired_waiting_projection(
+            complete_waiting_scan.as_ref().map_or_else(
+                || {
+                    Box::new(plan.bundles.values().filter_map(Option::as_deref))
+                        as Box<dyn Iterator<Item = &ScannedBundle>>
+                },
+                |scan| Box::new(scan.bundle_rows()) as Box<dyn Iterator<Item = &ScannedBundle>>,
+            ),
+            &retired_types,
+            manifest_hash,
+            SnapshotStamp {
+                instance: store.instance_id(),
+                version: observation,
+            },
+        )?,
+        None => None,
+    };
     let mut changed_bundles = BTreeSet::new();
     if plan.version_poison.is_none() {
         for (bundle_uuid, source) in &plan.bundles {
+            if waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.bundles.contains(bundle_uuid))
+            {
+                continue;
+            }
             let old = &durable_bundles[bundle_uuid];
             let current_summary = if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
                 Some(BundleSummary {
@@ -3606,6 +3910,12 @@ fn publish_incremental_scan(
             }
         }
         for (path, current) in &plan.paths {
+            if waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.paths.contains(path))
+            {
+                continue;
+            }
             let old = &old_paths[path];
             if old == current {
                 continue;
@@ -3623,6 +3933,14 @@ fn publish_incremental_scan(
         }
         for (child, current) in &plan.derived_outputs {
             let old = old_derived[child].as_ref();
+            if waiting.as_ref().is_some_and(|waiting| {
+                current
+                    .as_ref()
+                    .is_some_and(|entry| waiting.assets.contains(&entry.parent))
+                    || old.is_some_and(|(parent, _)| waiting.assets.contains(parent))
+            }) {
+                continue;
+            }
             let unchanged = match (old, current) {
                 (None, None) => true,
                 (Some((parent, key)), Some(entry)) => {
@@ -3647,6 +3965,7 @@ fn publish_incremental_scan(
         }
     }
 
+    let mut healed_retired = false;
     store.input_transaction(|transaction| {
         let mut root_ids = BTreeMap::new();
         let mut newest_mtime = watermark;
@@ -3690,6 +4009,20 @@ fn publish_incremental_scan(
             commit.pipeline_epoch_changed = true;
         } else if let Some(manifest) = &plan.lineage_manifest {
             transaction.project_verified_lineage_manifest(manifest)?;
+        }
+        if let Some(waiting) = &waiting {
+            transaction.publish_retired_type_referenced(&waiting.error)?;
+            commit.pipeline = Some(PipelineDiagnostic::RetiredTypeReferenced(
+                distill_rpc::RetiredTypeReferenced {
+                    manifest_hash: BundleFileHash(waiting.error.manifest_hash.0),
+                    basis: waiting.error.basis,
+                    type_uuid: waiting.error.type_uuid,
+                    references: waiting.error.references.clone(),
+                },
+            ));
+            commit.pipeline_epoch_changed = true;
+        } else if schema_transition.is_none() {
+            healed_retired = transaction.clear_retired_type_referenced()?;
         }
         if plan.version_poison.is_none() {
             for bundle_uuid in &changed_bundles {
@@ -3778,6 +4111,10 @@ fn publish_incremental_scan(
         }
         Ok(())
     })?;
+    if healed_retired {
+        commit.pipeline = Some(pipeline_diagnostic(store.pipeline_state()?));
+        commit.pipeline_epoch_changed = true;
+    }
     Ok(commit)
 }
 
@@ -3842,6 +4179,14 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
         Some(StoredPipelineState::Ready(_)) | None => PipelineDiagnostic::Ready,
         Some(StoredPipelineState::SchemaAcceptanceRequired { required, .. }) => {
             PipelineDiagnostic::SchemaAcceptanceRequired(required)
+        }
+        Some(StoredPipelineState::RetiredTypeReferenced { error, .. }) => {
+            PipelineDiagnostic::RetiredTypeReferenced(distill_rpc::RetiredTypeReferenced {
+                manifest_hash: BundleFileHash(error.manifest_hash.0),
+                basis: error.basis,
+                type_uuid: error.type_uuid,
+                references: error.references,
+            })
         }
         Some(StoredPipelineState::Poisoned { error, .. }) => PipelineDiagnostic::Poisoned(error),
     }
@@ -4021,6 +4366,7 @@ fn rpc_commit(
     projection: &PipelineProjection,
     derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
     changed_bundles: &BTreeSet<BundleUuid>,
+    waiting_bundles: &BTreeSet<BundleUuid>,
 ) -> Result<Commit, StoreError> {
     let mut commit = Commit {
         configuration: Some(candidate.configuration.clone()),
@@ -4035,12 +4381,26 @@ fn rpc_commit(
         return Ok(commit);
     }
 
-    let mut current_assets = BTreeSet::new();
+    let mut current_assets = old_asset_bundles
+        .iter()
+        .filter_map(|(asset, bundle)| waiting_bundles.contains(bundle).then_some(*asset))
+        .collect::<BTreeSet<_>>();
     let mut paths = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
+    for (path, _, asset) in old_paths {
+        if old_asset_bundles
+            .get(asset)
+            .is_some_and(|bundle| waiting_bundles.contains(bundle))
+        {
+            paths.entry(path.clone()).or_default().insert(*asset);
+        }
+    }
     for source in candidate.scan.bundle_rows() {
         let Ok(bundle) = &source.parsed else {
             continue;
         };
+        if waiting_bundles.contains(&bundle.uuid) {
+            continue;
+        }
         for (local_id, entry) in &bundle.assets {
             current_assets.insert(entry.uuid);
             if !changed_bundles.contains(&bundle.uuid) {

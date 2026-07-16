@@ -479,6 +479,12 @@ impl ConfigWatch {
         watcher: &WatcherControl,
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
+        // An ancestor event may have introduced a previously missing parent.
+        // Recompute native coverage synchronously before reading authority so
+        // subsequent edits stay incremental and do not depend on a rescan.
+        watcher
+            .replace_paths(self.control_paths())
+            .map_err(CoordinatorError::InvalidManifest)?;
         if !invalidation.configuration {
             if self.rejected && self.source_rejected {
                 self.refresh_cached_artifacts(invalidation);
@@ -690,11 +696,18 @@ fn control_invalidation_for(
     pipeline: &Path,
 ) -> Option<ControlInvalidation> {
     let touches = |wanted: &Path| {
-        batch.paths.iter().any(|path| path == wanted)
-            || batch
-                .renames
-                .iter()
-                .any(|rename| rename.from == wanted || rename.to == wanted)
+        batch
+            .paths
+            .iter()
+            .any(|path| path == wanted || path.starts_with(wanted) || wanted.starts_with(path))
+            || batch.renames.iter().any(|rename| {
+                rename.from == wanted
+                    || rename.to == wanted
+                    || rename.from.starts_with(wanted)
+                    || rename.to.starts_with(wanted)
+                    || wanted.starts_with(&rename.from)
+                    || wanted.starts_with(&rename.to)
+            })
     };
     if touches(configuration) {
         return Some(ControlInvalidation::all());
@@ -829,21 +842,9 @@ fn apply_live_values(active: &mut DaemonConfig, candidate: &DaemonConfig) {
     active.daemon.displaced_retention_days = candidate.daemon.displaced_retention_days;
 }
 
-#[cfg(unix)]
 fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
     use std::os::unix::ffi::OsStrExt;
     ConfigurationSourcePath::Unix(path.as_os_str().as_bytes().to_vec())
-}
-
-#[cfg(windows)]
-fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
-    use std::os::windows::ffi::OsStrExt;
-    ConfigurationSourcePath::Windows(path.as_os_str().encode_wide().collect())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
-    ConfigurationSourcePath::Unix(path.to_string_lossy().as_bytes().to_vec())
 }
 
 fn reconcile_imports(
@@ -976,5 +977,20 @@ mod tests {
         assert!(configuration.configuration);
         assert!(configuration.schema);
         assert!(configuration.pipeline);
+
+        let nested_schema = PathBuf::from("/project/schema/schema.json");
+        let schema_parent = control_invalidation_for(
+            &crate::watcher::WatcherBatch {
+                paths: vec![nested_schema.parent().unwrap().to_path_buf()],
+                renames: Vec::new(),
+            },
+            &config,
+            &nested_schema,
+            &pipeline,
+        )
+        .unwrap();
+        assert!(!schema_parent.configuration);
+        assert!(schema_parent.schema);
+        assert!(!schema_parent.pipeline);
     }
 }

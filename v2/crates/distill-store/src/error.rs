@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// The concrete publication that attempted to use retired schema authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RetiredTypeReference {
     Asset(distill_core::id::AssetUuid),
     MigrationEndpoint(distill_core::id::LogicalHash),

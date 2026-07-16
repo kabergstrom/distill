@@ -1786,22 +1786,20 @@ impl ModuleHost {
         match unload_epoch(&epoch) {
             Ok(()) => None,
             Err(error) => {
-                epoch.0.poison(
-                    PipelinePoisonCode::PublishedCleanup,
+                // This image never became published runtime. Fence and retain
+                // it so EpochInner::drop cannot run module-owned destructors,
+                // but report the candidate-cleanup matrix required at the
+                // publication boundary.
+                epoch.0.token.poison();
+                let poison = candidate_poison_record(
+                    PipelinePoisonCode::CandidateCleanup,
                     format!(
                         "unpublished candidate cleanup disposition={}: {}",
                         cleanup_disposition_name(error.disposition),
                         error.detail
                     ),
+                    error.disposition,
                 );
-                let poison = match (PipelineSnapshot {
-                    state: PublishedState::Ready(epoch.clone()),
-                })
-                .epoch()
-                {
-                    Err(poison) => poison,
-                    Ok(_) => unreachable!("discard cleanup poison must fence the epoch"),
-                };
                 self.retired.push(epoch);
                 Some(poison)
             }
@@ -2361,6 +2359,78 @@ pub(crate) fn processor_test_epoch_with<
         },
         Box::new(TestNoopModule),
     )
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    struct FailingUnloadModule;
+
+    impl LoadedPipelineModule for FailingUnloadModule {
+        fn source_identity(
+            &mut self,
+        ) -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn register(
+            &mut self,
+            _targets: &[TargetDefinition],
+            _arena: &mut CandidateRegistrationArena,
+        ) -> Result<BTreeSet<String>, ModuleCallError> {
+            Err(ModuleCallError::new("unused"))
+        }
+
+        fn unload(&mut self) -> Result<(), ModuleCallError> {
+            Err(ModuleCallError::new("injected unload failure"))
+        }
+
+        fn dlclose(&mut self) {}
+    }
+
+    #[test]
+    fn unpublished_cleanup_failure_uses_candidate_cleanup_poison_matrix() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = ModuleHost::new(temp.path()).unwrap();
+        let token = ModuleEpochToken::new(9100);
+        let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
+            name: "test".to_owned(),
+            target_definition_hash: [1; 32],
+        }])
+        .unwrap();
+        let epoch = PipelineEpoch::new(
+            9100,
+            StagedModule {
+                path: PathBuf::from("pipeline-failing-unload-test"),
+                content_hash: [1; 32],
+            },
+            token.clone(),
+            PreparedEpochRegistration {
+                target_set,
+                registration: RegistrationSet {
+                    registrations: Vec::new(),
+                    pipeline_targets: BTreeSet::from(["test".to_owned()]),
+                },
+                tools: BTreeMap::new(),
+                arena: CandidateRegistrationArena::new(token),
+            },
+            Box::new(FailingUnloadModule),
+        );
+
+        let poison = host.discard_unpublished(epoch).unwrap();
+        assert_eq!(poison.code, PipelinePoisonCode::CandidateCleanup);
+        assert_eq!(poison.origin, PipelinePoisonOrigin::CandidateOpen);
+        assert_eq!(
+            poison.cleanup,
+            CandidateCleanupDisposition::ModuleUnloadFailed
+        );
+        assert_eq!(host.retired_count(), 1);
+    }
 }
 
 #[cfg(test)]

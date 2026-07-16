@@ -1,14 +1,15 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
     AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
-    LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, PathResolveResult, PendingState,
-    PendingToken, RegistrationError, ReqId, ResolveResult, RuntimeTarget, StorageError,
-    TargetBindingState, UpdateResult,
+    LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, ManifestState, PathResolveResult,
+    PendingState, PendingToken, RegistrationError, ReqId, ResolveResult, RuntimeTarget,
+    StorageError, TargetBindingState, UpdateResult,
 };
 use distill_rpc::ServedLoadEdge;
 use distill_store::state::{InputVersion, StoreInstanceId};
@@ -25,6 +26,17 @@ struct B;
 
 #[distill_asset::asset(uuid = "43112233-4455-6677-8899-aabbccddeeff", build_only)]
 struct BuildOnly;
+
+static COUNTED_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+#[distill_asset::asset(uuid = "44112233-4455-6677-8899-aabbccddeeff")]
+struct Counted;
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        COUNTED_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 const PLACEHOLDER_TYPE: TypeUuid = TypeUuid([0x43; 16]);
 
@@ -221,6 +233,7 @@ struct Storage {
     commits: Vec<(HandleId, AdoptionId)>,
     pending_handles: BTreeSet<HandleId>,
     pending_ready: bool,
+    pending_failure: Option<StorageError>,
     tokens: BTreeMap<PendingToken, (HandleId, AdoptionId)>,
     polls: usize,
     next_token: u64,
@@ -259,7 +272,9 @@ impl AssetStorage for Storage {
 
     fn poll(&mut self, _token: PendingToken) -> PendingState {
         self.polls += 1;
-        if self.pending_ready {
+        if let Some(error) = self.pending_failure.clone() {
+            PendingState::Failed(error)
+        } else if self.pending_ready {
             PendingState::Ready
         } else {
             PendingState::Pending
@@ -390,6 +405,7 @@ fn register(loader: &mut Loader<MockIo>, epoch: u64, token: &ModuleEpochToken) {
                 B::descriptor(),
                 RefPlaceholder::descriptor(),
                 BuildOnly::descriptor(),
+                Counted::descriptor(),
             ],
         )
         .unwrap();
@@ -780,6 +796,68 @@ fn pending_member_defers_the_whole_dependency_component() {
 }
 
 #[test]
+fn failed_pending_storage_preserves_last_good_and_freezes_the_component() {
+    let token = ModuleEpochToken::new(48);
+    let mut io = mock_io();
+    io.basis = IoBasis::Rpc { snapshot: stamp(1) };
+    let mut loader = Loader::new(io);
+    register(&mut loader, 48, &token);
+    let asset_uuid = uuid(48);
+    let dependency_uuid = uuid(49);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (old_hash, old_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, old_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, old_hash, old_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.commits.len(), 1);
+
+    storage.pending_handles.insert(handle.id());
+    loader.io_mut().basis = IoBasis::Rpc { snapshot: stamp(2) };
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(2),
+        assets: vec![(asset_uuid, distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    let (new_hash, new_artifact) =
+        artifact_with_edges::<A>(asset_uuid, &[(dependency_uuid, B::TYPE_UUID)]);
+    resolve(&mut loader, asset_uuid, new_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, new_hash, new_artifact);
+    loader.process(&mut storage).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (dependency_hash, dependency_artifact) = artifact::<B>(dependency_uuid, &[]);
+    resolve(&mut loader, dependency_uuid, dependency_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, dependency_hash, dependency_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.commits.len(), 1, "candidate component is pending");
+
+    storage.pending_failure = Some(StorageError::Engine("upload failed".into()));
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(storage.commits.len(), 1);
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+    assert!(matches!(
+        loader.manifest_entry(asset_uuid).map(|entry| &entry.state),
+        Some(ManifestState::StaleLastGood {
+            content_hash,
+            built_from,
+            ..
+        }) if *content_hash == old_hash && *built_from == stamp(2)
+    ));
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { members, .. }
+            if members.contains(&asset_uuid) && members.contains(&dependency_uuid)
+    )));
+}
+
+#[test]
 fn module_drain_cancels_pending_storage_before_reporting_complete() {
     let token = ModuleEpochToken::new(42);
     let epoch = GameModuleEpoch(42);
@@ -999,6 +1077,87 @@ fn path_rebind_unsubscribes_old_uuid_before_subscribing_new_uuid() {
 }
 
 #[test]
+fn path_delta_resolves_only_the_rebound_component() {
+    let token = ModuleEpochToken::new(50);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 50, &token);
+    let path = "textures/scoped";
+    let path_uuid = uuid(50);
+    let unrelated_uuid = uuid(51);
+    let path_handle = loader.add_ref_indirect::<A>(path).unwrap();
+    let unrelated_handle = loader.add_ref::<B>(unrelated_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (path_req, path_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: path_req,
+        path: path.to_owned(),
+        result: PathResolveResult::Resolved(path_uuid),
+        basis: path_basis,
+    });
+    let (unrelated_hash, unrelated_artifact) = artifact::<B>(unrelated_uuid, &[]);
+    resolve(&mut loader, unrelated_uuid, unrelated_hash);
+    loader.process(&mut storage).unwrap();
+
+    let (path_hash, path_artifact) = artifact::<A>(path_uuid, &[]);
+    resolve(&mut loader, path_uuid, path_hash);
+    fetched(&mut loader, unrelated_hash, unrelated_artifact);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, path_hash, path_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&path_handle), LoadStatus::Loaded);
+    assert_eq!(loader.status(&unrelated_handle), LoadStatus::Loaded);
+
+    let unrelated_resolves = loader
+        .io()
+        .commands
+        .iter()
+        .filter(
+            |command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == unrelated_uuid),
+        )
+        .count();
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(3),
+        assets: Vec::new(),
+        paths: vec![path.to_owned()],
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(command, Command::Resolve(_, uuid, _) if *uuid == unrelated_uuid)
+            })
+            .count(),
+        unrelated_resolves,
+        "a path invalidation must not resolve a disconnected held asset"
+    );
+
+    let (rebind_req, rebind_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: rebind_req,
+        path: path.to_owned(),
+        result: PathResolveResult::Resolved(path_uuid),
+        basis: rebind_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(command, Command::Resolve(_, uuid, _) if *uuid == unrelated_uuid)
+            })
+            .count(),
+        unrelated_resolves
+    );
+}
+
+#[test]
 fn protocol_epoch_reconnect_fences_old_resolve_and_requires_target_binding() {
     let token = ModuleEpochToken::new(30);
     let mut loader = Loader::new(mock_io());
@@ -1053,6 +1212,44 @@ fn update_callback_failure_poisons_only_the_reported_module_epoch() {
     assert!(token.is_poisoned());
     assert!(!other.is_poisoned());
     assert!(storage.commits.is_empty());
+}
+
+#[test]
+fn storage_update_failure_freezes_component_and_destroys_unsubmitted_values() {
+    COUNTED_DROPS.store(0, Ordering::SeqCst);
+    let token = ModuleEpochToken::new(46);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 46, &token);
+    let first_uuid = uuid(46);
+    let second_uuid = uuid(47);
+    let first = loader.add_ref::<Counted>(first_uuid).unwrap();
+    let second = loader.add_ref::<Counted>(second_uuid).unwrap();
+    let mut storage = Storage {
+        fail_update: Some((first.id(), GameModuleEpoch(46))),
+        ..Storage::default()
+    };
+    loader.process(&mut storage).unwrap();
+
+    let (first_hash, first_artifact) =
+        artifact_with_edges::<Counted>(first_uuid, &[(second_uuid, Counted::TYPE_UUID)]);
+    let (second_hash, second_artifact) = artifact::<Counted>(second_uuid, &[]);
+    resolve(&mut loader, first_uuid, first_hash);
+    resolve(&mut loader, second_uuid, second_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, first_hash, first_artifact);
+    fetched(&mut loader, second_hash, second_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(COUNTED_DROPS.load(Ordering::SeqCst), 2);
+    assert!(storage.values.is_empty());
+    assert!(storage.commits.is_empty());
+    assert_eq!(loader.status(&first), LoadStatus::Unloaded);
+    assert_eq!(loader.status(&second), LoadStatus::Unloaded);
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { members, .. }
+            if members == &vec![first_uuid, second_uuid]
+    )));
 }
 
 #[test]

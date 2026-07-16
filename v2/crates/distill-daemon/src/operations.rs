@@ -408,10 +408,10 @@ impl AuthoringService {
         let coordinator = self
             .tag_index_coordinator()
             .ok_or_else(|| invalid("schema-transition coordinator is unavailable"))?;
-        let candidate_digest = coordinator
-            .pending_schema_digest(&request.candidate, request.type_uuid)
+        let (candidate_digest, migration_function_keys) = coordinator
+            .pending_schema_transition_context(&request.candidate, request.type_uuid)
             .map_err(invalid)?;
-        {
+        let accepted_lineage = {
             let store = self
                 .store
                 .lock()
@@ -420,19 +420,33 @@ impl AuthoringService {
             if store.schema_manifest_basis().map_err(invalid)?.as_ref() != Some(&request.manifest) {
                 return Err(invalid("schema transition manifest basis is stale"));
             }
-            let required = match store.pipeline_state().map_err(invalid)? {
-                Some(PipelineState::SchemaAcceptanceRequired { required, .. }) => required,
+            match store.pipeline_state().map_err(invalid)? {
+                Some(PipelineState::SchemaAcceptanceRequired { required, .. }) => {
+                    if required.manifest != request.manifest
+                        || required.candidate != request.candidate
+                    {
+                        return Err(invalid("schema transition candidate basis is stale"));
+                    }
+                }
+                Some(PipelineState::RetiredTypeReferenced { error, .. })
+                    if matches!(request.action, SchemaTransitionAction::Reactivate)
+                        && error.type_uuid == request.type_uuid
+                        && store
+                            .pending_schema_candidate_identity()
+                            .map_err(invalid)?
+                            .as_ref()
+                            == Some(&request.candidate) => {}
                 _ => return Err(invalid("no pipeline candidate awaits schema acceptance")),
-            };
-            if required.manifest != request.manifest || required.candidate != request.candidate {
-                return Err(invalid("schema transition candidate basis is stale"));
             }
             if let SchemaTransitionAction::Retire { control_basis } = request.action {
                 if control_basis != store.stamp() {
                     return Err(invalid("schema retirement control snapshot is stale"));
                 }
             }
-        }
+            store
+                .current_lineage_stamp(request.type_uuid)
+                .map_err(invalid)?
+        };
 
         let snapshot = self
             .scan_snapshot
@@ -483,22 +497,62 @@ impl AuthoringService {
             .map_err(invalid)?;
 
         let mut live_schema_hashes = BTreeSet::new();
-        let mut reverse_edges = BTreeSet::new();
-        for source in snapshot.bundle_rows() {
-            let Ok(bundle) = &source.parsed else {
-                continue;
-            };
-            for migration in bundle
-                .assets
-                .values()
-                .filter(|entry| entry.type_uuid == MIGRATION_TYPE_UUID)
-            {
-                let header = crate::migration_control::decode_header(&migration.data)
-                    .map_err(|error| invalid(error.to_string()))?;
-                if header.target_type_uuid == request.type_uuid {
+        let mut reverse_edges = Vec::new();
+        let mut waiting_paths = BTreeSet::new();
+        if !matches!(request.action, SchemaTransitionAction::Accept { .. }) {
+            for source in snapshot.bundle_rows() {
+                let Ok(bundle) = &source.parsed else {
+                    continue;
+                };
+                let mut waits_for_type = bundle
+                    .assets
+                    .values()
+                    .any(|entry| entry.type_uuid == request.type_uuid);
+                for migration in bundle
+                    .assets
+                    .values()
+                    .filter(|entry| entry.type_uuid == MIGRATION_TYPE_UUID)
+                {
+                    let header = crate::migration_control::decode_header(&migration.data)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    if header.target_type_uuid != request.type_uuid {
+                        continue;
+                    }
+                    waits_for_type = true;
                     live_schema_hashes.insert(header.from_hash);
                     live_schema_hashes.insert(header.to_hash);
-                    reverse_edges.insert((header.from_hash, header.to_hash));
+                    if matches!(
+                        request.action,
+                        SchemaTransitionAction::Rollback { .. }
+                            | SchemaTransitionAction::Reactivate
+                    ) {
+                        let accepted = accepted_lineage.as_ref().ok_or_else(|| {
+                            invalid(
+                                "rollback/reactivation proof target has no accepted lineage authority",
+                            )
+                        })?;
+                        crate::migration_control::validate_transition_edge(
+                            migration.uuid,
+                            bundle,
+                            migration,
+                            header,
+                            accepted,
+                            &migration_function_keys,
+                        )
+                        .map_err(|error| invalid(error.to_string()))?;
+                        reverse_edges.push(ReverseMigrationEdge {
+                            asset: migration.uuid,
+                            from: header.from_hash,
+                            to: header.to_hash,
+                        });
+                    }
+                }
+                if waits_for_type && matches!(request.action, SchemaTransitionAction::Reactivate) {
+                    waiting_paths.insert(
+                        self.scanner
+                            .physical_path(&source.root_name, &source.normalized_path)
+                            .map_err(invalid)?,
+                    );
                 }
             }
         }
@@ -511,10 +565,8 @@ impl AuthoringService {
             proposed_bytes,
             proposed,
             live_schema_hashes: live_schema_hashes.into_iter().collect(),
-            reverse_edges: reverse_edges
-                .into_iter()
-                .map(|(from, to)| ReverseMigrationEdge { from, to })
-                .collect(),
+            reverse_edges,
+            waiting_paths: waiting_paths.into_iter().collect(),
         })
     }
 }
@@ -552,6 +604,7 @@ pub(crate) struct PlannedSchemaTransition {
     pub(crate) proposed: VerifiedSchemaLineageManifest,
     pub(crate) live_schema_hashes: Vec<LogicalHash>,
     pub(crate) reverse_edges: Vec<ReverseMigrationEdge>,
+    pub(crate) waiting_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

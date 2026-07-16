@@ -92,7 +92,7 @@ fn preimage_mismatch_restores_file_and_reports_conflict() {
 }
 
 #[test]
-fn doctor_clean_runs_the_store_retention_sweep() {
+fn store_retention_sweep_removes_expired_displacements() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let watched = temp.path().join("assets");
@@ -115,7 +115,7 @@ fn doctor_clean_runs_the_store_retention_sweep() {
         .unwrap()
         .path;
 
-    assert_eq!(driver.doctor_clean(&mut store, i64::MAX).unwrap(), 1);
+    assert_eq!(store.sweep_displaced(i64::MAX).unwrap(), 1);
     assert!(!path.exists());
 }
 
@@ -261,6 +261,7 @@ fn unarmed_create_delete_group_is_abandoned_without_removing_the_source() {
     let destination = watched.join("destination.bundle");
     let proposal = watched.join(".destination.proposed");
     std::fs::write(&source, b"source bytes").unwrap();
+    std::fs::write(&proposal, b"destination bytes").unwrap();
     let source_hash = ContentHash(*blake3::hash(b"source bytes").as_bytes());
     let proposed_hash = ContentHash(*blake3::hash(b"destination bytes").as_bytes());
     let mut store = Store::open(StoreConfig::new(&state)).unwrap();

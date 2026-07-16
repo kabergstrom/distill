@@ -81,6 +81,7 @@ fn publish_replacement(
     std::fs::write(&temp, new).unwrap();
     let group = record_paths(store, &target, &temp, &conflict, Some(hash(old)), hash(new));
     let intent = group.child_intents[0];
+    let instance = store.instance_id();
     assert_eq!(
         store
             .publish_journaled_replacement(intent, &quarantine_dir(dir))
@@ -89,7 +90,7 @@ fn publish_replacement(
     );
     (
         intent,
-        quarantine_dir(dir).join(format!("intent-{intent}")),
+        quarantine_dir(dir).join(format!("intent-{instance}-{intent}")),
         target,
     )
 }
@@ -171,15 +172,20 @@ fn multi_path_parent_and_every_child_are_recorded_atomically() {
 #[test]
 fn parent_cannot_retire_until_every_child_is_terminal() {
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     let group = store
         .record_publication_group(
             PublicationGroupKind::LineageCreate,
             b"missing destination basis",
             &[JournalIntentPlan {
-                target_path: "root/lineage.bundle".into(),
-                temp_path: "root/.lineage.proposed".into(),
-                conflict_path: "root/lineage.conflict".into(),
+                target_path: root.join("lineage.bundle").to_string_lossy().into_owned(),
+                temp_path: root
+                    .join(".lineage.proposed")
+                    .to_string_lossy()
+                    .into_owned(),
+                conflict_path: root.join("lineage.conflict").to_string_lossy().into_owned(),
                 pre_image_hash: None,
                 proposed_hash: hash(b"manifest"),
             }],
@@ -240,7 +246,7 @@ fn quarantine_moves_the_displaced_inode_under_an_intent_id_on_its_filesystem() {
 
     assert_eq!(
         qpath.file_name().unwrap().to_string_lossy(),
-        format!("intent-{id}")
+        format!("intent-{}-{id}", store.instance_id())
     );
     assert!(qpath.starts_with(quarantine_dir(&dir)));
     assert!(qpath.is_file());
@@ -261,6 +267,24 @@ fn identical_bytes_from_distinct_intents_never_alias_inodes() {
 }
 
 #[test]
+fn disposable_store_recreation_cannot_reuse_a_retained_aside_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cfg(&dir);
+    let mut store = Store::open(config.clone()).unwrap();
+    let (_first, first_aside, _) =
+        publish_replacement(&mut store, &dir, "same", b"old one", b"new one");
+    drop(store);
+
+    let mut store = Store::recreate(config).unwrap();
+    let (_second, second_aside, _) =
+        publish_replacement(&mut store, &dir, "same", b"old two", b"new two");
+
+    assert_ne!(first_aside, second_aside);
+    assert_eq!(std::fs::read(first_aside).unwrap(), b"old one");
+    assert_eq!(std::fs::read(second_aside).unwrap(), b"old two");
+}
+
+#[test]
 fn journal_apis_reject_unknown_intents() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
@@ -275,26 +299,55 @@ fn temp_cleanup_is_journal_driven() {
     // §14: the daemon deletes only temp files some retired intent names
     // as its own, never "stray" files by pattern.
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("assets/tex");
+    std::fs::create_dir_all(&root).unwrap();
+    let retired_temp = root.join(".1.bundle.tmp");
+    let live_temp = root.join(".2.bundle.tmp");
+    let unrelated = root.join(".stray.tmp");
+    std::fs::write(&retired_temp, b"proposed bytes").unwrap();
+    std::fs::write(&live_temp, b"proposed bytes").unwrap();
+    std::fs::write(&unrelated, b"proposed bytes").unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     let a = record_group(
         &mut store,
         JournalIntentPlan {
-            target_path: "assets/tex/1.bundle".into(),
-            temp_path: "assets/tex/.1.bundle.tmp".into(),
-            conflict_path: "assets/tex/1.bundle.conflict".into(),
+            target_path: root.join("1.bundle").to_string_lossy().into_owned(),
+            temp_path: retired_temp.to_string_lossy().into_owned(),
+            conflict_path: root
+                .join("1.bundle.conflict")
+                .to_string_lossy()
+                .into_owned(),
             pre_image_hash: Some(hash(b"pre-image bytes")),
             proposed_hash: hash(b"proposed bytes"),
         },
         false,
     );
-    let _b = record(&mut store, 2); // stays unretired
+    let _b = record_group(
+        &mut store,
+        JournalIntentPlan {
+            target_path: root.join("2.bundle").to_string_lossy().into_owned(),
+            temp_path: live_temp.to_string_lossy().into_owned(),
+            conflict_path: root
+                .join("2.bundle.conflict")
+                .to_string_lossy()
+                .into_owned(),
+            pre_image_hash: Some(hash(b"pre-image bytes")),
+            proposed_hash: hash(b"proposed bytes"),
+        },
+        true,
+    );
     store.abort_unarmed_publication_group(a.group_id).unwrap();
 
     assert_eq!(
-        store.journal_owned_temp_paths().unwrap(),
-        vec!["assets/tex/.1.bundle.tmp".to_owned()],
-        "only the retired intent's temp path is deletable"
+        store.cleanup_retired_non_codegen_proposal_temps().unwrap(),
+        1
     );
+    assert!(
+        !retired_temp.exists(),
+        "retired journal-owned proposal removed"
+    );
+    assert!(live_temp.exists(), "unretired proposal retained");
+    assert!(unrelated.exists(), "unowned matching temp retained");
 }
 
 #[test]
@@ -422,10 +475,52 @@ fn native_journaled_replacement_installs_no_replace_and_retains_the_preimage() {
     assert_eq!(std::fs::read(&target).unwrap(), b"new manifest");
     assert!(!temp.exists());
     assert_eq!(
-        std::fs::read(quarantine_dir(&dir).join(format!("intent-{intent}"))).unwrap(),
+        std::fs::read(
+            quarantine_dir(&dir).join(format!("intent-{}-{intent}", store.instance_id()))
+        )
+        .unwrap(),
         b"old manifest"
     );
     assert!(store.unretired_intents().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_publication_rejects_a_symlinked_target_entry() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("asset-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let real = root.join("real.bundle");
+    let target = root.join("manifest.bundle");
+    let temp = root.join(".manifest.proposed");
+    let conflict = root.join("manifest.conflict");
+    std::fs::write(&real, b"user bytes").unwrap();
+    symlink(&real, &target).unwrap();
+    std::fs::write(&temp, b"proposal").unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let group = record_paths(
+        &mut store,
+        &target,
+        &temp,
+        &conflict,
+        Some(hash(b"user bytes")),
+        hash(b"proposal"),
+    );
+
+    let error = store
+        .publish_journaled_replacement(group.child_intents[0], &quarantine_dir(&dir))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::InvalidInput
+    ));
+    assert_eq!(std::fs::read(&real).unwrap(), b"user bytes");
+    assert!(target.is_symlink());
+    assert_eq!(std::fs::read(&temp).unwrap(), b"proposal");
+    assert_eq!(store.unretired_intents().unwrap().len(), 1);
 }
 
 #[test]

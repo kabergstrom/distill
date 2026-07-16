@@ -471,8 +471,17 @@ fn ingest_native(queue: &Mutex<WatcherQueue>, coverage: &Mutex<WatchCoverage>, m
     let mut assets = Vec::new();
     let mut controls = Vec::new();
     for path in &event.paths {
-        if let Some(authority_paths) = coverage.control_paths.get(path) {
-            controls.extend(authority_paths.iter().cloned());
+        for (observed_path, authority_paths) in &coverage.control_paths {
+            // A missing control file is watched at its nearest existing
+            // ancestor. Creating/replacing that ancestor is just as
+            // authoritative as an event naming the eventual file, while a
+            // descendant event covers backend-specific recursive reports.
+            if path == observed_path
+                || path.starts_with(observed_path)
+                || observed_path.starts_with(path)
+            {
+                controls.extend(authority_paths.iter().cloned());
+            }
         }
         if coverage.asset_path(path) {
             assets.push(path.clone());

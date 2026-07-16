@@ -7,6 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use distill_core::id::ContentHash;
 use rusqlite::OptionalExtension;
 
@@ -491,7 +498,7 @@ impl Store {
         quarantine_dir: &Path,
     ) -> Result<RenameAsideOutcome, StoreError> {
         self.ensure_intent_group_armed(intent_id)?;
-        let mut filesystem = NativeRenameAsideFs;
+        let mut filesystem = self.native_filesystem_for_intent(intent_id, Some(quarantine_dir))?;
         self.publish_rename_aside_with(intent_id, quarantine_dir, &mut filesystem)
     }
 
@@ -503,7 +510,7 @@ impl Store {
         quarantine_dir: &Path,
     ) -> Result<DeletionRecoveryOutcome, StoreError> {
         self.ensure_intent_group_armed(intent_id)?;
-        let mut filesystem = NativeRenameAsideFs;
+        let mut filesystem = self.native_filesystem_for_intent(intent_id, Some(quarantine_dir))?;
         self.reconcile_deletion_with(intent_id, quarantine_dir, &mut filesystem)
     }
 
@@ -514,8 +521,32 @@ impl Store {
         intent_id: i64,
     ) -> Result<CreationRecoveryOutcome, StoreError> {
         self.ensure_intent_group_armed(intent_id)?;
-        let mut filesystem = NativeRenameAsideFs;
+        let mut filesystem = self.native_filesystem_for_intent(intent_id, None)?;
         self.reconcile_creation_with(intent_id, &mut filesystem)
+    }
+
+    #[cfg(unix)]
+    fn native_filesystem_for_intent(
+        &self,
+        intent_id: i64,
+        quarantine_dir: Option<&Path>,
+    ) -> Result<NativeRenameAsideFs, StoreError> {
+        let paths: (String, String, String) = self.conn.query_row(
+            "SELECT target_path, temp_path, conflict_path
+             FROM write_intents WHERE intent_id = ?1",
+            [intent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        NativeRenameAsideFs::for_paths(
+            [
+                PathBuf::from(paths.0),
+                PathBuf::from(paths.1),
+                PathBuf::from(paths.2),
+            ]
+            .iter()
+            .filter(|path| !path.as_os_str().is_empty()),
+            quarantine_dir,
+        )
     }
 
     /// Resume a replacement through caller-supplied filesystem authority.
@@ -578,12 +609,12 @@ impl Store {
 
         let mut aside = self
             .displacement_path_optional(intent_id, 0)?
-            .unwrap_or_else(|| quarantine_dir.join(format!("intent-{intent_id}")));
+            .unwrap_or_else(|| self.reserved_aside_path(quarantine_dir, intent_id));
         if self.displacement_path_optional(intent_id, 0)?.is_none() {
-            let observed = read_hash(fs, &target)?.ok_or_else(|| StoreError::BadIntent {
-                intent_id,
-                detail: "unfinished deletion has neither target nor journaled displacement".into(),
-            })?;
+            let Some(observed) = read_hash(fs, &target)? else {
+                self.retire_intent_with_outcome(intent_id, false)?;
+                return Ok(DeletionRecoveryOutcome::RetryRequired);
+            };
             self.journal_rename_aside_displacement(
                 intent_id,
                 0,
@@ -658,10 +689,10 @@ impl Store {
                 }
             }
 
-            let observed = read_hash(fs, &target)?.ok_or_else(|| StoreError::BadIntent {
-                intent_id,
-                detail: "journaled deletion displacement and target are both missing".into(),
-            })?;
+            let Some(observed) = read_hash(fs, &target)? else {
+                self.retire_intent_with_outcome(intent_id, false)?;
+                return Ok(DeletionRecoveryOutcome::RetryRequired);
+            };
             match fs.rename_target_to_reserved(&target, &aside) {
                 Ok(()) => {
                     fs.sync_file(&aside)?;
@@ -766,8 +797,8 @@ impl Store {
         fs: &mut F,
     ) -> Result<RenameAsideOutcome, StoreError> {
         let mut intent = self.load_rename_aside_intent(intent_id)?;
-        let aside = if intent.state == RenameAsideState::Prepared {
-            quarantine_dir.join(format!("intent-{intent_id}"))
+        let mut aside = if intent.state == RenameAsideState::Prepared {
+            self.reserved_aside_path(quarantine_dir, intent_id)
         } else {
             self.displacement_path(intent_id, 0)?
         };
@@ -797,12 +828,10 @@ impl Store {
                         "proposed temp",
                     )?;
                     fs.sync_file(&intent.temp)?;
-                    let observed =
-                        read_hash(fs, &intent.target)?.ok_or_else(|| StoreError::BadIntent {
-                            intent_id,
-                            detail: "rename-aside target is missing before the first move"
-                                .to_owned(),
-                        })?;
+                    let Some(observed) = read_hash(fs, &intent.target)? else {
+                        self.retire_intent_with_outcome(intent_id, false)?;
+                        return Ok(RenameAsideOutcome::RetryRequired);
+                    };
                     // The preimage CAS belongs inside the journaled state
                     // machine immediately before its first filesystem
                     // mutation. A user edit that landed after planning stays
@@ -813,14 +842,12 @@ impl Store {
                         self.retire_intent_with_outcome(intent_id, false)?;
                         return Ok(RenameAsideOutcome::RetryRequired);
                     }
-                    if fs.read(&aside)?.is_some() {
-                        return Err(StoreError::BadIntent {
-                            intent_id,
-                            detail: format!(
-                                "rename-aside destination already exists: {}",
-                                aside.display()
-                            ),
-                        });
+                    if let Some(collision) = read_hash(fs, &aside)? {
+                        fs.sync_file(&aside)?;
+                        fs.sync_dir(aside.parent().unwrap_or_else(|| Path::new(".")))?;
+                        let replacement = self.available_conflict_path(fs, intent_id, &aside)?;
+                        self.record_reserved_path_collision(intent_id, &aside, collision)?;
+                        aside = replacement;
                     }
                     self.journal_rename_aside_displacement(
                         intent_id,
@@ -846,11 +873,8 @@ impl Store {
                         continue;
                     }
                     if fs.read(&intent.target)?.is_none() {
-                        return Err(StoreError::BadIntent {
-                            intent_id,
-                            detail: "journal names neither a target nor its planned aside"
-                                .to_owned(),
-                        });
+                        self.retire_intent_with_outcome(intent_id, false)?;
+                        return Ok(RenameAsideOutcome::RetryRequired);
                     }
                     match fs.rename_target_to_reserved(&intent.target, &aside) {
                         Ok(()) => {}
@@ -875,17 +899,17 @@ impl Store {
                             detail: "durable rename-aside state has no displaced pre-image"
                                 .to_owned(),
                         })?;
-                    let target_hash = read_hash(fs, &intent.target)?;
-
                     if aside_hash != intent.expected_preimage {
-                        if let Some(reappeared) = target_hash {
-                            self.begin_reappeared_target(fs, intent_id, reappeared, &mut intent)?;
-                            continue;
+                        if let Some(outcome) = self.restore_changed_aside(
+                            fs,
+                            intent_id,
+                            &aside,
+                            aside_hash,
+                            &mut intent,
+                        )? {
+                            return Ok(outcome);
                         }
-                        // The aside itself is a named raced edit. It is not
-                        // the verified pre-image, so neither installation nor
-                        // restoration is authorized.
-                        return Ok(RenameAsideOutcome::RetryRequired);
+                        continue;
                     }
 
                     // Verification is itself durable before installation;
@@ -901,10 +925,16 @@ impl Store {
                     let aside_hash =
                         existing_hash(fs, intent_id, &aside, "verified displaced pre-image")?;
                     if aside_hash != intent.expected_preimage {
-                        return Err(StoreError::BadIntent {
+                        if let Some(outcome) = self.restore_changed_aside(
+                            fs,
                             intent_id,
-                            detail: "pre-image changed after its durable verification".to_owned(),
-                        });
+                            &aside,
+                            aside_hash,
+                            &mut intent,
+                        )? {
+                            return Ok(outcome);
+                        }
+                        continue;
                     }
                     let target_hash = read_hash(fs, &intent.target)?;
                     let temp_hash = read_hash(fs, &intent.temp)?;
@@ -1058,9 +1088,6 @@ impl Store {
                 RenameAsideState::ConflictPreservedDurable => {
                     let aside_hash = read_hash(fs, &aside)?;
                     if let Some(aside_hash) = aside_hash {
-                        if aside_hash != intent.expected_preimage {
-                            return Ok(RenameAsideOutcome::RetryRequired);
-                        }
                         match read_hash(fs, &intent.target)? {
                             Some(target_hash) if target_hash == aside_hash => {
                                 fs.sync_file(&intent.target)?;
@@ -1107,9 +1134,6 @@ impl Store {
                     // hash is accepted as the restored target.
                     let displaced_hash = self.displacement_hash(intent_id, 0)?;
                     if read_hash(fs, &intent.target)? == Some(displaced_hash) {
-                        if displaced_hash != intent.expected_preimage {
-                            return Ok(RenameAsideOutcome::RetryRequired);
-                        }
                         fs.sync_file(&intent.target)?;
                         sync_move_dirs(fs, &aside, &intent.target)?;
                         self.finish_rename_aside_terminal(
@@ -1174,6 +1198,90 @@ impl Store {
             proposed: ContentHash(blob32(proposed)),
             state: RenameAsideState::from_db(intent_id, state)?,
         })
+    }
+
+    fn reserved_aside_path(&self, quarantine_dir: &Path, intent_id: i64) -> PathBuf {
+        quarantine_dir.join(format!("intent-{}-{intent_id}", self.instance_id()))
+    }
+
+    /// A retained quarantine directory can outlive disposable daemon state.
+    /// Account for a reserved-name collision before selecting a fresh aside;
+    /// the colliding bytes remain exactly where they were found.
+    fn record_reserved_path_collision(
+        &mut self,
+        intent_id: i64,
+        path: &Path,
+        content_hash: ContentHash,
+    ) -> Result<(), StoreError> {
+        let ordinal: u32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 2) FROM displaced WHERE intent_id = ?1",
+            [intent_id],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO displaced(intent_id, ordinal, content_hash, origin_path,
+                                    quarantine_path, quarantined_at, restored)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0)",
+            rusqlite::params![
+                intent_id,
+                ordinal,
+                content_hash.0.as_slice(),
+                path.to_string_lossy(),
+                now_secs(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// An in-place writer can change the displaced inode after the target was
+    /// atomically renamed aside. The changed inode is the newest user object:
+    /// restore it no-clobber (after preserving any reappeared target) and
+    /// terminate the child as a conflict instead of wedging recovery.
+    fn restore_changed_aside<F: JournalFilesystem + ?Sized>(
+        &mut self,
+        fs: &mut F,
+        intent_id: i64,
+        aside: &Path,
+        actual: ContentHash,
+        intent: &mut RenameAsideIntent,
+    ) -> Result<Option<RenameAsideOutcome>, StoreError> {
+        match read_hash(fs, &intent.target)? {
+            Some(target) if target == actual => {
+                fs.sync_file(&intent.target)?;
+                fs.sync_dir(intent.target.parent().unwrap_or_else(|| Path::new(".")))?;
+                self.finish_rename_aside_terminal(
+                    intent_id,
+                    RenameAsideState::PreimageRestoredDurable,
+                    true,
+                )?;
+                Ok(Some(RenameAsideOutcome::ConflictRestored))
+            }
+            Some(reappeared) => {
+                self.begin_reappeared_target(fs, intent_id, reappeared, intent)?;
+                Ok(None)
+            }
+            None => match fs.restore_retained_no_replace(aside, &intent.target) {
+                Ok(()) => {
+                    fs.sync_file(&intent.target)?;
+                    sync_move_dirs(fs, aside, &intent.target)?;
+                    require_hash(
+                        fs,
+                        intent_id,
+                        &intent.target,
+                        actual,
+                        "restored late-written displacement",
+                    )?;
+                    self.finish_rename_aside_terminal(
+                        intent_id,
+                        RenameAsideState::PreimageRestoredDurable,
+                        true,
+                    )?;
+                    Ok(Some(RenameAsideOutcome::ConflictRestored))
+                }
+                Err(NoReplaceMoveError::DestinationExists) => Ok(None),
+                Err(NoReplaceMoveError::Other(error)) => Err(error),
+            },
+        }
     }
 
     fn journal_rename_aside_displacement(
@@ -1557,15 +1665,72 @@ impl Store {
         Ok(out)
     }
 
-    pub fn journal_owned_temp_paths(&self) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT temp_path FROM write_intents WHERE retired = 1 ORDER BY intent_id")?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<Result<_, _>>()
-            .map_err(Into::into);
-        rows
+    /// Remove only a retired non-codegen proposal that still has exactly the
+    /// journaled proposed bytes. Unknown or edited files are left untouched.
+    #[cfg(unix)]
+    pub fn cleanup_retired_non_codegen_proposal_temps(&self) -> Result<usize, StoreError> {
+        let plans = self.retired_proposal_temps(false)?;
+        let mut cleaned = 0;
+        for (_, path, proposed) in plans {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            match std::fs::symlink_metadata(parent) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(StoreError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })
+                }
+            }
+            let mut filesystem = NativeRenameAsideFs::for_paths(std::iter::once(&path), None)?;
+            cleaned += usize::from(clean_retired_proposal_temp(
+                &mut filesystem,
+                &path,
+                proposed,
+            )?);
+        }
+        Ok(cleaned)
+    }
+
+    /// Codegen proposal paths are relative to independently validated output
+    /// authority, so startup cleanup uses that same filesystem capability.
+    pub fn cleanup_retired_codegen_proposal_temps_with_filesystem(
+        &self,
+        filesystem: &mut dyn JournalFilesystem,
+    ) -> Result<usize, StoreError> {
+        let plans = self.retired_proposal_temps(true)?;
+        let mut cleaned = 0;
+        for (_, path, proposed) in plans {
+            cleaned += usize::from(clean_retired_proposal_temp(filesystem, &path, proposed)?);
+        }
+        Ok(cleaned)
+    }
+
+    fn retired_proposal_temps(
+        &self,
+        codegen: bool,
+    ) -> Result<Vec<(i64, PathBuf, ContentHash)>, StoreError> {
+        let comparison = if codegen { "=" } else { "<>" };
+        let sql = format!(
+            "SELECT w.intent_id, w.temp_path, w.proposed_hash
+             FROM write_intents w
+             JOIN publication_group_children c ON c.intent_id = w.intent_id
+             JOIN publication_groups g ON g.group_id = c.group_id
+             WHERE w.retired = 1 AND w.temp_path <> '' AND g.kind {comparison} ?1
+             ORDER BY w.intent_id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let plans = stmt
+            .query_map([PublicationGroupKind::Codegen as i64], |row| {
+                Ok((
+                    row.get(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    ContentHash(blob32(row.get(2)?)),
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(plans)
     }
 
     pub fn displacement_history(&self) -> Result<Vec<DisplacedEntry>, StoreError> {
@@ -1605,6 +1770,20 @@ impl Store {
     pub fn verify_quarantine(&self) -> Result<Vec<RecoveredEdit>, StoreError> {
         let mut diagnostics = Vec::new();
         for entry in self.quarantined_entries()? {
+            let expected = if entry.ordinal == 0 {
+                self.conn
+                    .query_row(
+                        "SELECT pre_image_hash FROM write_intents WHERE intent_id = ?1",
+                        [entry.intent_id],
+                        |row| row.get::<_, Option<Vec<u8>>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .map(|bytes| ContentHash(blob32(bytes)))
+                    .unwrap_or(entry.content_hash)
+            } else {
+                entry.content_hash
+            };
             let actual = match std::fs::read(&entry.path) {
                 Ok(bytes) => Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1615,10 +1794,10 @@ impl Store {
                     })
                 }
             };
-            if actual != Some(entry.content_hash) {
+            if actual != Some(expected) {
                 diagnostics.push(RecoveredEdit {
                     origin_path: entry.origin_path,
-                    expected: entry.content_hash,
+                    expected,
                     actual,
                     quarantine_path: entry.path,
                 });
@@ -1678,6 +1857,20 @@ impl Store {
         }
         Ok(entries.len())
     }
+}
+
+fn clean_retired_proposal_temp<F: JournalFilesystem + ?Sized>(
+    fs: &mut F,
+    path: &Path,
+    proposed: ContentHash,
+) -> Result<bool, StoreError> {
+    if read_hash(fs, path)? != Some(proposed) {
+        return Ok(false);
+    }
+    fs.sync_file(path)?;
+    fs.remove_daemon_temp(path)?;
+    fs.sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(true)
 }
 
 fn read_hash<F: JournalFilesystem + ?Sized>(
@@ -1741,38 +1934,239 @@ fn sync_move_dirs<F: JournalFilesystem + ?Sized>(
 }
 
 #[cfg(unix)]
-struct NativeRenameAsideFs;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryIdentity {
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Native authored-file authority. The journal records trusted workspace
+/// paths, then this adapter pins every immediate directory used by the
+/// intent. Each operation revalidates that directory and rejects symlinked
+/// or non-regular entries immediately before touching it.
+#[cfg(unix)]
+struct NativeRenameAsideFs {
+    directories: BTreeMap<PathBuf, DirectoryIdentity>,
+}
+
+#[cfg(unix)]
+impl NativeRenameAsideFs {
+    fn for_paths<'a>(
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+        quarantine_dir: Option<&Path>,
+    ) -> Result<Self, StoreError> {
+        let mut this = Self {
+            directories: BTreeMap::new(),
+        };
+        for path in paths {
+            this.pin_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        }
+        if let Some(quarantine_dir) = quarantine_dir {
+            this.pin_dir(quarantine_dir.parent().unwrap_or_else(|| Path::new(".")))?;
+            if quarantine_dir.exists() {
+                this.pin_dir(quarantine_dir)?;
+            }
+        }
+        Ok(this)
+    }
+
+    fn pin_dir(&mut self, path: &Path) -> Result<(), StoreError> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid_journal_path(
+                path,
+                "journal directory is not a real directory",
+            ));
+        }
+        let canonical = std::fs::canonicalize(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        self.directories.insert(
+            path.to_path_buf(),
+            DirectoryIdentity {
+                canonical,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        );
+        Ok(())
+    }
+
+    fn validate_dir(&self, path: &Path) -> Result<&DirectoryIdentity, StoreError> {
+        let expected = self.directories.get(path).ok_or_else(|| {
+            invalid_journal_path(path, "journal operation escaped its pinned directories")
+        })?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let canonical = std::fs::canonicalize(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+            || canonical != expected.canonical
+        {
+            return Err(invalid_journal_path(
+                path,
+                "journal directory identity changed",
+            ));
+        }
+        Ok(expected)
+    }
+
+    fn validate_parent(&self, path: &Path) -> Result<&DirectoryIdentity, StoreError> {
+        self.validate_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    }
+
+    fn file_identity(&self, path: &Path) -> Result<Option<FileIdentity>, StoreError> {
+        self.validate_parent(path)?;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid_journal_path(
+                path,
+                "journal entry is not a real regular file",
+            ));
+        }
+        Ok(Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+
+    fn required_file_identity(&self, path: &Path) -> Result<FileIdentity, StoreError> {
+        self.file_identity(path)?.ok_or_else(|| StoreError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "journal file is missing"),
+        })
+    }
+
+    fn verify_file_identity(&self, path: &Path, expected: FileIdentity) -> Result<(), StoreError> {
+        if self.file_identity(path)? != Some(expected) {
+            return Err(invalid_journal_path(
+                path,
+                "journal file identity changed during operation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn invalid_journal_path(path: &Path, detail: &'static str) -> StoreError {
+    StoreError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, detail),
+    }
+}
 
 #[cfg(unix)]
 impl JournalFilesystem for NativeRenameAsideFs {
     fn read(&mut self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
-    }
-
-    fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError> {
-        std::fs::create_dir_all(path).map_err(|source| StoreError::Io {
+        let Some(expected) = self.file_identity(path)? else {
+            return Ok(None);
+        };
+        let mut file = std::fs::File::open(path).map_err(|source| StoreError::Io {
             path: path.to_path_buf(),
             source,
-        })
-    }
-
-    fn sync_file(&mut self, path: &Path) -> Result<(), StoreError> {
-        std::fs::File::open(path)
-            .and_then(|file| file.sync_all())
+        })?;
+        let before = file.metadata().map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !before.is_file() || before.dev() != expected.device || before.ino() != expected.inode {
+            return Err(invalid_journal_path(
+                path,
+                "journal file changed while it was opened",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
             .map_err(|source| StoreError::Io {
                 path: path.to_path_buf(),
                 source,
-            })
+            })?;
+        let after = file.metadata().map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        self.verify_file_identity(path, expected)?;
+        if before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || after.len() != bytes.len() as u64
+        {
+            return Err(invalid_journal_path(
+                path,
+                "journal file changed while it was read",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn create_dir_all(&mut self, path: &Path) -> Result<(), StoreError> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        self.validate_dir(parent)?;
+        std::fs::create_dir_all(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        self.validate_dir(parent)?;
+        self.pin_dir(path)
+    }
+
+    fn sync_file(&mut self, path: &Path) -> Result<(), StoreError> {
+        let expected = self.required_file_identity(path)?;
+        let file = std::fs::File::open(path).map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.is_file()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+        {
+            return Err(invalid_journal_path(
+                path,
+                "journal file changed while it was opened for sync",
+            ));
+        }
+        file.sync_all().map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        self.verify_file_identity(path, expected)
     }
 
     fn sync_dir(&mut self, path: &Path) -> Result<(), StoreError> {
+        self.validate_dir(path)?;
         crate::cas::manifest::fsync_dir(path)
     }
 
@@ -1781,7 +2175,15 @@ impl JournalFilesystem for NativeRenameAsideFs {
         source: &Path,
         destination_dir: &Path,
     ) -> Result<(), StoreError> {
-        ensure_same_filesystem(source, destination_dir)
+        let source_identity = self.required_file_identity(source)?;
+        let destination_identity = self.validate_dir(destination_dir)?;
+        if source_identity.device != destination_identity.device {
+            return Err(StoreError::CrossFilesystemQuarantine {
+                source: source.to_path_buf(),
+                quarantine: destination_dir.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     fn rename_target_to_reserved(
@@ -1789,22 +2191,40 @@ impl JournalFilesystem for NativeRenameAsideFs {
         source: &Path,
         destination: &Path,
     ) -> Result<(), NoReplaceMoveError> {
-        match std::fs::symlink_metadata(destination) {
-            Ok(_) => return Err(NoReplaceMoveError::DestinationExists),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(NoReplaceMoveError::Other(StoreError::Io {
-                    path: destination.to_path_buf(),
-                    source,
-                }))
-            }
+        let source_identity = self
+            .required_file_identity(source)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
+        if self
+            .file_identity(destination)
+            .map_err(NoReplaceMoveError::Other)?
+            .is_some()
+        {
+            return Err(NoReplaceMoveError::DestinationExists);
         }
+        self.verify_file_identity(source, source_identity)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
         std::fs::rename(source, destination).map_err(|source| {
             NoReplaceMoveError::Other(StoreError::Io {
                 path: destination.to_path_buf(),
                 source,
             })
-        })
+        })?;
+        self.validate_parent(source)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
+        // An editor may have atomically exchanged the target after the
+        // pre-image hash was read. The move still preserved that newer real
+        // file at the journaled aside, so let the state machine hash and
+        // restore it instead of converting a recoverable edit into an I/O
+        // wedge.
+        self.required_file_identity(destination)
+            .map_err(NoReplaceMoveError::Other)?;
+        Ok(())
     }
 
     fn install_temp_no_replace(
@@ -1812,6 +2232,11 @@ impl JournalFilesystem for NativeRenameAsideFs {
         source: &Path,
         destination: &Path,
     ) -> Result<(), NoReplaceMoveError> {
+        let source_identity = self
+            .required_file_identity(source)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
         match std::fs::hard_link(source, destination) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1824,6 +2249,12 @@ impl JournalFilesystem for NativeRenameAsideFs {
                 }))
             }
         }
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.verify_file_identity(destination, source_identity)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.verify_file_identity(source, source_identity)
+            .map_err(NoReplaceMoveError::Other)?;
         let source_path = source.to_path_buf();
         std::fs::remove_file(source).map_err(|source| {
             NoReplaceMoveError::Other(StoreError::Io {
@@ -1834,10 +2265,14 @@ impl JournalFilesystem for NativeRenameAsideFs {
     }
 
     fn remove_daemon_temp(&mut self, path: &Path) -> Result<(), StoreError> {
+        let identity = self.required_file_identity(path)?;
+        self.verify_file_identity(path, identity)?;
         std::fs::remove_file(path).map_err(|source| StoreError::Io {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        self.validate_parent(path)?;
+        Ok(())
     }
 
     fn restore_retained_no_replace(
@@ -1845,6 +2280,11 @@ impl JournalFilesystem for NativeRenameAsideFs {
         source: &Path,
         destination: &Path,
     ) -> Result<(), NoReplaceMoveError> {
+        let source_identity = self
+            .required_file_identity(source)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
         std::fs::hard_link(source, destination).map_err(|source| {
             if source.kind() == std::io::ErrorKind::AlreadyExists {
                 NoReplaceMoveError::DestinationExists
@@ -1854,7 +2294,13 @@ impl JournalFilesystem for NativeRenameAsideFs {
                     source,
                 })
             }
-        })
+        })?;
+        self.validate_parent(destination)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.verify_file_identity(source, source_identity)
+            .map_err(NoReplaceMoveError::Other)?;
+        self.verify_file_identity(destination, source_identity)
+            .map_err(NoReplaceMoveError::Other)
     }
 }
 
@@ -1863,30 +2309,6 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn ensure_same_filesystem(source: &Path, quarantine: &Path) -> Result<(), StoreError> {
-    use std::os::unix::fs::MetadataExt;
-    let source_dev = std::fs::metadata(source)
-        .map_err(|error| StoreError::Io {
-            path: source.to_path_buf(),
-            source: error,
-        })?
-        .dev();
-    let quarantine_dev = std::fs::metadata(quarantine)
-        .map_err(|error| StoreError::Io {
-            path: quarantine.to_path_buf(),
-            source: error,
-        })?
-        .dev();
-    if source_dev != quarantine_dev {
-        return Err(StoreError::CrossFilesystemQuarantine {
-            source: source.to_path_buf(),
-            quarantine: quarantine.to_path_buf(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2121,7 +2543,7 @@ mod rename_aside_tests {
             .unwrap();
         store.arm_publication_group(group.group_id).unwrap();
         let intent_id = group.child_intents[0];
-        let aside = quarantine.join(format!("intent-{intent_id}"));
+        let aside = store.reserved_aside_path(&quarantine, intent_id);
         let mut fs = FakeFs::default();
         fs.put(&target, b"preimage");
         fs.put(&temp, b"proposed");
@@ -2220,6 +2642,89 @@ mod rename_aside_tests {
         assert_eq!(
             persisted_state(&fixture.store, fixture.intent_id),
             (RenameAsideState::Prepared, true)
+        );
+    }
+
+    #[test]
+    fn target_exchange_between_hash_and_reserved_rename_restores_the_new_bytes() {
+        let mut fixture = fixture();
+        fixture.fs.inject_before_move(
+            &fixture.target,
+            &fixture.aside,
+            &fixture.target,
+            b"atomic editor exchange",
+        );
+
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::ConflictRestored);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.target),
+            Some(b"atomic editor exchange".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"atomic editor exchange".as_slice())
+        );
+        assert_eq!(
+            fixture.fs.bytes(&fixture.temp),
+            Some(b"proposed".as_slice())
+        );
+        assert_eq!(
+            persisted_state(&fixture.store, fixture.intent_id),
+            (RenameAsideState::PreimageRestoredDurable, true)
+        );
+    }
+
+    #[test]
+    fn missing_prepared_target_is_terminally_retired() {
+        let mut fixture = fixture();
+        fixture.fs.files.remove(&fixture.target);
+
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::RetryRequired);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.temp),
+            Some(b"proposed".as_slice())
+        );
+        assert_eq!(
+            persisted_state(&fixture.store, fixture.intent_id),
+            (RenameAsideState::Prepared, true)
+        );
+    }
+
+    #[test]
+    fn occupied_reserved_aside_is_accounted_and_replanned() {
+        let mut fixture = fixture();
+        fixture
+            .fs
+            .put(&fixture.aside, b"retained by an older store");
+
+        let outcome = fixture
+            .store
+            .publish_rename_aside_with(fixture.intent_id, &fixture.quarantine, &mut fixture.fs)
+            .unwrap();
+
+        assert_eq!(outcome, RenameAsideOutcome::Installed);
+        assert_eq!(
+            fixture.fs.bytes(&fixture.aside),
+            Some(b"retained by an older store".as_slice())
+        );
+        let history = fixture.store.displacement_history().unwrap();
+        let collision = history.iter().find(|entry| entry.ordinal == 2).unwrap();
+        let displaced = history.iter().find(|entry| entry.ordinal == 0).unwrap();
+        assert_eq!(collision.path, fixture.aside);
+        assert_ne!(displaced.path, fixture.aside);
+        assert_eq!(
+            fixture.fs.bytes(&displaced.path),
+            Some(b"preimage".as_slice())
         );
     }
 

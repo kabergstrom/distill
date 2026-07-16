@@ -29,6 +29,14 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
+fn reverse(asset: u8, from: LogicalHash, to: LogicalHash) -> ReverseMigrationEdge {
+    ReverseMigrationEdge {
+        asset: AssetUuid([asset; 16]),
+        from,
+        to,
+    }
+}
+
 fn tool_package(launcher: &[u8], resource: &[u8]) -> ToolRegistrationV2 {
     ToolRegistrationV2 {
         source: ResolvedToolSourceV2::Package {
@@ -605,10 +613,7 @@ fn candidate_bound_rollback_rejects_stale_base_then_moves_only_the_cursor() {
         current_cursors: base.current_cursors.clone(),
     };
     let proposed = verified(9, manifest(&[(T, accepted(&[h(1), h(2)], 0))]));
-    let reverse = [ReverseMigrationEdge {
-        from: h(2),
-        to: h(1),
-    }];
+    let reverse = [reverse(1, h(2), h(1))];
 
     let err = store
         .input_transaction(|txn| {
@@ -798,6 +803,71 @@ fn retirement_is_blocked_by_migration_endpoints_and_live_authored_entries() {
 }
 
 #[test]
+fn retired_reference_diagnostic_round_trips_and_heals_to_last_good() {
+    let (_d, mut store) = store();
+    store
+        .input_transaction(|txn| {
+            txn.project_verified_lineage_manifest(&verified(
+                70,
+                manifest(&[(T, retired(&[h(1)], 0))]),
+            ))?;
+            txn.publish_pipeline_epoch(&epoch_with_registry(30, &[]))?;
+            Ok(())
+        })
+        .unwrap();
+    let manifest_hash = store
+        .schema_manifest_basis()
+        .unwrap()
+        .unwrap()
+        .manifest_hash;
+    let asset = AssetUuid([71; 16]);
+    store
+        .input_transaction(|txn| {
+            let error = distill_store::state::RetiredTypeReferenced {
+                manifest_hash,
+                basis: distill_store::state::SnapshotStamp {
+                    instance: txn.base_stamp().instance,
+                    version: txn.version(),
+                },
+                type_uuid: T,
+                references: vec![
+                    RetiredTypeReference::Asset(asset),
+                    RetiredTypeReference::MigrationEndpoint(h(9)),
+                ],
+            };
+            txn.publish_retired_type_referenced(&error)
+        })
+        .unwrap();
+
+    match store.pipeline_state().unwrap().unwrap() {
+        PipelineState::RetiredTypeReferenced { error, last_good } => {
+            assert_eq!(error.manifest_hash, manifest_hash);
+            assert_eq!(error.type_uuid, T);
+            assert_eq!(
+                error.references,
+                [
+                    RetiredTypeReference::Asset(asset),
+                    RetiredTypeReference::MigrationEndpoint(h(9)),
+                ]
+            );
+            assert!(last_good.is_some());
+        }
+        other => panic!("expected retired reference diagnostic, got {other:?}"),
+    }
+
+    store
+        .input_transaction(|txn| {
+            assert!(txn.clear_retired_type_referenced()?);
+            Ok(())
+        })
+        .unwrap();
+    assert!(matches!(
+        store.pipeline_state().unwrap(),
+        Some(PipelineState::Ready(_))
+    ));
+}
+
+#[test]
 fn retirement_requires_exact_control_basis_and_blocks_later_type_references() {
     let (_d, mut store) = store();
     store
@@ -903,10 +973,7 @@ fn reactivation_of_existing_noncurrent_digest_requires_rollback_coverage() {
         .unwrap_err();
     assert!(matches!(err, StoreError::IncompleteRollbackCoverage { .. }));
 
-    let reverse = [ReverseMigrationEdge {
-        from: h(2),
-        to: h(1),
-    }];
+    let reverse = [reverse(1, h(2), h(1))];
     store
         .input_transaction(|txn| {
             txn.reactivate_schema_candidate(
@@ -1517,16 +1584,7 @@ fn rollback_moves_only_the_cursor_after_complete_reverse_edge_validation() {
         .unwrap();
     let candidate = epoch_with_registry(10, &[(T, h(1))]);
     let base = require_candidate(&mut store, &candidate);
-    let reverse = [
-        ReverseMigrationEdge {
-            from: h(3),
-            to: h(2),
-        },
-        ReverseMigrationEdge {
-            from: h(2),
-            to: h(1),
-        },
-    ];
+    let reverse = [reverse(1, h(3), h(2)), reverse(2, h(2), h(1))];
     let proposed = verified(33, manifest(&[(T, accepted(&[h(1), h(2), h(3)], 0))]));
     let (rolled_back, _) = store
         .input_transaction(|txn| {
@@ -1584,56 +1642,25 @@ fn rollback_rejects_missing_ambiguous_cyclic_and_unknown_coverage_atomically() {
     let proposed = verified(34, manifest(&[(T, accepted(&[h(1), h(2), h(3)], 0))]));
 
     let bad_cases: &[(&[LogicalHash], &[ReverseMigrationEdge])] = &[
-        (
-            &[h(3)],
-            &[ReverseMigrationEdge {
-                from: h(3),
-                to: h(2),
-            }],
-        ),
+        (&[h(3)], &[reverse(1, h(3), h(2))]),
         (
             &[h(3)],
             &[
-                ReverseMigrationEdge {
-                    from: h(3),
-                    to: h(2),
-                },
-                ReverseMigrationEdge {
-                    from: h(3),
-                    to: h(1),
-                },
-                ReverseMigrationEdge {
-                    from: h(2),
-                    to: h(1),
-                },
+                reverse(1, h(3), h(2)),
+                reverse(2, h(3), h(1)),
+                reverse(3, h(2), h(1)),
             ],
         ),
         (
             &[h(3)],
             &[
-                ReverseMigrationEdge {
-                    from: h(3),
-                    to: h(2),
-                },
-                ReverseMigrationEdge {
-                    from: h(2),
-                    to: h(3),
-                },
+                reverse(1, h(3), h(2)),
+                reverse(2, h(3), h(2)),
+                reverse(3, h(2), h(1)),
             ],
         ),
-        (
-            &[h(9)],
-            &[
-                ReverseMigrationEdge {
-                    from: h(3),
-                    to: h(2),
-                },
-                ReverseMigrationEdge {
-                    from: h(2),
-                    to: h(1),
-                },
-            ],
-        ),
+        (&[h(3)], &[reverse(1, h(3), h(2)), reverse(2, h(2), h(3))]),
+        (&[h(9)], &[reverse(1, h(3), h(2)), reverse(2, h(2), h(1))]),
     ];
     for (live, edges) in bad_cases {
         let err = store

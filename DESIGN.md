@@ -5424,6 +5424,13 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   reports overflow or incomplete observation. Overflow recovery is exceptional;
   treating every ordinary event as an overflow/full-rescan request is
   nonconforming.
+- **Control-path coverage is incremental too.** A control file whose immediate
+  parent does not yet exist is covered by watching its nearest existing
+  ancestor. Any event at an ancestor or descendant of the eventual control
+  path invalidates that exact control authority, then synchronously rebuilds
+  coverage before the authority is reread. Introducing or atomically replacing
+  a schema/module/configuration parent therefore never requires a complete
+  asset-root scan and cannot leave later edits outside native watch coverage.
 - **Startup reconciliation.** Watchers arm **before** the scan begins,
   never after. Events arriving during traversal remain in that startup
   generation and are replayed through the incremental path after the full-scan
@@ -5549,12 +5556,13 @@ v2 improvements over v1's tracker:
   the expected pre-image hash, and the proposed content hash — is
   written to daemon state and **fsynced before the first rename** of the
   protocol. The daemon writes and fsyncs the proposal temp, then atomically
-  renames the user-visible target to the journal-reserved, intent-ID-derived
-  aside path. That destination is private to the journal under R37's trusted
-  local-workspace boundary; an occupied reserved path is classified and
-  replanned rather than overwritten. The daemon fsyncs the moved file and its
-  directories, records the durable transition, hashes the displaced bytes,
-  and compares them against the recorded pre-image. The aside is the
+  renames the user-visible target to the journal-reserved,
+  store-instance-and-intent-ID-derived aside path. That destination is private
+  to the journal under R37's trusted local-workspace boundary; an occupied
+  reserved path is classified and replanned rather than overwritten. The
+  daemon fsyncs the moved file and its directories, records the durable
+  transition, hashes the displaced bytes, and compares them against the
+  recorded pre-image. The aside is the
   **quarantine entry for its filesystem** — the daemon
   keeps one per watched root, and one beside each daemon-owned output
   directory (`rs_mod_path`, §20), each daemon-owned, on the *same
@@ -5562,7 +5570,10 @@ v2 improvements over v1's tracker:
   inode only within its filesystem; a cross-filesystem copy would
   silently orphan an open writer's descriptor), and excluded from
   scanning by the daemon-owned identity rule above — under a name
-  derived from the journal entry's unique, never-reused **intent ID**.
+  derived from the durable **store instance ID** and the journal entry's
+  **intent ID**. Intent counters may restart after disposable daemon state is
+  recreated, but the re-minted store instance prevents a retained quarantine
+  name from aliasing a new intent.
   Content hashes are recorded as journal metadata, never used as
   quarantine names: two displaced inodes with equal bytes are still two
   inodes, each possibly held open by a different writer, and

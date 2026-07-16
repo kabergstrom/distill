@@ -41,6 +41,25 @@ fn events_during_startup_remain_owned_until_scan_finishes() {
 }
 
 #[test]
+fn failed_scan_finalization_can_requeue_events_without_leaving_scan_armed() {
+    let mut queue = WatcherQueue::new();
+    let path = PathBuf::from("/assets/arrived-during-failed-scan.txt");
+    queue.arm_scan();
+    queue.push_native(create(&path));
+
+    let retained = queue.finish_scan();
+    queue.requeue_action(retained);
+
+    assert_eq!(
+        queue.take_live_action(),
+        WatcherAction::Batch(distill_daemon::watcher::WatcherBatch {
+            paths: vec![path],
+            renames: Vec::new(),
+        })
+    );
+}
+
+#[test]
 fn native_rename_pairs_retain_order_and_coalesce_paths() {
     let mut queue = WatcherQueue::new();
     let from = PathBuf::from("/assets/a.txt");
@@ -230,4 +249,31 @@ fn native_watcher_admits_exact_control_files_but_not_siblings_or_quarantine() {
         panic!("exact control-file edit must be admitted")
     };
     assert_eq!(batch.paths, [control]);
+}
+
+#[test]
+fn native_watcher_maps_parent_introduction_to_missing_control_without_a_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    std::fs::create_dir(&root).unwrap();
+    let control = temp.path().join("controls/generated/schema.json");
+    let scanner = RootedScanner::new([AssetRoot::new(
+        "main",
+        &root,
+        root.join(".distill-displaced"),
+    )])
+    .unwrap();
+    let queue = Arc::new(Mutex::new(WatcherQueue::new()));
+    let _watcher = WatcherThread::start(scanner, [control.clone()], Arc::clone(&queue)).unwrap();
+
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(staging.join("generated")).unwrap();
+    std::fs::write(staging.join("generated/schema.json"), b"schema").unwrap();
+    std::fs::rename(&staging, temp.path().join("controls")).unwrap();
+
+    let WatcherAction::Batch(batch) = wait_for_action(&queue) else {
+        panic!("control-parent introduction must remain a precise invalidation")
+    };
+    assert_eq!(batch.paths, [control]);
+    assert!(batch.renames.is_empty());
 }

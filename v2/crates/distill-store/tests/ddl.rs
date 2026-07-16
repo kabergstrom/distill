@@ -77,6 +77,7 @@ fn every_section_13_table_exists() {
         "cas_extents",
         "cas_segments",
         "pipeline_state",
+        "pipeline_retired_references",
         "pipeline_schema_registry",
         "pipeline_candidate_schema_registry",
         "pipeline_target_set",
@@ -290,8 +291,16 @@ fn pipeline_state_row_shape() {
             "poison_identity",
             "poison_message",
             "acceptance_candidate_dylib_hash",
-            "acceptance_manifest_hash"
+            "acceptance_manifest_hash",
+            "retired_manifest_hash",
+            "retired_basis_instance",
+            "retired_basis_version",
+            "retired_type_uuid"
         ]
+    );
+    assert_eq!(
+        columns(&conn, "pipeline_retired_references"),
+        ["position", "reference_kind", "subject"]
     );
     assert_eq!(
         columns(&conn, "registrations"),

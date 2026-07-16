@@ -352,12 +352,25 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&runtime, async move {
-            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
-            address_tx.send(listener.local_addr().unwrap()).unwrap();
-            let mut connections = Vec::new();
-            for _ in 0..3 {
-                connections.push(listener.accept_one().await.unwrap());
-            }
+            let listener = StagedListener::bind(root.clone(), "127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            address_tx.send(address).unwrap();
+            let first = listener.accept_one().await.unwrap();
+            let second = listener.accept_one().await.unwrap();
+            drop(listener);
+
+            let failed_listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let (failed, _) = failed_listener.accept().await.unwrap();
+            drop(failed);
+            drop(failed_listener);
+
+            let listener = StagedListener::bind(root, &address.to_string())
+                .await
+                .unwrap();
+            let third = listener.accept_one().await.unwrap();
+            let connections = [first, second, third];
             for connection in connections {
                 connection.await.unwrap().unwrap();
             }
@@ -381,9 +394,22 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
         }
     )));
     io.bind_target(target);
-    assert!(poll_until(&mut io, 1)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut reconnect_events = Vec::new();
+    while !reconnect_events
         .iter()
-        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+        .any(|event| matches!(event, IoEvent::TargetBound { .. }))
+    {
+        reconnect_events.extend(io.poll());
+        assert!(
+            Instant::now() < deadline,
+            "RpcIO did not retry its failed target bind: {reconnect_events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(reconnect_events
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetRejected { .. })));
 
     server
         .commit(Commit {

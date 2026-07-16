@@ -1,13 +1,13 @@
 //! Closed decoder for format-owned `MigrationV1` authoring controls.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use distill_build::trace::{MigrationControlKind, MigrationControlValue};
 use distill_bundle::{AssetEntry, Bundle, LineageStamp};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
-use distill_core::lineage::AcceptedSchemaEpoch;
+use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch};
 use distill_json::AuthoredValue;
-use distill_migrate::{FieldPath, MigrationOp};
+use distill_migrate::{validate_plan, EdgeKind, FieldPath, MigrationOp};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MigrationHeader {
@@ -20,6 +20,7 @@ pub(crate) struct MigrationHeader {
 pub(crate) enum MigrationDecodeError {
     Malformed(String),
     SchemaClosure(String),
+    Invalid(String),
 }
 
 impl std::fmt::Display for MigrationDecodeError {
@@ -29,6 +30,7 @@ impl std::fmt::Display for MigrationDecodeError {
             Self::SchemaClosure(detail) => {
                 write!(formatter, "Migration schema closure is invalid: {detail}")
             }
+            Self::Invalid(detail) => write!(formatter, "Migration control is invalid: {detail}"),
         }
     }
 }
@@ -99,6 +101,101 @@ pub(crate) fn decode(
         to_lineage: decode_lineage(&fields["to_lineage"], "to_lineage")?,
         kind: decode_kind(&fields["kind"])?,
     })
+}
+
+/// Fully decode and validate one authored custom edge before it can
+/// participate in an authority-changing rollback/reactivation proof.
+pub(crate) fn validate_transition_edge(
+    asset: AssetUuid,
+    bundle: &Bundle,
+    entry: &AssetEntry,
+    header: MigrationHeader,
+    accepted: &LineageStamp,
+    migration_function_keys: &BTreeSet<String>,
+) -> Result<(), MigrationDecodeError> {
+    if !entry.authoring_only {
+        return Err(MigrationDecodeError::Invalid(
+            "Migration control is not authoring-only".to_owned(),
+        ));
+    }
+    let value = decode(asset, bundle, entry, header)?;
+    validate_lineage(&value, accepted)?;
+    validate_transition_value(asset, &value, migration_function_keys)
+}
+
+fn validate_transition_value(
+    asset: AssetUuid,
+    value: &MigrationControlValue,
+    migration_function_keys: &BTreeSet<String>,
+) -> Result<(), MigrationDecodeError> {
+    match &value.kind {
+        MigrationControlKind::Ops(ops) => {
+            validate_plan(
+                ops,
+                &value.from_schema.root,
+                &value.to_schema.root,
+                EdgeKind::Custom,
+            )
+            .map_err(|errors| {
+                MigrationDecodeError::Invalid(format!(
+                    "custom migration plan for asset {asset} is not total and disjoint: {errors:?}"
+                ))
+            })?;
+        }
+        MigrationControlKind::Function { key } => {
+            if !migration_function_keys.contains(key) {
+                return Err(MigrationDecodeError::Invalid(format!(
+                    "Migration function `{key}` for asset {asset} is not registered by the pending pipeline candidate"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_lineage(
+    value: &MigrationControlValue,
+    accepted: &LineageStamp,
+) -> Result<(), MigrationDecodeError> {
+    if value.from_hash == value.to_hash {
+        return Err(MigrationDecodeError::Invalid(
+            "Migration edge endpoints must differ".to_owned(),
+        ));
+    }
+    validate_endpoint_stamp(
+        value.target_type_uuid,
+        value.from_hash,
+        &value.from_lineage,
+        accepted,
+        "from",
+    )?;
+    validate_endpoint_stamp(
+        value.target_type_uuid,
+        value.to_hash,
+        &value.to_lineage,
+        accepted,
+        "to",
+    )
+}
+
+fn validate_endpoint_stamp(
+    type_uuid: TypeUuid,
+    hash: LogicalHash,
+    stamp: &LineageStamp,
+    accepted: &LineageStamp,
+    endpoint: &str,
+) -> Result<(), MigrationDecodeError> {
+    if stamp.epochs.is_empty()
+        || stamp.epochs.len() > accepted.epochs.len()
+        || stamp.epochs != accepted.epochs[..stamp.epochs.len()]
+        || stamp.selected_digest() != Some(hash)
+        || stamp.chain != lineage_chain_digest(type_uuid, &stamp.epochs, stamp.cursor)
+    {
+        return Err(MigrationDecodeError::Invalid(format!(
+            "Migration {endpoint} lineage is not a verified accepted prefix"
+        )));
+    }
+    Ok(())
 }
 
 fn decode_lineage(
@@ -386,4 +483,73 @@ fn malformed<T>(detail: impl Into<String>) -> Result<T, MigrationDecodeError> {
 
 fn malformed_error(detail: impl Into<String>) -> MigrationDecodeError {
     MigrationDecodeError::Malformed(detail.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
+
+    fn stamp(type_uuid: TypeUuid, epochs: Vec<AcceptedSchemaEpoch>, cursor: u32) -> LineageStamp {
+        LineageStamp {
+            chain: lineage_chain_digest(type_uuid, &epochs, cursor),
+            epochs,
+            cursor,
+        }
+    }
+
+    fn transition(kind: MigrationControlKind) -> (MigrationControlValue, LineageStamp) {
+        let target_type_uuid = TypeUuid([7; 16]);
+        let from_hash = LogicalHash([1; 32]);
+        let to_hash = LogicalHash([2; 32]);
+        let from_epoch = AcceptedSchemaEpoch {
+            digest: from_hash,
+            forward_parent: None,
+        };
+        let to_epoch = AcceptedSchemaEpoch {
+            digest: to_hash,
+            forward_parent: Some(0),
+        };
+        let accepted_epochs = vec![from_epoch, to_epoch];
+        let accepted = stamp(target_type_uuid, accepted_epochs.clone(), 1);
+        (
+            MigrationControlValue {
+                asset: AssetUuid([3; 16]),
+                target_type_uuid,
+                from_hash,
+                to_hash,
+                from_schema: LogicalSchema {
+                    root: SchemaNode::Primitive(PrimitiveKind::U8),
+                },
+                to_schema: LogicalSchema {
+                    root: SchemaNode::Primitive(PrimitiveKind::U16),
+                },
+                from_lineage: stamp(target_type_uuid, vec![from_epoch], 0),
+                to_lineage: stamp(target_type_uuid, accepted_epochs, 1),
+                kind,
+            },
+            accepted,
+        )
+    }
+
+    #[test]
+    fn authority_transition_rejects_non_total_ops_and_missing_functions() {
+        let (ops, accepted) = transition(MigrationControlKind::Ops(Vec::new()));
+        validate_lineage(&ops, &accepted).unwrap();
+        assert!(matches!(
+            validate_transition_value(ops.asset, &ops, &BTreeSet::new()),
+            Err(MigrationDecodeError::Invalid(_))
+        ));
+
+        let (function, accepted) = transition(MigrationControlKind::Function {
+            key: "migrate_u8_to_u16".to_owned(),
+        });
+        validate_lineage(&function, &accepted).unwrap();
+        assert!(matches!(
+            validate_transition_value(function.asset, &function, &BTreeSet::new()),
+            Err(MigrationDecodeError::Invalid(_))
+        ));
+        let registered = BTreeSet::from(["migrate_u8_to_u16".to_owned()]);
+        validate_transition_value(function.asset, &function, &registered).unwrap();
+    }
 }

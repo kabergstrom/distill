@@ -169,6 +169,17 @@ pub struct SchemaAcceptanceRequired {
     pub mismatches: Vec<SchemaRegistryMismatch>,
 }
 
+/// A published input version contains bytes that require explicitly retired
+/// schema authority. The sorted references are the waiting projection that an
+/// explicit reactivation may admit atomically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredTypeReferenced {
+    pub manifest_hash: ContentHash,
+    pub basis: SnapshotStamp,
+    pub type_uuid: TypeUuid,
+    pub references: Vec<crate::error::RetiredTypeReference>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum PipelinePoisonCode {
@@ -1919,6 +1930,10 @@ pub enum PipelineState {
         required: SchemaAcceptanceRequired,
         last_good: Option<Arc<PipelineEpoch>>,
     },
+    RetiredTypeReferenced {
+        error: RetiredTypeReferenced,
+        last_good: Option<Arc<PipelineEpoch>>,
+    },
     Poisoned {
         error: PipelinePoison,
         last_good: Option<Arc<PipelineEpoch>>,
@@ -1932,6 +1947,7 @@ pub enum PipelineState {
 pub enum PipelineUnavailable<'a> {
     Poisoned(&'a PipelinePoison),
     SchemaAcceptanceRequired(&'a SchemaAcceptanceRequired),
+    RetiredTypeReferenced(&'a RetiredTypeReferenced),
 }
 
 impl fmt::Display for PipelineUnavailable<'_> {
@@ -1944,6 +1960,12 @@ impl fmt::Display for PipelineUnavailable<'_> {
                 required.candidate.dylib_hash,
                 required.manifest.manifest_hash,
                 required.mismatches.len()
+            ),
+            PipelineUnavailable::RetiredTypeReferenced(error) => write!(
+                f,
+                "retired type {} is referenced by {} waiting input(s)",
+                error.type_uuid,
+                error.references.len()
             ),
         }
     }
@@ -1959,6 +1981,9 @@ impl PipelineState {
             PipelineState::Ready(epoch) => Ok(epoch),
             PipelineState::SchemaAcceptanceRequired { required, .. } => {
                 Err(PipelineUnavailable::SchemaAcceptanceRequired(required))
+            }
+            PipelineState::RetiredTypeReferenced { error, .. } => {
+                Err(PipelineUnavailable::RetiredTypeReferenced(error))
             }
             PipelineState::Poisoned { error, .. } => Err(PipelineUnavailable::Poisoned(error)),
         }
