@@ -517,6 +517,140 @@ fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
 }
 
 #[test]
+fn storage_repopulation_refetches_unchanged_content_with_stable_handle() {
+    let token = ModuleEpochToken::new(60);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 60, &token);
+    let asset_uuid = uuid(60);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let handle_id = handle.id();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (hash, first_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, first_artifact);
+    loader.process(&mut storage).unwrap();
+    let first_adoption = storage.commits[0].1;
+    let fetches_before = loader
+        .io()
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::Fetch(..)))
+        .count();
+
+    loader.begin_storage_repopulation(&mut storage);
+    assert_eq!(handle.id(), handle_id);
+    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+    assert!(storage.values.is_empty());
+    assert_eq!(
+        loader.manifest_entry(asset_uuid).unwrap().state,
+        ManifestState::Current { content_hash: hash }
+    );
+
+    loader.process(&mut storage).unwrap();
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Fetch(..)))
+            .count(),
+        fetches_before + 1,
+        "empty storage must bypass the unchanged-content fetch cutoff"
+    );
+    let (replayed_hash, replayed_artifact) = artifact::<A>(asset_uuid, &[]);
+    assert_eq!(replayed_hash, hash);
+    fetched(&mut loader, replayed_hash, replayed_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 2);
+    assert!(storage.commits[1].1 > first_adoption);
+    assert_eq!(storage.values.len(), 1);
+}
+
+#[test]
+fn repeated_storage_repopulation_abandons_old_device_pending_uploads() {
+    let token = ModuleEpochToken::new(61);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 61, &token);
+    let asset_uuid = uuid(61);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let (hash, first_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, first_artifact);
+    loader.process(&mut storage).unwrap();
+
+    loader.begin_storage_repopulation(&mut storage);
+    storage.pending_handles.insert(handle.id());
+    loader.process(&mut storage).unwrap();
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    let (_, replayed_artifact) = artifact::<A>(asset_uuid, &[]);
+    fetched(&mut loader, hash, replayed_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.tokens.len(), 1);
+    assert_eq!(storage.values.len(), 1);
+    assert_eq!(storage.commits.len(), 1);
+
+    loader.begin_storage_repopulation(&mut storage);
+    assert!(storage.tokens.is_empty());
+    assert!(storage.values.is_empty());
+    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+}
+
+#[test]
+fn storage_repopulation_requeues_a_first_load_abandoned_while_pending() {
+    let token = ModuleEpochToken::new(62);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 62, &token);
+    let asset_uuid = uuid(62);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    storage.pending_handles.insert(handle.id());
+    loader.process(&mut storage).unwrap();
+
+    let (hash, first_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, first_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(storage.tokens.len(), 1);
+    assert!(storage.commits.is_empty());
+    let resolves_before = loader
+        .io()
+        .commands
+        .iter()
+        .filter(|command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == asset_uuid))
+        .count();
+
+    loader.begin_storage_repopulation(&mut storage);
+    assert!(storage.tokens.is_empty());
+    assert!(storage.values.is_empty());
+    assert_eq!(loader.status(&handle), LoadStatus::Unloaded);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(
+                |command| matches!(command, Command::Resolve(_, uuid, _) if *uuid == asset_uuid)
+            )
+            .count(),
+        resolves_before + 1
+    );
+}
+
+#[test]
 fn unchanged_delta_cuts_off_before_fetch_and_does_not_sweep_unrelated_assets() {
     let token = ModuleEpochToken::new(2);
     let mut loader = Loader::new(mock_io());

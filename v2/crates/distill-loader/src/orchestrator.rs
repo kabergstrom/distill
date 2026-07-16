@@ -167,7 +167,7 @@ impl Binding {
 struct CurrentValue {
     type_uuid: TypeUuid,
     load_deps: Vec<AssetUuid>,
-    adoption: AdoptionId,
+    adoption: Option<AdoptionId>,
     epoch: GameModuleEpoch,
 }
 
@@ -608,6 +608,68 @@ impl<I: LoaderIO> Loader<I> {
         Ok(())
     }
 
+    /// Reset engine-local storage residency without changing handle or
+    /// manifest identity. Any old-device uploads are abandoned, committed
+    /// adoptions are freed, and every previously materialized dependency
+    /// component is forced through resolve/fetch/adoption again.
+    pub fn begin_storage_repopulation(&mut self, storage: &mut dyn AssetStorage) {
+        let pending = std::mem::take(&mut self.pending);
+        let pending_members = pending
+            .iter()
+            .flat_map(|component| component.members.iter().copied())
+            .collect::<BTreeSet<_>>();
+        for pending in pending {
+            self.rollback_updates(storage, pending.adoption, &pending.updates);
+        }
+        self.dirty.extend(pending_members);
+        if let Some(sweep) = &self.sweep {
+            self.dirty_paths.extend(sweep.pending_paths.iter().cloned());
+        }
+        self.restart_sweep();
+
+        let materialized = self
+            .slots
+            .values()
+            .filter(|slot| slot.current.is_some())
+            .filter_map(|slot| slot.binding.uuid())
+            .collect::<BTreeSet<_>>();
+        self.dirty
+            .extend(self.current_components_from(&materialized));
+
+        let committed = self
+            .slots
+            .iter()
+            .filter_map(|(handle, slot)| {
+                let current = slot.current.as_ref()?;
+                Some((*handle, current.type_uuid, current.adoption?, current.epoch))
+            })
+            .collect::<Vec<_>>();
+        for (handle, type_uuid, adoption, epoch) in committed {
+            let stored = StoredAdoption {
+                type_uuid,
+                handle,
+                adoption,
+            };
+            match storage.free(type_uuid, handle, adoption) {
+                Ok(()) => {
+                    let _ = self.epochs.release_adoption(epoch, stored);
+                    if let Some(current) = self
+                        .slots
+                        .get_mut(&handle)
+                        .and_then(|slot| slot.current.as_mut())
+                        .filter(|current| current.adoption == Some(adoption))
+                    {
+                        current.adoption = None;
+                    }
+                }
+                Err(_) => self.poison_epoch(epoch),
+            }
+        }
+        for slot in self.slots.values_mut() {
+            slot.status = LoadStatus::Unloaded;
+        }
+    }
+
     pub fn begin_module_drain(&mut self, epoch: GameModuleEpoch) -> Result<(), LoaderError> {
         self.epochs
             .begin_module_drain(epoch)
@@ -820,16 +882,18 @@ impl<I: LoaderIO> Loader<I> {
                     }
                 }
                 if let Some(current) = slot.current {
-                    let stored = StoredAdoption {
-                        type_uuid: current.type_uuid,
-                        handle: id,
-                        adoption: current.adoption,
-                    };
-                    match storage.free(current.type_uuid, id, current.adoption) {
-                        Ok(()) => {
-                            let _ = self.epochs.release_adoption(current.epoch, stored);
+                    if let Some(adoption) = current.adoption {
+                        let stored = StoredAdoption {
+                            type_uuid: current.type_uuid,
+                            handle: id,
+                            adoption,
+                        };
+                        match storage.free(current.type_uuid, id, adoption) {
+                            Ok(()) => {
+                                let _ = self.epochs.release_adoption(current.epoch, stored);
+                            }
+                            Err(_) => self.poison_epoch(current.epoch),
                         }
-                        Err(_) => self.poison_epoch(current.epoch),
                     }
                 }
                 self.direct_slots.retain(|_, value| *value != id);
@@ -2226,23 +2290,25 @@ impl<I: LoaderIO> Loader<I> {
                 .get_mut(&update.handle)
                 .and_then(|slot| slot.current.take());
             if let Some(old) = old {
-                let stored = StoredAdoption {
-                    type_uuid: old.type_uuid,
-                    handle: update.handle,
-                    adoption: old.adoption,
-                };
-                match storage.free(old.type_uuid, update.handle, old.adoption) {
-                    Ok(()) => {
-                        let _ = self.epochs.release_adoption(old.epoch, stored);
+                if let Some(old_adoption) = old.adoption {
+                    let stored = StoredAdoption {
+                        type_uuid: old.type_uuid,
+                        handle: update.handle,
+                        adoption: old_adoption,
+                    };
+                    match storage.free(old.type_uuid, update.handle, old_adoption) {
+                        Ok(()) => {
+                            let _ = self.epochs.release_adoption(old.epoch, stored);
+                        }
+                        Err(_) => self.poison_epoch(old.epoch),
                     }
-                    Err(_) => self.poison_epoch(old.epoch),
                 }
             }
             if let Some(slot) = self.slots.get_mut(&update.handle) {
                 slot.current = Some(CurrentValue {
                     type_uuid: update.type_uuid,
                     load_deps: update.load_deps,
-                    adoption,
+                    adoption: Some(adoption),
                     epoch: update.owner_epoch,
                 });
                 slot.status = if update.dead {
@@ -2308,7 +2374,11 @@ impl<I: LoaderIO> Loader<I> {
         for uuid in members {
             for handle in self.handles_for_uuid(*uuid) {
                 if let Some(slot) = self.slots.get_mut(&handle) {
-                    slot.status = if slot.current.is_some() {
+                    slot.status = if slot
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| current.adoption.is_some())
+                    {
                         LoadStatus::Loaded
                     } else {
                         LoadStatus::Unloaded
@@ -2399,6 +2469,9 @@ impl<I: LoaderIO> Loader<I> {
         let mut load_deps = BTreeSet::new();
         for handle in handles {
             let current = self.slots.get(&handle)?.current.as_ref()?;
+            if current.adoption.is_none() || !self.epochs.can_issue_work(current.epoch) {
+                return None;
+            }
             if type_uuid.is_some_and(|observed| observed != current.type_uuid) {
                 return None;
             }
