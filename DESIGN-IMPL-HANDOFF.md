@@ -9,9 +9,10 @@ git history is the authority for landed milestones._
 
 The Distill v2 implementation is present under `v2/` as a sixteen-package Rust
 workspace, including its two real dynamic-module test fixtures. The current
-implementation milestone is commit `47dd429` (`Add loader storage
-repopulation`). The corresponding New Game Plus Vulkan integration milestone is
-`80918c1` (`Validate Distill GPU asset residency`). At those commits:
+implementation milestone is commit `70048f0` (`Finalize GPU recovery and
+source-walk restarts`). The corresponding New Game Plus Vulkan integration
+milestone is `b636c66` (`Complete Vulkan asset runtime integration`), using
+Rafx `8bdc2cc1` (`Report post-submit presentation failures`). At those commits:
 
 - `cargo test --workspace --offline` passes, including integration, UI, and doc
   tests.
@@ -134,6 +135,7 @@ Relevant New Game Plus milestones, oldest to newest:
 - `a461bf8 Move development build supervision out of engine`
 - `c98ccd3 Integrate Distill GPU asset runtime`
 - `80918c1 Validate Distill GPU asset residency`
+- `b636c66 Complete Vulkan asset runtime integration`
 
 `ngp-schema` rejects duplicate canonical keys in either merge input. Its full
 offline test suite and `--no-deps` Clippy pass. Full dependency Clippy currently
@@ -453,6 +455,8 @@ The final implementation sequence on the Distill repository is:
 - `6829bb6 Specify daemon build supervision and GPU repopulation`
 - `8715603 Add distilld development supervisor`
 - `47dd429 Add loader storage repopulation`
+- `d35c948 Cook and load real game asset terminals`
+- `70048f0 Finalize GPU recovery and source-walk restarts`
 
 Earlier watcher milestones include:
 
