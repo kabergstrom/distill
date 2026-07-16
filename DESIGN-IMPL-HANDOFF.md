@@ -118,6 +118,29 @@ offline test suite and `--no-deps` Clippy pass. Full dependency Clippy currently
 encounters an unrelated pre-existing lint in `ngp-source-hash`; that is outside
 this Distill milestone.
 
+### Post-closure New Game Plus integration amendment
+
+The specification now assigns authoring build-process ownership to an optional
+outer `distilld dev` supervisor. It supervises the existing `source-walk` watch
+process and Cargo watch build for pipeline/gameplay artifacts; `source-walk`
+still owns incremental workspace observation, the serving daemon still stages
+only completed schema/pipeline artifacts, and New Game Plus still owns
+gameplay-module load/migration/commit. This avoids a bootstrap dependency on
+pipeline code and does not add a daemon Cargo-workspace crawler.
+
+The New Game Plus storage integration now treats device loss as engine-local
+storage repopulation. Stable resource keys and loader handles survive, but
+storage does not retain a second full CPU copy: a forced loader sweep refetches
+unchanged artifacts from RPC/CAS or the mounted pack, reconstructs and uploads
+them transiently, and commits fresh storage adoptions while stale transfer
+completions are device-generation fenced.
+
+These are the next integration milestone, not code present at the closure
+commits listed below. The core daemon, RPC, loader, pack, watcher, and fixture
+verticals remain complete; the standalone `distilld` development supervisor,
+loader storage-repopulation entry point, and production New Game Plus
+`AssetStorage` adapter are not yet implemented.
+
 ## 4. Workspace map and implemented behavior
 
 | Package | Implemented responsibility |

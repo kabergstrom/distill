@@ -202,10 +202,49 @@ any edit that raced publication.
 
 | Process | Role | Lifetime |
 |---------|------|----------|
-| **Daemon** | Watches the asset tree, imports, cooks, migrates, serves. Loads the pipeline cdylib. | Long-lived, survives game rebuilds |
+| **Daemon** | Watches the asset tree, imports, cooks, migrates, serves, and loads the pipeline cdylib. In authoring `dev` mode its outer supervisor also owns schema/module build-process lifetimes. | Long-lived, survives game rebuilds |
 | **Game** | Loads assets via RPC (dev) or packfile (release). | Rebuilt frequently |
 | **Editor** | Schema-driven UI; talks to daemon via RPC. | Independent |
-| **source-walk** | Extracts schemas from the asset-types crate via Rust Analyzer. | Runs during build |
+| **source-walk** | Extracts schemas from the asset-types crate via Rust Analyzer and owns incremental workspace-source observation. | Supervised by `distilld dev` during authoring builds |
+
+### Development build supervision
+
+`distilld` has a production `serve` mode, which consumes already-produced
+artifacts, and an optional authoring `dev` mode. `dev` contains a small outer
+supervisor that exists before the asset daemon opens a pipeline epoch. It
+starts and supervises exactly the project's `source-walk` watch process and
+Cargo watch build for the configured pipeline and gameplay-module packages,
+including process-group teardown, bounded crash-loop backoff, and diagnostic
+forwarding. It is pipeline-independent control-plane code: running Cargo or
+`source-walk` never requires a loaded pipeline module.
+
+On a clean checkout with no artifacts, the supervisor starts both producers
+and waits for the first readable schema and pipeline cdylib before starting
+the serving daemon. With prior artifacts it may start the serving daemon
+immediately while producers catch up. Thereafter the daemon's existing exact
+artifact watches and candidate gate are authoritative: a transient
+schema/module source-identity mismatch rejects only that candidate and keeps
+the prior epoch pinned. Build failure is a supervisor diagnostic, not an input
+version or pipeline poison by itself; only an observed output-artifact change
+enters candidate staging.
+
+This moves **process ownership**, not source analysis, into Distill.
+`source-walk` still owns the source-directory/VFS watch and the exact source
+snapshot it hashes; Cargo watch still owns Rust build invalidation. A Cargo
+manifest/feature-graph change makes `source-walk` request restart so the
+supervisor can reconstruct its Rust Analyzer workspace. The daemon does not
+crawl or hash the Cargo workspace and does not add a second source-staleness
+model. The gameplay cdylib is a supervised build output only: the game engine,
+not the daemon, stages, migrates, and commits that module because its live
+state and callbacks are engine-owned.
+
+The supervisor launch description (workspace root, source-walk launcher and
+arguments, Cargo launcher, pipeline/gameplay packages, target directory, and
+profile) is startup-only launcher configuration, separate from the watched
+§18 daemon TOML. Changing it restarts the supervisor and has no direct content
+identity; the resulting schema and module bytes already enter the ordinary
+input-version and module-epoch paths. This is deliberately not a generic task
+runner or a pipeline tool registration surface.
 
 ### Modules
 
@@ -849,6 +888,12 @@ triple, rustc identity, and source-walk extraction/layout algorithm version.
 It is not exported by the pipeline module and does not claim to enumerate the
 sources, features, cfgs, manifests, lock nodes, build-script inputs, or other
 causes that produced the layout.
+
+In authoring mode §3's daemon-resident development supervisor owns the
+`source-walk` and Cargo child-process lifetimes. That does not change this
+input boundary: workspace source paths are inputs to those producer processes,
+not daemon asset inputs; only their atomically published schema/module
+artifacts are admitted by the daemon watcher and candidate gate.
 
 Agreement is checked at the boundary that consumes it. An opened but
 unpublished pipeline module exports the same New Game Plus source identity
@@ -6178,10 +6223,11 @@ impl Loader {
                           descriptors: &[&'static AssetRuntimeDescriptor])
         -> Result<(), RegistrationError>;
     /// The unload barrier. After this call the loader issues no new loads
-    /// for the epoch's types; each `process()` sweep frees every
-    /// constructed value of those types through `AssetStorage::free`
-    /// (running the module's drop thunks while its code is still resident),
-    /// frees every placeholder value the epoch's thunks minted the
+    /// for the epoch's types; each `process()` sweep frees every storage
+    /// adoption of those types through `AssetStorage::free`, which destroys
+    /// any constructed value or transient staging state still retained
+    /// (running module drop thunks while its code is still resident), frees
+    /// every placeholder value the epoch's thunks minted the
     /// same way and forgets the thunks themselves,
     /// drops the epoch's compiled fixup plans, fails its in-flight
     /// fetches, and finally forgets its descriptors. Handles go `Dead`
@@ -6227,6 +6273,18 @@ impl Loader {
     /// Once per frame on the engine thread: drain IoEvents, advance handle
     /// state machines, run the adoption sweep, commit the swap batch.
     pub fn process(&mut self, storage: &mut dyn AssetStorage);
+    /// Engine-local residency loss (for example GPU device loss), not a daemon
+    /// or content-version event. Cancels/frees every staged and committed
+    /// storage adoption while retaining handles, subscriptions, manifest
+    /// content identities, and dependency graphs; cancellation of those old
+    /// pending tokens is initiated and consumed by this reset path, so it does
+    /// not freeze the component as an ordinary failed upload would. The loader
+    /// then marks every live
+    /// component for a forced fetch/construct/adopt sweep. The forced sweep
+    /// bypasses the unchanged-content cutoff, because identical artifact bytes
+    /// must be delivered again to repopulate empty storage.
+    pub fn begin_storage_repopulation(&mut self,
+                                      storage: &mut dyn AssetStorage);
 }
 
 /// Generated by the module-side `placeholder!` macro — not
@@ -6252,7 +6310,7 @@ pub enum LoadStatus { Unloaded, Resolving, LoadingDeps, Fetching, Loaded, Dead }
 pub trait AssetStorage {
     /// Two-phase (GPU gating, Plumbing above): update delivers the
     /// constructed value; commit makes `adoption` visible at the swap
-    /// boundary; free drops it. Adoption identity is the loader-minted
+    /// boundary; free retires that storage adoption. Adoption identity is the loader-minted
     /// `AdoptionId` end to end — never a daemon version, which is
     /// instance-local (§13) and absent for packs (§16), so distinct
     /// adoptions can never alias, even across daemon-state loss, a
@@ -6264,6 +6322,15 @@ pub trait AssetStorage {
     /// EVERY member reports Ready, so one Pending member defers the
     /// whole component's swap — the atomic-per-component rule,
     /// unchanged, extended through asynchronous uploads.
+    /// Storage need not retain a CPU copy for the adoption's full lifetime.
+    /// After it has extracted an engine-owned resource or its transfer queue
+    /// owns the required staging bytes, it may destroy `value` immediately
+    /// through the value's status thunk; a Pending update may do so before
+    /// `poll` first returns Ready. `free` then destroys the engine-owned
+    /// adoption and any transient value/staging state that still remains.
+    /// No module pointer, callback, or automatic-drop value may be hidden in
+    /// the engine-owned remainder after the status thunk succeeds.
+    ///
     /// `value` is CONSUMED on entry on both Ok and Err. On Err storage
     /// must retain no module-backed state from it — including upload
     /// callbacks or a hidden pending value — and must destroy or
@@ -6283,9 +6350,10 @@ pub trait AssetStorage {
     fn commit(&mut self, type_uuid: TypeUuid, handle: HandleId, adoption: AdoptionId);
     /// Freeing an adoption with an outstanding token cancels the token:
     /// the engine abandons the upload, and a later poll of a cancelled
-    /// token is Failed, never a phantom Ready. Destruction goes through
-    /// the stored value's status thunk (§4's ErasedValue — never
-    /// automatic Rust drop): a drop failure reports, leaks the value,
+    /// token is Failed, never a phantom Ready. Any still-retained value is
+    /// destroyed through its status thunk (§4's
+    /// ErasedValue — never automatic Rust drop): a drop failure reports,
+    /// leaks the value,
     /// and poisons the owning module epoch, so `drain_complete` never
     /// reports true and the host leaks the module (§3's failed-unload
     /// rule) rather than dlclosing corrupt state.
@@ -6308,7 +6376,36 @@ over its slotmap resources; GPU upload continues through the existing transfer
 queue. Asset hot-reload composes with module hot-reload — both are downstream
 of the same schema system, so a schema change flows: source-walk → daemon
 migrates bundles → rebuild → loader event → engine swaps data, while the
-engine separately hot-reloads the module.
+engine separately stages, migrates, and commits the gameplay module. In
+authoring mode `distilld dev` may supervise compilation of both cdylibs, but
+compilation ownership does not move gameplay-module loading into the daemon.
+
+GPU device loss is a **storage-residency reset, not an asset-content change**.
+New Game Plus first fences rendering and releases every reference to the dead
+device while preserving its stable slotmap resource keys. It then recreates
+the device and empty resource slots and calls
+`Loader::begin_storage_repopulation`. That call abandons old-device pending
+uploads, frees the dead committed storage adoptions, and forces every live
+load-dependency component through fetch, construction, upload gating, and
+atomic adoption even when its manifest `ContentHash` is unchanged. `HandleId`
+and the engine resource key remain stable, while each newly materialized
+storage instance receives a fresh `AdoptionId`; adoption identity names an
+owned storage instance, not asset content.
+
+Repopulation reads authoritative artifact bytes again from RpcIO/CAS in dev or
+the mounted pack in release. Constructed CPU values and decompressed/staging
+bytes are transient: `AssetStorage::update` transfers what the GPU upload needs
+and destroys the `ErasedValue` as soon as the transfer owns or has consumed
+those bytes. The steady state therefore retains no second full CPU asset copy
+solely for device recovery. A transfer completion is privately fenced by the
+engine's device generation, so a late completion from the dead device is
+discarded. Rendering may remain behind a global recovery barrier or use the
+existing dummy/placeholder resources until the forced component adoptions
+commit; it must never treat a recreated-but-empty allocation as resident.
+If RpcIO is temporarily unavailable, ordinary reconnect/backoff leaves the
+handles nonresident until refetch succeeds; a mounted shipping pack can replay
+locally. External/imported GPU objects that are not Distill assets remain their
+owning subsystem's responsibility and are re-imported after device creation.
 
 ## 16. Packfile Format
 
@@ -6768,8 +6865,9 @@ schema_path = "target/asset-schema.json"
 lineage_manifest = { root = "main", path = "schema/schema-lineage.bundle" }
 
 [modules]
-# Rebuilt by the project's dev-process supervisor (as newgameplus already
-# does for game modules); the daemon watches the artifact, swaps by epoch (§3).
+# Rebuilt by `distilld dev`'s optional development supervisor; the serving
+# daemon watches the completed artifact and swaps it by epoch (§3). Production
+# `distilld serve` consumes an artifact produced by the project build/CI.
 pipeline_dylib = "target/debug/libgame_pipeline.dylib"
 
 [targets]
@@ -7533,8 +7631,12 @@ put production image codecs, mesh optimization, or shader compilers in core.
   invariant — the daemon only ever deletes bytes it authored; anything
   unverified is preserved as a named conflict file; creation publishes
   by atomic no-replace linkage with the same conflict discipline.
-- **Dylib orchestration** (§18): the project's dev-process supervisor
-  builds; the daemon swaps by epoch.
+- **Dylib orchestration** (§§3, 18): `distilld dev`'s optional outer supervisor
+  owns `source-walk` and Cargo child-process lifetimes and may build both the
+  pipeline and gameplay cdylibs. The serving daemon swaps only the pipeline
+  module by epoch; the engine stages/migrates/commits the gameplay module.
+  `source-walk` and Cargo retain workspace invalidation ownership, so this adds
+  no daemon Cargo crawl or second freshness model.
 - **Pack path table** (§16): `include_path_table`, default off.
 - **Declared surface** (§3–§18): every structure and API named in this
   document carries a normative declaration — the module table,
