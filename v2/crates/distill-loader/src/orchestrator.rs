@@ -370,6 +370,8 @@ pub struct Loader<I: LoaderIO> {
     slots: BTreeMap<HandleId, Slot>,
     direct_slots: BTreeMap<(AssetUuid, TypeUuid), HandleId>,
     path_slots: BTreeMap<(String, TypeUuid), HandleId>,
+    asset_subscription_owners: BTreeMap<AssetUuid, usize>,
+    path_subscription_owners: BTreeMap<String, usize>,
     manifest: BTreeMap<AssetUuid, ManifestEntry>,
     dirty: BTreeSet<AssetUuid>,
     dirty_paths: BTreeSet<String>,
@@ -394,6 +396,8 @@ impl<I: LoaderIO> Loader<I> {
             slots: BTreeMap::new(),
             direct_slots: BTreeMap::new(),
             path_slots: BTreeMap::new(),
+            asset_subscription_owners: BTreeMap::new(),
+            path_subscription_owners: BTreeMap::new(),
             manifest: BTreeMap::new(),
             dirty: BTreeSet::new(),
             dirty_paths: BTreeSet::new(),
@@ -775,7 +779,7 @@ impl<I: LoaderIO> Loader<I> {
             slot.status = LoadStatus::Unloaded;
         }
         for uuid in unsubscribe {
-            self.io.unsubscribe(uuid);
+            self.release_asset_subscription(uuid);
         }
         for uuid in detached.iter().copied().collect::<Vec<_>>() {
             if self.handles_for_uuid(uuid).is_empty() {
@@ -795,11 +799,11 @@ impl<I: LoaderIO> Loader<I> {
         for id in released {
             if let Some(slot) = self.slots.remove(&id) {
                 if let Some(uuid) = slot.subscribed_uuid {
-                    self.io.unsubscribe(uuid);
+                    self.release_asset_subscription(uuid);
                 }
                 if slot.path_subscribed {
                     if let Binding::Indirect { path, .. } = &slot.binding {
-                        self.io.unsubscribe_path(path);
+                        self.release_path_subscription(path);
                     }
                 }
                 if let Some(current) = slot.current {
@@ -818,6 +822,49 @@ impl<I: LoaderIO> Loader<I> {
                 self.direct_slots.retain(|_, value| *value != id);
                 self.path_slots.retain(|_, value| *value != id);
             }
+        }
+    }
+
+    fn retain_asset_subscription(&mut self, uuid: AssetUuid) {
+        let owners = self.asset_subscription_owners.entry(uuid).or_default();
+        if *owners == 0 {
+            self.io.subscribe(uuid);
+        }
+        *owners += 1;
+    }
+
+    fn release_asset_subscription(&mut self, uuid: AssetUuid) {
+        let Some(owners) = self.asset_subscription_owners.get_mut(&uuid) else {
+            debug_assert!(false, "asset subscription owner underflow");
+            return;
+        };
+        *owners -= 1;
+        if *owners == 0 {
+            self.asset_subscription_owners.remove(&uuid);
+            self.io.unsubscribe(uuid);
+        }
+    }
+
+    fn retain_path_subscription(&mut self, path: &str) {
+        let owners = self
+            .path_subscription_owners
+            .entry(path.to_owned())
+            .or_default();
+        if *owners == 0 {
+            self.io.subscribe_path(path);
+        }
+        *owners += 1;
+    }
+
+    fn release_path_subscription(&mut self, path: &str) {
+        let Some(owners) = self.path_subscription_owners.get_mut(path) else {
+            debug_assert!(false, "path subscription owner underflow");
+            return;
+        };
+        *owners -= 1;
+        if *owners == 0 {
+            self.path_subscription_owners.remove(path);
+            self.io.unsubscribe_path(path);
         }
     }
 
@@ -899,22 +946,30 @@ impl<I: LoaderIO> Loader<I> {
                 candidate.resolve_issued = true;
             }
             for handle in self.handles_for_uuid(uuid) {
+                let mut subscribe = false;
                 if let Some(slot) = self.slots.get_mut(&handle) {
                     slot.status = LoadStatus::Resolving;
                     if slot.subscribed_uuid != Some(uuid) {
-                        self.io.subscribe(uuid);
                         slot.subscribed_uuid = Some(uuid);
+                        subscribe = true;
                     }
+                }
+                if subscribe {
+                    self.retain_asset_subscription(uuid);
                 }
             }
         }
+        let mut subscribe_paths = Vec::new();
         for slot in self.slots.values_mut() {
             if let Binding::Indirect { path, .. } = &slot.binding {
                 if !slot.path_subscribed {
-                    self.io.subscribe_path(path);
+                    subscribe_paths.push(path.clone());
                     slot.path_subscribed = true;
                 }
             }
+        }
+        for path in subscribe_paths {
+            self.retain_path_subscription(&path);
         }
         Ok(())
     }
@@ -1240,7 +1295,7 @@ impl<I: LoaderIO> Loader<I> {
             }
         }
         for uuid in unsubscribe {
-            self.io.unsubscribe(uuid);
+            self.release_asset_subscription(uuid);
         }
         for uuid in retired {
             if self.handles_for_uuid(uuid).is_empty() {

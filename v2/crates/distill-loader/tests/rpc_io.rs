@@ -8,8 +8,8 @@ use distill_loader::{
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, PathMutation, Server,
-    StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
+    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, LeasePolicy,
+    PathMutation, Server, StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
 };
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -173,6 +173,11 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
         1,
         "the first queued payload must retain its exclusive permit until consumed"
     );
+    assert_eq!(
+        io.begin_sweep(),
+        basis,
+        "control commands must bypass a queued fetch waiting for residency admission"
+    );
     drop(first_fetch);
     assert!(poll_until(&mut io, 1)
         .iter()
@@ -233,6 +238,84 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
 
     drop(events);
     assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
+    let Fixture {
+        server,
+        request,
+        asset,
+        ..
+    } = fixture();
+    server
+        .install_lease_policy(LeasePolicy {
+            ttl: Duration::from_millis(150),
+            max_snapshot_leases: 8,
+            max_connections: 8,
+        })
+        .unwrap();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            let mut connections = Vec::new();
+            for _ in 0..3 {
+                connections.push(listener.accept_one().await.unwrap());
+            }
+            for connection in connections {
+                connection.await.unwrap().unwrap();
+            }
+        });
+    });
+    let target = RuntimeTarget {
+        epoch: distill_loader::GameModuleEpoch(1),
+        target_definition_hash: request.target_definition_hash.0,
+    };
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    io.bind_target(target.clone());
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+    io.subscribe(asset);
+
+    assert!(poll_until(&mut io, 1).iter().any(|event| matches!(
+        event,
+        IoEvent::ReconnectRequired {
+            reason: distill_loader::ReconnectReason::LeaseExpired
+        }
+    )));
+    io.bind_target(target);
+    assert!(poll_until(&mut io, 1)
+        .iter()
+        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+
+    server
+        .commit(Commit {
+            assets: vec![AssetMutation::Set {
+                uuid: asset,
+                resolution: StoredResolve::Failed {
+                    error: "changed after reconnect".into(),
+                },
+                delta: AssetDeltaState::Changed,
+            }],
+            ..Commit::default()
+        })
+        .unwrap();
+    assert!(poll_until(&mut io, 1).iter().any(|event| matches!(
+        event,
+        IoEvent::Delta { assets, .. }
+            if assets == &vec![(asset, distill_loader::AssetDeltaState::Changed)]
+    )));
+
     drop(io);
     server_thread.join().unwrap();
 }

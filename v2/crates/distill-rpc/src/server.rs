@@ -609,7 +609,6 @@ struct ServerState {
     artifacts: HashMap<ContentHash, StoredArtifact>,
     wire_trees: HashMap<LayoutHash, StoredWireTree>,
     build_results: HashMap<BuildKey, BuildResolution>,
-    build_flights: HashMap<BuildKey, Arc<BuildFlight>>,
     connections: Vec<Weak<Mutex<ConnectionState>>>,
     next_connection_id: u64,
     chunk_size: usize,
@@ -628,45 +627,6 @@ enum BuildResolution {
     Built(ContentHash),
     Failed(String),
     Drifted(DriftedInput),
-}
-
-struct BuildFlight {
-    completed: Mutex<Option<Result<(), RpcFailure>>>,
-    wake: Condvar,
-}
-
-impl BuildFlight {
-    fn new() -> Self {
-        Self {
-            completed: Mutex::new(None),
-            wake: Condvar::new(),
-        }
-    }
-
-    fn wait(&self) -> Result<(), RpcFailure> {
-        let mut completed = self
-            .completed
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        while completed.is_none() {
-            completed = self
-                .wake
-                .wait(completed)
-                .unwrap_or_else(|poison| poison.into_inner());
-        }
-        completed
-            .as_ref()
-            .expect("completed build flight has an outcome")
-            .clone()
-    }
-
-    fn complete(&self, outcome: Result<(), RpcFailure>) {
-        *self
-            .completed
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(outcome);
-        self.wake.notify_all();
-    }
 }
 
 #[derive(Clone)]
@@ -973,7 +933,6 @@ impl Server {
                 artifacts: HashMap::new(),
                 wire_trees: HashMap::new(),
                 build_results: HashMap::new(),
-                build_flights: HashMap::new(),
                 connections: Vec::new(),
                 next_connection_id: 1,
                 chunk_size: DEFAULT_CHUNK_SIZE,
@@ -3123,7 +3082,7 @@ impl Snapshot {
         work_class: BuildWorkClass,
     ) -> RpcResult<TerminalEvent<ResolveResult>> {
         loop {
-            let mut state = self.server.lock();
+            let state = self.server.lock();
             let connection = lock_connection(&self.connection);
             if let Some(result) = self.preflight(&state, &connection) {
                 return result;
@@ -3181,16 +3140,6 @@ impl Snapshot {
                 if let (Some(VersionResolve::Drifted { input }), Some(entry)) =
                     (&version_resolution, runtime_entry.clone())
                 {
-                    if let Some(flight) = state.build_flights.get(&key).cloned() {
-                        drop(connection);
-                        drop(state);
-                        if let Err(error) = flight.wait() {
-                            return RpcResult::Failure(error);
-                        }
-                        continue;
-                    }
-                    let flight = Arc::new(BuildFlight::new());
-                    state.build_flights.insert(key.clone(), flight.clone());
                     let target_definition = state
                         .targets
                         .get(&connection.target)
@@ -3243,7 +3192,6 @@ impl Snapshot {
                         outcome = Err(error);
                     }
                     let mut state = self.server.lock();
-                    state.build_flights.remove(&key);
                     match self.lease.view() {
                         Some(view) => {
                             if let Some(error) = pipeline_failure(&view) {
@@ -3267,8 +3215,6 @@ impl Snapshot {
                         }
                     }
                     drop(state);
-                    let completed = outcome.as_ref().map(|_| ()).map_err(Clone::clone);
-                    flight.complete(completed);
                     if let Err(error) = outcome {
                         return RpcResult::Failure(error);
                     }

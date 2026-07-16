@@ -85,6 +85,7 @@ pub enum AssetDeltaState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectReason {
+    LeaseExpired,
     TargetDefinitionChanged,
     StoreInstanceChanged,
     ProtocolEpochChanged,

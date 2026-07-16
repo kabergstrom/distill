@@ -971,6 +971,95 @@ fn mock_io_records_subscriptions_through_the_declared_boundary() {
 }
 
 #[test]
+fn shared_subscription_owners_release_only_after_the_last_slot() {
+    let token = ModuleEpochToken::new(7);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 7, &token);
+    let asset = uuid(7);
+    let path = "models/shared";
+    let direct = loader.add_ref::<A>(asset).unwrap();
+    let indirect_a = loader.add_ref_indirect::<A>(path).unwrap();
+    let indirect_b = loader.add_ref_indirect::<B>(path).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::SubscribePath(value) if value == path))
+            .count(),
+        1,
+        "one transport subscription serves both typed path slots"
+    );
+    let (req, request_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req,
+        path: path.to_owned(),
+        result: PathResolveResult::Resolved(asset),
+        basis: request_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(
+                |command| matches!(command, Command::Subscribe(candidate) if *candidate == asset)
+            )
+            .count(),
+        1,
+        "one transport subscription serves the direct and indirect slots"
+    );
+
+    drop(indirect_a);
+    loader.process(&mut storage).unwrap();
+    assert!(!loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::UnsubscribePath)));
+    assert!(!loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::Unsubscribe(candidate) if *candidate == asset)));
+
+    drop(indirect_b);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::UnsubscribePath))
+            .count(),
+        1
+    );
+    assert!(!loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::Unsubscribe(candidate) if *candidate == asset)));
+
+    drop(direct);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(
+                |command| matches!(command, Command::Unsubscribe(candidate) if *candidate == asset)
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn placeholder_strong_reference_expands_and_gates_the_component() {
     let token = ModuleEpochToken::new(20);
     let mut loader = Loader::new(mock_io());

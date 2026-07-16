@@ -453,9 +453,6 @@ impl Driver {
                     return false;
                 };
                 let fetch_slot = std::sync::Arc::clone(&self.fetch_slot);
-                let Ok(fetch_slot) = fetch_slot.acquire_owned().await else {
-                    return false;
-                };
                 let hub = self.hub.clone();
                 let snapshot = self.snapshot.clone();
                 let events = self.events.clone();
@@ -463,6 +460,9 @@ impl Driver {
                 let spool_directory = self.spool_directory.clone();
                 tokio::task::spawn_local(async move {
                     let _request_slot = request_slot;
+                    let Ok(fetch_slot) = fetch_slot.acquire_owned().await else {
+                        return;
+                    };
                     let completion = fetch_event(
                         (hub, snapshot),
                         req,
@@ -659,7 +659,16 @@ impl Driver {
                                         }
                                     }
                                 }
-                                Ok(None) => return,
+                                Ok(None) => {
+                                    let _ = send_event(
+                                        &events,
+                                        IoEvent::ReconnectRequired {
+                                            reason: ReconnectReason::LeaseExpired,
+                                        },
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 Err(error) => {
                                     let _ = send_event(
                                         &events,
@@ -1155,6 +1164,9 @@ fn remote_request_event<T: std::fmt::Debug>(
         RemoteCall::ReconnectRequired(reason) => IoEvent::ReconnectRequired {
             reason: reconnect_reason(reason),
         },
+        RemoteCall::LeaseFailure(_) => IoEvent::ReconnectRequired {
+            reason: ReconnectReason::LeaseExpired,
+        },
         other => request_error(req, basis, remote_message(other)),
     }
 }
@@ -1163,6 +1175,9 @@ fn connection_event<T: std::fmt::Debug>(call: RemoteCall<T>) -> IoEvent {
     match call {
         RemoteCall::ReconnectRequired(reason) => IoEvent::ReconnectRequired {
             reason: reconnect_reason(reason),
+        },
+        RemoteCall::LeaseFailure(_) => IoEvent::ReconnectRequired {
+            reason: ReconnectReason::LeaseExpired,
         },
         other => IoEvent::ConnectionError {
             message: remote_message(other),
