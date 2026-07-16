@@ -127,6 +127,15 @@ fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) {
     }
 }
 
+fn discard_prepared(
+    runtime: &mut CoordinatedPipelineRuntime,
+    prepared: &mut Option<PipelineEpoch>,
+) {
+    if let Some(prepared) = prepared.take() {
+        let _ = runtime.host.discard_unpublished(prepared);
+    }
+}
+
 impl DaemonCoordinator {
     pub fn open(
         store_config: StoreConfig,
@@ -647,19 +656,33 @@ impl DaemonCoordinator {
                 PipelineProjection::default(),
             ),
         };
-        let installed_projection =
-            ScanProjectionIndex::build(&installed_snapshot, &projection, Some(&schema_authority))?;
+        let installed_projection = match ScanProjectionIndex::build(
+            &installed_snapshot,
+            &projection,
+            Some(&schema_authority),
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                discard_prepared(&mut runtime, &mut prepared_epoch);
+                return Err(error);
+            }
+        };
         let filesystem = Arc::new(Mutex::new(Some(filesystem)));
         let captured = Arc::clone(&filesystem);
         let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let base = self.server.current_stamp().version;
         let store = Arc::clone(&self.store);
-        let fallback_bundles = lock_store(&store)
-            .all_asset_bundles()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let fallback_bundles = match lock_store(&store).all_asset_bundles() {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                discard_prepared(&mut runtime, &mut prepared_epoch);
+                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+            }
+        };
         let authoring = Arc::clone(&self.authoring);
-        self.server
+        let result = self
+            .server
             .coordinated_replace_target_set(base, targets, || {
                 let mut commit = publish_scan(
                     &store,
@@ -775,8 +798,14 @@ impl DaemonCoordinator {
                 .apply(&mut commit);
                 commit.pipeline_epoch_changed = true;
                 Ok(commit)
-            })
-            .map_err(CoordinatorError::Coordinated)
+            });
+        match result {
+            Ok(stamp) => Ok(stamp),
+            Err(error) => {
+                discard_prepared(&mut runtime, &mut prepared_epoch);
+                Err(CoordinatorError::Coordinated(error))
+            }
+        }
     }
 
     /// Stage, attest, durably publish, and only then expose one pipeline
@@ -819,15 +848,23 @@ impl DaemonCoordinator {
         }
         let store = Arc::clone(&self.store);
         let tools = prepared.tool_epoch();
-        let authority = self.schema_authority().ok_or_else(|| {
-            CoordinatorError::InvalidManifest(
-                "pipeline publication requires project schema authority".to_owned(),
-            )
-        })?;
+        let authority = match self.schema_authority() {
+            Some(authority) => authority,
+            None => {
+                let _ = runtime.host.discard_unpublished(prepared);
+                return Err(CoordinatorError::InvalidManifest(
+                    "pipeline publication requires project schema authority".to_owned(),
+                ));
+            }
+        };
         let tag_epoch = authority.source_hash();
-        let asset_bundles = lock_store(&store)
-            .all_asset_bundles()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let asset_bundles = match lock_store(&store).all_asset_bundles() {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                let _ = runtime.host.discard_unpublished(prepared);
+                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+            }
+        };
         let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
         let targets = self
             .build_targets
@@ -4017,6 +4054,24 @@ mod scheduler_tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn prepared_candidate_error_cleanup_uses_the_explicit_unload_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = CoordinatedPipelineRuntime {
+            host: ModuleHost::new(temp.path().join("module-host")).unwrap(),
+            loader: DynamicPipelineModuleLoader,
+            pending: None,
+        };
+        let epoch = crate::epoch::empty_test_epoch();
+        let observed = epoch.clone();
+        let mut prepared = Some(epoch);
+
+        discard_prepared(&mut runtime, &mut prepared);
+
+        assert!(prepared.is_none());
+        assert!(observed.status().unloaded);
+    }
 
     #[test]
     fn production_admission_limits_concurrent_build_closures() {

@@ -344,20 +344,29 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
     };
     let old_hash = node_hash(&old_schema.root).unwrap();
     let new_hash = node_hash(&new_schema.root).unwrap();
+    // Keep the custom edge in the same bundle as the authored value. Disk
+    // migration compacts this bundle's schema table after rewriting the value,
+    // so the MigrationV1 endpoint snapshots must survive that compaction.
+    let mut value_bundle = distill_bundle::parse_bundle(&bundle(
+        BundleUuid([91; 16]),
+        AssetUuid([92; 16]),
+        VALUE_TYPE,
+        old_schema.clone(),
+        object([("value", AuthoredValue::UInt(7))]),
+    ))
+    .unwrap();
+    let migration_bundle = distill_bundle::parse_bundle(&custom_migration_bundle(
+        old_hash,
+        &old_schema,
+        new_hash,
+        &new_schema,
+    ))
+    .unwrap();
+    value_bundle.schemas.extend(migration_bundle.schemas);
+    value_bundle.assets.extend(migration_bundle.assets);
     std::fs::write(
         assets.join("value.bundle"),
-        bundle(
-            BundleUuid([91; 16]),
-            AssetUuid([92; 16]),
-            VALUE_TYPE,
-            old_schema.clone(),
-            object([("value", AuthoredValue::UInt(7))]),
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        assets.join("migration.bundle"),
-        custom_migration_bundle(old_hash, &old_schema, new_hash, &new_schema),
+        distill_bundle::write_bundle(&value_bundle).unwrap(),
     )
     .unwrap();
     let coordinator = Arc::new(
@@ -446,6 +455,8 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
         &entry.lineage,
         EntryLineageV1::Manifest(stamp) if stamp.cursor == 1 && stamp.selected_digest() == Some(new_hash)
     ));
+    assert!(migrated.schemas.contains_key(&old_hash));
+    assert!(migrated.schemas.contains_key(&new_hash));
     assert_eq!(
         coordinator.store().lock().unwrap().input_version(),
         InputVersion(3)

@@ -2464,6 +2464,37 @@ pub(crate) fn processor_test_epoch<P: crate::callbacks::PipelineProcessor>(
 }
 
 #[cfg(test)]
+pub(crate) fn empty_test_epoch() -> PipelineEpoch {
+    let target = "test".to_owned();
+    let target_definition_hash = [7; 32];
+    let token = ModuleEpochToken::new(9001);
+    let arena = CandidateRegistrationArena::new(token.clone());
+    let target_set = CanonicalTargetSet::canonical(vec![TargetSetRow {
+        name: target.clone(),
+        target_definition_hash,
+    }])
+    .expect("test target set is canonical");
+    PipelineEpoch::new(
+        9001,
+        StagedModule {
+            path: PathBuf::from("pipeline-empty-test"),
+            content_hash: [7; 32],
+        },
+        token,
+        PreparedEpochRegistration {
+            target_set,
+            registration: RegistrationSet {
+                registrations: Vec::new(),
+                pipeline_targets: BTreeSet::from([target]),
+            },
+            tools: BTreeMap::new(),
+            arena,
+        },
+        Box::new(TestNoopModule),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn processor_test_epoch_with<
     P: crate::callbacks::PipelineProcessor,
     F: FnOnce(&mut CandidateRegistrationArena),

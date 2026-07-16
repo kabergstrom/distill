@@ -16,7 +16,7 @@
 //! the bundle has no blobs; `write_bundle(parse_bundle(bytes)) == bytes`
 //! for canonically written files of either encoding.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
@@ -85,6 +85,18 @@ pub struct AssetEntry {
     /// processor input, reference target, query result, or pack member.
     pub authoring_only: bool,
     pub data: AuthoredValue,
+}
+
+/// Return the complete set of schema snapshots the bundle must retain:
+/// every entry schema plus the endpoint schemas embedded in MigrationV1
+/// controls. Callers that compact a bundle's schema table must use this
+/// closure rather than looking only at `AssetEntry::schema_hash`.
+pub fn referenced_schema_hashes(bundle: &Bundle) -> BTreeSet<LogicalHash> {
+    bundle
+        .assets
+        .values()
+        .flat_map(envelope::schema_references)
+        .collect()
 }
 
 /// The namespace-bearing portion of malformed bundle bytes. This is returned

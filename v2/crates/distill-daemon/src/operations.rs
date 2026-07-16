@@ -351,11 +351,7 @@ impl AuthoringService {
             }
             if changed {
                 bundle.schemas.extend(migrated_schemas);
-                let used = bundle
-                    .assets
-                    .values()
-                    .map(|entry| entry.schema_hash)
-                    .collect::<BTreeSet<_>>();
+                let used = distill_bundle::referenced_schema_hashes(&bundle);
                 bundle.schemas.retain(|hash, _| used.contains(hash));
                 files.push(OperationFile::replace(
                     target,

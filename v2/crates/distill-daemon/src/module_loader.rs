@@ -58,6 +58,35 @@ pub struct PipelineModuleTableV2 {
 
 pub type PipelineModuleEntryV2 = unsafe extern "C" fn() -> *const PipelineModuleTableV2;
 
+/// Copy a versioned module table without reading beyond the cross-ABI prefix
+/// before that prefix has selected the complete table layout.
+///
+/// # Safety
+///
+/// `pointer` must be null or point to readable, properly aligned storage for
+/// at least one `u32`. If that prefix names v2, it must point to a complete
+/// resident [`PipelineModuleTableV2`].
+unsafe fn read_pipeline_module_table(
+    pointer: *const PipelineModuleTableV2,
+) -> Result<PipelineModuleTableV2, ModuleCallError> {
+    if pointer.is_null() {
+        return Err(ModuleCallError::new(
+            "pipeline module returned a null function table",
+        ));
+    }
+    // SAFETY: the C bootstrap contract guarantees the version prefix exists;
+    // nothing after it is read until that prefix selects the v2 layout.
+    let abi_version = unsafe { (pointer.cast::<u32>()).read() };
+    if abi_version != PIPELINE_MODULE_ABI_VERSION_V2 {
+        return Err(ModuleCallError::new(format!(
+            "pipeline module ABI version {abi_version} is unsupported (expected {PIPELINE_MODULE_ABI_VERSION_V2})"
+        )));
+    }
+    // SAFETY: a matching prefix selects the complete v2 table contract, and
+    // the resident module keeps the pointed-to static alive.
+    Ok(unsafe { pointer.read() })
+}
+
 pub fn host_interface_closure_manifest() -> &'static [(&'static str, &'static [u8])] {
     host_interface_closure::HOST_INTERFACE_CLOSURE
 }
@@ -192,21 +221,11 @@ impl PipelineModuleLoader for DynamicPipelineModuleLoader {
             // SAFETY: the exported entry contract returns a resident static
             // table. It is copied while the image is pinned by `image`.
             let pointer = unsafe { entry() };
-            if pointer.is_null() {
-                return Err(ModuleCallError::new(
-                    "pipeline module returned a null function table",
-                ));
-            }
-            // SAFETY: non-null pointer is promised by the fixed entry ABI to
-            // identify a properly aligned PipelineModuleTableV2.
-            unsafe { *pointer }
+            // SAFETY: the fixed entry ABI guarantees at least the aligned C
+            // version prefix. The helper reads the remaining v2 table only
+            // after that prefix matches.
+            unsafe { read_pipeline_module_table(pointer) }?
         };
-        if table.abi_version != PIPELINE_MODULE_ABI_VERSION_V2 {
-            return Err(ModuleCallError::new(format!(
-                "pipeline module ABI version {} is unsupported (expected {})",
-                table.abi_version, PIPELINE_MODULE_ABI_VERSION_V2
-            )));
-        }
         Ok(Box::new(DynamicLoadedPipelineModule {
             image: Some(image),
             table: Some(table),
@@ -475,5 +494,20 @@ mod tests {
             .unwrap_err()
             .detail()
             .contains("already closed"));
+    }
+
+    #[test]
+    fn incompatible_prefix_is_rejected_before_the_complete_table_is_read() {
+        let prefix_only = PIPELINE_MODULE_ABI_VERSION_V2 + 1;
+        let pointer = std::ptr::from_ref(&prefix_only).cast::<PipelineModuleTableV2>();
+
+        // SAFETY: the test provides exactly the prefix storage promised for
+        // an incompatible table. Reading a complete table would be invalid.
+        let error = match unsafe { read_pipeline_module_table(pointer) } {
+            Ok(_) => panic!("incompatible prefix unexpectedly selected a complete table"),
+            Err(error) => error,
+        };
+
+        assert!(error.detail().contains("unsupported"));
     }
 }

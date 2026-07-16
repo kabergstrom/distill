@@ -514,11 +514,7 @@ impl AuthoringService {
             self.apply_set(store, &mut bundle, entry)?;
         }
         infer_primary(&mut bundle)?;
-        let used_schemas = bundle
-            .assets
-            .values()
-            .map(|entry| entry.schema_hash)
-            .collect::<BTreeSet<_>>();
+        let used_schemas = distill_bundle::referenced_schema_hashes(&bundle);
         bundle.schemas.retain(|hash, _| used_schemas.contains(hash));
         let proposed = if bundle.assets.is_empty() {
             None

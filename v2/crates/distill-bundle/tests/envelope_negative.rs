@@ -6,8 +6,8 @@ mod common;
 
 use common::*;
 use distill_bundle::{
-    extract_namespace_skeleton, parse_bundle, repair_missing_schemas, write_bundle, Bundle,
-    BundleError as E, EntryLineageV1,
+    extract_namespace_skeleton, parse_bundle, referenced_schema_hashes, repair_missing_schemas,
+    write_bundle, Bundle, BundleError as E, EntryLineageV1,
 };
 use distill_core::bootstrap::{
     BootstrapControlSpecV1, BootstrapControlSymbol, BOOTSTRAP_CONTROL_TYPE_UUIDS,
@@ -152,6 +152,7 @@ fn exact_held_schema_repairs_plain_bundle_canonically() {
 #[test]
 fn migration_endpoint_hashes_are_required_and_exactly_repairable() {
     let (bundle, missing_hash) = migration_bundle();
+    assert!(referenced_schema_hashes(&bundle).contains(&missing_hash));
     let canonical = write_bundle(&bundle).unwrap();
     let missing = mutate_envelope(&canonical, |env| {
         as_obj(as_obj(env).get_mut("schemas").unwrap()).remove(&missing_hash.to_string());
