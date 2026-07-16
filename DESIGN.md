@@ -6393,15 +6393,19 @@ storage instance receives a fresh `AdoptionId`; adoption identity names an
 owned storage instance, not asset content.
 
 Repopulation reads authoritative artifact bytes again from RpcIO/CAS in dev or
-the mounted pack in release. Constructed CPU values and decompressed/staging
-bytes are transient: `AssetStorage::update` transfers what the GPU upload needs
-and destroys the `ErasedValue` as soon as the transfer owns or has consumed
-those bytes. The steady state therefore retains no second full CPU asset copy
-solely for device recovery. A transfer completion is privately fenced by the
-engine's device generation, so a late completion from the dead device is
-discarded. Rendering may remain behind a global recovery barrier or use the
-existing dummy/placeholder resources until the forced component adoptions
-commit; it must never treat a recreated-but-empty allocation as resident.
+the mounted pack in release. Constructed texture/mesh CPU values and their
+decompressed/staging bytes are transient: `AssetStorage::update` transfers what
+the GPU upload needs and destroys the `ErasedValue` as soon as the transfer owns
+or has consumed those bytes. The steady state therefore retains no second full
+copy of bulk asset payloads solely for device recovery. A compact cooked
+pipeline package is the deliberate exception: New Game Plus may retain its one
+shared `Arc` representation after shader creation so pipelines rebuild
+automatically on the replacement device without retaining a second copy or
+recooking source. A transfer completion is privately fenced by the engine's
+device generation, so a late completion from the dead device is discarded.
+Rendering may remain behind a global recovery barrier or use the existing
+dummy/placeholder resources until the forced component adoptions commit; it
+must never treat a recreated-but-empty allocation as resident.
 If RpcIO is temporarily unavailable, ordinary reconnect/backoff leaves the
 handles nonresident until refetch succeeds; a mounted shipping pack can replay
 locally. External/imported GPU objects that are not Distill assets remain their

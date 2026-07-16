@@ -23,6 +23,7 @@ const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const REQUESTED_RESTART_EXIT_CODE: i32 = 75;
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -420,7 +421,7 @@ fn cargo_watch_command(config: &DevLaunchConfig) -> ChildCommand {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildKind {
     SourceWalk,
     CargoWatch,
@@ -520,6 +521,16 @@ impl ManagedChild {
     }
 
     fn record_exit(&mut self, status: ExitStatus) {
+        if is_requested_restart(self.kind, status) {
+            self.consecutive_failures = 0;
+            self.retry_at = Some(Instant::now());
+            let _ = self.diagnostics.send(DevDiagnostic {
+                source: self.kind.name(),
+                stream: DiagnosticStream::Supervisor,
+                text: "workspace changed; restarting with a fresh crate graph".to_owned(),
+            });
+            return;
+        }
         self.record_failure(format!("exited with {status}"));
     }
 
@@ -562,6 +573,14 @@ impl ManagedChild {
         }
         self.join_readers();
     }
+}
+
+fn is_requested_restart(kind: ChildKind, status: ExitStatus) -> bool {
+    is_requested_restart_code(kind, status.code())
+}
+
+fn is_requested_restart_code(kind: ChildKind, code: Option<i32>) -> bool {
+    kind == ChildKind::SourceWalk && code == Some(REQUESTED_RESTART_EXIT_CODE)
 }
 
 impl Drop for ManagedChild {
@@ -773,6 +792,20 @@ profile = "debug"
                 "--target-dir"
             ))
         ));
+    }
+
+    #[test]
+    fn only_source_walk_tempfail_requests_a_clean_restart() {
+        assert!(is_requested_restart_code(
+            ChildKind::SourceWalk,
+            Some(REQUESTED_RESTART_EXIT_CODE)
+        ));
+        assert!(!is_requested_restart_code(
+            ChildKind::CargoWatch,
+            Some(REQUESTED_RESTART_EXIT_CODE)
+        ));
+        assert!(!is_requested_restart_code(ChildKind::SourceWalk, Some(1)));
+        assert!(!is_requested_restart_code(ChildKind::SourceWalk, None));
     }
 
     #[test]

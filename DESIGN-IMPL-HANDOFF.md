@@ -151,11 +151,13 @@ gameplay-module load/migration/commit. This avoids a bootstrap dependency on
 pipeline code and does not add a daemon Cargo-workspace crawler.
 
 The New Game Plus storage integration now treats device loss as engine-local
-storage repopulation. Stable resource keys and loader handles survive, but
-storage does not retain a second full CPU copy: a forced loader sweep refetches
-unchanged artifacts from RPC/CAS or the mounted pack, reconstructs and uploads
-them transiently, and commits fresh storage adoptions while stale transfer
-completions are device-generation fenced.
+storage repopulation. Stable resource keys and loader handles survive. A forced
+loader sweep refetches bulk texture/mesh artifacts from RPC/CAS or the mounted
+pack, reconstructs and uploads them transiently, and commits fresh storage
+adoptions while stale transfer completions are device-generation fenced. The
+compact cooked pipeline package is retained once in a shared `Arc`, allowing
+automatic pipeline reconstruction without retaining duplicate source or bulk
+payload copies.
 
 That integration is now code, not a deferred milestone. `distilld dev` owns the
 two authoring child processes and restarts them with bounded backoff while the
@@ -165,8 +167,9 @@ ordinary resolve/fetch/adopt path even when its content hash is unchanged. New
 Game Plus supplies RPC/pack `LoaderIO`, registers texture/mesh/shader terminal
 types, drives the loader at frame boundaries, adopts transient decoded values
 into Rafx resources, and uses device generations to reject stale transfer
-completion. It retains resource identities and loader handles, not duplicate
-full CPU asset payloads.
+completion. It retains resource identities, loader handles, and one shared
+cooked package per resident pipeline asset—not duplicate full CPU asset
+payloads.
 
 ## 4. Workspace map and implemented behavior
 
@@ -258,7 +261,7 @@ The post-closure integration milestone additionally provides:
   change.
 - A New Game Plus `AssetStorage` bridge with separate asynchronous and inline
   upload lanes, transfer/graphics ownership completion, stable texture and mesh
-  resource keys, transient shader construction, generation-fenced recovery,
+  resource keys, shared cooked pipeline retention, generation-fenced recovery,
   and a real headless Vulkan texture/mesh/shader residency test.
 
 The adversarial closure review then fixed these failure paths:
