@@ -1,22 +1,28 @@
 # Distill v2 — implementation handoff
 
-_Updated 2026-07-16 after the complete implementation and review pass. This document is
-an operational handoff, not a second specification. `DESIGN.md` §§1–21 and its
-latest §22 refinements are normative; git history is the authority for landed
-milestones._
+_Updated 2026-07-16 after the post-closure New Game Plus integration and
+validation pass. This document is an operational handoff, not a second
+specification. `DESIGN.md` §§1–21 and its latest §22 refinements are normative;
+git history is the authority for landed milestones._
 
 ## 1. Current state
 
 The Distill v2 implementation is present under `v2/` as a sixteen-package Rust
 workspace, including its two real dynamic-module test fixtures. The current
-implementation/review milestone is commit `6e8d93f` (`Close rotated audit race
-conditions`). At that commit:
+implementation milestone is commit `47dd429` (`Add loader storage
+repopulation`). The corresponding New Game Plus Vulkan integration milestone is
+`80918c1` (`Validate Distill GPU asset residency`). At those commits:
 
 - `cargo test --workspace --offline` passes, including integration, UI, and doc
   tests.
 - `cargo clippy --workspace --all-targets --offline -- -D warnings` passes.
 - `git diff --check` passes.
-- The complete texture/mesh/shader and schema-transition vertical suites pass.
+- The complete daemon/RPC texture/mesh/shader and schema-transition vertical
+  suites pass.
+- The Vulkan New Game Plus integration compiles and its focused headless GPU
+  suite loads, replaces, and releases texture, mesh, and shader assets while
+  preserving stable resource keys across texture replacement. Metal is not a
+  validation target for this integration milestone.
 - Every confirmed CRITICAL/HIGH/MEDIUM adversarial-review finding is fixed with
   a regression or rejected with concrete counterevidence.
 - The filesystem overengineering audit is folded into R37 and the code: no
@@ -31,6 +37,19 @@ cd /Users/karl/Projects/distill/v2
 cargo test --workspace --offline
 cargo clippy --workspace --all-targets --offline -- -D warnings
 ```
+
+The New Game Plus integration is validated separately from its repository root:
+
+```sh
+cd /Users/karl/Projects/newgameplus
+cargo check -p newgameplus --features rafx-vulkan --offline
+cargo test -p newgameplus --lib --features rafx-vulkan \
+  distill_assets::tests --offline --no-fail-fast
+```
+
+The focused GPU test requires a usable Vulkan loader/ICD. On the current macOS
+host it runs through the installed Vulkan SDK and MoltenVK; it does not enable
+the Rafx Metal backend.
 
 `cargo fmt --all` traverses external path dependencies and therefore attempts
 to format repositories that Distill does not own. Format the sixteen Distill
@@ -112,6 +131,9 @@ Relevant New Game Plus milestones, oldest to newest:
 - `0db47ed Share module source identity across hosts`
 - `112255a Share logical schema decoding and narrow layout identity`
 - `6dff0e3 Reject duplicate schema merge identities`
+- `a461bf8 Move development build supervision out of engine`
+- `c98ccd3 Integrate Distill GPU asset runtime`
+- `80918c1 Validate Distill GPU asset residency`
 
 `ngp-schema` rejects duplicate canonical keys in either merge input. Its full
 offline test suite and `--no-deps` Clippy pass. Full dependency Clippy currently
@@ -135,11 +157,16 @@ unchanged artifacts from RPC/CAS or the mounted pack, reconstructs and uploads
 them transiently, and commits fresh storage adoptions while stale transfer
 completions are device-generation fenced.
 
-These are the next integration milestone, not code present at the closure
-commits listed below. The core daemon, RPC, loader, pack, watcher, and fixture
-verticals remain complete; the standalone `distilld` development supervisor,
-loader storage-repopulation entry point, and production New Game Plus
-`AssetStorage` adapter are not yet implemented.
+That integration is now code, not a deferred milestone. `distilld dev` owns the
+two authoring child processes and restarts them with bounded backoff while the
+ordinary serving daemon remains live. `Loader::begin_storage_repopulation`
+abandons old-device pending values and forces every live component through the
+ordinary resolve/fetch/adopt path even when its content hash is unchanged. New
+Game Plus supplies RPC/pack `LoaderIO`, registers texture/mesh/shader terminal
+types, drives the loader at frame boundaries, adopts transient decoded values
+into Rafx resources, and uses device generations to reject stale transfer
+completion. It retains resource identities and loader handles, not duplicate
+full CPU asset payloads.
 
 ## 4. Workspace map and implemented behavior
 
@@ -155,10 +182,10 @@ loader storage-repopulation entry point, and production New Game Plus
 | `distill-asset` | Runtime descriptors, erased ownership, placeholders, deterministic containers, callback status surfaces |
 | `distill-asset-macro` | `#[asset]` descriptors, defaults, reflection, canonical encoding, compile-time rejection tests |
 | `distill-build` | Query/dependency traces, imports, processors, tools, cache keys, artifact encoding |
-| `distill-loader` | Basis-consistent resolve/fetch, artifact admission, DSWL planning, component adoption and swaps |
+| `distill-loader` | Basis-consistent resolve/fetch, artifact admission, DSWL planning, component adoption/swaps, forced device-storage repopulation |
 | `distill-pack` | Canonical manifest/archive construction, activation, mount validation, `PackfileIO` |
 | `distill-rpc` | Loopback Cap'n Proto protocol, snapshots, resolve/fetch/subscribe, leases, target fencing |
-| `distill-daemon` | Watcher/scanner, config staging, module epochs, import/build orchestration, codegen, pack and doctor commands |
+| `distill-daemon` | Watcher/scanner, config staging, module epochs, import/build orchestration, codegen, optional authoring child-process supervision, pack and doctor commands |
 | `distill-pipeline-fixture` | Real dynamic pipeline module used by module-host integration tests |
 | `distill-game-assets-pipeline-fixture` | Tiny PPM/OBJ/shader import and cook module used by the full game-asset vertical test |
 
@@ -220,6 +247,19 @@ The closure milestone adds these end-to-end and durability guarantees:
   union names and replay retained history as ordinary deltas, and loader sweeps
   remain scoped to the affected dependency component with an unchanged-content
   cutoff before fetch/adoption.
+
+The post-closure integration milestone additionally provides:
+
+- An optional `distilld dev` process supervisor for incremental `source-walk`
+  schema emission and Cargo cdylib builds. Completed artifacts still enter the
+  serving daemon only through its ordinary watched control inputs.
+- Explicit loader storage repopulation that preserves handles and component
+  atomicity while refetching unchanged content after a device generation
+  change.
+- A New Game Plus `AssetStorage` bridge with separate asynchronous and inline
+  upload lanes, transfer/graphics ownership completion, stable texture and mesh
+  resource keys, transient shader construction, generation-fenced recovery,
+  and a real headless Vulkan texture/mesh/shader residency test.
 
 The adversarial closure review then fixed these failure paths:
 
@@ -407,6 +447,9 @@ The final implementation sequence on the Distill repository is:
 - `236015b Close adversarial review failure paths`
 - `d888c11 Finish final review recovery edges`
 - `6e8d93f Close rotated audit race conditions`
+- `6829bb6 Specify daemon build supervision and GPU repopulation`
+- `8715603 Add distilld development supervisor`
+- `47dd429 Add loader storage repopulation`
 
 Earlier watcher milestones include:
 
