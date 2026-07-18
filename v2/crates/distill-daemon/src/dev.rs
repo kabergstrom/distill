@@ -444,6 +444,7 @@ struct ManagedChild {
     diagnostics: mpsc::Sender<DevDiagnostic>,
     last_spawn: Option<Instant>,
     consecutive_failures: u32,
+    consecutive_requested_restarts: u32,
     retry_at: Option<Instant>,
     gave_up: bool,
 }
@@ -462,6 +463,7 @@ impl ManagedChild {
             diagnostics,
             last_spawn: None,
             consecutive_failures: 0,
+            consecutive_requested_restarts: 0,
             retry_at: None,
             gave_up: false,
         };
@@ -493,6 +495,7 @@ impl ManagedChild {
                     .is_some_and(|spawned| spawned.elapsed() >= MIN_HEALTHY_UPTIME)
                 {
                     self.consecutive_failures = 0;
+                    self.consecutive_requested_restarts = 0;
                 }
                 self.record_exit(status);
             }
@@ -522,19 +525,29 @@ impl ManagedChild {
 
     fn record_exit(&mut self, status: ExitStatus) {
         if is_requested_restart(self.kind, status) {
-            self.consecutive_failures = 0;
-            self.retry_at = Some(Instant::now());
-            let _ = self.diagnostics.send(DevDiagnostic {
-                source: self.kind.name(),
-                stream: DiagnosticStream::Supervisor,
-                text: "workspace changed; restarting with a fresh crate graph".to_owned(),
-            });
+            self.record_requested_restart();
             return;
         }
         self.record_failure(format!("exited with {status}"));
     }
 
+    fn record_requested_restart(&mut self) {
+        self.consecutive_failures = 0;
+        self.consecutive_requested_restarts = self.consecutive_requested_restarts.saturating_add(1);
+        let delay = backoff(self.consecutive_requested_restarts);
+        self.retry_at = Some(Instant::now() + delay);
+        let _ = self.diagnostics.send(DevDiagnostic {
+            source: self.kind.name(),
+            stream: DiagnosticStream::Supervisor,
+            text: format!(
+                "workspace changed; restarting with a fresh crate graph in {:.1}s",
+                delay.as_secs_f32()
+            ),
+        });
+    }
+
     fn record_failure(&mut self, reason: String) {
+        self.consecutive_requested_restarts = 0;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures > MAX_RAPID_FAILURES {
             self.gave_up = true;
@@ -829,6 +842,42 @@ profile = "debug"
         assert_eq!(backoff(1), BASE_BACKOFF);
         assert_eq!(backoff(2), BASE_BACKOFF * 2);
         assert_eq!(backoff(32), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn requested_restarts_are_rate_limited_and_escalate() {
+        let (diagnostics, rx) = mpsc::channel();
+        let command = ChildCommand {
+            program: PathBuf::from("unused"),
+            args: Vec::new(),
+            cwd: PathBuf::from("/"),
+            target_directory: None,
+        };
+        let mut child = ManagedChild {
+            kind: ChildKind::SourceWalk,
+            command,
+            child: None,
+            readers: Vec::new(),
+            diagnostics,
+            last_spawn: None,
+            consecutive_failures: 0,
+            consecutive_requested_restarts: 0,
+            retry_at: None,
+            gave_up: false,
+        };
+
+        let first_start = Instant::now();
+        child.record_requested_restart();
+        let first_retry = child.retry_at.unwrap();
+        assert!(first_retry >= first_start + BASE_BACKOFF);
+        assert_eq!(child.consecutive_requested_restarts, 1);
+
+        let second_start = Instant::now();
+        child.record_requested_restart();
+        let second_retry = child.retry_at.unwrap();
+        assert!(second_retry >= second_start + BASE_BACKOFF * 2);
+        assert_eq!(child.consecutive_requested_restarts, 2);
+        assert_eq!(rx.try_iter().count(), 2);
     }
 
     #[test]
