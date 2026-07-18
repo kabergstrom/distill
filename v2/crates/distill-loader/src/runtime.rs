@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use distill_core::id::ContentHash;
+use distill_core::id::{AssetUuid, ContentHash};
 use distill_store::state::SnapshotStamp;
 
 use crate::basis::IoBasis;
@@ -96,7 +96,7 @@ pub struct ConnectionEpoch(pub u64);
 pub enum RequestOwner {
     Handle(HandleId),
     Path(String),
-    Content(ContentHash),
+    Content { asset: AssetUuid, hash: ContentHash },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

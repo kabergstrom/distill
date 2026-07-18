@@ -6,10 +6,10 @@ use std::sync::{Arc, OnceLock};
 use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
-    AdoptionId, AssetStorage, FetchedArtifact, GameModuleEpoch, HandleId, IoBasis, IoEvent,
-    LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, ManifestState, PathResolveResult,
-    PendingState, PendingToken, RegistrationError, ReqId, ResolveResult, RuntimeTarget,
-    StorageError, TargetBindingState, UpdateResult,
+    AdoptionId, AssetStorage, CompletionDisposition, FetchedArtifact, GameModuleEpoch, HandleId,
+    IoBasis, IoEvent, LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, ManifestState,
+    PathResolveResult, PendingState, PendingToken, RegistrationError, ReqId, ResolveResult,
+    RuntimeTarget, StorageError, TargetBindingState, UpdateResult,
 };
 use distill_rpc::ServedLoadEdge;
 use distill_store::state::{InputVersion, StoreInstanceId};
@@ -514,6 +514,111 @@ fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
     assert_eq!(loader.status(&handle), LoadStatus::Loaded);
     assert_eq!(storage.updates.len(), 1);
     assert_eq!(storage.commits, storage.updates);
+}
+
+#[test]
+fn add_ref_during_a_live_sweep_joins_that_sweep() {
+    let token = ModuleEpochToken::new(63);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 63, &token);
+    let first_uuid = uuid(63);
+    let second_uuid = uuid(64);
+    let first = loader.add_ref::<A>(first_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let second = loader.add_ref::<B>(second_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().resolve_for(second_uuid).1, basis());
+
+    let (first_hash, first_artifact) = artifact::<A>(first_uuid, &[]);
+    let (second_hash, second_artifact) = artifact::<B>(second_uuid, &[]);
+    resolve(&mut loader, first_uuid, first_hash);
+    resolve(&mut loader, second_uuid, second_hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, first_hash, first_artifact);
+    fetched(&mut loader, second_hash, second_artifact);
+    loader.process(&mut storage).unwrap();
+
+    assert_eq!(loader.status(&first), LoadStatus::Loaded);
+    assert_eq!(loader.status(&second), LoadStatus::Loaded);
+    assert_eq!(storage.commits.len(), 2);
+}
+
+#[test]
+fn equal_fetch_hashes_are_owned_by_asset_and_cannot_wedge_a_sweep() {
+    let token = ModuleEpochToken::new(65);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 65, &token);
+    let first_uuid = uuid(65);
+    let second_uuid = uuid(66);
+    let first = loader.add_ref::<A>(first_uuid).unwrap();
+    let second = loader.add_ref::<B>(second_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    let shared_hash = ContentHash([0xaa; 32]);
+    resolve(&mut loader, first_uuid, shared_hash);
+    resolve(&mut loader, second_uuid, shared_hash);
+    loader.process(&mut storage).unwrap();
+    let fetches = loader
+        .io()
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Fetch(req, hash, request_basis) if *hash == shared_hash => {
+                Some((*req, request_basis.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fetches.len(), 2);
+
+    let (_, first_artifact) = artifact::<A>(first_uuid, &[]);
+    let (_, second_artifact) = artifact::<B>(second_uuid, &[]);
+    loader.io_mut().push(IoEvent::Fetched {
+        req: fetches[0].0,
+        content_hash: shared_hash,
+        artifact: first_artifact,
+        basis: fetches[0].1.clone(),
+    });
+    loader.io_mut().push(IoEvent::Fetched {
+        req: fetches[1].0,
+        content_hash: shared_hash,
+        artifact: second_artifact,
+        basis: fetches[1].1.clone(),
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&first), LoadStatus::Unloaded);
+    assert_eq!(loader.status(&second), LoadStatus::Unloaded);
+    assert!(!loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::StaleCompletion(CompletionDisposition::Superseded)
+    )));
+
+    let later_uuid = uuid(67);
+    let _later = loader.add_ref::<A>(later_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().resolve_for(later_uuid).1, basis());
+}
+
+#[test]
+fn releasing_the_last_handle_removes_its_live_sweep_candidate() {
+    let token = ModuleEpochToken::new(68);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 68, &token);
+    let abandoned_uuid = uuid(68);
+    let abandoned = loader.add_ref::<A>(abandoned_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+
+    drop(abandoned);
+    loader.process(&mut storage).unwrap();
+
+    let later_uuid = uuid(69);
+    let _later = loader.add_ref::<B>(later_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().resolve_for(later_uuid).1, basis());
 }
 
 #[test]

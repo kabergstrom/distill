@@ -1,4 +1,4 @@
-use distill_core::id::ContentHash;
+use distill_core::id::{AssetUuid, ContentHash};
 use distill_loader::runtime::ManifestTransitionError;
 use distill_loader::{
     AdoptionId, AssetDeltaState, CompletionDisposition, ConnectionEpoch, HandleId, IoBasis,
@@ -49,7 +49,10 @@ fn successful_completion_is_consumed_exactly_once() {
     let mut tracker = RequestTracker::new();
     let request = tracker
         .issue(
-            RequestOwner::Content(ContentHash([1; 32])),
+            RequestOwner::Content {
+                asset: AssetUuid([2; 16]),
+                hash: ContentHash([1; 32]),
+            },
             OutstandingPurpose::Fetch,
             basis(1),
         )

@@ -33,7 +33,7 @@ use crate::io::{
 };
 use crate::runtime::{
     AdoptionId, CompletionDisposition, HandleId, ManifestEntry, ManifestState, OutstandingPurpose,
-    RequestOwner, RequestTracker,
+    OutstandingRequest, RequestOwner, RequestTracker,
 };
 use crate::storage::{
     AssetStorage, GameModuleEpoch, PendingState, PendingToken, RuntimeEpochError, RuntimeEpochs,
@@ -349,6 +349,7 @@ struct Sweep {
     basis: IoBasis,
     candidates: BTreeMap<AssetUuid, CandidateRecord>,
     pending_paths: BTreeSet<String>,
+    dirty_seeds: BTreeSet<AssetUuid>,
 }
 
 struct PendingUpdate {
@@ -541,6 +542,7 @@ impl<I: LoaderIO> Loader<I> {
             adopted_at: AdoptionId(0),
         });
         self.dirty.insert(uuid);
+        self.add_to_live_sweep(BTreeSet::from([uuid]));
         Ok(Handle {
             id,
             lease,
@@ -873,6 +875,7 @@ impl<I: LoaderIO> Loader<I> {
     fn prune_released_slots(&mut self, storage: &mut dyn AssetStorage, released: Vec<HandleId>) {
         for id in released {
             if let Some(slot) = self.slots.remove(&id) {
+                let bound_uuid = slot.binding.uuid();
                 if let Some(uuid) = slot.subscribed_uuid {
                     self.release_asset_subscription(uuid);
                 }
@@ -898,6 +901,17 @@ impl<I: LoaderIO> Loader<I> {
                 }
                 self.direct_slots.retain(|_, value| *value != id);
                 self.path_slots.retain(|_, value| *value != id);
+                if let Some(uuid) = bound_uuid {
+                    if self.handles_for_uuid(uuid).is_empty() {
+                        self.dirty.remove(&uuid);
+                        if let Some(sweep) = &mut self.sweep {
+                            sweep.dirty_seeds.remove(&uuid);
+                            if let Some(candidate) = sweep.candidates.remove(&uuid) {
+                                destroy_candidate_values(candidate.terminal);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -968,8 +982,28 @@ impl<I: LoaderIO> Loader<I> {
             basis,
             candidates,
             pending_paths: self.dirty_paths.clone(),
+            dirty_seeds: self.dirty.clone(),
         });
         Ok(())
+    }
+
+    fn add_to_live_sweep(&mut self, seeds: BTreeSet<AssetUuid>) {
+        if self.sweep.is_none() {
+            return;
+        }
+        let affected = self.current_components_from(&seeds);
+        let sweep = self.sweep.as_mut().expect("checked above");
+        let basis = sweep.basis.clone();
+        sweep.dirty_seeds.extend(seeds);
+        for uuid in affected {
+            sweep.candidates.entry(uuid).or_insert(CandidateRecord {
+                basis: basis.clone(),
+                resolve_issued: false,
+                expected_terminal_types: BTreeSet::new(),
+                load_expectations: PlaceholderReferences::new(),
+                terminal: CandidateTerminal::Pending,
+            });
+        }
     }
 
     fn issue_sweep_requests(&mut self) -> Result<(), LoaderError> {
@@ -1195,14 +1229,18 @@ impl<I: LoaderIO> Loader<I> {
                         .push(LoaderDiagnostic::StaleCompletion(disposition));
                     return Ok(());
                 }
-                if !record.is_some_and(|record| {
-                    record.purpose == OutstandingPurpose::Fetch
-                        && record.owner == RequestOwner::Content(content_hash)
-                }) {
+                let Some(asset_uuid) = record.and_then(|record| match record {
+                    OutstandingRequest {
+                        purpose: OutstandingPurpose::Fetch,
+                        owner: RequestOwner::Content { asset, hash },
+                        ..
+                    } if hash == content_hash => Some(asset),
+                    _ => None,
+                }) else {
                     self.diagnostics.push(LoaderDiagnostic::EventMismatch);
                     return Ok(());
-                }
-                self.accept_fetched(content_hash, artifact, basis);
+                };
+                self.accept_fetched(asset_uuid, content_hash, artifact, basis);
             }
             IoEvent::RequestError {
                 req,
@@ -1224,8 +1262,8 @@ impl<I: LoaderIO> Loader<I> {
                             self.fail_candidate(uuid, &basis, message.clone());
                         }
                     }
-                    Some((OutstandingPurpose::Fetch, RequestOwner::Content(content_hash))) => {
-                        self.fail_content_candidate(content_hash, &basis, message.clone());
+                    Some((OutstandingPurpose::Fetch, RequestOwner::Content { asset, .. })) => {
+                        self.fail_candidate(asset, &basis, message.clone());
                     }
                     Some((OutstandingPurpose::ResolvePath, RequestOwner::Path(path))) => {
                         if let Some(sweep) = &mut self.sweep {
@@ -1309,7 +1347,10 @@ impl<I: LoaderIO> Loader<I> {
                 let req = self
                     .requests
                     .issue(
-                        RequestOwner::Content(content_hash),
+                        RequestOwner::Content {
+                            asset: uuid,
+                            hash: content_hash,
+                        },
                         OutstandingPurpose::Fetch,
                         event_basis.clone(),
                     )
@@ -1411,19 +1452,7 @@ impl<I: LoaderIO> Loader<I> {
                 }
             }
         }
-        let rebound_components = self.current_components_from(&rebound);
-        if let Some(sweep) = &mut self.sweep {
-            let basis = sweep.basis.clone();
-            for uuid in rebound_components {
-                sweep.candidates.entry(uuid).or_insert(CandidateRecord {
-                    basis: basis.clone(),
-                    resolve_issued: false,
-                    expected_terminal_types: BTreeSet::new(),
-                    load_expectations: PlaceholderReferences::new(),
-                    terminal: CandidateTerminal::Pending,
-                });
-            }
-        }
+        self.add_to_live_sweep(rebound);
         for uuid in unsubscribe {
             self.release_asset_subscription(uuid);
         }
@@ -1443,14 +1472,29 @@ impl<I: LoaderIO> Loader<I> {
 
     fn accept_fetched(
         &mut self,
+        uuid: AssetUuid,
         content_hash: ContentHash,
         artifact: FetchedArtifact,
         basis: IoBasis,
     ) {
-        let Some(uuid) = self.content_candidate_uuid(content_hash, &basis) else {
+        let candidate_matches = self
+            .sweep
+            .as_ref()
+            .and_then(|sweep| sweep.candidates.get(&uuid))
+            .is_some_and(|candidate| {
+                candidate.basis == basis
+                    && matches!(
+                        candidate.terminal,
+                        CandidateTerminal::Built {
+                            content_hash: expected,
+                            ..
+                        } if expected == content_hash
+                    )
+            });
+        if !candidate_matches {
             self.diagnostics.push(LoaderDiagnostic::EventMismatch);
             return;
-        };
+        }
         let blob_bytes = artifact
             .blobs
             .iter()
@@ -1641,31 +1685,21 @@ impl<I: LoaderIO> Loader<I> {
                 }
             }
         }
-        let Some(candidate) = self
+        let candidate = self
             .sweep
             .as_mut()
             .and_then(|sweep| sweep.candidates.get_mut(&uuid))
-        else {
-            return;
-        };
-        if candidate.basis != basis {
-            self.restart_sweep();
-            return;
-        }
+            .expect("fetched candidate was verified before value construction");
         let CandidateTerminal::Built {
-            content_hash: expected,
             fetched,
             type_uuid: candidate_type,
             load_deps: candidate_deps,
             values,
+            ..
         } = &mut candidate.terminal
         else {
-            return;
+            unreachable!("fetched candidate terminal was verified before value construction");
         };
-        if *expected != content_hash {
-            self.diagnostics.push(LoaderDiagnostic::EventMismatch);
-            return;
-        }
         *fetched = true;
         *candidate_type = Some(type_uuid);
         *candidate_deps = Some(load_deps.clone());
@@ -1673,44 +1707,10 @@ impl<I: LoaderIO> Loader<I> {
         candidate.load_expectations = load_expectations;
     }
 
-    fn content_candidate_uuid(
-        &self,
-        content_hash: ContentHash,
-        basis: &IoBasis,
-    ) -> Option<AssetUuid> {
-        self.sweep
-            .as_ref()?
-            .candidates
-            .iter()
-            .find_map(|(uuid, candidate)| {
-                if &candidate.basis != basis {
-                    return None;
-                }
-                match &candidate.terminal {
-                    CandidateTerminal::Built {
-                        content_hash: expected,
-                        ..
-                    } if *expected == content_hash => Some(*uuid),
-                    _ => None,
-                }
-            })
-    }
-
     fn reject_fetched(&mut self, uuid: AssetUuid, basis: &IoBasis, message: String) {
         self.diagnostics
             .push(LoaderDiagnostic::Artifact(message.clone()));
         self.fail_candidate(uuid, basis, message);
-    }
-
-    fn fail_content_candidate(
-        &mut self,
-        content_hash: ContentHash,
-        basis: &IoBasis,
-        message: String,
-    ) {
-        if let Some(uuid) = self.content_candidate_uuid(content_hash, basis) {
-            self.fail_candidate(uuid, basis, message);
-        }
     }
 
     fn fail_candidate(&mut self, uuid: AssetUuid, basis: &IoBasis, message: String) {
@@ -1887,24 +1887,10 @@ impl<I: LoaderIO> Loader<I> {
         }
         let held = sweep.candidates.keys().copied().collect::<BTreeSet<_>>();
         let current = self.current_graph();
-        let candidates = sweep
+        let graph = sweep
             .candidates
             .iter()
-            .map(|(uuid, candidate)| {
-                (
-                    *uuid,
-                    CandidateAsset {
-                        uuid: *uuid,
-                        basis: candidate.basis.clone(),
-                        load_deps: self.candidate_deps(candidate),
-                        outcome: self.candidate_outcome(*uuid, candidate),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let graph = candidates
-            .iter()
-            .map(|(uuid, candidate)| (*uuid, candidate.load_deps.clone()))
+            .map(|(uuid, candidate)| (*uuid, self.candidate_deps(candidate)))
             .collect::<BTreeMap<_, _>>();
         let cycles = load_cycles(&graph);
         for cycle in cycles {
@@ -1942,6 +1928,7 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let mut sweep = self.sweep.take().expect("checked Some");
+        let processed_dirty = std::mem::take(&mut sweep.dirty_seeds);
         for decision in decisions {
             match decision {
                 AdoptionDecision::Ready { members, .. } => {
@@ -1967,7 +1954,9 @@ impl<I: LoaderIO> Loader<I> {
                 AdoptionDecision::Reresolve { .. } => unreachable!("handled above"),
             }
         }
-        self.dirty.clear();
+        for uuid in processed_dirty {
+            self.dirty.remove(&uuid);
+        }
         Ok(())
     }
 
