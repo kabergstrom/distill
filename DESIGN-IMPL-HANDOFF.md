@@ -1,6 +1,6 @@
 # Distill v2 — implementation handoff
 
-_Updated 2026-07-16 after the post-closure New Game Plus integration and
+_Updated 2026-07-18 after the final cross-repository review closure and
 validation pass. This document is an operational handoff, not a second
 specification. `DESIGN.md` §§1–21 and its latest §22 refinements are normative;
 git history is the authority for landed milestones._
@@ -9,23 +9,23 @@ git history is the authority for landed milestones._
 
 The Distill v2 implementation is present under `v2/` as a sixteen-package Rust
 workspace, including its two real dynamic-module test fixtures. The current
-implementation milestone is commit `70048f0` (`Finalize GPU recovery and
-source-walk restarts`). The corresponding New Game Plus Vulkan integration
-milestone is `b636c66` (`Complete Vulkan asset runtime integration`), using
-Rafx `8bdc2cc1` (`Report post-submit presentation failures`). At those commits:
+implementation milestone is commit `ffd110a` (`Back off repeated source-walk
+restarts`). The corresponding New Game Plus Vulkan integration milestone is
+`7214f89` (`Fix RPC pointer introspection and test isolation`), using Rafx
+`e8702d93` (`Pin texture format wire representation`). At those commits:
 
-- `cargo test --workspace --offline` passes, including integration, UI, and doc
-  tests.
+- `cargo test --workspace --all-targets --offline` passes, including dynamic
+  module, game-asset, watcher, RPC, CAS, pack, migration, and doc tests.
 - `cargo clippy --workspace --all-targets --offline -- -D warnings` passes.
 - `git diff --check` passes.
 - The complete daemon/RPC texture/mesh/shader and schema-transition vertical
   suites pass.
-- The Vulkan New Game Plus integration compiles and its focused headless GPU
-  suite loads, replaces, and releases texture, mesh, and shader assets while
-  preserving stable resource keys across texture replacement. Metal is not a
-  validation target for this integration milestone.
-- Every confirmed CRITICAL/HIGH/MEDIUM adversarial-review finding is fixed with
-  a regression or rejected with concrete counterevidence.
+- The Vulkan New Game Plus library suite passes all 33 tests with the installed
+  ICD explicitly selected. Its real GPU path loads and releases texture, mesh,
+  and cooked-pipeline assets; no fake terminal payload stands in for the
+  pipeline compiler. Metal is not a validation target for this milestone.
+- Every concrete adversarial-review finding through the final review pass is
+  fixed with a regression or rejected with concrete counterevidence.
 - The filesystem overengineering audit is folded into R37 and the code: no
   retained directory handles, descriptor-relative traversal, persisted
   platform file identity, direct NT scanner, daemon `libc` dependency, or
@@ -35,7 +35,7 @@ Use the installed Rust toolchain directly:
 
 ```sh
 cd /Users/karl/Projects/distill/v2
-cargo test --workspace --offline
+cargo test --workspace --all-targets --offline
 cargo clippy --workspace --all-targets --offline -- -D warnings
 ```
 
@@ -43,9 +43,10 @@ The New Game Plus integration is validated separately from its repository root:
 
 ```sh
 cd /Users/karl/Projects/newgameplus
-cargo check -p newgameplus --features rafx-vulkan --offline
-cargo test -p newgameplus --lib --features rafx-vulkan \
-  distill_assets::tests --offline --no-fail-fast
+cargo +nightly test -p source-walk
+VULKAN_SDK=/Users/karl/VulkanSDK/1.4.321.0/macOS \
+VK_ICD_FILENAMES=/Users/karl/VulkanSDK/1.4.321.0/macOS/share/vulkan/icd.d/MoltenVK_icd.json \
+  cargo +nightly test -p newgameplus --lib --features rafx-vulkan
 ```
 
 The focused GPU test requires a usable Vulkan loader/ICD. On the current macOS
@@ -136,6 +137,9 @@ Relevant New Game Plus milestones, oldest to newest:
 - `c98ccd3 Integrate Distill GPU asset runtime`
 - `80918c1 Validate Distill GPU asset residency`
 - `b636c66 Complete Vulkan asset runtime integration`
+- `1a25698 Validate Distill texture residency inputs`
+- `a8ddc7c Publish source-walk outputs transactionally`
+- `7214f89 Fix RPC pointer introspection and test isolation`
 
 `ngp-schema` rejects duplicate canonical keys in either merge input. Its full
 offline test suite and `--no-deps` Clippy pass. Full dependency Clippy currently
@@ -172,6 +176,17 @@ into Rafx resources, and uses device generations to reject stale transfer
 completion. It retains resource identities, loader handles, and one shared
 cooked package per resident pipeline asset—not duplicate full CPU asset
 payloads.
+
+The closing review also pins `RafxFormat` to `repr(u8)` and centralizes checked
+wire-discriminant conversion in Rafx. NGP rejects undefined and depth/stencil
+terminal texture payloads before GPU access while retaining valid block-
+compressed color support. Source-walk publishes a schema only after the paired
+defaults/drops crates build, uses exclusive unique temporary files, flushes
+file data before rename, and syncs the containing directory on Unix. Failed
+support builds or publication leave the prior schema authoritative and
+retryable. Loader live-sweep ownership is per asset even when content hashes
+match, and add/release operations during a sweep cannot strand dirty work or
+storage candidates.
 
 ## 4. Workspace map and implemented behavior
 
@@ -457,6 +472,8 @@ The final implementation sequence on the Distill repository is:
 - `47dd429 Add loader storage repopulation`
 - `d35c948 Cook and load real game asset terminals`
 - `70048f0 Finalize GPU recovery and source-walk restarts`
+- `99ccce6 Fix loader sweep lifecycle stalls`
+- `ffd110a Back off repeated source-walk restarts`
 
 Earlier watcher milestones include:
 
