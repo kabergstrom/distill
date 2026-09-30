@@ -397,6 +397,11 @@ impl ServerHandle {
         self.published.send_modify(|count| *count = count.wrapping_add(1));
     }
 
+    /// How many publications readers have been told about.
+    pub fn publication_count(&self) -> u64 {
+        *self.published.borrow()
+    }
+
     fn subscribe(&self) -> watch::Receiver<u64> {
         self.published.subscribe()
     }

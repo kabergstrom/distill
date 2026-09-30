@@ -146,7 +146,8 @@ impl DaemonProcess {
             codegen,
             stop: Arc::clone(&stop),
             errors,
-            next_tick: Instant::now() + DEBOUNCE,
+            due: Some(Instant::now()),
+            publications: 0,
             next_retention_sweep: Instant::now() + RETENTION_SWEEP_INTERVAL,
         };
         // Startup runs on the authority before the loop: events the watcher
@@ -300,7 +301,10 @@ struct ProcessDriver {
     codegen: CodegenService,
     stop: Arc<AtomicBool>,
     errors: watch::Sender<Option<String>>,
-    next_tick: Instant,
+    /// When the next pass is due; `None` until something asks for one.
+    due: Option<Instant>,
+    /// The server's publication count the last pass saw.
+    publications: u64,
     next_retention_sweep: Instant,
 }
 
@@ -416,26 +420,52 @@ impl ProcessDriver {
                 if let Err(error) = self.codegen.run(&self.coordinator) {
                     tracing::warn!(%error, "codegen failed");
                     self.errors.send_replace(Some(error));
+                    self.schedule(Instant::now() + DEBOUNCE);
                 }
             }
         }
         true
+    }
+
+    /// Run a pass by `at` at the latest.
+    fn schedule(&mut self, at: Instant) {
+        self.due = Some(self.due.map_or(at, |due| due.min(at)));
     }
 }
 
 impl Driver for ProcessDriver {
     fn watch(&mut self, event: WatcherEvent) {
         self.queue.push(event);
+        // Debounce: a burst of events is reconciled together.
+        self.schedule(Instant::now() + DEBOUNCE);
     }
 
     fn deadline(&self) -> Instant {
-        self.next_tick
+        self.due
+            .map_or(self.next_retention_sweep, |due| due.min(self.next_retention_sweep))
     }
 
     fn fire(&mut self) -> bool {
+        self.due = None;
         let keep = self.tick();
-        self.next_tick = Instant::now() + DEBOUNCE;
+        self.publications = self.coordinator.server_handle().publication_count();
+        if self.queue.has_pending() {
+            // A failed pass requeued its work.
+            self.schedule(Instant::now() + DEBOUNCE);
+        }
         keep
+    }
+
+    fn poke(&mut self) {
+        self.schedule(Instant::now());
+    }
+
+    fn ran_job(&mut self) {
+        // A publication from elsewhere (an RPC write, an import) still needs
+        // codegen.
+        if self.coordinator.server_handle().publication_count() != self.publications {
+            self.schedule(Instant::now());
+        }
     }
 }
 

@@ -29,6 +29,10 @@ pub(crate) trait Driver {
     fn deadline(&self) -> Instant;
     /// Run the due work. `false` detaches the driver.
     fn fire(&mut self) -> bool;
+    /// Something asked for attention ([`AuthoritySender::poke`]).
+    fn poke(&mut self);
+    /// The authority ran a job, which may have published.
+    fn ran_job(&mut self);
 }
 
 /// Builds a driver on the authority thread; `None` attaches nothing.
@@ -37,6 +41,7 @@ pub(crate) type DriverFactory = Box<dyn FnOnce() -> Option<Box<dyn Driver>> + Se
 enum Message {
     Run(AuthorityJob),
     Watch(WatcherEvent),
+    Poke,
     Attach(DriverFactory),
     Detach,
     Shutdown,
@@ -82,6 +87,12 @@ impl AuthoritySender {
 
     pub(crate) fn watch(&self, event: WatcherEvent) {
         let _ = self.inbox.send(Message::Watch(event));
+    }
+
+    /// Ask the driver to look at the pipeline (a runtime poison, or a
+    /// retired epoch that may unload).
+    pub(crate) fn poke(&self) {
+        let _ = self.inbox.send(Message::Poke);
     }
 
     /// Install the process loop. Watcher events sent before it runs wait
@@ -168,7 +179,17 @@ fn run(messages: mpsc::Receiver<Message>) {
                     }
                 }
             }
-            Some(Message::Run(job)) => job(),
+            Some(Message::Run(job)) => {
+                job();
+                if let Some(active) = driver.as_mut() {
+                    active.ran_job();
+                }
+            }
+            Some(Message::Poke) => {
+                if let Some(active) = driver.as_mut() {
+                    active.poke();
+                }
+            }
             Some(Message::Watch(event)) => {
                 if let Some(active) = driver.as_mut() {
                     active.watch(event);

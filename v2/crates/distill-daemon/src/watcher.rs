@@ -123,6 +123,14 @@ impl WatcherQueue {
         }
     }
 
+    /// Whether anything waits to be reconciled.
+    pub fn has_pending(&self) -> bool {
+        self.overflowed
+            || self.failed.is_some()
+            || !self.paths.is_empty()
+            || !self.renames.is_empty()
+    }
+
     pub fn take_live_action(&mut self) -> WatcherAction {
         if self.scanning {
             WatcherAction::None

@@ -225,6 +225,9 @@ impl DaemonCoordinator {
                 authority: authority.sender().clone(),
             }),
         )?;
+        let mut host = host;
+        let poke = authority.sender().clone();
+        host.set_wake(Arc::new(move || poke.poke()));
         let pipeline = CoordinatedPipelineRuntime {
             host,
             loader: DynamicPipelineModuleLoader,

@@ -813,8 +813,22 @@ pub struct EpochStatus {
     pub unloaded: bool,
 }
 
+/// Called when an epoch may need its host's attention: a runtime poison
+/// to persist, or a retired epoch that may now unload.
+pub type EpochWake = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct PipelineEpoch(Arc<EpochInner>);
+
+impl Drop for PipelineEpoch {
+    fn drop(&mut self) {
+        // A drained, healthy epoch may unload once its last other holder is
+        // gone. (A poisoned one never unloads.)
+        if self.0.draining.load(Ordering::Acquire) && self.0.runtime_error.get().is_none() {
+            self.0.wake();
+        }
+    }
+}
 
 impl std::fmt::Debug for PipelineEpoch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -844,6 +858,7 @@ struct EpochInner {
     registration_arena: Option<CandidateRegistrationArena>,
     /// Touched only with the epoch exclusively held, or in `Drop`.
     module: Option<Box<dyn LoadedPipelineModule>>,
+    wake: OnceLock<EpochWake>,
 }
 
 // SAFETY: the module is reached only through `&mut EpochInner`. The arena's
@@ -894,6 +909,7 @@ impl PipelineEpoch {
             runtime_error: OnceLock::new(),
             registration_arena: Some(arena),
             module: Some(module),
+            wake: OnceLock::new(),
         }))
     }
 
@@ -1377,6 +1393,12 @@ impl PipelineEpoch {
 }
 
 impl EpochInner {
+    fn wake(&self) {
+        if let Some(wake) = self.wake.get() {
+            wake();
+        }
+    }
+
     fn observe_token_poison(&self) {
         if let Some(cause) = self.token.poison_cause() {
             let (code, detail) = match cause {
@@ -1399,7 +1421,9 @@ impl EpochInner {
             _ => ModuleEpochPoisonCause::CallbackRejected,
         });
         self.accepting.store(false, Ordering::Release);
-        let _ = self.runtime_error.set((code, detail));
+        if self.runtime_error.set((code, detail)).is_ok() {
+            self.wake();
+        }
     }
 
     fn rejection(&self) -> EpochWorkError {
@@ -1445,7 +1469,11 @@ pub enum EpochWorkError {
 
 impl Drop for EpochJobGuard {
     fn drop(&mut self) {
-        self.epoch.active_jobs.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.epoch.active_jobs.fetch_sub(1, Ordering::AcqRel);
+        let drained = previous == 1 && !self.epoch.accepting.load(Ordering::Acquire);
+        if drained || self.epoch.token.is_poisoned() {
+            self.epoch.wake();
+        }
     }
 }
 
@@ -1494,6 +1522,7 @@ pub struct ModuleHost {
     next_epoch_id: u64,
     published: Option<PublishedState>,
     retired: Vec<PipelineEpoch>,
+    wake: Option<EpochWake>,
 }
 
 impl ModuleHost {
@@ -1505,7 +1534,20 @@ impl ModuleHost {
             next_epoch_id: 1,
             published: None,
             retired: Vec::new(),
+            wake: None,
         })
+    }
+
+    /// Call `wake` when one of this host's epochs needs attention
+    /// ([`ModuleHost::reap_retired`], or persisting a runtime poison).
+    pub(crate) fn set_wake(&mut self, wake: EpochWake) {
+        self.wake = Some(wake);
+    }
+
+    fn attach_wake(&self, epoch: &PipelineEpoch) {
+        if let Some(wake) = &self.wake {
+            let _ = epoch.0.wake.set(Arc::clone(wake));
+        }
     }
 
     pub fn snapshot(&self) -> PipelineSnapshot {
@@ -1768,6 +1810,7 @@ impl ModuleHost {
     }
 
     pub(crate) fn install_ready(&mut self, epoch: PipelineEpoch) {
+        self.attach_wake(&epoch);
         self.retire_published_ready();
         self.published = Some(PublishedState::Ready(epoch));
     }
