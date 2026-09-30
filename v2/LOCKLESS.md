@@ -521,7 +521,7 @@ should reach zero by the end of phase 6.
     left in distill-store, distill-rpc or distill-daemon. The dev
     supervisor's sleeps go away with it in phase 9.
 
-- **Phase 7:** in progress.
+- **Phase 7:** done (commits `2505ff3`, `2f915c3`).
   - Namespace errors are per-entity. The `errors` table (store `errors.rs`)
     holds every current scan error, each scoped to its file, bundle or
     asset. `store_meta.version_poison` and the gates that made every
@@ -539,6 +539,18 @@ should reach zero by the end of phase 6.
   - A scan the filesystem refused (unreadable subtree, path collision,
     invalid path) keeps the namespace it had and publishes the errors.
   - Metadata diagnostics list every namespace error.
+  - Deviation from §4: only namespace errors live in `errors`. The
+    configuration error and the pipeline failure keep their single-row
+    state and their own gates, since each already scopes to one entity
+    (the configuration, the pipeline epoch): a pipeline failure blocks
+    builds against the target, not the namespace or metadata reads.
+    Bundle skeleton errors (`bundles.poison`) and tag-index errors stay
+    as columns on their own rows, for the same reason.
+  - The vocabulary is renamed: `VersionPoison` → `NamespaceError`,
+    `ConfigurationPoison` → `ConfigurationError`, `PipelinePoison` →
+    `PipelineFailure` (the `Poisoned` status arms became `Failed`). The
+    persisted bytes and SQL columns are unchanged. "Poison" now means only
+    a bundle's or tag entry's own error and a module epoch token.
 
 ## 7. Test baseline
 
