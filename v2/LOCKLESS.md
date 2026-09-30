@@ -155,75 +155,49 @@ work. If that work fails, SQLite and memory diverge:
 
 ## 3. Target thread model
 
+As built in phase 11. There is no authority thread: each thread writes on
+a connection of its own, and SQLite's write lock orders the writers.
+
 ```
- notify ──FsBatch──▶ ┌────────────┐ ──Job──▶ pool worker ×N (StoreReader each)
-                     │ authority  │ ◀─JobDone─┘
- rpc ────Command───▶ │ StoreWriter│
-    ◀──Published(v)──│ + CAS write│
-                     └────────────┘
- rpc (LocalSet, StoreReader, owns connections/leases/subscriptions)
-    ──BuildJob──▶ pool ──JobDone──▶ authority ──reply(hash)──▶ rpc
+ notify ──▶ watcher ──WatcherEvent──▶ process loop ──(own writer)──▶ SQLite
+ rpc (LocalSet front end: connections, snapshots, subscriptions)
+    ├─ reads: own StoreReader, one read transaction per snapshot
+    └─ writes, imports, builds: spawn_blocking ──(own writer)──▶ SQLite
+ scheduler workers: builds, each on its own reader and writer
 ```
 
-- **authority** (one OS thread) runs a blocking `recv` on its inbox. It never
-  sleep-polls; it debounces file events with `recv_timeout` against a
-  deadline. Messages:
-  - `FsBatch`, the watcher's raw events;
-  - `Command(AuthoringCommand, reply)`: write, import, reimport, operation,
-    lineage repair, admin;
-  - `JobDone(result)`: import or build result;
-  - `ConfigChanged`;
-  - `Shutdown`.
-
-  For each message the authority:
-  1. reads what it needs through its own connection,
-  2. plans,
-  3. dispatches jobs or performs journaled file publications,
-  4. runs one transaction,
-  5. sends notifications.
-- **Imports are jobs.** The authority sends `ImportJob{version, bundle,
-  importer, config, pipeline}`. A worker runs the importer against the
-  filesystem plus its `StoreReader` at `version` and returns the bundle
-  bytes plus the read set. The authority then:
-  1. revalidates the read set against `files` (an optimistic base check),
-  2. performs the journaled bundle-file publication,
-  3. commits namespace rows, `import_reads`, and the change log in one
-     transaction.
-
-  If the base drifted, it re-queues the job. No importer runs under any
-  lock or on the RPC thread.
-- **Builds are jobs.**
-  - RPC resolve sends `BuildJob{version, target, asset}`. The RPC thread
-    keeps an ephemeral in-flight map, which gives cross-request dedupe
-    (missing today).
-  - A worker does memo lookup and trace revalidation against its reader.
-    It builds dependency reads *inline* on the same worker with a per-job
-    content-addressed memo, and encodes the artifacts.
-  - It returns the encoded records.
-  - The authority appends to the CAS, indexes, and writes
-    `artifact_load_edges` and `resolutions` in one transaction, then
-    replies with the hash. If the build's input version is not the
-    snapshot's and its trace disagrees with the snapshot, the reply is
-    `Drifted` and the client retries on a fresh snapshot.
-  - A trace read no longer snapshots the whole project
-    (`StoreTraceSource::capture` is O(project) per callback today). It is
-    a point query on the worker's reader.
+- **Writers.** `SharedStore` hands each thread a writer from an idle pool.
+  Every write transaction takes the lock up front (`BEGIN IMMEDIATE`), so
+  a transaction reads the state it writes over. A thread with a
+  transaction open keeps its writer, and its reads go through it; nested
+  calls join that transaction (`write_transaction_with`). Reads otherwise
+  use the thread's own `StoreReader`.
+- **The process loop** owns the `WatcherQueue`, `ConfigWatch` and codegen.
+  It debounces watcher events against a deadline, publishes scans and
+  imports, and runs startup. Its scan state (the pending rejection and
+  health) sits in a `Mutex` other publications read.
+- **watcher** forwards `notify` events to the loop and holds no queue
+  state. It stops on its command channel.
+- **Imports and authoring calls** run on the calling thread, or on a
+  blocking worker for RPC. A publication reads its base inside its own
+  transaction and is refused if the base moved. No importer runs on the
+  RPC thread or inside a write transaction.
+- **Builds** run on scheduler workers. A worker does memo lookup and trace
+  revalidation against its reader, builds dependency reads inline, and
+  commits the CAS index, `artifact_load_edges` and `resolutions` in one
+  transaction on its own writer.
 - **rpc front ends** are cheap, `!Send`, per-thread values
   (`Rc<RefCell<…>>` state on a `LocalSet`). Each owns its connections,
-  subscriptions, lease timers, pack sessions, and in-flight build map, a
-  `StoreReader` for current-state and fence reads, and one read-transaction
-  connection per snapshot lease. Authoring and build requests go to the
-  authority over a channel with oneshot replies. Several front ends can
-  coexist (the daemon's RPC thread, a test thread). On a change-log `watch`
-  tick they read `change_log` and fan deltas out. Lease expiry is checked
-  lazily on access plus `tokio::time`, and the `distill-rpc-lease-expiry`
-  thread is deleted.
-- **watcher** forwards `notify` events to the authority inbox. It holds no
-  queue state.
-- **CAS compaction** is authority-only. Retired segment files are deleted
-  only after the jobs dispatched before the retirement have completed and
-  no snapshot lease predates the retirement. Readers resolve segment names from
-  `cas_segments`.
+  subscriptions, in-flight build map and snapshots. A snapshot is a read
+  transaction; the capnp transport expires it after a fixed TTL (30 s by
+  default, `SnapshotPolicy`), with a `spawn_local` timer, and caps the
+  number open. A call on an expired snapshot fails with
+  `SnapshotExpired`, and the client retries on a new one. Nothing pins
+  artifacts or CAS segments.
+- **CAS reclamation** deletes a retired segment once no read transaction
+  can still see it: the daemon waits the snapshot TTL plus a margin.
+- **Module epochs** unload when the last clone of their token drops.
+- The only atomics are ID and temp-name sequences.
 
 ## 4. Error model: per-entity rows instead of poisons
 
@@ -351,6 +325,14 @@ baseline failures) and the deferred-ngp hot-reload scenario still working
 9. **Bootstrap CLI and harness removal.**
 10. **Journal, quarantine, and lineage** (§5.7): replaced by atomic writes,
     migrate on read and `renamed_from`.
+
+11. **No authority, no leases, no drain atomics.**
+    - Each thread writes on its own connection with `BEGIN IMMEDIATE`.
+    - Snapshot capabilities expire at a fixed TTL; nothing pins.
+    - Module epochs unload on the last clone's drop.
+    - CAS files are reclaimed by a read bound.
+    - Owning-thread state is plain fields or `OnceLock`s. The only atomics
+      left are ID and temp-name sequences.
 
 A grep for `Mutex|RwLock|Condvar` over `distill-{store,rpc,daemon}/src`
 should reach zero by the end of phase 6.
@@ -711,6 +693,78 @@ should reach zero by the end of phase 6.
       rejected (`deny_unknown_fields`). A store from before SCHEMA_VERSION
       34 is refused; delete the state directory.
     - The scan diagnostic tag for quarantine no longer decodes.
+
+- **Phase 11:** done (commits `833a4ea`, `d614d5d`, `ac0896f`, `2753221`,
+  `e3d495d`; newgameplus `aef3393`). distill from `0c3f6d9`: 60 files,
+  +4368 −5256.
+  - **Epochs** (`833a4ea`): a `PipelineEpoch` is an `Arc`; the last drop
+    cleans registrations up, unloads and closes the library. The drain
+    atomics, arena fence, `EpochWake`, the retired list and reap polling
+    are gone.
+  - **CAS** (`d614d5d`): a read of CAS bytes finishes within the snapshot
+    TTL of its index lookup. Eviction deletes index rows; compaction
+    copies live records and repoints the index in one transaction; the
+    loop's `SegmentSweeper` deletes a dead segment's file after the TTL
+    plus `CAS_DELETE_MARGIN` (10 s). `cas_segments` replaces `CURRENT`;
+    each writer appends to its own segment; `cas_refs` makes pruning one
+    statement. The pins table, `CAS_MAINTENANCE` and build gating are
+    gone (SCHEMA_VERSION 35).
+  - **Writers** (`ac0896f`): the authority thread is gone. `SharedStore`
+    gives each thread a writer (see §3); RPC publications run as
+    `WriteCall`s on `spawn_blocking`; the scan/publish loop is its own
+    thread.
+  - **Snapshots** (`2753221`): a snapshot capability holds its read
+    transaction until dropped, its connection closes, or the TTL passes
+    (`SnapshotPolicy`, default 30 s, a `spawn_local` timer armed by the
+    capnp transport). Use does not extend it. Calls on an expired one
+    answer `snapshotExpired`; a fetch whose blob left the CAS answers
+    `ARTIFACT_NOT_FOUND`; a connection closed by the connection bound
+    answers `CONNECTION_CLOSED`. The loader retries the round at a new
+    snapshot on either, up to 3 times; pack builds retry the same way.
+    Artifact and pack-session pins, `ArtifactLeaseBackend`, connection
+    deadlines and the lease sweep are gone (PROTOCOL_VERSION 9).
+  - **Atomics** (`e3d495d`): `scan_initialized` and the import index flag
+    are `OnceLock`s, scan health sits with the pending scan rejection, the
+    watcher stops on its command channel, and a module epoch token latches
+    its poison cause in a `OnceLock`. Left outside tests: scheduler
+    `next_id`, `TEMP_SEQUENCE` (atomic.rs), pack activation `TEMP_ID`,
+    `NEXT_SHARED_ID`, and `NEXT_HANDLE_ID` plus the embedded state-dir
+    `NEXT` in server.rs.
+  - **Mutexes added:**
+    - `SharedStore::idle`: the idle writer pool, shared by every thread;
+      held only to push or pop.
+    - `PipelineState::runtime`: the module host; taken to prepare,
+      install or fail an epoch, never while waiting on the write lock.
+    - `DaemonCoordinator::scan` (pending rejection and health) and
+      `configuration_error`: written by the loop, read by publications on
+      other threads.
+  - **Tests:** 1044 passed, 1 failed (the known
+    `tool_output_is_drained_while_large_stdin_is_written`); newgameplus
+    lib 61 passed.
+  - **Headless check:** pipeline build, source-walk, daemon on
+    127.0.0.1:9910, import of tonemap.comp and lighting.comp; the RPC
+    client saw lighting.comp's new content hash ~0.4 s after an edit to
+    `gbuffer_common.glsl`, tonemap.comp's unchanged.
+  - **Deviations:**
+    - Tag-index refinement, build commits and `DeferredOperation`
+      completion run inside the input transaction. The front end's
+      build-result cache stays.
+    - `distilld pack` against a running daemon fails with `StateLocked`
+      (the state directory's process lock).
+    - Snapshots of one version on one front end share a `SnapshotTxn`;
+      each capability has its own expiry.
+    - Only the capnp transport arms expiry. In-process callers (pack,
+      tests) release on drop.
+    - The snapshot policy is per front end: a test installs it on the
+      serving thread's front end.
+    - Hub connections no longer time out; the connection bound closes
+      the oldest. The loader's reconnect path stays for transport loss.
+    - Resolve still checks that the artifact is in the CAS, without
+      pinning it.
+    - The import index flag is per process. A forced rebuild that fails
+      rolls back and leaves the flag set, so the old index stands until
+      the next full import pass.
+    - A stopping watcher delivers the events queued before `Stop`.
 
 ## 7. Test baseline
 
