@@ -89,16 +89,18 @@ impl Store {
     }
 
     pub fn clear_watched_import_failure(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
-        if self.watched_import_failure(bundle)?.is_none() {
-            return Ok(false);
-        }
-        let (removed, _) = self.memo_transaction(|transaction, _| {
-            Ok(transaction.execute(
-                "DELETE FROM watched_import_failures WHERE bundle_uuid = ?1",
-                [bundle.0.as_slice()],
-            )? > 0)
-        })?;
-        Ok(removed)
+        self.write_txn(|store| {
+            if store.watched_import_failure(bundle)?.is_none() {
+                return Ok(false);
+            }
+            let (removed, _) = store.memo_transaction(|transaction, _| {
+                Ok(transaction.execute(
+                    "DELETE FROM watched_import_failures WHERE bundle_uuid = ?1",
+                    [bundle.0.as_slice()],
+                )? > 0)
+            })?;
+            Ok(removed)
+        })
     }
 }
 
@@ -193,63 +195,65 @@ impl Store {
         sources: Option<&[(String, String)]>,
         rows: &[ImportIndexSource],
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.savepoint()?;
-        match sources {
-            None => transaction.execute_batch(
-                "DELETE FROM import_reads; DELETE FROM import_records;
-                 DELETE FROM directory_rule_sources;",
-            )?,
-            Some(sources) => {
-                for (root, path) in sources {
-                    let params = rusqlite::params![root, path];
-                    transaction.execute(
-                        "DELETE FROM import_reads WHERE bundle_uuid IN (
-                           SELECT t.bundle_uuid FROM import_records t JOIN roots r USING (root_id)
-                           WHERE r.name = ?1 AND t.path = ?2)",
-                        params,
-                    )?;
-                    for table in ["import_records", "directory_rule_sources"] {
+        self.write_txn(|store| {
+            let transaction = store.read.conn.savepoint()?;
+            match sources {
+                None => transaction.execute_batch(
+                    "DELETE FROM import_reads; DELETE FROM import_records;
+                     DELETE FROM directory_rule_sources;",
+                )?,
+                Some(sources) => {
+                    for (root, path) in sources {
+                        let params = rusqlite::params![root, path];
                         transaction.execute(
-                            &format!(
-                                "DELETE FROM {table} WHERE rowid IN (
-                                   SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
-                                   WHERE r.name = ?1 AND t.path = ?2)"
-                            ),
+                            "DELETE FROM import_reads WHERE bundle_uuid IN (
+                               SELECT t.bundle_uuid FROM import_records t JOIN roots r USING (root_id)
+                               WHERE r.name = ?1 AND t.path = ?2)",
                             params,
                         )?;
+                        for table in ["import_records", "directory_rule_sources"] {
+                            transaction.execute(
+                                &format!(
+                                    "DELETE FROM {table} WHERE rowid IN (
+                                       SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
+                                       WHERE r.name = ?1 AND t.path = ?2)"
+                                ),
+                                params,
+                            )?;
+                        }
                     }
                 }
             }
-        }
-        for row in rows {
-            let root = crate::files::intern_root(&transaction, &row.root_name)?;
-            if let Some(watched) = &row.watched {
-                let bundle = watched.bundle.0.as_slice();
-                transaction.execute("DELETE FROM import_reads WHERE bundle_uuid = ?1", [bundle])?;
-                transaction.execute(
-                    "INSERT OR REPLACE INTO import_records(bundle_uuid, root_id, path, basis)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![bundle, root.0, row.path, watched.basis],
-                )?;
-                for read in &watched.reads {
-                    let (kind, key) = read.row();
+            for row in rows {
+                let root = crate::files::intern_root(&transaction, &row.root_name)?;
+                if let Some(watched) = &row.watched {
+                    let bundle = watched.bundle.0.as_slice();
+                    transaction.execute("DELETE FROM import_reads WHERE bundle_uuid = ?1", [bundle])?;
                     transaction.execute(
-                        "INSERT OR IGNORE INTO import_reads(bundle_uuid, kind, key)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![bundle, kind, key],
+                        "INSERT OR REPLACE INTO import_records(bundle_uuid, root_id, path, basis)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![bundle, root.0, row.path, watched.basis],
+                    )?;
+                    for read in &watched.reads {
+                        let (kind, key) = read.row();
+                        transaction.execute(
+                            "INSERT OR IGNORE INTO import_reads(bundle_uuid, kind, key)
+                             VALUES (?1, ?2, ?3)",
+                            rusqlite::params![bundle, kind, key],
+                        )?;
+                    }
+                }
+                for (bundle, asset) in &row.directory_rules {
+                    transaction.execute(
+                        "INSERT OR REPLACE INTO directory_rule_sources(rules_bundle, rules_asset, root_id, path)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![bundle.0.as_slice(), asset.0.as_slice(), root.0, row.path],
                     )?;
                 }
             }
-            for (bundle, asset) in &row.directory_rules {
-                transaction.execute(
-                    "INSERT OR REPLACE INTO directory_rule_sources(rules_bundle, rules_asset, root_id, path)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![bundle.0.as_slice(), asset.0.as_slice(), root.0, row.path],
-                )?;
-            }
-        }
-        transaction.commit()?;
-        Ok(())
+            transaction.commit()?;
+            Ok(())
+        })
     }
 }
 

@@ -19,7 +19,7 @@ use distill_store::{StoreError, StoreReader};
 use crate::persist::decode_drifted_input;
 use crate::server::{
     authoring_entry, entry_role, history_deltas, is_embedded, pipeline_failure,
-    publish_backend_commit, store_failure, AuthorityCall, BuildKey, BuildResolution, ConnectionState,
+    publish_backend_commit, store_failure, BuildKey, BuildResolution, ConnectionState,
     MetadataBinding, PackSessionLease, SnapshotTxn, ViewLease, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
@@ -583,22 +583,9 @@ fn validate_progress(events: &[AuthoringProgressEvent]) -> Result<(), String> {
     Ok(())
 }
 
-/// What a job on the authority answered, or that the authority stopped.
-fn authority_outcome<T>(
-    outcome: Result<Option<RpcResult<T>>, AuthorityStopped>,
-) -> Option<RpcResult<T>> {
-    outcome.unwrap_or_else(|AuthorityStopped| {
-        Some(RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-            operation: "authority".to_owned(),
-        }))
-    })
-}
-
 /// What a [`Hub::write_call`] answered.
-pub fn write_call_outcome(
-    outcome: Result<Option<RpcResult<InputVersion>>, AuthorityStopped>,
-) -> RpcResult<InputVersion> {
-    authority_outcome(outcome).unwrap_or_else(|| {
+pub fn write_call_outcome(outcome: Option<RpcResult<InputVersion>>) -> RpcResult<InputVersion> {
+    outcome.unwrap_or_else(|| {
         RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
             operation: "write".to_owned(),
         })
@@ -606,48 +593,64 @@ pub fn write_call_outcome(
 }
 
 /// What a [`Hub::import_publish_call`] answered.
-pub fn import_call_outcome(
-    outcome: Result<Option<RpcResult<BundleUuid>>, AuthorityStopped>,
-) -> RpcResult<BundleUuid> {
-    authority_outcome(outcome).expect("an import always publishes")
+pub fn import_call_outcome(outcome: Option<RpcResult<BundleUuid>>) -> RpcResult<BundleUuid> {
+    outcome.expect("an import always publishes")
 }
 
-/// Complete a prepared operation on the authority, still at `base`.
-fn complete_on_authority(
+/// Complete a prepared operation as one input, still at `base`.
+fn complete_publication_call(
     server: &Server,
     base: InputVersion,
     publication: PreparedOperationPublication,
     what: &'static str,
-) -> AuthorityCall<Result<(), String>> {
-    server
-        .authority_call(move |server| {
-            let current = server.inner.current_stamp().version;
-            if current != base {
-                return Err(format!(
-                    "{what} lost its input basis: expected {base:?}, observed {current:?}"
-                ));
-            }
-            complete_publication(server, base, publication, what)
-        })
+) -> WriteCall<Result<(), String>> {
+    server.write_call(move |server| {
+        let mut failed = None;
+        let mut terminal = None;
+        let published = server.coordinated_maybe_commit(base, || {
+            let (commit, terminal_error) = match publication {
+                PreparedOperationPublication::Immediate(commit) => (*commit, None),
+                PreparedOperationPublication::Deferred(operation) => {
+                    match operation.complete(base) {
+                        Ok(completed) => (completed.commit, completed.terminal_error),
+                        Err(error) => {
+                            failed = Some(error);
+                            return Ok(None);
+                        }
+                    }
+                }
+            };
+            terminal = terminal_error;
+            Ok(Some(commit))
+        });
+        match published {
+            Ok(_) if failed.is_some() => Err(failed.expect("checked")),
+            Ok(_) => terminal.map_or(Ok(()), Err),
+            Err(CoordinatedCommitError::Stale { expected, observed }) => Err(format!(
+                "{what} lost its input basis: expected {expected:?}, observed {observed:?}"
+            )),
+            Err(error) => Err(format!(
+                "{what} commit rejected: {:?}",
+                coordinated_failure(error)
+            )),
+        }
+    })
 }
 
-/// Run a prepared operation's publication against `base`.
-fn complete_publication(
-    server: &Server,
-    base: InputVersion,
-    publication: PreparedOperationPublication,
-    what: &str,
-) -> Result<(), String> {
-    let (commit, terminal_error) = match publication {
-        PreparedOperationPublication::Immediate(commit) => (*commit, None),
-        PreparedOperationPublication::Deferred(operation) => {
-            let completed = operation.complete(base)?;
-            (completed.commit, completed.terminal_error)
+/// A coordinated publication's failure as the RPC reports it.
+fn coordinated_failure(error: CoordinatedCommitError) -> RpcFailure {
+    match error {
+        CoordinatedCommitError::Stale { expected, observed } => RpcFailure::StaleInputVersion {
+            expected: observed,
+            got: expected,
+        },
+        CoordinatedCommitError::Invalid(error) => RpcFailure::InvalidAuthoringRequest {
+            detail: format!("authoring backend produced an invalid commit: {error:?}"),
+        },
+        CoordinatedCommitError::Publication(detail) => {
+            RpcFailure::InvalidAuthoringRequest { detail }
         }
-    };
-    publish_backend_commit(server, base, commit)
-        .map_err(|error| format!("{what} commit rejected: {error:?}"))?;
-    terminal_error.map_or(Ok(()), Err)
+    }
 }
 
 struct ServerOperationCompletion {
@@ -658,7 +661,7 @@ struct ServerOperationCompletion {
 }
 
 impl ProgressCompletion for ServerOperationCompletion {
-    fn complete_call(&self) -> Result<AuthorityCall<Result<(), String>>, String> {
+    fn complete_call(&self) -> Result<WriteCall<Result<(), String>>, String> {
         let publication = self
             .publication
             .borrow_mut()
@@ -669,7 +672,7 @@ impl ProgressCompletion for ServerOperationCompletion {
                 "long-running operation lost its publication basis: {gate:?}"
             ));
         }
-        Ok(complete_on_authority(
+        Ok(complete_publication_call(
             &self.server,
             self.base,
             publication,
@@ -1018,8 +1021,8 @@ impl Hub {
         }
     }
 
-    /// On the authority, still at `base`: run the backend's `prepare` and
-    /// publish its commit. `None` when the backend declined.
+    /// Run the backend's `prepare` and publish its commit as one input,
+    /// still at `base`. `None` when the backend declined.
     fn prepared<T: Send + 'static>(
         &self,
         base: InputVersion,
@@ -1027,33 +1030,39 @@ impl Hub {
             + Send
             + 'static,
     ) -> Option<RpcResult<T>> {
-        authority_outcome(self.prepared_call(base, prepare).run())
+        self.prepared_call(base, prepare).run()
     }
 
-    /// [`Hub::prepared`] as a job for another thread to wait on.
+    /// [`Hub::prepared`] as a job for a blocking thread.
     fn prepared_call<T: Send + 'static>(
         &self,
         base: InputVersion,
         prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure>
             + Send
             + 'static,
-    ) -> AuthorityCall<Option<RpcResult<T>>> {
+    ) -> WriteCall<Option<RpcResult<T>>> {
         let backend = self.server.inner.handle.authoring_backend();
-        self.server.authority_call(move |server| {
-            let current = server.inner.current_stamp().version;
-            if current != base {
-                return Some(RpcResult::Failure(RpcFailure::StaleInputVersion {
-                    expected: current,
-                    got: base,
-                }));
-            }
-            match prepare(&*backend) {
-                Ok(Some((commit, value))) => Some(match publish_backend_commit(server, base, commit) {
-                    Ok(_) => RpcResult::Success(value),
-                    Err(error) => RpcResult::Failure(error),
-                }),
+        self.server.write_call(move |server| {
+            let mut value = None;
+            let mut failed = None;
+            let published = server.coordinated_maybe_commit(base, || match prepare(&*backend) {
+                Ok(Some((commit, prepared))) => {
+                    value = Some(prepared);
+                    Ok(Some(commit))
+                }
+                Ok(None) => Ok(None),
+                // What the backend made durable before it failed (a memoized
+                // failure) still commits; nothing is published.
+                Err(error) => {
+                    failed = Some(error);
+                    Ok(None)
+                }
+            });
+            match published {
+                Ok(_) if failed.is_some() => Some(RpcResult::Failure(failed.expect("checked"))),
+                Ok(Some(_)) => Some(RpcResult::Success(value.expect("a publication has a value"))),
                 Ok(None) => None,
-                Err(error) => Some(RpcResult::Failure(error)),
+                Err(error) => Some(RpcResult::Failure(coordinated_failure(error))),
             }
         })
     }
@@ -1072,16 +1081,16 @@ impl Hub {
         }
     }
 
-    /// Check a write. Against a daemon, the returned job publishes it on
-    /// the authority (`None`: the backend declined); transports wait on it
-    /// off the RPC thread. An embedded server answers here.
+    /// Check a write. Against a daemon, the returned job publishes it
+    /// (`None`: the backend declined); transports run it off the RPC
+    /// thread. An embedded server answers here.
     #[allow(clippy::type_complexity)]
     pub fn write_call(
         &self,
         base: InputVersion,
         ops: Vec<AuthoringOp>,
         force_lossy: bool,
-    ) -> Result<AuthorityCall<Option<RpcResult<InputVersion>>>, RpcResult<InputVersion>> {
+    ) -> Result<WriteCall<Option<RpcResult<InputVersion>>>, RpcResult<InputVersion>> {
         if let Some(result) = self.authoring_gate(base) {
             return Err(result);
         }
@@ -1262,8 +1271,7 @@ impl Hub {
         })
     }
 
-    /// Publish a finished import on the authority, only while still at
-    /// its base.
+    /// Publish a finished import, only while still at its base.
     pub fn import_finish(&self, finished: FinishedImport) -> RpcResult<BundleUuid> {
         match self.import_publish_call(finished) {
             Ok(call) => import_call_outcome(call.run()),
@@ -1271,12 +1279,12 @@ impl Hub {
         }
     }
 
-    /// [`Hub::import_finish`] as a job for another thread to wait on.
+    /// [`Hub::import_finish`] as a job for a blocking thread.
     #[allow(clippy::type_complexity)]
     pub fn import_publish_call(
         &self,
         finished: FinishedImport,
-    ) -> Result<AuthorityCall<Option<RpcResult<BundleUuid>>>, RpcResult<BundleUuid>> {
+    ) -> Result<WriteCall<Option<RpcResult<BundleUuid>>>, RpcResult<BundleUuid>> {
         let FinishedImport {
             base,
             reimport,

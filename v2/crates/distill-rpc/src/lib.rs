@@ -31,7 +31,7 @@ pub use capability::{
     write_call_outcome,
 };
 pub use server::{
-    target_map, run_scoped, AuthorityCall, AuthorityJob, AuthorityStopped, CoordinatedCommitError, ExternalStore, LeasePolicy, Root, Server, ServerHandle,
+    target_map, CoordinatedCommitError, LeasePolicy, Root, Server, ServerHandle, WriteCall,
     MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use validate::{decode_asset_reference_query, decode_authoring_payload};

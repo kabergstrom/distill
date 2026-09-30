@@ -123,7 +123,7 @@ fn rename_with_fixups_is_deferred_and_rescanned_as_one_version() {
         destination_root: "main".into(),
         destination_path: "renamed.bundle".into(),
     };
-    let prepared = coordinator.on_authority(|| coordinator.authoring_service().prepare_operation(base, &LongRunningOp::RenameWithFixups(request.encode())))
+    let prepared = coordinator.authoring_service().prepare_operation(base, &LongRunningOp::RenameWithFixups(request.encode()))
         .unwrap();
 
     assert!(assets.join("old.bundle").exists());

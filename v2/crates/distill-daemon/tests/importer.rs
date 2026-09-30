@@ -262,13 +262,13 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(first.assets["asset"].data, AuthoredValue::UInt(7));
     assert_eq!(first.assets["$settings"].data, AuthoredValue::UInt(3));
     assert!(first.assets.contains_key("$record"));
-    assert!(coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
+    assert!(coordinator.authoring_service().watched_imports_needing_reimport()
         .unwrap()
         .is_empty());
 
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     assert_eq!(
-        coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
+        coordinator.authoring_service().watched_imports_needing_reimport()
             .unwrap(),
         vec![imported_bundle]
     );
@@ -316,7 +316,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         "memoizing a failure is not an input event"
     );
     let failed_memo = failed.memo_seq;
-    assert!(coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
+    assert!(coordinator.authoring_service().watched_imports_needing_reimport()
         .unwrap()
         .is_empty());
     assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
@@ -368,7 +368,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
             .terminal,
         distill_store::imports::WatchedImportTerminal::Dependency
     );
-    assert!(coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
+    assert!(coordinator.authoring_service().watched_imports_needing_reimport()
         .unwrap()
         .is_empty());
     std::fs::write(assets.join("source.txt"), b"10").unwrap();

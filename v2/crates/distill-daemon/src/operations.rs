@@ -17,8 +17,8 @@ use distill_rpc::{
     RenameWithFixupsRequest, RpcFailure,
 };
 use distill_schema::ngp_schema::SchemaNode;
+use distill_store::SharedStore;
 
-use crate::store_cell::AuthorityStore;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::coordinator::publish_incremental_paths;
 use crate::atomic::{atomic_write_expecting, remove_expecting, AtomicWriteError};
@@ -58,7 +58,7 @@ impl AuthoringService {
                 let request =
                     DoctorRequest::decode(payload).map_err(|error| invalid(error.to_string()))?;
                 // Snapshot the served request set now, on the RPC thread; the
-                // deferred completion runs later on the authority.
+                // deferred completion runs later, in its own input.
                 let build_requests = if request == DoctorRequest::Verify {
                     match runtime.tag_index_coordinator.upgrade() {
                         Some(coordinator) => coordinator
@@ -66,7 +66,7 @@ impl AuthoringService {
                             .verification_build_requests()
                             .map_err(|error| {
                                 format!(
-                                    "build verification is unavailable for the current authority state: {error:?}"
+                                    "build verification is unavailable for the current store state: {error:?}"
                                 )
                             }),
                         None => Err("build coordinator stopped during doctor verify".to_owned()),
@@ -182,7 +182,7 @@ impl AuthoringService {
 
 #[derive(Clone)]
 struct OperationRuntime {
-    store: Arc<AuthorityStore>,
+    store: Arc<SharedStore>,
     scanner: RootedScanner,
     pipeline_projection: PipelineProjection,
     tag_index_coordinator: Weak<crate::coordinator::DaemonCoordinator>,

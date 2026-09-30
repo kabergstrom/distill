@@ -19,8 +19,10 @@ pub mod files;
 pub mod imports;
 pub mod pipeline;
 pub mod served;
+pub mod shared;
 pub mod state;
 
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
 pub use db::{InputTxn, Store, StoreReader, SCHEMA_VERSION};
 pub use error::StoreError;
+pub use shared::SharedStore;

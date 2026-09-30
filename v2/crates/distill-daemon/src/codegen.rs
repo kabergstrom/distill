@@ -18,10 +18,10 @@ use distill_build::codegen::{
 use distill_build::query::{asset_query_result_hash, AssetQuery};
 use distill_build::trace::{Observed, TraceOp};
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
+use distill_store::shared::WriteGuard;
 use distill_store::state::InputVersion;
-use distill_store::{Store, StoreReader};
+use distill_store::{SharedStore, StoreReader};
 
-use crate::store_cell::{AuthorityStore, WriteGuard};
 use crate::callbacks::{
     CallbackInvokeError, CodegenAsset, CodegenContextError, PipelineCodegenContext,
 };
@@ -90,7 +90,7 @@ impl CodegenService {
         let snapshot = daemon.pipeline_snapshot();
         let epoch = snapshot.epoch().map_err(|failure| failure.to_string())?;
         let store_handle = daemon.store();
-        let basis = write_store(&store_handle)?.input_version();
+        let basis = store_handle.read().input_version();
         if self.last_attempted == Some(basis) {
             return Ok(());
         }
@@ -153,7 +153,7 @@ fn retryable_codegen_callback_failure(error: &CallbackInvokeError<CodegenFailure
 }
 
 struct AuthoredCodegenContext {
-    store: Arc<AuthorityStore>,
+    store: Arc<SharedStore>,
     scanner: RootedScanner,
     basis: InputVersion,
     trace: Vec<TraceOp>,
@@ -161,7 +161,7 @@ struct AuthoredCodegenContext {
 }
 
 impl AuthoredCodegenContext {
-    fn new(store: Arc<AuthorityStore>, scanner: RootedScanner, basis: InputVersion) -> Self {
+    fn new(store: Arc<SharedStore>, scanner: RootedScanner, basis: InputVersion) -> Self {
         Self {
             store,
             scanner,
@@ -176,7 +176,7 @@ impl AuthoredCodegenContext {
         Err(CodegenContextError::Failed(error.into()))
     }
 
-    fn check_basis(&mut self, store: &Store) -> Result<(), CodegenContextError> {
+    fn check_basis(&mut self, store: &StoreReader) -> Result<(), CodegenContextError> {
         if self.stopped {
             return Err(CodegenContextError::AttemptStopped);
         }
@@ -205,7 +205,7 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
         }
         let store_handle = Arc::clone(&self.store);
         let result = {
-            let store = store_handle.write();
+            let store = store_handle.read();
             self.check_basis(&store)?;
             query_results(&store, &query).map_err(CodegenContextError::Failed)?
         };
@@ -222,7 +222,7 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
         }
         let store_handle = Arc::clone(&self.store);
         let loaded = {
-            let store = store_handle.write();
+            let store = store_handle.read();
             self.check_basis(&store)?;
             load_authored_asset(&store, &self.scanner, asset)
         };
@@ -237,7 +237,7 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
 }
 
 struct CodegenWorld<'a> {
-    store: Arc<AuthorityStore>,
+    store: Arc<SharedStore>,
     scanner: RootedScanner,
     output: &'a OutputDirectory,
 }
@@ -286,40 +286,44 @@ impl CodegenWorld<'_> {
     ) -> Result<(), String> {
         self.output.verify()?;
         let mut store = write_store(&self.store)?;
-        if store.input_version() != basis {
-            return Err("codegen input version changed before publication".into());
-        }
-        let previous = store.codegen_outputs().map_err(|error| error.to_string())?;
-        let desired = desired_namespace(files)?;
-        let proposed = desired
-            .iter()
-            .map(|(path, bytes)| (path.clone(), content_hash(bytes)))
-            .collect::<BTreeMap<_, _>>();
-        let current = self.verify_preimages(&previous, &proposed)?;
+        // The basis check, the file writes and the rows share one write
+        // transaction.
+        store.write_transaction_with(|error| error.to_string(), |store| {
+            if store.input_version() != basis {
+                return Err("codegen input version changed before publication".into());
+            }
+            let previous = store.codegen_outputs().map_err(|error| error.to_string())?;
+            let desired = desired_namespace(files)?;
+            let proposed = desired
+                .iter()
+                .map(|(path, bytes)| (path.clone(), content_hash(bytes)))
+                .collect::<BTreeMap<_, _>>();
+            let current = self.verify_preimages(&previous, &proposed)?;
 
-        for change in publication_changes(&previous, &desired, &proposed, &self.output.path) {
-            let relative = change
-                .target
-                .file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or_default();
-            let on_disk = current.get(relative).copied().flatten();
-            if on_disk == proposed.get(relative).copied() {
-                continue;
-            }
-            self.output.verify()?;
-            match change.bytes.as_deref() {
-                Some(bytes) => atomic_write_expecting(&change.target, bytes, on_disk.into()),
-                None => remove_expecting(&change.target, on_disk.map_or(Expected::Absent, Expected::Hash)),
-            }
-            .map_err(|error| error.to_string())?;
-        }
-        if previous != proposed {
-            store
-                .commit_codegen_outputs(&previous, &proposed)
+            for change in publication_changes(&previous, &desired, &proposed, &self.output.path) {
+                let relative = change
+                    .target
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or_default();
+                let on_disk = current.get(relative).copied().flatten();
+                if on_disk == proposed.get(relative).copied() {
+                    continue;
+                }
+                self.output.verify()?;
+                match change.bytes.as_deref() {
+                    Some(bytes) => atomic_write_expecting(&change.target, bytes, on_disk.into()),
+                    None => remove_expecting(&change.target, on_disk.map_or(Expected::Absent, Expected::Hash)),
+                }
                 .map_err(|error| error.to_string())?;
-        }
-        Ok(())
+            }
+            if previous != proposed {
+                store
+                    .commit_codegen_outputs(&previous, &proposed)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
     }
 
     /// Check that every generated path holds either its recorded pre-image
@@ -730,7 +734,7 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
     }
 }
 
-fn write_store(store: &Arc<AuthorityStore>) -> Result<WriteGuard<'_>, String> {
+fn write_store(store: &Arc<SharedStore>) -> Result<WriteGuard<'_>, String> {
     Ok(store.write())
 }
 
@@ -746,15 +750,15 @@ mod tests {
 
     fn publication_world(
         temp: &tempfile::TempDir,
-    ) -> (Arc<AuthorityStore>, RootedScanner, OutputDirectory) {
+    ) -> (Arc<SharedStore>, RootedScanner, OutputDirectory) {
         let assets = temp.path().join("assets");
         let output = temp.path().join("generated");
         fs::create_dir(&assets).unwrap();
         let scanner = RootedScanner::new([crate::scanner::AssetRoot::new("main", &assets)])
         .unwrap();
         let output = OutputDirectory::open(&output).unwrap();
-        let store = Arc::new(AuthorityStore::on_this_thread(
-            Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
+        let store = Arc::new(SharedStore::new(
+            distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
         ));
         (store, scanner, output)
     }
@@ -881,8 +885,8 @@ mod tests {
         })
         .unwrap();
         fs::write(assets.join("shader.bundle"), &bytes).unwrap();
-        let store = Arc::new(AuthorityStore::on_this_thread(
-            Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
+        let store = Arc::new(SharedStore::new(
+            distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
         ));
         let basis = {
             let mut store = store.write();

@@ -34,10 +34,9 @@ use distill_store::imports::{
     DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport, WatchedImportFailure,
     WatchedImportTerminal,
 };
-use distill_store::{Store, StoreReader};
+use distill_store::{SharedStore, Store, StoreReader};
 use globset::Glob;
 
-use crate::store_cell::AuthorityStore;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::scanner::{RootedScanner, ScanError};
 use distill_store::files::{FileKind, ObservedFile};
@@ -144,11 +143,15 @@ impl AuthoringService {
         if self.import_index_ready.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut rows = Vec::new();
-        for meta in store.all_bundles().map_err(invalid)? {
-            rows.push(self.index_import_bundle(store, &meta)?);
-        }
-        store.replace_import_index(None, &rows).map_err(invalid)?;
+        // The index is read from the bundles in the transaction that
+        // writes it.
+        store.write_transaction_with(invalid, |store| {
+            let mut rows = Vec::new();
+            for meta in store.all_bundles().map_err(invalid)? {
+                rows.push(self.index_import_bundle(store, &meta)?);
+            }
+            store.replace_import_index(None, &rows).map_err(invalid)
+        })?;
         self.directory_rule_entries(store)?;
         self.import_index_ready.store(true, Ordering::Release);
         Ok(())
@@ -161,30 +164,32 @@ impl AuthoringService {
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
     ) -> Result<(BTreeSet<(String, String)>, Vec<DirectoryRuleSource>), RpcFailure> {
-        let keys = dirty_bundle_keys(store, dirty)?;
-        let mut previous = Vec::new();
-        let mut rows = Vec::new();
-        for (root, path) in &keys {
-            previous.extend(store.directory_rule_sources_at(root, path).map_err(invalid)?);
-            let Some(bytes) = store.bundle_file(root, path).map_err(invalid)? else {
-                continue;
-            };
-            let source = crate::scanner::scanned_bundle(root, path, bytes);
-            let Ok(bundle) = &source.parsed else {
-                continue;
-            };
-            let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
-                continue;
-            };
-            rows.push(self.index_import_bundle(store, &meta)?);
-        }
-        if !keys.is_empty() {
-            let sources = keys.iter().cloned().collect::<Vec<_>>();
-            store
-                .replace_import_index(Some(&sources), &rows)
-                .map_err(invalid)?;
-        }
-        Ok((keys, previous))
+        store.write_transaction_with(invalid, |store| {
+            let keys = dirty_bundle_keys(store, dirty)?;
+            let mut previous = Vec::new();
+            let mut rows = Vec::new();
+            for (root, path) in &keys {
+                previous.extend(store.directory_rule_sources_at(root, path).map_err(invalid)?);
+                let Some(bytes) = store.bundle_file(root, path).map_err(invalid)? else {
+                    continue;
+                };
+                let source = crate::scanner::scanned_bundle(root, path, bytes);
+                let Ok(bundle) = &source.parsed else {
+                    continue;
+                };
+                let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
+                    continue;
+                };
+                rows.push(self.index_import_bundle(store, &meta)?);
+            }
+            if !keys.is_empty() {
+                let sources = keys.iter().cloned().collect::<Vec<_>>();
+                store
+                    .replace_import_index(Some(&sources), &rows)
+                    .map_err(invalid)?;
+            }
+            Ok((keys, previous))
+        })
     }
 
     fn index_import_bundle(
@@ -780,7 +785,7 @@ impl AuthoringService {
             .map_err(ImportExecutionError::into_rpc)
     }
 
-    /// Publish a run made at `base`, on the authority, still at `base`.
+    /// Publish a run made at `base`, in an input opened at `base`.
     pub(crate) fn publish_import_run(
         &self,
         base: InputVersion,
@@ -975,8 +980,8 @@ impl AuthoringService {
         self.publish_import(base, run, mode)
     }
 
-    /// Run the importer at `base`. This writes nothing, so it may run off
-    /// the authority; [`AuthoringService::publish_import`] publishes it.
+    /// Run the importer at `base`. This writes nothing, so it runs outside any
+    /// write transaction; [`AuthoringService::publish_import`] publishes it.
     fn run_import(
         &self,
         base: InputVersion,
@@ -1282,20 +1287,20 @@ impl AuthoringService {
         if !revalidate_read_set(read_set, &mut backend) {
             return Ok(false);
         }
-        let mut store = self
-            .store
-            .write();
-        // On the authority: nothing publishes between the revalidation above
-        // and this record, whatever version the attempt ran at.
-        let memo_seq = store.memo_seq();
-        store
-            .record_watched_import_failure(&WatchedImportFailure {
-                bundle: destination.bundle,
-                attempted_input_version: base,
-                basis,
-                terminal,
-                message: message.to_owned(),
-                memo_seq,
+        // The memo records the attempt whatever version it ran at; the
+        // revalidation above only decides whether it is still wanted.
+        self.store
+            .write()
+            .write_transaction(|store| {
+                let memo_seq = store.memo_seq();
+                store.record_watched_import_failure(&WatchedImportFailure {
+                    bundle: destination.bundle,
+                    attempted_input_version: base,
+                    basis,
+                    terminal,
+                    message: message.to_owned(),
+                    memo_seq,
+                })
             })
             .map_err(invalid)?;
         Ok(true)
@@ -1832,7 +1837,7 @@ impl<'a> RootedImportBackend<'a> {
     /// A backend on its own store connection.
     fn open(
         scanner: &'a RootedScanner,
-        store: &AuthorityStore,
+        store: &SharedStore,
         capabilities: &'a BTreeMap<String, [u8; 32]>,
     ) -> Result<Self, RpcFailure> {
         let reader = store.open_reader().map_err(invalid)?;

@@ -463,7 +463,7 @@ pub struct Store {
     input: InputState,
     /// Held for as long as any writer of this process is open: one process
     /// per state directory.
-    _state_lock: Arc<std::fs::File>,
+    pub(crate) _state_lock: Arc<std::fs::File>,
     /// Runs in `commit_build` between the append and the index transaction.
     #[cfg(test)]
     pub(crate) before_commit: Option<Box<dyn FnMut() + Send>>,
@@ -570,16 +570,30 @@ impl Store {
     /// thread: its own connection and its own CAS segment. Recovery ran
     /// when this store opened; nothing runs here.
     pub fn open_writer(&self) -> Result<Store, StoreError> {
-        let conn = open_writer_connection(&self.config.state_path.join("meta.sqlite"))?;
+        Self::open_sibling(
+            Arc::new((*self.config).clone()),
+            self.instance_id(),
+            self.cas.dir.clone(),
+            Arc::clone(&self._state_lock),
+        )
+    }
+
+    pub(crate) fn open_sibling(
+        config: Arc<StoreConfig>,
+        instance_id: StoreInstanceId,
+        cas_dir: PathBuf,
+        state_lock: Arc<std::fs::File>,
+    ) -> Result<Store, StoreError> {
+        let conn = open_writer_connection(&config.state_path.join("meta.sqlite"))?;
         Ok(Store {
             read: StoreReader {
                 conn: ReaderConn::Owned(conn),
-                config: Arc::new((*self.config).clone()),
-                instance_id: self.instance_id(),
+                config,
+                instance_id,
             },
-            cas: crate::cas::store::CasInner::new(self.cas.dir.clone()),
+            cas: crate::cas::store::CasInner::new(cas_dir),
             input: InputState::Closed,
-            _state_lock: Arc::clone(&self._state_lock),
+            _state_lock: state_lock,
             #[cfg(test)]
             before_commit: None,
         })
@@ -737,6 +751,20 @@ impl Store {
         self.input = InputState::Armed;
     }
 
+    /// Arm an input and begin it now, with `BEGIN IMMEDIATE`: every read
+    /// its writes depend on happens inside it. Returns its base.
+    pub fn open_input(&mut self) -> Result<InputVersion, StoreError> {
+        self.arm_input();
+        if let Err(error) = self.begin_input() {
+            self.input = InputState::Closed;
+            return Err(error);
+        }
+        match self.input {
+            InputState::Begun { base } => Ok(base),
+            _ => unreachable!("an input begun has a base"),
+        }
+    }
+
     fn begin_input(&mut self) -> Result<(), StoreError> {
         assert_eq!(self.input, InputState::Armed, "an input begins once armed");
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -813,6 +841,40 @@ impl Store {
         let _ = self.read.conn.execute_batch("ROLLBACK");
         self.cas.forget_active();
         out
+    }
+
+    /// [`Store::write_txn`] for callers outside this crate: reads that decide
+    /// a write belong inside it.
+    pub fn write_transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.write_txn(f)
+    }
+
+    /// [`Store::write_transaction`] for a caller with its own error type:
+    /// `lift` converts the transaction's own failures.
+    pub fn write_transaction_with<T, E>(
+        &mut self,
+        lift: impl FnOnce(StoreError) -> E,
+        f: impl FnOnce(&mut Store) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut failed = None;
+        let out = self.write_txn(|store| {
+            f(store).map_err(|error| {
+                failed = Some(error);
+                StoreError::Rejected {
+                    detail: "the transaction's step failed".to_owned(),
+                }
+            })
+        });
+        out.map_err(|error| failed.take().unwrap_or_else(|| lift(error)))
+    }
+
+    /// Whether this writer has a transaction open or an input armed: its
+    /// uncommitted state is visible only through it.
+    pub fn in_transaction(&self) -> bool {
+        self.input_open() || !self.read.conn.is_autocommit()
     }
 
     /// Attach memo state to an input basis without advancing any input

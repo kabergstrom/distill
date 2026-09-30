@@ -1,8 +1,7 @@
 //! Long-lived daemon process supervisor.
 //!
-//! The process loop runs on the coordinator's authority thread as its
-//! [`Driver`]: the watcher feeds it through the authority inbox, and every
-//! reconciliation it starts publishes from that thread.
+//! The process loop runs on a thread of its own, fed by the watcher over a
+//! channel; every reconciliation it starts publishes from that thread.
 
 use std::io::Read;
 use std::net::SocketAddr;
@@ -19,7 +18,6 @@ use distill_store::state::{
     PipelineFailureOrigin,
 };
 
-use crate::authority::Driver;
 use crate::codegen::CodegenService;
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
@@ -32,9 +30,8 @@ use distill_store::config::RestartOnlyChange;
 use distill_store::cas::SegmentSweeper;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
-/// How often the process loop takes the watcher queue (the debounce) and
-/// checks for a runtime pipeline failure or a drained retired epoch. The
-/// last two become authority messages when builds become jobs (phase 6).
+/// How long the process loop lets watcher events gather before it
+/// reconciles them (the debounce).
 const DEBOUNCE: Duration = Duration::from_millis(40);
 /// An idle daemon still runs a pass this often.
 const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -50,6 +47,8 @@ pub struct DaemonProcess {
     rpc_address: SocketAddr,
     stop: Arc<watch::Sender<bool>>,
     watcher: Option<WatcherThread>,
+    inbox: mpsc::Sender<LoopMessage>,
+    loop_thread: Option<JoinHandle<()>>,
     rpc_thread: Option<JoinHandle<Result<(), String>>>,
     last_background_error: watch::Receiver<Option<String>>,
 }
@@ -120,31 +119,39 @@ impl DaemonProcess {
         }
         coordinator.attach_build_backend();
         let config_watch = ConfigWatch::new(config.clone());
-        let inbox = coordinator.authority_sender().clone();
+        let (inbox, messages) = mpsc::channel();
         let sink: WatcherSink = {
             let inbox = inbox.clone();
-            Arc::new(move |event| inbox.watch(event))
+            Arc::new(move |event| {
+                let _ = inbox.send(LoopMessage::Watch(event));
+            })
         };
+        {
+            // Publications from elsewhere (an RPC write, an import) still
+            // need codegen.
+            let inbox = inbox.clone();
+            coordinator
+                .server_handle()
+                .install_publication_hook(Box::new(move || {
+                    let _ = inbox.send(LoopMessage::Published);
+                }));
+        }
         // Arm both asset and control-file coverage before any candidate scan.
         // Root replacement is synchronously scanned by candidate publication;
         // the watcher then installs the new root and requests one catch-up scan.
         let watcher = WatcherThread::start(coordinator.scanner(), config_watch.control_paths(), sink)?;
         let watcher_control = watcher.control();
-        // Codegen recovery writes the store: it starts on the authority.
-        let codegen = coordinator
-            .on_authority(|| {
-                CodegenService::new(
-                    &coordinator,
-                    &config.codegen.rs_mod_path,
-                    config.codegen.auto_codegen,
-                )
-            })
-            .map_err(DaemonProcessError::Codegen)?;
+        let codegen = CodegenService::new(
+            &coordinator,
+            &config.codegen.rs_mod_path,
+            config.codegen.auto_codegen,
+        )
+        .map_err(DaemonProcessError::Codegen)?;
 
         let stop = Arc::new(watch::Sender::new(false));
         let (errors, last_background_error) = watch::channel(None);
         let (ready, started) = mpsc::sync_channel(1);
-        let mut driver = ProcessDriver {
+        let mut process_loop = ProcessLoop {
             coordinator: Arc::clone(&coordinator),
             queue: WatcherQueue::new(),
             config_watch,
@@ -158,62 +165,62 @@ impl DaemonProcess {
             cas_sweeper: SegmentSweeper::new(CAS_DELETE_GRACE),
             next_cas_pass: Instant::now() + CAS_PASS_INTERVAL,
         };
-        // Startup runs on the authority before the loop: events the watcher
-        // sends meanwhile wait in the inbox for the driver.
-        inbox.attach(Box::new(move || match driver.startup() {
-            Ok(()) => {
-                let _ = ready.send(Ok(()));
-                Some(Box::new(driver) as Box<dyn Driver>)
-            }
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                None
-            }
-        }));
-        started.recv().map_err(|_| {
-            DaemonProcessError::Rpc("the authority stopped during startup".to_owned())
-        })??;
-
-        let (rpc_address, rpc_thread) = if serve_rpc {
-            let (address_tx, address_rx) = mpsc::sync_channel(1);
-            let rpc_thread = spawn_rpc_loop(
-                coordinator.server().root(),
-                config.daemon.address,
-                Arc::clone(&stop),
-                address_tx,
-            );
-            let rpc_address = match address_rx.recv() {
-                Ok(Ok(address)) => address,
-                Ok(Err(error)) => {
-                    stop.send_replace(true);
-                    inbox.detach();
-                    let _ = rpc_thread.join();
-                    return Err(DaemonProcessError::Rpc(error));
+        // Startup runs on the loop thread before the loop: events the
+        // watcher sends meanwhile wait in its inbox.
+        let loop_thread = thread::Builder::new()
+            .name("distill-process-loop".to_owned())
+            .spawn(move || match process_loop.startup() {
+                Ok(()) => {
+                    let _ = ready.send(Ok(()));
+                    process_loop.run(messages);
                 }
                 Err(error) => {
-                    stop.send_replace(true);
-                    inbox.detach();
-                    let _ = rpc_thread.join();
-                    return Err(DaemonProcessError::Rpc(format!(
-                        "RPC startup channel closed: {error}"
-                    )));
+                    let _ = ready.send(Err(error));
                 }
-            };
-            (rpc_address, Some(rpc_thread))
-        } else {
-            (config.daemon.address, None)
-        };
-
-        Ok(Self {
+            })
+            .expect("failed to start the distill process loop");
+        let startup = started.recv().unwrap_or_else(|_| {
+            Err(DaemonProcessError::Rpc(
+                "the process loop stopped during startup".to_owned(),
+            ))
+        });
+        let mut process = Self {
             coordinator,
-            rpc_address,
+            rpc_address: config.daemon.address,
             stop,
             watcher: Some(watcher),
-            rpc_thread,
+            inbox,
+            loop_thread: Some(loop_thread),
+            rpc_thread: None,
             last_background_error,
-        })
+        };
+        startup?;
+
+        if serve_rpc {
+            let (address_tx, address_rx) = mpsc::sync_channel(1);
+            let rpc_thread = spawn_rpc_loop(
+                process.coordinator.server().root(),
+                config.daemon.address,
+                Arc::clone(&process.stop),
+                address_tx,
+            );
+            process.rpc_thread = Some(rpc_thread);
+            process.rpc_address = match address_rx.recv() {
+                Ok(Ok(address)) => address,
+                Ok(Err(error)) => return Err(DaemonProcessError::Rpc(error)),
+                Err(error) => {
+                    return Err(DaemonProcessError::Rpc(format!(
+                        "RPC startup channel closed: {error}"
+                    )))
+                }
+            };
+        }
+        Ok(process)
     }
 
+}
+
+impl DaemonProcess {
     pub fn coordinator(&self) -> &Arc<DaemonCoordinator> {
         &self.coordinator
     }
@@ -244,7 +251,10 @@ impl Drop for DaemonProcess {
     fn drop(&mut self) {
         self.stop.send_replace(true);
         self.watcher.take();
-        self.coordinator.authority_sender().detach();
+        let _ = self.inbox.send(LoopMessage::Stop);
+        if let Some(thread) = self.loop_thread.take() {
+            let _ = thread.join();
+        }
         if let Some(thread) = self.rpc_thread.take() {
             let _ = thread.join();
         }
@@ -300,8 +310,16 @@ impl From<SchemaAuthorityError> for DaemonProcessError {
     }
 }
 
-/// The process loop, run by the authority.
-struct ProcessDriver {
+enum LoopMessage {
+    Watch(WatcherEvent),
+    Published,
+    Stop,
+}
+
+/// The process loop, on a thread of its own. It runs the scan-driven
+/// publications; builds, imports and RPC writes publish from wherever they
+/// run.
+struct ProcessLoop {
     coordinator: Arc<DaemonCoordinator>,
     queue: WatcherQueue,
     config_watch: ConfigWatch,
@@ -318,7 +336,7 @@ struct ProcessDriver {
     next_cas_pass: Instant,
 }
 
-impl ProcessDriver {
+impl ProcessLoop {
     fn startup(&mut self) -> Result<(), DaemonProcessError> {
         // Retain an existing daemon-owned output before the first candidate
         // performs its mandatory startup scan. Otherwise an authored symlink
@@ -418,21 +436,39 @@ impl ProcessDriver {
     fn schedule(&mut self, at: Instant) {
         self.due = Some(self.due.map_or(at, |due| due.min(at)));
     }
-}
 
-impl Driver for ProcessDriver {
+    /// The loop: fold watcher events into the queue, and reconcile when the
+    /// deadline fires.
+    fn run(mut self, messages: mpsc::Receiver<LoopMessage>) {
+        loop {
+            let wait = self.deadline().saturating_duration_since(Instant::now());
+            match messages.recv_timeout(wait) {
+                Ok(LoopMessage::Watch(event)) => self.watch(event),
+                Ok(LoopMessage::Published) => self.published(),
+                Ok(LoopMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !self.fire() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     fn watch(&mut self, event: WatcherEvent) {
         self.queue.push(event);
         // Debounce: a burst of events is reconciled together.
         self.schedule(Instant::now() + DEBOUNCE);
     }
 
+    /// When [`ProcessLoop::fire`] is next due.
     fn deadline(&self) -> Instant {
         self.due
             .map_or(self.next_idle_pass, |due| due.min(self.next_idle_pass))
             .min(self.next_cas_pass)
     }
 
+    /// Run the due work. `false` stops the loop.
     fn fire(&mut self) -> bool {
         let now = Instant::now();
         if now >= self.next_cas_pass {
@@ -455,13 +491,9 @@ impl Driver for ProcessDriver {
         keep
     }
 
-    fn poke(&mut self) {
-        self.schedule(Instant::now());
-    }
-
-    fn ran_job(&mut self) {
-        // A publication from elsewhere (an RPC write, an import) still needs
-        // codegen.
+    /// Something published; one from elsewhere (an RPC write, an import)
+    /// still needs codegen.
+    fn published(&mut self) {
         if self.coordinator.server_handle().publication_count() != self.publications {
             self.schedule(Instant::now());
         }

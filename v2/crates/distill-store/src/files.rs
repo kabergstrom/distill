@@ -351,11 +351,13 @@ impl Store {
         under: Option<&[(String, String)]>,
         diagnostics: &[ObservedDiagnostic],
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.savepoint()?;
-        clear_structure(&transaction, under, false)?;
-        insert_diagnostics(&transaction, diagnostics)?;
-        transaction.commit()?;
-        Ok(())
+        self.write_txn(|store| {
+            let transaction = store.read.conn.savepoint()?;
+            clear_structure(&transaction, under, false)?;
+            insert_diagnostics(&transaction, diagnostics)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
 
@@ -364,36 +366,38 @@ impl Store {
     /// durable; if any file observation changed, no captured row is cleared
     /// and the whole fold is retried. Rows appended after the prefix survive.
     pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<bool, StoreError> {
-        let transaction = self.read.conn.savepoint()?;
-        let mut latest = std::collections::BTreeMap::new();
-        for entry in &work.dirty {
-            latest.insert((entry.root, entry.path.as_str()), entry);
-        }
-        for ((root, path), entry) in latest {
-            let current = transaction
-                .query_row(
-                    "SELECT observation FROM files WHERE root_id = ?1 AND path = ?2",
-                    rusqlite::params![root.0, path],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            let matches = match (entry.exists, current) {
-                (true, Some(observation)) => observation as u64 == entry.observation.0,
-                (false, None) => true,
-                _ => false,
-            };
-            if !matches {
-                return Ok(false);
+        self.write_txn(|store| {
+            let transaction = store.read.conn.savepoint()?;
+            let mut latest = std::collections::BTreeMap::new();
+            for entry in &work.dirty {
+                latest.insert((entry.root, entry.path.as_str()), entry);
             }
-        }
-        if let Some(last) = work.dirty.last() {
-            transaction.execute("DELETE FROM dirty_files WHERE seq <= ?1", [last.seq])?;
-        }
-        if let Some(last) = work.renames.last() {
-            transaction.execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
-        }
-        transaction.commit()?;
-        Ok(true)
+            for ((root, path), entry) in latest {
+                let current = transaction
+                    .query_row(
+                        "SELECT observation FROM files WHERE root_id = ?1 AND path = ?2",
+                        rusqlite::params![root.0, path],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                let matches = match (entry.exists, current) {
+                    (true, Some(observation)) => observation as u64 == entry.observation.0,
+                    (false, None) => true,
+                    _ => false,
+                };
+                if !matches {
+                    return Ok(false);
+                }
+            }
+            if let Some(last) = work.dirty.last() {
+                transaction.execute("DELETE FROM dirty_files WHERE seq <= ?1", [last.seq])?;
+            }
+            if let Some(last) = work.renames.last() {
+                transaction.execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
+            }
+            transaction.commit()?;
+            Ok(true)
+        })
     }
 }
 

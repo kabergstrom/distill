@@ -23,9 +23,9 @@ use distill_rpc::{
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure,
 };
-use distill_store::StoreReader;
+use distill_store::shared::WriteGuard;
+use distill_store::{SharedStore, StoreReader};
 
-use crate::store_cell::{AuthorityStore, WriteGuard};
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::atomic::{atomic_write_expecting, remove_expecting};
@@ -33,7 +33,7 @@ use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{AssetRoot, RootedScanner, ScanError};
 
 pub struct AuthoringService {
-    pub(crate) store: Arc<AuthorityStore>,
+    pub(crate) store: Arc<SharedStore>,
     pub(crate) scanner: RootedScanner,
     /// The asset roots and what hangs off them, replaced together when the
     /// configuration changes.
@@ -70,7 +70,7 @@ impl AuthoringFilesystemCandidate {
 
 impl AuthoringService {
     pub fn new(
-        store: Arc<AuthorityStore>,
+        store: Arc<SharedStore>,
         roots: Vec<AssetRoot>,
         scanner: RootedScanner,
     ) -> Self {

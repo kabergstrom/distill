@@ -5,13 +5,13 @@
 //! that serves clients has its own cheap front end ([`Server`]) holding a
 //! store reader, its connections, leases, and subscription queues. A
 //! snapshot is an open read transaction; subscriptions follow the store's
-//! change log. Nothing here takes a lock.
+//! change log. Every thread writes through its own writer of the store
+//! ([`SharedStore`]); SQLite's write lock orders them.
 //!
 //! Embedded servers (tests, tools) own a private store in a temporary
-//! directory, written by one writer thread fed over a channel. Daemon
-//! servers read the daemon's store and never write its namespace: the
-//! daemon applies each [`Commit`] inside its own publishing transaction
-//! ([`crate::apply_commit`]) and then signals the handle.
+//! directory. Daemon servers share the daemon's store: the daemon's
+//! durable step and the served projection of each [`Commit`] commit as one
+//! input ([`crate::apply_commit`]), and then the handle is signalled.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
@@ -28,7 +28,7 @@ use unicode_normalization::UnicodeNormalization;
 use distill_store::served::{
     Change, ChangeEntry, ServedWrite, SERVED_PIPELINE,
 };
-use distill_store::{Store, StoreConfig, StoreError, StoreReader};
+use distill_store::{SharedStore, Store, StoreConfig, StoreError, StoreReader};
 
 use crate::apply::{
     apply_commit, apply_commit_served, configuration_status, publish_protocol_epoch, publish_restart_required,
@@ -102,65 +102,18 @@ pub enum CoordinatedCommitError {
 // ---------------------------------------------------------------------------
 // Handle
 
-type WriterJob = Box<dyn FnOnce(&mut Store) + Send>;
-
-/// The one writer of an embedded store, on its own thread.
-struct EmbeddedWriter {
-    jobs: Option<mpsc::Sender<WriterJob>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl EmbeddedWriter {
-    fn start(store: Store) -> Self {
-        let (jobs, inbox) = mpsc::channel::<WriterJob>();
-        let thread = std::thread::Builder::new()
-            .name("distill-rpc-embedded-writer".to_owned())
-            .spawn(move || {
-                let mut store = store;
-                for job in inbox {
-                    job(&mut store);
-                }
-            })
-            .expect("failed to start the embedded RPC store writer");
-        Self {
-            jobs: Some(jobs),
-            thread: Some(thread),
-        }
-    }
-
-    fn run<T: Send + 'static>(&self, job: impl FnOnce(&mut Store) -> T + Send + 'static) -> T {
-        let (reply, result) = mpsc::sync_channel(1);
-        self.jobs
-            .as_ref()
-            .expect("embedded writer is running")
-            .send(Box::new(move |store| {
-                let _ = reply.send(job(store));
-            }))
-            .expect("embedded RPC store writer stopped");
-        result.recv().expect("embedded RPC store writer stopped")
-    }
-}
-
-impl Drop for EmbeddedWriter {
-    fn drop(&mut self) {
-        self.jobs.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Work for the authority, to run on any thread ([`AuthorityCall::run`]).
-pub struct AuthorityCall<T> {
+/// A publication a transport runs on a blocking thread, so its event loop
+/// never waits on SQLite's write lock ([`WriteCall::run`]).
+pub struct WriteCall<T> {
     handle: Arc<ServerHandle>,
     step: Box<dyn FnOnce(&Server) -> T + Send>,
 }
 
-impl<T: Send> AuthorityCall<T> {
-    /// Run the step on the authority, blocking until it has run.
-    pub fn run(self) -> Result<T, AuthorityStopped> {
+impl<T> WriteCall<T> {
+    /// Run the step on this thread's front end.
+    pub fn run(self) -> T {
         let Self { handle, step } = self;
-        handle.on_authority(|| step(&Server::attach(&handle)))
+        step(&Server::attach(&handle))
     }
 }
 
@@ -175,8 +128,7 @@ impl OpenInput<'_> {
     fn finish(mut self) -> Result<(), CoordinatedCommitError> {
         self.open = false;
         self.handle
-            .writer()
-            .run(|store| store.finish_input(true))
+            .with_store(|store| store.finish_input(true))
             .map(|_| ())
             .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))
     }
@@ -185,97 +137,7 @@ impl OpenInput<'_> {
 impl Drop for OpenInput<'_> {
     fn drop(&mut self) {
         if self.open {
-            let _ = self.handle.writer().run(|store| store.finish_input(false));
-        }
-    }
-}
-
-/// A job for the authority thread.
-pub type AuthorityJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// The authority stopped before it ran a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthorityStopped;
-
-/// The daemon's side of a served store. One thread, the authority, runs
-/// every publication (LOCKLESS.md §3); front ends on other threads hand
-/// their publishing steps to it and wait for the result.
-pub trait ExternalStore: Send + Sync {
-    /// Whether the calling thread is the authority.
-    fn on_authority(&self) -> bool;
-    /// Queue `job` on the authority. A job the authority can no longer run
-    /// is dropped unrun.
-    fn execute(&self, job: AuthorityJob);
-    /// Exclusive write access to the store.
-    fn with_store(&self, job: &mut (dyn FnMut(&mut Store) + Send));
-}
-
-/// Runs a borrowed job on another thread through `execute`, blocking until
-/// it ran or was dropped.
-pub fn run_scoped<T: Send>(
-    execute: impl FnOnce(AuthorityJob),
-    step: impl FnOnce() -> T + Send,
-) -> Result<T, AuthorityStopped> {
-    struct Scoped<F, T> {
-        step: Option<F>,
-        reply: Option<mpsc::SyncSender<std::thread::Result<T>>>,
-    }
-    impl<F: FnOnce() -> T, T> Scoped<F, T> {
-        fn run(mut self) {
-            let step = self.step.take().expect("a scoped job runs once");
-            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
-            if let Some(reply) = self.reply.take() {
-                let _ = reply.send(output);
-            }
-        }
-    }
-    impl<F, T> Drop for Scoped<F, T> {
-        fn drop(&mut self) {
-            // The borrowed step goes before the reply: the waiting caller
-            // wakes only once nothing here refers to its stack.
-            drop(self.step.take());
-            drop(self.reply.take());
-        }
-    }
-    let (reply, result) = mpsc::sync_channel(1);
-    let scoped = Scoped {
-        step: Some(step),
-        reply: Some(reply),
-    };
-    let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || scoped.run());
-    // SAFETY: the job only borrows from this frame, and this function does
-    // not return until the job has run or been dropped: `result` yields only
-    // once the reply sender is sent on or dropped, and `Scoped` drops (or has
-    // consumed) the step first. Extending the trait object's lifetime changes
-    // no layout.
-    let job = unsafe {
-        std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, AuthorityJob>(job)
-    };
-    execute(job);
-    match result.recv() {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        Err(_) => Err(AuthorityStopped),
-    }
-}
-
-enum Writer {
-    Embedded(EmbeddedWriter),
-    External(Arc<dyn ExternalStore>),
-}
-
-impl Writer {
-    fn run<T: Send + 'static>(&self, job: impl FnOnce(&mut Store) -> T + Send + 'static) -> T {
-        match self {
-            Self::Embedded(writer) => writer.run(job),
-            Self::External(store) => {
-                let mut job = Some(job);
-                let mut output = None;
-                store.with_store(&mut |store| {
-                    output = Some((job.take().expect("the store job runs once"))(store));
-                });
-                output.expect("the external store ran the job")
-            }
+            let _ = self.handle.with_store(|store| store.finish_input(false));
         }
     }
 }
@@ -301,12 +163,14 @@ pub struct ServerHandle {
     authoring_backend: Arc<dyn AuthoringBackend>,
     build_backend: OnceLock<Arc<dyn BuildBackend>>,
     lease_backend: OnceLock<Arc<dyn ArtifactLeaseBackend>>,
+    on_publish: OnceLock<Box<dyn Fn() + Send + Sync>>,
     next_lease_id: AtomicU64,
     next_connection_id: AtomicU64,
     lease_ttl_nanos: AtomicU64,
     max_snapshot_leases: AtomicUsize,
     max_connections: AtomicUsize,
-    writer: Option<Writer>,
+    /// Every thread writes through its own writer of this store.
+    store: Option<Arc<SharedStore>>,
     embedded_dir: Option<PathBuf>,
 }
 
@@ -321,7 +185,7 @@ impl fmt::Debug for ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        self.writer.take();
+        self.store.take();
         if let Some(dir) = self.embedded_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -333,7 +197,7 @@ impl ServerHandle {
         instance: StoreInstanceId,
         config: StoreConfig,
         authoring_backend: Arc<dyn AuthoringBackend>,
-        writer: Writer,
+        store: Arc<SharedStore>,
         embedded_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         let policy = LeasePolicy::default();
@@ -345,70 +209,52 @@ impl ServerHandle {
             authoring_backend,
             build_backend: OnceLock::new(),
             lease_backend: OnceLock::new(),
+            on_publish: OnceLock::new(),
             next_lease_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),
             lease_ttl_nanos: AtomicU64::new(policy.ttl.as_nanos() as u64),
             max_snapshot_leases: AtomicUsize::new(policy.max_snapshot_leases),
             max_connections: AtomicUsize::new(policy.max_connections),
-            writer: Some(writer),
+            store: Some(store),
             embedded_dir,
         })
     }
 
-    /// Serve a daemon store, written through `store`. The target set must
-    /// already be recorded ([`crate::publish_target_set`]).
-    pub fn open(
-        config: StoreConfig,
-        authoring_backend: Arc<dyn AuthoringBackend>,
-        store: Arc<dyn ExternalStore>,
-    ) -> Result<Arc<Self>, StoreError> {
-        let reader = StoreReader::open(config.clone())?;
-        Ok(Self::new(
-            reader.instance_id(),
-            config,
-            authoring_backend,
-            Writer::External(store),
-            None,
-        ))
+    /// Serve a daemon store. The target set must already be recorded
+    /// ([`crate::publish_target_set`]).
+    pub fn open(authoring_backend: Arc<dyn AuthoringBackend>, store: Arc<SharedStore>) -> Arc<Self> {
+        let config = StoreConfig::clone(&store.config());
+        Self::new(store.instance_id(), config, authoring_backend, store, None)
     }
 
     pub fn instance(&self) -> StoreInstanceId {
         self.instance
     }
 
-    fn writer(&self) -> &Writer {
-        self.writer.as_ref().expect("the writer lives as long as the handle")
+    /// Run `job` on this thread's writer.
+    fn with_store<T>(&self, job: impl FnOnce(&mut Store) -> T) -> T {
+        let store = self.store.as_ref().expect("the store lives as long as the handle");
+        job(&mut store.write())
     }
 
     pub(crate) fn embedded(&self) -> bool {
-        matches!(self.writer, Some(Writer::Embedded(_)))
-    }
-
-    /// Whether the calling thread may publish: always when embedded.
-    pub fn is_authority(&self) -> bool {
-        match self.writer() {
-            Writer::Embedded(_) => true,
-            Writer::External(store) => store.on_authority(),
-        }
-    }
-
-    /// Run `step` as the authority: inline when embedded (publications
-    /// check their base inside the transaction) or already on it, else on
-    /// the authority thread, blocking until it finishes. `step` may borrow.
-    pub fn on_authority<T: Send>(
-        &self,
-        step: impl FnOnce() -> T + Send,
-    ) -> Result<T, AuthorityStopped> {
-        match self.writer() {
-            Writer::Embedded(_) => Ok(step()),
-            Writer::External(store) if store.on_authority() => Ok(step()),
-            Writer::External(store) => run_scoped(|job| store.execute(job), step),
-        }
+        self.embedded_dir.is_some()
     }
 
     /// Wake every front end: the store published a new version or fence.
     pub fn notify_published(&self) {
         self.published.send_modify(|count| *count = count.wrapping_add(1));
+        if let Some(hook) = self.on_publish.get() {
+            hook();
+        }
+    }
+
+    /// Call `hook` after every publication, from the publishing thread.
+    /// Install it once.
+    pub fn install_publication_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        if self.on_publish.set(hook).is_err() {
+            panic!("the publication hook is already installed");
+        }
     }
 
     /// How many publications readers have been told about.
@@ -473,7 +319,7 @@ impl ServerHandle {
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<SnapshotStamp, PublishError> {
         let full = self.embedded();
-        let result = self.writer().run(move |store| {
+        let result = self.with_store(|store| {
             let mut rejection = None;
             let mut stale = None;
             let mut reject = |error: ApplyError| match error {
@@ -534,7 +380,7 @@ impl ServerHandle {
             }
         });
         // Inside an open input, readers are told once it commits.
-        if result.is_ok() && !self.writer().run(|store| store.input_open()) {
+        if result.is_ok() && !self.with_store(|store| store.input_open()) {
             self.notify_published();
         }
         result
@@ -547,7 +393,7 @@ impl ServerHandle {
         new_version: bool,
         job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<T, StoreError> + Send + 'static,
     ) -> T {
-        let result = self.writer().run(move |store| {
+        let result = self.with_store(|store| {
             if new_version {
                 store
                     .input_transaction(|txn| job(txn))
@@ -766,7 +612,7 @@ impl Server {
             instance,
             config,
             authoring_backend,
-            Writer::Embedded(EmbeddedWriter::start(store)),
+            Arc::new(SharedStore::new(store)),
             Some(dir),
         );
         Ok(Self::attach(&handle))
@@ -906,7 +752,6 @@ impl Server {
         failure: PipelineFailure,
         persist: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        self.assert_authority();
         self.runtime_pipeline_failure_locked(failure, persist)
     }
 
@@ -1013,8 +858,7 @@ impl Server {
         let stored = self
             .inner
             .handle
-            .writer()
-            .run(move |store| store.put_artifact(asset, &bytes, &edges));
+            .with_store(|store| store.put_artifact(asset, &bytes, &edges));
         match stored {
             Ok(stored) if stored == hash => Ok(()),
             Ok(stored) => Err(AdminError::InvalidArtifact {
@@ -1053,8 +897,7 @@ impl Server {
         let stored = self
             .inner
             .handle
-            .writer()
-            .run(move |store| store.put_wire_tree(&body))
+            .with_store(|store| store.put_wire_tree(&body))
             .map_err(|error| AdminError::InvalidWireTree {
                 detail: format!("the store rejected the wire tree: {error}"),
             })?;
@@ -1158,33 +1001,16 @@ impl Server {
             .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
-    /// `step` as a job another thread can wait on (the transport waits on
-    /// its blocking pool, never on its own thread).
-    pub(crate) fn authority_call<T: Send + 'static>(
+    /// `step` as a job a transport runs on its blocking pool, never on its
+    /// event loop.
+    pub(crate) fn write_call<T: Send + 'static>(
         &self,
         step: impl FnOnce(&Server) -> T + Send + 'static,
-    ) -> AuthorityCall<T> {
-        AuthorityCall {
+    ) -> WriteCall<T> {
+        WriteCall {
             handle: Arc::clone(&self.inner.handle),
             step: Box::new(step),
         }
-    }
-
-    /// Coordinated publications are the authority's own steps: the daemon
-    /// runs them there ([`ServerHandle::on_authority`]).
-    fn coordinated<T>(
-        &self,
-        step: impl FnOnce(&Server) -> Result<T, CoordinatedCommitError>,
-    ) -> Result<T, CoordinatedCommitError> {
-        self.assert_authority();
-        step(self)
-    }
-
-    fn assert_authority(&self) {
-        assert!(
-            self.inner.handle.is_authority(),
-            "coordinated publications run on the authority thread"
-        );
     }
 
     /// A coordinated publication that may terminate in durable memo state
@@ -1194,7 +1020,7 @@ impl Server {
         base: InputVersion,
         publish: impl FnOnce() -> Result<Option<Commit>, String>,
     ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
-        self.coordinated(|server| server.coordinated_locked(base, publish, None))
+        self.coordinated_locked(base, publish, None)
     }
 
     fn coordinated_locked(
@@ -1203,24 +1029,20 @@ impl Server {
         publish: impl FnOnce() -> Result<Option<Commit>, String>,
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
-        let observed = self.inner.current_stamp().version;
+        let handle = &self.inner.handle;
+        // The step, its own writes and the served projection commit as one
+        // input, begun here: the base is checked inside it, and no reader
+        // sees the version before its rows.
+        let observed = handle
+            .with_store(|store| store.open_input())
+            .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
+        let open = OpenInput { handle, open: true };
         if observed != base {
             return Err(CoordinatedCommitError::Stale {
                 expected: base,
                 observed,
             });
         }
-        let handle = &self.inner.handle;
-        if handle.embedded() {
-            let Some(commit) = publish().map_err(CoordinatedCommitError::Publication)? else {
-                return Ok(None);
-            };
-            return self.publish_locked(base, commit, targets).map(Some);
-        }
-        // The daemon's step, its own writes and the served projection
-        // commit as one input: no reader sees the version before its rows.
-        handle.writer().run(|store| store.arm_input());
-        let open = OpenInput { handle, open: true };
         let published = match publish().map_err(CoordinatedCommitError::Publication)? {
             Some(commit) => Some(self.publish_locked(base, commit, targets)?),
             None => None,
@@ -1230,8 +1052,8 @@ impl Server {
         Ok(published)
     }
 
-    /// Apply `commit` as the version after `base`; the caller is the
-    /// authority.
+    /// Apply `commit` as the version after `base`, inside the caller's
+    /// input.
     pub(crate) fn publish_locked(
         &self,
         base: InputVersion,
@@ -1260,9 +1082,7 @@ impl Server {
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
         let targets = target_map(replacements)
             .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
-        self.coordinated(|server| {
-            server.coordinated_locked(base, || publish().map(Some), Some(targets))
-        })
+        self.coordinated_locked(base, || publish().map(Some), Some(targets))
         .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
@@ -2142,8 +1962,8 @@ impl Inner {
 }
 
 /// Publish an authoring-backend commit as the version after `base`. The
-/// caller is the authority ([`Server::authority`]) across the backend's
-/// prepare step and this.
+/// caller holds the input open across the backend's prepare step and
+/// this.
 pub(crate) fn publish_backend_commit(
     server: &Server,
     base: InputVersion,

@@ -357,6 +357,20 @@ impl Store {
         Ok(id)
     }
 
+    /// Seal this writer's active segment: it stops appending, for good.
+    pub fn seal_active(&mut self) -> Result<(), StoreError> {
+        let Some(previous) = self.cas.take_active() else {
+            return Ok(());
+        };
+        self.write_txn(|store| {
+            store.conn.execute(
+                "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
+                rusqlite::params![previous as i64, SEGMENT_SEALED, SEGMENT_OPEN],
+            )?;
+            Ok(())
+        })
+    }
+
     /// The active segment with room for `incoming` bytes, rolling (and
     /// sealing the previous one) at the size cap (§18's
     /// `cas.segment_size`).

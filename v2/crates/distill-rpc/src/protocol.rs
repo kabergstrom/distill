@@ -631,7 +631,7 @@ pub struct PreparedImportCommit {
 pub trait DeferredOperation: Send + Sync {
     /// Execute the already-validated operation against `base`. The RPC server
     /// invokes this only when the client consumes the terminal Completed
-    /// event, on the authority thread.
+    /// event, inside the input that publishes it.
     fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String>;
 }
 
@@ -684,8 +684,8 @@ impl PreparedOperationCommit {
     }
 }
 
-/// The authority-side step of an import run: publish what ran off the
-/// authority, or fail.
+/// The publishing step of an import run: publish what ran on a worker, or
+/// fail. It runs inside the input that publishes it.
 pub type ImportJob = Box<dyn FnOnce() -> Result<PreparedImportCommit, RpcFailure> + Send>;
 
 /// Daemon integration seam for workflows that require importer, filesystem,
@@ -697,7 +697,7 @@ pub trait AuthoringBackend: Send + Sync + 'static {
     /// publication. `Ok(None)` retains the in-memory-only implementation used
     /// by embedders and tests that have no filesystem authority.
     ///
-    /// The RPC server invokes this on the authority thread;
+    /// The RPC server invokes this inside the input that publishes it;
     /// production implementations must compare their durable store version
     /// with `base`, publish, rescan, and advance that store exactly once before
     /// returning. They must not call back into the [`crate::Server`].
@@ -722,9 +722,8 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure>;
 
-    /// Run an import on a worker, off both the authority and the RPC
-    /// thread, and return the step that publishes it, which the authority
-    /// runs while still at `base`. The default leaves all the work to that
+    /// Run an import on a worker, off the RPC thread, and return the step
+    /// that publishes it while still at `base`. The default leaves all the work to that
     /// step.
     fn run_import(
         self: Arc<Self>,
@@ -964,31 +963,21 @@ impl ChunkStream {
 }
 
 pub(crate) trait ProgressCompletion {
-    /// Check the completion here; the returned job publishes it on the
-    /// authority.
-    fn complete_call(&self) -> Result<crate::AuthorityCall<Result<(), String>>, String>;
+    /// Check the completion here; the returned job publishes it.
+    fn complete_call(&self) -> Result<crate::WriteCall<Result<(), String>>, String>;
     fn cancel(&self) -> bool;
 }
 
 /// A step of a [`ProgressStream`].
 pub enum ProgressStep {
     Event(AuthoringProgressEvent),
-    /// The operation completed; its publication waits on the authority.
-    /// Run `call` (off the RPC thread) and hand its outcome to
+    /// The operation completed; its publication is pending. Run `call`
+    /// (off the RPC thread) and hand its outcome to
     /// [`ProgressStream::finish_completion`].
     Complete {
         event: AuthoringProgressEvent,
-        call: Result<crate::AuthorityCall<Result<(), String>>, String>,
+        call: Result<crate::WriteCall<Result<(), String>>, String>,
     },
-}
-
-/// What a completion's job answered, or that the authority stopped.
-pub fn completion_outcome(
-    outcome: Result<Result<(), String>, crate::AuthorityStopped>,
-) -> Result<(), String> {
-    outcome.unwrap_or_else(|crate::AuthorityStopped| {
-        Err("the publishing authority stopped".to_owned())
-    })
 }
 
 pub struct ProgressStream {
@@ -1073,7 +1062,7 @@ impl Iterator for ProgressStream {
         match self.next_step()? {
             ProgressStep::Event(event) => Some(event),
             ProgressStep::Complete { event, call } => {
-                let outcome = call.and_then(|call| completion_outcome(call.run()));
+                let outcome = call.and_then(|call| call.run());
                 Some(self.finish_completion(event, outcome))
             }
         }

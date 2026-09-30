@@ -302,10 +302,12 @@ impl Store {
     /// an input version: claims are derived from the scan and the pipeline
     /// projection, and the next full publication rewrites them.
     pub fn clear_source_claims(&mut self) -> Result<(), StoreError> {
-        let transaction = self.read.conn.savepoint()?;
-        clear_claims(&transaction)?;
-        transaction.commit()?;
-        Ok(())
+        self.write_txn(|store| {
+            let transaction = store.read.conn.savepoint()?;
+            clear_claims(&transaction)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 }
 

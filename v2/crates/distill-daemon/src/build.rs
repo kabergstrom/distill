@@ -53,11 +53,11 @@ use distill_store::cas::record::{
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::RegisteredTool;
-use distill_store::{Store, StoreError, StoreReader};
+use distill_store::shared::ReadGuard;
+use distill_store::{SharedStore, Store, StoreError, StoreReader};
 use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERSION};
 use distill_wire::encode::EncodeError;
 
-use crate::store_cell::{AuthorityStore, ReadGuard};
 use crate::callbacks::{
     CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
     ProcessContextError, ProcessOutputs,
@@ -314,7 +314,7 @@ struct NodePublication {
 }
 
 struct BuildContext {
-    store: Arc<AuthorityStore>,
+    store: Arc<SharedStore>,
     store_instance: distill_store::state::StoreInstanceId,
     drifted_input: DriftedInput,
     scanner: RootedScanner,
@@ -384,22 +384,22 @@ fn lock_build_store(context: &BuildContext) -> Result<ReadGuard<'_>, BuildError>
     Ok(store)
 }
 
-/// Run a build's write on the authority, still at the build's basis.
-fn write_build_store<R: Send>(
+/// Run a build's write in one write transaction, still at the build's
+/// basis.
+fn write_build_store<R>(
     context: &BuildContext,
-    write: impl FnOnce(&mut Store) -> Result<R, StoreError> + Send,
+    write: impl FnOnce(&mut Store) -> Result<R, StoreError>,
 ) -> Result<R, BuildError> {
     let (instance, basis) = (context.store_instance, context.basis);
-    let drifted = &context.drifted_input;
     context
         .store
-        .write_with(|store| {
+        .write()
+        .write_transaction_with(BuildError::infrastructure, |store| {
             if store.instance_id() != instance || store.input_version() != basis {
-                return Err(BuildError::Drifted(drifted.clone()));
+                return Err(BuildError::Drifted(context.drifted_input.clone()));
             }
             write(store).map_err(BuildError::infrastructure)
         })
-        .map_err(|_| BuildError::Infrastructure("the authority stopped".to_owned()))?
 }
 
 fn ensure_build_basis(context: &BuildContext) -> Result<(), BuildError> {
@@ -891,9 +891,9 @@ pub(crate) fn doctor_verify_builds(
 }
 
 /// Finish §10 tag indexing against a namespace that has advanced durably but
-/// is not yet served: the authority applies its RPC delta afterwards.
+/// is not yet served: the open input applies its RPC delta afterwards.
 pub(crate) fn refine_published_tag_index(
-    store_handle: Arc<AuthorityStore>,
+    store_handle: Arc<SharedStore>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -917,7 +917,7 @@ pub(crate) fn refine_published_tag_index(
 /// publication. Deleted identities become bounded removals; unrelated tag
 /// rows and cached traces are not enumerated.
 pub(crate) fn refine_published_tag_index_incremental(
-    store_handle: Arc<AuthorityStore>,
+    store_handle: Arc<SharedStore>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -948,7 +948,7 @@ pub(crate) fn refine_published_tag_index_incremental(
 }
 
 fn try_refine_published_tag_index(
-    store_handle: Arc<AuthorityStore>,
+    store_handle: Arc<SharedStore>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -3947,7 +3947,6 @@ mod tests {
 
     struct StoreLockProbeProcessor {
         calls: Arc<AtomicUsize>,
-        store: Arc<AuthorityStore>,
         observed_unlocked: Arc<AtomicBool>,
     }
 
@@ -3959,7 +3958,7 @@ mod tests {
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.observed_unlocked
-                .store(!crate::store_cell::guard_held(), Ordering::SeqCst);
+                .store(!distill_store::shared::guard_held(), Ordering::SeqCst);
             let AuthoredValue::Object(fields) = &input else {
                 panic!("processor input is a struct");
             };
@@ -4092,17 +4091,15 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
-        coordinator.on_authority(|| {
-            refine_published_tag_index(
-                coordinator.store(),
-                coordinator.scanner(),
-                Arc::clone(&authority),
-                coordinator.pipeline_snapshot(),
-                &BTreeMap::from([("dev".to_owned(), build_target)]),
-                64,
-                &BTreeMap::from([(ASSET, BUNDLE)]),
-            )
-        });
+        refine_published_tag_index(
+            coordinator.store(),
+            coordinator.scanner(),
+            Arc::clone(&authority),
+            coordinator.pipeline_snapshot(),
+            &BTreeMap::from([("dev".to_owned(), build_target)]),
+            64,
+            &BTreeMap::from([(ASSET, BUNDLE)]),
+        );
         let indexed = coordinator
             .store()
             .read()
@@ -4315,7 +4312,6 @@ mod tests {
             },
             StoreLockProbeProcessor {
                 calls: Arc::clone(&calls),
-                store: coordinator.store(),
                 observed_unlocked: Arc::clone(&observed_unlocked),
             },
             move |arena| {

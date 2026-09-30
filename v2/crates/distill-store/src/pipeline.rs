@@ -803,65 +803,67 @@ impl Store {
         expected_dylib_hash: [u8; 32],
         failure: &PipelineFailure,
     ) -> Result<(), StoreError> {
-        failure
-            .validate()
-            .map_err(StoreError::InvalidPipelineFailure)?;
-        if failure.origin != crate::state::PipelineFailureOrigin::PublishedRuntime {
-            return Err(StoreError::InvalidPipelineFailure(
-                crate::state::PipelineFailureDecodeError::InvalidMatrix,
-            ));
-        }
+        self.write_txn(|store| {
+            failure
+                .validate()
+                .map_err(StoreError::InvalidPipelineFailure)?;
+            if failure.origin != crate::state::PipelineFailureOrigin::PublishedRuntime {
+                return Err(StoreError::InvalidPipelineFailure(
+                    crate::state::PipelineFailureDecodeError::InvalidMatrix,
+                ));
+            }
 
-        let transaction = self.read.conn.savepoint()?;
-        let row: Option<(Option<Vec<u8>>, Option<i64>)> = transaction
-            .query_row(
-                "SELECT dylib_hash, poison_code FROM pipeline_state WHERE id = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (actual, already_unavailable) = match row {
-            Some((actual, failure_code)) => (
-                actual
-                    .map(|bytes| exact_blob32(bytes, "published pipeline dylib hash"))
-                    .transpose()?,
-                failure_code.is_some(),
-            ),
-            None => (None, false),
-        };
-        if actual != Some(expected_dylib_hash) || already_unavailable {
-            return Err(StoreError::StalePublishedPipeline {
-                expected: expected_dylib_hash,
-                actual,
-                already_unavailable,
-            });
-        }
-        let changed = transaction.execute(
-            "UPDATE pipeline_state SET
-                 poison_code = ?1,
-                 poison_origin = ?2,
-                 poison_cleanup = ?3,
-                 poison_identity = ?4,
-                 poison_message = ?5
-             WHERE id = 0 AND dylib_hash = ?6 AND poison_code IS NULL",
-            rusqlite::params![
-                failure.code as u16,
-                failure.origin as u16,
-                failure.cleanup as u16,
-                failure.identity.as_slice(),
-                failure.message,
-                expected_dylib_hash.as_slice(),
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::StalePublishedPipeline {
-                expected: expected_dylib_hash,
-                actual,
-                already_unavailable: true,
-            });
-        }
-        transaction.commit()?;
-        Ok(())
+            let transaction = store.read.conn.savepoint()?;
+            let row: Option<(Option<Vec<u8>>, Option<i64>)> = transaction
+                .query_row(
+                    "SELECT dylib_hash, poison_code FROM pipeline_state WHERE id = 0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (actual, already_unavailable) = match row {
+                Some((actual, failure_code)) => (
+                    actual
+                        .map(|bytes| exact_blob32(bytes, "published pipeline dylib hash"))
+                        .transpose()?,
+                    failure_code.is_some(),
+                ),
+                None => (None, false),
+            };
+            if actual != Some(expected_dylib_hash) || already_unavailable {
+                return Err(StoreError::StalePublishedPipeline {
+                    expected: expected_dylib_hash,
+                    actual,
+                    already_unavailable,
+                });
+            }
+            let changed = transaction.execute(
+                "UPDATE pipeline_state SET
+                     poison_code = ?1,
+                     poison_origin = ?2,
+                     poison_cleanup = ?3,
+                     poison_identity = ?4,
+                     poison_message = ?5
+                 WHERE id = 0 AND dylib_hash = ?6 AND poison_code IS NULL",
+                rusqlite::params![
+                    failure.code as u16,
+                    failure.origin as u16,
+                    failure.cleanup as u16,
+                    failure.identity.as_slice(),
+                    failure.message,
+                    expected_dylib_hash.as_slice(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::StalePublishedPipeline {
+                    expected: expected_dylib_hash,
+                    actual,
+                    already_unavailable: true,
+                });
+            }
+            transaction.commit()?;
+            Ok(())
+        })
     }
 }
 

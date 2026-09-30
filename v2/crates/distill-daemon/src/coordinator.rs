@@ -1,15 +1,15 @@
-//! Single-writer daemon coordinator.
+//! The daemon coordinator.
 //!
-//! Filesystem scans are candidates. Publication happens only on the
-//! authority thread ([`crate::authority`]), through one closure which
-//! rechecks the durable store basis, applies the complete SQLite input
-//! transaction, and returns the exact RPC projection for the same successor
-//! version.
+//! Filesystem scans are candidates. A publication is one input
+//! transaction, begun with SQLite's write lock, which rechecks the durable
+//! store basis, applies the complete input, and commits the exact RPC
+//! projection for the same successor version. Publications run on the
+//! calling thread; the process loop runs the scan-driven ones.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
@@ -43,10 +43,8 @@ use distill_store::state::{
     PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
-use distill_store::{Store, StoreConfig, StoreError, StoreReader};
+use distill_store::{SharedStore, Store, StoreConfig, StoreError, StoreReader};
 
-use crate::store_cell::AuthorityStore;
-use crate::authority::{Authority, AuthorityCell, AuthorityRef, AuthoritySender};
 use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
@@ -79,20 +77,19 @@ pub(crate) struct ConfigurationCandidate {
 }
 
 pub struct DaemonCoordinator {
-    store: Arc<AuthorityStore>,
+    store: Arc<SharedStore>,
     scanner: RootedScanner,
     scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
-    scan_rejection: AuthorityCell<Option<PendingScanRejection>>,
+    /// Written by the publishing loop, read by any publication.
+    scan_rejection: Mutex<Option<PendingScanRejection>>,
     server: Arc<ServerHandle>,
     authoring: Arc<AuthoringService>,
     pipeline: PipelineState,
     schema_authority: ArcSwapOption<ProjectSchemaAuthority>,
     build_targets: ArcSwap<BTreeMap<String, Target>>,
-    configuration_error: AuthorityCell<Option<ConfigurationError>>,
+    configuration_error: Mutex<Option<ConfigurationError>>,
     operational: ScheduledPool,
-    /// Last: stopped (and joined) after everything else is gone.
-    authority: Authority,
 }
 
 struct CoordinatedPipelineRuntime {
@@ -148,46 +145,29 @@ impl DaemonCoordinator {
             module_state_path.join("modules"),
         )?;
         let target_set = distill_rpc::target_map(targets)?;
-        // The store belongs to the authority from the start: it is opened
-        // and first written there.
-        let authority = Authority::start();
-        let sender = authority.sender().clone();
-        let (store, backend) = authority
-            .sender()
-            .run(|| -> Result<_, CoordinatorInitError> {
-                let mut opened_store = Store::open(store_config.clone())?;
-                // Claims follow the pipeline projection; the first full
-                // publication rewrites them.
-                opened_store.clear_source_claims()?;
-                if opened_store.pending_restart()?.is_some() {
-                    opened_store.input_transaction(|transaction| {
-                        transaction.adopt_pending_restart().map(|_| ())
-                    })?;
-                }
-                let version = opened_store.input_version();
-                opened_store.served_transaction(|transaction| {
-                    use distill_store::served::ServedWrite;
-                    transaction.init_change_log_oldest(version)?;
-                    distill_rpc::publish_target_set(transaction, &target_set)?;
-                    Ok(())
-                })?;
-                let store = Arc::new(AuthorityStore::new(opened_store, sender));
-                let backend = Arc::new(AuthoringService::new(
-                    Arc::clone(&store),
-                    roots,
-                    scanner.clone(),
-                ));
-                Ok((store, backend))
-            })
-            .expect("the authority runs while its coordinator opens")?;
-        let server = ServerHandle::open(
-            store_config.clone(),
-            backend.clone(),
-            Arc::new(DaemonStore {
-                store: Arc::clone(&store),
-                authority: authority.sender().clone(),
-            }),
-        )?;
+        let mut opened_store = Store::open(store_config.clone())?;
+        // Claims follow the pipeline projection; the first full
+        // publication rewrites them.
+        opened_store.clear_source_claims()?;
+        if opened_store.pending_restart()?.is_some() {
+            opened_store.input_transaction(|transaction| {
+                transaction.adopt_pending_restart().map(|_| ())
+            })?;
+        }
+        let version = opened_store.input_version();
+        opened_store.served_transaction(|transaction| {
+            use distill_store::served::ServedWrite;
+            transaction.init_change_log_oldest(version)?;
+            distill_rpc::publish_target_set(transaction, &target_set)?;
+            Ok(())
+        })?;
+        let store = Arc::new(SharedStore::new(opened_store));
+        let backend = Arc::new(AuthoringService::new(
+            Arc::clone(&store),
+            roots,
+            scanner.clone(),
+        ));
+        let server = ServerHandle::open(backend.clone(), Arc::clone(&store));
         let pipeline = CoordinatedPipelineRuntime {
             host,
             loader: DynamicPipelineModuleLoader,
@@ -209,37 +189,24 @@ impl DaemonCoordinator {
             scanner,
             scan_initialized: AtomicBool::new(false),
             scan_healthy: AtomicBool::new(true),
-            scan_rejection: AuthorityCell::new(None, authority.sender()),
+            scan_rejection: Mutex::new(None),
             server,
             authoring: backend,
-            pipeline: PipelineState::new(pipeline, authority.sender()),
+            pipeline: PipelineState::new(pipeline),
             schema_authority: ArcSwapOption::empty(),
             build_targets: ArcSwap::from_pointee(BTreeMap::new()),
-            configuration_error: AuthorityCell::new(None, authority.sender()),
+            configuration_error: Mutex::new(None),
             operational,
-            authority,
         })
     }
 
-    /// The authority thread's inbox.
-    pub(crate) fn authority_sender(&self) -> &AuthoritySender {
-        self.authority.sender()
-    }
-
-    /// Run `step` on the authority (inline when already on it).
-    pub fn on_authority<T: Send>(&self, step: impl FnOnce() -> T + Send) -> T {
-        self.server
-            .on_authority(step)
-            .expect("the authority runs while its coordinator is alive")
-    }
-
-    /// Publish one coordinated step against `base` on the authority.
+    /// Publish one coordinated step against `base`.
     pub fn coordinated_commit(
         &self,
         base: InputVersion,
         publish: impl FnOnce() -> Result<Commit, String> + Send,
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.on_authority(|| self.server().coordinated_commit(base, publish))
+        self.server().coordinated_commit(base, publish)
     }
 
     /// This thread's RPC front end.
@@ -261,7 +228,7 @@ impl DaemonCoordinator {
         self.authoring.attach_tag_index_coordinator(self);
     }
 
-    pub fn store(&self) -> Arc<AuthorityStore> {
+    pub fn store(&self) -> Arc<SharedStore> {
         Arc::clone(&self.store)
     }
 
@@ -298,35 +265,38 @@ impl DaemonCoordinator {
     pub(crate) fn sync_runtime_pipeline_failure(
         &self,
     ) -> Result<Option<PipelineFailure>, CoordinatorError> {
-        self.on_authority(|| {
-            let runtime = lock_pipeline(&self.pipeline);
-            let Some(epoch) = runtime.host.published_ready_epoch() else {
-                return Ok(None);
-            };
-            let observed = match runtime.host.snapshot().epoch() {
-                Ok(_) => return Ok(None),
-                Err(failure) if failure.origin == PipelineFailureOrigin::PublishedRuntime => {
-                    (epoch.dylib_hash(), failure)
+        // Only a latched runtime failure needs the runtime.
+        match self.pipeline.published.load().epoch() {
+            Err(failure) if failure.origin == PipelineFailureOrigin::PublishedRuntime => {}
+            _ => return Ok(None),
+        }
+        let runtime = lock_pipeline(&self.pipeline);
+        let Some(epoch) = runtime.host.published_ready_epoch() else {
+            return Ok(None);
+        };
+        let observed = match runtime.host.snapshot().epoch() {
+            Ok(_) => return Ok(None),
+            Err(failure) if failure.origin == PipelineFailureOrigin::PublishedRuntime => {
+                (epoch.dylib_hash(), failure)
+            }
+            Err(_) => return Ok(None),
+        };
+        let diagnostic = observed.1.clone();
+        self.server()
+            .coordinated_runtime_pipeline_failure(diagnostic, || {
+                let mut store = self.store.write();
+                match store.fail_published_pipeline_epoch(observed.0, &observed.1) {
+                    Ok(()) => Ok(()),
+                    Err(StoreError::StalePublishedPipeline {
+                        actual: Some(actual),
+                        already_unavailable: true,
+                        ..
+                    }) if actual == observed.0 => Ok(()),
+                    Err(error) => Err(error.to_string()),
                 }
-                Err(_) => return Ok(None),
-            };
-            let diagnostic = observed.1.clone();
-            self.server()
-                .coordinated_runtime_pipeline_failure(diagnostic, || {
-                    let mut store = self.store.write();
-                    match store.fail_published_pipeline_epoch(observed.0, &observed.1) {
-                        Ok(()) => Ok(()),
-                        Err(StoreError::StalePublishedPipeline {
-                            actual: Some(actual),
-                            already_unavailable: true,
-                            ..
-                        }) if actual == observed.0 => Ok(()),
-                        Err(error) => Err(error.to_string()),
-                    }
-                })
-                .map_err(CoordinatorError::RuntimePipeline)?;
-            Ok(Some(observed.1))
-        })
+            })
+            .map_err(CoordinatorError::RuntimePipeline)?;
+        Ok(Some(observed.1))
     }
 
     pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
@@ -355,7 +325,7 @@ impl DaemonCoordinator {
 
     #[cfg(test)]
     pub(crate) fn install_pipeline_epoch_for_test(&self, epoch: PipelineEpoch) {
-        self.on_authority(|| lock_pipeline(&self.pipeline).host.install_ready(epoch));
+        lock_pipeline(&self.pipeline).host.install_ready(epoch);
     }
 
     pub fn operational_configuration(&self) -> SchedulerConfig {
@@ -370,14 +340,15 @@ impl DaemonCoordinator {
     where
         R: Send + 'static,
     {
-        // An authority that waits here lends itself to the worker, whose
-        // store writes would otherwise wait on it.
-        let lent = self.authority_sender().lend();
+        // A caller with a write transaction open runs the job itself: a
+        // worker's writes would wait on that transaction. Dependency builds
+        // run inline on the worker.
+        if self.store.in_transaction() {
+            return run();
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         self.operational.submit(class, move || {
-            let authority = lent.map(crate::authority::Lent::enter);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-            drop(authority);
             let _ = sender.send(outcome);
         });
         match receiver.recv() {
@@ -392,61 +363,51 @@ impl DaemonCoordinator {
         store_config: &StoreConfig,
         max_dependency_depth: usize,
     ) -> Result<(), CoordinatorError> {
-        self.on_authority(|| {
-            let scheduler = SchedulerConfig {
-                parallelism: store_config.parallelism,
-                batch_reserved_workers: store_config.batch_reserved_workers,
-                max_dependency_depth,
-            };
-            scheduler
-                .validate()
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            let replacement_pool = {
-                (self.operational.config().parallelism != scheduler.parallelism)
-                    .then(|| build_worker_pool(scheduler.parallelism))
-                    .transpose()
-                    .map_err(CoordinatorError::InvalidManifest)?
-            };
-            self.store.write()
-                .apply_operational_config(store_config)
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            self.operational
-                .reconfigure(scheduler, replacement_pool)
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
-        })
+        let scheduler = SchedulerConfig {
+            parallelism: store_config.parallelism,
+            batch_reserved_workers: store_config.batch_reserved_workers,
+            max_dependency_depth,
+        };
+        scheduler
+            .validate()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let replacement_pool = {
+            (self.operational.config().parallelism != scheduler.parallelism)
+                .then(|| build_worker_pool(scheduler.parallelism))
+                .transpose()
+                .map_err(CoordinatorError::InvalidManifest)?
+        };
+        self.store
+            .apply_operational_config(store_config)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        self.operational
+            .reconfigure(scheduler, replacement_pool)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
     pub fn stage_restart_configuration(
         &self,
         changes: &[RestartOnlyChange],
     ) -> Result<PendingRestart, CoordinatorError> {
-        self.on_authority(|| {
-            let pending = self.store.write()
-                .stage_pending_restart(changes)
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            self.server().restart_required(pending.keys.clone());
-            Ok(pending)
-        })
+        let pending = self.store.write()
+            .stage_pending_restart(changes)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        self.server().restart_required(pending.keys.clone());
+        Ok(pending)
     }
 
     pub fn clear_restart_configuration(&self) -> Result<(), CoordinatorError> {
-        self.on_authority(|| {
-            self.store.write()
-                .clear_pending_restart()
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            self.server().restart_required(Vec::new());
-            Ok(())
-        })
+        self.store.write()
+            .clear_pending_restart()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        self.server().restart_required(Vec::new());
+        Ok(())
     }
 
     fn configuration_error(&self) -> Option<ConfigurationError> {
-        let source = self
-            .configuration_error
-            .borrow_mut()
+        let source = locked(&self.configuration_error)
             .clone();
-        let scan = self
-            .scan_rejection
-            .borrow_mut()
+        let scan = locked(&self.scan_rejection)
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
         ConfigurationError::select_canonical(source.into_iter().chain(scan))
@@ -456,15 +417,13 @@ impl DaemonCoordinator {
 
     /// The namespace errors of the pending scan rejection.
     fn pending_scan_errors(&self) -> Vec<NamespaceError> {
-        self.scan_rejection
-            .borrow_mut()
+        locked(&self.scan_rejection)
             .as_ref()
             .map_or_else(Vec::new, |pending| pending.rejection.version.clone())
     }
 
     fn configuration_without_source_error(&self) -> ConfigurationStatus {
-        self.scan_rejection
-            .borrow_mut()
+        locked(&self.scan_rejection)
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone())
             .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
@@ -479,288 +438,272 @@ impl DaemonCoordinator {
         message: impl Into<String>,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let message: String = message.into();
-        self.on_authority(|| {
-            let error = ConfigurationError::from_reason(&reason, message);
-            let previous = {
-                let mut current = self
-                    .configuration_error
-                    .borrow_mut();
-                current.replace(error)
-            };
-            match self.publish_cached_scan() {
-                Ok(stamp) => Ok(stamp),
-                Err(error) => {
-                    *self
-                        .configuration_error
-                        .borrow_mut() = previous;
-                    Err(error)
-                }
+        let error = ConfigurationError::from_reason(&reason, message);
+        let previous = {
+            let mut current = locked(&self.configuration_error);
+            current.replace(error)
+        };
+        match self.publish_cached_scan() {
+            Ok(stamp) => Ok(stamp),
+            Err(error) => {
+                *locked(&self.configuration_error) = previous;
+                Err(error)
             }
-        })
+        }
     }
 
     pub fn heal_configuration_rejection(&self) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            let previous = self
-                .configuration_error
-                .borrow_mut()
-                .take();
-            match self.publish_cached_scan() {
-                Ok(stamp) => Ok(stamp),
-                Err(error) => {
-                    *self
-                        .configuration_error
-                        .borrow_mut() = previous;
-                    Err(error)
-                }
+        let previous = locked(&self.configuration_error)
+            .take();
+        match self.publish_cached_scan() {
+            Ok(stamp) => Ok(stamp),
+            Err(error) => {
+                *locked(&self.configuration_error) = previous;
+                Err(error)
             }
-        })
+        }
     }
 
     pub(crate) fn publish_configuration_candidate(
         &self,
         candidate: ConfigurationCandidate,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            let ConfigurationCandidate {
-                roots,
-                targets,
-                build_targets,
-                pipeline_source,
-                mut requirements,
-                schema_authority,
-            } = candidate;
-            let filesystem = self
-                .authoring
-                .prepare_filesystem_candidate(roots)
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            let filesystem_changed = !self.scanner.has_same_roots(filesystem.scanner());
-            // Schema, target, or module-only candidates reuse the already
-            // observed asset snapshot. A physical complete scan is reserved for
-            // an actual configured-root replacement.
-            let candidate_scan_heals =
-                filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
-            let scan = if candidate_scan_heals {
-                filesystem.scanner().scan()?
-            } else {
-                self.published_scan()?
-            };
-            let mut candidate = ScanCandidate::build(
-                scan,
-                None,
-                Some(&schema_authority),
-            )?;
-            if !candidate_scan_heals {
-                candidate
-                        .namespace_errors
-                        .extend(self.pending_scan_errors());
-            }
-            let mut runtime = lock_pipeline(&self.pipeline);
-            let prepared_epoch = {
-                let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
-                host.prepare_candidate(&pipeline_source, &mut requirements, loader)
-            };
-            let authored_types = requirements
-                .schema_registry
-                .keys()
-                .copied()
-                .filter(|type_uuid| !distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
-                .collect::<Vec<_>>();
-            let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
-                Ok(prepared) => {
-                    match PipelineProjection::build(
-                        prepared.processor_descriptors(),
-                        prepared.dylib_hash(),
-                        &build_targets,
-                        authored_types,
-                    ) {
-                        Err(error) => {
-                            let cleanup = runtime.host.discard_unpublished(prepared);
-                            let failure = cleanup.unwrap_or_else(|| {
-                                PipelineFailure::new(
-                                    PipelineFailureCode::CandidateRegistration,
-                                    PipelineFailureOrigin::CandidateOpen,
-                                    CleanupDisposition::CleanedAndClosed,
-                                    format!("invalid target-resolved pipeline map: {error:?}"),
-                                )
-                                .expect("candidate-registration cleanup tuple is valid")
-                            });
-                            (
-                                ConfigurationPipelinePublication::Failed(failure),
-                                None,
-                                PipelineProjection::default(),
+        let ConfigurationCandidate {
+            roots,
+            targets,
+            build_targets,
+            pipeline_source,
+            mut requirements,
+            schema_authority,
+        } = candidate;
+        let filesystem = self
+            .authoring
+            .prepare_filesystem_candidate(roots)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        let filesystem_changed = !self.scanner.has_same_roots(filesystem.scanner());
+        // Schema, target, or module-only candidates reuse the already
+        // observed asset snapshot. A physical complete scan is reserved for
+        // an actual configured-root replacement.
+        let candidate_scan_heals =
+            filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
+        let scan = if candidate_scan_heals {
+            filesystem.scanner().scan()?
+        } else {
+            self.published_scan()?
+        };
+        let mut candidate = ScanCandidate::build(
+            scan,
+            None,
+            Some(&schema_authority),
+        )?;
+        if !candidate_scan_heals {
+            candidate
+                    .namespace_errors
+                    .extend(self.pending_scan_errors());
+        }
+        let mut runtime = lock_pipeline(&self.pipeline);
+        let prepared_epoch = {
+            let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
+            host.prepare_candidate(&pipeline_source, &mut requirements, loader)
+        };
+        let authored_types = requirements
+            .schema_registry
+            .keys()
+            .copied()
+            .filter(|type_uuid| !distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
+            .collect::<Vec<_>>();
+        let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
+            Ok(prepared) => {
+                match PipelineProjection::build(
+                    prepared.processor_descriptors(),
+                    prepared.dylib_hash(),
+                    &build_targets,
+                    authored_types,
+                ) {
+                    Err(error) => {
+                        let cleanup = runtime.host.discard_unpublished(prepared);
+                        let failure = cleanup.unwrap_or_else(|| {
+                            PipelineFailure::new(
+                                PipelineFailureCode::CandidateRegistration,
+                                PipelineFailureOrigin::CandidateOpen,
+                                CleanupDisposition::CleanedAndClosed,
+                                format!("invalid target-resolved pipeline map: {error:?}"),
                             )
-                        }
-                        Ok(projection) => {
-                            let stored = match stored_pipeline_epoch(&prepared, &requirements) {
-                                Ok(stored) => stored,
-                                Err(error) => {
-                                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
-                                        drop(runtime);
-                                        return self.publish_pipeline_rejection(failure);
-                                    }
-                                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
-                                }
-                            };
-                            if let Err(error) = self.authoring.prepare_pipeline_importers(
-                                EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
-                            ) {
+                            .expect("candidate-registration cleanup tuple is valid")
+                        });
+                        (
+                            ConfigurationPipelinePublication::Failed(failure),
+                            None,
+                            PipelineProjection::default(),
+                        )
+                    }
+                    Ok(projection) => {
+                        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+                            Ok(stored) => stored,
+                            Err(error) => {
                                 if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                                     drop(runtime);
                                     return self.publish_pipeline_rejection(failure);
                                 }
-                                return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+                                return Err(CoordinatorError::InvalidManifest(error.to_string()));
                             }
-                            let tools = prepared.tool_epoch();
-                            (
-                                ConfigurationPipelinePublication::Epoch {
-                                    epoch: stored,
-                                    tools,
-                                },
-                                Some(prepared),
-                                projection,
-                            )
+                        };
+                        if let Err(error) = self.authoring.prepare_pipeline_importers(
+                            EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
+                        ) {
+                            if let Some(failure) = runtime.host.discard_unpublished(prepared) {
+                                drop(runtime);
+                                return self.publish_pipeline_rejection(failure);
+                            }
+                            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
                         }
-                    }
-                }
-                Err(failure) => (
-                    ConfigurationPipelinePublication::Failed(failure),
-                    None,
-                    PipelineProjection::default(),
-                ),
-            };
-            let installed_claims = match bundle_claims(
-                candidate.scan.bundle_rows(),
-                &projection,
-                Some(&schema_authority),
-            ) {
-                Ok(claims) => claims,
-                Err(error) => {
-                    if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                        drop(runtime);
-                        return self.publish_pipeline_rejection(failure);
-                    }
-                    return Err(error);
-                }
-            };
-            let tag_epoch = schema_authority.source_hash();
-            let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-            let base = self.server().current_stamp().version;
-            let store = Arc::clone(&self.store);
-            let fallback_bundles = match store.read().all_asset_bundles() {
-                Ok(bundles) => bundles,
-                Err(error) => {
-                    if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                        drop(runtime);
-                        return self.publish_pipeline_rejection(failure);
-                    }
-                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
-                }
-            };
-            let authoring = Arc::clone(&self.authoring);
-            let mut cleanup_failure = None;
-            let result = self
-                .server()
-                .coordinated_replace_target_set(base, targets, || {
-                    let mut commit = publish_scan(
-                        &store,
-                        base,
-                        candidate,
-                        true,
-                        Some(&pipeline),
-                        &projection,
-                        tag_epoch,
-                        &installed_claims,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let published_pipeline = commit
-                        .pipeline
-                        .clone()
-                        .expect("scan commit always carries pipeline diagnostics");
-                    self.scanner.replace_from(filesystem.scanner());
-                    authoring.install_filesystem_candidate(filesystem);
-                    self.scan_initialized.store(true, Ordering::Release);
-                    if candidate_scan_heals {
-                        self.scan_rejection
-                            .borrow_mut()
-                            .take();
-                        self.scan_healthy.store(true, Ordering::Release);
-                    }
-                    self.schema_authority
-                        .store(Some(Arc::clone(&schema_authority)));
-                    self.build_targets.store(Arc::new(build_targets.clone()));
-                    authoring.install_pipeline_projection(projection.clone());
-                    self.configuration_error
-                        .borrow_mut()
-                        .take();
-                    match (&pipeline, prepared_epoch.take(), published_pipeline) {
+                        let tools = prepared.tool_epoch();
                         (
-                            ConfigurationPipelinePublication::Epoch { .. },
+                            ConfigurationPipelinePublication::Epoch {
+                                epoch: stored,
+                                tools,
+                            },
                             Some(prepared),
-                            PipelineDiagnostic::Ready,
-                        ) => {
-                            let importers = EpochAuthoringImporter::all(&prepared);
-                            runtime.host.install_ready(prepared);
-                            authoring
-                                .replace_pipeline_importers(importers)
-                                .expect("candidate importer metadata was prevalidated");
-                        }
-                        (
-                            ConfigurationPipelinePublication::Epoch { .. },
-                            Some(prepared),
-                            PipelineDiagnostic::Failed(error),
-                        ) => {
-                            record_cleanup_failure(
-                                &mut cleanup_failure,
-                                runtime.host.discard_unpublished(prepared),
-                            );
-                            runtime.host.install_failure(error);
-                            authoring.install_pipeline_importers(BTreeMap::new());
-                        }
-                        (
-                            ConfigurationPipelinePublication::Failed(failure),
-                            None,
-                            PipelineDiagnostic::Failed(_),
-                        ) => {
-                            runtime.host.install_failure(failure.clone());
-                            authoring.install_pipeline_importers(BTreeMap::new());
-                        }
-                        _ => unreachable!(
-                            "durable configuration pipeline state must match its prepared candidate"
-                        ),
+                            projection,
+                        )
                     }
-                    crate::build::refine_published_tag_index(
-                        Arc::clone(&store),
-                        self.scanner.clone(),
-                        Arc::clone(&schema_authority),
-                        runtime.host.snapshot(),
-                        &build_targets,
-                        max_dependency_depth,
-                        &commit_asset_bundles(&commit, &fallback_bundles),
-                    )
-                    .apply(&mut commit);
-                    commit.pipeline_epoch_changed = true;
-                    Ok(commit)
-                });
-            match result {
-                Ok(stamp) => {
-                    let failure = cleanup_failure.take();
-                    if let Some(failure) = failure {
-                        drop(runtime);
-                        self.publish_pipeline_rejection(failure)
-                    } else {
-                        Ok(stamp)
-                    }
-                }
-                Err(error) => {
-                    if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                        drop(runtime);
-                        return self.publish_pipeline_rejection(failure);
-                    }
-                    Err(CoordinatorError::Coordinated(error))
                 }
             }
-        })
+            Err(failure) => (
+                ConfigurationPipelinePublication::Failed(failure),
+                None,
+                PipelineProjection::default(),
+            ),
+        };
+        let installed_claims = match bundle_claims(
+            candidate.scan.bundle_rows(),
+            &projection,
+            Some(&schema_authority),
+        ) {
+            Ok(claims) => claims,
+            Err(error) => {
+                if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(failure);
+                }
+                return Err(error);
+            }
+        };
+        let tag_epoch = schema_authority.source_hash();
+        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+        let base = self.server().current_stamp().version;
+        let store = Arc::clone(&self.store);
+        let fallback_bundles = match store.read().all_asset_bundles() {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(failure);
+                }
+                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+            }
+        };
+        let authoring = Arc::clone(&self.authoring);
+        let mut cleanup_failure = None;
+        let result = self
+            .server()
+            .coordinated_replace_target_set(base, targets, || {
+                let mut commit = publish_scan(
+                    &store,
+                    base,
+                    candidate,
+                    true,
+                    Some(&pipeline),
+                    &projection,
+                    tag_epoch,
+                    &installed_claims,
+                )
+                .map_err(|error| error.to_string())?;
+                let published_pipeline = commit
+                    .pipeline
+                    .clone()
+                    .expect("scan commit always carries pipeline diagnostics");
+                self.scanner.replace_from(filesystem.scanner());
+                authoring.install_filesystem_candidate(filesystem);
+                self.scan_initialized.store(true, Ordering::Release);
+                if candidate_scan_heals {
+                    locked(&self.scan_rejection)
+                        .take();
+                    self.scan_healthy.store(true, Ordering::Release);
+                }
+                self.schema_authority
+                    .store(Some(Arc::clone(&schema_authority)));
+                self.build_targets.store(Arc::new(build_targets.clone()));
+                authoring.install_pipeline_projection(projection.clone());
+                locked(&self.configuration_error)
+                    .take();
+                match (&pipeline, prepared_epoch.take(), published_pipeline) {
+                    (
+                        ConfigurationPipelinePublication::Epoch { .. },
+                        Some(prepared),
+                        PipelineDiagnostic::Ready,
+                    ) => {
+                        let importers = EpochAuthoringImporter::all(&prepared);
+                        runtime.host.install_ready(prepared);
+                        authoring
+                            .replace_pipeline_importers(importers)
+                            .expect("candidate importer metadata was prevalidated");
+                    }
+                    (
+                        ConfigurationPipelinePublication::Epoch { .. },
+                        Some(prepared),
+                        PipelineDiagnostic::Failed(error),
+                    ) => {
+                        record_cleanup_failure(
+                            &mut cleanup_failure,
+                            runtime.host.discard_unpublished(prepared),
+                        );
+                        runtime.host.install_failure(error);
+                        authoring.install_pipeline_importers(BTreeMap::new());
+                    }
+                    (
+                        ConfigurationPipelinePublication::Failed(failure),
+                        None,
+                        PipelineDiagnostic::Failed(_),
+                    ) => {
+                        runtime.host.install_failure(failure.clone());
+                        authoring.install_pipeline_importers(BTreeMap::new());
+                    }
+                    _ => unreachable!(
+                        "durable configuration pipeline state must match its prepared candidate"
+                    ),
+                }
+                crate::build::refine_published_tag_index(
+                    Arc::clone(&store),
+                    self.scanner.clone(),
+                    Arc::clone(&schema_authority),
+                    runtime.host.snapshot(),
+                    &build_targets,
+                    max_dependency_depth,
+                    &commit_asset_bundles(&commit, &fallback_bundles),
+                )
+                .apply(&mut commit);
+                commit.pipeline_epoch_changed = true;
+                Ok(commit)
+            });
+        match result {
+            Ok(stamp) => {
+                let failure = cleanup_failure.take();
+                if let Some(failure) = failure {
+                    drop(runtime);
+                    self.publish_pipeline_rejection(failure)
+                } else {
+                    Ok(stamp)
+                }
+            }
+            Err(error) => {
+                if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(failure);
+                }
+                Err(CoordinatorError::Coordinated(error))
+            }
+        }
     }
 
     /// Stage, attest, durably publish, and only then expose one pipeline
@@ -771,131 +714,129 @@ impl DaemonCoordinator {
         source: &std::path::Path,
         mut requirements: CandidateRequirements,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            let base = self.server().current_stamp().version;
-            let mut runtime = lock_pipeline(&self.pipeline);
-            let prepared = {
-                let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
-                host.prepare_candidate(source, &mut requirements, loader)
-            };
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(failure);
-                }
-            };
+        let base = self.server().current_stamp().version;
+        let mut runtime = lock_pipeline(&self.pipeline);
+        let prepared = {
+            let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
+            host.prepare_candidate(source, &mut requirements, loader)
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                drop(runtime);
+                return self.publish_pipeline_rejection(failure);
+            }
+        };
 
-            let stored = match stored_pipeline_epoch(&prepared, &requirements) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
-                        drop(runtime);
-                        return self.publish_pipeline_rejection(failure);
-                    }
-                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
-                }
-            };
-            if let Err(error) =
-                self.authoring
-                    .prepare_pipeline_importers(EpochAuthoringImporter::metadata_only(
-                        prepared.importer_descriptors(),
-                    ))
-            {
+        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+            Ok(stored) => stored,
+            Err(error) => {
                 if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                     drop(runtime);
                     return self.publish_pipeline_rejection(failure);
                 }
-                return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+                return Err(CoordinatorError::InvalidManifest(error.to_string()));
             }
-            let store = Arc::clone(&self.store);
-            let tools = prepared.tool_epoch();
-            let authority = match self.schema_authority() {
-                Some(authority) => authority,
-                None => {
-                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
+        };
+        if let Err(error) =
+            self.authoring
+                .prepare_pipeline_importers(EpochAuthoringImporter::metadata_only(
+                    prepared.importer_descriptors(),
+                ))
+        {
+            if let Some(failure) = runtime.host.discard_unpublished(prepared) {
+                drop(runtime);
+                return self.publish_pipeline_rejection(failure);
+            }
+            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+        }
+        let store = Arc::clone(&self.store);
+        let tools = prepared.tool_epoch();
+        let authority = match self.schema_authority() {
+            Some(authority) => authority,
+            None => {
+                if let Some(failure) = runtime.host.discard_unpublished(prepared) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(failure);
+                }
+                return Err(CoordinatorError::InvalidManifest(
+                    "pipeline publication requires project schema authority".to_owned(),
+                ));
+            }
+        };
+        let tag_epoch = authority.source_hash();
+        let asset_bundles = match store.read().all_asset_bundles() {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                if let Some(failure) = runtime.host.discard_unpublished(prepared) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(failure);
+                }
+                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+            }
+        };
+        let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
+        let targets = self
+            .build_targets.load_full();
+        let scanner = self.scanner.clone();
+        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+        let mut prepared = Some(prepared);
+        let result = self.server().coordinated_commit(base, || {
+            let mut durable = store.write();
+            if durable.input_version() != base {
+                return Err(format!(
+                    "durable pipeline basis is {:?}, expected {base:?}",
+                    durable.input_version()
+                ));
+            }
+            durable
+                .input_transaction(|transaction| {
+                    transaction.publish_pipeline_epoch(&stored)?;
+                    transaction.publish_tool_epoch(&tools)?;
+                    for asset in &assets {
+                        transaction.set_tag_index_pending(*asset, tag_epoch)?;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
+            drop(durable);
+            let candidate = prepared
+                .take()
+                .expect("pipeline candidate is installed once");
+            let importers = EpochAuthoringImporter::all(&candidate);
+            runtime.host.install_ready(candidate);
+            self.authoring
+                .replace_pipeline_importers(importers)
+                .expect("candidate importer metadata was prevalidated");
+            let mut commit = Commit {
+                pipeline: Some(PipelineDiagnostic::Ready),
+                pipeline_epoch_changed: true,
+                ..Commit::default()
+            };
+            crate::build::refine_published_tag_index(
+                Arc::clone(&store),
+                scanner,
+                Arc::clone(&authority),
+                runtime.host.snapshot(),
+                &targets,
+                max_dependency_depth,
+                &asset_bundles,
+            )
+            .apply(&mut commit);
+            Ok(commit)
+        });
+        match result {
+            Ok(stamp) => Ok(stamp),
+            Err(error) => {
+                if let Some(candidate) = prepared.take() {
+                    if let Some(failure) = runtime.host.discard_unpublished(candidate) {
                         drop(runtime);
                         return self.publish_pipeline_rejection(failure);
                     }
-                    return Err(CoordinatorError::InvalidManifest(
-                        "pipeline publication requires project schema authority".to_owned(),
-                    ));
                 }
-            };
-            let tag_epoch = authority.source_hash();
-            let asset_bundles = match store.read().all_asset_bundles() {
-                Ok(bundles) => bundles,
-                Err(error) => {
-                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
-                        drop(runtime);
-                        return self.publish_pipeline_rejection(failure);
-                    }
-                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
-                }
-            };
-            let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
-            let targets = self
-                .build_targets.load_full();
-            let scanner = self.scanner.clone();
-            let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-            let mut prepared = Some(prepared);
-            let result = self.server().coordinated_commit(base, || {
-                let mut durable = store.write();
-                if durable.input_version() != base {
-                    return Err(format!(
-                        "durable pipeline basis is {:?}, expected {base:?}",
-                        durable.input_version()
-                    ));
-                }
-                durable
-                    .input_transaction(|transaction| {
-                        transaction.publish_pipeline_epoch(&stored)?;
-                        transaction.publish_tool_epoch(&tools)?;
-                        for asset in &assets {
-                            transaction.set_tag_index_pending(*asset, tag_epoch)?;
-                        }
-                        Ok(())
-                    })
-                    .map_err(|error| error.to_string())?;
-                drop(durable);
-                let candidate = prepared
-                    .take()
-                    .expect("pipeline candidate is installed once");
-                let importers = EpochAuthoringImporter::all(&candidate);
-                runtime.host.install_ready(candidate);
-                self.authoring
-                    .replace_pipeline_importers(importers)
-                    .expect("candidate importer metadata was prevalidated");
-                let mut commit = Commit {
-                    pipeline: Some(PipelineDiagnostic::Ready),
-                    pipeline_epoch_changed: true,
-                    ..Commit::default()
-                };
-                crate::build::refine_published_tag_index(
-                    Arc::clone(&store),
-                    scanner,
-                    Arc::clone(&authority),
-                    runtime.host.snapshot(),
-                    &targets,
-                    max_dependency_depth,
-                    &asset_bundles,
-                )
-                .apply(&mut commit);
-                Ok(commit)
-            });
-            match result {
-                Ok(stamp) => Ok(stamp),
-                Err(error) => {
-                    if let Some(candidate) = prepared.take() {
-                        if let Some(failure) = runtime.host.discard_unpublished(candidate) {
-                            drop(runtime);
-                            return self.publish_pipeline_rejection(failure);
-                        }
-                    }
-                    Err(CoordinatorError::Coordinated(error))
-                }
+                Err(CoordinatorError::Coordinated(error))
             }
-        })
+        }
     }
 
     /// Publish a candidate-input failure which occurs before a module can be
@@ -906,18 +847,14 @@ impl DaemonCoordinator {
         &self,
         failure: PipelineFailure,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            self.publish_pipeline_rejection_inner(failure, false)
-        })
+        self.publish_pipeline_rejection_inner(failure, false)
     }
 
     pub(crate) fn publish_pipeline_rejection_healing_configuration(
         &self,
         failure: PipelineFailure,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            self.publish_pipeline_rejection_inner(failure, true)
-        })
+        self.publish_pipeline_rejection_inner(failure, true)
     }
 
     fn publish_pipeline_rejection_inner(
@@ -974,8 +911,7 @@ impl DaemonCoordinator {
                 runtime.host.install_failure(failure);
                 self.authoring.install_pipeline_importers(BTreeMap::new());
                 if heal_configuration {
-                    self.configuration_error
-                        .borrow_mut()
+                    locked(&self.configuration_error)
                         .take();
                 }
                 Ok(stamp)
@@ -999,36 +935,34 @@ impl DaemonCoordinator {
 
     /// Reconcile one complete identity-checked namespace scan.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            match self.scanner.scan() {
-                Ok(scan)
-                    if self.scan_healthy.load(Ordering::Acquire)
-                        && self.scan_initialized.load(Ordering::Acquire) =>
-                {
-                    let mut store = self.store.write();
-                    if scan.same_namespace_observation(&ScanSnapshot::load(&store)?) {
-                        // Warning-grade exclusions are scanner state, not authored
-                        // input: refresh them without minting an input version.
-                        store.replace_scan_diagnostics(None, &scan.encoded_diagnostic_rows())?;
-                        drop(store);
-                        Ok(self.server().current_stamp())
-                    } else {
-                        drop(store);
-                        self.publish_scan(scan)
-                    }
-                }
-                Ok(scan) => self.publish_scan(scan),
-                Err(error) => {
-                    self.scan_healthy.store(false, Ordering::Release);
-                    self.publish_scan_rejection(&error, true)
+        match self.scanner.scan() {
+            Ok(scan)
+                if self.scan_healthy.load(Ordering::Acquire)
+                    && self.scan_initialized.load(Ordering::Acquire) =>
+            {
+                let mut store = self.store.write();
+                if scan.same_namespace_observation(&ScanSnapshot::load(&store)?) {
+                    // Warning-grade exclusions are scanner state, not authored
+                    // input: refresh them without minting an input version.
+                    store.replace_scan_diagnostics(None, &scan.encoded_diagnostic_rows())?;
+                    drop(store);
+                    Ok(self.server().current_stamp())
+                } else {
+                    drop(store);
+                    self.publish_scan(scan)
                 }
             }
-        })
+            Ok(scan) => self.publish_scan(scan),
+            Err(error) => {
+                self.scan_healthy.store(false, Ordering::Release);
+                self.publish_scan_rejection(&error, true)
+            }
+        }
     }
 
     /// Full startup/recovery scan. Events already queued are replayed
     /// incrementally after the scan commits; only admitted overflow repeats
-    /// the complete scan. Later events wait in the authority inbox.
+    /// the complete scan. Later events wait in the loop's inbox.
     pub fn reconcile_startup(
         &self,
         queue: &mut WatcherQueue,
@@ -1064,193 +998,183 @@ impl DaemonCoordinator {
         &self,
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.on_authority(|| {
-            let pending_subjects = self
-                .scan_rejection
-                .borrow_mut()
-                .as_ref()
-                .map(|pending| pending.subjects.clone())
-                .unwrap_or_default();
-            let event_keys = batch
-                .paths
-                .iter()
-                .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
-                .collect::<Vec<_>>();
-            let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
-                prefix.0 == candidate.0
-                    && (prefix.1.is_empty()
-                        || candidate.1 == prefix.1
-                        || candidate
-                            .1
-                            .strip_prefix(&prefix.1)
-                            .is_some_and(|suffix| suffix.starts_with('/')))
-            };
-            let heals_pending_rejection = pending_subjects.iter().any(|subject| {
-                let physical_overlap = batch.paths.iter().any(|event| {
-                    event == subject || subject.starts_with(event) || event.starts_with(subject)
-                });
-                physical_overlap
-                    || self
-                        .scanner
-                        .event_path_key(subject)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|subject_key| {
-                            event_keys.iter().any(|event_key| {
-                                logical_contains(&subject_key, event_key)
-                                    || logical_contains(event_key, &subject_key)
-                            })
+        let pending_subjects = locked(&self.scan_rejection)
+            .as_ref()
+            .map(|pending| pending.subjects.clone())
+            .unwrap_or_default();
+        let event_keys = batch
+            .paths
+            .iter()
+            .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
+            .collect::<Vec<_>>();
+        let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
+            prefix.0 == candidate.0
+                && (prefix.1.is_empty()
+                    || candidate.1 == prefix.1
+                    || candidate
+                        .1
+                        .strip_prefix(&prefix.1)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        };
+        let heals_pending_rejection = pending_subjects.iter().any(|subject| {
+            let physical_overlap = batch.paths.iter().any(|event| {
+                event == subject || subject.starts_with(event) || event.starts_with(subject)
+            });
+            physical_overlap
+                || self
+                    .scanner
+                    .event_path_key(subject)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|subject_key| {
+                        event_keys.iter().any(|event_key| {
+                            logical_contains(&subject_key, event_key)
+                                || logical_contains(event_key, &subject_key)
                         })
-            });
-            let mut scan_paths = batch.paths.clone();
-            if heals_pending_rejection {
-                // Revalidate the complete rejected subject set, but no unrelated
-                // root or subtree. This lets independently repaired defects heal
-                // across separate native batches without falling back to a full
-                // scan.
-                scan_paths.extend(pending_subjects);
-                scan_paths.sort_unstable();
-                scan_paths.dedup();
-            }
-            let mut renames = Vec::new();
-            for rename in &batch.renames {
-                let from = self.scanner.event_path_key(&rename.from)?;
-                let to = self.scanner.event_path_key(&rename.to)?;
-                if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
-                    if from_root == to_root {
-                        renames.push(LogicalRename {
-                            root_name: from_root,
-                            from_path,
-                            to_path,
-                        });
-                    }
+                    })
+        });
+        let mut scan_paths = batch.paths.clone();
+        if heals_pending_rejection {
+            // Revalidate the complete rejected subject set, but no unrelated
+            // root or subtree. This lets independently repaired defects heal
+            // across separate native batches without falling back to a full
+            // scan.
+            scan_paths.extend(pending_subjects);
+            scan_paths.sort_unstable();
+            scan_paths.dedup();
+        }
+        let mut renames = Vec::new();
+        for rename in &batch.renames {
+            let from = self.scanner.event_path_key(&rename.from)?;
+            let to = self.scanner.event_path_key(&rename.to)?;
+            if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
+                if from_root == to_root {
+                    renames.push(LogicalRename {
+                        root_name: from_root,
+                        from_path,
+                        to_path,
+                    });
                 }
             }
-            // On the authority: no other publication interleaves with this step.
-            let server = self.server();
-            let (delta, baseline) = {
-                let store = self.store.read();
-                let stored = StoredBaseline::new(&store);
-                let delta = self.scanner.scan_incremental_delta(&stored, &scan_paths);
-                stored.finish()?;
-                match delta {
-                    Ok(None) => return Ok(server.current_stamp()),
-                    // The published rows the delta replaces.
-                    Ok(Some(delta)) => {
-                        let baseline = ScanSnapshot::load_under(&store, delta.affected_prefixes())?;
-                        (delta, baseline)
-                    }
-                    Err(error) => {
-                        drop(store);
-                        self.scan_healthy.store(false, Ordering::Release);
-                        return self.publish_scan_rejection(&error, heals_pending_rejection);
-                    }
+        }
+        // Inside the open input: no other publication interleaves with this step.
+        let server = self.server();
+        let (delta, baseline) = {
+            let store = self.store.read();
+            let stored = StoredBaseline::new(&store);
+            let delta = self.scanner.scan_incremental_delta(&stored, &scan_paths);
+            stored.finish()?;
+            match delta {
+                Ok(None) => return Ok(server.current_stamp()),
+                // The published rows the delta replaces.
+                Ok(Some(delta)) => {
+                    let baseline = ScanSnapshot::load_under(&store, delta.affected_prefixes())?;
+                    (delta, baseline)
                 }
-            };
-            let healed_rejection = heals_pending_rejection
-                .then(|| {
-                    self.scan_rejection
-                        .borrow_mut()
-                        .take()
-                })
-                .flatten();
-            if delta.is_same_namespace_observation(&baseline)
-                && renames.is_empty()
-                && self.scan_healthy.load(Ordering::Acquire)
-            {
-                // Diagnostics are replaced with their affected subtree even when
-                // the authored namespace itself did not change.
-                self.store.write().replace_scan_diagnostics(
-                    Some(delta.affected_prefixes()),
-                    &delta.observed().encoded_diagnostic_rows(),
-                )?;
-                return Ok(server.current_stamp());
+                Err(error) => {
+                    drop(store);
+                    self.scan_healthy.store(false, Ordering::Release);
+                    return self.publish_scan_rejection(&error, heals_pending_rejection);
+                }
             }
-            let projection = self.authoring.pipeline_projection();
-            let authority = self.schema_authority();
-            let claims = match bundle_claims(
-                delta
-                    .observed_bundle_entries()
-                    .map(|(_, source)| source.as_ref()),
+        };
+        let healed_rejection = heals_pending_rejection
+            .then(|| {
+                locked(&self.scan_rejection)
+                    .take()
+            })
+            .flatten();
+        if delta.is_same_namespace_observation(&baseline)
+            && renames.is_empty()
+            && self.scan_healthy.load(Ordering::Acquire)
+        {
+            // Diagnostics are replaced with their affected subtree even when
+            // the authored namespace itself did not change.
+            self.store.write().replace_scan_diagnostics(
+                Some(delta.affected_prefixes()),
+                &delta.observed().encoded_diagnostic_rows(),
+            )?;
+            return Ok(server.current_stamp());
+        }
+        let projection = self.authoring.pipeline_projection();
+        let authority = self.schema_authority();
+        let claims = match bundle_claims(
+            delta
+                .observed_bundle_entries()
+                .map(|(_, source)| source.as_ref()),
+            &projection,
+            authority.as_deref(),
+        ) {
+            Ok(claims) => claims,
+            Err(error) => {
+                if let Some(rejection) = healed_rejection {
+                    *locked(&self.scan_rejection) = Some(rejection);
+                }
+                return Err(error);
+            }
+        };
+        let inputs = PlanInputs {
+            configuration_error: self.configuration_error(),
+            namespace_errors: self.pending_scan_errors(),
+            authority: authority.as_deref(),
+            fresh: fresh_bundles(&delta),
+        };
+        let base = server.current_stamp().version;
+        let store = Arc::clone(&self.store);
+        let tag_epoch = authority
+            .as_ref()
+            .map_or([0; 32], |authority| authority.source_hash());
+        let pipeline = self.pipeline_snapshot();
+        let targets = self
+            .build_targets.load_full();
+        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+        let scanner = self.scanner.clone();
+        let result = server.coordinated_commit(base, || {
+            let mut commit = publish_incremental_scan(
+                &store,
+                base,
+                &baseline,
+                &delta,
+                &claims,
+                &inputs,
+                &renames,
                 &projection,
-                authority.as_deref(),
-            ) {
-                Ok(claims) => claims,
-                Err(error) => {
-                    if let Some(rejection) = healed_rejection {
-                        *self
-                            .scan_rejection
-                            .borrow_mut() = Some(rejection);
-                    }
-                    return Err(error);
-                }
-            };
-            let inputs = PlanInputs {
-                configuration_error: self.configuration_error(),
-                namespace_errors: self.pending_scan_errors(),
-                authority: authority.as_deref(),
-                fresh: fresh_bundles(&delta),
-            };
-            let base = server.current_stamp().version;
-            let store = Arc::clone(&self.store);
-            let tag_epoch = authority
-                .as_ref()
-                .map_or([0; 32], |authority| authority.source_hash());
-            let pipeline = self.pipeline_snapshot();
-            let targets = self
-                .build_targets.load_full();
-            let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-            let scanner = self.scanner.clone();
-            let result = server.coordinated_commit(base, || {
-                let mut commit = publish_incremental_scan(
-                    &store,
-                    base,
-                    &baseline,
-                    &delta,
-                    &claims,
-                    &inputs,
-                    &renames,
-                    &projection,
-                    tag_epoch,
-                )
-                .map_err(|error| error.to_string())?;
-                if let Some(authority) = authority.clone() {
-                    let affected = commit_affected_asset_bundles(&commit);
-                    if !affected.is_empty() {
-                        crate::build::refine_published_tag_index_incremental(
-                            Arc::clone(&store),
-                            scanner,
-                            authority,
-                            pipeline,
-                            &targets,
-                            max_dependency_depth,
-                            &affected,
-                        )
-                        .apply_incremental(&mut commit);
-                    }
-                }
-                Ok(commit)
-            });
-            match result {
-                Ok(stamp) => {
-                    self.scan_healthy.store(
-                        self.scan_rejection
-                            .borrow_mut()
-                            .is_none(),
-                        Ordering::Release,
-                    );
-                    Ok(stamp)
-                }
-                Err(error) => {
-                    if let Some(rejection) = healed_rejection {
-                        *self
-                            .scan_rejection
-                            .borrow_mut() = Some(rejection);
-                    }
-                    Err(CoordinatorError::Coordinated(error))
+                tag_epoch,
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(authority) = authority.clone() {
+                let affected = commit_affected_asset_bundles(&commit);
+                if !affected.is_empty() {
+                    crate::build::refine_published_tag_index_incremental(
+                        Arc::clone(&store),
+                        scanner,
+                        authority,
+                        pipeline,
+                        &targets,
+                        max_dependency_depth,
+                        &affected,
+                    )
+                    .apply_incremental(&mut commit);
                 }
             }
-        })
+            Ok(commit)
+        });
+        match result {
+            Ok(stamp) => {
+                self.scan_healthy.store(
+                    locked(&self.scan_rejection)
+                        .is_none(),
+                    Ordering::Release,
+                );
+                Ok(stamp)
+            }
+            Err(error) => {
+                if let Some(rejection) = healed_rejection {
+                    *locked(&self.scan_rejection) = Some(rejection);
+                }
+                Err(CoordinatorError::Coordinated(error))
+            }
+        }
     }
 
     fn publish_cached_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
@@ -1330,13 +1254,11 @@ impl DaemonCoordinator {
             .map_err(CoordinatorError::Coordinated)?;
         self.scan_initialized.store(true, Ordering::Release);
         if heals_scan_rejection {
-            self.scan_rejection
-                .borrow_mut()
+            locked(&self.scan_rejection)
                 .take();
         }
         self.scan_healthy.store(
-            self.scan_rejection
-                .borrow_mut()
+            locked(&self.scan_rejection)
                 .is_none(),
             Ordering::Release,
         );
@@ -1349,9 +1271,7 @@ impl DaemonCoordinator {
         replaces_pending: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let observed_rejection = classify_scan_rejection(&self.scanner, error)?;
-        let previous_pending = self
-            .scan_rejection
-            .borrow_mut()
+        let previous_pending = locked(&self.scan_rejection)
             .clone();
         let rejection = if replaces_pending {
             observed_rejection
@@ -1385,9 +1305,7 @@ impl DaemonCoordinator {
             .into_iter()
             .chain(rejection.version.iter().cloned())
             .collect::<Vec<_>>();
-        let source_configuration = self
-            .configuration_error
-            .borrow_mut()
+        let source_configuration = locked(&self.configuration_error)
             .clone();
         let external_configuration = ConfigurationError::select_canonical(
             source_configuration
@@ -1439,9 +1357,7 @@ impl DaemonCoordinator {
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)?;
-        *self
-            .scan_rejection
-            .borrow_mut() = Some(pending);
+        *locked(&self.scan_rejection) = Some(pending);
         Ok(stamp)
     }
 
@@ -1450,7 +1366,8 @@ impl DaemonCoordinator {
     /// roll back an earlier per-file success.
     pub fn reconcile_watched_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let pending = self
-            .on_authority(|| self.authoring.watched_imports_needing_reimport())
+            .authoring
+            .watched_imports_needing_reimport()
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
         self.reconcile_watched_import_bundles(pending)
     }
@@ -1462,17 +1379,13 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let pending = self
-            .on_authority(|| {
-                if capabilities_changed {
-                    self.authoring
-                        .watched_imports_affected_by_capabilities(&work.dirty, &work.renames)
-                } else {
-                    self.authoring
-                        .watched_imports_affected_by(&work.dirty, &work.renames)
-                }
-            })
-            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        let pending = if capabilities_changed {
+            self.authoring
+                .watched_imports_affected_by_capabilities(&work.dirty, &work.renames)
+        } else {
+            self.authoring.watched_imports_affected_by(&work.dirty, &work.renames)
+        }
+        .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
         self.reconcile_watched_import_bundles(pending)
     }
 
@@ -1487,8 +1400,8 @@ impl DaemonCoordinator {
         )
     }
 
-    /// Run each watched import in parallel, off the authority, at the
-    /// current version; then publish them in order on the authority, each as
+    /// Run each watched import in parallel, outside any write, at the
+    /// current version; then publish them in order, each in its own input as
     /// its own version. A run that an earlier publication made stale reruns
     /// there, at the version it publishes after.
     fn reconcile_watched<T: Sync>(
@@ -1507,36 +1420,34 @@ impl DaemonCoordinator {
             .par_iter()
             .map(|item| run(base, item))
             .collect::<Vec<_>>();
-        self.on_authority(|| {
-            let mut imported = Vec::with_capacity(items.len());
-            for (item, run) in items.iter().zip(runs) {
-                let current = self.server().current_stamp().version;
-                let drifted = current != base;
-                let mut bundle = None;
-                let publication = self
-                    .server()
-                    .coordinated_maybe_commit(current, || {
-                        let prepared = match run {
-                            Ok(run) => match self.authoring.publish_watched_import(current, run) {
-                                Err(_) if drifted => rerun(current, item),
-                                published => published,
-                            },
+        let mut imported = Vec::with_capacity(items.len());
+        for (item, run) in items.iter().zip(runs) {
+            let current = self.server().current_stamp().version;
+            let drifted = current != base;
+            let mut bundle = None;
+            let publication = self
+                .server()
+                .coordinated_maybe_commit(current, || {
+                    let prepared = match run {
+                        Ok(run) => match self.authoring.publish_watched_import(current, run) {
                             Err(_) if drifted => rerun(current, item),
-                            Err(error) => Err(error),
-                        }
-                        .map_err(|error| format!("{error:?}"))?;
-                        Ok(prepared.map(|prepared| {
-                            bundle = Some(prepared.bundle);
-                            prepared.commit
-                        }))
-                    })
-                    .map_err(CoordinatorError::Coordinated)?;
-                if publication.is_some() {
-                    imported.push(bundle.expect("a published watched import names its bundle"));
-                }
+                            published => published,
+                        },
+                        Err(_) if drifted => rerun(current, item),
+                        Err(error) => Err(error),
+                    }
+                    .map_err(|error| format!("{error:?}"))?;
+                    Ok(prepared.map(|prepared| {
+                        bundle = Some(prepared.bundle);
+                        prepared.commit
+                    }))
+                })
+                .map_err(CoordinatorError::Coordinated)?;
+            if publication.is_some() {
+                imported.push(bundle.expect("a published watched import names its bundle"));
             }
-            Ok(imported)
-        })
+        }
+        Ok(imported)
     }
 
 
@@ -1547,18 +1458,16 @@ impl DaemonCoordinator {
     }
 
     pub fn acknowledge_file_work(&self, work: &PendingFileWork) -> Result<(), CoordinatorError> {
-        self.on_authority(|| {
-            if work.is_empty() {
-                return Ok(());
-            }
-            match self.store.write().acknowledge_file_work(work) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(CoordinatorError::InvalidManifest(
-                    "watcher work observation changed before acknowledgement".to_owned(),
-                )),
-                Err(error) => Err(CoordinatorError::InvalidManifest(error.to_string())),
-            }
-        })
+        if work.is_empty() {
+            return Ok(());
+        }
+        match self.store.write().acknowledge_file_work(work) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CoordinatorError::InvalidManifest(
+                "watcher work observation changed before acknowledgement".to_owned(),
+            )),
+            Err(error) => Err(CoordinatorError::InvalidManifest(error.to_string())),
+        }
     }
 
     /// Discover and apply authored directory-import rules. Every generated
@@ -1566,7 +1475,8 @@ impl DaemonCoordinator {
     /// are deliberately retained and therefore never appear as deletion work.
     pub fn reconcile_directory_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let tasks = self
-            .on_authority(|| self.authoring.directory_import_tasks())
+            .authoring
+            .directory_import_tasks()
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
         self.reconcile_directory_import_tasks(tasks)
     }
@@ -1576,17 +1486,13 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let tasks = self
-            .on_authority(|| {
-                if capabilities_changed {
-                    self.authoring
-                        .directory_import_tasks_affected_by_capabilities(&work.dirty, &work.renames)
-                } else {
-                    self.authoring
-                        .directory_import_tasks_affected_by(&work.dirty, &work.renames)
-                }
-            })
-            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        let tasks = if capabilities_changed {
+            self.authoring
+                .directory_import_tasks_affected_by_capabilities(&work.dirty, &work.renames)
+        } else {
+            self.authoring.directory_import_tasks_affected_by(&work.dirty, &work.renames)
+        }
+        .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
         self.reconcile_directory_import_tasks(tasks)
     }
 
@@ -2534,7 +2440,7 @@ fn published_bundle_assets(
 
 #[allow(clippy::too_many_arguments)] // The scan transaction receives each publication input explicitly.
 fn publish_scan(
-    store: &Arc<AuthorityStore>,
+    store: &Arc<SharedStore>,
     base: InputVersion,
     mut candidate: ScanCandidate,
     advance_configuration: bool,
@@ -2872,7 +2778,7 @@ fn append_path_mutations(
 /// failed publication rolls both back.
 #[allow(clippy::too_many_arguments)] // The transaction receives each independently pinned publication authority.
 fn publish_incremental_scan(
-    store: &Arc<AuthorityStore>,
+    store: &Arc<SharedStore>,
     base: InputVersion,
     baseline: &ScanSnapshot,
     delta: &ScanDelta,
@@ -3320,7 +3226,7 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
 pub(crate) fn publish_incremental_paths(
     scanner: &RootedScanner,
     paths: &[PathBuf],
-    store: &Arc<AuthorityStore>,
+    store: &Arc<SharedStore>,
     base: InputVersion,
     projection: &PipelineProjection,
     coordinator: Option<&DaemonCoordinator>,
@@ -3695,49 +3601,27 @@ fn skeleton_failure(error: &distill_bundle::BundleError) -> SkeletonFailureCode 
 }
 
 
-/// The daemon side of the RPC server's store: publications run on the
-/// authority, writes go through the shared store mutex.
-struct DaemonStore {
-    store: Arc<AuthorityStore>,
-    authority: AuthoritySender,
-}
-
-impl distill_rpc::ExternalStore for DaemonStore {
-    fn on_authority(&self) -> bool {
-        self.authority.on_authority()
-    }
-
-    fn execute(&self, job: distill_rpc::AuthorityJob) {
-        self.authority.execute(job);
-    }
-
-    fn with_store(&self, job: &mut (dyn FnMut(&mut Store) + Send)) {
-        self.store
-            .write_with(|store| job(store))
-            .expect("the authority runs while its store is served");
-    }
-}
-
-/// The pipeline runtime, which only the authority touches, and the
-/// snapshot of it that other threads read.
+/// The pipeline runtime and the snapshot of it that other threads read.
 struct PipelineState {
-    runtime: AuthorityCell<CoordinatedPipelineRuntime>,
+    /// Taken to prepare, install or fail an epoch; never while waiting on
+    /// SQLite's write lock with a transaction open.
+    runtime: Mutex<CoordinatedPipelineRuntime>,
     published: ArcSwap<PipelineSnapshot>,
 }
 
 impl PipelineState {
-    fn new(runtime: CoordinatedPipelineRuntime, authority: &AuthoritySender) -> Self {
+    fn new(runtime: CoordinatedPipelineRuntime) -> Self {
         Self {
             published: ArcSwap::from_pointee(runtime.host.snapshot()),
-            runtime: AuthorityCell::new(runtime, authority),
+            runtime: Mutex::new(runtime),
         }
     }
 }
 
-/// The pipeline runtime, borrowed on the authority. Dropping it publishes
-/// the host's snapshot.
+/// The pipeline runtime, locked. Dropping it publishes the host's
+/// snapshot.
 struct PipelineGuard<'a> {
-    runtime: AuthorityRef<'a, CoordinatedPipelineRuntime>,
+    runtime: MutexGuard<'a, CoordinatedPipelineRuntime>,
     published: &'a ArcSwap<PipelineSnapshot>,
 }
 
@@ -3763,9 +3647,14 @@ impl Drop for PipelineGuard<'_> {
 
 fn lock_pipeline(pipeline: &PipelineState) -> PipelineGuard<'_> {
     PipelineGuard {
-        runtime: pipeline.runtime.borrow_mut(),
+        runtime: locked(&pipeline.runtime),
         published: &pipeline.published,
     }
+}
+
+/// `mutex`, locked; a panic while it was held leaves the state as it was.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn build_worker_pool(parallelism: usize) -> Result<Arc<ThreadPool>, String> {

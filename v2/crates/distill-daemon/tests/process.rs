@@ -381,11 +381,7 @@ fn operational_configuration_applies_live_without_an_input_version() {
         before
     );
     assert_eq!(
-        // The operational config lives on the writer.
-        process
-            .coordinator()
-            .on_authority(|| process.coordinator().store().read().operational_config())
-            .parallelism,
+        process.coordinator().store().config().parallelism,
         3
     );
 }

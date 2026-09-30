@@ -194,37 +194,34 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         rows.sort_by(|a, b| a.0.cmp(b.0));
         rows.dedup_by(|a, b| a.0 == b.0);
-        let active: u64 = self
-            .conn
-            .query_row(
-                "SELECT active_generation FROM configuration_state WHERE id = 0",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(persistence)?
-            .unwrap_or(0) as u64;
-        let prior: u64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(generation), 0) FROM pending_restart",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(persistence)? as u64;
-        let generation = active.max(prior) + 1;
-        let txn = self.read.conn.savepoint().map_err(persistence)?;
-        txn.execute("DELETE FROM pending_restart", [])
+        let generation = self
+            .write_txn(|store| {
+                let active = store
+                    .conn
+                    .query_row(
+                        "SELECT active_generation FROM configuration_state WHERE id = 0",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0) as u64;
+                let prior = store.conn.query_row(
+                    "SELECT COALESCE(MAX(generation), 0) FROM pending_restart",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? as u64;
+                let generation = active.max(prior) + 1;
+                store.conn.execute("DELETE FROM pending_restart", [])?;
+                for (key, value) in &rows {
+                    store.conn.execute(
+                        "INSERT INTO pending_restart(generation, config_key, config_value)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![generation as i64, key, value],
+                    )?;
+                }
+                Ok(generation)
+            })
             .map_err(persistence)?;
-        for (key, value) in &rows {
-            txn.execute(
-                "INSERT INTO pending_restart(generation, config_key, config_value)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![generation as i64, key, value],
-            )
-            .map_err(persistence)?;
-        }
-        txn.commit().map_err(persistence)?;
         Ok(PendingRestart {
             generation,
             keys: rows.into_iter().map(|(key, _)| key.to_owned()).collect(),
@@ -234,8 +231,10 @@ impl Store {
     /// Clear a staged restart candidate that has been edited back to the
     /// active startup values. This is not an input event.
     pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM pending_restart", [])?;
-        Ok(())
+        self.write_txn(|store| {
+            store.conn.execute("DELETE FROM pending_restart", [])?;
+            Ok(())
+        })
     }
 }
 

@@ -461,7 +461,7 @@ impl Store {
 
     /// Complete tag extraction after the owning input transaction has made
     /// the candidate namespace readable but before that version is exposed by
-    /// the authority's RPC publication step. This deliberately does not
+    /// the RPC publication step. This deliberately does not
     /// advance the input version: a crash between the namespace transaction
     /// and this refinement leaves the conservative pending poison intact.
     pub fn refine_unpublished_tag_index(
@@ -469,70 +469,72 @@ impl Store {
         expected: InputVersion,
         updates: &[TagIndexUpdate],
     ) -> Result<(), StoreError> {
-        if self.input_version() != expected {
-            return Err(StoreError::InvalidConfiguration {
-                error: format!(
-                    "tag-index refinement basis {:?}, current {:?}",
-                    expected,
-                    self.input_version()
-                ),
-            });
-        }
-        let mut assets = BTreeSet::new();
-        let txn = self.read.conn.savepoint()?;
-        for update in updates {
-            if !assets.insert(update.asset) {
+        self.write_txn(|store| {
+            if store.input_version() != expected {
                 return Err(StoreError::InvalidConfiguration {
-                    error: format!("duplicate tag-index update for {}", update.asset),
+                    error: format!(
+                        "tag-index refinement basis {:?}, current {:?}",
+                        expected,
+                        store.input_version()
+                    ),
                 });
             }
-            let exists: bool = txn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)",
-                [update.asset.0.as_slice()],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Err(StoreError::InvalidConfiguration {
-                    error: format!("tag-index update names missing asset {}", update.asset),
-                });
-            }
-            if update.poison.is_some() && !update.tags.is_empty() {
-                return Err(StoreError::InvalidConfiguration {
-                    error: format!("poisoned tag-index update {} carried tags", update.asset),
-                });
-            }
-            txn.execute(
-                "DELETE FROM asset_tags WHERE asset_uuid = ?1",
-                [update.asset.0.as_slice()],
-            )?;
-            for (tag, value) in &update.tags {
+            let mut assets = BTreeSet::new();
+            let txn = store.read.conn.savepoint()?;
+            for update in updates {
+                if !assets.insert(update.asset) {
+                    return Err(StoreError::InvalidConfiguration {
+                        error: format!("duplicate tag-index update for {}", update.asset),
+                    });
+                }
+                let exists: bool = txn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)",
+                    [update.asset.0.as_slice()],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(StoreError::InvalidConfiguration {
+                        error: format!("tag-index update names missing asset {}", update.asset),
+                    });
+                }
+                if update.poison.is_some() && !update.tags.is_empty() {
+                    return Err(StoreError::InvalidConfiguration {
+                        error: format!("poisoned tag-index update {} carried tags", update.asset),
+                    });
+                }
                 txn.execute(
-                    "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![update.asset.0.as_slice(), tag, value],
+                    "DELETE FROM asset_tags WHERE asset_uuid = ?1",
+                    [update.asset.0.as_slice()],
+                )?;
+                for (tag, value) in &update.tags {
+                    txn.execute(
+                        "INSERT INTO asset_tags(asset_uuid, tag, value) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![update.asset.0.as_slice(), tag, value],
+                    )?;
+                }
+                txn.execute(
+                    "INSERT INTO asset_tag_index(
+                        asset_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(asset_uuid) DO UPDATE SET
+                        tag_epoch = excluded.tag_epoch,
+                        planner_version = excluded.planner_version,
+                        dylib_hash = excluded.dylib_hash,
+                        trace = excluded.trace,
+                        poison = excluded.poison",
+                    rusqlite::params![
+                        update.asset.0.as_slice(),
+                        update.tag_epoch.as_slice(),
+                        update.planner_version.map(i64::from),
+                        update.dylib_hash.map(|hash| hash.to_vec()),
+                        update.trace,
+                        update.poison,
+                    ],
                 )?;
             }
-            txn.execute(
-                "INSERT INTO asset_tag_index(
-                    asset_uuid, tag_epoch, planner_version, dylib_hash, trace, poison
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(asset_uuid) DO UPDATE SET
-                    tag_epoch = excluded.tag_epoch,
-                    planner_version = excluded.planner_version,
-                    dylib_hash = excluded.dylib_hash,
-                    trace = excluded.trace,
-                    poison = excluded.poison",
-                rusqlite::params![
-                    update.asset.0.as_slice(),
-                    update.tag_epoch.as_slice(),
-                    update.planner_version.map(i64::from),
-                    update.dylib_hash.map(|hash| hash.to_vec()),
-                    update.trace,
-                    update.poison,
-                ],
-            )?;
-        }
-        txn.commit()?;
-        Ok(())
+            txn.commit()?;
+            Ok(())
+        })
     }
 }
 

@@ -34,14 +34,12 @@ use crate::{
 
 pub use crate::distill_rpc_capnp as schema;
 
-/// Wait for `call` on a blocking worker: the single-threaded capnp-rpc
-/// driver never waits on the authority itself.
-async fn run_off_thread<T: Send + 'static>(
-    call: crate::AuthorityCall<T>,
-) -> Result<Result<T, crate::AuthorityStopped>, capnp::Error> {
+/// Run `call` on a blocking worker: a publication may wait on SQLite's
+/// write lock, and the single-threaded capnp-rpc driver never does.
+async fn run_blocking<T: Send + 'static>(call: crate::WriteCall<T>) -> Result<T, capnp::Error> {
     tokio::task::spawn_blocking(move || call.run())
         .await
-        .map_err(|error| capnp::Error::failed(format!("authority wait failed: {error}")))
+        .map_err(|error| capnp::Error::failed(format!("publication failed: {error}")))
 }
 
 const WIRE_INVALID_UUID: u16 = 1001;
@@ -538,7 +536,7 @@ impl schema::hub::Server for HubService {
                 ops,
                 params.get_force_lossy(),
             ) {
-                Ok(call) => crate::write_call_outcome(run_off_thread(call).await?),
+                Ok(call) => crate::write_call_outcome(run_blocking(call).await?),
                 Err(result) => result,
             };
             write_uint64_result(
@@ -584,7 +582,7 @@ impl schema::hub::Server for HubService {
                             capnp::Error::failed(format!("import worker failed: {error}"))
                         })?;
                     match self.hub.import_publish_call(finished) {
-                        Ok(call) => crate::import_call_outcome(run_off_thread(call).await?),
+                        Ok(call) => crate::import_call_outcome(run_blocking(call).await?),
                         Err(result) => result,
                     }
                 }
@@ -626,7 +624,7 @@ impl schema::hub::Server for HubService {
                             capnp::Error::failed(format!("import worker failed: {error}"))
                         })?;
                     match self.hub.import_publish_call(finished) {
-                        Ok(call) => crate::import_call_outcome(run_off_thread(call).await?),
+                        Ok(call) => crate::import_call_outcome(run_blocking(call).await?),
                         Err(result) => result,
                     }
                 }
@@ -1277,7 +1275,7 @@ impl schema::progress_stream::Server for ProgressStreamService {
                 Some(crate::ProgressStep::Event(event)) => Some(event),
                 Some(crate::ProgressStep::Complete { event, call }) => {
                     let outcome = match call {
-                        Ok(call) => crate::completion_outcome(run_off_thread(call).await?),
+                        Ok(call) => run_blocking(call).await?,
                         Err(error) => Err(error),
                     };
                     Some(self.stream.borrow_mut().finish_completion(event, outcome))

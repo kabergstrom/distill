@@ -60,7 +60,7 @@ pub enum WatcherEvent {
     Failed(String),
 }
 
-/// Where the watcher delivers its events (the authority inbox).
+/// Where the watcher delivers its events (the process loop's inbox).
 pub type WatcherSink = Arc<dyn Fn(WatcherEvent) + Send + Sync>;
 
 pub struct WatcherQueue {

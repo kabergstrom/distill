@@ -5,7 +5,6 @@
 
 pub mod atomic;
 pub mod authoring;
-mod authority;
 pub mod bootstrap;
 mod build;
 pub mod callbacks;
@@ -21,7 +20,6 @@ mod pipeline_map;
 pub mod process;
 pub mod scanner;
 pub mod scheduler;
-pub mod store_cell;
 mod tool_resolver;
 pub mod watcher;
 #[cfg(not(unix))]
