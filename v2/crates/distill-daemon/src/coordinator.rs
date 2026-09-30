@@ -1382,6 +1382,9 @@ impl DaemonCoordinator {
                     // Warning-grade exclusions are scanner state, not authored
                     // input: refresh them without minting an input version.
                     *baseline = scan;
+                    // Never take the publication lock under the scan
+                    // snapshot (see `Server::publication_lock`).
+                    drop(baseline);
                     Ok(self.server.current_stamp())
                 } else {
                     drop(baseline);
@@ -1496,12 +1499,16 @@ impl DaemonCoordinator {
                 }
             }
         }
+        // Publication lock before the scan snapshot: authoring imports take
+        // the snapshot inside the publication lock (`Server::publication_lock`).
+        let mut publication = self.server.publication_lock();
         let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
         let delta = match self.scanner.scan_incremental_delta(&baseline, &scan_paths) {
-            Ok(None) => return Ok(self.server.current_stamp()),
+            Ok(None) => return Ok(publication.current_stamp()),
             Ok(Some(delta)) => delta,
             Err(error) => {
                 drop(baseline);
+                drop(publication);
                 self.scan_healthy.store(false, Ordering::Release);
                 return self.publish_scan_rejection(&error, heals_pending_rejection);
             }
@@ -1521,7 +1528,7 @@ impl DaemonCoordinator {
             // Diagnostics are replaced with their affected subtree even when
             // the authored namespace itself did not change.
             baseline.apply_delta(delta);
-            return Ok(self.server.current_stamp());
+            return Ok(publication.current_stamp());
         }
         let projection = self.authoring.pipeline_projection();
         let authority = self.schema_authority();
@@ -1556,7 +1563,7 @@ impl DaemonCoordinator {
                 .chain(self.pending_scan_version_poison()),
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let base = self.server.current_stamp().version;
+        let base = publication.current_stamp().version;
         let store = Arc::clone(&self.store);
         let tag_epoch = authority
             .as_ref()
@@ -1569,7 +1576,7 @@ impl DaemonCoordinator {
             .clone();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let scanner = self.scanner.clone();
-        let result = self.server.coordinated_commit(base, || {
+        let result = publication.coordinated_commit(base, || {
             let mut commit = publish_incremental_scan(
                 &store,
                 base,

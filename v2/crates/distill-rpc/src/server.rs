@@ -357,6 +357,33 @@ pub enum CoordinatedCommitError {
     Invalid(AdminError),
 }
 
+/// The held server publication lock (`Server::publication_lock`).
+pub struct PublicationLock<'a> {
+    state: MutexGuard<'a, ServerState>,
+}
+
+impl PublicationLock<'_> {
+    pub fn current_stamp(&self) -> SnapshotStamp {
+        stamp(&self.state)
+    }
+
+    /// `Server::coordinated_commit` under the already-held lock.
+    pub fn coordinated_commit(
+        &mut self,
+        base: InputVersion,
+        publish: impl FnOnce() -> Result<Commit, String>,
+    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
+        if self.state.current != base {
+            return Err(CoordinatedCommitError::Stale {
+                expected: base,
+                observed: self.state.current,
+            });
+        }
+        let commit = publish().map_err(CoordinatedCommitError::Publication)?;
+        commit_locked(&mut self.state, commit).map_err(CoordinatedCommitError::Invalid)
+    }
+}
+
 struct MetadataBinding {
     id: u64,
     store_instance: StoreInstanceId,
@@ -1440,15 +1467,16 @@ impl Server {
         base: InputVersion,
         publish: impl FnOnce() -> Result<Commit, String>,
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        let mut state = self.lock();
-        if state.current != base {
-            return Err(CoordinatedCommitError::Stale {
-                expected: base,
-                observed: state.current,
-            });
-        }
-        let commit = publish().map_err(CoordinatedCommitError::Publication)?;
-        commit_locked(&mut state, commit).map_err(CoordinatedCommitError::Invalid)
+        self.publication_lock().coordinated_commit(base, publish)
+    }
+
+    /// Hold the publication lock across a whole coordinator step. A
+    /// coordinator that must keep a daemon-side lock (scan snapshot, store)
+    /// across its commit takes this first: authoring backends take those
+    /// locks inside the publication lock, so taking them outside it would
+    /// invert the order and deadlock against a concurrent import.
+    pub fn publication_lock(&self) -> PublicationLock<'_> {
+        PublicationLock { state: self.lock() }
     }
 
     /// Serialize an attempted coordinator publication that may terminate in
