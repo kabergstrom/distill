@@ -1379,9 +1379,6 @@ never a per-target logical schema. Logical identity stays one; only
 layout varies by target. cfg-dependent data belongs behind processors
 (§9), not inside asset shapes.
 
-From these records, two distinct schemas per type are
-derived:
-
 An enum's fields reference `EnumVariant` TypeDefs. A variant's
 `#[asset(rev = N)]` has exactly one carrier: that variant TypeDef's
 `attrs.rev`, not the enclosing enum field's `FieldAttrs.rev`. Both the
@@ -1389,6 +1386,8 @@ source-walk emitter and logical projection use this existing attribute
 channel; no separate variant-attribute record is needed. Native matching
 metadata and the operational Schema metadata above do not enter DSLH or
 DSWL grammar bytes.
+
+From these records, two distinct schemas per type are derived:
 
 ### Logical schema — identity
 

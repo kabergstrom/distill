@@ -1,7 +1,8 @@
 # Distill v2 — implementation handoff
 
-_Updated 2026-07-18 after the final cross-repository review closure and
-validation pass. This document is an operational handoff, not a second
+_Updated 2026-09-30 after integration with current New Game Plus master and
+the Nix-store Opus 5.5 xhigh review. This document is an operational handoff,
+not a second
 specification. `DESIGN.md` §§1–21 and its latest §22 refinements are normative;
 git history is the authority for landed milestones._
 
@@ -9,49 +10,79 @@ git history is the authority for landed milestones._
 
 The Distill v2 implementation is present under `v2/` as a sixteen-package Rust
 workspace, including its two real dynamic-module test fixtures. The current
-implementation milestone is commit `ffd110a` (`Back off repeated source-walk
-restarts`). The corresponding New Game Plus Vulkan integration milestone is
-`7214f89` (`Fix RPC pointer introspection and test isolation`), using Rafx
-`e8702d93` (`Pin texture format wire representation`). At those commits:
+implementation milestones include `a99a1f1` (released-handle cleanup),
+`3898ba8` (latest shared-schema fixture ports), and `f83d72a` (spec alignment).
+New Game Plus master is integrated at `cee84ff`, including upstream master
+`eadbaa1` and all prior Distill work. Rafx is at `0f3d1a83`, incorporating
+upstream `cdf52833` plus the shader include fixes. At this integration:
 
-- `cargo test --workspace --all-targets --offline` passes, including dynamic
-  module, game-asset, watcher, RPC, CAS, pack, migration, and doc tests.
-- `cargo clippy --workspace --all-targets --offline -- -D warnings` passes.
+- `cargo +stable test --workspace --all-targets --offline -j1` passes all
+  1,123 tests across 102 suites, including dynamic
+  module, game-asset, watcher, RPC, CAS, pack, and migration tests.
+- Separate workspace doc-tests pass. The older July milestone passed
+  Clippy with `-D warnings`; that result is not a new Rust 1.98 Clippy claim.
 - `git diff --check` passes.
 - The complete daemon/RPC texture/mesh/shader and schema-transition vertical
   suites pass.
-- The Vulkan New Game Plus library suite passes all 33 tests with the installed
-  ICD explicitly selected. Its real GPU path loads and releases texture, mesh,
+- The Vulkan New Game Plus library suite passes all 62 tests with the installed
+  ICD explicitly selected and `reload-test-schema` enabled. Its real GPU path
+  loads and releases texture, mesh,
   and cooked-pipeline assets; no fake terminal payload stands in for the
   pipeline compiler. Metal is not a validation target for this milestone.
-- Every concrete adversarial-review finding through the final review pass is
-  fixed with a regression or rejected with concrete counterevidence.
+- The final shared schema/host/reflection/source-hash suite passes 128 tests;
+  the source-walk producer suite passes six tests, and the binary hash parser
+  regression passes. The reload fixture is a separately built real cdylib
+  with its generated TypeOps table, not a synthetic metadata substitute.
+- Opus reviewed the complete integration delta and the two newest master
+  commits' resolutions. All concrete findings are fixed. The final code
+  verdict found no remaining defect; its pending test conditions subsequently
+  passed. See `IMPLEMENTATION-REVIEW-opus-5.5-master.md`.
+- Real emitted engine schemas self-merge and merge with a real external-module
+  schema. Repeated analyzer observations normalize transactionally, retaining
+  native integer/const distinctions and keeping unresolved identities opaque.
 - The filesystem overengineering audit is folded into R37 and the code: no
   retained directory handles, descriptor-relative traversal, persisted
-  platform file identity, direct NT scanner, daemon `libc` dependency, or
+  platform file identity, direct NT scanner, filesystem-specific daemon
+  `libc` layer, or
   separate Windows publication backend remains.
 
-Use the installed Rust toolchain directly:
+Use Rust 1.98 stable for current master (the newer Rust Analyzer requires it).
+Set `SHADERC_LIB_DIR` explicitly on this host:
 
 ```sh
 cd /Users/karl/Projects/distill/v2
-cargo test --workspace --all-targets --offline
-cargo clippy --workspace --all-targets --offline -- -D warnings
+export SHADERC_LIB_DIR=/Users/karl/VulkanSDK/1.4.321.0/macOS/lib
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/Users/karl/Projects/newgameplus/target
+cargo +stable test --workspace --all-targets --offline -j1
+cargo +stable test --workspace --doc --offline -j1
 ```
 
 The New Game Plus integration is validated separately from its repository root:
 
 ```sh
 cd /Users/karl/Projects/newgameplus
-cargo +nightly test -p source-walk
-VULKAN_SDK=/Users/karl/VulkanSDK/1.4.321.0/macOS \
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export SHADERC_LIB_DIR=/Users/karl/VulkanSDK/1.4.321.0/macOS/lib
+cargo +stable test -p source-walk --lib --offline -j1
+cargo +stable run -p source-walk --offline -j1 -- \
+  --once --module-crate newgameplus-ui-test-module --target-dir target --features rafx-vulkan
+cargo +stable build -p newgameplus-ui-test-module --offline -j1
 VK_ICD_FILENAMES=/Users/karl/VulkanSDK/1.4.321.0/macOS/share/vulkan/icd.d/MoltenVK_icd.json \
-  cargo +nightly test -p newgameplus --lib --features rafx-vulkan
+  cargo +stable test -p newgameplus --lib --features rafx-vulkan,reload-test-schema --offline -j1
 ```
 
 The focused GPU test requires a usable Vulkan loader/ICD. On the current macOS
 host it runs through the installed Vulkan SDK and MoltenVK; it does not enable
 the Rafx Metal backend.
+
+Verification limits: the Rafx shader processor passes 44 tests with its four
+legacy `shader_types` tests excluded; `spirv-reflect` 0.2.3 aborts under Rust
+1.98's unsafe precondition checks. No checks were disabled. Linux/Android's
+TLS-residency descriptor probe is implemented but was not executed on this
+Mac. The complete interactive external-module launch script was not run;
+its shell syntax, real schema merge, cdylib loading and reload paths were
+validated separately. These are not claims of full cross-platform validation.
 
 `cargo fmt --all` traverses external path dependencies and therefore attempts
 to format repositories that Distill does not own. Format the sixteen Distill
@@ -180,10 +211,11 @@ payloads.
 The closing review also pins `RafxFormat` to `repr(u8)` and centralizes checked
 wire-discriminant conversion in Rafx. NGP rejects undefined and depth/stencil
 terminal texture payloads before GPU access while retaining valid block-
-compressed color support. Source-walk publishes a schema only after the paired
-defaults/drops crates build, uses exclusive unique temporary files, flushes
+compressed color support. Source-walk validates and normalizes the schema,
+publishes the paired generated `ngp_type_ops.rs` before the schema, uses
+exclusive unique temporary files, flushes
 file data before rename, and syncs the containing directory on Unix. Failed
-support builds or publication leave the prior schema authoritative and
+generation or publication leave the prior schema authoritative and
 retryable. Loader live-sweep ownership is per asset even when content hashes
 match, and add/release operations during a sweep cannot strand dirty work or
 storage candidates.
