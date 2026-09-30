@@ -33,8 +33,8 @@ use distill_core::id::{
 };
 use distill_json::AuthoredValue;
 use distill_migrate::{
-    conforms, execute_ops, plan_automatic, validate_plan, DefaultProvider, EdgeKind, FieldPath,
-    MigrationError, MigrationOp,
+    conforms, execute_ops, plan_automatic_renamed, validate_plan, DefaultProvider, EdgeKind,
+    FieldPath, MigrationError, MigrationOp,
 };
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
@@ -2777,6 +2777,7 @@ fn load_current_value(
         &bundle,
         &project.logical_schema,
         project.logical_hash,
+        &project.renamed_from,
         &trace_source.current_load,
         trace,
     )
@@ -2788,6 +2789,7 @@ fn load_current_entry(
     bundle: &Bundle,
     current_schema: &distill_schema::ngp_schema::LogicalSchema,
     current_hash: LogicalHash,
+    renames: &distill_schema::ngp_schema::Renames,
     trace_source: &CurrentLoadSource,
     trace: &mut Vec<TraceOp>,
 ) -> Result<AuthoredValue, BuildError> {
@@ -2828,20 +2830,22 @@ fn load_current_entry(
         );
     }
 
-    let plan = plan_automatic(&schema.root, &current_schema.root).map_err(|error| {
-        migration_plan_error(
-            entry.type_uuid,
-            node,
-            current_hash,
-            MigrationPlanFailureV1::MissingPath {
-                path: FieldPath::root(),
-            },
-            format!(
-                "asset {} has no registered migration function and the automatic plan was refused: {error}",
-                entry.uuid
-            ),
-        )
-    })?;
+    let plan = plan_automatic_renamed(&schema.root, &current_schema.root, renames).map_err(
+        |error| {
+            migration_plan_error(
+                entry.type_uuid,
+                node,
+                current_hash,
+                MigrationPlanFailureV1::MissingPath {
+                    path: FieldPath::root(),
+                },
+                format!(
+                    "asset {} has no registered migration function and the automatic plan was refused: {error}",
+                    entry.uuid
+                ),
+            )
+        },
+    )?;
     validate_plan(
         &plan,
         &schema.root,

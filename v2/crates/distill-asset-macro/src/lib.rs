@@ -25,6 +25,9 @@ struct NodeArgs {
     skip: bool,
     blob: bool,
     tag: bool,
+    /// `renamed_from = "old"`: read by source-walk for migration
+    /// planning; never hashed, so the macro only validates it.
+    renamed_from: bool,
     rev: u32,
     rev_present: bool,
 }
@@ -216,6 +219,15 @@ fn take_node_args(attrs: &mut Vec<Attribute>, variant: bool) -> syn::Result<Node
                     return Err(meta.error("duplicate `tag`"));
                 }
                 result.tag = true;
+            } else if meta.path.is_ident("renamed_from") {
+                if result.renamed_from {
+                    return Err(meta.error("duplicate `renamed_from`"));
+                }
+                let old: syn::LitStr = meta.value()?.parse()?;
+                if old.value().is_empty() {
+                    return Err(meta.error("`renamed_from` needs the old field name"));
+                }
+                result.renamed_from = true;
             } else {
                 return Err(meta.error("unknown asset field option"));
             }
@@ -223,10 +235,10 @@ fn take_node_args(attrs: &mut Vec<Attribute>, variant: bool) -> syn::Result<Node
         })?;
     }
     *attrs = retained;
-    if result.skip && (result.blob || result.tag || result.rev_present) {
+    if result.skip && (result.blob || result.tag || result.rev_present || result.renamed_from) {
         return Err(syn::Error::new(
             Span::call_site(),
-            "`skip` cannot be combined with `blob`, `tag`, or `rev`",
+            "`skip` cannot be combined with `blob`, `tag`, `rev`, or `renamed_from`",
         ));
     }
     if result.blob && result.tag {

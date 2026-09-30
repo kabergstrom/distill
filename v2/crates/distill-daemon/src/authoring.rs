@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
-use distill_migrate::{lossy_drops, plan_automatic};
+use distill_migrate::{lossy_drops, plan_automatic_renamed};
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
     decode_authoring_payload, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
@@ -489,7 +489,8 @@ impl AuthoringService {
             fields,
             detail,
         };
-        match plan_automatic(&stored.root, &written.root) {
+        let renames = self.current_renames(existing.type_uuid, written_hash);
+        match plan_automatic_renamed(&stored.root, &written.root, &renames) {
             Ok(ops) => {
                 let fields = lossy_drops(&ops, &stored.root, &existing.data);
                 if fields.is_empty() {
@@ -518,6 +519,22 @@ impl AuthoringService {
         }
     }
 
+    /// The renamed fields of the type's current schema, when the write
+    /// is under it.
+    fn current_renames(
+        &self,
+        type_uuid: distill_core::id::TypeUuid,
+        written_hash: LogicalHash,
+    ) -> distill_schema::ngp_schema::Renames {
+        self.tag_index_coordinator()
+            .and_then(|coordinator| coordinator.schema_authority())
+            .and_then(|authority| {
+                let project = authority.project_type(type_uuid)?;
+                (project.logical_hash == written_hash).then(|| project.renamed_from.clone())
+            })
+            .unwrap_or_default()
+    }
+
     fn migration_function_registered(&self, key: &MigrationKey) -> bool {
         let Some(coordinator) = self.tag_index_coordinator() else {
             return false;
@@ -529,7 +546,6 @@ impl AuthoringService {
     }
 
     fn write_store(&self) -> Result<WriteGuard<'_>, RpcFailure> {
-
         Ok(self.store.write())
     }
 }

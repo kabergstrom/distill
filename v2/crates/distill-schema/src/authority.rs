@@ -38,6 +38,8 @@ pub struct ProjectTypeAuthority {
     pub build_only: bool,
     pub logical_schema: ngp_schema::LogicalSchema,
     pub logical_hash: LogicalHash,
+    /// Renamed fields by planner display path, for migration planning.
+    pub renamed_from: ngp_schema::Renames,
     pub wire: WireNode,
     pub layout_hash: LayoutHash,
     pub dswl_bytes: Vec<u8>,
@@ -92,6 +94,7 @@ impl ProjectSchemaAuthority {
                     type_path: ty.path.display_path(),
                 }
             })?;
+            let (_, renamed_from) = ngp_schema::project_with_renames(&schema, ty.id)?;
             let wire = derive_wire(view, ty.id)
                 .map_err(|error| SchemaAuthorityError::Wire(error.to_string()))?;
             let layout_hash =
@@ -105,6 +108,7 @@ impl ProjectSchemaAuthority {
                     build_only: ty.attrs.build_only,
                     logical_schema: logical_schema.clone(),
                     logical_hash,
+                    renamed_from,
                     wire,
                     layout_hash,
                     dswl_bytes,

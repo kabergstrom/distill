@@ -2,8 +2,9 @@
 //! logical migration plan, refusing anything it cannot prove safe.
 //!
 //! Matching identity (PINNED, §11 "matches structurally"): struct fields
-//! and enum variants match by NAME; a name-matched entry whose rev
-//! differs is a HARD STOP (R20/H8) — `rev` marks same-shape/new-meaning,
+//! and enum variants match by NAME (a new field with no name match also
+//! matches the old field its `renamed_from` names); a matched entry whose
+//! rev differs is a HARD STOP (R20/H8) — `rev` marks same-shape/new-meaning,
 //! and both silent options (copying = reinterpretation, drop+default =
 //! data loss) are exactly what rev exists to prevent, so a custom
 //! migration edge is required. Containers match by position/kind;
@@ -27,7 +28,7 @@
 use crate::identical::meaning_identical;
 use crate::{FieldPath, MigrationOp};
 use ngp_schema::migrate::{can_widen_float, can_widen_int};
-use ngp_schema::SchemaNode;
+use ngp_schema::{Renames, SchemaNode};
 use std::fmt;
 
 /// The planner's refusal: a list of (path, reason) pairs naming every
@@ -52,9 +53,24 @@ impl std::error::Error for PlanRefusal {}
 
 /// Diff `old` against `new` into a logical migration plan.
 pub fn plan_automatic(old: &SchemaNode, new: &SchemaNode) -> Result<Vec<MigrationOp>, PlanRefusal> {
+    plan_automatic_renamed(old, new, &Renames::new())
+}
+
+/// [`plan_automatic`] with the renamed fields of `new`
+/// (`#[asset(renamed_from)]`, keyed by display path). A new field with no
+/// old field of its own name matches the old field it was renamed from:
+/// an identical or widened value is copied across; a rename whose value
+/// also changed shape is refused, since nested ops cannot move a field.
+pub fn plan_automatic_renamed(
+    old: &SchemaNode,
+    new: &SchemaNode,
+    renames: &Renames,
+) -> Result<Vec<MigrationOp>, PlanRefusal> {
     let mut ctx = Ctx {
         refusals: Vec::new(),
+        renames,
     };
+
     let ops = ctx.diff(old, new, Vec::new(), "$", &[], &[]);
     if ctx.refusals.is_empty() {
         Ok(ops)
@@ -65,8 +81,9 @@ pub fn plan_automatic(old: &SchemaNode, new: &SchemaNode) -> Result<Vec<Migratio
     }
 }
 
-struct Ctx {
+struct Ctx<'a> {
     refusals: Vec<(String, String)>,
+    renames: &'a Renames,
 }
 
 fn kind_name(n: &SchemaNode) -> &'static str {
@@ -88,7 +105,7 @@ fn kind_name(n: &SchemaNode) -> &'static str {
     }
 }
 
-impl Ctx {
+impl Ctx<'_> {
     fn refuse(&mut self, disp: &str, reason: impl Into<String>) {
         self.refusals.push((disp.to_string(), reason.into()));
     }
@@ -303,8 +320,9 @@ impl Ctx {
         }
     }
 
-    /// Field matching by name; a name-matched field whose rev differs is a
-    /// HARD STOP (review R20/H8): `rev` marks same-shape/new-meaning, and
+    /// Field matching by name, then by `renamed_from`; a matched field
+    /// whose rev differs is a HARD STOP (review R20/H8): `rev` marks
+    /// same-shape/new-meaning, and
     /// both silent options — copying (reinterpretation) and drop+default
     /// (data loss) — are exactly what rev exists to prevent. A custom
     /// migration edge is required.
@@ -317,24 +335,46 @@ impl Ctx {
         new_frames: &[&SchemaNode],
     ) -> Vec<MigrationOp> {
         let mut ops = Vec::new();
+        let mut renamed = Vec::new();
+        let renames = self.renames;
         for (nname, nrev, nnode) in new_fields {
+            let ndisp = format!("{disp}.{nname}");
             // Names are unique per side (the grammar rejects duplicates), so
-            // by-name lookup is total matching.
+            // by-name lookup is total matching. A rename applies only when
+            // neither side still has a field of the old name.
             let by_name = old_fields.iter().find(|(oname, _, _)| oname == nname);
-            match by_name {
-                Some((_, orev, onode)) if orev == nrev => {
-                    ops.extend(self.diff(
+            let by_rename = || {
+                let old = renames.get(&ndisp)?;
+                if new_fields.iter().any(|(name, _, _)| name == old) {
+                    return None;
+                }
+                old_fields.iter().find(|(oname, _, _)| oname == old)
+            };
+            let from_rename = by_name.is_none();
+            match by_name.or_else(by_rename) {
+                Some((oname, _, _)) if from_rename && renamed.contains(oname) => {
+                    self.refuse(&ndisp, format!("field {oname:?} is renamed to two fields"));
+                }
+                Some((oname, orev, onode)) if orev == nrev => {
+                    let inner = self.diff(
                         onode,
                         nnode,
                         vec![nname.clone()],
-                        &format!("{disp}.{nname}"),
+                        &ndisp,
                         old_frames,
                         new_frames,
-                    ));
+                    );
+                    if from_rename {
+                        renamed.push(oname.clone());
+                        ops.extend(self.rename(inner, oname, nname, &ndisp));
+                    } else {
+                        ops.extend(inner);
+                    }
                 }
                 Some((_, orev, _)) => {
+
                     self.refuse(
-                        &format!("{disp}.{nname}"),
+                        &ndisp,
                         format!(
                             "semantic revision changed ({orev} -> {nrev}): \
                              custom migration edge required"
@@ -358,13 +398,41 @@ impl Ctx {
             // Name-matched fields were handled above (diffed or refused);
             // only a truly name-absent field is a documented drop.
             let name_present = new_fields.iter().any(|(nname, _, _)| nname == oname);
-            if !name_present {
+            if !name_present && !renamed.contains(oname) {
                 ops.push(MigrationOp::DropField {
                     at: FieldPath(vec![oname.clone()]),
                 });
             }
         }
         ops
+    }
+
+    /// Point a renamed field's diff at its old name: a copy or a widening
+    /// moves; anything nested is refused, since nested ops read and write
+    /// the same path.
+    fn rename(
+        &mut self,
+        ops: Vec<MigrationOp>,
+        old: &str,
+        new: &str,
+        disp: &str,
+    ) -> Vec<MigrationOp> {
+        let (from, to) = (FieldPath(vec![old.to_owned()]), FieldPath(vec![new.to_owned()]));
+        match ops.as_slice() {
+            [MigrationOp::CopyField { .. }] => vec![MigrationOp::CopyField { from, to }],
+            [MigrationOp::Widen { .. }] => vec![MigrationOp::Widen { from, to }],
+            // The diff already refused.
+            [] => Vec::new(),
+            _ => {
+                self.refuse(
+                    disp,
+                    format!(
+                        "renamed from {old:?} and changed shape: register a migration function"
+                    ),
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Variant matching by (name, rev). Per changed matched variant emit

@@ -58,6 +58,12 @@ struct SameShapeB {
     value: u32,
 }
 
+#[distill_asset_macro::asset(uuid = "20000000-0000-4000-8000-000000000004")]
+struct RenamedShape {
+    #[asset(renamed_from = "old_value")]
+    value: u32,
+}
+
 #[distill_asset_macro::asset(uuid = "20000000-0000-4000-8000-000000000003", rev = 1)]
 struct RevisedShape {
     value: u32,
@@ -223,6 +229,10 @@ fn logical_identity_is_structural_and_revision_sensitive() {
     assert_eq!(
         SameShapeA::descriptor().logical_hash,
         SameShapeB::descriptor().logical_hash
+    );
+    assert_eq!(
+        SameShapeA::descriptor().logical_hash,
+        RenamedShape::descriptor().logical_hash
     );
     assert_ne!(
         SameShapeA::descriptor().logical_hash,

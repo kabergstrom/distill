@@ -231,6 +231,24 @@ fn project_authority_preserves_build_only_policy() {
 }
 
 #[test]
+fn project_authority_carries_renamed_fields_outside_the_hash() {
+    let plain = ProjectSchemaAuthority::from_schema(project_schema(), [7; 32]).unwrap();
+    let mut schema = project_schema();
+    schema.types[0].fields[1].attrs.renamed_from = Some("gamma".to_owned());
+    let renamed = ProjectSchemaAuthority::from_schema(schema, [7; 32]).unwrap();
+    let (plain, renamed) = (
+        plain.project_type(PROJECT_UUID).unwrap(),
+        renamed.project_type(PROJECT_UUID).unwrap(),
+    );
+    assert_eq!(plain.logical_hash, renamed.logical_hash);
+    assert!(plain.renamed_from.is_empty());
+    assert_eq!(
+        renamed.renamed_from,
+        BTreeMap::from([("$.beta".to_owned(), "gamma".to_owned())])
+    );
+}
+
+#[test]
 fn current_schema_tag_extraction_reads_and_validates_annotated_string_values() {
     let schema = tagged_schema();
     let tags = extract_search_tags(
