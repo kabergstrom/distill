@@ -552,6 +552,38 @@ should reach zero by the end of phase 6.
     persisted bytes and SQL columns are unchanged. "Poison" now means only
     a bundle's or tag entry's own error and a module epoch token.
 
+- **Phase 8:** done (commits `85afc7d`, `f43efca`, `7be33d8`; deferred-ngp
+  `f148cda`).
+  - **`distill-pipeline-api`** holds everything a module links: the callback
+    traits and descriptors, products and errors, the importer interface,
+    the erasure and call thunks, the registration arena, the module table,
+    probe, ABI identity and `export_pipeline_module_v2!`, and the leaf types
+    split out of `distill-build` (query grammar, `OutputDecls`, `Target*`,
+    the `StableFailureFingerprint` closure, `ImportOutput`/`ImportError`,
+    `GeneratedFile`/`CodegenFailure`, `ToolOutput`/`ToolRunError`). The
+    daemon and `distill-build` re-export them at their old paths.
+    `CallbackPanic` moved to `distill-core`; `distill-wire` re-exports it.
+  - **Closure:** distill-core, distill-json, distill-migrate, ngp-schema,
+    ngp-source-hash (plus blake3, globset, unicode-normalization, serde).
+    No distill-store, rusqlite, distill-build or distill-daemon.
+  - **Registration.** `register` receives the API's `RegistrationArena`,
+    which wraps a `&mut dyn RegistrationHost`. Its generic `register_*`
+    run in the module and erase the callback there; the host's single
+    `install_callback` wraps it in a capsule owned by the candidate's own
+    epoch and installs it as before, under `HostCallbackBoundary`. The
+    payload is consumed on entry. The daemon-side arena (`install`,
+    `from_raw`, `owner_pin`) is unchanged for host tests;
+    `CandidateRegistrationArena::registrar()` gives the module view.
+  - **Fingerprint.** `build.rs` moved to the API crate and hashes only
+    that closure. The v2 `Cargo.toml`/`Cargo.lock` are no longer hashed
+    (a plugin workspace resolves its own lock). Daemon, build and store
+    edits leave built modules valid. The table ABI version stays 2: an old
+    module fails the identity check before `register`.
+  - **Ports.** The two test fixtures and deferred-ngp's
+    `tools/distill/pipeline` depend on the API crate. The deferred-ngp
+    pipeline's debug `.so` went from 286 MB to 104 MB (the rest is
+    rafx-shader-processor).
+
 ## 7. Test baseline
 
 Recorded at the start of phase 0; see `git log` for updates.
@@ -566,3 +598,5 @@ End of phase 3: `cargo test --workspace --no-fail-fast` → only the same
 `tool_output_is_drained_while_large_stdin_is_written` failure.
 
 End of phase 4: the same single failure.
+
+End of phase 8: 1151 passed, the same single failure.
