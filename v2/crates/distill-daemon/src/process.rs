@@ -21,7 +21,6 @@ use distill_store::state::{
 use crate::codegen::CodegenService;
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
-use crate::scanner::DaemonOwnedDirectoryKind;
 use crate::watcher::{
     WatcherAction, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink, WatcherStartError,
     WatcherThread,
@@ -57,28 +56,6 @@ impl DaemonProcess {
     /// Start from the configured shared schema artifact. Production never
     /// substitutes the bootstrap-only table for `assets.schema_path`.
     pub fn start(config: DaemonConfig) -> Result<Self, DaemonProcessError> {
-        Self::start_internal(config, true, Vec::new())
-    }
-
-    pub(crate) fn start_for_pack(
-        config: DaemonConfig,
-        package_output: &Path,
-    ) -> Result<Self, DaemonProcessError> {
-        Self::start_internal(
-            config,
-            false,
-            vec![(
-                DaemonOwnedDirectoryKind::PackageOutput,
-                package_output.to_path_buf(),
-            )],
-        )
-    }
-
-    fn start_internal(
-        config: DaemonConfig,
-        serve_rpc: bool,
-        daemon_owned: Vec<(DaemonOwnedDirectoryKind, PathBuf)>,
-    ) -> Result<Self, DaemonProcessError> {
         let schema_bytes = std::fs::read(&config.assets.schema_path).map_err(|source| {
             DaemonProcessError::SchemaRead {
                 path: config.assets.schema_path.clone(),
@@ -86,21 +63,12 @@ impl DaemonProcess {
             }
         })?;
         let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
-        Self::start_with_authority_internal(config, authority, serve_rpc, daemon_owned)
+        Self::start_with_authority(config, authority)
     }
 
     pub fn start_with_authority(
         config: DaemonConfig,
         authority: ProjectSchemaAuthority,
-    ) -> Result<Self, DaemonProcessError> {
-        Self::start_with_authority_internal(config, authority, true, Vec::new())
-    }
-
-    fn start_with_authority_internal(
-        config: DaemonConfig,
-        authority: ProjectSchemaAuthority,
-        serve_rpc: bool,
-        daemon_owned: Vec<(DaemonOwnedDirectoryKind, PathBuf)>,
     ) -> Result<Self, DaemonProcessError> {
         let targets = config.target_definitions(authority.identity())?;
         let coordinator = Arc::new(DaemonCoordinator::open(
@@ -109,14 +77,6 @@ impl DaemonProcess {
             targets,
             config.pipeline.max_dependency_depth,
         )?);
-        for (kind, path) in daemon_owned {
-            coordinator
-                .scanner()
-                .retain_daemon_owned_directory(kind, path)
-                .map_err(|error| {
-                    DaemonProcessError::CoordinatorInit(CoordinatorInitError::Scan(error))
-                })?;
-        }
         coordinator.attach_build_backend();
         let config_watch = ConfigWatch::new(config.clone());
         let (inbox, messages) = mpsc::channel();
@@ -198,25 +158,23 @@ impl DaemonProcess {
         };
         startup?;
 
-        if serve_rpc {
-            let (address_tx, address_rx) = mpsc::sync_channel(1);
-            let rpc_thread = spawn_rpc_loop(
-                process.coordinator.server().root(),
-                config.daemon.address,
-                Arc::clone(&process.stop),
-                address_tx,
-            );
-            process.rpc_thread = Some(rpc_thread);
-            process.rpc_address = match address_rx.recv() {
-                Ok(Ok(address)) => address,
-                Ok(Err(error)) => return Err(DaemonProcessError::Rpc(error)),
-                Err(error) => {
-                    return Err(DaemonProcessError::Rpc(format!(
-                        "RPC startup channel closed: {error}"
-                    )))
-                }
-            };
-        }
+        let (address_tx, address_rx) = mpsc::sync_channel(1);
+        let rpc_thread = spawn_rpc_loop(
+            process.coordinator.server().root(),
+            config.daemon.address,
+            Arc::clone(&process.stop),
+            address_tx,
+        );
+        process.rpc_thread = Some(rpc_thread);
+        process.rpc_address = match address_rx.recv() {
+            Ok(Ok(address)) => address,
+            Ok(Err(error)) => return Err(DaemonProcessError::Rpc(error)),
+            Err(error) => {
+                return Err(DaemonProcessError::Rpc(format!(
+                    "RPC startup channel closed: {error}"
+                )))
+            }
+        };
         Ok(process)
     }
 

@@ -59,7 +59,7 @@ fn target_name<'a>(config: &'a DaemonConfig, target: Option<&'a str>) -> Result<
     }
 }
 
-fn target_hash(
+pub(crate) fn target_hash(
     config: &DaemonConfig,
     authority: &ProjectSchemaAuthority,
     target: &str,

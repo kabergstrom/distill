@@ -341,7 +341,8 @@ impl BuildBackend for BlockingBuildBackend {
 
 #[test]
 fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
-    let source = include_str!("../schema/distill_rpc.capnp");
+    // A Windows checkout may carry CRLF line ends.
+    let source = include_str!("../schema/distill_rpc.capnp").replace("\r\n", "\n");
     assert!(!source.contains("CallStatus"));
     assert!(!source.contains("AnyPointer"));
     assert!(!source.contains("-> (status"));
@@ -359,6 +360,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         "ResolveCall",
         "PathResolveCall",
         "ChunkStreamCall",
+        "RuntimeTypePolicyCall",
     ] {
         let marker = format!("struct {name} {{");
         let body = source
@@ -1942,4 +1944,131 @@ fn namespace_error_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() 
             .unwrap()
     )
     .is_err());
+}
+
+/// Records each build's work class and answers the type policy.
+#[derive(Default)]
+struct PackBackend {
+    work_classes: Mutex<Vec<BuildWorkClass>>,
+}
+
+impl BuildBackend for PackBackend {
+    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+        self.work_classes.lock().unwrap().push(request.work_class);
+        Ok(BuildBackendOutcome::Drifted {
+            input: request.drifted_input.clone(),
+        })
+    }
+
+    fn runtime_type_policy(
+        &self,
+        request: &RuntimeTypePolicyRequest,
+    ) -> Result<RuntimeTypePolicy, RpcFailure> {
+        Ok(RuntimeTypePolicy {
+            build_only: request.type_uuid == TypeUuid([2; 16]),
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn remote_snapshot_serves_the_pack_surface() {
+    LocalSet::new()
+        .run_until(async {
+            let server = server();
+            let backend = Arc::new(PackBackend::default());
+            server.install_build_backend(backend.clone());
+            let entry = authoring_entry(5, AuthoringEntryRole::Runtime);
+            let definition = authoring_entry(6, AuthoringEntryRole::AuthoringOnly);
+            server
+                .commit(Commit {
+                    assets: vec![AssetMutation::Set {
+                        uuid: entry.uuid,
+                        resolution: StoredResolve::Drifted {
+                            input: DriftedInput::Asset(entry.uuid),
+                        },
+                        delta: AssetDeltaState::Changed,
+                    }],
+                    authoring: vec![
+                        AuthoringMutation::Set(entry.clone()),
+                        AuthoringMutation::Set(definition.clone()),
+                    ],
+                    ..Commit::default()
+                })
+                .unwrap();
+            let listener = Rc::new(
+                StagedListener::bind(server.root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let serving = Rc::clone(&listener);
+            let server_task = tokio::task::spawn_local(async move { serving.serve().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let hub = RemoteHub::connected(client.connect(&request()).await.unwrap()).unwrap();
+            let snapshot = hub.snapshot().await.unwrap().success().unwrap();
+
+            // query and entry carry the runtime namespace.
+            let selected = snapshot
+                .query(&AssetQuery {
+                    tag: Some(TagSelector {
+                        tag: "group".into(),
+                        value: Some("group-5".into()),
+                    }),
+                    ..AssetQuery::default()
+                })
+                .await
+                .unwrap()
+                .success()
+                .unwrap();
+            assert_eq!(selected, vec![entry.uuid]);
+            let meta = snapshot.entry(entry.uuid).await.unwrap().success().unwrap();
+            assert_eq!(meta.normalized_path, entry.normalized_path);
+            assert_eq!(meta.tags, entry.tags);
+            match snapshot.entry(definition.uuid).await.unwrap() {
+                RemoteCall::Error(error) => {
+                    assert_eq!(error.code, distill_rpc::capnp_transport::ASSET_NOT_FOUND)
+                }
+                other => panic!("an authoring-only entry is not a runtime entry: {other:?}"),
+            }
+
+            // A batch resolve admits its build as batch work.
+            snapshot.resolve_batch(entry.uuid).await.unwrap().success().unwrap();
+            assert_eq!(
+                *backend.work_classes.lock().unwrap(),
+                vec![BuildWorkClass::Batch]
+            );
+
+            for (type_uuid, build_only) in [(TypeUuid([1; 16]), false), (TypeUuid([2; 16]), true)] {
+                let policy = snapshot
+                    .runtime_type_policy(type_uuid)
+                    .await
+                    .unwrap()
+                    .success()
+                    .unwrap();
+                assert_eq!(policy.build_only, build_only);
+            }
+
+            // The metadata hub inspects the authoring-only definition.
+            let metadata = distill_rpc::capnp_loader::RemoteMetadataHub::connected(
+                client.metadata(PROTOCOL_VERSION).await.unwrap(),
+            )
+            .ok()
+            .expect("metadata connects");
+            let authoring = metadata.authoring_snapshot().await.unwrap().success().unwrap();
+            match authoring.inspect(definition.uuid).await.unwrap().success().unwrap() {
+                AuthoringInspectResult::Inspection(inspection) => {
+                    assert_eq!(inspection.role, AuthoringEntryRole::AuthoringOnly);
+                    assert_eq!(inspection.stamp, snapshot.basis().snapshot);
+                    assert_eq!(inspection.value, definition.value);
+                }
+                other => panic!("expected an inspection, got {other:?}"),
+            }
+            assert!(matches!(
+                authoring.inspect(AssetUuid([99; 16])).await.unwrap().success(),
+                Some(AuthoringInspectResult::Missing)
+            ));
+            drop(client);
+            server_task.abort();
+        })
+        .await;
 }

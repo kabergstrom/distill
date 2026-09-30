@@ -1,4 +1,5 @@
-//! One-shot construction of a v2 pack from one pinned RPC snapshot.
+//! One-shot construction of a v2 pack from one pinned snapshot of a running
+//! daemon, over its Cap'n Proto RPC.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -10,9 +11,13 @@ use distill_build::query::{
 use distill_build::trace::PackDefinitionControlValue;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_json::AuthoredValue;
+use distill_rpc::capnp_loader::{
+    RemoteCall, RemoteChunkStream, RemoteError, RemoteHub, RemoteSnapshot,
+};
+use distill_rpc::capnp_transport::{ARTIFACT_NOT_FOUND, ASSET_NOT_FOUND};
 use distill_rpc::{
-    ArtifactChunkKind, AuthoringValue, ConfigurationError, Hub, PathResolveResult,
-    ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector,
+    ArtifactChunkKind, AuthoringValue, ConfigurationError, PathResolveResult, ReconnectReason,
+    ResolveResult, TagSelector,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use unicode_normalization::UnicodeNormalization;
@@ -56,7 +61,12 @@ pub enum PackBuildError {
     },
     ReconnectRequired(ReconnectReason),
     ConfigurationFailed(Box<ConfigurationError>),
-    Rpc(Box<RpcFailure>),
+    /// The pinned snapshot expired (its TTL passed) mid-build.
+    SnapshotExpired,
+    /// A call answered an error; `code` is the transport's `RpcError.code`.
+    Remote(RemoteError),
+    /// The connection itself failed.
+    Transport(String),
     BasisMismatch,
     Resolve {
         asset: AssetUuid,
@@ -95,6 +105,18 @@ impl fmt::Display for PackBuildError {
 }
 
 impl std::error::Error for PackBuildError {}
+
+impl PackBuildError {
+    /// The snapshot expired or an artifact left the CAS mid-build: a cache
+    /// miss, built again at a new snapshot.
+    pub fn is_cache_miss(&self) -> bool {
+        match self {
+            Self::SnapshotExpired => true,
+            Self::Remote(error) => error.code == ARTIFACT_NOT_FOUND,
+            _ => false,
+        }
+    }
+}
 
 impl From<ArchiveError> for PackBuildError {
     fn from(value: ArchiveError) -> Self {
@@ -348,12 +370,12 @@ struct FetchedArtifact {
 
 /// Build the single-archive v2 pack described by `definition` from exactly
 /// `snapshot`. Drift and every other non-built terminal result are fatal.
-pub fn build_pack(
+pub async fn build_pack(
     definition: &PackDefinitionControlValue,
     target: &PackBuildTarget,
     encoder_identity: &str,
-    snapshot: &Snapshot,
-    hub: &Hub,
+    snapshot: &RemoteSnapshot,
+    hub: &RemoteHub,
 ) -> Result<PackBuildOutput, PackBuildError> {
     let target_name = target.name.nfc().collect::<String>();
     let definition_target = definition.target.nfc().collect::<String>();
@@ -372,7 +394,7 @@ pub fn build_pack(
             .clone()
             .close(None)
             .map_err(|error| PackBuildError::InvalidRoot { index, error })?;
-        let results = rpc_success(snapshot.query(to_rpc_query(root)))?;
+        let results = remote(snapshot.query(&to_rpc_query(root)).await)?;
         if results.is_empty() {
             return Err(PackBuildError::EmptyRoot { index });
         }
@@ -384,7 +406,7 @@ pub fn build_pack(
         if artifacts.contains_key(&asset) {
             continue;
         }
-        let resolved = terminal(snapshot, rpc_success(snapshot.resolve_batch(asset))?)?;
+        let resolved = terminal(snapshot, remote(snapshot.resolve_batch(asset).await)?)?;
         let content_hash = match resolved {
             ResolveResult::Built { content_hash } => content_hash,
             result => {
@@ -394,9 +416,9 @@ pub fn build_pack(
                 });
             }
         };
-        let chunks = terminal(snapshot, rpc_success(snapshot.fetch(content_hash))?)?;
+        let chunks = terminal(snapshot, remote(snapshot.fetch(content_hash).await)?)?;
         let load_edges = chunks.load_edges().to_vec();
-        let (structural, blobs) = collect_chunks(content_hash, chunks)?;
+        let (structural, blobs) = collect_chunks(content_hash, chunks).await?;
         let blob_parts = blobs.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let parsed = parse_artifact_parts(&structural, &blob_parts)
             .map_err(|error| PackBuildError::Artifact { asset, error })?;
@@ -450,7 +472,7 @@ pub fn build_pack(
         .map(|artifact| artifact.terminal_type)
         .collect::<BTreeSet<_>>()
     {
-        if rpc_success(snapshot.runtime_type_policy(type_uuid))?.build_only {
+        if remote(snapshot.runtime_type_policy(type_uuid).await)?.build_only {
             return Err(PackBuildError::BuildOnlyType { type_uuid });
         }
     }
@@ -461,7 +483,7 @@ pub fn build_pack(
         .map(|artifact| artifact.layout_hash)
         .collect::<BTreeSet<_>>()
     {
-        let bytes = rpc_success(hub.wire_tree(layout_hash))?.to_vec();
+        let bytes = remote(hub.wire_tree(layout_hash).await)?.to_vec();
         let root = distill_wire::dswl::decode_dswl(&bytes)
             .map_err(|_| PackBuildError::InvalidWireTree(layout_hash))?;
         if distill_wire::dswl::dswl_hash(&root)
@@ -494,10 +516,7 @@ pub fn build_pack(
         .collect::<BTreeMap<_, _>>();
 
     let paths = if definition.include_path_table {
-        Some(build_paths(
-            snapshot,
-            artifacts.keys().copied(),
-        )?)
+        Some(build_paths(snapshot, artifacts.keys().copied()).await?)
     } else {
         None
     };
@@ -556,16 +575,15 @@ pub fn build_pack(
 /// Build, durably publish, and activate one v2 pack in the required order.
 /// The destination directory must already exist. If publication fails before
 /// activation, the old `pack.current` remains authoritative.
-#[allow(clippy::too_many_arguments)]
-pub fn build_publish_and_activate_pack(
+pub async fn build_publish_and_activate_pack(
     directory: &Path,
     definition: &PackDefinitionControlValue,
     target: &PackBuildTarget,
     encoder_identity: &str,
-    snapshot: &Snapshot,
-    hub: &Hub,
+    snapshot: &RemoteSnapshot,
+    hub: &RemoteHub,
 ) -> Result<PackBuildOutput, PackBuildError> {
-    let output = build_pack(definition, target, encoder_identity, snapshot, hub)?;
+    let output = build_pack(definition, target, encoder_identity, snapshot, hub).await?;
     let archive_hash = publish_archive(directory, &output.archive_bytes)?;
     debug_assert_eq!(archive_hash, output.archive_file_hash);
     let manifest_hash = publish_manifest(directory, &output.manifest_bytes)?;
@@ -591,19 +609,20 @@ fn to_rpc_query(query: BuildAssetQuery) -> distill_rpc::AssetQuery {
     }
 }
 
-fn rpc_success<T>(result: RpcResult<T>) -> Result<T, PackBuildError> {
-    match result {
-        RpcResult::Success(value) => Ok(value),
-        RpcResult::ReconnectRequired { reason } => Err(PackBuildError::ReconnectRequired(reason)),
-        RpcResult::ConfigurationFailed(error) => {
+fn remote<T, E: fmt::Display>(result: Result<RemoteCall<T>, E>) -> Result<T, PackBuildError> {
+    match result.map_err(|error| PackBuildError::Transport(error.to_string()))? {
+        RemoteCall::Success(value) => Ok(value),
+        RemoteCall::ReconnectRequired(reason) => Err(PackBuildError::ReconnectRequired(reason)),
+        RemoteCall::ConfigurationFailed(error) => {
             Err(PackBuildError::ConfigurationFailed(Box::new(error)))
         }
-        RpcResult::Failure(error) => Err(PackBuildError::Rpc(Box::new(error))),
+        RemoteCall::SnapshotExpired => Err(PackBuildError::SnapshotExpired),
+        RemoteCall::Error(error) => Err(PackBuildError::Remote(error)),
     }
 }
 
 fn terminal<T>(
-    snapshot: &Snapshot,
+    snapshot: &RemoteSnapshot,
     event: distill_rpc::TerminalEvent<T>,
 ) -> Result<T, PackBuildError> {
     if &event.basis != snapshot.basis() {
@@ -612,13 +631,17 @@ fn terminal<T>(
     Ok(event.value)
 }
 
-fn collect_chunks(
+async fn collect_chunks(
     hash: ContentHash,
-    mut stream: distill_rpc::ChunkStream,
+    mut stream: RemoteChunkStream,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), PackBuildError> {
     let mut structural = Vec::new();
     let mut blobs = BTreeMap::<u32, Vec<u8>>::new();
-    while let Some(chunk) = stream.next_chunk() {
+    while let Some(chunk) = stream
+        .next_chunk()
+        .await
+        .map_err(|error| PackBuildError::Transport(error.to_string()))?
+    {
         let output = match chunk.kind {
             ArtifactChunkKind::Structural => &mut structural,
             ArtifactChunkKind::Blob { index } => blobs.entry(index).or_default(),
@@ -634,18 +657,19 @@ fn collect_chunks(
     Ok((structural, blobs.into_values().collect()))
 }
 
-fn build_paths(
-    snapshot: &Snapshot,
+async fn build_paths(
+    snapshot: &RemoteSnapshot,
     assets: impl IntoIterator<Item = AssetUuid>,
 ) -> Result<Vec<PathRow>, PackBuildError> {
     let mut paths = Vec::new();
     for asset in assets {
-        let entry = match snapshot.entry(asset) {
-            RpcResult::Failure(RpcFailure::AssetNotFound { uuid }) if uuid == asset => continue,
-            result => rpc_success(result)?,
+        // A derived output has no runtime entry and so no path.
+        let entry = match remote(snapshot.entry(asset).await) {
+            Err(PackBuildError::Remote(error)) if error.code == ASSET_NOT_FOUND => continue,
+            result => result?,
         };
         let path = entry.normalized_path;
-        match terminal(snapshot, rpc_success(snapshot.resolve_path(&path))?)? {
+        match terminal(snapshot, remote(snapshot.resolve_path(&path).await)?)? {
             PathResolveResult::Resolved(primary) if primary == asset => paths.push(PathRow {
                 path,
                 asset_uuid: asset,

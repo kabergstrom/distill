@@ -1,18 +1,21 @@
-//! Typed client-side realization of the loader subset of the Cap'n Proto RPC.
+//! Typed client-side realization of the loader and pack subset of the Cap'n
+//! Proto RPC.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid};
 use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 use crate::capnp_transport::{
-    decode_configuration_error, decode_rpc_basis, schema,
-    RemoteConnectOutcome,
+    decode_authoring_inspection, decode_configuration_error, decode_rpc_basis, schema,
+    RemoteConnectOutcome, RemoteMetadataOutcome,
 };
 use crate::{
-    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AuthoringEntryRole,
-    ConfigurationError, Delta, DriftedInput, ImportFailure, ImportRequest, PathResolveFailure, PathResolveResult,
-    ReconnectReason, ResolveResult, RpcBasis, ServedLoadEdge, StreamEvent, TerminalEvent,
+    ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AssetQuery,
+    AuthoringEntryRole, AuthoringInspectResult, ConfigurationError, Delta, DriftedInput,
+    ImportFailure, ImportRequest, MetadataEntry, PathResolveFailure, PathResolveResult, ReconnectReason,
+    ResolveResult, RpcBasis, RuntimeTypePolicy, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,8 +391,26 @@ impl RemoteSnapshot {
         &self,
         uuid: AssetUuid,
     ) -> Result<RemoteCall<TerminalEvent<ResolveResult>>, capnp::Error> {
+        self.resolve_with(uuid, false).await
+    }
+
+    /// [`Self::resolve`] for a pack traversal: any build it needs is
+    /// admitted as batch work. The answer is the same.
+    pub async fn resolve_batch(
+        &self,
+        uuid: AssetUuid,
+    ) -> Result<RemoteCall<TerminalEvent<ResolveResult>>, capnp::Error> {
+        self.resolve_with(uuid, true).await
+    }
+
+    async fn resolve_with(
+        &self,
+        uuid: AssetUuid,
+        batch: bool,
+    ) -> Result<RemoteCall<TerminalEvent<ResolveResult>>, capnp::Error> {
         let mut request = self.client.resolve_request();
         request.get().set_uuid(&uuid.0);
+        request.get().set_batch(batch);
         let response = request.send().promise.await?;
         let result = response.get()?.get_result()?;
         match result.which()? {
@@ -441,6 +462,189 @@ impl RemoteSnapshot {
             ),
             schema::path_resolve_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::path_resolve_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
+        }
+    }
+
+    /// The runtime assets `query` selects, UUID-sorted.
+    pub async fn query(
+        &self,
+        query: &AssetQuery,
+    ) -> Result<RemoteCall<Vec<AssetUuid>>, capnp::Error> {
+        let mut request = self.client.query_request();
+        write_asset_query(request.get().init_query(), query);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::uuid_list_call::Which::Success(values) => {
+                let mut assets = Vec::new();
+                for value in values?.iter() {
+                    assets.push(AssetUuid(fixed::<16>(value.get_bytes()?, "query.uuid")?));
+                }
+                Ok(RemoteCall::Success(assets))
+            }
+            schema::uuid_list_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::uuid_list_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::uuid_list_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::uuid_list_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
+        }
+    }
+
+    /// The runtime entry of `uuid`; an authoring-only or absent one answers
+    /// an `AssetNotFound` error.
+    pub async fn entry(&self, uuid: AssetUuid) -> Result<RemoteCall<MetadataEntry>, capnp::Error> {
+        let mut request = self.client.entry_request();
+        request.get().set_uuid(&uuid.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::entry_meta_call::Which::Success(value) => {
+                Ok(RemoteCall::Success(decode_entry(value?)?))
+            }
+            schema::entry_meta_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::entry_meta_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::entry_meta_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
+            schema::entry_meta_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
+        }
+    }
+
+    /// The published schema's runtime policy for terminal type `type_uuid`,
+    /// at this snapshot's target and pipeline epoch.
+    pub async fn runtime_type_policy(
+        &self,
+        type_uuid: TypeUuid,
+    ) -> Result<RemoteCall<RuntimeTypePolicy>, capnp::Error> {
+        let mut request = self.client.runtime_type_policy_request();
+        request.get().set_type_uuid(&type_uuid.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::runtime_type_policy_call::Which::Success(value) => {
+                Ok(RemoteCall::Success(RuntimeTypePolicy {
+                    build_only: value?.get_build_only(),
+                }))
+            }
+            schema::runtime_type_policy_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::runtime_type_policy_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::runtime_type_policy_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
+            schema::runtime_type_policy_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
+        }
+    }
+}
+
+/// The target-independent metadata hub of `Root.metadata`.
+#[derive(Clone)]
+pub struct RemoteMetadataHub {
+    client: schema::metadata_hub::Client,
+}
+
+impl std::fmt::Debug for RemoteMetadataHub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RemoteMetadataHub").finish_non_exhaustive()
+    }
+}
+
+impl RemoteMetadataHub {
+    pub fn connected(
+        outcome: RemoteMetadataOutcome,
+    ) -> Result<Self, Box<RemoteMetadataOutcome>> {
+        match outcome {
+            RemoteMetadataOutcome::Connected { hub, .. } => Ok(Self { client: hub }),
+            other => Err(Box::new(other)),
+        }
+    }
+
+    /// Pin an authoring view at the current store stamp.
+    pub async fn authoring_snapshot(
+        &self,
+    ) -> Result<RemoteCall<RemoteMetadataAuthoringSnapshot>, capnp::Error> {
+        let response = self.client.authoring_snapshot_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::metadata_authoring_snapshot_call::Which::Success(client) => Ok(
+                RemoteCall::Success(RemoteMetadataAuthoringSnapshot { client: client? }),
+            ),
+            schema::metadata_authoring_snapshot_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
+            ),
+            schema::metadata_authoring_snapshot_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
+            schema::metadata_authoring_snapshot_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
+        }
+    }
+}
+
+/// An authoring view of the metadata hub: authoring-only entries are
+/// visible to `inspect`.
+#[derive(Clone)]
+pub struct RemoteMetadataAuthoringSnapshot {
+    client: schema::metadata_authoring_snapshot::Client,
+}
+
+impl std::fmt::Debug for RemoteMetadataAuthoringSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteMetadataAuthoringSnapshot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteMetadataAuthoringSnapshot {
+    /// The authored entry of `uuid` with its value, authenticated against
+    /// its logical schema. The inspection carries the snapshot's stamp.
+    pub async fn inspect(
+        &self,
+        uuid: AssetUuid,
+    ) -> Result<RemoteCall<AuthoringInspectResult>, capnp::Error> {
+        let mut request = self.client.inspect_request();
+        request.get().init_uuid().set_bytes(&uuid.0);
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::metadata_authoring_inspect_call::Which::Success(value) => Ok(
+                RemoteCall::Success(AuthoringInspectResult::Inspection(
+                    decode_authoring_inspection(value?)?,
+                )),
+            ),
+            schema::metadata_authoring_inspect_call::Which::Missing(()) => {
+                Ok(RemoteCall::Success(AuthoringInspectResult::Missing))
+            }
+            schema::metadata_authoring_inspect_call::Which::RoleIneligible(value) => {
+                Ok(RemoteCall::Success(AuthoringInspectResult::RoleIneligible {
+                    observed: decode_role(value?.get_observed()?),
+                }))
+            }
+            schema::metadata_authoring_inspect_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_metadata_reconnect(value?.get_reason()?)),
+            ),
+            schema::metadata_authoring_inspect_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
+            schema::metadata_authoring_inspect_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
         }
@@ -609,6 +813,74 @@ fn decode_resolve(
     })
 }
 
+fn write_asset_query(mut output: schema::asset_query::Builder<'_>, query: &AssetQuery) {
+    // Every selector's union defaults to `absent`.
+    if let Some(uuid) = query.uuid {
+        output.reborrow().init_uuid().set_value(&uuid.0);
+    }
+    if let Some(path) = &query.bundle_path {
+        output.reborrow().init_bundle_path().set_value(path.as_str());
+    }
+    if let Some(local_id) = &query.local_id {
+        output.reborrow().init_local_id().set_value(local_id.as_str());
+    }
+    if let Some(bundle) = query.bundle_uuid {
+        output.reborrow().init_bundle_uuid().set_value(&bundle.0);
+    }
+    if let Some(authored) = query.authored_type {
+        output.reborrow().init_authored_type().set_value(&authored.0);
+    }
+    if let Some(terminal) = query.terminal_type {
+        output.reborrow().init_terminal_type().set_value(&terminal.0);
+    }
+    if let Some(tag) = &query.tag {
+        let mut selector = output.reborrow().init_tag().init_value();
+        selector.set_tag(tag.tag.as_str());
+        if let Some(value) = &tag.value {
+            selector.init_value().set_value(value.as_str());
+        }
+    }
+    if let Some(prefix) = &query.path_prefix {
+        output.reborrow().init_path_prefix().set_value(prefix.as_str());
+    }
+    if let Some(glob) = &query.path_glob {
+        output.reborrow().init_path_glob().set_value(glob.as_str());
+    }
+    if let Some(authoring_only) = query.authoring_only {
+        output.init_authoring_only().set_value(authoring_only);
+    }
+}
+
+fn decode_entry(value: schema::entry_meta::Reader<'_>) -> Result<MetadataEntry, capnp::Error> {
+    let mut tags = BTreeMap::new();
+    for tag in value.get_tags()?.iter() {
+        let name = text(tag.get_tag()?, "entry.tag")?;
+        let tag_value = if tag.get_has_value() {
+            Some(text(tag.get_value()?, "entry.tag.value")?)
+        } else {
+            None
+        };
+        tags.insert(name, tag_value);
+    }
+    Ok(MetadataEntry {
+        uuid: AssetUuid(fixed::<16>(value.get_uuid()?.get_bytes()?, "entry.uuid")?),
+        bundle: BundleUuid(fixed::<16>(value.get_bundle()?.get_bytes()?, "entry.bundle")?),
+        local_id: text(value.get_local_id()?, "entry.localId")?,
+        normalized_path: text(value.get_normalized_path()?, "entry.normalizedPath")?,
+        authored_type: TypeUuid(fixed::<16>(
+            value.get_authored_type()?.get_bytes()?,
+            "entry.authoredType",
+        )?),
+        terminal_type: TypeUuid(fixed::<16>(
+            value.get_terminal_type()?.get_bytes()?,
+            "entry.terminalType",
+        )?),
+        schema_hash: LogicalHash(fixed::<32>(value.get_schema_hash()?, "entry.schemaHash")?),
+        role: decode_role(value.get_role()?),
+        tags,
+    })
+}
+
 fn decode_path(
     value: schema::path_resolve_result::Reader<'_>,
 ) -> Result<PathResolveResult, capnp::Error> {
@@ -683,6 +955,17 @@ fn decode_reconnect(value: schema::ReconnectReason) -> ReconnectReason {
         schema::ReconnectReason::StoreInstanceChanged => ReconnectReason::StoreInstanceChanged,
         schema::ReconnectReason::ProtocolEpochChanged => ReconnectReason::ProtocolEpochChanged,
         schema::ReconnectReason::PipelineEpochChanged => ReconnectReason::PipelineEpochChanged,
+    }
+}
+
+fn decode_metadata_reconnect(value: schema::MetadataReconnectReason) -> ReconnectReason {
+    match value {
+        schema::MetadataReconnectReason::StoreInstanceChanged => {
+            ReconnectReason::StoreInstanceChanged
+        }
+        schema::MetadataReconnectReason::ProtocolEpochChanged => {
+            ReconnectReason::ProtocolEpochChanged
+        }
     }
 }
 

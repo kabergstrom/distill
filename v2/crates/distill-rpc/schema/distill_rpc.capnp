@@ -804,11 +804,28 @@ interface Snapshot {
   version @0 () -> (result :UInt64Call);
   query @1 (query :AssetQuery) -> (result :UuidListCall);
   entry @2 (uuid :Data) -> (result :EntryMetaCall);
-  resolve @3 (uuid :Data) -> (result :ResolveCall);
+  # batch admits any build as batch work (a pack traversal) instead of
+  # interactive; the answer is the same.
+  resolve @3 (uuid :Data, batch :Bool) -> (result :ResolveCall);
   refresh @4 () -> (result :SnapshotCall);
   resolvePath @5 (path :Text) -> (result :PathResolveCall);
   configuration @6 () -> (result :VoidCall);
   fetch @7 (hash :Data) -> (result :ChunkStreamCall);
+  runtimeTypePolicy @8 (typeUuid :Data) -> (result :RuntimeTypePolicyCall);
+}
+
+struct RuntimeTypePolicy {
+  buildOnly @0 :Bool;
+}
+
+struct RuntimeTypePolicyCall {
+  union {
+    success @0 :RuntimeTypePolicy;
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
 }
 
 interface AuthoringSnapshot {

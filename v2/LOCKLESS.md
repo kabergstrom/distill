@@ -760,12 +760,17 @@ should reach zero by the end of phase 6.
     - Tag-index refinement, build commits and `DeferredOperation`
       completion run inside the input transaction. The front end's
       build-result cache stays.
-    - `distilld pack` against a running daemon fails with `StateLocked`
-      (the state directory's process lock).
+    - `distilld pack` is an RPC client of the running daemon (fixed
+      `daemon.address`, as `import`); with no daemon it says to start
+      one. It reads the PackDefinition on the metadata hub and builds on
+      the definition's target hub: `resolve` with `batch` set,
+      `runtimeTypePolicy`, `query`, `entry` (PROTOCOL_VERSION 10). The
+      in-process pack path is gone. The daemon does not own the output
+      directory, so it must lie outside every asset root.
     - Snapshots of one version on one front end share a `SnapshotTxn`;
       each capability has its own expiry.
-    - Only the capnp transport arms expiry. In-process callers (pack,
-      tests) release on drop.
+    - Only the capnp transport arms expiry. In-process callers (tests)
+      release on drop.
     - The snapshot policy is per front end: a test installs it on the
       serving thread's front end.
     - Hub connections no longer time out; the connection bound closes

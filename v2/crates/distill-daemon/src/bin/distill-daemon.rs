@@ -148,7 +148,14 @@ fn pack(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     };
     let definition: AssetUuid = utf8(definition)?.parse()?;
     let config = DaemonConfig::load(config_path)?;
-    let output = build_configured_pack(config, definition, &PathBuf::from(destination))?;
+    // A client of the running daemon, like import.
+    let output = match build_configured_pack(&config, definition, &PathBuf::from(destination)) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("distilld pack: {error}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
         "activated pack manifest {} with archive {}",
         distill_pack::manifest_filename(distill_pack::manifest_hash(&output.manifest_bytes)),

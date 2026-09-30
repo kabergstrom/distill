@@ -197,7 +197,6 @@ pub struct RootedScanner {
 pub enum DaemonOwnedDirectoryKind {
     State,
     ModuleStaging,
-    PackageOutput,
     CodegenOutput,
 }
 
@@ -206,7 +205,6 @@ impl std::fmt::Display for DaemonOwnedDirectoryKind {
         let name = match self {
             Self::State => "daemon state",
             Self::ModuleStaging => "pipeline module staging",
-            Self::PackageOutput => "package output",
             Self::CodegenOutput => "codegen output",
         };
         formatter.write_str(name)
@@ -772,7 +770,7 @@ fn encode_diagnostic(diagnostic: &ScanDiagnostic) -> Vec<u8> {
             out.push(match kind {
                 DaemonOwnedDirectoryKind::State => 0,
                 DaemonOwnedDirectoryKind::ModuleStaging => 1,
-                DaemonOwnedDirectoryKind::PackageOutput => 2,
+                // 2 was the in-process pack's package output.
                 DaemonOwnedDirectoryKind::CodegenOutput => 3,
             });
         }
@@ -804,7 +802,6 @@ fn decode_diagnostic(bytes: &[u8]) -> Option<ScanDiagnostic> {
             let kind = match input {
                 [0] => DaemonOwnedDirectoryKind::State,
                 [1] => DaemonOwnedDirectoryKind::ModuleStaging,
-                [2] => DaemonOwnedDirectoryKind::PackageOutput,
                 [3] => DaemonOwnedDirectoryKind::CodegenOutput,
                 _ => return None,
             };
