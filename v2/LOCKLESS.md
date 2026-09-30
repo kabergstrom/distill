@@ -371,7 +371,7 @@ should reach zero by the end of phase 6.
       in `artifact_load_edges`.
     - A read checks those edges against the parsed dependencies.
     - `ArtifactPayloadBackend` is deleted.
-  - **Known gap (open until phase 5).** The daemon commits its namespace in
+  - **Known gap (open until phase 6; see phase 5).** The daemon commits its namespace in
     its own input transaction. The RPC `Delta` for that commit is applied
     afterwards, in a second served transaction (`apply_commit_served`), on
     the same authority step.
@@ -412,11 +412,57 @@ should reach zero by the end of phase 6.
     - The driver ticks every 40 ms (the debounce) to check for a runtime
       pipeline poison and to reap drained retired epochs. Both become
       messages once builds are jobs.
-    - The watcher monitor polls `scanner.revision()` until phase 5 moves the
-      roots into the authority.
+    - The watcher monitor polled `scanner.revision()`. Phase 5 removed that.
   - **Still blocking:** an RPC authoring call blocks the RPC thread until the
     authority replies, as the publication mutex did before. Replies become
     awaited oneshots with the build jobs (phase 6).
+- **Phase 5:** done (commits `0f545da`–`411edc9`).
+  - **Scan observation in tables.**
+    - `files` gains `raw_path` and `symlink_target`.
+    - `bundle_files` holds the bytes each bundle was read as.
+    - `directories` and `scan_diagnostics` hold the traversal state.
+    - Incremental scans check against `StoredBaseline`, a `ScanBaseline`
+      over those tables, and load only the affected prefixes.
+    - `ScanSnapshot` remains only as the scanner's result type and as a
+      loaded view for full republication and doctor verify.
+  - **Claims in tables** (`claims.rs`, schema 30).
+    - `source_claims` holds one row per claim per source. Claim kinds are
+      bundle, authored, derived, primary path, lineage and malformed.
+    - `claim_collisions` and `claim_pending` are kept by
+      `InputTxn::replace_source_claims`, for the touched subjects only.
+    - An incremental scan writes its files, structure and claims, then
+      plans against `transaction.reader()`, all in one input transaction.
+    - `ScanProjectionIndex` and its checkpoint/restore logic are deleted.
+  - **Import index in tables** (`imports.rs`, schema 31).
+    - `import_records` and `import_reads(kind, key)` store the watched read
+      sets. Dirty paths join against them.
+    - `directory_rule_sources` stores directory rules.
+    - `ImportWatchIndex` is deleted. A readiness `AtomicBool` replaces its
+      mutex.
+  - **Imports as jobs.**
+    - An import is a run (`run_import`: execute the importer, write nothing)
+      plus a publish (`publish_import`: fold, revalidate the read set,
+      write the bundle).
+    - RPC import and reimport:
+      - `Hub::import_prepare` returns a Send `PendingImport`.
+      - The transport runs it under `spawn_blocking`
+        (`AuthoringBackend::run_import`, which takes `Arc<Self>`).
+      - `Hub::import_finish` publishes on the authority, only while still at
+        the request's base.
+    - Watched reimports and directory imports:
+      - They run in parallel (rayon) at one version.
+      - They publish in order on the authority, each as its own version.
+      - A run from an older version publishes when its destination row and
+        read set are unchanged. Anything else reruns on the authority.
+  - **Watcher roots by command.** The driver sends the scanner's coverage
+    (`ReplaceAssetRoots`) after each configuration reconcile, and the
+    monitor blocks on its channel.
+  - **Deferred to phase 6: the `Delta` gap above.**
+    - Tag-index refinement (`refine_published_tag_index[_incremental]`)
+      runs builds through the store mutex against the committed namespace,
+      after the input transaction, and then mutates the `Commit`.
+    - So the served `Delta` cannot be written in the daemon's transaction
+      until refinement becomes a build job that reads the uncommitted view.
 
 ## 7. Test baseline
 
