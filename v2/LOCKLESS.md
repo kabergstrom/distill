@@ -136,7 +136,7 @@ work. If that work fails, SQLite and memory diverge:
 - `refine_unpublished_tag_index` is a second transaction inside every publication, and its failure is swallowed as a poison.
 - `importer.rs`: `clear_watched_import_failure` (1292), `record_directory_orphans*` (633, 695), and `acknowledge_file_work` are separate commits.
 - `retire_publication_group` does check-then-act as three autocommits.
-- `lookup_candidates` is a "read" that writes `last_used`. Workers will report the candidates they touched, and the authority updates them in a batch.
+- `lookup_candidates` was a "read" that wrote `last_used`. Done: lookups are pure and the cache-limit sweep evicts at random, so a hit never writes (LRU drops to zero hits once the working set exceeds the cap).
 
 ## 3. Target thread model
 
@@ -184,7 +184,7 @@ work. If that work fails, SQLite and memory diverge:
   - A worker does memo lookup and trace revalidation against its reader.
     It builds dependency reads *inline* on the same worker with a per-job
     content-addressed memo, and encodes the artifacts.
-  - It returns records plus the touched memo candidates.
+  - It returns the encoded records.
   - The authority appends to the CAS, indexes, and writes `artifact_meta`
     and `resolutions` in one transaction, then replies with the hash.
   - A trace read no longer snapshots the whole project
@@ -275,7 +275,7 @@ baseline failures) and the deferred-ngp hot-reload scenario still working
      (a read-only connection with `&self` reads).
    - Drop the cached `input_version` / `memo_seq`.
    - Readers use `cas_segments` for file names.
-   - `lookup_candidates` becomes pure.
+   - `lookup_candidates` becomes pure (done; eviction is random).
    - Merge `refine_unpublished_tag_index` and the other separate commits
      into their parent transactions.
    - `Arc<Mutex<Store>>` still wraps the writer during this phase. Readers
