@@ -18,14 +18,13 @@ use distill_build::trace::{
     CapabilityKey, DirectoryGrouping, LocalFailureClass, Observed, RawFileFailureClass, RawFileOp,
     RawFileSubject, StableFailureFingerprint,
 };
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
+use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BootstrapControlSymbol,
     DIRECTORY_IMPORT_RULES_TYPE_UUID, IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_json::AuthoredValue;
 use distill_rpc::{
     decode_authoring_payload, ImportRequest, InputVersion, PreparedImportCommit, RpcFailure,
@@ -1192,8 +1191,12 @@ impl AuthoringService {
                 "import read-set changed before publication; the result was discarded",
             )));
         }
+        let authority = self
+            .tag_index_coordinator()
+            .and_then(|coordinator| coordinator.schema_authority());
         let bytes = build_import_bundle(
             &store,
+            authority.as_deref(),
             &importer,
             &folded,
             prior.as_ref().map(|prior| &prior.bundle),
@@ -2092,6 +2095,7 @@ fn dep_failure(dep: &FileDep) -> Option<&distill_build::trace::StableFailureFing
 
 fn build_import_bundle(
     store: &StoreReader,
+    authority: Option<&distill_schema::ProjectSchemaAuthority>,
     importer: &RegisteredImporter,
     imported: &ImportedBundle,
     prior: Option<&Bundle>,
@@ -2100,14 +2104,13 @@ fn build_import_bundle(
     let mut schemas = BTreeMap::new();
     let mut assets = BTreeMap::new();
     for (local_id, entry) in &imported.entries {
-        let (hash, schema, lineage) = current_type_schema(store, entry.type_uuid)?;
+        let (hash, schema) = current_type_schema(store, authority, entry.type_uuid)?;
         assets.insert(
             local_id.clone(),
             AssetEntry {
                 uuid: entry.uuid,
                 type_uuid: entry.type_uuid,
                 schema_hash: hash,
-                lineage: EntryLineageV1::Manifest(lineage),
                 authoring_only: false,
                 data: entry.value.clone(),
             },
@@ -2115,11 +2118,6 @@ fn build_import_bundle(
         schemas.insert(hash, schema);
     }
 
-    let settings_lineage = store
-        .current_lineage_stamp(importer.settings_type_uuid)
-        .map_err(invalid)?
-        .filter(|stamp| stamp.selected_digest() == Some(importer.settings_hash))
-        .ok_or_else(|| invalid("importer settings schema is not the accepted current lineage"))?;
     schemas.insert(importer.settings_hash, importer.settings_schema.clone());
     assets.insert(
         "$settings".into(),
@@ -2129,7 +2127,6 @@ fn build_import_bundle(
                 .map_or_else(|| ids.next_asset(), |entry| entry.uuid),
             type_uuid: importer.settings_type_uuid,
             schema_hash: importer.settings_hash,
-            lineage: EntryLineageV1::Manifest(settings_lineage),
             authoring_only: true,
             data: imported.settings.clone(),
         },
@@ -2152,9 +2149,6 @@ fn build_import_bundle(
                 .map_or_else(|| ids.next_asset(), |entry| entry.uuid),
             type_uuid: IMPORT_RECORD_TYPE_UUID,
             schema_hash: record_row.logical_hash,
-            lineage: EntryLineageV1::Bootstrap {
-                bundle_format_version: BUNDLE_FORMAT_VERSION,
-            },
             authoring_only: true,
             data: encode_import_record(&imported.record)?,
         },
@@ -2169,29 +2163,34 @@ fn build_import_bundle(
     distill_bundle::write_bundle(&bundle).map_err(invalid)
 }
 
+/// The current schema of an importer output type: the project schema's, else
+/// the published registry's hash with its cached snapshot.
 fn current_type_schema(
     store: &StoreReader,
+    authority: Option<&distill_schema::ProjectSchemaAuthority>,
     type_uuid: TypeUuid,
-) -> Result<(LogicalHash, LogicalSchema, LineageStamp), RpcFailure> {
+) -> Result<(LogicalHash, LogicalSchema), RpcFailure> {
     if is_bootstrap_control_type(type_uuid) {
         return Err(invalid(
             "importer output cannot mint bootstrap control entries",
         ));
     }
-    let hash = store
-        .lineage_current(type_uuid)
-        .map_err(invalid)?
-        .ok_or_else(|| invalid(format!("output type {type_uuid} has no accepted schema")))?;
+    if let Some(project) = authority.and_then(|authority| authority.project_type(type_uuid)) {
+        return Ok((project.logical_hash, project.logical_schema.clone()));
+    }
+    let hash = match store.pipeline_state().map_err(invalid)? {
+        Some(distill_store::state::PipelineState::Ready(epoch)) => {
+            epoch.schema_registry.get(&type_uuid).copied()
+        }
+        _ => None,
+    }
+    .ok_or_else(|| invalid(format!("output type {type_uuid} has no current schema")))?;
     let snapshot = store
         .schema(hash)
         .map_err(invalid)?
-        .ok_or_else(|| invalid(format!("accepted schema {hash} is not cached")))?;
+        .ok_or_else(|| invalid(format!("current schema {hash} is not cached")))?;
     let schema = verify_snapshot(&snapshot, hash).map_err(invalid)?;
-    let stamp = store
-        .current_lineage_stamp(type_uuid)
-        .map_err(invalid)?
-        .ok_or_else(|| invalid("accepted output lineage has no stamp"))?;
-    Ok((hash, schema, stamp))
+    Ok((hash, schema))
 }
 
 fn validate_default_settings(
@@ -2200,10 +2199,6 @@ fn validate_default_settings(
     schema: &LogicalSchema,
     value: &AuthoredValue,
 ) -> Result<(), RpcFailure> {
-    let epochs = vec![AcceptedSchemaEpoch {
-        digest: hash,
-        forward_parent: None,
-    }];
     let bundle = Bundle {
         format_version: BUNDLE_FORMAT_VERSION,
         uuid: BundleUuid([0x41; 16]),
@@ -2215,11 +2210,6 @@ fn validate_default_settings(
                 uuid: AssetUuid([0x42; 16]),
                 type_uuid,
                 schema_hash: hash,
-                lineage: EntryLineageV1::Manifest(LineageStamp {
-                    chain: lineage_chain_digest(type_uuid, &epochs, 0),
-                    epochs,
-                    cursor: 0,
-                }),
                 authoring_only: false,
                 data: value.clone(),
             },

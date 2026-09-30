@@ -6,15 +6,13 @@ pub use distill_core::id::{
 };
 pub use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationError, ConfigurationErrorCode, DscpV1,
-    GlobalBundleReadFailureCode, InputVersion, LineageManifestClaimant, PhysicalPathClaim,
-    PhysicalPathFailureCode, PipelineCandidateIdentity, PipelineFailure, PipelineFailureCode,
-    PipelineFailureOrigin, PlatformPathBytes, ReadableBundleSource, ScanFailureCode, ScanSubject,
-    SchemaAcceptanceRequired, SchemaManifestBasis, SchemaRegistryMismatch, SkeletonFailureCode,
+    GlobalBundleReadFailureCode, InputVersion, PhysicalPathClaim, PhysicalPathFailureCode,
+    PipelineFailure, PipelineFailureCode, PipelineFailureOrigin, PlatformPathBytes,
+    ReadableBundleSource, ScanFailureCode, ScanSubject, SkeletonFailureCode,
     SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
 };
-pub use distill_store::RetiredTypeReference;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -62,132 +60,12 @@ pub enum ConnectOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineUnavailableDiagnostic {
     PipelineFailure(PipelineFailure),
-    SchemaAcceptanceRequired(SchemaAcceptanceRequired),
-    RetiredTypeReferenced(RetiredTypeReferenced),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataConnectOutcome {
     Connected(MetadataConnected),
     ProtocolMismatch { expected: u32, observed: u32 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OccupiedLineageDestinationKind {
-    CanonicalBundle,
-    Opaque,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineageRepairDestination {
-    Absent,
-    Occupied {
-        file_hash: BundleFileHash,
-        kind: OccupiedLineageDestinationKind,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineageRepairState {
-    Missing {
-        configured_root: String,
-        configured_path: String,
-        destination: LineageRepairDestination,
-    },
-    Duplicate {
-        claimants: Vec<LineageManifestClaimant>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageRepairInspection {
-    pub instance: StoreInstanceId,
-    pub stamp: SnapshotStamp,
-    pub state: LineageRepairState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineageRepairUnavailable {
-    ConfigurationReady,
-    OtherConfigurationError(ConfigurationError),
-}
-
-#[derive(Debug, Clone)]
-pub struct LineageRepairConnected {
-    pub repair: crate::LineageRepair,
-    pub instance: StoreInstanceId,
-    pub protocol_epoch: u32,
-}
-
-#[derive(Debug, Clone)]
-pub enum LineageRepairConnectOutcome {
-    Connected(LineageRepairConnected),
-    Unavailable(LineageRepairUnavailable),
-    ProtocolMismatch { expected: u32, observed: u32 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineageRepairInvalidCode {
-    WrongBasisState,
-    NonCanonicalBundle,
-    MissingManifestEntry,
-    NotAuthoringOnly,
-    BootstrapTypePresent,
-    InvalidLineage,
-    SurvivorNotClaimant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageRepairInvalid {
-    pub code: LineageRepairInvalidCode,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineageRepairStaleCode {
-    StampChanged,
-    StateChanged,
-    DestinationAppeared,
-    ClaimantChanged,
-    PreimageChanged,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageRepairStale {
-    pub code: LineageRepairStaleCode,
-    pub observed_stamp: SnapshotStamp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LineageRepairCommitted {
-    pub stamp: SnapshotStamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineageRepairInspectOutcome {
-    Success(LineageRepairInspection),
-    Unavailable(LineageRepairUnavailable),
-    ReconnectRequired { reason: MetadataReconnectReason },
-    Failure(RpcFailure),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineageRepairMutationOutcome {
-    Success(LineageRepairCommitted),
-    StaleBasis(LineageRepairStale),
-    Invalid(LineageRepairInvalid),
-    Unavailable(LineageRepairUnavailable),
-    ReconnectRequired { reason: MetadataReconnectReason },
-    Failure(RpcFailure),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LineageRepairBackendError {
-    /// Descriptor-relative destination/claimant/preimage drift observed by the
-    /// durable backend after the RPC coordinator's in-memory basis CAS.
-    Stale(LineageRepairStale),
-    Invalid(LineageRepairInvalid),
-    Failure(RpcFailure),
 }
 
 impl MetadataConnectOutcome {
@@ -241,16 +119,6 @@ pub enum ConfigurationStatus {
 pub enum PipelineDiagnostic {
     Ready,
     Failed(PipelineFailure),
-    SchemaAcceptanceRequired(SchemaAcceptanceRequired),
-    RetiredTypeReferenced(RetiredTypeReferenced),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetiredTypeReferenced {
-    pub manifest_hash: BundleFileHash,
-    pub basis: SnapshotStamp,
-    pub type_uuid: TypeUuid,
-    pub references: Vec<RetiredTypeReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,9 +438,7 @@ pub struct ImportRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LongRunningOp {
     RenameWithFixups(Arc<[u8]>),
-    DiskMigration(Arc<[u8]>),
     Doctor(Arc<[u8]>),
-    SchemaTransition(Arc<[u8]>),
 }
 
 /// Canonical request carried by [`LongRunningOp::RenameWithFixups`].  The
@@ -585,14 +451,6 @@ pub struct RenameWithFixupsRequest {
     pub destination_path: String,
 }
 
-/// Canonical request carried by [`LongRunningOp::DiskMigration`].  Empty means
-/// every authored bundle with a pending forward migration; otherwise the list
-/// is raw-UUID sorted and unique.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiskMigrationRequest {
-    pub bundles: Vec<BundleUuid>,
-}
-
 /// Closed maintenance request carried by [`LongRunningOp::Doctor`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorRequest {
@@ -602,30 +460,6 @@ pub enum DoctorRequest {
     /// sweep.
     Clean,
     RebuildIndexes,
-}
-
-/// Canonical request carried by [`LongRunningOp::SchemaTransition`]. Every
-/// action repeats the complete manifest and pending-candidate basis reported
-/// by [`SchemaAcceptanceRequired`], so a command cannot be consumed by a
-/// different manifest revision or staged module.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaTransitionRequest {
-    pub manifest: SchemaManifestBasis,
-    pub candidate: PipelineCandidateIdentity,
-    pub type_uuid: TypeUuid,
-    pub action: SchemaTransitionAction,
-}
-
-/// The four explicit schema-authority transitions. Ordinary acceptance and
-/// rollback name the exact candidate digest to select. Retirement additionally
-/// carries the metadata/control snapshot that established its negative proof;
-/// reactivation selects the named pending candidate's row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaTransitionAction {
-    Accept { requested: LogicalHash },
-    Rollback { target: LogicalHash },
-    Retire { control_basis: SnapshotStamp },
-    Reactivate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,40 +502,6 @@ impl RenameWithFixupsRequest {
     }
 }
 
-impl DiskMigrationRequest {
-    pub fn encode(&self) -> Result<Arc<[u8]>, OperationPayloadError> {
-        if !self.bundles.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            return Err(OperationPayloadError::NonCanonicalOrder);
-        }
-        let count =
-            u32::try_from(self.bundles.len()).map_err(|_| OperationPayloadError::CountOverflow)?;
-        let mut bytes = vec![1];
-        bytes.extend_from_slice(&count.to_le_bytes());
-        for bundle in &self.bundles {
-            bytes.extend_from_slice(&bundle.0);
-        }
-        Ok(Arc::from(bytes))
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
-        let mut reader = OperationPayloadReader::new(bytes)?;
-        let count =
-            usize::try_from(reader.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
-        if count > reader.remaining() / 16 {
-            return Err(OperationPayloadError::CountOverflow);
-        }
-        let mut bundles = Vec::with_capacity(count);
-        for _ in 0..count {
-            bundles.push(BundleUuid(reader.array()?));
-        }
-        reader.finish()?;
-        if !bundles.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            return Err(OperationPayloadError::NonCanonicalOrder);
-        }
-        Ok(Self { bundles })
-    }
-}
-
 impl DoctorRequest {
     pub fn encode(self) -> Arc<[u8]> {
         Arc::from([1, self.tag()])
@@ -728,137 +528,10 @@ impl DoctorRequest {
     }
 }
 
-impl SchemaTransitionRequest {
-    pub fn encode(&self) -> Result<Arc<[u8]>, OperationPayloadError> {
-        distill_core::target_set::CanonicalTargetSet::from_canonical(
-            self.candidate.target_set.rows.clone(),
-        )
-        .map_err(|_| OperationPayloadError::NonCanonicalOrder)?;
-        let cursor_count = u32::try_from(self.manifest.current_cursors.len())
-            .map_err(|_| OperationPayloadError::CountOverflow)?;
-        let target_count = u32::try_from(self.candidate.target_set.rows.len())
-            .map_err(|_| OperationPayloadError::CountOverflow)?;
-
-        let mut bytes = vec![1, self.action.tag()];
-        bytes.extend_from_slice(&self.manifest.manifest_hash.0);
-        bytes.extend_from_slice(&cursor_count.to_le_bytes());
-        for (type_uuid, logical_hash) in &self.manifest.current_cursors {
-            bytes.extend_from_slice(&type_uuid.0);
-            bytes.extend_from_slice(&logical_hash.0);
-        }
-        bytes.extend_from_slice(&self.candidate.dylib_hash);
-        bytes.extend_from_slice(&target_count.to_le_bytes());
-        for target in &self.candidate.target_set.rows {
-            encode_operation_text_checked(&mut bytes, &target.name)?;
-            bytes.extend_from_slice(&target.target_definition_hash);
-        }
-        bytes.extend_from_slice(&self.type_uuid.0);
-        match self.action {
-            SchemaTransitionAction::Accept { requested } => bytes.extend_from_slice(&requested.0),
-            SchemaTransitionAction::Rollback { target } => bytes.extend_from_slice(&target.0),
-            SchemaTransitionAction::Retire { control_basis } => {
-                bytes.extend_from_slice(&control_basis.instance.0);
-                bytes.extend_from_slice(&control_basis.version.0.to_le_bytes());
-            }
-            SchemaTransitionAction::Reactivate => {}
-        }
-        Ok(Arc::from(bytes))
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, OperationPayloadError> {
-        let mut reader = OperationPayloadReader::new(bytes)?;
-        let action_tag = reader.u8()?;
-        let manifest_hash = ContentHash(reader.array()?);
-        let cursor_count =
-            usize::try_from(reader.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
-        if cursor_count > reader.remaining() / 48 {
-            return Err(OperationPayloadError::CountOverflow);
-        }
-        let mut current_cursors = BTreeMap::new();
-        let mut prior_type_uuid = None;
-        for _ in 0..cursor_count {
-            let type_uuid = TypeUuid(reader.array()?);
-            if prior_type_uuid.is_some_and(|prior| prior >= type_uuid) {
-                return Err(OperationPayloadError::NonCanonicalOrder);
-            }
-            let logical_hash = LogicalHash(reader.array()?);
-            current_cursors.insert(type_uuid, logical_hash);
-            prior_type_uuid = Some(type_uuid);
-        }
-
-        let dylib_hash = reader.array()?;
-        let target_count =
-            usize::try_from(reader.u32()?).map_err(|_| OperationPayloadError::CountOverflow)?;
-        if target_count > reader.remaining() / 36 {
-            return Err(OperationPayloadError::CountOverflow);
-        }
-        let mut target_rows = Vec::with_capacity(target_count);
-        for _ in 0..target_count {
-            target_rows.push(distill_core::target_set::TargetSetRow {
-                name: reader.text()?,
-                target_definition_hash: reader.array()?,
-            });
-        }
-        let target_set = distill_core::target_set::CanonicalTargetSet::from_canonical(target_rows)
-            .map_err(|_| OperationPayloadError::NonCanonicalOrder)?;
-        let type_uuid = TypeUuid(reader.array()?);
-        let action = match action_tag {
-            1 => SchemaTransitionAction::Accept {
-                requested: LogicalHash(reader.array()?),
-            },
-            2 => SchemaTransitionAction::Rollback {
-                target: LogicalHash(reader.array()?),
-            },
-            3 => SchemaTransitionAction::Retire {
-                control_basis: SnapshotStamp {
-                    instance: StoreInstanceId(reader.array()?),
-                    version: InputVersion(reader.u64()?),
-                },
-            },
-            4 => SchemaTransitionAction::Reactivate,
-            tag => return Err(OperationPayloadError::InvalidTag(tag)),
-        };
-        reader.finish()?;
-        Ok(Self {
-            manifest: SchemaManifestBasis {
-                manifest_hash,
-                current_cursors,
-            },
-            candidate: PipelineCandidateIdentity {
-                dylib_hash,
-                target_set,
-            },
-            type_uuid,
-            action,
-        })
-    }
-}
-
-impl SchemaTransitionAction {
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Accept { .. } => 1,
-            Self::Rollback { .. } => 2,
-            Self::Retire { .. } => 3,
-            Self::Reactivate => 4,
-        }
-    }
-}
-
 fn encode_operation_text(bytes: &mut Vec<u8>, text: &str) {
     let len = u32::try_from(text.len()).expect("operation text exceeds the RPC message limit");
     bytes.extend_from_slice(&len.to_le_bytes());
     bytes.extend_from_slice(text.as_bytes());
-}
-
-fn encode_operation_text_checked(
-    bytes: &mut Vec<u8>,
-    text: &str,
-) -> Result<(), OperationPayloadError> {
-    let len = u32::try_from(text.len()).map_err(|_| OperationPayloadError::CountOverflow)?;
-    bytes.extend_from_slice(&len.to_le_bytes());
-    bytes.extend_from_slice(text.as_bytes());
-    Ok(())
 }
 
 struct OperationPayloadReader<'a> {
@@ -875,10 +548,6 @@ impl<'a> OperationPayloadReader<'a> {
             return Err(OperationPayloadError::UnsupportedVersion(version));
         }
         Ok(Self { bytes, position: 1 })
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.position)
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], OperationPayloadError> {
@@ -906,10 +575,6 @@ impl<'a> OperationPayloadReader<'a> {
 
     fn u32(&mut self) -> Result<u32, OperationPayloadError> {
         Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, OperationPayloadError> {
-        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn text(&mut self) -> Result<String, OperationPayloadError> {
@@ -1079,34 +744,6 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure>;
 
-    /// Execute the destination-aware durable repair and return its
-    /// rescan-proven publication commit. The RPC coordinator invokes this
-    /// only after its second exact inspection CAS, on the authority thread,
-    /// and installs the returned commit before the authority runs anything
-    /// else. Implementations must not publish through this `Server`.
-    fn prepare_create_missing_lineage(
-        &self,
-        _basis: &LineageRepairInspection,
-        _canonical_manifest_bundle: &[u8],
-    ) -> Result<Commit, LineageRepairBackendError> {
-        Err(LineageRepairBackendError::Failure(
-            RpcFailure::AuthoringBackendUnavailable {
-                operation: "lineageRepair.createMissing".to_owned(),
-            },
-        ))
-    }
-
-    fn prepare_resolve_duplicate_lineage(
-        &self,
-        _basis: &LineageRepairInspection,
-        _survivor: &LineageManifestClaimant,
-    ) -> Result<Commit, LineageRepairBackendError> {
-        Err(LineageRepairBackendError::Failure(
-            RpcFailure::AuthoringBackendUnavailable {
-                operation: "lineageRepair.resolveDuplicate".to_owned(),
-            },
-        ))
-    }
 }
 
 /// Snapshot-pinned request issued when runtime resolution reaches a drifted
@@ -1685,9 +1322,6 @@ pub struct Commit {
     pub pipeline_epoch_changed: bool,
     /// `Some` replaces the namespace errors (LOCKLESS.md §4).
     pub namespace_errors: Option<Vec<NamespaceError>>,
-    /// `Some(None)` clears repair inspection; `Some(Some(_))` publishes the
-    /// exact current missing/duplicate lineage basis.
-    pub lineage_repair: Option<Option<LineageRepairState>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1717,9 +1351,6 @@ pub enum AdminError {
         detail: String,
     },
     InvalidArtifact {
-        detail: String,
-    },
-    InvalidLineageRepairState {
         detail: String,
     },
     InvalidNamespaceError {

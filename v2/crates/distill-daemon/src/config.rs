@@ -14,7 +14,6 @@ use distill_store::StoreConfig;
 use serde::Deserialize;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
-use crate::coordinator::LineageDestination;
 use crate::epoch::{CandidateRequirements, TargetDefinition as PipelineTarget};
 use crate::module_loader::host_module_abi_identity;
 use crate::scanner::AssetRoot;
@@ -43,7 +42,6 @@ pub struct DaemonSection {
 pub struct AssetsSection {
     pub roots: BTreeMap<String, PathBuf>,
     pub schema_path: PathBuf,
-    pub lineage_manifest: LineageDestination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,8 +95,6 @@ pub enum DaemonConfigError {
         name: String,
     },
     RootUnavailable(PathBuf),
-    UnknownLineageRoot(String),
-    InvalidLineagePath(String),
     EmptyTargets,
     EmptyTargetApis(String),
     InvalidTargetApi {
@@ -164,14 +160,6 @@ const fn default_retention() -> u32 {
 struct RawAssets {
     roots: BTreeMap<String, PathBuf>,
     schema_path: PathBuf,
-    lineage_manifest: RawLineageDestination,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLineageDestination {
-    root: String,
-    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,15 +248,6 @@ impl DaemonConfig {
         }
 
         let roots = normalize_paths("asset root", raw.assets.roots, base, true)?;
-        if !roots.contains_key(&raw.assets.lineage_manifest.root) {
-            return Err(DaemonConfigError::UnknownLineageRoot(
-                raw.assets.lineage_manifest.root,
-            ));
-        }
-        let lineage_path = distill_build::query::normalize_path(&raw.assets.lineage_manifest.path)
-            .map_err(|_| {
-                DaemonConfigError::InvalidLineagePath(raw.assets.lineage_manifest.path.clone())
-            })?;
         let state_path = resolve(base, &raw.daemon.state_path)?;
         let schema_path = resolve(base, &raw.assets.schema_path)?;
         let pipeline_dylib = resolve(base, &raw.modules.pipeline_dylib)?;
@@ -324,10 +303,6 @@ impl DaemonConfig {
             assets: AssetsSection {
                 roots,
                 schema_path,
-                lineage_manifest: LineageDestination {
-                    root: raw.assets.lineage_manifest.root,
-                    path: lineage_path,
-                },
             },
             modules: ModulesSection { pipeline_dylib },
             targets,
@@ -585,17 +560,6 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
             Err(error) => errors.push(error),
         }
     }
-    let lineage_root = raw.assets.lineage_manifest.root.nfc().collect::<String>();
-    if !normalized_roots.contains(&lineage_root) {
-        errors.push(DaemonConfigError::UnknownLineageRoot(
-            raw.assets.lineage_manifest.root.clone(),
-        ));
-    }
-    if distill_build::query::normalize_path(&raw.assets.lineage_manifest.path).is_err() {
-        errors.push(DaemonConfigError::InvalidLineagePath(
-            raw.assets.lineage_manifest.path.clone(),
-        ));
-    }
 
     let controlled = [
         ("daemon.state_path", &raw.daemon.state_path),
@@ -732,17 +696,6 @@ pub(crate) fn config_error_reason(error: &DaemonConfigError, source: &[u8]) -> D
                 normalized_or_raw_path: path,
             })
         }
-        DaemonConfigError::InvalidLineagePath(path) => {
-            let normalized = path.nfc().collect::<String>();
-            DscpV1::InvalidPath {
-                key: ConfigurationPathKey::ImportDestination,
-                normalized_or_raw_path: normalized,
-            }
-        }
-        DaemonConfigError::UnknownLineageRoot(root) => DscpV1::InvalidPath {
-            key: ConfigurationPathKey::ImportDestination,
-            normalized_or_raw_path: root.clone(),
-        },
         DaemonConfigError::EmptyTargetApis(target) => DscpV1::EmptyTargetApis {
             target: target.clone(),
         },
@@ -996,10 +949,6 @@ mod tests {
             assets: RawAssets {
                 roots: BTreeMap::from([("main".to_owned(), assets)]),
                 schema_path: temp.path().join("schema.json"),
-                lineage_manifest: RawLineageDestination {
-                    root: "main".to_owned(),
-                    path: "schema/lineage.bundle".to_owned(),
-                },
             },
             modules: RawModules {
                 pipeline_dylib: temp.path().join("pipeline.so"),

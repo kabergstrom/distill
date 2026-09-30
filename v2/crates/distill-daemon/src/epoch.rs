@@ -2192,6 +2192,29 @@ pub(crate) fn processor_test_epoch_with<
     processor: P,
     configure: F,
 ) -> PipelineEpoch {
+    processor_test_epoch_with_dylib(
+        [9; 32],
+        target,
+        target_definition_hash,
+        descriptor,
+        processor,
+        configure,
+    )
+}
+
+/// As `processor_test_epoch_with`, staged from a dylib with `dylib_hash`.
+#[cfg(test)]
+pub(crate) fn processor_test_epoch_with_dylib<
+    P: crate::callbacks::PipelineProcessor,
+    F: FnOnce(&mut CandidateRegistrationArena),
+>(
+    dylib_hash: [u8; 32],
+    target: &str,
+    target_definition_hash: [u8; 32],
+    descriptor: crate::callbacks::ProcessorDescriptor,
+    processor: P,
+    configure: F,
+) -> PipelineEpoch {
     let token = ModuleEpochToken::new(9002);
     let mut arena = CandidateRegistrationArena::new(token.clone());
     arena
@@ -2210,7 +2233,7 @@ pub(crate) fn processor_test_epoch_with<
         9002,
         StagedModule {
             path: PathBuf::from("pipeline-test"),
-            content_hash: [9; 32],
+            content_hash: dylib_hash,
         },
         token,
         PreparedEpochRegistration {
@@ -2719,9 +2742,14 @@ mod callback_tests {
             .unwrap();
         arena
             .registrar()
-            .register_migration("upgrade", |value| -> Result<_, MigrationFunctionError> {
-                Ok(value)
-            })
+            .register_migration(
+                crate::callbacks::MigrationKey {
+                    type_uuid: TypeUuid([2; 16]),
+                    from: distill_core::id::LogicalHash([3; 32]),
+                    to: distill_core::id::LogicalHash([4; 32]),
+                },
+                |value| -> Result<_, MigrationFunctionError> { Ok(value) },
+            )
             .into_result()
             .unwrap();
         arena
@@ -2830,7 +2858,15 @@ mod callback_tests {
         assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
         assert_eq!(
             epoch
-                .invoke_migration("upgrade", distill_json::AuthoredValue::UInt(13))
+                .invoke_migration(
+                    &crate::callbacks::MigrationKey {
+                        type_uuid: TypeUuid([2; 16]),
+                        from: distill_core::id::LogicalHash([3; 32]),
+                        to: distill_core::id::LogicalHash([4; 32]),
+                    }
+                    .id(),
+                    distill_json::AuthoredValue::UInt(13),
+                )
                 .unwrap(),
             distill_json::AuthoredValue::UInt(13)
         );

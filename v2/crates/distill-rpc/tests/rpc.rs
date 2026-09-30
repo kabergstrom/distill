@@ -610,7 +610,6 @@ struct RecordingAuthoringBackend {
     imports: Mutex<Vec<ImportRequest>>,
     reimports: Mutex<Vec<BundleUuid>>,
     operations: Mutex<Vec<LongRunningOp>>,
-    widen_lineage_publication: bool,
 }
 
 impl AuthoringBackend for RecordingAuthoringBackend {
@@ -645,10 +644,9 @@ impl AuthoringBackend for RecordingAuthoringBackend {
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         self.operations.lock().unwrap().push(operation.clone());
         let payload = match operation {
-            LongRunningOp::RenameWithFixups(payload)
-            | LongRunningOp::DiskMigration(payload)
-            | LongRunningOp::Doctor(payload)
-            | LongRunningOp::SchemaTransition(payload) => payload.clone(),
+            LongRunningOp::RenameWithFixups(payload) | LongRunningOp::Doctor(payload) => {
+                payload.clone()
+            }
         };
         Ok(PreparedOperationCommit::immediate(
             Commit::default(),
@@ -670,26 +668,6 @@ impl AuthoringBackend for RecordingAuthoringBackend {
                 },
             ],
         ))
-    }
-
-    fn prepare_resolve_duplicate_lineage(
-        &self,
-        _basis: &LineageRepairInspection,
-        _survivor: &LineageManifestClaimant,
-    ) -> Result<Commit, LineageRepairBackendError> {
-        Ok(Commit {
-            assets: self
-                .widen_lineage_publication
-                .then_some(AssetMutation::Remove {
-                    uuid: AssetUuid([99; 16]),
-                    delta: AssetDeltaState::Changed,
-                })
-                .into_iter()
-                .collect(),
-            configuration: Some(ConfigurationStatus::Ready),
-            lineage_repair: Some(None),
-            ..Commit::default()
-        })
     }
 }
 
@@ -1077,6 +1055,16 @@ fn test_namespace_error() -> NamespaceError {
     .unwrap()
 }
 
+fn test_pipeline_failure() -> PipelineFailure {
+    PipelineFailure::new(
+        PipelineFailureCode::PublishedCallbackPanic,
+        PipelineFailureOrigin::PublishedRuntime,
+        CleanupDisposition::PublishedEpochLeaked,
+        "processor callback panicked",
+    )
+    .unwrap()
+}
+
 #[test]
 fn metadata_namespace_calls_serve_around_a_namespace_error() {
     let server = server_with(&[(1, false)]);
@@ -1089,24 +1077,7 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
                 path: entry.normalized_path.clone(),
                 candidates: BTreeSet::from([entry.uuid]),
             }],
-            pipeline: Some(PipelineDiagnostic::SchemaAcceptanceRequired(
-                SchemaAcceptanceRequired {
-                    manifest: SchemaManifestBasis {
-                        manifest_hash: content_hash(41),
-                        current_cursors: BTreeMap::new(),
-                    },
-                    candidate: PipelineCandidateIdentity {
-                        dylib_hash: [42; 32],
-                        target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![])
-                            .unwrap(),
-                    },
-                    mismatches: vec![SchemaRegistryMismatch {
-                        type_uuid: type_id(1),
-                        candidate: Some(LogicalHash([45; 32])),
-                        manifest: None,
-                    }],
-                },
-            )),
+            pipeline: Some(PipelineDiagnostic::Failed(test_pipeline_failure())),
             namespace_errors: Some(vec![error.clone()]),
             ..Commit::default()
         })
@@ -1120,7 +1091,7 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
     assert_eq!(diagnostics.namespace_errors, vec![error]);
     assert!(matches!(
         diagnostics.pipeline,
-        PipelineDiagnostic::SchemaAcceptanceRequired(_)
+        PipelineDiagnostic::Failed(_)
     ));
     let snapshot = connected.hub.snapshot().success().unwrap();
     assert!(matches!(
@@ -1163,109 +1134,6 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
         .unwrap()
         .namespace_errors
         .is_empty());
-}
-
-#[test]
-fn metadata_schema_transition_is_reachable_while_target_connect_is_blocked_and_fenced() {
-    let backend = Arc::new(RecordingAuthoringBackend::default());
-    let server = Server::new_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        vec![target_with(7, &[(1, false)])],
-        backend.clone(),
-    )
-    .unwrap();
-    let required = SchemaAcceptanceRequired {
-        manifest: SchemaManifestBasis {
-            manifest_hash: content_hash(41),
-            current_cursors: BTreeMap::new(),
-        },
-        candidate: PipelineCandidateIdentity {
-            dylib_hash: [42; 32],
-            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
-        },
-        mismatches: vec![SchemaRegistryMismatch {
-            type_uuid: type_id(1),
-            candidate: Some(LogicalHash([45; 32])),
-            manifest: None,
-        }],
-    };
-    server
-        .commit(Commit {
-            pipeline: Some(PipelineDiagnostic::SchemaAcceptanceRequired(
-                required.clone(),
-            )),
-            ..Commit::default()
-        })
-        .unwrap();
-    assert!(matches!(
-        server.root().connect(request_for(7, 0, &[(1, false)])),
-        ConnectOutcome::PipelineUnavailable(
-            PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(observed)
-        ) if observed == required
-    ));
-
-    let metadata = server
-        .root()
-        .metadata(PROTOCOL_VERSION)
-        .connected()
-        .unwrap()
-        .hub;
-    let payload: Arc<[u8]> = Arc::from(&b"schema-transition-cas"[..]);
-    assert!(matches!(
-        metadata.schema_transition(InputVersion(0), Arc::clone(&payload)),
-        MetadataCall::Error(RpcFailure::StaleInputVersion {
-            expected: InputVersion(1),
-            got: InputVersion(0),
-        })
-    ));
-    assert!(backend.operations.lock().unwrap().is_empty());
-
-    let progress = metadata
-        .schema_transition(InputVersion(1), Arc::clone(&payload))
-        .success()
-        .unwrap()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        progress.iter().map(|event| event.state).collect::<Vec<_>>(),
-        vec![
-            AuthoringProgressState::Started,
-            AuthoringProgressState::Running,
-            AuthoringProgressState::Completed,
-        ]
-    );
-    assert_eq!(server.current_stamp().version, InputVersion(2));
-    assert_eq!(
-        *backend.operations.lock().unwrap(),
-        vec![LongRunningOp::SchemaTransition(payload)]
-    );
-
-    let mut fenced = metadata
-        .schema_transition(
-            InputVersion(2),
-            Arc::from(&b"must-not-publish-after-fence"[..]),
-        )
-        .success()
-        .unwrap();
-    assert_eq!(
-        fenced.next().unwrap().state,
-        AuthoringProgressState::Started
-    );
-    assert_eq!(
-        fenced.next().unwrap().state,
-        AuthoringProgressState::Running
-    );
-    server.replace_protocol_epoch(PROTOCOL_VERSION + 1);
-    let fenced_version = server.current_stamp().version;
-    let terminal = fenced.next().unwrap();
-    assert_eq!(terminal.state, AuthoringProgressState::Failed);
-    assert!(String::from_utf8_lossy(&terminal.payload).contains("ProtocolEpochChanged"));
-    assert_eq!(server.current_stamp().version, fenced_version);
-    assert!(matches!(
-        metadata.schema_transition(InputVersion(2), Arc::from(&b"fenced"[..])),
-        MetadataCall::ReconnectRequired {
-            reason: MetadataReconnectReason::ProtocolEpochChanged,
-        }
-    ));
 }
 
 #[test]
@@ -1905,35 +1773,17 @@ fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads(
 #[test]
 fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
     let server = server_with(&[(1, false)]);
-    let required = SchemaAcceptanceRequired {
-        manifest: SchemaManifestBasis {
-            manifest_hash: content_hash(41),
-            current_cursors: BTreeMap::new(),
-        },
-        candidate: PipelineCandidateIdentity {
-            dylib_hash: [42; 32],
-            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
-        },
-        mismatches: vec![SchemaRegistryMismatch {
-            type_uuid: type_id(1),
-            candidate: Some(LogicalHash([45; 32])),
-            manifest: None,
-        }],
-    };
+    let failure = test_pipeline_failure();
     server
         .commit(Commit {
-            pipeline: Some(PipelineDiagnostic::SchemaAcceptanceRequired(
-                required.clone(),
-            )),
+            pipeline: Some(PipelineDiagnostic::Failed(failure.clone())),
             ..Commit::default()
         })
         .unwrap();
 
     assert_eq!(
         server.root().connect(request_for(7, 2, &[(1, false)])),
-        ConnectOutcome::PipelineUnavailable(
-            PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required)
-        )
+        ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelineFailure(failure))
     );
 
     server
@@ -2043,34 +1893,11 @@ fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnosti
         Err(AdminError::InvalidConfigurationError { .. })
     ));
 
-    let empty_schema = PipelineDiagnostic::SchemaAcceptanceRequired(SchemaAcceptanceRequired {
-        manifest: SchemaManifestBasis {
-            manifest_hash: content_hash(3),
-            current_cursors: BTreeMap::new(),
-        },
-        candidate: PipelineCandidateIdentity {
-            dylib_hash: [4; 32],
-            target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![]).unwrap(),
-        },
-        mismatches: vec![],
-    });
+    let mut tampered = test_pipeline_failure();
+    tampered.identity = [0; 32];
     assert!(matches!(
         server.commit(Commit {
-            pipeline: Some(empty_schema),
-            ..Commit::default()
-        }),
-        Err(AdminError::InvalidPipelineDiagnostic { .. })
-    ));
-
-    let empty_retired = PipelineDiagnostic::RetiredTypeReferenced(RetiredTypeReferenced {
-        manifest_hash: BundleFileHash([7; 32]),
-        basis: before,
-        type_uuid: type_id(1),
-        references: vec![],
-    });
-    assert!(matches!(
-        server.commit(Commit {
-            pipeline: Some(empty_retired),
+            pipeline: Some(PipelineDiagnostic::Failed(tampered)),
             ..Commit::default()
         }),
         Err(AdminError::InvalidPipelineDiagnostic { .. })
@@ -2690,19 +2517,6 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
         rename
     );
 
-    let migration = DiskMigrationRequest {
-        bundles: vec![BundleUuid([1; 16]), BundleUuid([2; 16])],
-    };
-    let encoded = migration.encode().unwrap();
-    assert_eq!(DiskMigrationRequest::decode(&encoded).unwrap(), migration);
-    assert_eq!(
-        DiskMigrationRequest {
-            bundles: vec![BundleUuid([2; 16]), BundleUuid([1; 16])],
-        }
-        .encode(),
-        Err(OperationPayloadError::NonCanonicalOrder)
-    );
-
     for request in [
         DoctorRequest::Verify,
         DoctorRequest::Clean,
@@ -2713,86 +2527,6 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
     assert_eq!(
         DoctorRequest::decode(&[1, 99]),
         Err(OperationPayloadError::InvalidTag(99))
-    );
-
-    let manifest = SchemaManifestBasis {
-        manifest_hash: ContentHash([31; 32]),
-        current_cursors: BTreeMap::from([
-            (TypeUuid([1; 16]), LogicalHash([41; 32])),
-            (TypeUuid([2; 16]), LogicalHash([42; 32])),
-        ]),
-    };
-    let candidate = PipelineCandidateIdentity {
-        dylib_hash: [51; 32],
-        target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![
-            distill_core::target_set::TargetSetRow {
-                name: "editor".to_owned(),
-                target_definition_hash: [61; 32],
-            },
-            distill_core::target_set::TargetSetRow {
-                name: "runtime".to_owned(),
-                target_definition_hash: [62; 32],
-            },
-        ])
-        .unwrap(),
-    };
-    for action in [
-        SchemaTransitionAction::Accept {
-            requested: LogicalHash([71; 32]),
-        },
-        SchemaTransitionAction::Rollback {
-            target: LogicalHash([72; 32]),
-        },
-        SchemaTransitionAction::Retire {
-            control_basis: SnapshotStamp {
-                instance: StoreInstanceId([73; 16]),
-                version: InputVersion(74),
-            },
-        },
-        SchemaTransitionAction::Reactivate,
-    ] {
-        let request = SchemaTransitionRequest {
-            manifest: manifest.clone(),
-            candidate: candidate.clone(),
-            type_uuid: TypeUuid([75; 16]),
-            action,
-        };
-        let encoded = request.encode().unwrap();
-        assert_eq!(SchemaTransitionRequest::decode(&encoded).unwrap(), request);
-    }
-
-    let noncanonical_candidate = SchemaTransitionRequest {
-        manifest: manifest.clone(),
-        candidate: PipelineCandidateIdentity {
-            dylib_hash: [51; 32],
-            target_set: distill_core::target_set::CanonicalTargetSet {
-                rows: candidate.target_set.rows.iter().cloned().rev().collect(),
-            },
-        },
-        type_uuid: TypeUuid([75; 16]),
-        action: SchemaTransitionAction::Reactivate,
-    };
-    assert_eq!(
-        noncanonical_candidate.encode(),
-        Err(OperationPayloadError::NonCanonicalOrder)
-    );
-
-    let canonical = SchemaTransitionRequest {
-        manifest,
-        candidate,
-        type_uuid: TypeUuid([75; 16]),
-        action: SchemaTransitionAction::Reactivate,
-    }
-    .encode()
-    .unwrap();
-    let mut noncanonical_cursors = canonical.to_vec();
-    const CURSORS_OFFSET: usize = 1 + 1 + 32 + 4;
-    let (first, second) =
-        noncanonical_cursors[CURSORS_OFFSET..CURSORS_OFFSET + 96].split_at_mut(48);
-    first.swap_with_slice(second);
-    assert_eq!(
-        SchemaTransitionRequest::decode(&noncanonical_cursors),
-        Err(OperationPayloadError::NonCanonicalOrder)
     );
 }
 
@@ -3071,176 +2805,6 @@ fn artifact_install_authenticates_header_hash_and_direct_typed_load_edges() {
             expected_terminal: type_id(2),
         }]
     );
-}
-
-#[test]
-fn lineage_repair_is_a_narrow_exact_basis_capability_with_typed_cas_outcomes() {
-    let backend = Arc::new(RecordingAuthoringBackend::default());
-    let server = Server::new_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        vec![target_with(7, &[(1, false)])],
-        backend,
-    )
-    .unwrap();
-    assert!(matches!(
-        server.root().lineage_repair(PROTOCOL_VERSION),
-        LineageRepairConnectOutcome::Unavailable(LineageRepairUnavailable::ConfigurationReady)
-    ));
-    assert!(matches!(
-        server.root().lineage_repair(PROTOCOL_VERSION + 1),
-        LineageRepairConnectOutcome::ProtocolMismatch {
-            expected: PROTOCOL_VERSION,
-            observed,
-        } if observed == PROTOCOL_VERSION + 1
-    ));
-
-    let claimants = vec![
-        LineageManifestClaimant {
-            root_name: "assets".to_owned(),
-            normalized_path: "a.bundle".to_owned(),
-            bundle: BundleUuid([1; 16]),
-            local_id: "manifest-a".to_owned(),
-            asset: AssetUuid([1; 16]),
-            file_hash: BundleFileHash([1; 32]),
-        },
-        LineageManifestClaimant {
-            root_name: "assets".to_owned(),
-            normalized_path: "b.bundle".to_owned(),
-            bundle: BundleUuid([2; 16]),
-            local_id: "manifest-b".to_owned(),
-            asset: AssetUuid([2; 16]),
-            file_hash: BundleFileHash([2; 32]),
-        },
-    ];
-    let error = ConfigurationError::from_reason(
-        &DscpV1::DuplicateLineageManifest {
-            entries: claimants.clone(),
-        },
-        "two lineage manifests",
-    );
-    let failed_stamp = server
-        .commit(Commit {
-            configuration: Some(ConfigurationStatus::Failed(error)),
-            lineage_repair: Some(Some(LineageRepairState::Duplicate {
-                claimants: claimants.clone(),
-            })),
-            ..Commit::default()
-        })
-        .unwrap();
-    let repair = match server.root().lineage_repair(PROTOCOL_VERSION) {
-        LineageRepairConnectOutcome::Connected(connected) => connected.repair,
-        other => panic!("expected lineage repair capability, got {other:?}"),
-    };
-    let first = match repair.inspect() {
-        LineageRepairInspectOutcome::Success(inspection) => inspection,
-        other => panic!("expected exact repair inspection, got {other:?}"),
-    };
-    assert_eq!(first.instance, StoreInstanceId([9; 16]));
-    assert_eq!(first.stamp, failed_stamp);
-    assert_eq!(
-        repair.resolve_duplicate(
-            first.clone(),
-            LineageManifestClaimant {
-                asset: AssetUuid([9; 16]),
-                ..claimants[0].clone()
-            }
-        ),
-        LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-            code: LineageRepairInvalidCode::SurvivorNotClaimant,
-            message: "selected survivor is not an exact current claimant".to_owned(),
-        })
-    );
-
-    server.commit(Commit::default()).unwrap();
-    assert!(matches!(
-        repair.resolve_duplicate(first, claimants[0].clone()),
-        LineageRepairMutationOutcome::StaleBasis(LineageRepairStale {
-            code: LineageRepairStaleCode::StampChanged,
-            ..
-        })
-    ));
-    let current = match repair.inspect() {
-        LineageRepairInspectOutcome::Success(inspection) => inspection,
-        other => panic!("expected refreshed repair inspection, got {other:?}"),
-    };
-    let committed = repair.resolve_duplicate(current, claimants[0].clone());
-    assert!(matches!(
-        committed,
-        LineageRepairMutationOutcome::Success(LineageRepairCommitted { stamp })
-            if stamp == server.current_stamp()
-    ));
-    assert!(matches!(
-        repair.inspect(),
-        LineageRepairInspectOutcome::Unavailable(LineageRepairUnavailable::ConfigurationReady)
-    ));
-}
-
-#[test]
-fn lineage_repair_rejects_backend_publication_outside_the_repair_boundary() {
-    let backend = Arc::new(RecordingAuthoringBackend {
-        widen_lineage_publication: true,
-        ..RecordingAuthoringBackend::default()
-    });
-    let server = Server::new_with_authoring_backend(
-        StoreInstanceId([9; 16]),
-        vec![target_with(7, &[(1, false)])],
-        backend,
-    )
-    .unwrap();
-    let claimants = vec![
-        LineageManifestClaimant {
-            root_name: "assets".to_owned(),
-            normalized_path: "a.bundle".to_owned(),
-            bundle: BundleUuid([1; 16]),
-            local_id: "manifest-a".to_owned(),
-            asset: AssetUuid([1; 16]),
-            file_hash: BundleFileHash([1; 32]),
-        },
-        LineageManifestClaimant {
-            root_name: "assets".to_owned(),
-            normalized_path: "b.bundle".to_owned(),
-            bundle: BundleUuid([2; 16]),
-            local_id: "manifest-b".to_owned(),
-            asset: AssetUuid([2; 16]),
-            file_hash: BundleFileHash([2; 32]),
-        },
-    ];
-    let error = ConfigurationError::from_reason(
-        &DscpV1::DuplicateLineageManifest {
-            entries: claimants.clone(),
-        },
-        "two lineage manifests",
-    );
-    server
-        .commit(Commit {
-            configuration: Some(ConfigurationStatus::Failed(error)),
-            lineage_repair: Some(Some(LineageRepairState::Duplicate {
-                claimants: claimants.clone(),
-            })),
-            ..Commit::default()
-        })
-        .unwrap();
-    let repair = match server.root().lineage_repair(PROTOCOL_VERSION) {
-        LineageRepairConnectOutcome::Connected(connected) => connected.repair,
-        other => panic!("expected repair connection, got {other:?}"),
-    };
-    let basis = match repair.inspect() {
-        LineageRepairInspectOutcome::Success(basis) => basis,
-        other => panic!("expected repair inspection, got {other:?}"),
-    };
-    let before = server.current_stamp();
-    assert!(matches!(
-        repair.resolve_duplicate(basis, claimants[0].clone()),
-        LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-            code: LineageRepairInvalidCode::WrongBasisState,
-            ..
-        })
-    ));
-    assert_eq!(server.current_stamp(), before);
-    assert!(matches!(
-        repair.inspect(),
-        LineageRepairInspectOutcome::Success(_)
-    ));
 }
 
 #[test]

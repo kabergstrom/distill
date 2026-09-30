@@ -165,13 +165,13 @@ pub enum BundleError {
         field: &'static str,
         found: String,
     },
-    /// Schema-closure violation (§6, §11): an entry schema or Migration
-    /// endpoint hash does not resolve in the bundle's own `schemas`.
+    /// Schema-closure violation (§6, §11): an entry schema hash does
+    /// not resolve in the bundle's own `schemas`.
     MissingSchema {
         local_id: String,
         schema_hash: LogicalHash,
     },
-    EntryLineage {
+    EntryRole {
         local_id: String,
         detail: &'static str,
     },
@@ -456,8 +456,8 @@ impl fmt::Display for BundleError {
                 f,
                 "asset {local_id:?}: schema_hash {schema_hash} does not resolve in this bundle's schemas (bundles are schema-closed)"
             ),
-            E::EntryLineage { local_id, detail } => {
-                write!(f, "asset {local_id:?} has invalid entry lineage: {detail}")
+            E::EntryRole { local_id, detail } => {
+                write!(f, "asset {local_id:?} has an invalid entry role: {detail}")
             }
             E::Shape {
                 local_id,

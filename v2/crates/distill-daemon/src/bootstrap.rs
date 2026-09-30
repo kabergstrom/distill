@@ -1,25 +1,15 @@
-//! Project bootstrap behind `distilld init`, `distilld import` and
-//! `distilld engine-args`, shared with the tests.
+//! Project bootstrap behind `distilld import` and `distilld engine-args`,
+//! shared with the tests.
 //!
-//! - [`init`] writes the control bundles an asset root needs before the
-//!   daemon can publish against its project schema: the schema-lineage
-//!   manifest (one accepted epoch per project type, at its current logical
-//!   hash) and the schema seed (one authoring-only entry per project type,
-//!   holding the type's zero value, which puts every logical schema in the
-//!   namespace).
 //! - [`import`] runs an authoring import through a running daemon's RPC hub.
 //! - [`engine_args`] prints what a game needs to connect to a target.
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use distill_build::keys::target_definition_hash;
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
-use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
-use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
+use distill_core::id::BundleUuid;
 use distill_json::AuthoredValue;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
@@ -29,22 +19,11 @@ use distill_schema::ProjectSchemaAuthority;
 use distill_store::state::InputVersion;
 
 use crate::config::DaemonConfig;
-use crate::coordinator::LineageDestination;
-
-/// The schema seed's file name. It sits beside the lineage manifest.
-pub const SCHEMA_SEED_FILE: &str = "project-schema-cache.bundle";
 
 #[derive(Debug)]
 pub enum BootstrapError {
     Io { path: PathBuf, source: std::io::Error },
     Schema(String),
-    Bundle(String),
-    /// A project type whose value cannot be empty (a required asset
-    /// reference, or a required recursive field).
-    NoZeroValue { type_uuid: TypeUuid, detail: String },
-    /// The manifest on disk has schema-transition history for this type,
-    /// which a regenerated single-epoch manifest would drop.
-    ManifestHistory(TypeUuid),
     Config(String),
     Rpc(String),
 }
@@ -57,13 +36,6 @@ impl std::fmt::Display for BootstrapError {
 
 impl std::error::Error for BootstrapError {}
 
-/// What [`init`] wrote; files whose bytes already matched are `unchanged`.
-#[derive(Debug, Default)]
-pub struct InitReport {
-    pub written: Vec<PathBuf>,
-    pub unchanged: Vec<PathBuf>,
-}
-
 /// The project schema authority for the schema file `config` names.
 pub fn load_authority(config: &DaemonConfig) -> Result<ProjectSchemaAuthority, BootstrapError> {
     let path = &config.assets.schema_path;
@@ -73,142 +45,6 @@ pub fn load_authority(config: &DaemonConfig) -> Result<ProjectSchemaAuthority, B
     })?;
     ProjectSchemaAuthority::from_json(&bytes)
         .map_err(|error| BootstrapError::Schema(format!("{}: {error}", path.display())))
-}
-
-/// Write the lineage manifest and schema seed for `config`'s schema. Only
-/// changed bytes are written: identical rewrites would still wake a running
-/// daemon's watcher.
-pub fn init(config: &DaemonConfig) -> Result<InitReport, BootstrapError> {
-    let authority = load_authority(config)?;
-    let destination = &config.assets.lineage_manifest;
-    let root = config.assets.roots.get(&destination.root).ok_or_else(|| {
-        BootstrapError::Config(format!("unknown lineage root {}", destination.root))
-    })?;
-    let manifest_path = root.join(&destination.path);
-    let seed_path = manifest_path.with_file_name(SCHEMA_SEED_FILE);
-    refuse_manifest_history(&manifest_path)?;
-    let manifest = lineage_manifest_bundle(&authority, destination)?;
-    let seed = schema_seed_bundle(&authority, destination)?;
-    let mut report = InitReport::default();
-    for (path, bundle) in [(manifest_path, manifest), (seed_path, seed)] {
-        let bytes = distill_bundle::write_bundle(&bundle)
-            .map_err(|error| BootstrapError::Bundle(format!("{}: {error:?}", path.display())))?;
-        if write_if_changed(&path, &bytes)? {
-            report.written.push(path);
-        } else {
-            report.unchanged.push(path);
-        }
-    }
-    Ok(report)
-}
-
-/// The schema-lineage manifest: every project type active at one epoch, its
-/// current logical hash.
-pub fn lineage_manifest_bundle(
-    authority: &ProjectSchemaAuthority,
-    destination: &LineageDestination,
-) -> Result<Bundle, BootstrapError> {
-    let row = BootstrapControlSpecV1::embedded()
-        .map_err(|error| BootstrapError::Schema(error.to_string()))?
-        .0
-        .into_iter()
-        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
-        .ok_or_else(|| BootstrapError::Schema("no lineage manifest control row".into()))?;
-    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema)
-        .map_err(|error| BootstrapError::Schema(error.to_string()))?;
-    let types = authority
-        .project_types()
-        .iter()
-        .map(|(type_uuid, project)| {
-            AuthoredValue::Array(vec![
-                bytes(&type_uuid.0),
-                AuthoredValue::Object(BTreeMap::from([
-                    (
-                        "authority".into(),
-                        AuthoredValue::Object(BTreeMap::from([(
-                            "Active".into(),
-                            AuthoredValue::Object(BTreeMap::new()),
-                        )])),
-                    ),
-                    ("current".into(), AuthoredValue::UInt(0)),
-                    (
-                        "epochs".into(),
-                        AuthoredValue::Array(vec![AuthoredValue::Object(BTreeMap::from([
-                            ("digest".into(), bytes(&project.logical_hash.0)),
-                            ("forward_parent".into(), AuthoredValue::Null),
-                        ]))]),
-                    ),
-                ])),
-            ])
-        })
-        .collect();
-    Ok(Bundle {
-        format_version: 1,
-        uuid: BundleUuid(derived_id("lineage manifest bundle", destination, &[])),
-        primary: None,
-        schemas: BTreeMap::from([(row.logical_hash, schema)]),
-        assets: BTreeMap::from([(
-            "manifest".into(),
-            AssetEntry {
-                uuid: AssetUuid(derived_id("lineage manifest", destination, &[])),
-                type_uuid: row.type_uuid,
-                schema_hash: row.logical_hash,
-                lineage: EntryLineageV1::Bootstrap {
-                    bundle_format_version: 1,
-                },
-                authoring_only: true,
-                data: AuthoredValue::Object(BTreeMap::from([(
-                    "types".into(),
-                    AuthoredValue::Array(types),
-                )])),
-            },
-        )]),
-    })
-}
-
-/// The schema seed: one authoring-only zero value per project type, stamped
-/// at the manifest's single epoch.
-pub fn schema_seed_bundle(
-    authority: &ProjectSchemaAuthority,
-    destination: &LineageDestination,
-) -> Result<Bundle, BootstrapError> {
-    let mut schemas = BTreeMap::new();
-    let mut entries = BTreeMap::new();
-    for (type_uuid, project) in authority.project_types() {
-        schemas.insert(project.logical_hash, project.logical_schema.clone());
-        let epochs = vec![AcceptedSchemaEpoch {
-            digest: project.logical_hash,
-            forward_parent: None,
-        }];
-        let data = zero_value(&project.logical_schema.root).map_err(|detail| {
-            BootstrapError::NoZeroValue {
-                type_uuid: *type_uuid,
-                detail,
-            }
-        })?;
-        entries.insert(
-            format!("schema-{}", hex(&type_uuid.0)),
-            AssetEntry {
-                uuid: AssetUuid(derived_id("schema seed", destination, &type_uuid.0)),
-                type_uuid: *type_uuid,
-                schema_hash: project.logical_hash,
-                lineage: EntryLineageV1::Manifest(LineageStamp {
-                    chain: lineage_chain_digest(*type_uuid, &epochs, 0),
-                    epochs,
-                    cursor: 0,
-                }),
-                authoring_only: true,
-                data,
-            },
-        );
-    }
-    Ok(Bundle {
-        format_version: 1,
-        uuid: BundleUuid(derived_id("schema seed bundle", destination, &[])),
-        primary: None,
-        schemas,
-        assets: entries,
-    })
 }
 
 /// The empty value of a logical schema: zero numbers, empty strings and
@@ -254,65 +90,6 @@ pub fn zero_value(node: &SchemaNode) -> Result<AuthoredValue, String> {
         }
         SchemaNode::BackRef(_) => return Err("a required recursive field".into()),
     })
-}
-
-/// A regenerated manifest has one epoch per type. Refuse to replace one that
-/// recorded schema transitions.
-fn refuse_manifest_history(path: &Path) -> Result<(), BootstrapError> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Ok(());
-    };
-    let Ok(bundle) = distill_bundle::parse_bundle(&bytes) else {
-        return Ok(());
-    };
-    for entry in bundle.assets.values() {
-        let AuthoredValue::Object(data) = &entry.data else {
-            continue;
-        };
-        let Some(AuthoredValue::Array(types)) = data.get("types") else {
-            continue;
-        };
-        for row in types {
-            let AuthoredValue::Array(pair) = row else {
-                continue;
-            };
-            let [uuid, AuthoredValue::Object(lineage)] = pair.as_slice() else {
-                continue;
-            };
-            if matches!(lineage.get("epochs"), Some(AuthoredValue::Array(epochs)) if epochs.len() > 1)
-            {
-                return Err(BootstrapError::ManifestHistory(TypeUuid(uuid_bytes(uuid))));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Write `bytes` to `path` through a sibling temporary file unless it
-/// already holds them. Returns whether it wrote.
-pub fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool, BootstrapError> {
-    if std::fs::read(path).ok().as_deref() == Some(bytes) {
-        return Ok(false);
-    }
-    let io = |source| BootstrapError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(io)?;
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let result = std::fs::File::create(&temp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&temp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result.map_err(io)?;
-    Ok(true)
 }
 
 /// The target a command addresses: the named one, else the only (or first)
@@ -462,46 +239,6 @@ async fn import_at(
     }
 }
 
-/// A stable identity for one bootstrap entry of one lineage destination, so
-/// rerunning `init` reproduces the same bytes.
-fn derived_id(label: &str, destination: &LineageDestination, salt: &[u8]) -> [u8; 16] {
-    let mut hasher = blake3::Hasher::new();
-    for part in [
-        b"distill bootstrap".as_slice(),
-        label.as_bytes(),
-        destination.root.as_bytes(),
-        destination.path.as_bytes(),
-        salt,
-    ] {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part);
-    }
-    let mut id = [0; 16];
-    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    id
-}
-
-fn bytes(bytes: &[u8]) -> AuthoredValue {
-    AuthoredValue::Array(
-        bytes
-            .iter()
-            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
-            .collect(),
-    )
-}
-
-fn uuid_bytes(value: &AuthoredValue) -> [u8; 16] {
-    let mut out = [0; 16];
-    if let AuthoredValue::Array(items) = value {
-        for (slot, item) in out.iter_mut().zip(items) {
-            if let AuthoredValue::UInt(byte) = item {
-                *slot = *byte as u8;
-            }
-        }
-    }
-    out
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -509,6 +246,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use distill_core::id::TypeUuid;
 
     #[test]
     fn zero_values_conform_to_their_schema() {

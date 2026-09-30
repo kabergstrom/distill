@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
+use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
-use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
-use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination};
+use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::scanner::{AssetRoot, ScanDiagnostic};
 use distill_daemon::watcher::WatcherBatch;
 use distill_json::AuthoredValue;
@@ -21,7 +19,7 @@ use distill_schema::ngp_schema::{
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, NamespaceErrorV1};
 use distill_store::served::ResolutionRow;
-use distill_store::{Store, StoreConfig, StoreError, StoreReader};
+use distill_store::{Store, StoreConfig, StoreReader};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
     ordinary_bundle_with(73, 72, 7)
@@ -37,21 +35,12 @@ fn ordinary_bundle_with(
         root: SchemaNode::Primitive(PrimitiveKind::U8),
     };
     let schema_hash = node_hash(&schema.root).unwrap();
-    let epochs = vec![AcceptedSchemaEpoch {
-        digest: schema_hash,
-        forward_parent: None,
-    }];
     let asset = AssetUuid([asset_byte; 16]);
     let bundle = BundleUuid([bundle_byte; 16]);
     let entry = AssetEntry {
         uuid: asset,
         type_uuid,
         schema_hash,
-        lineage: EntryLineageV1::Manifest(LineageStamp {
-            chain: lineage_chain_digest(type_uuid, &epochs, 0),
-            epochs,
-            cursor: 0,
-        }),
         authoring_only: false,
         data: AuthoredValue::UInt(value.into()),
     };
@@ -69,70 +58,6 @@ fn ordinary_bundle_with(
     )
 }
 
-fn bytes(value: &[u8]) -> AuthoredValue {
-    AuthoredValue::Array(
-        value
-            .iter()
-            .map(|byte| AuthoredValue::UInt((*byte).into()))
-            .collect(),
-    )
-}
-
-fn lineage_manifest_bundle(
-    type_uuid: TypeUuid,
-    schema_hash: distill_core::id::LogicalHash,
-) -> Vec<u8> {
-    let row = BootstrapControlSpecV1::embedded()
-        .unwrap()
-        .0
-        .into_iter()
-        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
-        .unwrap();
-    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
-    let data = AuthoredValue::Object(BTreeMap::from([(
-        "types".to_owned(),
-        AuthoredValue::Array(vec![AuthoredValue::Array(vec![
-            bytes(&type_uuid.0),
-            AuthoredValue::Object(BTreeMap::from([
-                (
-                    "authority".to_owned(),
-                    AuthoredValue::Object(BTreeMap::from([(
-                        "Active".to_owned(),
-                        AuthoredValue::Object(BTreeMap::new()),
-                    )])),
-                ),
-                ("current".to_owned(), AuthoredValue::UInt(0)),
-                (
-                    "epochs".to_owned(),
-                    AuthoredValue::Array(vec![AuthoredValue::Object(BTreeMap::from([
-                        ("digest".to_owned(), bytes(&schema_hash.0)),
-                        ("forward_parent".to_owned(), AuthoredValue::Null),
-                    ]))]),
-                ),
-            ])),
-        ])]),
-    )]));
-    distill_bundle::write_bundle(&Bundle {
-        format_version: 1,
-        uuid: BundleUuid([93; 16]),
-        primary: None,
-        schemas: BTreeMap::from([(row.logical_hash, schema)]),
-        assets: BTreeMap::from([(
-            "manifest".to_owned(),
-            AssetEntry {
-                uuid: AssetUuid([94; 16]),
-                type_uuid: row.type_uuid,
-                schema_hash: row.logical_hash,
-                lineage: EntryLineageV1::Bootstrap {
-                    bundle_format_version: 1,
-                },
-                authoring_only: true,
-                data,
-            },
-        )]),
-    })
-    .unwrap()
-}
 
 fn add_unknown_envelope_key(bytes: &[u8]) -> Vec<u8> {
     let mut value = distill_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
@@ -153,16 +78,6 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     std::fs::create_dir_all(temp.path().join("assets")).unwrap();
     std::fs::write(&first_path, first_bytes).unwrap();
     std::fs::write(&second_path, second_bytes).unwrap();
-    let schema_hash = distill_bundle::parse_bundle(&std::fs::read(&first_path).unwrap())
-        .unwrap()
-        .assets["entry"]
-        .schema_hash;
-    std::fs::create_dir_all(temp.path().join("assets/schema")).unwrap();
-    std::fs::write(
-        temp.path().join("assets/schema/schema-lineage.bundle"),
-        lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash),
-    )
-    .unwrap();
     let coordinator = coordinator(&temp);
     let startup = coordinator.reconcile_full_scan().unwrap();
 
@@ -207,13 +122,8 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
     std::fs::create_dir_all(assets.join("schema")).unwrap();
     let (ordinary, _, ordinary_asset) = ordinary_bundle();
     std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
-    let schema_hash =
-        distill_bundle::parse_bundle(&std::fs::read(assets.join("ordinary.bundle")).unwrap())
-            .unwrap()
-            .assets["entry"]
-            .schema_hash;
-    let manifest = lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash);
-    let manifest_path = assets.join("schema/schema-lineage.bundle");
+    let (manifest, _, _) = ordinary_bundle_with(93, 94, 5);
+    let manifest_path = assets.join("schema/sample.bundle");
     std::fs::write(&manifest_path, &manifest).unwrap();
     let coordinator = coordinator(&temp);
     coordinator.reconcile_full_scan().unwrap();
@@ -229,11 +139,16 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
     {
         let store = coordinator.store();
         let store = store.read();
-        assert!(store.namespace_errors().unwrap().is_empty());
+        let errors = store.namespace_errors().unwrap();
+        assert_eq!(errors.len(), 1);
         assert!(matches!(
-            store.entry(AssetUuid([94; 16])).unwrap_err(),
-            StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([93; 16])
+            &errors[0].detail,
+            NamespaceErrorV1::IncompleteSkeleton { source, .. }
+                if source.normalized_path == "schema/sample.bundle"
         ));
+        // No project authority knows its type, so the bundle drops out of
+        // the namespace instead of being indexed as a poisoned skeleton.
+        assert!(store.entry(AssetUuid([94; 16])).unwrap().is_none());
         assert!(store.entry(ordinary_asset).unwrap().is_some());
     }
 
@@ -262,7 +177,7 @@ fn bundle_sharing(bundle_byte: u8, own_byte: u8, shared: AssetUuid) -> Vec<u8> {
     distill_bundle::write_bundle(&bundle).unwrap()
 }
 
-/// Two roots' worth of fixture: the lineage manifest, `first.bundle`
+/// Two roots' worth of fixture: `first.bundle`
 /// (bundle 31, asset 32 + the shared 40) and optionally `second.bundle`
 /// (bundle 33, asset 34 + the shared 40).
 fn collision_fixture(temp: &tempfile::TempDir, second: bool) -> DaemonCoordinator {
@@ -270,16 +185,10 @@ fn collision_fixture(temp: &tempfile::TempDir, second: bool) -> DaemonCoordinato
     std::fs::create_dir_all(assets.join("schema")).unwrap();
     let shared = AssetUuid([40; 16]);
     let first = bundle_sharing(31, 32, shared);
-    let schema_hash = distill_bundle::parse_bundle(&first).unwrap().assets["entry"].schema_hash;
     std::fs::write(assets.join("first.bundle"), first).unwrap();
     if second {
         std::fs::write(assets.join("second.bundle"), bundle_sharing(33, 34, shared)).unwrap();
     }
-    std::fs::write(
-        assets.join("schema/schema-lineage.bundle"),
-        lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash),
-    )
-    .unwrap();
     coordinator(temp)
 }
 
@@ -373,10 +282,6 @@ fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {
             &assets,
             assets.join(".distill-displaced"),
         )],
-        LineageDestination {
-            root: "main".to_owned(),
-            path: "schema/schema-lineage.bundle".to_owned(),
-        },
         vec![target()],
         64,
     )
@@ -411,7 +316,7 @@ fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
 }
 
 #[test]
-fn full_scan_publishes_one_store_and_rpc_version_with_missing_lineage_repair_basis() {
+fn full_scan_publishes_one_store_and_rpc_version() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle, asset) = ordinary_bundle();
     let coordinator = coordinator(&temp);
@@ -427,8 +332,7 @@ fn full_scan_publishes_one_store_and_rpc_version_with_missing_lineage_repair_bas
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
     assert!(matches!(
         store.configuration_state().unwrap(),
-        ConfigurationState::Failed { reason, .. }
-            if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
+        ConfigurationState::Ready(_)
     ));
     drop(store);
 
@@ -762,15 +666,6 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     let (ordinary, _, ordinary_asset) = ordinary_bundle();
     let ordinary_path = assets.join("ordinary.bundle");
     std::fs::write(&ordinary_path, ordinary).unwrap();
-    let schema_hash = distill_bundle::parse_bundle(&std::fs::read(&ordinary_path).unwrap())
-        .unwrap()
-        .assets["entry"]
-        .schema_hash;
-    std::fs::write(
-        assets.join("schema/schema-lineage.bundle"),
-        lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash),
-    )
-    .unwrap();
     let coordinator = Arc::new(coordinator(&temp));
     coordinator.attach_build_backend();
     let alias = assets.join("daemon-state-alias");

@@ -1,6 +1,6 @@
 //! Stable failure fingerprints (§§8–10) and the closed vocabulary they carry.
 
-use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 
 use crate::query::{AssetQuery, FileQuery};
 
@@ -94,10 +94,6 @@ pub enum CapabilityKey {
 /// query cannot opt authoring-only control entries into its result set.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ControlQuery {
-    MigrationEdges {
-        type_uuid: TypeUuid,
-        from_hash: LogicalHash,
-    },
     /// Enumerate all directory-import-rule controls at the pinned basis.
     DirectoryImportRuleSet,
 }
@@ -105,14 +101,12 @@ pub enum ControlQuery {
 /// The exact non-artifact control value a coordinator read attempted.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ControlSubject {
-    Migration(AssetUuid),
     PackDefinition(AssetUuid),
     DirectoryImportRules(AssetUuid),
     ImportSettings {
         bundle: BundleUuid,
         local_id: String,
     },
-    SchemaLineageManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

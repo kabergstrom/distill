@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
 
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
+use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
-use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
 use distill_daemon::scanner::{
     AssetRoot, RootedScanner, ScanDiagnostic, ScanError, ScannedFileKind,
 };
 use distill_json::AuthoredValue;
-use distill_rpc::{LineageRepairDestination, OccupiedLineageDestinationKind};
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
 use distill_store::state::{PlatformPathBytes, ScanSubject};
 
@@ -17,19 +15,10 @@ fn ordinary_bundle() -> Vec<u8> {
         root: SchemaNode::Primitive(PrimitiveKind::U8),
     };
     let schema_hash = node_hash(&schema.root).unwrap();
-    let epochs = vec![AcceptedSchemaEpoch {
-        digest: schema_hash,
-        forward_parent: None,
-    }];
     let entry = AssetEntry {
         uuid: AssetUuid([72; 16]),
         type_uuid,
         schema_hash,
-        lineage: EntryLineageV1::Manifest(LineageStamp {
-            chain: lineage_chain_digest(type_uuid, &epochs, 0),
-            epochs,
-            cursor: 0,
-        }),
         authoring_only: false,
         data: AuthoredValue::UInt(7),
     };
@@ -155,43 +144,6 @@ fn incremental_directory_create_enumerates_only_that_subtree() {
             .collect::<Vec<_>>(),
         ["new", "new/nested", "new/nested/source.txt", "stable.txt"]
     );
-}
-
-#[test]
-fn destination_basis_distinguishes_absent_opaque_and_exact_canonical_bundle() {
-    let temp = tempfile::tempdir().unwrap();
-    let scanner = scanner(&temp);
-    assert_eq!(
-        scanner
-            .inspect_destination("main", "control/lineage.bundle")
-            .unwrap(),
-        LineageRepairDestination::Absent
-    );
-
-    let control = temp.path().join("assets/control");
-    std::fs::create_dir_all(&control).unwrap();
-    let destination = control.join("lineage.bundle");
-    std::fs::write(&destination, b"not a bundle").unwrap();
-    assert!(matches!(
-        scanner
-            .inspect_destination("main", "control/lineage.bundle")
-            .unwrap(),
-        LineageRepairDestination::Occupied {
-            kind: OccupiedLineageDestinationKind::Opaque,
-            ..
-        }
-    ));
-
-    std::fs::write(&destination, ordinary_bundle()).unwrap();
-    assert!(matches!(
-        scanner
-            .inspect_destination("main", "control/lineage.bundle")
-            .unwrap(),
-        LineageRepairDestination::Occupied {
-            kind: OccupiedLineageDestinationKind::CanonicalBundle,
-            ..
-        }
-    ));
 }
 
 #[test]

@@ -10,10 +10,7 @@ use distill_core::tool::ToolCwdPolicy;
 use distill_store::bundles::{AssetRecord, BundleMeta};
 use distill_store::cas::record::KeyKind;
 use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
-use distill_store::pipeline::{
-    AcceptedSchemaEpoch, AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState,
-    ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
-};
+use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
     CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
@@ -154,26 +151,6 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 served: None,
                 tags: std::collections::BTreeMap::from([("t".into(), None)]),
             })?;
-            txn.project_verified_lineage_manifest(
-                &VerifiedSchemaLineageManifest::from_verified_source(
-                    ContentHash([10u8; 32]),
-                    SchemaLineageManifest {
-                        types: [(
-                            TypeUuid([3u8; 16]),
-                            AcceptedTypeLineage {
-                                epochs: vec![AcceptedSchemaEpoch {
-                                    digest: LogicalHash([5u8; 32]),
-                                    forward_parent: None,
-                                }],
-                                current: 0,
-                                authority: TypeAuthorityState::Active,
-                            },
-                        )]
-                        .into_iter()
-                        .collect(),
-                    },
-                ),
-            )?;
             txn.register_tool(
                 "tool",
                 ToolRegistrationV2 {
@@ -205,7 +182,6 @@ fn multi_table_input_transactions_are_all_or_nothing() {
     assert_eq!(store.input_version().0, 0);
     assert!(store.entry(AssetUuid([2u8; 16])).unwrap().is_none());
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
-    assert!(store.lineage(TypeUuid([3u8; 16])).unwrap().is_empty());
     assert!(store.tool("tool").unwrap().is_none());
     assert!(store.pipeline_state().unwrap().is_none());
     assert_eq!(
@@ -317,12 +293,6 @@ fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     store
         .input_transaction(|txn| {
-            txn.project_verified_lineage_manifest(
-                &VerifiedSchemaLineageManifest::from_verified_source(
-                    ContentHash([11u8; 32]),
-                    SchemaLineageManifest::default(),
-                ),
-            )?;
             txn.publish_pipeline_epoch(&validated_epoch([1u8; 32], None))?;
             txn.set_namespace_errors([namespace_error("identity collision")])?;
             Ok(())

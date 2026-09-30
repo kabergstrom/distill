@@ -5,13 +5,6 @@
 use std::fmt;
 use std::path::PathBuf;
 
-/// The concrete publication that attempted to use retired schema authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RetiredTypeReference {
-    Asset(distill_core::id::AssetUuid),
-    MigrationEndpoint(distill_core::id::AssetUuid),
-}
-
 #[derive(Debug)]
 pub enum StoreError {
     /// An underlying SQLite error.
@@ -37,8 +30,8 @@ pub enum StoreError {
     InvalidBootstrapSpec(distill_core::bootstrap::BootstrapSpecError),
     /// A store-side epoch has invalid identity or registration metadata.
     InvalidPipelineEpoch { detail: &'static str },
-    /// A candidate omitted or changed one of the five format-owned logical
-    /// control rows before active lineage equality was evaluated.
+    /// A candidate omitted or changed one of the format-owned logical
+    /// control rows.
     InvalidBootstrapRegistry {
         type_uuid: distill_core::id::TypeUuid,
         expected: distill_core::id::LogicalHash,
@@ -69,57 +62,11 @@ pub enum StoreError {
     /// A runtime/query/pack surface attempted to select an authoring-only
     /// control entry. Tooling metadata inspection uses a separate API.
     RoleIneligible { asset: distill_core::id::AssetUuid },
-    /// An explicit schema accept/rollback command named a lineage
-    /// projection epoch that is no longer current (or expected one before
-    /// the authoritative manifest had been projected).
-    StaleSchemaManifestBase {
-        expected: Box<crate::state::SchemaManifestBasis>,
-        actual: Option<Box<crate::state::SchemaManifestBasis>>,
-    },
-    /// An explicit schema command attempted to consume a different staged
-    /// candidate from the one that published `SchemaAcceptanceRequired`.
-    StaleSchemaCandidate {
-        expected: Box<crate::state::PipelineCandidateIdentity>,
-        actual: Box<crate::state::PipelineCandidateIdentity>,
-    },
-    /// The command's requested cursor is not the digest compiled into the
-    /// named candidate registry row (or that row is absent).
-    SchemaCandidateCursorMismatch {
-        type_uuid: distill_core::id::TypeUuid,
-        requested: distill_core::id::LogicalHash,
-        candidate: Option<distill_core::id::LogicalHash>,
-    },
-    /// Retirement requires the pending candidate to omit the type entirely.
-    SchemaCandidateRetirementMismatch {
-        type_uuid: distill_core::id::TypeUuid,
-        candidate: Option<distill_core::id::LogicalHash>,
-    },
-    /// Reactivation requires the pending candidate to include the type.
-    SchemaCandidateReactivationMismatch {
-        type_uuid: distill_core::id::TypeUuid,
-    },
-    /// Retirement cannot strand authored entries or migration endpoints.
-    SchemaRetirementBlocked {
-        type_uuid: distill_core::id::TypeUuid,
-        live_assets: u64,
-        live_migration_endpoints: usize,
-    },
     /// An authority command was derived from control reads of a different
     /// committed store snapshot than the transaction it attempted to mutate.
     StaleControlSnapshotBasis {
         provided: crate::state::SnapshotStamp,
         current: crate::state::SnapshotStamp,
-    },
-    /// A scanner/importer/CRUD publication attempted to reintroduce a type
-    /// whose retained lineage authority is explicitly retired.
-    RetiredTypeReferenced {
-        type_uuid: distill_core::id::TypeUuid,
-        reference: RetiredTypeReference,
-    },
-    /// An explicit authority command named a row in an ineligible state.
-    InvalidAuthorityTransition {
-        type_uuid: distill_core::id::TypeUuid,
-        detail: String,
     },
     /// Target-set rows/digest were forged or non-canonical. The store
     /// validates exact canonical rows at every publication and schema command.
@@ -135,35 +82,8 @@ pub enum StoreError {
         path: PathBuf,
         detail: &'static str,
     },
-    /// Once initialized, authoritative lineage changes may only occur
-    /// through candidate-bound accept or rollback APIs.
-    LineageMutationRequiresCandidate,
-    /// General manifest projection refused a cursor-only move to an existing
-    /// accepted epoch. It is a rollback (§11, §13), so it must use the
-    /// explicit reverse-coverage validation path instead.
-    LineageRollback {
-        type_uuid: distill_core::id::TypeUuid,
-        candidate: distill_core::id::LogicalHash,
-        current: distill_core::id::LogicalHash,
-    },
-    /// The unique source-controlled lineage manifest is absent, so the
-    /// disposable projection has no authority. Observed bundle stamps may
-    /// diagnose this state but can never rebuild it.
-    LineageManifestUnavailable,
-    /// The source-controlled manifest or its disposable projection violates
-    /// the accepted-history/current-cursor invariants.
-    InvalidLineageManifest {
-        type_uuid: Option<distill_core::id::TypeUuid>,
-        detail: String,
-    },
-    /// An explicit rollback lacked one unambiguous, total custom migration
-    /// path from a required live source schema to the requested cursor.
-    IncompleteRollbackCoverage {
-        type_uuid: distill_core::id::TypeUuid,
-        target: distill_core::id::LogicalHash,
-        source: distill_core::id::LogicalHash,
-        detail: String,
-    },
+    /// A persisted pipeline-state row is malformed or inconsistent.
+    InvalidPipelineState { detail: String },
     /// A configuration transition was structurally invalid.
     InvalidConfiguration { error: String },
     /// A codegen filesystem publication was prepared from a different set of
@@ -290,76 +210,10 @@ impl fmt::Display for StoreError {
                 f,
                 "asset {asset} is authoring-only and ineligible for runtime selection"
             ),
-            StoreError::StaleSchemaManifestBase { expected, actual } => match actual {
-                Some(actual) => write!(
-                    f,
-                    "schema command manifest base {} is stale; current source manifest is {}",
-                    expected.manifest_hash, actual.manifest_hash
-                ),
-                None => write!(
-                    f,
-                    "schema command manifest base {} is stale; no authoritative manifest is projected",
-                    expected.manifest_hash
-                ),
-            },
-            StoreError::StaleSchemaCandidate { expected, actual } => write!(
-                f,
-                "schema command names stale candidate dylib {:02x?}; pending candidate is {:02x?}",
-                actual.dylib_hash, expected.dylib_hash
-            ),
-            StoreError::SchemaCandidateCursorMismatch {
-                type_uuid,
-                requested,
-                candidate,
-            } => match candidate {
-                Some(candidate) => write!(
-                    f,
-                    "schema command requests cursor {requested} for {type_uuid}, but candidate compiled {candidate}"
-                ),
-                None => write!(
-                    f,
-                    "schema command requests cursor {requested} for {type_uuid}, but candidate has no such registry row"
-                ),
-            },
-            StoreError::SchemaCandidateRetirementMismatch {
-                type_uuid,
-                candidate,
-            } => write!(
-                f,
-                "schema retirement for {type_uuid} requires candidate omission, got {candidate:?}"
-            ),
-            StoreError::SchemaCandidateReactivationMismatch { type_uuid } => write!(
-                f,
-                "schema reactivation for {type_uuid} requires the pending candidate to include it"
-            ),
-            StoreError::SchemaRetirementBlocked {
-                type_uuid,
-                live_assets,
-                live_migration_endpoints,
-            } => write!(
-                f,
-                "schema retirement for {type_uuid} is blocked by {live_assets} live authored entries and {live_migration_endpoints} live migration endpoints"
-            ),
             StoreError::StaleControlSnapshotBasis { provided, current } => write!(
                 f,
                 "schema authority command control basis {provided:?} is stale; current transaction basis is {current:?}"
             ),
-            StoreError::RetiredTypeReferenced {
-                type_uuid,
-                reference,
-            } => match reference {
-                RetiredTypeReference::Asset(asset) => write!(
-                    f,
-                    "asset {asset} references retired schema authority {type_uuid}; explicit reactivation is required"
-                ),
-                RetiredTypeReference::MigrationEndpoint(asset) => write!(
-                    f,
-                    "Migration asset {asset} references retired schema authority {type_uuid}; explicit reactivation is required"
-                ),
-            },
-            StoreError::InvalidAuthorityTransition { type_uuid, detail } => {
-                write!(f, "schema authority transition for {type_uuid} is invalid: {detail}")
-            }
             StoreError::InvalidTargetSet(error) => {
                 write!(f, "candidate target rows are invalid: {error}")
             }
@@ -374,38 +228,9 @@ impl fmt::Display for StoreError {
                 "tool {key:?} is unavailable at {}: {detail}",
                 path.display()
             ),
-            StoreError::LineageMutationRequiresCandidate => write!(
-                f,
-                "an initialized schema-lineage projection may change only through a stale-base-checked candidate accept or rollback"
-            ),
-            StoreError::LineageRollback {
-                type_uuid,
-                candidate,
-                current,
-            } => write!(
-                f,
-                "schema lineage for {type_uuid}: candidate current {candidate} differs from \
-                 current {current} without an appended epoch — explicit rollback validation is required"
-            ),
-            StoreError::LineageManifestUnavailable => write!(
-                f,
-                "schema lineage manifest is unavailable; bundle stamps cannot establish authority"
-            ),
-            StoreError::InvalidLineageManifest { type_uuid, detail } => match type_uuid {
-                Some(type_uuid) => {
-                    write!(f, "schema lineage manifest for {type_uuid} is invalid: {detail}")
-                }
-                None => write!(f, "schema lineage manifest is invalid: {detail}"),
-            },
-            StoreError::IncompleteRollbackCoverage {
-                type_uuid,
-                target,
-                source,
-                detail,
-            } => write!(
-                f,
-                "schema rollback for {type_uuid} to {target} lacks complete reverse coverage from {source}: {detail}"
-            ),
+            StoreError::InvalidPipelineState { detail } => {
+                write!(f, "persisted pipeline state is invalid: {detail}")
+            }
             StoreError::InvalidConfiguration { error } => {
                 write!(f, "invalid configuration transition: {error}")
             }

@@ -1,11 +1,8 @@
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash};
+use distill_core::id::ContentHash;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
@@ -33,7 +30,6 @@ state_path = "{}"
 [assets]
 roots = {{ main = "{}" }}
 schema_path = "{}"
-lineage_manifest = {{ root = "main", path = "schema/lineage.bundle" }}
 [modules]
 pipeline_dylib = "{}"
 [targets.dev]
@@ -88,42 +84,6 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
         }],
     };
     std::fs::write(path, serde_json::to_vec(&schema).unwrap()).unwrap();
-}
-
-fn write_empty_lineage_manifest(temp: &tempfile::TempDir) {
-    let row = BootstrapControlSpecV1::embedded()
-        .unwrap()
-        .0
-        .into_iter()
-        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
-        .unwrap();
-    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
-    let bytes = distill_bundle::write_bundle(&Bundle {
-        format_version: 1,
-        uuid: BundleUuid([93; 16]),
-        primary: None,
-        schemas: BTreeMap::from([(row.logical_hash, schema)]),
-        assets: BTreeMap::from([(
-            "manifest".to_owned(),
-            AssetEntry {
-                uuid: AssetUuid([94; 16]),
-                type_uuid: row.type_uuid,
-                schema_hash: row.logical_hash,
-                lineage: EntryLineageV1::Bootstrap {
-                    bundle_format_version: 1,
-                },
-                authoring_only: true,
-                data: distill_json::AuthoredValue::Object(BTreeMap::from([(
-                    "types".to_owned(),
-                    distill_json::AuthoredValue::Array(Vec::new()),
-                )])),
-            },
-        )]),
-    })
-    .unwrap();
-    let path = temp.path().join("assets/schema/lineage.bundle");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, bytes).unwrap();
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
@@ -402,19 +362,14 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
                 .read()
                 .configuration_state()
                 .unwrap();
-            version > failed
-                && matches!(
-                    state,
-                    ConfigurationState::Failed { reason, .. }
-                        if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
-                )
+            version > failed && matches!(state, ConfigurationState::Ready(_))
         },
         "valid configuration did not clear its malformed-source error",
     );
 }
 
 #[test]
-fn valid_configuration_with_malformed_schema_retains_lineage_configuration_error() {
+fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     let config_path = temp.path().join("distill.toml");
@@ -443,15 +398,14 @@ fn valid_configuration_with_malformed_schema_retains_lineage_configuration_error
             let store = store.read();
             matches!(
                 store.configuration_state().unwrap(),
-                ConfigurationState::Failed { reason, .. }
-                    if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
+                ConfigurationState::Ready(_)
             ) && matches!(
                 store.pipeline_state().unwrap(),
                 Some(PipelineState::Failed { error, .. })
                     if error.message.contains("schema authority")
             )
         },
-        "valid configuration erased independent lineage configuration error",
+        "valid configuration with a malformed schema did not fail only the pipeline",
     );
     assert!(
         process.last_background_error().is_none(),
@@ -494,7 +448,6 @@ fn simultaneous_configuration_defects_choose_canonical_authority() {
 fn schema_bound_target_mismatches_publish_configuration_error() {
     let temp = tempfile::tempdir().unwrap();
     let config = config(&temp);
-    write_empty_lineage_manifest(&temp);
     let process = DaemonProcess::start(config).unwrap();
     let source = config_source(&temp).replace("os = \"macos\"", "os = \"linux\"");
     std::fs::write(temp.path().join("distill.toml"), source).unwrap();

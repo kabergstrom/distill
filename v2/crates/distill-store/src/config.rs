@@ -78,7 +78,6 @@ pub fn change_class(key: &str) -> Option<ChangeClass> {
     Some(match key {
         "assets.roots"
         | "assets.schema_path"
-        | "assets.lineage_manifest"
         | "targets"
         | "modules.pipeline_dylib"
         | "tools" => ChangeClass::InputVersionedEpoch,

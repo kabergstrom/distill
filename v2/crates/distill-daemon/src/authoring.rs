@@ -13,15 +13,14 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
+use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
 use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{BundleUuid, ContentHash};
 use distill_rpc::{
     decode_authoring_payload, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
-    Commit, ImportJob, ImportRequest, InputVersion, LineageManifestClaimant, LineageRepairBackendError,
-    LineageRepairInspection, LongRunningOp, PreparedImportCommit, PreparedOperationCommit,
-    RpcFailure,
+    Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
+    PreparedOperationCommit, RpcFailure,
 };
 use distill_store::journal::{
     CreationRecoveryOutcome, DeletionRecoveryOutcome, JournalIntentPlan, PublicationGroupKind,
@@ -30,12 +29,9 @@ use distill_store::journal::{
 use distill_store::StoreReader;
 
 use crate::store_cell::{AuthorityStore, WriteGuard};
-use crate::coordinator::{publish_incremental_paths, LineageDestination};
+use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
-use crate::lineage_repair::{
-    plan_same_dir_temp, unique_sibling, write_planned_temp, LineageRepairBackend,
-    LineageRepairBackendInitError,
-};
+use crate::atomic::{plan_same_dir_temp, unique_sibling, write_planned_temp};
 use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::{
     material_recovery_diagnostic, QuarantineDriver, QuarantineError, QuarantineRoot,
@@ -60,8 +56,6 @@ pub struct AuthoringService {
 struct AuthoringFilesystem {
     roots: Vec<AssetRoot>,
     quarantine: QuarantineDriver,
-    lineage_destination: LineageDestination,
-    lineage: LineageRepairBackend,
 }
 
 /// Registered importers: the daemon's own, and the loaded pipeline's.
@@ -80,10 +74,6 @@ impl AuthoringFilesystemCandidate {
     pub(crate) fn scanner(&self) -> &RootedScanner {
         &self.scanner
     }
-
-    pub(crate) fn lineage_destination(&self) -> &LineageDestination {
-        &self.filesystem.lineage_destination
-    }
 }
 
 impl AuthoringService {
@@ -91,7 +81,6 @@ impl AuthoringService {
         store: Arc<AuthorityStore>,
         roots: Vec<AssetRoot>,
         scanner: RootedScanner,
-        lineage_destination: LineageDestination,
     ) -> Result<Self, AuthoringServiceInitError> {
         let quarantine = QuarantineDriver::new(
             roots
@@ -113,15 +102,12 @@ impl AuthoringService {
             let recovered = quarantine.reconcile_non_codegen(&mut store)?;
             material_recovery_diagnostic(&recovered)
         };
-        let lineage = LineageRepairBackend::new(Arc::clone(&store), roots.clone())?;
         Ok(Self {
             store,
             scanner,
             filesystem: ArcSwap::from_pointee(AuthoringFilesystem {
                 roots,
                 quarantine,
-                lineage_destination,
-                lineage,
             }),
             importers: ArcSwap::from_pointee(Importers::default()),
             pipeline_projection: ArcSwap::from_pointee(PipelineProjection::default()),
@@ -169,7 +155,6 @@ impl AuthoringService {
     pub(crate) fn prepare_filesystem_candidate(
         &self,
         roots: Vec<AssetRoot>,
-        lineage_destination: LineageDestination,
     ) -> Result<AuthoringFilesystemCandidate, AuthoringServiceInitError> {
         let scanner = self.scanner.candidate_with_roots(roots.clone())?;
         let quarantine = QuarantineDriver::new(
@@ -187,14 +172,11 @@ impl AuthoringService {
                 &root.quarantine_dir,
             )?;
         }
-        let lineage = LineageRepairBackend::new(Arc::clone(&self.store), roots.clone())?;
         Ok(AuthoringFilesystemCandidate {
             scanner,
             filesystem: AuthoringFilesystem {
                 roots,
                 quarantine,
-                lineage_destination,
-                lineage,
             },
         })
     }
@@ -210,10 +192,6 @@ impl AuthoringService {
 
     pub(crate) fn quarantine_snapshot(&self) -> QuarantineDriver {
         self.filesystem.load().quarantine.clone()
-    }
-
-    pub(crate) fn lineage_destination_snapshot(&self) -> LineageDestination {
-        self.filesystem.load().lineage_destination.clone()
     }
 
     pub(crate) fn importers(&self) -> Arc<Importers> {
@@ -373,7 +351,6 @@ impl AuthoringService {
         publish_incremental_paths(
             &self.scanner,
             std::slice::from_ref(&target),
-            &self.lineage_destination_snapshot(),
             &self.store,
             base,
             &self.pipeline_projection(),
@@ -574,26 +551,6 @@ impl AuthoringService {
             .map_err(invalid)?;
         let data = decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value)
             .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
-        let lineage = match bundle.assets.get(&entry.local_id) {
-            Some(existing)
-                if existing.uuid == entry.uuid
-                    && existing.type_uuid == entry.type_uuid
-                    && existing.schema_hash == entry.schema_hash =>
-            {
-                existing.lineage.clone()
-            }
-            _ => EntryLineageV1::Manifest(
-                store
-                    .current_lineage_stamp(entry.type_uuid)
-                    .map_err(invalid)?
-                    .filter(|stamp| stamp.selected_digest() == Some(entry.schema_hash))
-                    .ok_or_else(|| {
-                        invalid(
-                            "authored schema is not the accepted current lineage cursor for its type",
-                        )
-                    })?,
-            ),
-        };
         bundle.schemas.insert(entry.schema_hash, schema);
         bundle.assets.insert(
             entry.local_id.clone(),
@@ -601,7 +558,6 @@ impl AuthoringService {
                 uuid: entry.uuid,
                 type_uuid: entry.type_uuid,
                 schema_hash: entry.schema_hash,
-                lineage,
                 authoring_only: entry.role == AuthoringEntryRole::AuthoringOnly,
                 data,
             },
@@ -665,27 +621,6 @@ impl AuthoringBackend for AuthoringService {
         self.prepare_long_operation(base, operation)
     }
 
-    fn prepare_create_missing_lineage(
-        &self,
-        basis: &LineageRepairInspection,
-        canonical_manifest_bundle: &[u8],
-    ) -> Result<Commit, LineageRepairBackendError> {
-        self.filesystem
-            .load()
-            .lineage
-            .prepare_create_missing_lineage(basis, canonical_manifest_bundle)
-    }
-
-    fn prepare_resolve_duplicate_lineage(
-        &self,
-        basis: &LineageRepairInspection,
-        survivor: &LineageManifestClaimant,
-    ) -> Result<Commit, LineageRepairBackendError> {
-        self.filesystem
-            .load()
-            .lineage
-            .prepare_resolve_duplicate_lineage(basis, survivor)
-    }
 }
 
 struct PlannedBundleMutation {
@@ -775,7 +710,6 @@ pub(crate) fn invalid(error: impl std::fmt::Display) -> RpcFailure {
 pub enum AuthoringServiceInitError {
     Scan(ScanError),
     Quarantine(QuarantineError),
-    Lineage(LineageRepairBackendInitError),
 }
 
 impl std::fmt::Display for AuthoringServiceInitError {
@@ -795,11 +729,5 @@ impl From<ScanError> for AuthoringServiceInitError {
 impl From<QuarantineError> for AuthoringServiceInitError {
     fn from(error: QuarantineError) -> Self {
         Self::Quarantine(error)
-    }
-}
-
-impl From<LineageRepairBackendInitError> for AuthoringServiceInitError {
-    fn from(error: LineageRepairBackendInitError) -> Self {
-        Self::Lineage(error)
     }
 }

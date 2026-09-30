@@ -13,7 +13,6 @@ pub mod capnp_loader;
 pub mod capnp_transport;
 mod apply;
 mod capability;
-mod lineage;
 mod persist;
 mod protocol;
 mod server;
@@ -27,9 +26,9 @@ pub use apply::{
     publish_target, publish_target_set, ApplyError, ApplyMode, RETAINED_HISTORY_VERSIONS,
 };
 pub use capability::{
-    AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, LineageRepair, MetadataAuthoringSnapshot,
-    MetadataHub, MetadataSnapshot, PackSession, PendingBuild, ResolveStep, Snapshot,
-    import_call_outcome, lineage_call_outcome, write_call_outcome,
+    AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, MetadataAuthoringSnapshot, MetadataHub,
+    MetadataSnapshot, PackSession, PendingBuild, ResolveStep, Snapshot, import_call_outcome,
+    write_call_outcome,
 };
 pub use server::{
     target_map, run_scoped, AuthorityCall, AuthorityJob, AuthorityStopped, CoordinatedCommitError, ExternalStore, LeasePolicy, Root, Server, ServerHandle,

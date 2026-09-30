@@ -99,7 +99,6 @@ impl DaemonProcess {
         let coordinator = Arc::new(DaemonCoordinator::open(
             config.store_config(),
             config.asset_roots(),
-            config.assets.lineage_manifest.clone(),
             targets,
             config.pipeline.max_dependency_depth,
         )?);
@@ -766,7 +765,6 @@ impl ConfigWatch {
                 coordinator.publish_configuration_candidate(
                     crate::coordinator::ConfigurationCandidate {
                         roots: candidate.asset_roots(),
-                        lineage_destination: candidate.assets.lineage_manifest.clone(),
                         targets: staged.targets,
                         build_targets: staged.build_targets,
                         pipeline_source: candidate.modules.pipeline_dylib.clone(),

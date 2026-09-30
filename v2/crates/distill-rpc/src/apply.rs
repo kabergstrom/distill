@@ -9,15 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use distill_store::bundles::{AssetRecord, BundleMeta, ServedAuthoring};
 use distill_store::served::{
     encode_authored_value, Change, DerivedOutputRow, ResolutionRow, ServedWrite,
-    SERVED_LINEAGE_REPAIR, SERVED_PIPELINE, SERVED_RESTART_KEYS,
+    SERVED_PIPELINE, SERVED_RESTART_KEYS,
 };
 use distill_store::{InputTxn, StoreError};
 
 use crate::persist::{
-    decode_lineage_repair, decode_served_pipeline, delta_state_code, encode_drifted_input,
-    encode_lineage_repair, encode_served_pipeline, reconnect_code,
+    decode_served_pipeline, delta_state_code, encode_drifted_input, encode_served_pipeline,
+    reconnect_code,
 };
-use crate::validate::{validate_commit, validate_lineage_repair_configuration};
+use crate::validate::validate_commit;
 use crate::*;
 
 /// Input versions of subscription history kept in the change log.
@@ -86,14 +86,6 @@ pub(crate) fn read_served_pipeline(
     }
 }
 
-pub(crate) fn read_lineage_repair(
-    bytes: Option<Vec<u8>>,
-) -> Result<Option<LineageRepairState>, StoreError> {
-    bytes
-        .map(|bytes| decode_lineage_repair(&bytes).map_err(corrupt))
-        .transpose()
-}
-
 /// The RPC view of the store's configuration state.
 pub(crate) fn configuration_status(
     state: &distill_store::state::ConfigurationState,
@@ -142,15 +134,6 @@ fn apply<W: ServedWrite>(
             .pipeline
             .as_ref()
             .is_some_and(|next| next != &current_pipeline);
-    let configuration = match &commit.configuration {
-        Some(configuration) => configuration.clone(),
-        None => configuration_status(&txn.txn_configuration_state()?),
-    };
-    let repair = match &commit.lineage_repair {
-        Some(repair) => repair.clone(),
-        None => read_lineage_repair(txn.txn_served_blob(SERVED_LINEAGE_REPAIR)?)?,
-    };
-    validate_lineage_repair_configuration(&configuration, repair.as_ref())?;
 
     // The fence row comes first: a front end fences its connections on it
     // before it reaches this version's deltas.
@@ -194,12 +177,6 @@ fn apply<W: ServedWrite>(
         txn.set_served_blob(
             SERVED_PIPELINE,
             Some(&encode_served_pipeline(version, pipeline)),
-        )?;
-    }
-    if let Some(repair) = &commit.lineage_repair {
-        txn.set_served_blob(
-            SERVED_LINEAGE_REPAIR,
-            repair.as_ref().map(encode_lineage_repair).as_deref(),
         )?;
     }
 

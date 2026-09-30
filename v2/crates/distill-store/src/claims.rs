@@ -1,6 +1,6 @@
 //! Scan claims: what each scanned `.bundle` source claims — its bundle
 //! UUID, its authored asset UUIDs, the derived outputs its assets project,
-//! its primary path, a lineage manifest, or (for an unreadable skeleton) a
+//! its primary path, or (for an unreadable skeleton) a
 //! namespace error. Rows are keyed by the claiming (root, path), so a scan
 //! replaces exactly the claims of the subtree it observed.
 //!
@@ -12,13 +12,12 @@
 use std::collections::BTreeSet;
 
 use distill_core::canonical::CanonicalEncoder;
-use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
-    encode_asset_claimant, encode_bundle_source, encode_lineage_manifest_claimant, AssetClaimant,
-    LineageManifestClaimant, ReadableBundleSource, NamespaceError, NamespaceErrorDecoder,
+    encode_asset_claimant, encode_bundle_source, AssetClaimant, ReadableBundleSource, NamespaceError, NamespaceErrorDecoder,
     NamespaceErrorDecodeError, NamespaceErrorV1,
 };
 
@@ -26,7 +25,6 @@ const BUNDLE: i64 = 0;
 const AUTHORED: i64 = 1;
 const DERIVED: i64 = 2;
 const PRIMARY_PATH: i64 = 3;
-const LINEAGE: i64 = 4;
 const MALFORMED: i64 = 5;
 
 /// Collision groups: bundle UUIDs collide among themselves, authored and
@@ -54,8 +52,6 @@ pub enum SourceClaim {
         path: String,
         asset: AssetUuid,
     },
-    /// A SchemaLineageManifest entry.
-    Lineage(LineageManifestClaimant),
     /// The source's skeleton is unreadable.
     Malformed(NamespaceError),
 }
@@ -120,12 +116,6 @@ fn claim_row(claim: &SourceClaim) -> Result<(i64, Vec<u8>, Vec<u8>, Vec<u8>), St
             PRIMARY_PATH,
             path.as_bytes().to_vec(),
             asset.0.to_vec(),
-            Vec::new(),
-        ),
-        SourceClaim::Lineage(claimant) => (
-            LINEAGE,
-            Vec::new(),
-            encoded(&|encoder| encode_lineage_manifest_claimant(encoder, claimant)),
             Vec::new(),
         ),
         SourceClaim::Malformed(error) => (
@@ -343,23 +333,6 @@ fn decode_asset_claimant(bytes: &[u8]) -> Result<AssetClaimant, StoreError> {
     Ok(claimant)
 }
 
-fn decode_lineage_claimant(bytes: &[u8]) -> Result<LineageManifestClaimant, StoreError> {
-    let mut decoder = NamespaceErrorDecoder::new(bytes);
-    let claimant = (|| {
-        Ok(LineageManifestClaimant {
-            root_name: decoder.string()?,
-            normalized_path: decoder.string()?,
-            bundle: BundleUuid(decoder.array()?),
-            local_id: decoder.string()?,
-            asset: AssetUuid(decoder.array()?),
-            file_hash: BundleFileHash(decoder.array()?),
-        })
-    })()
-    .map_err(invalid_namespace_error)?;
-    decoder.finish().map_err(invalid_namespace_error)?;
-    Ok(claimant)
-}
-
 impl StoreReader {
     /// The namespace errors of the claims, in canonical order: every
     /// malformed skeleton and every bundle or asset UUID with more than one
@@ -469,18 +442,6 @@ impl StoreReader {
         )?
         .iter()
         .map(|bytes| Ok(AssetUuid(uuid16(bytes)?)))
-        .collect()
-    }
-
-    /// The distinct lineage manifest claimants.
-    pub fn lineage_claims(&self) -> Result<BTreeSet<LineageManifestClaimant>, StoreError> {
-        self.query_rows(
-            "SELECT DISTINCT claimant FROM source_claims WHERE kind = 4",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?
-        .iter()
-        .map(|claimant| decode_lineage_claimant(claimant))
         .collect()
     }
 

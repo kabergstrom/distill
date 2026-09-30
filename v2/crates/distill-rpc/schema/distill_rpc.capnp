@@ -70,11 +70,7 @@ struct ConnectCall {
 }
 
 struct PipelineUnavailableDiagnostic {
-  union {
-    pipelineFailure @0 :PipelineFailure;
-    schemaAcceptanceRequired @1 :SchemaAcceptanceRequired;
-    retiredTypeReferenced @2 :RetiredTypeReferenced;
-  }
+  pipelineFailure @0 :PipelineFailure;
 }
 
 struct ConnectSuccess {
@@ -534,59 +530,10 @@ struct PipelineFailure {
   message @4 :Text;
 }
 
-struct SchemaManifestCursor {
-  typeUuid @0 :Uuid;
-  logicalHash @1 :Data;
-}
-
-struct SchemaManifestBasis {
-  manifestHash @0 :Data;
-  currentCursors @1 :List(SchemaManifestCursor);
-}
-
-struct PipelineCandidateIdentity {
-  dylibHash @0 :Data;
-  reservedCompiledTypes @1 :Void;
-  targetRows @2 :List(PipelineTargetRow);
-}
-
-struct PipelineTargetRow {
-  name @0 :Text;
-  targetDefinitionHash @1 :Data;
-}
-
-struct SchemaRegistryMismatch {
-  typeUuid @0 :Uuid;
-  candidate @1 :Data;
-  hasCandidate @2 :Bool;
-  manifest @3 :Data;
-  hasManifest @4 :Bool;
-}
-
-struct SchemaAcceptanceRequired {
-  manifest @0 :SchemaManifestBasis;
-  candidate @1 :PipelineCandidateIdentity;
-  mismatches @2 :List(SchemaRegistryMismatch);
-}
-
-struct RetiredTypeReference { union {
-  asset @0 :Uuid;
-  migrationEndpoint @1 :Data;
-} }
-
-struct RetiredTypeReferenced {
-  manifestHash @0 :Data;
-  basis @1 :SnapshotStampValue;
-  typeUuid @2 :Uuid;
-  references @3 :List(RetiredTypeReference);
-}
-
 struct PipelineDiagnostic {
   union {
     ready @0 :Void;
     failed @1 :PipelineFailure;
-    schemaAcceptanceRequired @2 :SchemaAcceptanceRequired;
-    retiredTypeReferenced @3 :RetiredTypeReferenced;
   }
 }
 
@@ -635,9 +582,7 @@ struct ImportRequest {
 struct LongRunningOp {
   union {
     renameWithFixups @0 :Data;
-    diskMigration @1 :Data;
-    doctor @2 :Data;
-    schemaTransition @3 :Data;
+    doctor @1 :Data;
   }
 }
 
@@ -794,138 +739,10 @@ struct Subscription {
   installed @1 :UInt64;
 }
 
-struct LineageManifestClaimant {
-  asset @0 :Uuid;
-  rootName @1 :Text;
-  normalizedPath @2 :Text;
-  fileHash @3 :Data;
-  bundle @4 :Uuid;
-  localId @5 :Text;
-}
-
-enum OccupiedLineageDestinationKind {
-  canonicalBundle @0;
-  opaque @1;
-}
-
-struct OccupiedLineageDestination {
-  fileHash @0 :Data;
-  kind @1 :OccupiedLineageDestinationKind;
-}
-
-struct LineageRepairDestination {
-  union {
-    absent @0 :Void;
-    occupied @1 :OccupiedLineageDestination;
-  }
-}
-
-struct MissingLineageRepairState {
-  configuredRoot @0 :Text;
-  configuredPath @1 :Text;
-  destination @2 :LineageRepairDestination;
-}
-
-struct DuplicateLineageRepairState {
-  claimants @0 :List(LineageManifestClaimant);
-}
-
-struct LineageRepairState {
-  union {
-    missing @0 :MissingLineageRepairState;
-    duplicate @1 :DuplicateLineageRepairState;
-  }
-}
-
-struct LineageRepairInspection {
-  instance @0 :Data;
-  stamp @1 :SnapshotStamp;
-  state @2 :LineageRepairState;
-}
-
-struct LineageRepairUnavailable {
-  union {
-    configurationReady @0 :Void;
-    otherConfigurationError @1 :ConfigurationError;
-  }
-}
-
-struct LineageRepairConnectResult {
-  union {
-    success @0 :LineageRepair;
-    unavailable @1 :LineageRepairUnavailable;
-    protocolFailure @2 :ProtocolFailure;
-    error @3 :RpcError;
-  }
-}
-
-enum LineageRepairInvalidCode {
-  wrongBasisState @0;
-  nonCanonicalBundle @1;
-  missingManifestEntry @2;
-  notAuthoringOnly @3;
-  bootstrapTypePresent @4;
-  invalidLineage @5;
-  survivorNotClaimant @6;
-}
-
-struct LineageRepairInvalid {
-  code @0 :LineageRepairInvalidCode;
-  message @1 :Text;
-}
-
-enum LineageRepairStaleCode {
-  stampChanged @0;
-  stateChanged @1;
-  destinationAppeared @2;
-  claimantChanged @3;
-  preimageChanged @4;
-}
-
-struct LineageRepairStale {
-  code @0 :LineageRepairStaleCode;
-  observedStamp @1 :SnapshotStamp;
-}
-
-struct LineageRepairCommitted {
-  stamp @0 :SnapshotStamp;
-}
-
-struct LineageRepairInspectResult {
-  union {
-    success @0 :LineageRepairInspection;
-    unavailable @1 :LineageRepairUnavailable;
-    reconnectRequired @2 :MetadataReconnectRequired;
-    error @3 :RpcError;
-  }
-}
-
-struct LineageRepairMutationResult {
-  union {
-    success @0 :LineageRepairCommitted;
-    staleBasis @1 :LineageRepairStale;
-    invalid @2 :LineageRepairInvalid;
-    unavailable @3 :LineageRepairUnavailable;
-    reconnectRequired @4 :MetadataReconnectRequired;
-    error @5 :RpcError;
-  }
-}
-
-interface LineageRepair {
-  inspect @0 () -> (result :LineageRepairInspectResult);
-  createMissing @1 (basis :LineageRepairInspection,
-                    canonicalManifestBundle :Data)
-                -> (result :LineageRepairMutationResult);
-  resolveDuplicate @2 (basis :LineageRepairInspection,
-                       survivor :LineageManifestClaimant)
-                -> (result :LineageRepairMutationResult);
-}
-
 interface Root {
   connect @0 (target :Text, targetDefHash :Data, protocol :UInt32)
           -> (result :ConnectCall);
   metadata @1 (protocol :UInt32) -> (result :MetadataConnectResult);
-  lineageRepair @2 (protocol :UInt32) -> (result :LineageRepairConnectResult);
 }
 
 interface MetadataHub {
@@ -933,7 +750,6 @@ interface MetadataHub {
   authoringSnapshot @1 () -> (result :MetadataAuthoringSnapshotCall);
   diagnostics @2 () -> (result :MetadataDiagnosticsCall);
   fetch @3 (hash :Data) -> (result :MetadataChunkStreamCall);
-  schemaTransition @4 (base :UInt64, payload :Data) -> (result :ProgressCall);
 }
 
 interface MetadataSnapshot {

@@ -9,16 +9,13 @@
 //! `schemas`. The `$` local_id namespace is reserved for exactly
 //! `$settings` and `$record`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use distill_core::bootstrap::{
-    is_bootstrap_control_type, BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS,
-    IMPORT_RECORD_TYPE_UUID, MIGRATION_TYPE_UUID,
+    BootstrapControlSpecV1, BOOTSTRAP_CONTROL_TYPE_UUIDS,
+    IMPORT_RECORD_TYPE_UUID,
 };
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
-use distill_core::lineage::{
-    lineage_chain_digest, AcceptedSchemaEpoch, EntryLineageV1, LineageStamp,
-};
 use distill_json::AuthoredValue;
 use ngp_schema::{node_bytes, snapshot_to_json, verify_snapshot, LogicalSchema};
 
@@ -117,80 +114,6 @@ pub(crate) fn decode_namespace(value: AuthoredValue) -> Result<Bundle, BundleErr
         }
     }
     decode(AuthoredValue::Object(top))
-}
-
-pub(crate) fn inject_missing_schemas(
-    value: &mut AuthoredValue,
-    holders: &BTreeMap<LogicalHash, LogicalSchema>,
-) -> Result<bool, BundleError> {
-    let AuthoredValue::Object(top) = value else {
-        return Ok(false);
-    };
-    let Some(AuthoredValue::Object(assets)) = top.get("assets") else {
-        return Ok(false);
-    };
-    let existing = match top.get("schemas") {
-        Some(AuthoredValue::Object(existing)) => existing.keys().cloned().collect::<BTreeSet<_>>(),
-        None => BTreeSet::new(),
-        Some(_) => return Ok(false),
-    };
-    let mut missing = BTreeMap::<LogicalHash, String>::new();
-    for (local_id, entry) in assets {
-        let AuthoredValue::Object(fields) = entry else {
-            continue;
-        };
-        let Some(AuthoredValue::Str(hash)) = fields.get("schema_hash") else {
-            continue;
-        };
-        let Ok(hash) = hash.parse::<LogicalHash>() else {
-            continue;
-        };
-        if !existing.contains(&hash.to_string()) {
-            missing.entry(hash).or_insert_with(|| local_id.clone());
-        }
-        let is_migration = fields.get("type_uuid").and_then(|value| match value {
-            AuthoredValue::Str(value) => value.parse::<TypeUuid>().ok(),
-            _ => None,
-        }) == Some(MIGRATION_TYPE_UUID);
-        if !is_migration {
-            continue;
-        }
-        let Some(AuthoredValue::Object(data)) = fields.get("data") else {
-            continue;
-        };
-        for field in ["from_hash", "to_hash"] {
-            let Some(hash) = data.get(field).and_then(logical_hash_from_byte_array) else {
-                continue;
-            };
-            if !existing.contains(&hash.to_string()) {
-                missing.entry(hash).or_insert_with(|| local_id.clone());
-            }
-        }
-    }
-    if missing.is_empty() {
-        return Ok(false);
-    }
-    let AuthoredValue::Object(top) = value else {
-        unreachable!()
-    };
-    let schemas = top
-        .entry("schemas".to_owned())
-        .or_insert_with(|| AuthoredValue::Object(BTreeMap::new()));
-    let AuthoredValue::Object(schemas) = schemas else {
-        unreachable!()
-    };
-    for (hash, local_id) in missing {
-        let schema = holders.get(&hash).ok_or(BundleError::MissingSchema {
-            local_id,
-            schema_hash: hash,
-        })?;
-        let text = ngp_schema::snapshot_to_json(schema).map_err(|error| BundleError::Internal {
-            detail: format!("cannot render held schema {hash}: {error}"),
-        })?;
-        let snapshot = distill_json::parse(&text).map_err(BundleError::Json)?;
-        schemas.insert(hash.to_string(), snapshot);
-    }
-    Ok(true)
 }
 
 /// Decode the envelope JSON value into a `Bundle` (data left as-is; the
@@ -317,15 +240,9 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
         let uuid: AssetUuid = take_id(&mut entry, &local_id, "uuid")?;
         let type_uuid: TypeUuid = take_id(&mut entry, &local_id, "type_uuid")?;
         let schema_hash: LogicalHash = take_id(&mut entry, &local_id, "schema_hash")?;
-        let lineage = decode_entry_lineage(
-            entry
-                .remove("lineage")
-                .ok_or_else(|| BundleError::MissingEntryKey {
-                    local_id: local_id.clone(),
-                    key: "lineage",
-                })?,
-            &local_id,
-        )?;
+        // Bundles written before lineage was retired carry a `lineage` key;
+        // it is accepted and ignored.
+        entry.remove("lineage");
         let authoring_only = match entry.remove("authoring_only") {
             None => {
                 return Err(BundleError::MissingEntryKey {
@@ -356,15 +273,13 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
                 uuid,
                 type_uuid,
                 schema_hash,
-                lineage,
                 authoring_only,
                 data,
             },
         );
     }
 
-    // Schema-closure (§6, §11): every entry schema and both endpoints of a
-    // closed MigrationV1 control resolve within the file.
+    // Schema-closure (§6, §11): every entry schema resolves within the file.
     for (local_id, entry) in &assets {
         for schema_hash in schema_references(entry) {
             if !schemas.contains_key(&schema_hash) {
@@ -375,7 +290,7 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
             }
         }
         let schema = &schemas[&entry.schema_hash];
-        validate_entry_lineage(local_id, format_version, entry, schema)?;
+        validate_entry_role(local_id, format_version, entry, schema)?;
     }
     if let Some(p) = &primary {
         match assets.get(p) {
@@ -396,40 +311,9 @@ pub(crate) fn decode(value: AuthoredValue) -> Result<Bundle, BundleError> {
     })
 }
 
-/// Exact schema hashes named by a bundle entry. Malformed Migration data is
-/// left to the bootstrap schema walk and closed decoder; well-shaped endpoint
-/// hashes participate in bundle closure even before daemon migration planning.
+/// Exact schema hashes named by a bundle entry.
 pub(crate) fn schema_references(entry: &AssetEntry) -> Vec<LogicalHash> {
-    let mut hashes = vec![entry.schema_hash];
-    if entry.type_uuid == MIGRATION_TYPE_UUID {
-        if let AuthoredValue::Object(data) = &entry.data {
-            for field in ["from_hash", "to_hash"] {
-                if let Some(hash) = data.get(field).and_then(logical_hash_from_byte_array) {
-                    if !hashes.contains(&hash) {
-                        hashes.push(hash);
-                    }
-                }
-            }
-        }
-    }
-    hashes
-}
-
-fn logical_hash_from_byte_array(value: &AuthoredValue) -> Option<LogicalHash> {
-    let AuthoredValue::Array(values) = value else {
-        return None;
-    };
-    if values.len() != 32 {
-        return None;
-    }
-    let mut bytes = [0; 32];
-    for (output, value) in bytes.iter_mut().zip(values) {
-        let AuthoredValue::UInt(value) = value else {
-            return None;
-        };
-        *output = u8::try_from(*value).ok()?;
-    }
-    Some(LogicalHash(bytes))
+    vec![entry.schema_hash]
 }
 
 /// The reserved `$` namespace (§6): only `$settings` and `$record`, at
@@ -466,252 +350,50 @@ fn take_id<T: std::str::FromStr>(
     }
 }
 
-fn decode_entry_lineage(
-    value: AuthoredValue,
-    local_id: &str,
-) -> Result<EntryLineageV1, BundleError> {
-    let mut outer = match value {
-        AuthoredValue::Object(value) if value.len() == 1 => value,
-        _ => return lineage_error(local_id, "lineage must be an exact one-member object"),
-    };
-    if let Some(value) = outer.remove("manifest") {
-        let mut manifest = match value {
-            AuthoredValue::Object(value) => value,
-            _ => return lineage_error(local_id, "manifest lineage must be an object"),
-        };
-        if manifest.len() != 3
-            || !manifest.contains_key("epochs")
-            || !manifest.contains_key("cursor")
-            || !manifest.contains_key("chain")
-        {
-            return lineage_error(local_id, "manifest lineage fields are not exact");
-        }
-        let epochs = match manifest.remove("epochs").unwrap() {
-            AuthoredValue::Array(values) => values
-                .into_iter()
-                .map(|value| decode_lineage_epoch(value, local_id))
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => return lineage_error(local_id, "lineage epochs must be an array"),
-        };
-        let cursor = match manifest.remove("cursor").unwrap() {
-            AuthoredValue::UInt(value) => {
-                u32::try_from(value).map_err(|_| BundleError::EntryLineage {
-                    local_id: local_id.to_owned(),
-                    detail: "lineage cursor exceeds u32",
-                })?
-            }
-            _ => return lineage_error(local_id, "lineage cursor must be unsigned"),
-        };
-        let chain =
-            match manifest.remove("chain").unwrap() {
-                AuthoredValue::Str(value) => value
-                    .parse::<LogicalHash>()
-                    .map(|hash| hash.0)
-                    .map_err(|_| BundleError::EntryLineage {
-                        local_id: local_id.to_owned(),
-                        detail: "lineage chain must be 32-byte lowercase hex",
-                    })?,
-                _ => return lineage_error(local_id, "lineage chain must be text"),
-            };
-        return Ok(EntryLineageV1::Manifest(LineageStamp {
-            epochs,
-            cursor,
-            chain,
-        }));
-    }
-    if let Some(value) = outer.remove("bootstrap") {
-        let mut bootstrap = match value {
-            AuthoredValue::Object(value) if value.len() == 1 => value,
-            _ => return lineage_error(local_id, "bootstrap lineage must be an exact object"),
-        };
-        let version = match bootstrap.remove("bundle_format_version") {
-            Some(AuthoredValue::UInt(value)) => {
-                u32::try_from(value).map_err(|_| BundleError::EntryLineage {
-                    local_id: local_id.to_owned(),
-                    detail: "bootstrap format version exceeds u32",
-                })?
-            }
-            _ => return lineage_error(local_id, "bootstrap format version must be unsigned"),
-        };
-        return Ok(EntryLineageV1::Bootstrap {
-            bundle_format_version: version,
-        });
-    }
-    lineage_error(local_id, "unknown entry-lineage arm")
-}
-
-fn decode_lineage_epoch(
-    value: AuthoredValue,
-    local_id: &str,
-) -> Result<AcceptedSchemaEpoch, BundleError> {
-    let mut epoch = match value {
-        AuthoredValue::Object(value) if value.len() == 2 => value,
-        _ => return lineage_error(local_id, "lineage epoch must be an exact object"),
-    };
-    let digest = match epoch.remove("digest") {
-        Some(AuthoredValue::Str(value)) => {
-            value.parse().map_err(|_| BundleError::EntryLineage {
-                local_id: local_id.to_owned(),
-                detail: "lineage epoch digest is malformed",
-            })?
-        }
-        _ => return lineage_error(local_id, "lineage epoch digest must be text"),
-    };
-    let forward_parent = match epoch.remove("forward_parent") {
-        Some(AuthoredValue::Null) => None,
-        Some(AuthoredValue::UInt(value)) => {
-            Some(u32::try_from(value).map_err(|_| BundleError::EntryLineage {
-                local_id: local_id.to_owned(),
-                detail: "lineage parent exceeds u32",
-            })?)
-        }
-        _ => return lineage_error(local_id, "lineage parent must be null or unsigned"),
-    };
-    Ok(AcceptedSchemaEpoch {
-        digest,
-        forward_parent,
-    })
-}
-
-pub(crate) fn validate_entry_lineage(
+/// Entry roles: `$record` is exactly the built-in ImportRecord, and a
+/// bootstrap control entry is authoring-only with the embedded schema.
+pub(crate) fn validate_entry_role(
     local_id: &str,
     format_version: u32,
     entry: &AssetEntry,
     schema: &LogicalSchema,
 ) -> Result<(), BundleError> {
     if (local_id == "$record") != (entry.type_uuid == IMPORT_RECORD_TYPE_UUID) {
-        return lineage_error(
+        return role_error(
             local_id,
             "$record is reserved exclusively for the built-in ImportRecord type",
         );
     }
-    match (&entry.lineage, is_bootstrap_control_type(entry.type_uuid)) {
-        (
-            EntryLineageV1::Bootstrap {
-                bundle_format_version,
-            },
-            true,
-        ) => {
-            if *bundle_format_version != BUNDLE_FORMAT_VERSION
-                || format_version != BUNDLE_FORMAT_VERSION
-                || !entry.authoring_only
-            {
-                return lineage_error(local_id, "bootstrap lineage has invalid version or role");
-            }
-            let index = BOOTSTRAP_CONTROL_TYPE_UUIDS
-                .iter()
-                .position(|type_uuid| *type_uuid == entry.type_uuid)
-                .expect("bootstrap predicate and closed UUID table agree");
-            let expected = &BootstrapControlSpecV1::embedded()
-                .map_err(|_| BundleError::EntryLineage {
-                    local_id: local_id.to_owned(),
-                    detail: "embedded bootstrap spec is invalid",
-                })?
-                .0[index];
-            let actual_schema =
-                node_bytes(&schema.root).map_err(|_| BundleError::EntryLineage {
-                    local_id: local_id.to_owned(),
-                    detail: "bootstrap logical schema is not canonical",
-                })?;
-            if entry.schema_hash != expected.logical_hash
-                || actual_schema != expected.logical_schema
-            {
-                return lineage_error(local_id, "bootstrap schema hash does not match DSB");
-            }
-            Ok(())
-        }
-        (EntryLineageV1::Manifest(stamp), false) => {
-            if stamp.epochs.is_empty()
-                || stamp
-                    .epochs
-                    .iter()
-                    .map(|epoch| epoch.digest)
-                    .collect::<BTreeSet<_>>()
-                    .len()
-                    != stamp.epochs.len()
-                || usize::try_from(stamp.cursor)
-                    .ok()
-                    .is_none_or(|cursor| cursor >= stamp.epochs.len())
-                || stamp.epochs[0].forward_parent.is_some()
-                || stamp
-                    .epochs
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .any(|(index, epoch)| {
-                        epoch.forward_parent.is_none_or(|parent| {
-                            usize::try_from(parent).unwrap_or(usize::MAX) >= index
-                        })
-                    })
-                || stamp.selected_digest() != Some(entry.schema_hash)
-                || stamp.chain != lineage_chain_digest(entry.type_uuid, &stamp.epochs, stamp.cursor)
-            {
-                return lineage_error(local_id, "manifest lineage stamp is not canonical");
-            }
-            Ok(())
-        }
-        (EntryLineageV1::Bootstrap { .. }, false) => {
-            lineage_error(local_id, "non-bootstrap type used bootstrap lineage")
-        }
-        (EntryLineageV1::Manifest(_), true) => {
-            lineage_error(local_id, "bootstrap type used manifest lineage")
-        }
+    let Some(index) = BOOTSTRAP_CONTROL_TYPE_UUIDS
+        .iter()
+        .position(|type_uuid| *type_uuid == entry.type_uuid)
+    else {
+        return Ok(());
+    };
+    if format_version != BUNDLE_FORMAT_VERSION || !entry.authoring_only {
+        return role_error(local_id, "bootstrap control has invalid version or role");
     }
+    let expected = &BootstrapControlSpecV1::embedded()
+        .map_err(|_| BundleError::EntryRole {
+            local_id: local_id.to_owned(),
+            detail: "embedded bootstrap spec is invalid",
+        })?
+        .0[index];
+    let actual_schema = node_bytes(&schema.root).map_err(|_| BundleError::EntryRole {
+        local_id: local_id.to_owned(),
+        detail: "bootstrap logical schema is not canonical",
+    })?;
+    if entry.schema_hash != expected.logical_hash || actual_schema != expected.logical_schema {
+        return role_error(local_id, "bootstrap schema hash does not match DSB");
+    }
+    Ok(())
 }
 
-fn lineage_error<T>(local_id: &str, detail: &'static str) -> Result<T, BundleError> {
-    Err(BundleError::EntryLineage {
+fn role_error<T>(local_id: &str, detail: &'static str) -> Result<T, BundleError> {
+    Err(BundleError::EntryRole {
         local_id: local_id.to_owned(),
         detail,
     })
-}
-
-fn encode_entry_lineage(lineage: &EntryLineageV1) -> AuthoredValue {
-    let mut outer = BTreeMap::new();
-    match lineage {
-        EntryLineageV1::Manifest(stamp) => {
-            let epochs = stamp
-                .epochs
-                .iter()
-                .map(|epoch| {
-                    let mut value = BTreeMap::new();
-                    value.insert(
-                        "digest".into(),
-                        AuthoredValue::Str(epoch.digest.to_string()),
-                    );
-                    value.insert(
-                        "forward_parent".into(),
-                        epoch.forward_parent.map_or(AuthoredValue::Null, |parent| {
-                            AuthoredValue::UInt(u128::from(parent))
-                        }),
-                    );
-                    AuthoredValue::Object(value)
-                })
-                .collect();
-            let mut value = BTreeMap::new();
-            value.insert("epochs".into(), AuthoredValue::Array(epochs));
-            value.insert(
-                "cursor".into(),
-                AuthoredValue::UInt(u128::from(stamp.cursor)),
-            );
-            value.insert(
-                "chain".into(),
-                AuthoredValue::Str(LogicalHash(stamp.chain).to_string()),
-            );
-            outer.insert("manifest".into(), AuthoredValue::Object(value));
-        }
-        EntryLineageV1::Bootstrap {
-            bundle_format_version,
-        } => {
-            let mut value = BTreeMap::new();
-            value.insert(
-                "bundle_format_version".into(),
-                AuthoredValue::UInt(u128::from(*bundle_format_version)),
-            );
-            outer.insert("bootstrap".into(), AuthoredValue::Object(value));
-        }
-    }
-    AuthoredValue::Object(outer)
 }
 
 /// Build the envelope JSON value for the writer. `data` carries each
@@ -762,7 +444,6 @@ pub(crate) fn build(
             "schema_hash".to_string(),
             AuthoredValue::Str(entry.schema_hash.to_string()),
         );
-        m.insert("lineage".to_string(), encode_entry_lineage(&entry.lineage));
         m.insert(
             "authoring_only".to_string(),
             AuthoredValue::Bool(entry.authoring_only),

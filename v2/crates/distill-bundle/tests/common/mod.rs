@@ -5,11 +5,9 @@
 use std::collections::BTreeMap;
 
 use distill_bundle::{
-    crc32c, AcceptedSchemaEpoch, AssetEntry, Bundle, EntryLineageV1, LineageStamp, CONTAINER_MAGIC,
-    CONTAINER_VERSION,
+    crc32c, AssetEntry, Bundle, CONTAINER_MAGIC, CONTAINER_VERSION,
 };
 use distill_core::id::{LogicalHash, TypeUuid};
-use distill_core::lineage::lineage_chain_digest;
 use distill_json::AuthoredValue as V;
 use ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode as N};
 
@@ -120,19 +118,10 @@ pub const BUNDLE_UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 pub fn entry(uuid: &str, schema: &LogicalSchema, data: V) -> AssetEntry {
     let type_uuid: TypeUuid = TYPE_A.parse().expect("fixture type uuid");
     let schema_hash = lh(schema);
-    let epochs = vec![AcceptedSchemaEpoch {
-        digest: schema_hash,
-        forward_parent: None,
-    }];
     AssetEntry {
         uuid: uuid.parse().expect("fixture asset uuid"),
         type_uuid,
         schema_hash,
-        lineage: EntryLineageV1::Manifest(LineageStamp {
-            chain: lineage_chain_digest(type_uuid, &epochs, 0),
-            epochs,
-            cursor: 0,
-        }),
         authoring_only: false,
         data,
     }
@@ -234,43 +223,6 @@ pub fn envelope_value(b: &Bundle) -> V {
         m.insert("uuid".to_string(), V::Str(e.uuid.to_string()));
         m.insert("type_uuid".to_string(), V::Str(e.type_uuid.to_string()));
         m.insert("schema_hash".to_string(), V::Str(e.schema_hash.to_string()));
-        let lineage = match &e.lineage {
-            EntryLineageV1::Manifest(stamp) => {
-                let epochs = stamp
-                    .epochs
-                    .iter()
-                    .map(|epoch| {
-                        obj(&[
-                            ("digest", s(&epoch.digest.to_string())),
-                            (
-                                "forward_parent",
-                                epoch
-                                    .forward_parent
-                                    .map_or(V::Null, |parent| V::UInt(u128::from(parent))),
-                            ),
-                        ])
-                    })
-                    .collect();
-                obj(&[(
-                    "manifest",
-                    obj(&[
-                        ("epochs", V::Array(epochs)),
-                        ("cursor", V::UInt(u128::from(stamp.cursor))),
-                        ("chain", s(&LogicalHash(stamp.chain).to_string())),
-                    ]),
-                )])
-            }
-            EntryLineageV1::Bootstrap {
-                bundle_format_version,
-            } => obj(&[(
-                "bootstrap",
-                obj(&[(
-                    "bundle_format_version",
-                    V::UInt(u128::from(*bundle_format_version)),
-                )]),
-            )]),
-        };
-        m.insert("lineage".to_string(), lineage);
         m.insert("authoring_only".to_string(), V::Bool(e.authoring_only));
         m.insert("data".to_string(), e.data.clone());
         assets.insert(id.clone(), V::Object(m));

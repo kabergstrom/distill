@@ -1,4 +1,4 @@
-//! Filesystem-side authority for §14 scanning and §6 lineage repair.
+//! Filesystem-side authority for scanning.
 //!
 //! Logical paths are accepted only in their canonical root-relative form.
 //! Physical traversal is confined to canonical configured roots, daemon-owned
@@ -15,11 +15,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
 use distill_core::id::{BundleFileHash, ContentHash};
-use distill_rpc::{
-    LineageManifestClaimant, LineageRepairDestination, OccupiedLineageDestinationKind,
-};
 use distill_store::db::StoreReader;
 use distill_store::error::StoreError;
 use distill_store::files::{
@@ -380,35 +376,6 @@ impl ScanSnapshot {
         self.diagnostics.values()
     }
 
-    pub fn lineage_claimants(&self) -> Vec<LineageManifestClaimant> {
-        let mut claimants = Vec::new();
-        for bundle in self.bundles.values() {
-            let Ok(parsed) = &bundle.parsed else {
-                continue;
-            };
-            for (local_id, entry) in &parsed.assets {
-                if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
-                    claimants.push(LineageManifestClaimant {
-                        root_name: bundle.root_name.clone(),
-                        normalized_path: bundle.normalized_path.clone(),
-                        bundle: parsed.uuid,
-                        local_id: local_id.clone(),
-                        asset: entry.uuid,
-                        file_hash: bundle.file_hash,
-                    });
-                }
-            }
-        }
-        claimants.sort();
-        claimants.dedup();
-        claimants
-    }
-
-    pub(crate) fn bundle_at(&self, root: &str, path: &str) -> Option<Arc<ScannedBundle>> {
-        self.bundles
-            .get(&(root.to_owned(), path.to_owned()))
-            .cloned()
-    }
 
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for affected in &delta.affected {
@@ -617,11 +584,6 @@ impl ScanSnapshot {
     /// Only the diagnostic rows of the published observation.
     pub(crate) fn load_diagnostics(reader: &StoreReader) -> Result<Self, StoreError> {
         Self::from_rows(Vec::new(), Vec::new(), reader.scan_diagnostics()?, Vec::new())
-    }
-
-    /// Only the parsed `.bundle` rows of the published observation.
-    pub(crate) fn load_bundles(reader: &StoreReader) -> Result<Self, StoreError> {
-        Self::from_rows(Vec::new(), Vec::new(), Vec::new(), reader.bundle_files()?)
     }
 
     fn from_rows(
@@ -1212,32 +1174,6 @@ impl RootedScanner {
             )
     }
 
-    pub fn inspect_destination(
-        &self,
-        root: &str,
-        path: &str,
-    ) -> Result<LineageRepairDestination, ScanError> {
-        let path = self.physical_path(root, path)?;
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(LineageRepairDestination::Absent)
-            }
-            Err(source) => Err(ScanError::Io { path, source }),
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
-                let bytes = self.read_identity_checked(&path)?;
-                let file_hash = BundleFileHash::of_observed_bytes(&bytes);
-                let kind = distill_bundle::parse_bundle(&bytes)
-                    .ok()
-                    .and_then(|bundle| distill_bundle::write_bundle(&bundle).ok())
-                    .filter(|canonical| canonical == &bytes)
-                    .map_or(OccupiedLineageDestinationKind::Opaque, |_| {
-                        OccupiedLineageDestinationKind::CanonicalBundle
-                    });
-                Ok(LineageRepairDestination::Occupied { file_hash, kind })
-            }
-            Ok(_) => Err(ScanError::NonRegularFile { path }),
-        }
-    }
 
     /// Enumerate the complete raw namespace in deterministic `(root, path)`
     /// order. This is the startup/recovery path; ordinary live watcher batches

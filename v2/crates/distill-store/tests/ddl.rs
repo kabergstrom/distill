@@ -86,18 +86,12 @@ fn every_section_13_table_exists() {
         "cas_extents",
         "cas_segments",
         "pipeline_state",
-        "pipeline_retired_references",
         "pipeline_schema_registry",
-        "pipeline_candidate_schema_registry",
         "pipeline_target_set",
-        "pipeline_candidate_target_set",
         "configuration_state",
         "pending_restart",
         "registrations",
         "tools",
-        "schema_lineage",
-        "schema_lineage_current",
-        "schema_lineage_state",
         "roots",
         "store_meta",
         "pins",
@@ -254,47 +248,8 @@ fn tools_table_is_the_tool_epoch() {
 }
 
 #[test]
-fn schema_lineage_records_the_chain_with_generations_and_digests() {
-    // §13: append-only accepted history and the independently movable
-    // current cursor are different tables. A manifest-availability row
-    // distinguishes an empty manifest from missing authority.
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "schema_lineage"),
-        [
-            "type_uuid",
-            "generation",
-            "schema_hash",
-            "forward_parent",
-            "input_version"
-        ]
-    );
-    assert_eq!(
-        pk_columns(&conn, "schema_lineage"),
-        ["type_uuid", "generation"]
-    );
-    assert_eq!(
-        columns(&conn, "schema_lineage_current"),
-        [
-            "type_uuid",
-            "current_cursor",
-            "chain_digest",
-            "authority",
-            "retired_from",
-            "input_version"
-        ]
-    );
-    assert_eq!(pk_columns(&conn, "schema_lineage_current"), ["type_uuid"]);
-    assert_eq!(
-        columns(&conn, "schema_lineage_state"),
-        ["id", "input_version", "manifest_hash"]
-    );
-}
-
-#[test]
 fn pipeline_state_row_shape() {
-    // §13: module content identity plus typed failure/acceptance state.
+    // §13: module content identity plus typed failure state.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(
@@ -307,18 +262,8 @@ fn pipeline_state_row_shape() {
             "poison_origin",
             "poison_cleanup",
             "poison_identity",
-            "poison_message",
-            "acceptance_candidate_dylib_hash",
-            "acceptance_manifest_hash",
-            "retired_manifest_hash",
-            "retired_basis_instance",
-            "retired_basis_version",
-            "retired_type_uuid"
+            "poison_message"
         ]
-    );
-    assert_eq!(
-        columns(&conn, "pipeline_retired_references"),
-        ["position", "reference_kind", "subject"]
     );
     assert_eq!(
         columns(&conn, "registrations"),
@@ -329,15 +274,7 @@ fn pipeline_state_row_shape() {
         ["type_uuid", "logical_hash"]
     );
     assert_eq!(
-        columns(&conn, "pipeline_candidate_schema_registry"),
-        ["type_uuid", "logical_hash"]
-    );
-    assert_eq!(
         columns(&conn, "pipeline_target_set"),
-        ["name", "target_definition_hash"]
-    );
-    assert_eq!(
-        columns(&conn, "pipeline_candidate_target_set"),
         ["name", "target_definition_hash"]
     );
 }

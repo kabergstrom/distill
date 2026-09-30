@@ -12,7 +12,6 @@ use distill_rpc::{AuthoringValue, ImportRequest};
 
 const USAGE: &str = "usage:
   distilld [config-path]
-  distilld init <config-path>
   distilld import <config-path> <source> <dest-bundle> --importer <id> --settings <json>
                   [--root <name>] [--target <name>] [--no-watch] [--if-missing] [--wait <seconds>]
   distilld engine-args <config-path> [target]
@@ -35,7 +34,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let rest: Vec<OsString> = args.collect();
     match first.to_str() {
-        Some("init") => init(rest),
         Some("import") => import(rest),
         Some("engine-args") => engine_args(rest),
         Some("pack") => pack(rest),
@@ -53,21 +51,6 @@ fn run_daemon(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let process = DaemonProcess::start(config)?;
     eprintln!("distill daemon listening on {}", process.rpc_address());
     process.wait()
-}
-
-fn init(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
-    let [config] = args.as_slice() else {
-        return Err(USAGE.into());
-    };
-    let config = DaemonConfig::load(config)?;
-    let report = bootstrap::init(&config)?;
-    for path in &report.written {
-        eprintln!("wrote {}", path.display());
-    }
-    for path in &report.unchanged {
-        eprintln!("unchanged {}", path.display());
-    }
-    Ok(())
 }
 
 fn engine_args(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {

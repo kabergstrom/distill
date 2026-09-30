@@ -21,7 +21,6 @@ displaced_retention_days = 7
 [assets]
 roots = {{ main = "{}" }}
 schema_path = "{}"
-lineage_manifest = {{ root = "main", path = "schema/schema-lineage.bundle" }}
 
 [modules]
 pipeline_dylib = "{}"
@@ -110,7 +109,7 @@ fn rejects_unknown_keys_nonloopback_and_invalid_scheduler_bounds() {
 }
 
 #[test]
-fn rejects_empty_target_apis_unknown_lineage_root_and_watched_output_nesting() {
+fn rejects_empty_target_apis_retired_lineage_key_and_watched_output_nesting() {
     let temp = tempfile::tempdir().unwrap();
     let source = valid_config(&temp).replace("apis = [\"vulkan\"]", "apis = []");
     assert!(matches!(
@@ -118,14 +117,12 @@ fn rejects_empty_target_apis_unknown_lineage_root_and_watched_output_nesting() {
         Err(DaemonConfigError::EmptyTargetApis(name)) if name == "dev"
     ));
 
+    // The retired schema-lineage key is an unknown field now.
     let source = valid_config(&temp).replace(
-        "lineage_manifest = { root = \"main\"",
-        "lineage_manifest = { root = \"missing\"",
+        "[modules]",
+        "lineage_manifest = { root = \"main\", path = \"schema/lineage.bundle\" }\n\n[modules]",
     );
-    assert!(matches!(
-        DaemonConfig::parse(temp.path().join("distill.toml"), &source),
-        Err(DaemonConfigError::UnknownLineageRoot(name)) if name == "missing"
-    ));
+    assert!(DaemonConfig::parse(temp.path().join("distill.toml"), &source).is_err());
 
     let source = valid_config(&temp).replace(
         &temp.path().join("generated").display().to_string(),

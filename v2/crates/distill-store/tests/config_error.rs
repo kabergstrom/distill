@@ -1,11 +1,10 @@
 //! DSCP v1 configuration-error grammar and persistence pinning.
 
-use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
     ConfigurationPathKey, ConfigurationError, ConfigurationErrorCode,
     ConfigurationSourceFailureCode, ConfigurationSourcePath, ConfigurationState,
-    DirectoryAliasSide, DscpV1, LineageManifestClaimant, OwnedPathKind, OwnedPathSide,
+    DirectoryAliasSide, DscpV1, OwnedPathKind, OwnedPathSide,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use ngp_schema::identity::LayoutIdentity;
@@ -24,17 +23,6 @@ fn identity(target: &str, marker: u8) -> LayoutIdentity {
     }
 }
 
-fn lineage_claimant(marker: u8, asset: u8) -> LineageManifestClaimant {
-    LineageManifestClaimant {
-        root_name: "main".into(),
-        normalized_path: format!("lineage-{marker}.bundle"),
-        bundle: BundleUuid([marker; 16]),
-        local_id: format!("manifest-{marker}"),
-        asset: AssetUuid([asset; 16]),
-        file_hash: BundleFileHash([marker; 32]),
-    }
-}
-
 #[test]
 fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
     assert_eq!(ConfigurationErrorCode::MalformedConfiguration as u16, 1);
@@ -46,8 +34,6 @@ fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
     assert_eq!(ConfigurationErrorCode::InvalidParallelism as u16, 7);
     assert_eq!(ConfigurationErrorCode::InvalidBatchReservation as u16, 8);
     assert_eq!(ConfigurationErrorCode::DirectoryAlias as u16, 9);
-    assert_eq!(ConfigurationErrorCode::MissingLineageManifest as u16, 10);
-    assert_eq!(ConfigurationErrorCode::DuplicateLineageManifest as u16, 11);
     assert_eq!(
         ConfigurationErrorCode::UnsupportedTargetIdentity as u16,
         12
@@ -152,16 +138,6 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
             ConfigurationErrorCode::DirectoryAlias,
         ),
         (
-            DscpV1::MissingLineageManifest,
-            ConfigurationErrorCode::MissingLineageManifest,
-        ),
-        (
-            DscpV1::DuplicateLineageManifest {
-                entries: vec![lineage_claimant(1, 9), lineage_claimant(2, 9)],
-            },
-            ConfigurationErrorCode::DuplicateLineageManifest,
-        ),
-        (
             DscpV1::UnsupportedTargetIdentity {
                 target: "ship".to_owned(),
                 expected: compilation.clone(),
@@ -194,26 +170,7 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
 }
 
 #[test]
-fn dscp_detail_decoder_rejects_noncanonical_order_and_text() {
-    let first = lineage_claimant(1, 9);
-    let second = lineage_claimant(2, 9);
-    let canonical = DscpV1::DuplicateLineageManifest {
-        entries: vec![first.clone(), second.clone()],
-    }
-    .canonical_detail_bytes();
-    let row_len = (canonical.len() - 4) / 2;
-    let mut unsorted = Vec::with_capacity(canonical.len());
-    unsorted.extend_from_slice(&2_u32.to_le_bytes());
-    unsorted.extend_from_slice(&canonical[4 + row_len..]);
-    unsorted.extend_from_slice(&canonical[4..4 + row_len]);
-    assert!(matches!(
-        DscpV1::from_canonical_detail_bytes(
-            ConfigurationErrorCode::DuplicateLineageManifest,
-            &unsorted,
-        ),
-        Err(distill_store::state::DscpError::NonCanonical)
-    ));
-
+fn dscp_detail_decoder_rejects_noncanonical_text() {
     let mut decomposed = Vec::new();
     decomposed.extend_from_slice(&6_u32.to_le_bytes());
     decomposed.extend_from_slice(b"cafe\xcc\x81");
@@ -342,27 +299,6 @@ fn configuration_defects_select_one_authority_and_retain_the_canonical_doctor_se
         ConfigurationError::select_canonical([later, first, duplicate]).unwrap(),
         Some(set[0].clone())
     );
-}
-
-#[test]
-fn duplicate_lineage_entries_sort_and_deduplicate_complete_claimant_rows() {
-    let a = lineage_claimant(1, 9);
-    let b = lineage_claimant(2, 9);
-    let noisy = DscpV1::DuplicateLineageManifest {
-        entries: vec![b.clone(), a.clone(), b, a.clone()],
-    };
-    let canonical = DscpV1::DuplicateLineageManifest {
-        entries: vec![a.clone(), lineage_claimant(2, 9)],
-    };
-    assert_eq!(noisy.reason_hash(), canonical.reason_hash());
-
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(b"DSCP");
-    preimage.push(1);
-    preimage.extend_from_slice(&11u16.to_le_bytes());
-    preimage.extend_from_slice(&2u32.to_le_bytes());
-    preimage.extend_from_slice(&canonical.canonical_detail_bytes()[4..]);
-    assert_eq!(canonical.reason_hash(), *blake3::hash(&preimage).as_bytes());
 }
 
 #[test]

@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use distill_core::id::ContentHash;
 use distill_store::codegen::CodegenPublicationBasis;
 use distill_store::journal::{
     JournalFilesystem, JournalIntentPlan, PublicationGroup, PublicationGroupKind,
@@ -11,8 +10,6 @@ use distill_store::journal::{
 };
 use distill_store::{Store, StoreError};
 
-use crate::lineage_repair::{plan_same_dir_temp, unique_sibling, write_planned_temp};
-use crate::operations::SchemaTransitionJournalBasis;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineRoot {
@@ -314,10 +311,6 @@ impl QuarantineDriver {
             if group.state == PublicationGroupState::Unarmed {
                 continue;
             }
-            if group.kind == PublicationGroupKind::SchemaTransition {
-                self.recover_schema_transition_group(store, &group)?;
-                continue;
-            }
             if group.kind == PublicationGroupKind::Codegen && !recover_codegen {
                 continue;
             }
@@ -357,124 +350,6 @@ impl QuarantineDriver {
             )?;
         }
         Ok(outcomes)
-    }
-
-    fn recover_schema_transition_group(
-        &self,
-        store: &mut Store,
-        group: &PublicationGroup,
-    ) -> Result<(), QuarantineError> {
-        let basis = SchemaTransitionJournalBasis::decode(&group.basis).map_err(|detail| {
-            QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: group.group_id,
-                detail,
-            }))
-        })?;
-        let current = store
-            .schema_manifest_basis()?
-            .ok_or_else(|| {
-                QuarantineError::Store(Box::new(StoreError::BadIntent {
-                    intent_id: group.group_id,
-                    detail: "schema-transition recovery has no durable manifest basis".into(),
-                }))
-            })?
-            .manifest_hash;
-        if current != basis.old_manifest_hash && current != basis.proposed_manifest_hash {
-            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: group.group_id,
-                detail: "durable manifest matches neither side of the schema transition".into(),
-            })));
-        }
-        let target_bytes = std::fs::read(&basis.target).map_err(|source| {
-            QuarantineError::Store(Box::new(StoreError::Io {
-                path: basis.target.clone(),
-                source,
-            }))
-        })?;
-        let target_hash = ContentHash(*blake3::hash(&target_bytes).as_bytes());
-        if target_hash == current {
-            store.retire_publication_group(group.group_id)?;
-            return Ok(());
-        }
-        if current != basis.old_manifest_hash || target_hash != basis.proposed_manifest_hash {
-            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: group.group_id,
-                detail:
-                    "schema-transition file and durable authority do not form a recoverable pair"
-                        .into(),
-            })));
-        }
-        let [child] = group.child_intents.as_slice() else {
-            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: group.group_id,
-                detail: "schema transition must have exactly one journal child".into(),
-            })));
-        };
-        let displaced = store
-            .quarantined_entries()?
-            .into_iter()
-            .find(|entry| {
-                entry.intent_id == *child
-                    && entry.ordinal == 0
-                    && entry.content_hash == basis.old_manifest_hash
-            })
-            .ok_or_else(|| {
-                QuarantineError::Store(Box::new(StoreError::BadIntent {
-                    intent_id: group.group_id,
-                    detail: "schema-transition recovery lost its retained manifest preimage".into(),
-                }))
-            })?;
-        let old_bytes = std::fs::read(&displaced.path).map_err(|source| {
-            QuarantineError::Store(Box::new(StoreError::Io {
-                path: displaced.path.clone(),
-                source,
-            }))
-        })?;
-        if ContentHash(*blake3::hash(&old_bytes).as_bytes()) != basis.old_manifest_hash {
-            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: group.group_id,
-                detail: "retained schema-manifest preimage hash changed".into(),
-            })));
-        }
-
-        let temp = plan_same_dir_temp(&basis.target).map_err(|detail| {
-            QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: group.group_id,
-                detail,
-            }))
-        })?;
-        let reverse_plan = JournalIntentPlan {
-            target_path: basis.target.to_string_lossy().into_owned(),
-            temp_path: temp.to_string_lossy().into_owned(),
-            conflict_path: unique_sibling(&basis.target, "schema-recovery-conflict")
-                .to_string_lossy()
-                .into_owned(),
-            pre_image_hash: Some(basis.proposed_manifest_hash),
-            proposed_hash: basis.old_manifest_hash,
-        };
-        let reverse = store.record_publication_group(
-            PublicationGroupKind::SchemaTransition,
-            &group.basis,
-            &[reverse_plan],
-        )?;
-        write_planned_temp(&temp, &old_bytes).map_err(|detail| {
-            QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: reverse.group_id,
-                detail,
-            }))
-        })?;
-        store.arm_publication_group(reverse.group_id)?;
-        let quarantine = self.quarantine_for(&basis.target)?;
-        let outcome = store.publish_journaled_replacement(reverse.child_intents[0], quarantine)?;
-        if outcome != distill_store::journal::RenameAsideOutcome::Installed {
-            return Err(QuarantineError::Store(Box::new(StoreError::BadIntent {
-                intent_id: reverse.group_id,
-                detail: "schema-transition recovery could not restore the retained preimage".into(),
-            })));
-        }
-        store.retire_publication_group(reverse.group_id)?;
-        store.retire_publication_group(group.group_id)?;
-        Ok(())
     }
 
     /// Reconcile startup work that can be authorized by watched-root
@@ -629,93 +504,3 @@ impl PublicationDriver<'_> {
     }
 }
 
-#[cfg(test)]
-mod schema_transition_recovery_tests {
-    use super::*;
-    use distill_store::pipeline::{SchemaLineageManifest, VerifiedSchemaLineageManifest};
-    use distill_store::StoreConfig;
-
-    fn hash(bytes: &[u8]) -> ContentHash {
-        ContentHash(*blake3::hash(bytes).as_bytes())
-    }
-
-    fn interrupted_transition(store_already_committed: bool) {
-        let tempdir = tempfile::tempdir().unwrap();
-        let root = tempdir.path().join("assets");
-        let quarantine_path = root.join(".displaced");
-        std::fs::create_dir_all(&quarantine_path).unwrap();
-        let target = root.join("lineage.bundle");
-        let old_bytes = b"old manifest bytes";
-        let proposed_bytes = b"proposed manifest bytes";
-        let old_hash = hash(old_bytes);
-        let proposed_hash = hash(proposed_bytes);
-        std::fs::write(&target, old_bytes).unwrap();
-
-        let mut store = Store::open(StoreConfig::new(tempdir.path().join("state"))).unwrap();
-        let projected_hash = if store_already_committed {
-            proposed_hash
-        } else {
-            old_hash
-        };
-        store
-            .input_transaction(|transaction| {
-                transaction.project_verified_lineage_manifest(
-                    &VerifiedSchemaLineageManifest::from_verified_source(
-                        projected_hash,
-                        SchemaLineageManifest::default(),
-                    ),
-                )
-            })
-            .unwrap();
-        let driver = QuarantineDriver::new([QuarantineRoot::new(&root, &quarantine_path)]).unwrap();
-        let proposal_temp = plan_same_dir_temp(&target).unwrap();
-        let basis = SchemaTransitionJournalBasis {
-            base: store.input_version(),
-            target: target.clone(),
-            old_manifest_hash: old_hash,
-            proposed_manifest_hash: proposed_hash,
-        };
-        let group = store
-            .record_publication_group(
-                PublicationGroupKind::SchemaTransition,
-                &basis.encode().unwrap(),
-                &[JournalIntentPlan {
-                    target_path: target.to_string_lossy().into_owned(),
-                    temp_path: proposal_temp.to_string_lossy().into_owned(),
-                    conflict_path: unique_sibling(&target, "conflict")
-                        .to_string_lossy()
-                        .into_owned(),
-                    pre_image_hash: Some(old_hash),
-                    proposed_hash,
-                }],
-            )
-            .unwrap();
-        write_planned_temp(&proposal_temp, proposed_bytes).unwrap();
-        store.arm_publication_group(group.group_id).unwrap();
-        assert_eq!(
-            store
-                .publish_journaled_replacement(group.child_intents[0], &quarantine_path)
-                .unwrap(),
-            distill_store::journal::RenameAsideOutcome::Installed
-        );
-
-        driver.reconcile_non_codegen(&mut store).unwrap();
-        let expected = if store_already_committed {
-            proposed_bytes.as_slice()
-        } else {
-            old_bytes.as_slice()
-        };
-        assert_eq!(std::fs::read(&target).unwrap(), expected);
-        assert!(store.unfinished_publication_groups().unwrap().is_empty());
-    }
-
-    #[test]
-    fn interrupted_schema_transition_restores_preimage_when_store_is_old() {
-        interrupted_transition(false);
-    }
-
-    #[test]
-    fn interrupted_schema_transition_keeps_proposal_when_store_committed() {
-        interrupted_transition(true);
-    }
-}

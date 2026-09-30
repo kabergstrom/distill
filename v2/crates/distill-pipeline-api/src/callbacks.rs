@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use distill_core::callback::CallbackPanic;
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_core::tool::ToolCwdPolicy;
 use distill_json::AuthoredValue;
 use distill_migrate::FieldPath;
@@ -380,6 +380,23 @@ pub trait PipelineValidator: Send + Sync + 'static {
         asset: &AuthoredValue,
         diagnostics: &mut Diagnostics,
     ) -> Result<(), CallbackPanic>;
+}
+
+/// Which conversion a migration function performs: values of `type_uuid`
+/// written under schema `from` become values under schema `to`. The build
+/// looks a function up by the entry's own schema hash and the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MigrationKey {
+    pub type_uuid: TypeUuid,
+    pub from: LogicalHash,
+    pub to: LogicalHash,
+}
+
+impl MigrationKey {
+    /// The registration id and capability key.
+    pub fn id(&self) -> String {
+        format!("{}:{}:{}", self.type_uuid, self.from, self.to)
+    }
 }
 
 pub trait PipelineMigration: Send + Sync + 'static {

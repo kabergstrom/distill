@@ -444,16 +444,9 @@ fn every_dslf_local_failure_class_has_a_stable_nonzero_code() {
     assert_eq!(classes.map(|class| class as u16), [1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
-fn migration_query() -> ControlQuery {
-    ControlQuery::MigrationEdges {
-        type_uuid: TypeUuid([10; 16]),
-        from_hash: LogicalHash([11; 32]),
-    }
-}
-
 #[test]
 fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
-    let query = migration_query();
+    let query = ControlQuery::DirectoryImportRuleSet;
     let a = AssetUuid([1; 16]);
     let b = AssetUuid([2; 16]);
     let failure = control_failure_fingerprint(
@@ -472,15 +465,11 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
     expected.push(1); // domain version
     expected.extend_from_slice(&1_u32.to_le_bytes()); // trace entry count
     expected.push(8); // TraceOp::Control
-    expected.push(1); // ControlQuery::MigrationEdges
-    expected.extend_from_slice(&[10; 16]);
-    expected.extend_from_slice(&[11; 32]);
+    expected.push(2); // ControlQuery::DirectoryImportRuleSet
     expected.push(2); // Observed::Err
     expected.push(9); // StableFailureFingerprint::Control
     expected.push(1); // ControlFailureSubject::Query
-    expected.push(1); // ControlQuery::MigrationEdges
-    expected.extend_from_slice(&[10; 16]);
-    expected.extend_from_slice(&[11; 32]);
+    expected.push(2); // ControlQuery::DirectoryImportRuleSet
     expected.extend_from_slice(&3_u16.to_le_bytes()); // Ambiguous
     expected.extend_from_slice(&2_u32.to_le_bytes()); // sorted/dedup entries
     expected.extend_from_slice(&a.0);
@@ -491,7 +480,7 @@ fn dstr_control_failure_bytes_pin_tags_u16_codes_and_framing() {
 #[test]
 fn dstr_control_read_failure_pins_read_subject_tag() {
     let asset = AssetUuid([21; 16]);
-    let subject = ControlSubject::Migration(asset);
+    let subject = ControlSubject::PackDefinition(asset);
     let failure = control_failure_fingerprint(
         ControlFailureSubject::Read(subject.clone()),
         ControlFailureCode::Missing,
@@ -508,12 +497,12 @@ fn dstr_control_read_failure_pins_read_subject_tag() {
     expected.push(1);
     expected.extend_from_slice(&1_u32.to_le_bytes());
     expected.push(9); // TraceOp::ControlRead
-    expected.push(1); // ControlSubject::Migration
+    expected.push(2); // ControlSubject::PackDefinition
     expected.extend_from_slice(&asset.0);
     expected.push(2); // Observed::Err
     expected.push(9); // StableFailureFingerprint::Control
     expected.push(2); // ControlFailureSubject::Read
-    expected.push(1); // ControlSubject::Migration
+    expected.push(2); // ControlSubject::PackDefinition
     expected.extend_from_slice(&asset.0);
     expected.extend_from_slice(&2_u16.to_le_bytes()); // Missing
     expected.extend_from_slice(&0_u32.to_le_bytes()); // no conflicting entries
@@ -561,7 +550,7 @@ fn control_failure_entries_are_sorted_and_deduplicated_before_revalidation() {
 #[test]
 fn successful_and_failed_control_reads_revalidate_and_heal() {
     let asset = AssetUuid([12; 16]);
-    let subject = ControlSubject::Migration(asset);
+    let subject = ControlSubject::PackDefinition(asset);
     let identity = ControlValueHash([13; 32]);
     let success = TraceOp::ControlRead {
         subject: subject.clone(),
@@ -595,23 +584,6 @@ fn successful_and_failed_control_reads_revalidate_and_heal() {
         .control_reads
         .insert(subject, Observed::Ok(identity));
     assert!(!revalidate(std::slice::from_ref(&failed), &snapshot));
-}
-
-#[test]
-fn directory_rule_enumeration_is_distinct_control_trace_data() {
-    let empty = [0; 32];
-    let migrations = TraceOp::Control {
-        query: migration_query(),
-        observed: Observed::Ok(empty),
-    };
-    let directory_rules = TraceOp::Control {
-        query: ControlQuery::DirectoryImportRuleSet,
-        observed: Observed::Ok(empty),
-    };
-    assert_ne!(
-        trace_canonical_bytes(&[migrations]),
-        trace_canonical_bytes(&[directory_rules])
-    );
 }
 
 #[test]

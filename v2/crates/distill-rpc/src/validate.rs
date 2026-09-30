@@ -20,9 +20,6 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
     if let Some(pipeline) = &commit.pipeline {
         validate_pipeline_diagnostic(pipeline)?;
     }
-    if let Some(Some(repair)) = &commit.lineage_repair {
-        validate_lineage_repair_state(repair)?;
-    }
     if let Some(derived_outputs) = &commit.derived_outputs {
         for (child, entry) in derived_outputs {
             if *child != AssetUuid::v5(entry.parent, &entry.output_key)
@@ -185,72 +182,6 @@ pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
     Ok(())
 }
 
-pub(crate) fn validate_lineage_repair_state(state: &LineageRepairState) -> Result<(), AdminError> {
-    let invalid = |detail: &str| AdminError::InvalidLineageRepairState {
-        detail: detail.to_owned(),
-    };
-    match state {
-        LineageRepairState::Missing {
-            configured_root,
-            configured_path,
-            ..
-        } => {
-            if !valid_identifier(configured_root) || !valid_logical_path(configured_path) {
-                return Err(invalid("missing-lineage destination is not canonical"));
-            }
-        }
-        LineageRepairState::Duplicate { claimants } => {
-            if claimants.len() < 2
-                || claimants.windows(2).any(|pair| pair[0] >= pair[1])
-                || claimants.iter().any(|claimant| {
-                    !valid_identifier(&claimant.root_name)
-                        || !valid_logical_path(&claimant.normalized_path)
-                        || !valid_reference_local_id(&claimant.local_id)
-                })
-            {
-                return Err(invalid(
-                    "duplicate-lineage claimants must be canonical, strict, and contain at least two rows",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_lineage_repair_configuration(
-    configuration: &ConfigurationStatus,
-    repair: Option<&LineageRepairState>,
-) -> Result<(), AdminError> {
-    let matches = match (configuration, repair) {
-        (ConfigurationStatus::Ready, None) => true,
-        (
-            ConfigurationStatus::Failed(ConfigurationError { detail, .. }),
-            Some(LineageRepairState::Missing { .. }),
-        ) => matches!(detail.as_ref(), DscpV1::MissingLineageManifest),
-        (
-            ConfigurationStatus::Failed(ConfigurationError { detail, .. }),
-            Some(LineageRepairState::Duplicate { claimants }),
-        ) => matches!(
-            detail.as_ref(),
-            DscpV1::DuplicateLineageManifest { entries } if entries == claimants
-        ),
-        (ConfigurationStatus::Failed(error), None) => !matches!(
-            error.detail.as_ref(),
-            DscpV1::MissingLineageManifest | DscpV1::DuplicateLineageManifest { .. }
-        ),
-        _ => false,
-    };
-    if matches {
-        Ok(())
-    } else {
-        Err(AdminError::InvalidLineageRepairState {
-            detail:
-                "repair inspection must exactly match the current missing/duplicate DSCP detail"
-                    .to_owned(),
-        })
-    }
-}
-
 pub(crate) fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> Result<(), AdminError> {
     let invalid = |detail: &str| AdminError::InvalidPipelineDiagnostic {
         detail: detail.to_owned(),
@@ -260,50 +191,6 @@ pub(crate) fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> R
         PipelineDiagnostic::Failed(failure) => failure
             .validate()
             .map_err(|error| invalid(&format!("invalid DSPP record: {error:?}"))),
-        PipelineDiagnostic::SchemaAcceptanceRequired(required) => {
-            if required.mismatches.is_empty() {
-                return Err(invalid("schema mismatch table must not be empty"));
-            }
-            let mut previous = None;
-            for mismatch in &required.mismatches {
-                if previous.is_some_and(|uuid| uuid >= mismatch.type_uuid)
-                    || distill_core::bootstrap::is_bootstrap_control_type(mismatch.type_uuid)
-                    || mismatch.candidate == mismatch.manifest
-                {
-                    return Err(invalid(
-                        "schema mismatches must be strict, non-bootstrap disagreements",
-                    ));
-                }
-                previous = Some(mismatch.type_uuid);
-            }
-            Ok(())
-        }
-        PipelineDiagnostic::RetiredTypeReferenced(retired) => {
-            if retired.references.is_empty() {
-                return Err(invalid("retired reference table must not be empty"));
-            }
-            let mut previous: Option<Vec<u8>> = None;
-            for reference in &retired.references {
-                let mut encoded = Vec::with_capacity(17);
-                match reference {
-                    RetiredTypeReference::Asset(uuid) => {
-                        encoded.push(1);
-                        encoded.extend_from_slice(&uuid.0);
-                    }
-                    RetiredTypeReference::MigrationEndpoint(asset) => {
-                        encoded.push(2);
-                        encoded.extend_from_slice(&asset.0);
-                    }
-                }
-                if previous.as_ref().is_some_and(|prior| prior >= &encoded) {
-                    return Err(invalid(
-                        "retired references must be strictly canonical and deduplicated",
-                    ));
-                }
-                previous = Some(encoded);
-            }
-            Ok(())
-        }
     }
 }
 

@@ -7,8 +7,8 @@
 
 use crate::callbacks::{
     cleanup_callback, erase_callback, CallbackHandle, CodegenDescriptor, DefaultsDescriptor,
-    ImporterDescriptor, PipelineCodegen, PipelineDefaults, PipelineImporter, PipelineMigration,
-    PipelineProcessor, PipelineValidator, ProcessorDescriptor, ToolDescriptor,
+    ImporterDescriptor, MigrationKey, PipelineCodegen, PipelineDefaults, PipelineImporter,
+    PipelineMigration, PipelineProcessor, PipelineValidator, ProcessorDescriptor, ToolDescriptor,
     ValidatorDescriptor,
 };
 
@@ -205,10 +205,10 @@ impl<'a> RegistrationArena<'a> {
 
     pub fn register_migration<T: PipelineMigration>(
         &mut self,
-        key: impl Into<String>,
+        key: MigrationKey,
         callback: T,
     ) -> RegistrationStatus {
-        let key = key.into();
+        let key = key.id();
         let registration = Registration {
             kind: RegistrationKind::Migration,
             id: key.clone(),

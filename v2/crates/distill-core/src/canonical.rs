@@ -21,9 +21,6 @@ pub const DSTG: [u8; 4] = *b"DSTG";
 pub const DSSI: [u8; 4] = *b"DSSI";
 /// `TraceOp` sequences (§9).
 pub const DSTR: [u8; 4] = *b"DSTR";
-/// Schema-lineage chain digest — a type's ordered schema-digest history
-/// (§6, §11, §13).
-pub const DSSL: [u8; 4] = *b"DSSL";
 /// Typed local deterministic-failure detail (§5, §9).
 pub const DSLF: [u8; 4] = *b"DSLF";
 /// Typed configuration-error reason facts (§5, §13, §17).

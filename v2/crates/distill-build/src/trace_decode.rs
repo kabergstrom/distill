@@ -273,10 +273,6 @@ impl Reader<'_> {
 
     fn control_query(&mut self) -> Result<ControlQuery, TraceDecodeError> {
         Ok(match self.u8()? {
-            1 => ControlQuery::MigrationEdges {
-                type_uuid: TypeUuid(self.array16()?),
-                from_hash: LogicalHash(self.array32()?),
-            },
             2 => ControlQuery::DirectoryImportRuleSet,
             tag => return Err(TraceDecodeError::UnknownControlQuery(tag)),
         })
@@ -284,14 +280,12 @@ impl Reader<'_> {
 
     fn control_subject(&mut self) -> Result<ControlSubject, TraceDecodeError> {
         Ok(match self.u8()? {
-            1 => ControlSubject::Migration(AssetUuid(self.array16()?)),
             2 => ControlSubject::PackDefinition(AssetUuid(self.array16()?)),
             3 => ControlSubject::DirectoryImportRules(AssetUuid(self.array16()?)),
             4 => ControlSubject::ImportSettings {
                 bundle: BundleUuid(self.array16()?),
                 local_id: self.string()?,
             },
-            5 => ControlSubject::SchemaLineageManifest,
             tag => return Err(TraceDecodeError::UnknownControlSubject(tag)),
         })
     }

@@ -22,8 +22,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use distill_core::canonical::{domain_digest, CanonicalEncoder, DSCP, DSPP, DSVP};
-use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_core::target_set::{CanonicalTargetSet, TargetSetError};
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::target_set::CanonicalTargetSet;
 use ngp_schema::identity::LayoutIdentity;
 
 /// Advanced by watcher batches + authoring ops — module/schema artifact
@@ -108,76 +108,13 @@ pub struct PipelineEpoch {
     pub dylib_hash: [u8; 32],
     /// Complete canonical target-definition set used to construct the
     /// candidate pipeline map. The store validates and compares these exact
-    /// canonical rows before publishing and before every schema command.
+    /// canonical rows before publishing.
     pub target_set: CanonicalTargetSet,
-    /// The candidate's complete compiled registry projection. `Ready`
-    /// requires exact key/value equality with the authoritative lineage
-    /// manifest's current cursors; a missing, extra, or unequal row is a
-    /// typed schema-acceptance requirement instead.
+    /// The candidate's complete compiled registry projection: the current
+    /// logical schema of every registered type.
     pub schema_registry: BTreeMap<TypeUuid, LogicalHash>,
     /// Importer/processor registrations and versions.
     pub registrations: Vec<Registration>,
-}
-
-/// Store-side identity of a candidate whose logical schema projection is
-/// awaiting explicit acceptance or rollback. The staged dylib and exact
-/// canonical target rows prevent a different candidate from consuming the
-/// pending command; its exact logical map is stored separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelineCandidateIdentity {
-    pub dylib_hash: [u8; 32],
-    pub target_set: CanonicalTargetSet,
-}
-
-impl TryFrom<&PipelineEpoch> for PipelineCandidateIdentity {
-    type Error = TargetSetError;
-
-    fn try_from(epoch: &PipelineEpoch) -> Result<Self, Self::Error> {
-        let target_set = CanonicalTargetSet::from_canonical(epoch.target_set.rows.clone())?;
-        Ok(Self {
-            dylib_hash: epoch.dylib_hash,
-            target_set,
-        })
-    }
-}
-
-/// One exact registry-versus-authority disagreement. `None` names a row
-/// missing from that side, so missing, extra, and unequal cases share one
-/// stable typed representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchemaRegistryMismatch {
-    pub type_uuid: TypeUuid,
-    pub candidate: Option<LogicalHash>,
-    pub manifest: Option<LogicalHash>,
-}
-
-/// Exact stale-base identity of the verified source-controlled manifest.
-/// The file hash prevents ABA across append-only history changes; the full
-/// sorted cursor projection makes the requested selection explicit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaManifestBasis {
-    pub manifest_hash: ContentHash,
-    pub current_cursors: BTreeMap<TypeUuid, LogicalHash>,
-}
-
-/// A candidate that cannot become `Ready` until explicit schema acceptance
-/// or rollback publishes another verified source-controlled manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaAcceptanceRequired {
-    pub manifest: SchemaManifestBasis,
-    pub candidate: PipelineCandidateIdentity,
-    pub mismatches: Vec<SchemaRegistryMismatch>,
-}
-
-/// A published input version contains bytes that require explicitly retired
-/// schema authority. The sorted references are the waiting projection that an
-/// explicit reactivation may admit atomically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetiredTypeReferenced {
-    pub manifest_hash: ContentHash,
-    pub basis: SnapshotStamp,
-    pub type_uuid: TypeUuid,
-    pub references: Vec<crate::error::RetiredTypeReference>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,8 +317,6 @@ pub enum ConfigurationErrorCode {
     InvalidParallelism = 7,
     InvalidBatchReservation = 8,
     DirectoryAlias = 9,
-    MissingLineageManifest = 10,
-    DuplicateLineageManifest = 11,
     UnsupportedTargetIdentity = 12,
     DuplicateTargetName = 13,
     ConfigurationSourceUnavailable = 14,
@@ -401,8 +336,6 @@ impl TryFrom<u16> for ConfigurationErrorCode {
             7 => Ok(Self::InvalidParallelism),
             8 => Ok(Self::InvalidBatchReservation),
             9 => Ok(Self::DirectoryAlias),
-            10 => Ok(Self::MissingLineageManifest),
-            11 => Ok(Self::DuplicateLineageManifest),
             12 => Ok(Self::UnsupportedTargetIdentity),
             13 => Ok(Self::DuplicateTargetName),
             14 => Ok(Self::ConfigurationSourceUnavailable),
@@ -495,16 +428,6 @@ pub struct DirectoryAliasSide {
     pub normalized_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LineageManifestClaimant {
-    pub root_name: String,
-    pub normalized_path: String,
-    pub bundle: BundleUuid,
-    pub local_id: String,
-    pub asset: AssetUuid,
-    pub file_hash: BundleFileHash,
-}
-
 /// Exact, closed typed facts hashed by DSCP v1. Presentation prose never
 /// enters this value; callers supply it separately when publishing an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,10 +464,6 @@ pub enum DscpV1 {
         first: DirectoryAliasSide,
         second: DirectoryAliasSide,
     },
-    MissingLineageManifest,
-    DuplicateLineageManifest {
-        entries: Vec<LineageManifestClaimant>,
-    },
     UnsupportedTargetIdentity {
         target: String,
         expected: LayoutIdentity,
@@ -573,10 +492,6 @@ impl DscpV1 {
                 ConfigurationErrorCode::InvalidBatchReservation
             }
             Self::DirectoryAlias { .. } => ConfigurationErrorCode::DirectoryAlias,
-            Self::MissingLineageManifest => ConfigurationErrorCode::MissingLineageManifest,
-            Self::DuplicateLineageManifest { .. } => {
-                ConfigurationErrorCode::DuplicateLineageManifest
-            }
             Self::UnsupportedTargetIdentity { .. } => {
                 ConfigurationErrorCode::UnsupportedTargetIdentity
             }
@@ -588,7 +503,7 @@ impl DscpV1 {
     }
 
     /// `blake3("DSCP" || 0x01 || code:u16 || exact variant fields)`.
-    /// Symmetric records and unordered lineage UUIDs are canonicalized here,
+    /// Symmetric records are canonicalized here,
     /// so callers cannot publish an order-dependent state.
     pub fn reason_hash(&self) -> [u8; 32] {
         domain_digest(DSCP, 1, |encoder| {
@@ -651,10 +566,6 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
         DscpV1::DirectoryAlias { first, second } => {
             encode_symmetric_pair(encoder, first, second, encode_directory_alias_side);
         }
-        DscpV1::MissingLineageManifest => {}
-        DscpV1::DuplicateLineageManifest { entries } => {
-            encoder.set(entries, encode_lineage_manifest_claimant);
-        }
         DscpV1::UnsupportedTargetIdentity {
             target,
             expected,
@@ -670,18 +581,6 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
             encoder.u16(*failure as u16);
         }
     }
-}
-
-pub(crate) fn encode_lineage_manifest_claimant(
-    encoder: &mut CanonicalEncoder,
-    claimant: &LineageManifestClaimant,
-) {
-    encoder.str(&claimant.root_name);
-    encoder.str(&claimant.normalized_path);
-    encoder.raw(&claimant.bundle.0);
-    encoder.str(&claimant.local_id);
-    encoder.raw(&claimant.asset.0);
-    encoder.raw(&claimant.file_hash.0);
 }
 
 fn encode_configuration_source_path(
@@ -824,17 +723,6 @@ impl<'a> DscpDecoder<'a> {
         }
     }
 
-    fn lineage_manifest_claimant(&mut self) -> Result<LineageManifestClaimant, DscpError> {
-        Ok(LineageManifestClaimant {
-            root_name: self.string()?,
-            normalized_path: self.string()?,
-            bundle: BundleUuid(self.array()?),
-            local_id: self.string()?,
-            asset: AssetUuid(self.array()?),
-            file_hash: BundleFileHash(self.array()?),
-        })
-    }
-
     fn layout_identity(&mut self) -> Result<LayoutIdentity, DscpError> {
         Ok(LayoutIdentity {
             target_triple: self.string()?,
@@ -885,15 +773,6 @@ impl<'a> DscpDecoder<'a> {
                 first: self.directory_alias_side()?,
                 second: self.directory_alias_side()?,
             },
-            ConfigurationErrorCode::MissingLineageManifest => DscpV1::MissingLineageManifest,
-            ConfigurationErrorCode::DuplicateLineageManifest => {
-                let count = self.count(76)?;
-                DscpV1::DuplicateLineageManifest {
-                    entries: (0..count)
-                        .map(|_| self.lineage_manifest_claimant())
-                        .collect::<Result<Vec<_>, _>>()?,
-                }
-            }
             ConfigurationErrorCode::UnsupportedTargetIdentity => {
                 DscpV1::UnsupportedTargetIdentity {
                     target: self.string()?,
@@ -931,22 +810,7 @@ fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
         DscpV1::MalformedConfiguration { .. }
         | DscpV1::InvalidParallelism { .. }
         | DscpV1::InvalidBatchReservation { .. }
-        | DscpV1::MissingLineageManifest
         | DscpV1::ConfigurationSourceUnavailable { .. } => {}
-        DscpV1::DuplicateLineageManifest { entries } => {
-            for entry in entries {
-                if validate_root_and_path(&entry.root_name, &entry.normalized_path).is_err()
-                    || validate_identifier(&entry.local_id).is_err()
-                {
-                    return Err(DscpError::InvalidText);
-                }
-                values.extend([
-                    entry.root_name.as_str(),
-                    entry.normalized_path.as_str(),
-                    entry.local_id.as_str(),
-                ]);
-            }
-        }
         DscpV1::NonLoopbackAddress { address } => values.push(address.as_str()),
         DscpV1::DuplicateRootName { normalized_name }
         | DscpV1::DuplicateTargetName { normalized_name } => {
@@ -2037,47 +1901,22 @@ impl NamespaceError {
 #[derive(Debug, Clone)]
 pub enum PipelineState {
     Ready(Arc<PipelineEpoch>),
-    SchemaAcceptanceRequired {
-        required: SchemaAcceptanceRequired,
-        last_good: Option<Arc<PipelineEpoch>>,
-    },
-    RetiredTypeReferenced {
-        error: RetiredTypeReferenced,
-        last_good: Option<Arc<PipelineEpoch>>,
-    },
     Failed {
         error: PipelineFailure,
         last_good: Option<Arc<PipelineEpoch>>,
     },
 }
 
-/// Typed reason a snapshot has no usable pipeline epoch. Schema acceptance
-/// is deliberately not collapsed into a generic pipeline failure: authoring can
-/// inspect its manifest/candidate basis and issue the explicit bound command.
+/// Typed reason a snapshot has no usable pipeline epoch.
 #[derive(Debug, Clone, Copy)]
 pub enum PipelineUnavailable<'a> {
     Failed(&'a PipelineFailure),
-    SchemaAcceptanceRequired(&'a SchemaAcceptanceRequired),
-    RetiredTypeReferenced(&'a RetiredTypeReferenced),
 }
 
 impl fmt::Display for PipelineUnavailable<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PipelineUnavailable::Failed(error) => error.fmt(f),
-            PipelineUnavailable::SchemaAcceptanceRequired(required) => write!(
-                f,
-                "schema acceptance required for candidate dylib {:02x?} against source manifest {} ({} registry mismatch(es))",
-                required.candidate.dylib_hash,
-                required.manifest.manifest_hash,
-                required.mismatches.len()
-            ),
-            PipelineUnavailable::RetiredTypeReferenced(error) => write!(
-                f,
-                "retired type {} is referenced by {} waiting input(s)",
-                error.type_uuid,
-                error.references.len()
-            ),
         }
     }
 }
@@ -2090,12 +1929,6 @@ impl PipelineState {
     pub fn epoch(&self) -> Result<&Arc<PipelineEpoch>, PipelineUnavailable<'_>> {
         match self {
             PipelineState::Ready(epoch) => Ok(epoch),
-            PipelineState::SchemaAcceptanceRequired { required, .. } => {
-                Err(PipelineUnavailable::SchemaAcceptanceRequired(required))
-            }
-            PipelineState::RetiredTypeReferenced { error, .. } => {
-                Err(PipelineUnavailable::RetiredTypeReferenced(error))
-            }
             PipelineState::Failed { error, .. } => Err(PipelineUnavailable::Failed(error)),
         }
     }

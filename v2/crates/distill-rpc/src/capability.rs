@@ -1,5 +1,5 @@
 //! Client capabilities over one front end ([`Server`]): target-bound hubs
-//! and snapshots, metadata and lineage-repair bootstraps, pack sessions,
+//! and snapshots, metadata bootstraps, pack sessions,
 //! delta streams and progress completions. Every call reads the store
 //! through the capability's pinned read transaction (snapshots) or the front
 //! end's current-state reader (fences, CAS).
@@ -29,12 +29,6 @@ use crate::*;
 
 // ---------------------------------------------------------------------------
 // Capability types
-
-#[derive(Clone)]
-pub struct LineageRepair {
-    pub(crate) server: Server,
-    pub(crate) binding: Rc<MetadataBinding>,
-}
 
 #[derive(Clone)]
 pub struct Hub {
@@ -106,14 +100,6 @@ impl Drop for PackSession {
         {
             slot.take();
         }
-    }
-}
-
-impl fmt::Debug for LineageRepair {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LineageRepair")
-            .field("binding", &self.binding.id)
-            .finish_non_exhaustive()
     }
 }
 
@@ -608,17 +594,6 @@ fn authority_outcome<T>(
     })
 }
 
-/// Run a checked lineage repair's job here.
-fn lineage_outcome(
-    call: Result<AuthorityCall<LineageRepairMutationOutcome>, LineageRepairMutationOutcome>,
-) -> LineageRepairMutationOutcome {
-    match call {
-        Ok(call) => lineage_call_outcome(call.run()),
-        Err(outcome) => outcome,
-    }
-}
-
-/// What a lineage repair's job answered, or that the authority stopped.
 /// What a [`Hub::write_call`] answered.
 pub fn write_call_outcome(
     outcome: Result<Option<RpcResult<InputVersion>>, AuthorityStopped>,
@@ -635,16 +610,6 @@ pub fn import_call_outcome(
     outcome: Result<Option<RpcResult<BundleUuid>>, AuthorityStopped>,
 ) -> RpcResult<BundleUuid> {
     authority_outcome(outcome).expect("an import always publishes")
-}
-
-pub fn lineage_call_outcome(
-    outcome: Result<LineageRepairMutationOutcome, AuthorityStopped>,
-) -> LineageRepairMutationOutcome {
-    outcome.unwrap_or_else(|AuthorityStopped| {
-        LineageRepairMutationOutcome::Failure(RpcFailure::AuthoringBackendUnavailable {
-            operation: "lineageRepair".to_owned(),
-        })
-    })
 }
 
 /// Complete a prepared operation on the authority, still at `base`.
@@ -714,231 +679,6 @@ impl ProgressCompletion for ServerOperationCompletion {
 
     fn cancel(&self) -> bool {
         self.publication.borrow_mut().take().is_some()
-    }
-}
-
-struct MetadataSchemaTransitionCompletion {
-    server: Server,
-    binding: Rc<MetadataBinding>,
-    base: InputVersion,
-    publication: RefCell<Option<PreparedOperationPublication>>,
-}
-
-impl ProgressCompletion for MetadataSchemaTransitionCompletion {
-    fn complete_call(&self) -> Result<AuthorityCall<Result<(), String>>, String> {
-        let publication = self
-            .publication
-            .borrow_mut()
-            .take()
-            .ok_or_else(|| "schema transition is already terminal".to_owned())?;
-        if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-            return Err(format!(
-                "schema transition lost its metadata binding: {reason:?}"
-            ));
-        }
-        Ok(complete_on_authority(
-            &self.server,
-            self.base,
-            publication,
-            "schema transition",
-        ))
-    }
-
-    fn cancel(&self) -> bool {
-        self.publication.borrow_mut().take().is_some()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Lineage repair
-
-/// The current lineage inspection as `binding` sees it.
-fn lineage_inspection_now(
-    server: &Server,
-    binding: &MetadataBinding,
-) -> Result<LineageRepairInspection, LineageRepairMutationOutcome> {
-    if let Some(reason) = server.inner.metadata_fence(binding) {
-        return Err(LineageRepairMutationOutcome::ReconnectRequired { reason });
-    }
-    let txn = server
-        .inner
-        .current_snapshot()
-        .map_err(|error| LineageRepairMutationOutcome::Failure(store_failure(error)))?;
-    crate::lineage::lineage_inspection(txn.stamp, &txn.configuration, txn.lineage_repair.as_ref())
-        .map_err(|failure| match failure {
-            crate::lineage::LineageInspectionFailure::Unavailable(unavailable) => {
-                LineageRepairMutationOutcome::Unavailable(unavailable)
-            }
-            crate::lineage::LineageInspectionFailure::Invalid(error) => {
-                LineageRepairMutationOutcome::Failure(error)
-            }
-        })
-}
-
-/// `basis` is still the current inspection.
-fn lineage_preflight(
-    server: &Server,
-    binding: &MetadataBinding,
-    basis: &LineageRepairInspection,
-) -> Result<(), LineageRepairMutationOutcome> {
-    let current = lineage_inspection_now(server, binding)?;
-    if &current != basis {
-        return Err(LineageRepairMutationOutcome::StaleBasis(
-            crate::lineage::lineage_stale(basis, &current),
-        ));
-    }
-    Ok(())
-}
-
-/// On the authority: recheck the inspection, run the backend, publish.
-fn publish_lineage_repair_locked(
-    server: &Server,
-    binding: &MetadataBinding,
-    basis: LineageRepairInspection,
-    prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError>,
-) -> LineageRepairMutationOutcome {
-    if let Err(outcome) = lineage_preflight(server, binding, &basis) {
-        return outcome;
-    }
-    let base = basis.stamp.version;
-    let prepared = match prepare() {
-        Ok(commit) => commit,
-        Err(LineageRepairBackendError::Stale(stale)) => {
-            return LineageRepairMutationOutcome::StaleBasis(stale)
-        }
-        Err(LineageRepairBackendError::Invalid(invalid)) => {
-            return LineageRepairMutationOutcome::Invalid(invalid)
-        }
-        Err(LineageRepairBackendError::Failure(error)) => {
-            return LineageRepairMutationOutcome::Failure(error)
-        }
-    };
-    if !prepared.assets.is_empty()
-        || !prepared.authoring.is_empty()
-        || !prepared.paths.is_empty()
-        || prepared.pipeline.is_some()
-        || prepared.namespace_errors.is_some()
-        || prepared.configuration != Some(ConfigurationStatus::Ready)
-        || prepared.lineage_repair != Some(None)
-    {
-        return LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-            code: LineageRepairInvalidCode::WrongBasisState,
-            message: "repair backend publication may only install a rescan-proven Ready state and clear its lineage inspection"
-                .to_owned(),
-        });
-    }
-    match publish_backend_commit(server, base, prepared) {
-        Ok(stamp) => LineageRepairMutationOutcome::Success(LineageRepairCommitted { stamp }),
-        Err(error) => LineageRepairMutationOutcome::Failure(RpcFailure::InvalidAuthoringRequest {
-            detail: format!("lineage repair publication rejected: {error:?}"),
-        }),
-    }
-}
-
-impl LineageRepair {
-    fn current_inspection(&self) -> Result<LineageRepairInspection, LineageRepairMutationOutcome> {
-        lineage_inspection_now(&self.server, &self.binding)
-    }
-
-    pub fn inspect(&self) -> LineageRepairInspectOutcome {
-        match self.current_inspection() {
-            Ok(inspection) => LineageRepairInspectOutcome::Success(inspection),
-            Err(LineageRepairMutationOutcome::ReconnectRequired { reason }) => {
-                LineageRepairInspectOutcome::ReconnectRequired { reason }
-            }
-            Err(LineageRepairMutationOutcome::Unavailable(unavailable)) => {
-                LineageRepairInspectOutcome::Unavailable(unavailable)
-            }
-            Err(LineageRepairMutationOutcome::Failure(error)) => {
-                LineageRepairInspectOutcome::Failure(error)
-            }
-            Err(other) => unreachable!("inspection cannot fail with {other:?}"),
-        }
-    }
-
-    pub fn create_missing(
-        &self,
-        basis: LineageRepairInspection,
-        canonical_manifest_bundle: Arc<[u8]>,
-    ) -> LineageRepairMutationOutcome {
-        lineage_outcome(self.create_missing_call(basis, canonical_manifest_bundle))
-    }
-
-    /// Check a `createMissing`; the returned job publishes it on the
-    /// authority, for transports to wait on off the RPC thread.
-    pub fn create_missing_call(
-        &self,
-        basis: LineageRepairInspection,
-        canonical_manifest_bundle: Arc<[u8]>,
-    ) -> Result<AuthorityCall<LineageRepairMutationOutcome>, LineageRepairMutationOutcome> {
-        self.mutation_preflight(&basis)?;
-        if !matches!(basis.state, LineageRepairState::Missing { .. }) {
-            return Err(LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-                code: LineageRepairInvalidCode::WrongBasisState,
-                message: "createMissing requires a Missing inspection".to_owned(),
-            }));
-        }
-        if let Err(invalid) =
-            crate::lineage::validate_manifest_repair_bundle(&canonical_manifest_bundle)
-        {
-            return Err(LineageRepairMutationOutcome::Invalid(invalid));
-        }
-        let backend = Arc::clone(&self.server.inner.handle.authoring_backend());
-        Ok(self.lineage_repair_call(basis.clone(), move || {
-            backend.prepare_create_missing_lineage(&basis, &canonical_manifest_bundle)
-        }))
-    }
-
-    pub fn resolve_duplicate(
-        &self,
-        basis: LineageRepairInspection,
-        survivor: LineageManifestClaimant,
-    ) -> LineageRepairMutationOutcome {
-        lineage_outcome(self.resolve_duplicate_call(basis, survivor))
-    }
-
-    /// Check a `resolveDuplicate`; the returned job publishes it on the
-    /// authority, for transports to wait on off the RPC thread.
-    pub fn resolve_duplicate_call(
-        &self,
-        basis: LineageRepairInspection,
-        survivor: LineageManifestClaimant,
-    ) -> Result<AuthorityCall<LineageRepairMutationOutcome>, LineageRepairMutationOutcome> {
-        self.mutation_preflight(&basis)?;
-        let LineageRepairState::Duplicate { claimants } = &basis.state else {
-            return Err(LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-                code: LineageRepairInvalidCode::WrongBasisState,
-                message: "resolveDuplicate requires a Duplicate inspection".to_owned(),
-            }));
-        };
-        if claimants.binary_search(&survivor).is_err() {
-            return Err(LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-                code: LineageRepairInvalidCode::SurvivorNotClaimant,
-                message: "selected survivor is not an exact current claimant".to_owned(),
-            }));
-        }
-        let backend = Arc::clone(&self.server.inner.handle.authoring_backend());
-        Ok(self.lineage_repair_call(basis.clone(), move || {
-            backend.prepare_resolve_duplicate_lineage(&basis, &survivor)
-        }))
-    }
-
-    fn mutation_preflight(
-        &self,
-        basis: &LineageRepairInspection,
-    ) -> Result<(), LineageRepairMutationOutcome> {
-        lineage_preflight(&self.server, &self.binding, basis)
-    }
-
-    fn lineage_repair_call(
-        &self,
-        basis: LineageRepairInspection,
-        prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError> + Send + 'static,
-    ) -> AuthorityCall<LineageRepairMutationOutcome> {
-        let binding = MetadataBinding::clone(&self.binding);
-        self.server.authority_call(move |server| {
-            publish_lineage_repair_locked(server, &binding, basis, prepare)
-        })
     }
 }
 
@@ -1013,59 +753,6 @@ impl MetadataHub {
         }
     }
 
-    /// Execute the one mutation needed to leave
-    /// `SchemaAcceptanceRequired`. This intentionally lives on the unbound
-    /// metadata capability because no target-bound Hub can be acquired while
-    /// that diagnostic is current; it does not expose the general operation
-    /// surface.
-    pub fn schema_transition(
-        &self,
-        base: InputVersion,
-        payload: Arc<[u8]>,
-    ) -> MetadataCall<ProgressStream> {
-        let gate = || {
-            if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-                return Some(MetadataCall::ReconnectRequired { reason });
-            }
-            let current = self.server.inner.current_stamp().version;
-            (current != base).then(|| {
-                MetadataCall::Error(RpcFailure::StaleInputVersion {
-                    expected: current,
-                    got: base,
-                })
-            })
-        };
-        if let Some(result) = gate() {
-            return result;
-        }
-        let prepared = match self
-            .server
-            .inner
-            .handle
-            .authoring_backend()
-            .prepare_operation(base, &LongRunningOp::SchemaTransition(payload))
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return MetadataCall::Error(error),
-        };
-        if let Err(detail) = validate_progress(&prepared.progress) {
-            return MetadataCall::Error(RpcFailure::InvalidAuthoringRequest { detail });
-        }
-        if let Some(result) = gate() {
-            return result;
-        }
-        MetadataCall::Success(ProgressStream {
-            events: prepared.progress.into(),
-            next_sequence: 0,
-            terminal_seen: false,
-            completion: Rc::new(MetadataSchemaTransitionCompletion {
-                server: self.server.clone(),
-                binding: self.binding.clone(),
-                base,
-                publication: RefCell::new(Some(prepared.publication)),
-            }),
-        })
-    }
 }
 
 impl<T> MetadataCall<T> {

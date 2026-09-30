@@ -22,8 +22,6 @@ use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
 use ngp_schema::LogicalSchema;
 
-pub use distill_core::lineage::{AcceptedSchemaEpoch, EntryLineageV1, LineageStamp};
-
 mod container;
 mod crc32c;
 mod envelope;
@@ -80,7 +78,6 @@ pub struct AssetEntry {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
     pub schema_hash: LogicalHash,
-    pub lineage: EntryLineageV1,
     /// Authoring/control metadata is never eligible as a runtime primary,
     /// processor input, reference target, query result, or pack member.
     pub authoring_only: bool,
@@ -88,9 +85,8 @@ pub struct AssetEntry {
 }
 
 /// Return the complete set of schema snapshots the bundle must retain:
-/// every entry schema plus the endpoint schemas embedded in MigrationV1
-/// controls. Callers that compact a bundle's schema table must use this
-/// closure rather than looking only at `AssetEntry::schema_hash`.
+/// every entry schema. Callers that compact a bundle's schema table use this
+/// rather than walking entries themselves.
 pub fn referenced_schema_hashes(bundle: &Bundle) -> BTreeSet<LogicalHash> {
     bundle
         .assets
@@ -110,41 +106,6 @@ pub struct BundleNamespaceSkeleton {
     pub uuid: BundleUuid,
     pub schemas: BTreeMap<LogicalHash, LogicalSchema>,
     pub assets: BTreeMap<String, AssetEntry>,
-}
-
-/// Revalidate an entry against the unique accepted lineage-manifest
-/// authority after ordinary bundle parsing has established its local shape.
-/// Bootstrap controls deliberately receive `None`; every other type requires
-/// the exact accepted epoch vector and its embedded stamp must be a prefix.
-pub fn validate_entry_lineage_authority(
-    local_id: &str,
-    format_version: u32,
-    entry: &AssetEntry,
-    schema: &LogicalSchema,
-    accepted_epochs: Option<&[AcceptedSchemaEpoch]>,
-) -> Result<(), BundleError> {
-    envelope::validate_entry_lineage(local_id, format_version, entry, schema)?;
-    match (&entry.lineage, accepted_epochs) {
-        (EntryLineageV1::Bootstrap { .. }, None) => Ok(()),
-        (EntryLineageV1::Bootstrap { .. }, Some(_)) => Err(BundleError::EntryLineage {
-            local_id: local_id.to_owned(),
-            detail: "bootstrap type must be absent from lineage-manifest authority",
-        }),
-        (EntryLineageV1::Manifest(_), None) => Err(BundleError::EntryLineage {
-            local_id: local_id.to_owned(),
-            detail: "manifest lineage authority is unavailable",
-        }),
-        (EntryLineageV1::Manifest(stamp), Some(accepted))
-            if stamp.epochs.len() <= accepted.len()
-                && stamp.epochs == accepted[..stamp.epochs.len()] =>
-        {
-            Ok(())
-        }
-        (EntryLineageV1::Manifest(_), Some(_)) => Err(BundleError::EntryLineage {
-            local_id: local_id.to_owned(),
-            detail: "entry lineage is not an exact accepted manifest prefix",
-        }),
-    }
 }
 
 /// Stack reserved for the recursive phases (schema walk, JSON
@@ -198,7 +159,7 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, BundleError> {
 /// Extract a complete namespace skeleton from malformed bytes when the
 /// malformed portion cannot change bundle/asset identity or entry data. This
 /// deliberately remains stricter than a best-effort parser: if framing,
-/// schema closure, lineage, or any schema-directed value walk fails, callers
+/// schema closure, entry roles, or any schema-directed value walk fails, callers
 /// must publish a namespace error.
 pub fn extract_namespace_skeleton(bytes: &[u8]) -> Result<BundleNamespaceSkeleton, BundleError> {
     on_reserved_stack(|| {
@@ -213,29 +174,6 @@ pub fn extract_namespace_skeleton(bytes: &[u8]) -> Result<BundleNamespaceSkeleto
             schemas: bundle.schemas,
             assets: bundle.assets,
         })
-    })
-}
-
-/// Repair only exact schema-closure omissions from authenticated snapshots
-/// held by other bundles. No schema is inferred: an unavailable hash remains
-/// an error, and every repaired file is reparsed and rewritten canonically.
-pub fn repair_missing_schemas(
-    bytes: &[u8],
-    holders: &BTreeMap<LogicalHash, LogicalSchema>,
-) -> Result<Option<Vec<u8>>, BundleError> {
-    on_reserved_stack(|| {
-        if bytes.first() == Some(&0x89) {
-            return container::repair_missing_schemas(bytes, holders);
-        }
-        let text = envelope::utf8(bytes)?;
-        let mut value = distill_json::parse(text).map_err(BundleError::Json)?;
-        if !envelope::inject_missing_schemas(&mut value, holders)? {
-            return Ok(None);
-        }
-        let mut repaired = distill_json::write(&value).map_err(BundleError::JsonWrite)?;
-        repaired.push('\n');
-        let bundle = envelope::parse_plain(repaired.as_bytes())?;
-        write_bundle(&bundle).map(Some)
     })
 }
 

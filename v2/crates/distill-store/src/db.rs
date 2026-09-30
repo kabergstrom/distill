@@ -20,7 +20,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 32;
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -77,7 +77,7 @@ CREATE TABLE scan_diagnostics (
     PRIMARY KEY (root_id, path)
 );
 -- What each scanned bundle claims (bundle and asset UUIDs, derived
--- outputs, primary paths, lineage manifests, malformed skeletons), keyed
+-- outputs, primary paths, malformed skeletons), keyed
 -- by the claiming source. See `claims`.
 CREATE TABLE source_claims (
     root_id  INTEGER NOT NULL,
@@ -265,21 +265,10 @@ CREATE TABLE pipeline_state (
     poison_cleanup     INTEGER CHECK (poison_cleanup BETWEEN 0 AND 7),
     poison_identity    BLOB,
     poison_message     TEXT,
-    acceptance_candidate_dylib_hash BLOB,
-    acceptance_manifest_hash BLOB,
-    retired_manifest_hash BLOB,
-    retired_basis_instance BLOB,
-    retired_basis_version INTEGER,
-    retired_type_uuid BLOB,
     CHECK ((poison_code IS NULL AND poison_origin IS NULL AND poison_cleanup IS NULL
             AND poison_identity IS NULL AND poison_message IS NULL)
         OR (poison_code IS NOT NULL AND poison_origin IS NOT NULL AND poison_cleanup IS NOT NULL
             AND poison_identity IS NOT NULL AND poison_message IS NOT NULL))
-);
-CREATE TABLE pipeline_retired_references (
-    position INTEGER NOT NULL PRIMARY KEY,
-    reference_kind INTEGER NOT NULL CHECK (reference_kind IN (1, 2)),
-    subject BLOB NOT NULL
 );
 CREATE TABLE registrations (
     kind    INTEGER NOT NULL,
@@ -291,15 +280,7 @@ CREATE TABLE pipeline_schema_registry (
     type_uuid   BLOB NOT NULL PRIMARY KEY,
     logical_hash BLOB NOT NULL
 );
-CREATE TABLE pipeline_candidate_schema_registry (
-    type_uuid   BLOB NOT NULL PRIMARY KEY,
-    logical_hash BLOB NOT NULL
-);
 CREATE TABLE pipeline_target_set (
-    name                   TEXT NOT NULL PRIMARY KEY,
-    target_definition_hash BLOB NOT NULL
-);
-CREATE TABLE pipeline_candidate_target_set (
     name                   TEXT NOT NULL PRIMARY KEY,
     target_definition_hash BLOB NOT NULL
 );
@@ -307,7 +288,7 @@ CREATE TABLE configuration_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
     active_generation  INTEGER NOT NULL,
     input_version      INTEGER NOT NULL,
-    poison_code        INTEGER CHECK (poison_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)),
+    poison_code        INTEGER CHECK (poison_code IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14)),
     poison_detail_version INTEGER CHECK (poison_detail_version IS NULL OR poison_detail_version = 1),
     poison_detail      BLOB,
     poison_reason_hash BLOB CHECK (poison_reason_hash IS NULL OR length(poison_reason_hash) = 32),
@@ -330,28 +311,6 @@ CREATE TABLE tools (
     tool_hash      BLOB NOT NULL CHECK (length(tool_hash) = 32),
     input_version  INTEGER NOT NULL,
     PRIMARY KEY (tool_key, input_version)
-);
-CREATE TABLE schema_lineage (
-    type_uuid     BLOB NOT NULL,
-    generation    INTEGER NOT NULL,
-    schema_hash   BLOB NOT NULL,
-    forward_parent INTEGER,
-    input_version INTEGER NOT NULL,
-    PRIMARY KEY (type_uuid, generation)
-);
-CREATE UNIQUE INDEX lineage_by_hash ON schema_lineage(type_uuid, schema_hash);
-CREATE TABLE schema_lineage_current (
-    type_uuid     BLOB NOT NULL PRIMARY KEY,
-    current_cursor INTEGER NOT NULL,
-    chain_digest  BLOB NOT NULL,
-    authority     INTEGER NOT NULL CHECK (authority IN (0, 1)),
-    retired_from  INTEGER,
-    input_version INTEGER NOT NULL
-);
-CREATE TABLE schema_lineage_state (
-    id            INTEGER PRIMARY KEY CHECK (id = 0),
-    input_version INTEGER NOT NULL,
-    manifest_hash BLOB NOT NULL
 );
 CREATE TABLE pins (
     kind         INTEGER NOT NULL,

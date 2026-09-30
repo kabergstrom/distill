@@ -2,7 +2,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use distill_core::id::BundleFileHash;
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub};
 use distill_rpc::capnp_transport::{
     schema, CapnpClient, RemoteConnectOutcome, RemoteMetadataOutcome, StagedListener,
@@ -328,10 +327,9 @@ impl AuthoringBackend for RecordingAuthoringBackend {
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         self.operations.lock().unwrap().push(operation.clone());
         let payload = match operation {
-            LongRunningOp::RenameWithFixups(payload)
-            | LongRunningOp::DiskMigration(payload)
-            | LongRunningOp::Doctor(payload)
-            | LongRunningOp::SchemaTransition(payload) => payload.clone(),
+            LongRunningOp::RenameWithFixups(payload) | LongRunningOp::Doctor(payload) => {
+                payload.clone()
+            }
         };
         Ok(PreparedOperationCommit::immediate(
             Commit::default(),
@@ -972,94 +970,6 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lineage_repair_bootstrap_and_exact_inspection_round_trip_over_tcp() {
-    LocalSet::new()
-        .run_until(async {
-            let server = server();
-            let error = ConfigurationError::from_reason(
-                &DscpV1::MissingLineageManifest,
-                "lineage manifest is missing",
-            );
-            let destination_hash = BundleFileHash([8; 32]);
-            let configured_path = format!("control/{}.bundle", "a".repeat(300));
-            let stamp = server
-                .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Failed(error)),
-                    lineage_repair: Some(Some(LineageRepairState::Missing {
-                        configured_root: "assets".to_owned(),
-                        configured_path: configured_path.clone(),
-                        destination: LineageRepairDestination::Occupied {
-                            file_hash: destination_hash,
-                            kind: OccupiedLineageDestinationKind::Opaque,
-                        },
-                    })),
-                    ..Commit::default()
-                })
-                .unwrap();
-            let listener = Rc::new(
-                StagedListener::bind(server.root(), "127.0.0.1:0")
-                    .await
-                    .unwrap(),
-            );
-            let address = listener.local_addr().unwrap();
-            let server_listener = listener.clone();
-            let server_task =
-                tokio::task::spawn_local(async move { server_listener.serve_one().await });
-            let client = CapnpClient::connect_local(address).await.unwrap();
-            let mut connect = client.root().lineage_repair_request();
-            connect.get().set_protocol(PROTOCOL_VERSION);
-            let response = connect.send().promise.await.unwrap();
-            let repair = match response
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::lineage_repair_connect_result::Which::Success(repair) => repair.unwrap(),
-                _ => panic!("expected lineage repair capability"),
-            };
-            let response = repair.inspect_request().send().promise.await.unwrap();
-            let inspection = match response
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::lineage_repair_inspect_result::Which::Success(inspection) => {
-                    inspection.unwrap()
-                }
-                _ => panic!("expected lineage repair inspection"),
-            };
-            assert_eq!(inspection.get_instance().unwrap(), &stamp.instance.0);
-            let observed_stamp = inspection.get_stamp().unwrap();
-            assert_eq!(observed_stamp.get_instance().unwrap(), &stamp.instance.0);
-            assert_eq!(observed_stamp.get_version(), stamp.version.0);
-            let missing = match inspection.get_state().unwrap().which().unwrap() {
-                schema::lineage_repair_state::Which::Missing(missing) => missing.unwrap(),
-                _ => panic!("expected missing-lineage inspection"),
-            };
-            assert_eq!(missing.get_configured_root().unwrap(), "assets");
-            assert_eq!(missing.get_configured_path().unwrap(), configured_path);
-            let occupied = match missing.get_destination().unwrap().which().unwrap() {
-                schema::lineage_repair_destination::Which::Occupied(occupied) => occupied.unwrap(),
-                _ => panic!("expected occupied destination basis"),
-            };
-            assert_eq!(occupied.get_file_hash().unwrap(), &destination_hash.0);
-            assert_eq!(
-                occupied.get_kind().unwrap(),
-                schema::OccupiedLineageDestinationKind::Opaque
-            );
-            drop(client);
-            server_task.await.unwrap().unwrap();
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_delta() {
     LocalSet::new()
         .run_until(async {
@@ -1533,27 +1443,16 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
                 backend.clone(),
             )
             .unwrap();
-            let required = SchemaAcceptanceRequired {
-                manifest: SchemaManifestBasis {
-                    manifest_hash: ContentHash([41; 32]),
-                    current_cursors: std::collections::BTreeMap::new(),
-                },
-                candidate: PipelineCandidateIdentity {
-                    dylib_hash: [42; 32],
-                    target_set: distill_core::target_set::CanonicalTargetSet::canonical(vec![])
-                        .unwrap(),
-                },
-                mismatches: vec![SchemaRegistryMismatch {
-                    type_uuid: TypeUuid([1; 16]),
-                    candidate: Some(LogicalHash([45; 32])),
-                    manifest: None,
-                }],
-            };
+            let failure = PipelineFailure::new(
+                PipelineFailureCode::PublishedCallbackPanic,
+                PipelineFailureOrigin::PublishedRuntime,
+                CleanupDisposition::PublishedEpochLeaked,
+                "processor callback panicked",
+            )
+            .unwrap();
             server
                 .commit(Commit {
-                    pipeline: Some(PipelineDiagnostic::SchemaAcceptanceRequired(
-                        required.clone(),
-                    )),
+                    pipeline: Some(PipelineDiagnostic::Failed(failure.clone())),
                     ..Commit::default()
                 })
                 .unwrap();
@@ -1571,55 +1470,9 @@ async fn wire_connect_returns_closed_pipeline_unavailable_diagnostic() {
             assert!(matches!(
                 client.connect(&request()).await.unwrap(),
                 RemoteConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(observed)
-                ) if observed == required
+                    PipelineUnavailableDiagnostic::PipelineFailure(observed)
+                ) if observed == failure
             ));
-
-            let metadata = match client.metadata(PROTOCOL_VERSION).await.unwrap() {
-                RemoteMetadataOutcome::Connected { hub, .. } => hub,
-                _ => panic!("expected unbound metadata capability"),
-            };
-            let mut transition = metadata.schema_transition_request();
-            transition.get().set_base(1);
-            transition
-                .get()
-                .set_payload(b"metadata-schema-transition-cas");
-            let transition = transition.send().promise.await.unwrap();
-            let progress = match transition
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::progress_call::Which::Success(progress) => progress.unwrap(),
-                _ => panic!("expected schema-transition progress capability"),
-            };
-            for expected in [
-                schema::AuthoringProgressState::Started,
-                schema::AuthoringProgressState::Running,
-                schema::AuthoringProgressState::Completed,
-            ] {
-                let event = progress.next_request().send().promise.await.unwrap();
-                assert_eq!(
-                    event
-                        .get()
-                        .unwrap()
-                        .get_progress()
-                        .unwrap()
-                        .get_state()
-                        .unwrap(),
-                    expected
-                );
-            }
-            assert_eq!(server.current_stamp().version, InputVersion(2));
-            assert_eq!(
-                *backend.operations.lock().unwrap(),
-                vec![LongRunningOp::SchemaTransition(Arc::from(
-                    &b"metadata-schema-transition-cas"[..]
-                ))]
-            );
 
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
@@ -1798,47 +1651,6 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 schema::AuthoringProgressState::Cancelled
             );
 
-            let mut schema_transition = hub.operation_request();
-            schema_transition.get().set_base(4);
-            schema_transition
-                .get()
-                .reborrow()
-                .init_operation()
-                .set_schema_transition(b"schema-transition-cas");
-            let schema_transition = schema_transition.send().promise.await.unwrap();
-            let schema_transition = match schema_transition
-                .get()
-                .unwrap()
-                .get_result()
-                .unwrap()
-                .which()
-                .unwrap()
-            {
-                schema::progress_call::Which::Success(progress) => progress.unwrap(),
-                _ => panic!("expected schema-transition progress capability"),
-            };
-            for expected in [
-                schema::AuthoringProgressState::Started,
-                schema::AuthoringProgressState::Running,
-                schema::AuthoringProgressState::Completed,
-            ] {
-                let event = schema_transition
-                    .next_request()
-                    .send()
-                    .promise
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    event
-                        .get()
-                        .unwrap()
-                        .get_progress()
-                        .unwrap()
-                        .get_state()
-                        .unwrap(),
-                    expected
-                );
-            }
             assert_eq!(backend.imports.lock().unwrap().len(), 1);
             assert_eq!(
                 backend.imports.lock().unwrap()[0].settings.blobs[0].as_ref(),
@@ -1853,7 +1665,6 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
                 vec![
                     LongRunningOp::Doctor(Arc::from(&b"verify-cas"[..])),
                     LongRunningOp::Doctor(Arc::from(&b"cancel-me"[..])),
-                    LongRunningOp::SchemaTransition(Arc::from(&b"schema-transition-cas"[..])),
                 ]
             );
 
@@ -2048,103 +1859,6 @@ fn configuration_error_wire_authenticates_dscp_version_detail_code_and_digest() 
         )
         .is_err());
     }
-}
-
-#[test]
-fn typed_pipeline_diagnostic_codecs_reject_empty_and_noncanonical_tables() {
-    let mut schema_message = capnp::message::Builder::new_default();
-    {
-        let mut root =
-            schema_message.init_root::<schema::schema_acceptance_required::Builder<'_>>();
-        let mut manifest = root.reborrow().init_manifest();
-        manifest.set_manifest_hash(&[1; 32]);
-        let mut cursor = manifest.reborrow().init_current_cursors(1).get(0);
-        cursor.reborrow().init_type_uuid().set_bytes(&[2; 16]);
-        cursor.set_logical_hash(&[3; 32]);
-        let mut candidate = root.reborrow().init_candidate();
-        candidate.set_dylib_hash(&[4; 32]);
-        candidate.set_reserved_compiled_types(());
-        candidate.init_target_rows(0);
-        let mut mismatch = root.init_mismatches(1).get(0);
-        mismatch.reborrow().init_type_uuid().set_bytes(&[7; 16]);
-        mismatch.set_candidate(&[8; 32]);
-        mismatch.set_has_candidate(true);
-        mismatch.set_has_manifest(false);
-    }
-    let decoded = distill_rpc::capnp_transport::decode_schema_acceptance_required(
-        schema_message
-            .get_root_as_reader::<schema::schema_acceptance_required::Reader<'_>>()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(decoded.mismatches.len(), 1);
-    assert_eq!(decoded.mismatches[0].type_uuid, TypeUuid([7; 16]));
-
-    let mut empty = capnp::message::Builder::new_default();
-    empty
-        .init_root::<schema::schema_acceptance_required::Builder<'_>>()
-        .init_mismatches(0);
-    assert!(
-        distill_rpc::capnp_transport::decode_schema_acceptance_required(
-            empty
-                .get_root_as_reader::<schema::schema_acceptance_required::Reader<'_>>()
-                .unwrap(),
-        )
-        .is_err()
-    );
-
-    let mut retired_message = capnp::message::Builder::new_default();
-    {
-        let mut root = retired_message.init_root::<schema::retired_type_referenced::Builder<'_>>();
-        root.set_manifest_hash(&[9; 32]);
-        let mut basis = root.reborrow().init_basis();
-        basis.set_instance(&[10; 16]);
-        basis.set_input_version(11);
-        root.reborrow().init_type_uuid().set_bytes(&[12; 16]);
-        let mut references = root.init_references(2);
-        references
-            .reborrow()
-            .get(0)
-            .init_asset()
-            .set_bytes(&[13; 16]);
-        references.get(1).set_migration_endpoint(&[14; 16]);
-    }
-    let retired = distill_rpc::capnp_transport::decode_retired_type_referenced(
-        retired_message
-            .get_root_as_reader::<schema::retired_type_referenced::Reader<'_>>()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        retired.references,
-        [
-            distill_rpc::RetiredTypeReference::Asset(AssetUuid([13; 16])),
-            distill_rpc::RetiredTypeReference::MigrationEndpoint(AssetUuid([14; 16])),
-        ]
-    );
-
-    let mut duplicate = capnp::message::Builder::new_default();
-    {
-        let mut root = duplicate.init_root::<schema::retired_type_referenced::Builder<'_>>();
-        root.set_manifest_hash(&[9; 32]);
-        root.reborrow().init_basis().set_instance(&[10; 16]);
-        root.reborrow().init_type_uuid().set_bytes(&[12; 16]);
-        let mut references = root.init_references(2);
-        references
-            .reborrow()
-            .get(0)
-            .init_asset()
-            .set_bytes(&[13; 16]);
-        references.get(1).init_asset().set_bytes(&[13; 16]);
-    }
-    assert!(
-        distill_rpc::capnp_transport::decode_retired_type_referenced(
-            duplicate
-                .get_root_as_reader::<schema::retired_type_referenced::Reader<'_>>()
-                .unwrap(),
-        )
-        .is_err()
-    );
 }
 
 #[test]

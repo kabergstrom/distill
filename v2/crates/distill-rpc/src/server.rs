@@ -26,13 +26,13 @@ use tokio::sync::{watch, Notify};
 use unicode_normalization::UnicodeNormalization;
 
 use distill_store::served::{
-    Change, ChangeEntry, ServedWrite, SERVED_LINEAGE_REPAIR, SERVED_PIPELINE,
+    Change, ChangeEntry, ServedWrite, SERVED_PIPELINE,
 };
 use distill_store::{Store, StoreConfig, StoreError, StoreReader};
 
 use crate::apply::{
     apply_commit, apply_commit_served, configuration_status, publish_protocol_epoch, publish_restart_required,
-    publish_runtime_pipeline_failure, publish_target, publish_target_set, read_lineage_repair,
+    publish_runtime_pipeline_failure, publish_target, publish_target_set,
     read_served_pipeline, ApplyError, ApplyMode,
 };
 use crate::persist::{delta_state, reconnect_reason};
@@ -1371,16 +1371,6 @@ pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFai
         PipelineDiagnostic::Failed(failure) => Some(RpcFailure::PipelineUnavailable(Box::new(
             PipelineUnavailableDiagnostic::PipelineFailure(failure),
         ))),
-        PipelineDiagnostic::SchemaAcceptanceRequired(required) => {
-            Some(RpcFailure::PipelineUnavailable(Box::new(
-                PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required),
-            )))
-        }
-        PipelineDiagnostic::RetiredTypeReferenced(retired) => {
-            Some(RpcFailure::PipelineUnavailable(Box::new(
-                PipelineUnavailableDiagnostic::RetiredTypeReferenced(retired),
-            )))
-        }
     }
 }
 
@@ -1393,7 +1383,6 @@ pub(crate) struct SnapshotTxn {
     snapshot: Option<distill_store::served::StoreSnapshot>,
     pub(crate) stamp: SnapshotStamp,
     pub(crate) configuration: ConfigurationStatus,
-    pub(crate) lineage_repair: Option<LineageRepairState>,
     pipeline_installed_at: InputVersion,
     pipeline: PipelineDiagnostic,
     inner: Weak<Inner>,
@@ -1735,14 +1724,12 @@ impl Inner {
         }
         let snapshot = self.take_reader()?.begin_snapshot()?;
         let configuration = configuration_status(&snapshot.configuration_state()?);
-        let lineage_repair = read_lineage_repair(snapshot.served_blob(SERVED_LINEAGE_REPAIR)?)?;
         let (pipeline_installed_at, pipeline) =
             read_served_pipeline(snapshot.served_blob(SERVED_PIPELINE)?)?;
         let txn = Rc::new(SnapshotTxn {
             stamp: snapshot.stamp(),
             snapshot: Some(snapshot),
             configuration,
-            lineage_repair,
             pipeline_installed_at,
             pipeline,
             inner: Rc::downgrade(self),
@@ -2043,13 +2030,6 @@ impl Inner {
 }
 
 impl Root {
-    /// Narrow, unbound recovery bootstrap. It is minted only while the
-    /// authoritative configuration error is exactly missing/duplicate
-    /// lineage and exposes no metadata or target capability.
-    pub fn lineage_repair(&self, protocol: u32) -> LineageRepairConnectOutcome {
-        self.server().lineage_repair(protocol)
-    }
-
     /// Target- and compiled-registry-free bootstrap for failure-safe metadata,
     /// diagnostics, authored-value inspection, and immutable CAS reads.
     pub fn metadata(&self, protocol: u32) -> MetadataConnectOutcome {
@@ -2062,54 +2042,6 @@ impl Root {
 }
 
 impl Server {
-    fn lineage_repair(&self, protocol: u32) -> LineageRepairConnectOutcome {
-        let expected = self.inner.protocol_epoch();
-        if protocol != expected {
-            return LineageRepairConnectOutcome::ProtocolMismatch {
-                expected,
-                observed: protocol,
-            };
-        }
-        let txn = match self.inner.current_snapshot() {
-            Ok(txn) => txn,
-            Err(error) => {
-                tracing::error!(%error, "cannot read lineage-repair state");
-                return LineageRepairConnectOutcome::Unavailable(
-                    LineageRepairUnavailable::ConfigurationReady,
-                );
-            }
-        };
-        if let Err(outcome) = crate::lineage::lineage_inspection(
-            txn.stamp,
-            &txn.configuration,
-            txn.lineage_repair.as_ref(),
-        ) {
-            return match outcome {
-                crate::lineage::LineageInspectionFailure::Unavailable(unavailable) => {
-                    LineageRepairConnectOutcome::Unavailable(unavailable)
-                }
-                // A same-code DSCP without its exact inspection is an invalid
-                // server publication, never authority to repair.
-                crate::lineage::LineageInspectionFailure::Invalid(_error) => {
-                    LineageRepairConnectOutcome::Unavailable(match &txn.configuration {
-                        ConfigurationStatus::Failed(error) => {
-                            LineageRepairUnavailable::OtherConfigurationError(error.clone())
-                        }
-                        ConfigurationStatus::Ready => LineageRepairUnavailable::ConfigurationReady,
-                    })
-                }
-            };
-        }
-        LineageRepairConnectOutcome::Connected(LineageRepairConnected {
-            repair: LineageRepair {
-                binding: self.metadata_binding(expected),
-                server: self.clone(),
-            },
-            instance: self.inner.handle.instance,
-            protocol_epoch: expected,
-        })
-    }
-
     fn metadata_binding(&self, protocol_epoch: u32) -> Rc<MetadataBinding> {
         Rc::new(MetadataBinding {
             id: self.inner.handle.next_connection_id(),
@@ -2176,16 +2108,6 @@ impl Server {
             Ok(PipelineDiagnostic::Failed(failure)) => {
                 return ConnectOutcome::PipelineUnavailable(
                     PipelineUnavailableDiagnostic::PipelineFailure(failure),
-                );
-            }
-            Ok(PipelineDiagnostic::SchemaAcceptanceRequired(required)) => {
-                return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required),
-                );
-            }
-            Ok(PipelineDiagnostic::RetiredTypeReferenced(retired)) => {
-                return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::RetiredTypeReferenced(retired),
                 );
             }
             Err(error) => panic!("cannot read the served pipeline: {error}"),

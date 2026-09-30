@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
+use distill_bundle::{AssetEntry, Bundle};
 use distill_core::bootstrap::{
-    BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
+    bootstrap_control_logical_registry_v1, BootstrapControlSpecV1, BootstrapControlSymbol,
+    DIRECTORY_IMPORT_RULES_TYPE_UUID,
 };
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
-use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
-use distill_daemon::coordinator::{DaemonCoordinator, LineageDestination};
+use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+use distill_daemon::coordinator::DaemonCoordinator;
 use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
 use distill_daemon::scanner::AssetRoot;
 use distill_daemon::watcher::WatcherBatch;
@@ -17,9 +18,8 @@ use distill_rpc::{
     TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
-use distill_store::pipeline::{
-    AcceptedTypeLineage, SchemaLineageManifest, TypeAuthorityState, VerifiedSchemaLineageManifest,
-};
+use distill_store::pipeline::ValidatedPipelineEpoch;
+use distill_store::state::PipelineEpoch;
 use distill_store::StoreConfig;
 
 const TYPE_UUID: TypeUuid = TypeUuid([71; 16]);
@@ -78,19 +78,10 @@ fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) 
         root: SchemaNode::Primitive(PrimitiveKind::U8),
     };
     let schema_hash = node_hash(&schema.root).unwrap();
-    let epochs = vec![AcceptedSchemaEpoch {
-        digest: schema_hash,
-        forward_parent: None,
-    }];
     let entry = AssetEntry {
         uuid: AssetUuid([72; 16]),
         type_uuid: TYPE_UUID,
         schema_hash,
-        lineage: EntryLineageV1::Manifest(LineageStamp {
-            chain: lineage_chain_digest(TYPE_UUID, &epochs, 0),
-            epochs,
-            cursor: 0,
-        }),
         authoring_only: false,
         data: AuthoredValue::UInt(1),
     };
@@ -110,6 +101,35 @@ fn ordinary_bundle() -> (Vec<u8>, LogicalSchema, distill_core::id::LogicalHash) 
 
 fn target() -> TargetDefinition {
     TargetDefinition::new("dev", TargetDefinitionHash([4; 32]))
+}
+
+/// Publish a Ready pipeline epoch whose registry names `schema_hash` as the
+/// current schema of `TYPE_UUID`: importer outputs are written at it.
+fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: LogicalHash) {
+    let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
+    schema_registry.insert(TYPE_UUID, schema_hash);
+    let epoch = ValidatedPipelineEpoch::validate(PipelineEpoch {
+        dylib_hash: [9; 32],
+        target_set: CanonicalTargetSet::canonical(vec![TargetSetRow {
+            name: "dev".into(),
+            target_definition_hash: [4; 32],
+        }])
+        .unwrap(),
+        schema_registry,
+        registrations: Vec::new(),
+    })
+    .unwrap();
+    let store = coordinator.store();
+    let base = coordinator.server().current_stamp().version;
+    coordinator
+        .coordinated_commit(base, || {
+            store
+                .write()
+                .input_transaction(|transaction| transaction.publish_pipeline_epoch(&epoch))
+                .map_err(|error| error.to_string())?;
+            Ok(Commit::default())
+        })
+        .unwrap();
 }
 
 fn object<const N: usize>(fields: [(&str, AuthoredValue); N]) -> AuthoredValue {
@@ -179,9 +199,6 @@ fn directory_rules_bundle_with_rule(include_rule: bool) -> Vec<u8> {
                 uuid: AssetUuid([99; 16]),
                 type_uuid: DIRECTORY_IMPORT_RULES_TYPE_UUID,
                 schema_hash: row.logical_hash,
-                lineage: EntryLineageV1::Bootstrap {
-                    bundle_format_version: 1,
-                },
                 authoring_only: true,
                 data,
             },
@@ -205,44 +222,13 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
             &assets,
             assets.join(".distill-displaced"),
         )],
-        LineageDestination {
-            root: "main".into(),
-            path: "schema/schema-lineage.bundle".into(),
-        },
         vec![target()],
         64,
     )
     .unwrap();
     coordinator.reconcile_full_scan().unwrap();
 
-    let store = coordinator.store();
-    let manifest = VerifiedSchemaLineageManifest::from_verified_source(
-        ContentHash([9; 32]),
-        SchemaLineageManifest {
-            types: BTreeMap::from([(
-                TYPE_UUID,
-                AcceptedTypeLineage {
-                    epochs: vec![AcceptedSchemaEpoch {
-                        digest: schema_hash,
-                        forward_parent: None,
-                    }],
-                    current: 0,
-                    authority: TypeAuthorityState::Active,
-                },
-            )]),
-        },
-    );
-    coordinator
-        .coordinated_commit(InputVersion(1), || {
-            store
-                .write()
-                .input_transaction(|transaction| {
-                    transaction.project_verified_lineage_manifest(&manifest)
-                })
-                .map_err(|error| error.to_string())?;
-            Ok(Commit::default())
-        })
-        .unwrap();
+    publish_schema_registry(&coordinator, schema_hash);
 
     coordinator
         .authoring_service()
@@ -424,43 +410,12 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
             &assets,
             assets.join(".distill-displaced"),
         )],
-        LineageDestination {
-            root: "main".into(),
-            path: "schema/schema-lineage.bundle".into(),
-        },
         vec![target()],
         64,
     )
     .unwrap();
     coordinator.reconcile_full_scan().unwrap();
-    let store = coordinator.store();
-    let manifest = VerifiedSchemaLineageManifest::from_verified_source(
-        ContentHash([9; 32]),
-        SchemaLineageManifest {
-            types: BTreeMap::from([(
-                TYPE_UUID,
-                AcceptedTypeLineage {
-                    epochs: vec![AcceptedSchemaEpoch {
-                        digest: schema_hash,
-                        forward_parent: None,
-                    }],
-                    current: 0,
-                    authority: TypeAuthorityState::Active,
-                },
-            )]),
-        },
-    );
-    coordinator
-        .coordinated_commit(InputVersion(1), || {
-            store
-                .write()
-                .input_transaction(|transaction| {
-                    transaction.project_verified_lineage_manifest(&manifest)
-                })
-                .map_err(|error| error.to_string())?;
-            Ok(Commit::default())
-        })
-        .unwrap();
+    publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(ByteImporter { schema }))

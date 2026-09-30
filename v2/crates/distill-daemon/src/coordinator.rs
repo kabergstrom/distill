@@ -17,16 +17,14 @@ use rayon::ThreadPool;
 
 use distill_build::pipeline::Target;
 use distill_bundle::{AssetEntry, Bundle};
-use distill_core::bootstrap::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
-use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
-use distill_core::lineage::AcceptedSchemaEpoch;
+use distill_core::bootstrap::is_bootstrap_control_type;
+use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
     AuthoringValue, Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
-    DerivedOutputEntry, DerivedOutputMutation, DriftedInput, LineageManifestClaimant,
-    LineageRepairState, PathMutation, PipelineCandidateIdentity, PipelineDiagnostic,
-    SchemaTransitionAction, Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, NamespaceError,
+    DerivedOutputEntry, DerivedOutputMutation, DriftedInput, PathMutation, PipelineDiagnostic,
+    Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, NamespaceError,
     PreparedImportCommit, RpcFailure, NamespaceErrorV1,
 };
 use distill_schema::ProjectSchemaAuthority;
@@ -37,20 +35,15 @@ use distill_store::bundles::{
 use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileObservation, PendingFileWork};
-use distill_store::journal::{JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome};
-use distill_store::pipeline::{
-    AcceptedTypeLineage, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
-    TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
-};
+use distill_store::pipeline::ValidatedPipelineEpoch;
 use distill_store::served::{encode_authored_value, ResolutionRow};
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
-    PipelineState as StoredPipelineState, ReadableBundleSource,
-    RetiredTypeReferenced as StoredRetiredTypeReferenced, ScanFailureCode, ScanSubject,
+    PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
-use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError, StoreReader};
+use distill_store::{Store, StoreConfig, StoreError, StoreReader};
 
 use crate::store_cell::AuthorityStore;
 use crate::authority::{Authority, AuthorityCell, AuthorityRef, AuthoritySender};
@@ -60,26 +53,15 @@ use crate::epoch::{
     stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
     UnloadOutcome,
 };
-use crate::lineage_repair::{
-    plan_same_dir_temp, unique_sibling, write_planned_temp, LineageRepairBackendInitError,
-};
 use crate::importer::ImportRun;
 use crate::module_loader::DynamicPipelineModuleLoader;
-use crate::operations::{PlannedSchemaTransition, SchemaTransitionJournalBasis};
 use crate::pipeline_map::PipelineProjection;
-use crate::quarantine::QuarantineDriver;
 use crate::scanner::{
     AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanDiagnostic, ScanError,
     ScanSnapshot, ScannedBundle, StoredBaseline,
 };
 use crate::scheduler::{ScheduledPool, Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageDestination {
-    pub root: String,
-    pub path: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogicalRename {
@@ -90,7 +72,6 @@ struct LogicalRename {
 
 pub(crate) struct ConfigurationCandidate {
     pub roots: Vec<AssetRoot>,
-    pub lineage_destination: LineageDestination,
     pub targets: Vec<TargetDefinition>,
     pub build_targets: BTreeMap<String, Target>,
     pub pipeline_source: PathBuf,
@@ -105,7 +86,6 @@ pub struct DaemonCoordinator {
     scan_healthy: AtomicBool,
     scan_rejection: AuthorityCell<Option<PendingScanRejection>>,
     server: Arc<ServerHandle>,
-    lineage_destination: ArcSwap<LineageDestination>,
     authoring: Arc<AuthoringService>,
     pipeline: PipelineState,
     schema_authority: ArcSwapOption<ProjectSchemaAuthority>,
@@ -119,12 +99,6 @@ pub struct DaemonCoordinator {
 struct CoordinatedPipelineRuntime {
     host: ModuleHost,
     loader: DynamicPipelineModuleLoader,
-    pending: Option<PendingPipelineEpoch>,
-}
-
-struct PendingPipelineEpoch {
-    loaded: PipelineEpoch,
-    stored: ValidatedPipelineEpoch,
 }
 
 enum ConfigurationPipelinePublication {
@@ -133,14 +107,6 @@ enum ConfigurationPipelinePublication {
         tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     },
     Failed(PipelineFailure),
-}
-
-fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) -> Option<PipelineFailure> {
-    if let Some(pending) = runtime.pending.take() {
-        runtime.host.discard_unpublished(pending.loaded)
-    } else {
-        None
-    }
 }
 
 fn discard_prepared(
@@ -166,7 +132,6 @@ impl DaemonCoordinator {
     pub fn open(
         store_config: StoreConfig,
         roots: Vec<AssetRoot>,
-        lineage_destination: LineageDestination,
         targets: Vec<TargetDefinition>,
         max_dependency_depth: usize,
     ) -> Result<Self, CoordinatorInitError> {
@@ -212,7 +177,6 @@ impl DaemonCoordinator {
                     Arc::clone(&store),
                     roots,
                     scanner.clone(),
-                    lineage_destination.clone(),
                 )?);
                 Ok((store, backend))
             })
@@ -231,7 +195,6 @@ impl DaemonCoordinator {
         let pipeline = CoordinatedPipelineRuntime {
             host,
             loader: DynamicPipelineModuleLoader,
-            pending: None,
         };
         let scheduler_config = SchedulerConfig {
             parallelism: store_config.parallelism,
@@ -252,7 +215,6 @@ impl DaemonCoordinator {
             scan_healthy: AtomicBool::new(true),
             scan_rejection: AuthorityCell::new(None, authority.sender()),
             server,
-            lineage_destination: ArcSwap::from_pointee(lineage_destination),
             authoring: backend,
             pipeline: PipelineState::new(pipeline, authority.sender()),
             schema_authority: ArcSwapOption::empty(),
@@ -514,26 +476,12 @@ impl DaemonCoordinator {
             .map_or_else(Vec::new, |pending| pending.rejection.version.clone())
     }
 
-    fn configuration_without_source_error(
-        &self,
-    ) -> Result<(ConfigurationStatus, Option<LineageRepairState>), CoordinatorError> {
-        let scan_error = self
-            .scan_rejection
+    fn configuration_without_source_error(&self) -> ConfigurationStatus {
+        self.scan_rejection
             .borrow_mut()
             .as_ref()
-            .and_then(|pending| pending.rejection.configuration.clone());
-        let lineage = claimed_lineage(&self.store.read(), &BTreeMap::new())?;
-        indexed_lineage_projection(
-            &lineage,
-            &self.scanner,
-            &self.lineage_destination(),
-            scan_error,
-        )
-        .map(|(configuration, repair, _)| (configuration, repair))
-    }
-
-    fn lineage_destination(&self) -> LineageDestination {
-        LineageDestination::clone(&self.lineage_destination.load())
+            .and_then(|pending| pending.rejection.configuration.clone())
+            .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
     }
 
     /// Publish a rejected configuration source as an ordinary input version.
@@ -590,7 +538,6 @@ impl DaemonCoordinator {
         self.on_authority(|| {
             let ConfigurationCandidate {
                 roots,
-                lineage_destination,
                 targets,
                 build_targets,
                 pipeline_source,
@@ -599,13 +546,12 @@ impl DaemonCoordinator {
             } = candidate;
             let filesystem = self
                 .authoring
-                .prepare_filesystem_candidate(roots, lineage_destination)
+                .prepare_filesystem_candidate(roots)
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
             let filesystem_changed = !self.scanner.has_same_roots(filesystem.scanner());
             // Schema, target, or module-only candidates reuse the already
             // observed asset snapshot. A physical complete scan is reserved for
-            // an actual configured-root replacement; the lineage destination is
-            // projection authority, not filesystem watch coverage.
+            // an actual configured-root replacement.
             let candidate_scan_heals =
                 filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
             let scan = if candidate_scan_heals {
@@ -613,10 +559,7 @@ impl DaemonCoordinator {
             } else {
                 self.published_scan()?
             };
-            let destination = filesystem.lineage_destination().clone();
             let mut candidate = ScanCandidate::build(
-                filesystem.scanner(),
-                &destination,
                 scan,
                 None,
                 Some(&schema_authority),
@@ -757,7 +700,6 @@ impl DaemonCoordinator {
                             .take();
                         self.scan_healthy.store(true, Ordering::Release);
                     }
-                    self.lineage_destination.store(Arc::new(destination));
                     self.schema_authority
                         .store(Some(Arc::clone(&schema_authority)));
                     self.build_targets.store(Arc::new(build_targets.clone()));
@@ -772,38 +714,10 @@ impl DaemonCoordinator {
                             PipelineDiagnostic::Ready,
                         ) => {
                             let importers = EpochAuthoringImporter::all(&prepared);
-                            record_cleanup_failure(
-                                &mut cleanup_failure,
-                                discard_pending(&mut runtime),
-                            );
                             runtime.host.install_ready(prepared);
                             authoring
                                 .replace_pipeline_importers(importers)
                                 .expect("candidate importer metadata was prevalidated");
-                        }
-                        (
-                            ConfigurationPipelinePublication::Epoch { epoch, .. },
-                            Some(prepared),
-                            PipelineDiagnostic::SchemaAcceptanceRequired(_)
-                            | PipelineDiagnostic::RetiredTypeReferenced(_),
-                        ) => {
-                            record_cleanup_failure(
-                                &mut cleanup_failure,
-                                discard_pending(&mut runtime),
-                            );
-                            let fence = PipelineFailure::new(
-                                PipelineFailureCode::CandidateValidation,
-                                PipelineFailureOrigin::CandidateOpen,
-                                CleanupDisposition::None,
-                                "pipeline candidate requires explicit schema acceptance",
-                            )
-                            .expect("schema-acceptance fence is valid");
-                            runtime.host.install_failure(fence);
-                            runtime.pending = Some(PendingPipelineEpoch {
-                                loaded: prepared,
-                                stored: epoch.clone(),
-                            });
-                            authoring.install_pipeline_importers(BTreeMap::new());
                         }
                         (
                             ConfigurationPipelinePublication::Epoch { .. },
@@ -814,23 +728,14 @@ impl DaemonCoordinator {
                                 &mut cleanup_failure,
                                 runtime.host.discard_unpublished(prepared),
                             );
-                            record_cleanup_failure(
-                                &mut cleanup_failure,
-                                discard_pending(&mut runtime),
-                            );
                             runtime.host.install_failure(error);
                             authoring.install_pipeline_importers(BTreeMap::new());
                         }
                         (
                             ConfigurationPipelinePublication::Failed(failure),
                             None,
-                            PipelineDiagnostic::Failed(_)
-                            | PipelineDiagnostic::RetiredTypeReferenced(_),
+                            PipelineDiagnostic::Failed(_),
                         ) => {
-                            record_cleanup_failure(
-                                &mut cleanup_failure,
-                                discard_pending(&mut runtime),
-                            );
                             runtime.host.install_failure(failure.clone());
                             authoring.install_pipeline_importers(BTreeMap::new());
                         }
@@ -948,7 +853,6 @@ impl DaemonCoordinator {
             let scanner = self.scanner.clone();
             let max_dependency_depth = self.operational_configuration().max_dependency_depth;
             let mut prepared = Some(prepared);
-            let mut cleanup_failure = None;
             let result = self.server().coordinated_commit(base, || {
                 let mut durable = store.write();
                 if durable.input_version() != base {
@@ -957,13 +861,10 @@ impl DaemonCoordinator {
                         durable.input_version()
                     ));
                 }
-                let mut acceptance = None;
                 durable
                     .input_transaction(|transaction| {
-                        acceptance = Some(transaction.pipeline_acceptance_requirement(&stored)?);
-                        if transaction.publish_pipeline_epoch(&stored)? {
-                            transaction.publish_tool_epoch(&tools)?;
-                        }
+                        transaction.publish_pipeline_epoch(&stored)?;
+                        transaction.publish_tool_epoch(&tools)?;
                         for asset in &assets {
                             transaction.set_tag_index_pending(*asset, tag_epoch)?;
                         }
@@ -974,43 +875,13 @@ impl DaemonCoordinator {
                 let candidate = prepared
                     .take()
                     .expect("pipeline candidate is installed once");
-                let diagnostic = match acceptance.expect("pipeline outcome is captured in-transaction")
-                {
-                    None => {
-                        let importers = EpochAuthoringImporter::all(&candidate);
-                        record_cleanup_failure(
-                            &mut cleanup_failure,
-                            discard_pending(&mut runtime),
-                        );
-                        runtime.host.install_ready(candidate);
-                        self.authoring
-                            .replace_pipeline_importers(importers)
-                            .expect("candidate importer metadata was prevalidated");
-                        PipelineDiagnostic::Ready
-                    }
-                    Some(required) => {
-                        record_cleanup_failure(
-                            &mut cleanup_failure,
-                            discard_pending(&mut runtime),
-                        );
-                        let fence = PipelineFailure::new(
-                            PipelineFailureCode::CandidateValidation,
-                            PipelineFailureOrigin::CandidateOpen,
-                            CleanupDisposition::None,
-                            "pipeline candidate requires explicit schema acceptance",
-                        )
-                        .expect("schema-acceptance fence is a valid candidate failure");
-                        runtime.host.install_failure(fence);
-                        runtime.pending = Some(PendingPipelineEpoch {
-                            loaded: candidate,
-                            stored: stored.clone(),
-                        });
-                        self.authoring.install_pipeline_importers(BTreeMap::new());
-                        PipelineDiagnostic::SchemaAcceptanceRequired(required)
-                    }
-                };
+                let importers = EpochAuthoringImporter::all(&candidate);
+                runtime.host.install_ready(candidate);
+                self.authoring
+                    .replace_pipeline_importers(importers)
+                    .expect("candidate importer metadata was prevalidated");
                 let mut commit = Commit {
-                    pipeline: Some(diagnostic),
+                    pipeline: Some(PipelineDiagnostic::Ready),
                     pipeline_epoch_changed: true,
                     ..Commit::default()
                 };
@@ -1027,15 +898,7 @@ impl DaemonCoordinator {
                 Ok(commit)
             });
             match result {
-                Ok(stamp) => {
-                    let failure = cleanup_failure.take();
-                    if let Some(failure) = failure {
-                        drop(runtime);
-                        self.publish_pipeline_rejection(failure)
-                    } else {
-                        Ok(stamp)
-                    }
-                }
+                Ok(stamp) => Ok(stamp),
                 Err(error) => {
                     if let Some(candidate) = prepared.take() {
                         if let Some(failure) = runtime.host.discard_unpublished(candidate) {
@@ -1071,204 +934,13 @@ impl DaemonCoordinator {
         })
     }
 
-    pub(crate) fn pending_schema_transition_context(
-        &self,
-        candidate: &PipelineCandidateIdentity,
-        type_uuid: TypeUuid,
-    ) -> Result<(Option<LogicalHash>, BTreeSet<String>), String> {
-        self.on_authority(|| {
-            let runtime = lock_pipeline(&self.pipeline);
-            let pending = runtime
-                .pending
-                .as_ref()
-                .ok_or_else(|| "no loaded pipeline candidate awaits schema acceptance".to_owned())?;
-            let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
-                .map_err(|error| error.to_string())?;
-            if &actual != candidate {
-                return Err("loaded schema candidate identity is stale".to_owned());
-            }
-            Ok((
-                pending.stored.schema_registry.get(&type_uuid).copied(),
-                pending
-                    .loaded
-                    .migration_function_keys()
-                    .into_iter()
-                    .collect(),
-            ))
-        })
-    }
-
-    pub(crate) fn publish_schema_transition(
-        &self,
-        base: InputVersion,
-        planned: &PlannedSchemaTransition,
-        quarantine: &QuarantineDriver,
-    ) -> Result<distill_rpc::DeferredOperationResult, String> {
-        self.on_authority(|| {
-            // Keep the exact unpublished candidate reserved through durable
-            // manifest replacement, rescan, and promotion. Ordinary pipeline
-            // staging also runs on the authority, so it cannot replace the
-            // candidate between the store CAS and live installation.
-            let mut runtime = lock_pipeline(&self.pipeline);
-            let (candidate, tools, prepared_importers) = {
-                let pending = runtime.pending.as_ref().ok_or_else(|| {
-                    "no loaded pipeline candidate awaits schema acceptance".to_owned()
-                })?;
-                let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
-                    .map_err(|error| error.to_string())?;
-                if actual != planned.request.candidate {
-                    return Err("loaded schema candidate identity is stale".to_owned());
-                }
-                let importers = self
-                    .authoring
-                    .prepare_pipeline_importers(EpochAuthoringImporter::all(&pending.loaded))
-                    .map_err(|error| format!("candidate importer metadata is invalid: {error:?}"))?;
-                (
-                    pending.stored.clone(),
-                    pending.loaded.tool_epoch(),
-                    importers,
-                )
-            };
-            let transition = IncrementalSchemaTransition {
-                planned,
-                candidate: &candidate,
-                tools: &tools,
-            };
-
-            let temp = plan_same_dir_temp(&planned.target)?;
-            let plan = JournalIntentPlan {
-                target_path: planned
-                    .target
-                    .to_str()
-                    .ok_or_else(|| "schema manifest path is not lossless UTF-8".to_owned())?
-                    .to_owned(),
-                temp_path: temp
-                    .to_str()
-                    .ok_or_else(|| "schema manifest temp path is not lossless UTF-8".to_owned())?
-                    .to_owned(),
-                conflict_path: unique_sibling(&planned.target, "conflict")
-                    .to_str()
-                    .ok_or_else(|| "schema manifest conflict path is not lossless UTF-8".to_owned())?
-                    .to_owned(),
-                pre_image_hash: Some(planned.preimage),
-                proposed_hash: planned.proposed.manifest_hash(),
-            };
-            let group_id = {
-                let mut store = self.store.write();
-                if store.input_version() != base
-                    || store
-                        .schema_manifest_basis()
-                        .map_err(|error| error.to_string())?
-                        .as_ref()
-                        != Some(&planned.request.manifest)
-                {
-                    return Err("schema transition durable basis is stale".to_owned());
-                }
-                store
-                    .preview_input_transaction(|transaction| {
-                        apply_schema_transition(transaction, &transition).map(|_| ())
-                    })
-                    .map_err(|error| error.to_string())?;
-                let mut publication = quarantine
-                    .admit_publication(&mut store)
-                    .map_err(|error| error.to_string())?;
-                let basis = SchemaTransitionJournalBasis {
-                    base,
-                    target: planned.target.clone(),
-                    old_manifest_hash: planned.preimage,
-                    proposed_manifest_hash: planned.proposed.manifest_hash(),
-                }
-                .encode()?;
-                let group = publication
-                    .record_group(PublicationGroupKind::SchemaTransition, &basis, &[plan])
-                    .map_err(|error| error.to_string())?;
-                write_planned_temp(&temp, &planned.proposed_bytes)?;
-                publication
-                    .arm_group(group.group_id)
-                    .map_err(|error| error.to_string())?;
-                let outcome = publication
-                    .resume_group_replace(group.child_intents[0], &planned.target)
-                    .map_err(|error| error.to_string())?;
-                if outcome != RenameAsideOutcome::Installed {
-                    publication
-                        .retire_group(group.group_id)
-                        .map_err(|error| error.to_string())?;
-                    return Err(
-                        "schema manifest changed concurrently; its bytes were preserved".to_owned(),
-                    );
-                }
-                group.group_id
-            };
-
-            let projection = self.authoring.pipeline_projection();
-            let mut transition_paths = planned.waiting_paths.clone();
-            transition_paths.push(planned.target.clone());
-            transition_paths.sort();
-            transition_paths.dedup();
-            let commit = publish_incremental_paths_with_schema_transition(
-                &self.scanner,
-                &transition_paths,
-                &self
-                    .lineage_destination.load(),
-                &self.store,
-                base,
-                &projection,
-                Some(self),
-                Some(&transition),
-            )?;
-
-            let mut terminal_errors = Vec::new();
-            if let Err(error) = self.store.write().retire_publication_group(group_id) {
-                terminal_errors.push(format!(
-                    "schema transition committed but journal retirement failed: {error}"
-                ));
-            }
-
-            if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
-                match runtime.pending.take() {
-                    Some(pending) => {
-                        match PipelineCandidateIdentity::try_from(pending.stored.epoch()) {
-                            Ok(actual) if actual == planned.request.candidate => {
-                                runtime.host.install_ready(pending.loaded);
-                                self.authoring
-                                    .install_pipeline_importers(prepared_importers);
-                            }
-                            Ok(_) => {
-                                runtime.pending = Some(pending);
-                                terminal_errors.push(
-                                    "schema transition committed but the reserved candidate identity changed"
-                                        .to_owned(),
-                                );
-                            }
-                            Err(error) => {
-                                runtime.pending = Some(pending);
-                                terminal_errors.push(format!(
-                                    "schema transition committed but the reserved candidate identity became invalid: {error}"
-                                ));
-                            }
-                        }
-                    }
-                    None => terminal_errors.push(
-                        "schema transition committed but the reserved candidate disappeared".to_owned(),
-                    ),
-                }
-            }
-
-            Ok(distill_rpc::DeferredOperationResult {
-                commit,
-                terminal_error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
-            })
-        })
-    }
-
     fn publish_pipeline_rejection_inner(
         &self,
         failure: PipelineFailure,
         heal_configuration: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let healed_configuration = heal_configuration
-            .then(|| self.configuration_without_source_error())
-            .transpose()?;
+            .then(|| self.configuration_without_source_error());
         let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let diagnostic = failure.clone();
@@ -1292,10 +964,7 @@ impl DaemonCoordinator {
             store
                 .input_transaction(|transaction| {
                     transaction.publish_pipeline_failure(&diagnostic)?;
-                    match healed_configuration
-                        .as_ref()
-                        .map(|(configuration, _)| configuration)
-                    {
+                    match healed_configuration.as_ref() {
                         Some(ConfigurationStatus::Ready) => {
                             transaction.publish_configuration_ready(generation)?
                         }
@@ -1307,12 +976,7 @@ impl DaemonCoordinator {
                 })
                 .map_err(|error| error.to_string())?;
             Ok(Commit {
-                configuration: healed_configuration
-                    .as_ref()
-                    .map(|(configuration, _)| configuration.clone()),
-                lineage_repair: healed_configuration
-                    .as_ref()
-                    .map(|(_, repair)| repair.clone()),
+                configuration: healed_configuration.clone(),
                 pipeline: Some(PipelineDiagnostic::Failed(diagnostic.clone())),
                 pipeline_epoch_changed: true,
                 ..Commit::default()
@@ -1321,10 +985,6 @@ impl DaemonCoordinator {
         match result {
             Ok(stamp) => {
                 let mut runtime = lock_pipeline(&self.pipeline);
-                if let Some(cleanup) = discard_pending(&mut runtime) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection_inner(cleanup, false);
-                }
                 runtime.host.install_failure(failure);
                 self.authoring.install_pipeline_importers(BTreeMap::new());
                 if heal_configuration {
@@ -1531,8 +1191,6 @@ impl DaemonCoordinator {
                 }
             };
             let inputs = PlanInputs {
-                scanner: &self.scanner,
-                destination: self.lineage_destination(),
                 configuration_error: self.configuration_error(),
                 namespace_errors: self.pending_scan_errors(),
                 authority: authority.as_deref(),
@@ -1559,7 +1217,6 @@ impl DaemonCoordinator {
                     &renames,
                     &projection,
                     tag_epoch,
-                    None,
                 )
                 .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority.clone() {
@@ -1618,8 +1275,6 @@ impl DaemonCoordinator {
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let authority = self.schema_authority();
         let mut candidate = ScanCandidate::build(
-            &self.scanner,
-            &self.lineage_destination(),
             scan,
             self.configuration_error(),
             authority.as_deref(),
@@ -1745,22 +1400,8 @@ impl DaemonCoordinator {
                 .chain(rejection.configuration.clone()),
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let (configuration, lineage_repair) = if self.scan_initialized.load(Ordering::Acquire) {
-            let lineage = claimed_lineage(&self.store.read(), &BTreeMap::new())?;
-            let (configuration, repair, _) = indexed_lineage_projection(
-                &lineage,
-                &self.scanner,
-                &self.lineage_destination(),
-                external_configuration,
-            )?;
-            (configuration, repair)
-        } else {
-            (
-                external_configuration
-                    .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed),
-                None,
-            )
-        };
+        let configuration =
+            external_configuration.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed);
         let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let stamp = self
@@ -1798,7 +1439,6 @@ impl DaemonCoordinator {
                 let commit = Commit {
                     configuration: Some(configuration.clone()),
                     namespace_errors: Some(version.clone()),
-                    lineage_repair: Some(lineage_repair.clone()),
                     ..Commit::default()
                 };
                 Ok(commit)
@@ -2141,7 +1781,6 @@ fn classify_scan_rejection(
 pub enum CoordinatorInitError {
     Store(StoreError),
     Scan(ScanError),
-    Repair(LineageRepairBackendInitError),
     Authoring(AuthoringServiceInitError),
     Rpc(distill_rpc::TargetSetError),
     Module(String),
@@ -2165,11 +1804,6 @@ impl From<StoreError> for CoordinatorInitError {
 impl From<ScanError> for CoordinatorInitError {
     fn from(error: ScanError) -> Self {
         Self::Scan(error)
-    }
-}
-impl From<LineageRepairBackendInitError> for CoordinatorInitError {
-    fn from(error: LineageRepairBackendInitError) -> Self {
-        Self::Repair(error)
     }
 }
 impl From<AuthoringServiceInitError> for CoordinatorInitError {
@@ -2448,17 +2082,6 @@ fn source_claims(
             });
             for (local_id, entry) in &bundle.assets {
                 authored_claims(&mut claims, bundle.uuid, local_id, entry.uuid, entry.type_uuid);
-                if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
-                    decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
-                    claims.push(SourceClaim::Lineage(LineageManifestClaimant {
-                        root_name: source.root_name.clone(),
-                        normalized_path: source.normalized_path.clone(),
-                        bundle: bundle.uuid,
-                        local_id: local_id.clone(),
-                        asset: entry.uuid,
-                        file_hash: source.file_hash,
-                    }));
-                }
             }
             if let Some(primary) = &bundle.primary {
                 claims.push(SourceClaim::PrimaryPath {
@@ -2489,8 +2112,6 @@ fn bundle_claims<'a>(
 
 /// What the incremental plan reads besides the claims.
 struct PlanInputs<'a> {
-    scanner: &'a RootedScanner,
-    destination: LineageDestination,
     configuration_error: Option<ConfigurationError>,
     /// Namespace errors outside the claims (a pending scan rejection's).
     namespace_errors: Vec<NamespaceError>,
@@ -2524,36 +2145,6 @@ fn claimed_source(
     Ok(Arc::new(crate::scanner::scanned_bundle(root_name, path, bytes)))
 }
 
-/// The claimed lineage manifests, decoded from their sources.
-fn claimed_lineage(
-    reader: &StoreReader,
-    fresh: &BTreeMap<ScanKey, Arc<ScannedBundle>>,
-) -> Result<BTreeMap<LineageManifestClaimant, VerifiedSchemaLineageManifest>, CoordinatorError> {
-    let mut lineage = BTreeMap::new();
-    for claimant in reader.lineage_claims()? {
-        let source = claimed_source(
-            reader,
-            fresh,
-            &claimant.root_name,
-            &claimant.normalized_path,
-        )?;
-        let entry = source
-            .parsed
-            .as_ref()
-            .ok()
-            .and_then(|bundle| bundle.assets.get(&claimant.local_id))
-            .ok_or_else(|| {
-                CoordinatorError::InvalidManifest(format!(
-                    "lineage claimant {}:{} no longer parses",
-                    claimant.root_name, claimant.normalized_path
-                ))
-            })?;
-        let manifest = decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
-        lineage.insert(claimant, manifest);
-    }
-    Ok(lineage)
-}
-
 fn incremental_plan(
     reader: &StoreReader,
     inputs: &PlanInputs<'_>,
@@ -2565,12 +2156,10 @@ fn incremental_plan(
             .chain(inputs.namespace_errors.iter().cloned()),
     )
     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-    let (configuration, lineage_repair, lineage_manifest) = indexed_lineage_projection(
-        &claimed_lineage(reader, &inputs.fresh)?,
-        inputs.scanner,
-        &inputs.destination,
-        inputs.configuration_error.clone(),
-    )?;
+    let configuration = inputs
+        .configuration_error
+        .clone()
+        .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed);
     let pending = reader.pending_claims()?;
     // Every source of each pending bundle: a colliding bundle withholds the
     // assets of all of them.
@@ -2635,8 +2224,6 @@ fn incremental_plan(
         namespace_errors,
         withheld,
         configuration,
-        lineage_repair,
-        lineage_manifest,
         bundles,
         bundle_poisons,
         derived_outputs,
@@ -2648,86 +2235,10 @@ struct IncrementalScanPlan {
     namespace_errors: Vec<NamespaceError>,
     withheld: Withheld,
     configuration: ConfigurationStatus,
-    lineage_repair: Option<LineageRepairState>,
-    lineage_manifest: Option<VerifiedSchemaLineageManifest>,
     bundles: BTreeMap<BundleUuid, Option<Arc<ScannedBundle>>>,
     bundle_poisons: BTreeMap<BundleUuid, ScopedBundlePoison>,
     derived_outputs: BTreeMap<AssetUuid, Option<DerivedOutputEntry>>,
     paths: BTreeMap<String, BTreeSet<AssetUuid>>,
-}
-
-fn indexed_lineage_projection(
-    lineage: &BTreeMap<LineageManifestClaimant, VerifiedSchemaLineageManifest>,
-    scanner: &RootedScanner,
-    destination: &LineageDestination,
-    external_error: Option<ConfigurationError>,
-) -> Result<
-    (
-        ConfigurationStatus,
-        Option<LineageRepairState>,
-        Option<VerifiedSchemaLineageManifest>,
-    ),
-    CoordinatorError,
-> {
-    let (lineage_configuration, mut repair, manifest) = match lineage.len() {
-        0 => {
-            let reason = DscpV1::MissingLineageManifest;
-            let error = ConfigurationError::from_reason(
-                &reason,
-                "the unique SchemaLineageManifest is missing",
-            );
-            (
-                ConfigurationStatus::Failed(error),
-                Some(LineageRepairState::Missing {
-                    configured_root: destination.root.clone(),
-                    configured_path: destination.path.clone(),
-                    destination: scanner
-                        .inspect_destination(&destination.root, &destination.path)?,
-                }),
-                None,
-            )
-        }
-        1 => {
-            let manifest = lineage
-                .values()
-                .next()
-                .expect("one lineage claimant has one manifest")
-                .clone();
-            (ConfigurationStatus::Ready, None, Some(manifest))
-        }
-        _ => {
-            let claimants = lineage.keys().cloned().collect::<Vec<_>>();
-            let reason = DscpV1::DuplicateLineageManifest {
-                entries: claimants.clone(),
-            };
-            let error = ConfigurationError::from_reason(
-                &reason,
-                "multiple SchemaLineageManifest entries claim authority",
-            );
-            (
-                ConfigurationStatus::Failed(error),
-                Some(LineageRepairState::Duplicate { claimants }),
-                None,
-            )
-        }
-    };
-    let configuration = match lineage_configuration {
-        ConfigurationStatus::Ready => {
-            external_error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
-        }
-        ConfigurationStatus::Failed(lineage_error) => {
-            let selected = ConfigurationError::select_canonical(
-                external_error.into_iter().chain([lineage_error.clone()]),
-            )
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
-            .expect("lineage supplied one configuration error");
-            if selected.reason_hash != lineage_error.reason_hash {
-                repair = None;
-            }
-            ConfigurationStatus::Failed(selected)
-        }
-    };
-    Ok((configuration, repair, manifest))
 }
 
 fn scan_key_matches(prefix: &ScanKey, key: &ScanKey) -> bool {
@@ -2745,14 +2256,10 @@ struct ScanCandidate {
     namespace_errors: Vec<NamespaceError>,
     bundle_poisons: BTreeMap<BundleUuid, ScopedBundlePoison>,
     configuration: ConfigurationStatus,
-    lineage_repair: Option<LineageRepairState>,
-    lineage_manifest: Option<VerifiedSchemaLineageManifest>,
 }
 
 impl ScanCandidate {
     fn build(
-        scanner: &RootedScanner,
-        destination: &LineageDestination,
         scan: ScanSnapshot,
         external_error: Option<ConfigurationError>,
         authority: Option<&ProjectSchemaAuthority>,
@@ -2850,80 +2357,14 @@ impl ScanCandidate {
         let namespace_errors = NamespaceError::canonical_set(errors)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
 
-        let mut claimants = lineage_claimants(&parsed);
-        claimants.sort();
-        claimants.dedup();
-        let (lineage_configuration, mut lineage_repair, lineage_manifest) =
-            match claimants.as_slice() {
-                [] => {
-                    let reason = DscpV1::MissingLineageManifest;
-                    let error = distill_rpc::ConfigurationError::from_reason(
-                        &reason,
-                        "the unique SchemaLineageManifest is missing",
-                    );
-                    let repair = LineageRepairState::Missing {
-                        configured_root: destination.root.clone(),
-                        configured_path: destination.path.clone(),
-                        destination: scanner
-                            .inspect_destination(&destination.root, &destination.path)?,
-                    };
-                    (ConfigurationStatus::Failed(error), Some(repair), None)
-                }
-                [claimant] => {
-                    let (source, bundle) = parsed
-                        .iter()
-                        .find(|(source, bundle)| {
-                            source.root_name == claimant.root_name
-                                && source.normalized_path == claimant.normalized_path
-                                && bundle.uuid == claimant.bundle
-                        })
-                        .expect("claimant came from parsed scan");
-                    let entry = &bundle.assets[&claimant.local_id];
-                    let manifest =
-                        decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
-                    (ConfigurationStatus::Ready, None, Some(manifest))
-                }
-                _ => {
-                    let reason = DscpV1::DuplicateLineageManifest {
-                        entries: claimants.clone(),
-                    };
-                    let error = distill_rpc::ConfigurationError::from_reason(
-                        &reason,
-                        "multiple SchemaLineageManifest entries claim authority",
-                    );
-                    (
-                        ConfigurationStatus::Failed(error),
-                        Some(LineageRepairState::Duplicate { claimants }),
-                        None,
-                    )
-                }
-            };
-
-        let configuration = match lineage_configuration {
-            ConfigurationStatus::Ready => {
-                external_error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
-            }
-            ConfigurationStatus::Failed(lineage_error) => {
-                let selected = ConfigurationError::select_canonical(
-                    external_error.into_iter().chain([lineage_error.clone()]),
-                )
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
-                .expect("lineage supplied one configuration error");
-                if selected.reason_hash != lineage_error.reason_hash {
-                    lineage_repair = None;
-                }
-                ConfigurationStatus::Failed(selected)
-            }
-        };
-
+        let configuration =
+            external_error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed);
         Ok(Self {
             scan,
             renames: Vec::new(),
             namespace_errors,
             bundle_poisons,
             configuration,
-            lineage_repair,
-            lineage_manifest,
         })
     }
 }
@@ -3020,78 +2461,6 @@ struct BundleSummary {
     format_version: u32,
     content_hash: ContentHash,
     origin: Option<distill_store::bundles::DirectoryOrigin>,
-}
-
-struct RetiredWaitingProjection {
-    error: StoredRetiredTypeReferenced,
-    bundles: BTreeSet<BundleUuid>,
-    paths: BTreeSet<String>,
-    assets: BTreeSet<AssetUuid>,
-}
-
-fn retired_waiting_projection<'a>(
-    sources: impl IntoIterator<Item = &'a ScannedBundle>,
-    retired_types: &BTreeSet<TypeUuid>,
-    manifest_hash: ContentHash,
-    basis: SnapshotStamp,
-) -> Result<Option<RetiredWaitingProjection>, StoreError> {
-    if retired_types.is_empty() {
-        return Ok(None);
-    }
-    let mut references = BTreeMap::<TypeUuid, BTreeSet<RetiredTypeReference>>::new();
-    let mut bundles = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    let mut assets = BTreeSet::new();
-    for source in sources {
-        let Ok(bundle) = &source.parsed else {
-            continue;
-        };
-        let mut bundle_waits = false;
-        for entry in bundle.assets.values() {
-            if retired_types.contains(&entry.type_uuid) {
-                references
-                    .entry(entry.type_uuid)
-                    .or_default()
-                    .insert(RetiredTypeReference::Asset(entry.uuid));
-                bundle_waits = true;
-            }
-            if entry.type_uuid == distill_core::bootstrap::MIGRATION_TYPE_UUID {
-                let header =
-                    crate::migration_control::decode_header(&entry.data).map_err(|error| {
-                        StoreError::InvalidConfiguration {
-                            error: format!(
-                                "cannot classify retired Migration reference {}: {error}",
-                                entry.uuid
-                            ),
-                        }
-                    })?;
-                if retired_types.contains(&header.target_type_uuid) {
-                    let target = references.entry(header.target_type_uuid).or_default();
-                    target.insert(RetiredTypeReference::MigrationEndpoint(entry.uuid));
-                    bundle_waits = true;
-                }
-            }
-        }
-        if bundle_waits {
-            bundles.insert(bundle.uuid);
-            paths.insert(source.normalized_path.clone());
-            assets.extend(bundle.assets.values().map(|entry| entry.uuid));
-        }
-    }
-    let Some((type_uuid, references)) = references.into_iter().next() else {
-        return Ok(None);
-    };
-    Ok(Some(RetiredWaitingProjection {
-        error: StoredRetiredTypeReferenced {
-            manifest_hash,
-            basis,
-            type_uuid,
-            references: references.into_iter().collect(),
-        },
-        bundles,
-        paths,
-        assets,
-    }))
 }
 
 impl BundleSummary {
@@ -3293,36 +2662,8 @@ fn publish_scan(
                     error: "input version exhausted".to_owned(),
                 })?,
         );
-    let manifest_hash = candidate
-        .lineage_manifest
-        .as_ref()
-        .map(VerifiedSchemaLineageManifest::manifest_hash)
-        .or(store
-            .schema_manifest_basis()?
-            .map(|basis| basis.manifest_hash));
-    let waiting = match manifest_hash {
-        Some(manifest_hash) => retired_waiting_projection(
-            published.iter().map(AsRef::as_ref),
-            &store.retired_type_uuids()?,
-            manifest_hash,
-            SnapshotStamp {
-                instance: store.instance_id(),
-                version: observation,
-            },
-        )?,
-        None => None,
-    };
-    let waiting_bundles = waiting
-        .as_ref()
-        .map_or_else(BTreeSet::new, |waiting| waiting.bundles.clone());
-    let publishable_changed_bundles = changed_bundles
-        .difference(&waiting_bundles)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let rpc_publishable_bundles = rpc_changed_bundles
-        .difference(&waiting_bundles)
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let publishable_changed_bundles = changed_bundles;
+    let rpc_publishable_bundles = rpc_changed_bundles;
     let mut commit = rpc_commit(
         &candidate,
         &published,
@@ -3333,13 +2674,8 @@ fn publish_scan(
         projection,
         derived_outputs.clone(),
         &rpc_publishable_bundles,
-        &waiting_bundles,
     )?;
-    if waiting.is_some() {
-        commit.derived_outputs = None;
-    }
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
-    let mut healed_retired = false;
     store.input_transaction(|transaction| {
         transaction.replace_source_claims(None, claims)?;
         let mut root_ids = BTreeMap::new();
@@ -3379,18 +2715,14 @@ fn publish_scan(
         )?;
         transaction.set_clean_watermark(newest_mtime)?;
         transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
-        if waiting.is_none() {
-            transaction.clear_derived_outputs()?;
-        }
-        if waiting.is_none() {
-            for (child, output) in &derived_outputs {
-                transaction.set_derived_output(
-                    *child,
-                    output.parent,
-                    &output.output_key,
-                    output.terminal_type,
-                )?;
-            }
+        transaction.clear_derived_outputs()?;
+        for (child, output) in &derived_outputs {
+            transaction.set_derived_output(
+                *child,
+                output.parent,
+                &output.output_key,
+                output.terminal_type,
+            )?;
         }
 
         match &candidate.configuration {
@@ -3399,38 +2731,17 @@ fn publish_scan(
                 transaction.publish_configuration_error(&error.detail, &error.message)?
             }
         }
-        if let Some(manifest) = &candidate.lineage_manifest {
-            transaction.project_verified_lineage_manifest(manifest)?;
-        }
         match pipeline {
             Some(ConfigurationPipelinePublication::Epoch { epoch, tools }) => {
-                next_pipeline = transaction
-                    .pipeline_acceptance_requirement(epoch)?
-                    .map_or(PipelineDiagnostic::Ready, |required| {
-                        PipelineDiagnostic::SchemaAcceptanceRequired(required)
-                    });
-                if transaction.publish_pipeline_epoch(epoch)? {
-                    transaction.publish_tool_epoch(tools)?;
-                }
+                next_pipeline = PipelineDiagnostic::Ready;
+                transaction.publish_pipeline_epoch(epoch)?;
+                transaction.publish_tool_epoch(tools)?;
             }
             Some(ConfigurationPipelinePublication::Failed(failure)) => {
                 next_pipeline = PipelineDiagnostic::Failed(failure.clone());
                 transaction.publish_pipeline_failure(failure)?;
             }
             None => {}
-        }
-        if let Some(waiting) = &waiting {
-            transaction.publish_retired_type_referenced(&waiting.error)?;
-            next_pipeline =
-                PipelineDiagnostic::RetiredTypeReferenced(distill_rpc::RetiredTypeReferenced {
-                    manifest_hash: BundleFileHash(waiting.error.manifest_hash.0),
-                    basis: waiting.error.basis,
-                    type_uuid: waiting.error.type_uuid,
-                    references: waiting.error.references.clone(),
-                });
-            commit.pipeline_epoch_changed = true;
-        } else if pipeline.is_none() {
-            healed_retired = transaction.clear_retired_type_referenced()?;
         }
 
         for bundle in old_bundle_summaries.keys() {
@@ -3516,10 +2827,6 @@ fn publish_scan(
         }
         Ok(())
     })?;
-    if healed_retired {
-        next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
-        commit.pipeline_epoch_changed = true;
-    }
     commit.pipeline = Some(next_pipeline);
     Ok(commit)
 }
@@ -3542,55 +2849,12 @@ struct DurableBundleBasis {
     assets: BTreeSet<AssetUuid>,
 }
 
-fn preserve_waiting_bundle_paths(
-    waiting: &mut RetiredWaitingProjection,
-    durable_bundles: &BTreeMap<BundleUuid, DurableBundleBasis>,
-) {
-    for bundle in &waiting.bundles {
-        if let Some(path) = durable_bundles
-            .get(bundle)
-            .and_then(|basis| basis.summary.as_ref())
-            .map(|summary| &summary.path)
-        {
-            waiting.paths.insert(path.clone());
-        }
-    }
-}
-
-fn include_reactivation_durable_paths(
-    paths: &mut BTreeMap<String, BTreeSet<AssetUuid>>,
-    scan: &ScanSnapshot,
-    durable_bundles: &BTreeMap<BundleUuid, DurableBundleBasis>,
-) {
-    for path in durable_bundles
-        .values()
-        .filter_map(|basis| basis.summary.as_ref().map(|summary| summary.path.clone()))
-    {
-        paths.entry(path.clone()).or_insert_with(|| {
-            scan.bundle_rows()
-                .filter(|source| source.normalized_path == path)
-                .filter_map(|source| source.parsed.as_ref().ok())
-                .filter_map(|bundle| {
-                    bundle
-                        .primary
-                        .as_ref()
-                        .map(|primary| bundle.assets[primary].uuid)
-                })
-                .collect()
-        });
-    }
-}
-
 fn append_path_mutations(
     commit: &mut Commit,
     current_paths: &BTreeMap<String, BTreeSet<AssetUuid>>,
     old_paths: &BTreeMap<String, BTreeSet<AssetUuid>>,
-    waiting: Option<&RetiredWaitingProjection>,
 ) {
     for (path, current) in current_paths {
-        if waiting.is_some_and(|waiting| waiting.paths.contains(path)) {
-            continue;
-        }
         let old = &old_paths[path];
         if old == current {
             continue;
@@ -3608,72 +2872,6 @@ fn append_path_mutations(
     }
 }
 
-struct IncrementalSchemaTransition<'a> {
-    planned: &'a PlannedSchemaTransition,
-    candidate: &'a ValidatedPipelineEpoch,
-    tools: &'a BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
-}
-
-fn apply_schema_transition(
-    transaction: &mut distill_store::db::InputTxn<'_>,
-    transition: &IncrementalSchemaTransition<'_>,
-) -> Result<PipelineDiagnostic, StoreError> {
-    let request = &transition.planned.request;
-    match request.action {
-        SchemaTransitionAction::Accept { requested } => {
-            transaction.accept_schema_candidate(
-                transition.candidate,
-                &request.manifest,
-                &transition.planned.proposed,
-                request.type_uuid,
-                requested,
-            )?;
-        }
-        SchemaTransitionAction::Rollback { target } => {
-            transaction.rollback_schema_candidate(
-                transition.candidate,
-                &request.manifest,
-                &transition.planned.proposed,
-                SchemaRollbackRequest {
-                    type_uuid: request.type_uuid,
-                    target,
-                    live_schema_hashes: &transition.planned.live_schema_hashes,
-                    reverse_edges: &transition.planned.reverse_edges,
-                },
-            )?;
-        }
-        SchemaTransitionAction::Retire { control_basis } => {
-            transaction.retire_schema_candidate(
-                transition.candidate,
-                &request.manifest,
-                control_basis,
-                &transition.planned.proposed,
-                request.type_uuid,
-                &transition.planned.live_schema_hashes,
-            )?;
-        }
-        SchemaTransitionAction::Reactivate => {
-            transaction.reactivate_schema_candidate(
-                transition.candidate,
-                &request.manifest,
-                &transition.planned.proposed,
-                SchemaReactivationRequest {
-                    type_uuid: request.type_uuid,
-                    live_schema_hashes: &transition.planned.live_schema_hashes,
-                    reverse_edges: &transition.planned.reverse_edges,
-                },
-            )?;
-        }
-    }
-    transaction
-        .pipeline_acceptance_requirement(transition.candidate)
-        .map(|required| {
-            required.map_or(PipelineDiagnostic::Ready, |required| {
-                PipelineDiagnostic::SchemaAcceptanceRequired(required)
-            })
-        })
-}
-
 /// Publish one incremental scan in one input transaction: its file rows and
 /// claims are written first, and the plan is read back from them, so a
 /// failed publication rolls both back.
@@ -3688,7 +2886,6 @@ fn publish_incremental_scan(
     renames: &[LogicalRename],
     projection: &PipelineProjection,
     tag_epoch: [u8; 32],
-    schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<Commit, StoreError> {
     let file_mutations = incremental_file_mutations(baseline, delta);
     let mut store = store.write();
@@ -3708,8 +2905,7 @@ fn publish_incremental_scan(
                     error: "input version exhausted".to_owned(),
                 })?,
         );
-    let mut healed_retired = false;
-    let (mut commit, _) = store.input_transaction(|transaction| {
+    let (commit, _) = store.input_transaction(|transaction| {
         let watermark = transaction.reader().clean_watermark()?.unwrap_or(0);
         let mut root_ids = BTreeMap::new();
         let mut newest_mtime = watermark;
@@ -3743,17 +2939,13 @@ fn publish_incremental_scan(
         transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
         let IncrementalPublication {
             plan,
-            mut commit,
-            waiting,
+            commit,
             changed_bundles,
             configuration_generation,
         } = prepare_incremental_publication(
             &transaction.reader(),
-            delta,
             inputs,
             projection,
-            observation,
-            schema_transition,
         )?;
         transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
         match &plan.configuration {
@@ -3763,35 +2955,6 @@ fn publish_incremental_scan(
             ConfigurationStatus::Failed(error) => {
                 transaction.publish_configuration_error(&error.detail, &error.message)?;
             }
-        }
-        if let Some(transition) = schema_transition {
-            if plan.lineage_manifest.as_ref() != Some(&transition.planned.proposed) {
-                return Err(StoreError::InvalidConfiguration {
-                    error: "incremental scan did not reproduce the planned schema manifest"
-                        .to_owned(),
-                });
-            }
-            commit.pipeline = Some(apply_schema_transition(transaction, transition)?);
-            if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
-                transaction.publish_tool_epoch(transition.tools)?;
-            }
-            commit.pipeline_epoch_changed = true;
-        } else if let Some(manifest) = &plan.lineage_manifest {
-            transaction.project_verified_lineage_manifest(manifest)?;
-        }
-        if let Some(waiting) = &waiting {
-            transaction.publish_retired_type_referenced(&waiting.error)?;
-            commit.pipeline = Some(PipelineDiagnostic::RetiredTypeReferenced(
-                distill_rpc::RetiredTypeReferenced {
-                    manifest_hash: BundleFileHash(waiting.error.manifest_hash.0),
-                    basis: waiting.error.basis,
-                    type_uuid: waiting.error.type_uuid,
-                    references: waiting.error.references.clone(),
-                },
-            ));
-            commit.pipeline_epoch_changed = true;
-        } else if schema_transition.is_none() {
-            healed_retired = transaction.clear_retired_type_referenced()?;
         }
         for bundle_uuid in &changed_bundles {
             transaction.remove_bundle(*bundle_uuid)?;
@@ -3885,17 +3048,12 @@ fn publish_incremental_scan(
         transaction.clear_pending_claims()?;
         Ok(commit)
     })?;
-    if healed_retired {
-        commit.pipeline = Some(pipeline_diagnostic(store.pipeline_state()?));
-        commit.pipeline_epoch_changed = true;
-    }
     Ok(commit)
 }
 
 struct IncrementalPublication {
     plan: IncrementalScanPlan,
     commit: Commit,
-    waiting: Option<RetiredWaitingProjection>,
     changed_bundles: BTreeSet<BundleUuid>,
     configuration_generation: u64,
 }
@@ -3904,11 +3062,8 @@ struct IncrementalPublication {
 /// the published rows it replaces.
 fn prepare_incremental_publication(
     store: &StoreReader,
-    delta: &ScanDelta,
     inputs: &PlanInputs<'_>,
     projection: &PipelineProjection,
-    observation: InputVersion,
-    schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<IncrementalPublication, StoreError> {
     let plan = incremental_plan(store, inputs).map_err(|error| StoreError::InvalidConfiguration {
         error: error.to_string(),
@@ -3948,98 +3103,20 @@ fn prepare_incremental_publication(
         .map(|child| Ok((*child, store.derived_output_row(*child)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     let stored_pipeline = store.pipeline_state()?;
-    let was_retired = matches!(
-        stored_pipeline,
-        Some(StoredPipelineState::RetiredTypeReferenced { .. })
-    );
     let mut commit = Commit {
         configuration: Some(plan.configuration.clone()),
         pipeline: Some(pipeline_diagnostic(stored_pipeline)),
         namespace_errors: Some(plan.namespace_errors.clone()),
-        lineage_repair: Some(plan.lineage_repair.clone()),
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
-    let mut retired_types = store.retired_type_uuids()?;
-    if schema_transition.is_some_and(|transition| {
-        matches!(
-            transition.planned.request.action,
-            SchemaTransitionAction::Reactivate
-        )
-    }) {
-        retired_types.remove(
-            &schema_transition
-                .expect("reactivation transition is present")
-                .planned
-                .request
-                .type_uuid,
-        );
-    }
-    let manifest_hash = plan
-        .lineage_manifest
-        .as_ref()
-        .map(VerifiedSchemaLineageManifest::manifest_hash)
-        .or(store
-            .schema_manifest_basis()?
-            .map(|basis| basis.manifest_hash));
-    let mut complete_waiting_scan = None;
-    if was_retired || schema_transition.is_some() {
-        let mut next = ScanSnapshot::load(&store)?;
-        next.apply_delta(delta.clone());
-        complete_waiting_scan = Some(next);
-    }
-    let mut waiting = match manifest_hash {
-        Some(manifest_hash) => retired_waiting_projection(
-            complete_waiting_scan.as_ref().map_or_else(
-                || {
-                    Box::new(plan.bundles.values().filter_map(Option::as_deref))
-                        as Box<dyn Iterator<Item = &ScannedBundle>>
-                },
-                |scan| Box::new(scan.bundle_rows()) as Box<dyn Iterator<Item = &ScannedBundle>>,
-            ),
-            &retired_types,
-            manifest_hash,
-            SnapshotStamp {
-                instance: store.instance_id(),
-                version: observation,
-            },
-        )?,
-        None => None,
-    };
-    if let Some(waiting) = &mut waiting {
-        // A waiting bundle may have moved. Its new path is in the observed
-        // projection, while the old path is part of the last published bundle
-        // projection. Hold both so RPC and SQLite preserve the same complete
-        // last-good view until reactivation admits the move atomically.
-        preserve_waiting_bundle_paths(waiting, &durable_bundles);
-    }
-    let mut path_projections = plan.paths.clone();
-    if schema_transition.is_some_and(|transition| {
-        matches!(
-            transition.planned.request.action,
-            SchemaTransitionAction::Reactivate
-        )
-    }) {
-        include_reactivation_durable_paths(
-            &mut path_projections,
-            complete_waiting_scan
-                .as_ref()
-                .expect("schema transition constructed a complete scan"),
-            &durable_bundles,
-        );
-    }
+    let path_projections = &plan.paths;
     let old_paths = path_projections
         .keys()
         .map(|path| Ok((path.clone(), store.path_assets(path)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     let mut changed_bundles = BTreeSet::new();
     for (bundle_uuid, source) in &plan.bundles {
-        if waiting
-            .as_ref()
-            .is_some_and(|waiting| waiting.bundles.contains(bundle_uuid))
-        {
-            continue;
-        }
         let old = &durable_bundles[bundle_uuid];
         let current_summary = if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
             Some(BundleSummary {
@@ -4130,17 +3207,9 @@ fn prepare_incremental_publication(
                 .push(AuthoringMutation::Remove { uuid: *asset });
         }
     }
-    append_path_mutations(&mut commit, &path_projections, &old_paths, waiting.as_ref());
+    append_path_mutations(&mut commit, path_projections, &old_paths);
     for (child, current) in &plan.derived_outputs {
         let old = old_derived[child].as_ref();
-        if waiting.as_ref().is_some_and(|waiting| {
-            current
-                .as_ref()
-                .is_some_and(|entry| waiting.assets.contains(&entry.parent))
-                || old.is_some_and(|(parent, _)| waiting.assets.contains(parent))
-        }) {
-            continue;
-        }
         let unchanged = match (old, current) {
             (None, None) => true,
             (Some((parent, key)), Some(entry)) => {
@@ -4178,7 +3247,6 @@ fn prepare_incremental_publication(
     Ok(IncrementalPublication {
         plan,
         commit,
-        waiting,
         changed_bundles,
         configuration_generation,
     })
@@ -4247,17 +3315,6 @@ fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
 fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic {
     match state {
         Some(StoredPipelineState::Ready(_)) | None => PipelineDiagnostic::Ready,
-        Some(StoredPipelineState::SchemaAcceptanceRequired { required, .. }) => {
-            PipelineDiagnostic::SchemaAcceptanceRequired(required)
-        }
-        Some(StoredPipelineState::RetiredTypeReferenced { error, .. }) => {
-            PipelineDiagnostic::RetiredTypeReferenced(distill_rpc::RetiredTypeReferenced {
-                manifest_hash: BundleFileHash(error.manifest_hash.0),
-                basis: error.basis,
-                type_uuid: error.type_uuid,
-                references: error.references,
-            })
-        }
         Some(StoredPipelineState::Failed { error, .. }) => PipelineDiagnostic::Failed(error),
     }
 }
@@ -4268,34 +3325,10 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
 pub(crate) fn publish_incremental_paths(
     scanner: &RootedScanner,
     paths: &[PathBuf],
-    lineage_destination: &LineageDestination,
     store: &Arc<AuthorityStore>,
     base: InputVersion,
     projection: &PipelineProjection,
     coordinator: Option<&DaemonCoordinator>,
-) -> Result<Commit, String> {
-    publish_incremental_paths_with_schema_transition(
-        scanner,
-        paths,
-        lineage_destination,
-        store,
-        base,
-        projection,
-        coordinator,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn publish_incremental_paths_with_schema_transition(
-    scanner: &RootedScanner,
-    paths: &[PathBuf],
-    lineage_destination: &LineageDestination,
-    store: &Arc<AuthorityStore>,
-    base: InputVersion,
-    projection: &PipelineProjection,
-    coordinator: Option<&DaemonCoordinator>,
-    schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<Commit, String> {
     let (delta, baseline) = {
         let store = store.read();
@@ -4324,8 +3357,6 @@ fn publish_incremental_paths_with_schema_transition(
         )
         .map_err(|error| error.to_string())?;
         let inputs = PlanInputs {
-            scanner,
-            destination: lineage_destination.clone(),
             configuration_error: coordinator.configuration_error(),
             namespace_errors: Vec::new(),
             authority: authority.as_deref(),
@@ -4341,33 +3372,26 @@ fn publish_incremental_paths_with_schema_transition(
             &[],
             projection,
             tag_epoch,
-            schema_transition,
         )
         .map_err(|error| error.to_string())?;
-        if schema_transition.is_none() {
-            if let Some(authority) = authority.clone() {
-                let affected = commit_affected_asset_bundles(&commit);
-                if !affected.is_empty() {
-                    let targets = coordinator
-                        .build_targets.load_full();
-                    crate::build::refine_published_tag_index_incremental(
-                        Arc::clone(store),
-                        scanner.clone(),
-                        authority,
-                        coordinator.pipeline_snapshot(),
-                        &targets,
-                        coordinator.operational_configuration().max_dependency_depth,
-                        &affected,
-                    )
-                    .apply_incremental(&mut commit);
-                }
+        if let Some(authority) = authority.clone() {
+            let affected = commit_affected_asset_bundles(&commit);
+            if !affected.is_empty() {
+                let targets = coordinator
+                    .build_targets.load_full();
+                crate::build::refine_published_tag_index_incremental(
+                    Arc::clone(store),
+                    scanner.clone(),
+                    authority,
+                    coordinator.pipeline_snapshot(),
+                    &targets,
+                    coordinator.operational_configuration().max_dependency_depth,
+                    &affected,
+                )
+                .apply_incremental(&mut commit);
             }
         }
         return Ok(commit);
-    }
-
-    if schema_transition.is_some() {
-        return Err("schema transition requires the live daemon coordinator".to_owned());
     }
 
     drop(baseline);
@@ -4375,13 +3399,7 @@ fn publish_incremental_paths_with_schema_transition(
     scan.apply_delta(delta);
     let claims = bundle_claims(scan.bundle_rows(), projection, authority.as_deref())
         .map_err(|error| error.to_string())?;
-    let candidate = ScanCandidate::build(
-        scanner,
-        lineage_destination,
-        scan,
-        None,
-        authority.as_deref(),
-    )
+    let candidate = ScanCandidate::build(scan, None, authority.as_deref())
     .map_err(|error| error.to_string())?;
     let commit = publish_scan(
         store,
@@ -4437,23 +3455,21 @@ fn rpc_commit(
     projection: &PipelineProjection,
     derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
     changed_bundles: &BTreeSet<BundleUuid>,
-    waiting_bundles: &BTreeSet<BundleUuid>,
 ) -> Result<Commit, StoreError> {
     let mut commit = Commit {
         configuration: Some(candidate.configuration.clone()),
         pipeline: Some(PipelineDiagnostic::Ready),
         namespace_errors: Some(candidate.namespace_errors.clone()),
-        lineage_repair: Some(candidate.lineage_repair.clone()),
         derived_outputs: Some(derived_outputs),
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
 
     // A withheld asset is not deleted: it resolves to its error.
-    let mut current_assets = old_asset_bundles
-        .iter()
-        .filter_map(|(asset, bundle)| waiting_bundles.contains(bundle).then_some(*asset))
-        .chain(withheld.assets.keys().copied())
+    let mut current_assets = withheld
+        .assets
+        .keys()
+        .copied()
         .collect::<BTreeSet<_>>();
     for (asset, error) in newly_failed {
         commit.assets.push(AssetMutation::Set {
@@ -4470,21 +3486,10 @@ fn rpc_commit(
         }
     }
     let mut paths = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
-    for (path, _, asset) in old_paths {
-        if old_asset_bundles
-            .get(asset)
-            .is_some_and(|bundle| waiting_bundles.contains(bundle))
-        {
-            paths.entry(path.clone()).or_default().insert(*asset);
-        }
-    }
     for source in published {
         let Ok(bundle) = &source.parsed else {
             continue;
         };
-        if waiting_bundles.contains(&bundle.uuid) {
-            continue;
-        }
         for (local_id, entry) in &bundle.assets {
             current_assets.insert(entry.uuid);
             if !changed_bundles.contains(&bundle.uuid) {
@@ -4670,27 +3675,6 @@ fn readable_source(source: &crate::scanner::ScannedBundle) -> ReadableBundleSour
     }
 }
 
-fn lineage_claimants(
-    parsed: &[(&crate::scanner::ScannedBundle, &Bundle)],
-) -> Vec<LineageManifestClaimant> {
-    parsed
-        .iter()
-        .flat_map(|(source, bundle)| {
-            bundle.assets.iter().filter_map(move |(local_id, entry)| {
-                (entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID).then_some(
-                    LineageManifestClaimant {
-                        root_name: source.root_name.clone(),
-                        normalized_path: source.normalized_path.clone(),
-                        bundle: bundle.uuid,
-                        local_id: local_id.clone(),
-                        asset: entry.uuid,
-                        file_hash: source.file_hash,
-                    },
-                )
-            })
-        })
-        .collect()
-}
 
 fn skeleton_failure(error: &distill_bundle::BundleError) -> SkeletonFailureCode {
     use distill_bundle::BundleError;
@@ -4715,136 +3699,6 @@ fn skeleton_failure(error: &distill_bundle::BundleError) -> SkeletonFailureCode 
     }
 }
 
-pub(crate) fn decode_lineage_manifest(
-    value: &AuthoredValue,
-    hash: ContentHash,
-) -> Result<VerifiedSchemaLineageManifest, CoordinatorError> {
-    let object = exact_object(value, &["types"])?;
-    let AuthoredValue::Array(rows) = &object["types"] else {
-        return invalid_manifest("lineage types must be a canonical non-string map array");
-    };
-    let mut types = BTreeMap::new();
-    for row in rows {
-        let AuthoredValue::Array(pair) = row else {
-            return invalid_manifest("lineage type map row must be a pair");
-        };
-        if pair.len() != 2 {
-            return invalid_manifest("lineage type map row must contain two values");
-        }
-        let type_uuid = TypeUuid(fixed_bytes::<16>(&pair[0], "type UUID")?);
-        if is_bootstrap_control_type(type_uuid) || types.contains_key(&type_uuid) {
-            return invalid_manifest("lineage type is bootstrap-controlled or duplicated");
-        }
-        let lineage = exact_object(&pair[1], &["authority", "current", "epochs"])?;
-        let AuthoredValue::Array(epoch_values) = &lineage["epochs"] else {
-            return invalid_manifest("lineage epochs must be an array");
-        };
-        let mut epochs = Vec::with_capacity(epoch_values.len());
-        for epoch in epoch_values {
-            let epoch = exact_object(epoch, &["digest", "forward_parent"])?;
-            let digest = LogicalHash(fixed_bytes::<32>(&epoch["digest"], "schema digest")?);
-            let forward_parent = match &epoch["forward_parent"] {
-                AuthoredValue::Null => None,
-                AuthoredValue::UInt(value) => Some(u32::try_from(*value).map_err(|_| {
-                    CoordinatorError::InvalidManifest(
-                        "lineage forward parent exceeds u32".to_owned(),
-                    )
-                })?),
-                _ => return invalid_manifest("lineage forward parent must be null or u32"),
-            };
-            epochs.push(AcceptedSchemaEpoch {
-                digest,
-                forward_parent,
-            });
-        }
-        let current = match &lineage["current"] {
-            AuthoredValue::UInt(value) => u32::try_from(*value).map_err(|_| {
-                CoordinatorError::InvalidManifest("lineage cursor exceeds u32".to_owned())
-            })?,
-            _ => return invalid_manifest("lineage current cursor must be u32"),
-        };
-        let authority_object = exact_one_variant(&lineage["authority"])?;
-        let authority = match authority_object.0 {
-            "Active" => {
-                exact_object(authority_object.1, &[])?;
-                TypeAuthorityState::Active
-            }
-            "Retired" => {
-                let payload = exact_object(authority_object.1, &["retired_from"])?;
-                let AuthoredValue::UInt(retired_from) = payload["retired_from"] else {
-                    return invalid_manifest("retired_from must be u32");
-                };
-                TypeAuthorityState::Retired {
-                    retired_from: u32::try_from(retired_from).map_err(|_| {
-                        CoordinatorError::InvalidManifest("retired_from exceeds u32".to_owned())
-                    })?,
-                }
-            }
-            _ => return invalid_manifest("unknown lineage authority variant"),
-        };
-        types.insert(
-            type_uuid,
-            AcceptedTypeLineage {
-                epochs,
-                current,
-                authority,
-            },
-        );
-    }
-    Ok(VerifiedSchemaLineageManifest::from_verified_source(
-        hash,
-        SchemaLineageManifest { types },
-    ))
-}
-
-fn exact_object<'a>(
-    value: &'a AuthoredValue,
-    keys: &[&str],
-) -> Result<&'a BTreeMap<String, AuthoredValue>, CoordinatorError> {
-    let AuthoredValue::Object(object) = value else {
-        return invalid_manifest("expected an object");
-    };
-    if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
-        return invalid_manifest("object field set is not exact");
-    }
-    Ok(object)
-}
-
-fn exact_one_variant(value: &AuthoredValue) -> Result<(&str, &AuthoredValue), CoordinatorError> {
-    let AuthoredValue::Object(object) = value else {
-        return invalid_manifest("enum must be an object");
-    };
-    if object.len() != 1 {
-        return invalid_manifest("enum must select exactly one variant");
-    }
-    let (name, payload) = object.first_key_value().expect("one row");
-    Ok((name, payload))
-}
-
-fn fixed_bytes<const N: usize>(
-    value: &AuthoredValue,
-    subject: &str,
-) -> Result<[u8; N], CoordinatorError> {
-    let AuthoredValue::Array(values) = value else {
-        return invalid_manifest(&format!("{subject} must be a byte array"));
-    };
-    if values.len() != N {
-        return invalid_manifest(&format!("{subject} must contain {N} bytes"));
-    }
-    let mut bytes = [0; N];
-    for (output, value) in bytes.iter_mut().zip(values) {
-        let AuthoredValue::UInt(value) = value else {
-            return invalid_manifest(&format!("{subject} byte must be unsigned"));
-        };
-        *output = u8::try_from(*value)
-            .map_err(|_| CoordinatorError::InvalidManifest(format!("{subject} byte exceeds u8")))?;
-    }
-    Ok(bytes)
-}
-
-fn invalid_manifest<T>(detail: &str) -> Result<T, CoordinatorError> {
-    Err(CoordinatorError::InvalidManifest(detail.to_owned()))
-}
 
 /// The daemon side of the RPC server's store: publications run on the
 /// authority, writes go through the shared store mutex.
@@ -4939,200 +3793,11 @@ mod scheduler_tests {
     use std::time::Duration;
 
     #[test]
-    fn waiting_bundle_move_holds_both_old_and_new_paths() {
-        let bundle = BundleUuid([41; 16]);
-        let mut waiting = RetiredWaitingProjection {
-            error: StoredRetiredTypeReferenced {
-                manifest_hash: ContentHash([42; 32]),
-                basis: SnapshotStamp {
-                    instance: distill_store::state::StoreInstanceId([43; 16]),
-                    version: InputVersion(7),
-                },
-                type_uuid: TypeUuid([44; 16]),
-                references: vec![RetiredTypeReference::Asset(AssetUuid([45; 16]))],
-            },
-            bundles: BTreeSet::from([bundle]),
-            paths: BTreeSet::from(["new/location.bundle".to_owned()]),
-            assets: BTreeSet::new(),
-        };
-        let durable = BTreeMap::from([(
-            bundle,
-            DurableBundleBasis {
-                summary: Some(BundleSummary {
-                    root_name: "main".to_owned(),
-                    path: "old/location.bundle".to_owned(),
-                    format_version: 1,
-                    content_hash: ContentHash([46; 32]),
-                    origin: None,
-                }),
-                assets: BTreeSet::new(),
-            },
-        )]);
-
-        preserve_waiting_bundle_paths(&mut waiting, &durable);
-
-        assert_eq!(
-            waiting.paths,
-            BTreeSet::from([
-                "new/location.bundle".to_owned(),
-                "old/location.bundle".to_owned(),
-            ])
-        );
-    }
-
-    #[test]
-    fn reactivation_removes_durable_old_path_and_sets_observed_new_path() {
-        let bundle_uuid = BundleUuid([61; 16]);
-        let asset = AssetUuid([62; 16]);
-        let old_path = "old/location.bundle".to_owned();
-        let new_path = "new/location.bundle".to_owned();
-        let bundle = Bundle {
-            format_version: 1,
-            uuid: bundle_uuid,
-            primary: Some("primary".to_owned()),
-            schemas: BTreeMap::new(),
-            assets: BTreeMap::from([(
-                "primary".to_owned(),
-                AssetEntry {
-                    uuid: asset,
-                    type_uuid: TypeUuid([63; 16]),
-                    schema_hash: LogicalHash([64; 32]),
-                    lineage: distill_bundle::EntryLineageV1::Bootstrap {
-                        bundle_format_version: 1,
-                    },
-                    authoring_only: false,
-                    data: AuthoredValue::Null,
-                },
-            )]),
-        };
-        let mut scan = ScanSnapshot::default();
-        scan.bundles.insert(
-            ("main".to_owned(), new_path.clone()),
-            Arc::new(ScannedBundle {
-                root_name: "main".to_owned(),
-                normalized_path: new_path.clone(),
-                file_hash: BundleFileHash([65; 32]),
-                bytes: Vec::new(),
-                parsed: Ok(bundle),
-                namespace_skeleton: None,
-            }),
-        );
-        let durable = BTreeMap::from([(
-            bundle_uuid,
-            DurableBundleBasis {
-                summary: Some(BundleSummary {
-                    root_name: "main".to_owned(),
-                    path: old_path.clone(),
-                    format_version: 1,
-                    content_hash: ContentHash([66; 32]),
-                    origin: None,
-                }),
-                assets: BTreeSet::from([asset]),
-            },
-        )]);
-        let mut current_paths = BTreeMap::from([(new_path.clone(), BTreeSet::from([asset]))]);
-
-        include_reactivation_durable_paths(&mut current_paths, &scan, &durable);
-        let old_paths = BTreeMap::from([
-            (old_path.clone(), BTreeSet::from([asset])),
-            (new_path.clone(), BTreeSet::new()),
-        ]);
-        let mut commit = Commit::default();
-        append_path_mutations(&mut commit, &current_paths, &old_paths, None);
-
-        assert!(commit.paths.contains(&PathMutation::Remove {
-            path: old_path.clone(),
-        }));
-        assert!(commit.paths.contains(&PathMutation::Set {
-            path: new_path,
-            candidates: BTreeSet::from([asset]),
-        }));
-    }
-
-    #[test]
-    fn retired_migration_diagnostics_preserve_control_asset_multiplicity() {
-        fn bytes<const N: usize>(value: [u8; N]) -> AuthoredValue {
-            AuthoredValue::Array(
-                value
-                    .into_iter()
-                    .map(|byte| AuthoredValue::UInt(u128::from(byte)))
-                    .collect(),
-            )
-        }
-
-        let retired_type = TypeUuid([51; 16]);
-        let migration_a = AssetUuid([52; 16]);
-        let migration_b = AssetUuid([53; 16]);
-        let from = LogicalHash([54; 32]);
-        let to = LogicalHash([55; 32]);
-        let migration_value = || {
-            AuthoredValue::Object(BTreeMap::from([
-                ("from_hash".to_owned(), bytes(from.0)),
-                ("from_lineage".to_owned(), AuthoredValue::Null),
-                ("kind".to_owned(), AuthoredValue::Null),
-                ("target_type_uuid".to_owned(), bytes(retired_type.0)),
-                ("to_hash".to_owned(), bytes(to.0)),
-                ("to_lineage".to_owned(), AuthoredValue::Null),
-            ]))
-        };
-        let migration_entry = |uuid| AssetEntry {
-            uuid,
-            type_uuid: distill_core::bootstrap::MIGRATION_TYPE_UUID,
-            schema_hash: LogicalHash([56; 32]),
-            lineage: distill_bundle::EntryLineageV1::Bootstrap {
-                bundle_format_version: 1,
-            },
-            authoring_only: true,
-            data: migration_value(),
-        };
-        let bundle_uuid = BundleUuid([57; 16]);
-        let source = ScannedBundle {
-            root_name: "main".to_owned(),
-            normalized_path: "migrations.bundle".to_owned(),
-            file_hash: BundleFileHash([58; 32]),
-            bytes: Vec::new(),
-            parsed: Ok(Bundle {
-                format_version: 1,
-                uuid: bundle_uuid,
-                primary: None,
-                schemas: BTreeMap::new(),
-                assets: BTreeMap::from([
-                    ("a".to_owned(), migration_entry(migration_a)),
-                    ("b".to_owned(), migration_entry(migration_b)),
-                ]),
-            }),
-            namespace_skeleton: None,
-        };
-
-        let waiting = retired_waiting_projection(
-            [&source],
-            &BTreeSet::from([retired_type]),
-            ContentHash([59; 32]),
-            SnapshotStamp {
-                instance: distill_store::state::StoreInstanceId([60; 16]),
-                version: InputVersion(8),
-            },
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            waiting.error.references,
-            [
-                RetiredTypeReference::MigrationEndpoint(migration_a),
-                RetiredTypeReference::MigrationEndpoint(migration_b),
-            ]
-        );
-        assert_eq!(waiting.bundles, BTreeSet::from([bundle_uuid]));
-    }
-
-    #[test]
     fn prepared_candidate_error_cleanup_uses_the_explicit_unload_path() {
         let temp = tempfile::tempdir().unwrap();
         let mut runtime = CoordinatedPipelineRuntime {
             host: ModuleHost::new(temp.path().join("module-host")).unwrap(),
             loader: DynamicPipelineModuleLoader,
-            pending: None,
         };
         let mut prepared = Some(crate::epoch::empty_test_epoch());
 
@@ -5158,10 +3823,6 @@ mod scheduler_tests {
                     &assets,
                     assets.join(".distill-displaced"),
                 )],
-                LineageDestination {
-                    root: "main".to_owned(),
-                    path: "schema/lineage.bundle".to_owned(),
-                },
                 Vec::new(),
                 8,
             )
@@ -5222,10 +3883,6 @@ mod scheduler_tests {
                     &assets,
                     assets.join(".distill-displaced"),
                 )],
-                LineageDestination {
-                    root: "main".to_owned(),
-                    path: "schema/lineage.bundle".to_owned(),
-                },
                 Vec::new(),
                 8,
             )

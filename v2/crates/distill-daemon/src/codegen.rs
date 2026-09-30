@@ -31,7 +31,7 @@ use crate::callbacks::{
     CallbackInvokeError, CodegenAsset, CodegenContextError, PipelineCodegenContext,
 };
 use crate::coordinator::DaemonCoordinator;
-use crate::lineage_repair::{plan_same_dir_temp, unique_sibling, write_planned_temp};
+use crate::atomic::{plan_same_dir_temp, unique_sibling, write_planned_temp};
 use crate::quarantine::{QuarantineDriver, QuarantineRoot};
 use crate::scanner::{DaemonOwnedDirectoryKind, RootedScanner};
 
@@ -1169,9 +1169,8 @@ fn write_store(store: &Arc<AuthorityStore>) -> Result<WriteGuard<'_>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
+    use distill_bundle::{AssetEntry, Bundle};
     use distill_core::id::{BundleUuid, LogicalHash, TypeUuid};
-    use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
     use distill_json::AuthoredValue;
     use distill_schema::ngp_schema::{node_hash, LogicalSchema, PrimitiveKind, SchemaNode};
     use distill_store::bundles::{AssetRecord, BundleMeta};
@@ -1310,10 +1309,6 @@ mod tests {
             root: SchemaNode::Primitive(PrimitiveKind::U8),
         };
         let logical_hash = node_hash(&schema.root).unwrap();
-        let epochs = vec![AcceptedSchemaEpoch {
-            digest: logical_hash,
-            forward_parent: None,
-        }];
         let asset = AssetUuid([8; 16]);
         let bundle_uuid = BundleUuid([9; 16]);
         let bytes = distill_bundle::write_bundle(&Bundle {
@@ -1327,11 +1322,6 @@ mod tests {
                     uuid: asset,
                     type_uuid,
                     schema_hash: logical_hash,
-                    lineage: EntryLineageV1::Manifest(LineageStamp {
-                        chain: lineage_chain_digest(type_uuid, &epochs, 0),
-                        epochs,
-                        cursor: 0,
-                    }),
                     authoring_only: false,
                     data: AuthoredValue::UInt(7),
                 },

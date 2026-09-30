@@ -135,10 +135,6 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     )
     .unwrap();
     let config = write_config(&temp, &module, authority.identity());
-    let report = distill_daemon::bootstrap::init(&config).unwrap();
-    assert_eq!(report.written.len(), 2);
-    let rerun = distill_daemon::bootstrap::init(&config).unwrap();
-    assert!(rerun.written.is_empty(), "init rewrote identical bundles");
     let process = DaemonProcess::start(config.clone()).unwrap();
     let pipeline_state = process
         .coordinator()
@@ -863,7 +859,6 @@ state_path = "{}"
 [assets]
 roots = {{ main = "{}" }}
 schema_path = "{}"
-lineage_manifest = {{ root = "main", path = "schema/schema-lineage.bundle" }}
 [modules]
 pipeline_dylib = "{}"
 [targets.dev]

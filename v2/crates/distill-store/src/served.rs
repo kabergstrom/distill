@@ -5,7 +5,7 @@
 //! / `schemas` / `path_index` / `derived_outputs` rows. This module adds the
 //! served-only facts next to them: explicit resolutions, the change log that
 //! subscriptions and reconnect fences read, the RPC target generations, the
-//! published pipeline and lineage-repair diagnostics, and the typed load
+//! published pipeline diagnostic, and the typed load
 //! edges of stored artifacts.
 //!
 //! A snapshot is a read transaction over these tables
@@ -23,8 +23,6 @@ use crate::state::{InputVersion, SnapshotStamp};
 
 /// `store_meta` key of the published pipeline diagnostic.
 pub const SERVED_PIPELINE: &str = "served_pipeline";
-/// `store_meta` key of the published lineage-repair inspection state.
-pub const SERVED_LINEAGE_REPAIR: &str = "served_lineage_repair";
 /// `store_meta` key of the staged restart-required configuration keys.
 pub const SERVED_RESTART_KEYS: &str = "served_restart_keys";
 

@@ -3,9 +3,6 @@
 use distill_core::canonical::{CanonicalEncoder, DSTR};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
-use distill_migrate::MigrationOp;
-use distill_schema::ngp_schema::LogicalSchema;
-use distill_store::pipeline::{LineageStamp, VerifiedSchemaLineageManifest};
 
 pub use distill_pipeline_api::failure::{
     control_failure_fingerprint, CapabilityKey, ControlFailureCode, ControlFailureEntries,
@@ -32,25 +29,6 @@ pub enum Observed<T> {
 /// artifact/content dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ControlValueHash(pub [u8; 32]);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MigrationControlValue {
-    pub asset: AssetUuid,
-    pub target_type_uuid: TypeUuid,
-    pub from_hash: LogicalHash,
-    pub to_hash: LogicalHash,
-    pub from_schema: LogicalSchema,
-    pub to_schema: LogicalSchema,
-    pub from_lineage: LineageStamp,
-    pub to_lineage: LineageStamp,
-    pub kind: MigrationControlKind,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum MigrationControlKind {
-    Ops(Vec<MigrationOp>),
-    Function { key: String },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackDefinitionControlValue {
@@ -110,27 +88,21 @@ impl ImportSettingsControlValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaLineageManifestControlValue(pub VerifiedSchemaLineageManifest);
-
 /// Closed decoded control values. The variant brands otherwise opaque
 /// canonical metadata without exposing `AuthoredValue`, artifacts, or any
 /// dependency carrier to control-plane consumers.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlValue {
-    Migration(Box<MigrationControlValue>),
     PackDefinition(PackDefinitionControlValue),
     DirectoryImportRules(DirectoryImportRulesControlValue),
     ImportSettings(ImportSettingsControlValue),
-    Lineage(SchemaLineageManifestControlValue),
 }
 
 impl ControlValue {
     pub fn matches_subject(&self, subject: &ControlSubject) -> bool {
         matches!(
             (self, subject),
-            (Self::Migration(_), ControlSubject::Migration(_))
-                | (Self::PackDefinition(_), ControlSubject::PackDefinition(_))
+            (Self::PackDefinition(_), ControlSubject::PackDefinition(_))
                 | (
                     Self::DirectoryImportRules(_),
                     ControlSubject::DirectoryImportRules(_)
@@ -139,7 +111,6 @@ impl ControlValue {
                     Self::ImportSettings(_),
                     ControlSubject::ImportSettings { .. }
                 )
-                | (Self::Lineage(_), ControlSubject::SchemaLineageManifest)
         )
     }
 }
@@ -364,24 +335,12 @@ fn encode_trace_op(e: &mut CanonicalEncoder, op: &TraceOp) {
 
 fn encode_control_query(e: &mut CanonicalEncoder, query: &ControlQuery) {
     match query {
-        ControlQuery::MigrationEdges {
-            type_uuid,
-            from_hash,
-        } => {
-            e.enum_variant(1);
-            e.raw(&type_uuid.0);
-            e.raw(&from_hash.0);
-        }
         ControlQuery::DirectoryImportRuleSet => e.enum_variant(2),
     }
 }
 
 fn encode_control_subject(e: &mut CanonicalEncoder, subject: &ControlSubject) {
     match subject {
-        ControlSubject::Migration(asset) => {
-            e.enum_variant(1);
-            e.raw(&asset.0);
-        }
         ControlSubject::PackDefinition(asset) => {
             e.enum_variant(2);
             e.raw(&asset.0);
@@ -395,7 +354,6 @@ fn encode_control_subject(e: &mut CanonicalEncoder, subject: &ControlSubject) {
             e.raw(&bundle.0);
             e.str(local_id);
         }
-        ControlSubject::SchemaLineageManifest => e.enum_variant(5),
     }
 }
 

@@ -4,11 +4,11 @@ use distill_core::bootstrap::{
 };
 
 #[test]
-fn checked_in_spec_is_exactly_five_sorted_logical_rows() {
+fn checked_in_spec_is_exactly_three_sorted_logical_rows() {
     let spec = BootstrapControlSpecV1::embedded().unwrap();
     assert_eq!(spec.type_uuids(), BOOTSTRAP_CONTROL_TYPE_UUIDS);
     assert_eq!(spec.encode().unwrap(), BOOTSTRAP_CONTROL_SPEC_V1_BYTES);
-    assert_eq!(bootstrap_control_logical_registry_v1().unwrap().len(), 5);
+    assert_eq!(bootstrap_control_logical_registry_v1().unwrap().len(), 3);
     assert!(BOOTSTRAP_CONTROL_TYPE_UUIDS
         .iter()
         .all(|uuid| is_bootstrap_control_type(*uuid)));
