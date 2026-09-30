@@ -6,14 +6,13 @@ use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 use crate::capnp_transport::{
-    decode_configuration_poison, decode_rpc_basis, decode_version_poison, schema,
+    decode_configuration_poison, decode_rpc_basis, schema,
     RemoteConnectOutcome,
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AuthoringEntryRole,
     ConfigurationPoison, Delta, DriftedInput, PathResolveFailure, PathResolveResult,
     ReconnectReason, ResolveResult, RpcBasis, ServedLoadEdge, StreamEvent, TerminalEvent,
-    VersionPoison,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +26,6 @@ pub enum RemoteCall<T> {
     Success(T),
     ReconnectRequired(ReconnectReason),
     ConfigurationPoisoned(ConfigurationPoison),
-    VersionPoisoned(VersionPoison),
     LeaseFailure(RemoteError),
     Error(RemoteError),
 }
@@ -344,9 +342,6 @@ impl RemoteSnapshot {
             schema::resolve_call::Which::ConfigurationPoisoned(value) => Ok(
                 RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
             ),
-            schema::resolve_call::Which::VersionPoisoned(value) => {
-                Ok(RemoteCall::VersionPoisoned(decode_version_poison(value?)?))
-            }
             schema::resolve_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
             }
@@ -380,9 +375,6 @@ impl RemoteSnapshot {
             schema::path_resolve_call::Which::ConfigurationPoisoned(value) => Ok(
                 RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
             ),
-            schema::path_resolve_call::Which::VersionPoisoned(value) => {
-                Ok(RemoteCall::VersionPoisoned(decode_version_poison(value?)?))
-            }
             schema::path_resolve_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
             }

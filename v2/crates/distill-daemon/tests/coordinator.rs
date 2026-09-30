@@ -20,6 +20,7 @@ use distill_schema::ngp_schema::{
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
+use distill_store::served::ResolutionRow;
 use distill_store::{Store, StoreConfig, StoreError, StoreReader};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
@@ -228,7 +229,7 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
     {
         let store = coordinator.store();
         let store = store.read();
-        assert!(store.version_poison().unwrap().is_none());
+        assert!(store.namespace_errors().unwrap().is_empty());
         assert!(matches!(
             store.entry(AssetUuid([94; 16])).unwrap_err(),
             StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([93; 16])
@@ -245,8 +246,117 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
         .unwrap();
     let store = coordinator.store();
     let store = store.read();
-    assert!(store.version_poison().unwrap().is_none());
+    assert!(store.namespace_errors().unwrap().is_empty());
     assert!(store.entry(AssetUuid([94; 16])).unwrap().is_some());
+}
+
+
+/// A bundle holding its own asset plus `shared`, which another bundle may
+/// claim too.
+fn bundle_sharing(bundle_byte: u8, own_byte: u8, shared: AssetUuid) -> Vec<u8> {
+    let (bytes, _, _) = ordinary_bundle_with(bundle_byte, own_byte, 1);
+    let mut bundle = distill_bundle::parse_bundle(&bytes).unwrap();
+    let mut entry = bundle.assets["entry"].clone();
+    entry.uuid = shared;
+    bundle.assets.insert("shared".into(), entry);
+    distill_bundle::write_bundle(&bundle).unwrap()
+}
+
+/// Two roots' worth of fixture: the lineage manifest, `first.bundle`
+/// (bundle 31, asset 32 + the shared 40) and optionally `second.bundle`
+/// (bundle 33, asset 34 + the shared 40).
+fn collision_fixture(temp: &tempfile::TempDir, second: bool) -> DaemonCoordinator {
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(assets.join("schema")).unwrap();
+    let shared = AssetUuid([40; 16]);
+    let first = bundle_sharing(31, 32, shared);
+    let schema_hash = distill_bundle::parse_bundle(&first).unwrap().assets["entry"].schema_hash;
+    std::fs::write(assets.join("first.bundle"), first).unwrap();
+    if second {
+        std::fs::write(assets.join("second.bundle"), bundle_sharing(33, 34, shared)).unwrap();
+    }
+    std::fs::write(
+        assets.join("schema/schema-lineage.bundle"),
+        lineage_manifest_bundle(TypeUuid([71; 16]), schema_hash),
+    )
+    .unwrap();
+    coordinator(temp)
+}
+
+fn assert_only_the_shared_asset_is_withheld(store: &StoreReader) {
+    let [error] = <[_; 1]>::try_from(store.namespace_errors().unwrap()).unwrap();
+    assert!(matches!(
+        error.detail,
+        VersionPoisonV1::DuplicateAssetUuid { asset, .. } if asset == AssetUuid([40; 16])
+    ));
+    assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
+    assert!(store.entry(AssetUuid([34; 16])).unwrap().is_some());
+    assert!(store.entry(AssetUuid([40; 16])).unwrap().is_none());
+    assert_eq!(
+        store.asset_resolution(AssetUuid([40; 16])).unwrap(),
+        Some(ResolutionRow::Failed(error.message))
+    );
+}
+
+#[test]
+fn a_colliding_asset_is_withheld_alone_and_heals_when_one_claimant_leaves() {
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = collision_fixture(&temp, true);
+    coordinator.reconcile_full_scan().unwrap();
+    assert_only_the_shared_asset_is_withheld(&coordinator.store().read());
+
+    let second = temp.path().join("assets/second.bundle");
+    std::fs::remove_file(&second).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![second],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    let store = coordinator.store();
+    let store = store.read();
+    assert!(store.namespace_errors().unwrap().is_empty());
+    assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
+    assert!(store.entry(AssetUuid([34; 16])).unwrap().is_none());
+    assert!(store.entry(AssetUuid([40; 16])).unwrap().is_some());
+}
+
+#[test]
+fn an_incremental_collision_withholds_the_asset_and_republishes_the_survivor_on_heal() {
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = collision_fixture(&temp, false);
+    coordinator.reconcile_full_scan().unwrap();
+    assert!(coordinator
+        .store()
+        .read()
+        .entry(AssetUuid([40; 16]))
+        .unwrap()
+        .is_some());
+
+    let second = temp.path().join("assets/second.bundle");
+    std::fs::write(&second, bundle_sharing(33, 34, AssetUuid([40; 16]))).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![second.clone()],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert_only_the_shared_asset_is_withheld(&coordinator.store().read());
+
+    // The second bundle drops the shared asset: the first bundle, whose
+    // bytes never changed, publishes it again.
+    std::fs::write(&second, ordinary_bundle_with(33, 34, 1).0).unwrap();
+    coordinator
+        .reconcile_incremental(&WatcherBatch {
+            paths: vec![second],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    let store = coordinator.store();
+    let store = store.read();
+    assert!(store.namespace_errors().unwrap().is_empty());
+    assert!(store.entry(AssetUuid([34; 16])).unwrap().is_some());
+    assert!(store.entry(AssetUuid([40; 16])).unwrap().is_some());
 }
 
 fn target() -> TargetDefinition {
@@ -470,12 +580,7 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
     );
     let store = coordinator.store();
     assert!(matches!(
-        store
-            .read()
-            .version_poison()
-            .unwrap()
-            .unwrap()
-            .detail,
+        store.read().namespace_errors().unwrap()[0].detail,
         VersionPoisonV1::UnreadableScanSubtree { .. }
     ));
 
@@ -484,7 +589,7 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
         coordinator.reconcile_full_scan().unwrap().version,
         InputVersion(2)
     );
-    assert!(store.read().version_poison().unwrap().is_none());
+    assert!(store.read().namespace_errors().unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -527,9 +632,9 @@ fn incremental_scan_poison_heals_when_observation_returns_to_last_good() {
     assert!(coordinator
         .store()
         .read()
-        .version_poison()
+        .namespace_errors()
         .unwrap()
-        .is_none());
+        .is_empty());
 }
 
 #[cfg(unix)]
@@ -562,12 +667,12 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
             renames: Vec::new(),
         })
         .unwrap();
-    assert!(coordinator
+    assert!(!coordinator
         .store()
         .read()
-        .version_poison()
+        .namespace_errors()
         .unwrap()
-        .is_some());
+        .is_empty());
 
     std::fs::remove_file(&link).unwrap();
     coordinator
@@ -579,14 +684,14 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
     assert!(coordinator
         .store()
         .read()
-        .version_poison()
+        .namespace_errors()
         .unwrap()
-        .is_none());
+        .is_empty());
 }
 
 #[cfg(unix)]
 #[test]
-fn configuration_scan_rejection_preserves_existing_version_poison() {
+fn configuration_scan_rejection_preserves_existing_namespace_errors() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -601,8 +706,7 @@ fn configuration_scan_rejection_preserves_existing_version_poison() {
     let initial = coordinator
         .store()
         .read()
-        .version_poison()
-        .unwrap()
+        .namespace_errors()
         .unwrap();
 
     let alias = assets.join("alias");
@@ -618,8 +722,7 @@ fn configuration_scan_rejection_preserves_existing_version_poison() {
         coordinator
             .store()
             .read()
-            .version_poison()
-            .unwrap()
+            .namespace_errors()
             .unwrap(),
         initial
     );

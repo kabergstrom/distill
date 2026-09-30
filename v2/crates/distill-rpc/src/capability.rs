@@ -817,7 +817,7 @@ fn publish_lineage_repair_locked(
         || !prepared.authoring.is_empty()
         || !prepared.paths.is_empty()
         || prepared.pipeline.is_some()
-        || prepared.version_poison.is_some()
+        || prepared.namespace_errors.is_some()
         || prepared.configuration != Some(ConfigurationStatus::Ready)
         || prepared.lineage_repair != Some(None)
     {
@@ -999,7 +999,7 @@ impl MetadataHub {
             stamp: txn.stamp,
             configuration: txn.configuration.clone(),
             pipeline: self.server.inner.effective_pipeline(&txn),
-            version_poison: txn.version_poison.clone(),
+            namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
         })
     }
 
@@ -1104,9 +1104,6 @@ impl MetadataView<'_> {
         let Some(txn) = self.lease.txn() else {
             return Err(MetadataNamespaceCall::LeaseFailure);
         };
-        if let Some(poison) = &txn.version_poison {
-            return Err(MetadataNamespaceCall::VersionPoisoned(poison.clone()));
-        }
         Ok(txn)
     }
 
@@ -1173,7 +1170,7 @@ impl MetadataSnapshot {
             stamp: self.basis.snapshot,
             configuration: txn.configuration.clone(),
             pipeline: self.server.inner.effective_pipeline(&txn),
-            version_poison: txn.version_poison.clone(),
+            namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
         })
     }
 
@@ -2036,9 +2033,6 @@ impl Snapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        if let Some(poison) = &txn.version_poison {
-            return RpcResult::VersionPoisoned(poison.clone());
-        }
         if query.terminal_type.is_some() {
             if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
                 return RpcResult::Failure(error);
@@ -2062,9 +2056,6 @@ impl Snapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        if let Some(poison) = &txn.version_poison {
-            return RpcResult::VersionPoisoned(poison.clone());
-        }
         if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
             return RpcResult::Failure(error);
         }
@@ -2154,9 +2145,6 @@ impl Snapshot {
             Ok(txn) => txn,
             Err(result) => return done(result),
         };
-        if let Some(poison) = &txn.version_poison {
-            return done(RpcResult::VersionPoisoned(poison.clone()));
-        }
         if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
             return done(RpcResult::Failure(error));
         }
@@ -2347,9 +2335,6 @@ impl Snapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        if let Some(poison) = &txn.version_poison {
-            return RpcResult::VersionPoisoned(poison.clone());
-        }
         if !valid_logical_path(path) {
             return RpcResult::Failure(RpcFailure::InvalidPath {
                 path: path.to_owned(),
@@ -2381,7 +2366,6 @@ impl<T> RpcResult<T> {
             Self::Success(_) => unreachable!("only failures are retyped"),
             Self::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
             Self::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
-            Self::VersionPoisoned(poison) => RpcResult::VersionPoisoned(poison),
             Self::Failure(error) => RpcResult::Failure(error),
         }
     }
@@ -2461,9 +2445,6 @@ impl AuthoringSnapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        if let Some(poison) = &txn.version_poison {
-            return RpcResult::VersionPoisoned(poison.clone());
-        }
         if let Err(detail) = validate_asset_query(&query, true) {
             return RpcResult::Failure(RpcFailure::InvalidQuery { detail });
         }
@@ -2483,9 +2464,6 @@ impl AuthoringSnapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        if let Some(poison) = &txn.version_poison {
-            return RpcResult::VersionPoisoned(poison.clone());
-        }
         RpcResult::Success(rpc_try!(inspect_authoring(
             txn.snapshot(),
             self.basis.snapshot,

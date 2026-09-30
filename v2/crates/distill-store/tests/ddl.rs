@@ -103,6 +103,7 @@ fn every_section_13_table_exists() {
         "pins",
         "write_intents",
         "displaced",
+        "errors",
         "publication_groups",
         "publication_group_children",
         "codegen_outputs",

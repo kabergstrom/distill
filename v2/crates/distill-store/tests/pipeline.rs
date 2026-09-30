@@ -1172,12 +1172,12 @@ fn a_failed_transaction_publishes_no_tool_mapping() {
     let err = store
         .input_transaction::<(), _>(|txn| {
             txn.register_tool("shaderc", tool_package(b"tool v1", b"resource"))?;
-            Err(StoreError::Poisoned {
+            Err(StoreError::InvalidConfiguration {
                 error: "abort".into(),
             })
         })
         .unwrap_err();
-    assert!(matches!(err, StoreError::Poisoned { .. }));
+    assert!(matches!(err, StoreError::InvalidConfiguration { .. }));
     // The mapping never published; the content-addressed orphan file is
     // inert (unreferenced by any row).
     assert!(store.tool("shaderc").unwrap().is_none());

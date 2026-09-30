@@ -1078,7 +1078,7 @@ fn test_version_poison() -> VersionPoison {
 }
 
 #[test]
-fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_version_poison() {
+fn metadata_namespace_calls_serve_around_a_namespace_error() {
     let server = server_with(&[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
     let poison = test_version_poison();
@@ -1107,7 +1107,7 @@ fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_versio
                     }],
                 },
             )),
-            version_poison: Some(Some(poison.clone())),
+            namespace_errors: Some(vec![poison.clone()]),
             ..Commit::default()
         })
         .unwrap();
@@ -1117,7 +1117,7 @@ fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_versio
         .connected()
         .unwrap();
     let diagnostics = connected.hub.diagnostics().success().unwrap();
-    assert_eq!(diagnostics.version_poison, Some(poison.clone()));
+    assert_eq!(diagnostics.namespace_errors, vec![poison]);
     assert!(matches!(
         diagnostics.pipeline,
         PipelineDiagnostic::SchemaAcceptanceRequired(_)
@@ -1127,31 +1127,7 @@ fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_versio
         snapshot.version(),
         MetadataCall::Success(InputVersion(1))
     ));
-    assert_eq!(
-        snapshot.query(&PureMetadataQuery::default()),
-        MetadataNamespaceCall::VersionPoisoned(poison.clone())
-    );
-    assert_eq!(
-        snapshot.entry(entry.uuid),
-        MetadataNamespaceCall::VersionPoisoned(poison.clone())
-    );
-    assert_eq!(
-        snapshot.resolve_path(&entry.normalized_path),
-        MetadataNamespaceCall::VersionPoisoned(poison.clone())
-    );
-    let authoring = connected.hub.authoring_snapshot().success().unwrap();
-    assert_eq!(
-        authoring.inspect(entry.uuid),
-        MetadataNamespaceCall::VersionPoisoned(poison)
-    );
-
-    server
-        .commit(Commit {
-            version_poison: Some(None),
-            ..Commit::default()
-        })
-        .unwrap();
-    let healed = snapshot.refresh().success().unwrap();
+    // The error is about one file: the rest of the namespace serves.
     let query = PureMetadataQuery {
         bundle: Some(entry.bundle),
         authored_type: Some(entry.type_uuid),
@@ -1160,17 +1136,33 @@ fn metadata_capabilities_are_poison_safe_but_namespace_calls_return_exact_versio
         ..PureMetadataQuery::default()
     };
     assert_eq!(
-        healed.query(&query),
+        snapshot.query(&query),
         MetadataNamespaceCall::Success(vec![entry.uuid])
     );
     assert_eq!(
-        healed.entry(entry.uuid).success().unwrap().normalized_path,
+        snapshot.entry(entry.uuid).success().unwrap().normalized_path,
         entry.normalized_path
     );
     assert_eq!(
-        healed.resolve_path("bundle-1.asset"),
+        snapshot.resolve_path("bundle-1.asset"),
         MetadataNamespaceCall::Success(PathResolveResult::Resolved(entry.uuid))
     );
+    let authoring = connected.hub.authoring_snapshot().success().unwrap();
+    assert!(authoring.inspect(entry.uuid).success().is_some());
+
+    server
+        .commit(Commit {
+            namespace_errors: Some(vec![]),
+            ..Commit::default()
+        })
+        .unwrap();
+    assert!(connected
+        .hub
+        .diagnostics()
+        .success()
+        .unwrap()
+        .namespace_errors
+        .is_empty());
 }
 
 #[test]
@@ -1277,48 +1269,36 @@ fn metadata_schema_transition_is_reachable_while_target_connect_is_blocked_and_f
 }
 
 #[test]
-fn target_snapshot_namespace_calls_return_the_exact_pinned_version_poison() {
+fn target_snapshot_namespace_calls_serve_around_a_namespace_error() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);
-    let poison = test_version_poison();
     server
         .commit(Commit {
-            version_poison: Some(Some(poison.clone())),
+            namespace_errors: Some(vec![test_version_poison()]),
             ..Commit::default()
         })
         .unwrap();
     let snapshot = snapshot(&hub);
     let authoring = authoring_snapshot(&hub);
-    assert_eq!(
-        snapshot.query(AssetQuery {
+    assert!(snapshot
+        .query(AssetQuery {
             uuid: Some(asset_id(1)),
             ..AssetQuery::default()
-        }),
-        RpcResult::VersionPoisoned(poison.clone())
-    );
+        })
+        .success()
+        .is_some());
     assert_eq!(
         snapshot.entry(asset_id(1)),
-        RpcResult::VersionPoisoned(poison.clone())
+        RpcResult::Failure(RpcFailure::AssetNotFound { uuid: asset_id(1) })
     );
-    assert_eq!(
-        snapshot.resolve(asset_id(1)),
-        RpcResult::VersionPoisoned(poison.clone())
-    );
-    assert_eq!(
-        snapshot.resolve_path("a.asset"),
-        RpcResult::VersionPoisoned(poison.clone())
-    );
-    assert_eq!(
-        authoring.query(AssetQuery {
+    assert!(snapshot.resolve_path("a.asset").success().is_some());
+    assert!(authoring
+        .query(AssetQuery {
             uuid: Some(asset_id(1)),
             ..AssetQuery::default()
-        }),
-        RpcResult::VersionPoisoned(poison.clone())
-    );
-    assert_eq!(
-        authoring.inspect(asset_id(1)),
-        RpcResult::VersionPoisoned(poison)
-    );
+        })
+        .success()
+        .is_some());
 }
 
 #[test]

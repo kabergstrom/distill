@@ -467,19 +467,16 @@ fn the_namespace_is_the_only_authority_for_child_resolution() {
 }
 
 #[test]
-fn resolve_child_is_namespace_facing_under_version_poison() {
+fn resolve_child_ignores_namespace_errors_elsewhere() {
     let (_d, mut store) = store();
     let child = declare_child(&mut store, PARENT, "normals");
     store
-        .input_transaction(|txn| {
-            let poison = version_poison("collision");
-            txn.set_version_poison(Some(&poison))
-        })
+        .input_transaction(|txn| txn.set_namespace_errors([version_poison("collision")]))
         .unwrap();
-    assert!(matches!(
-        store.resolve_child(child),
-        Err(StoreError::Poisoned { .. })
-    ));
+    assert_eq!(
+        store.resolve_child(child).unwrap(),
+        Some((PARENT, "normals".to_owned()))
+    );
 }
 
 // ---- segment rolling + persistence ----

@@ -884,16 +884,11 @@ impl StoreReader {
 
     /// Resolve a derived child through the namespace index — the only
     /// authority (§9): historical result records never resurrect a
-    /// retired child. Namespace-facing: fails under version poison.
+    /// retired child.
     pub fn resolve_child(
         &self,
         child: AssetUuid,
     ) -> Result<Option<(AssetUuid, String)>, StoreError> {
-        if let Some(poison) = self.version_poison()? {
-            return Err(StoreError::Poisoned {
-                error: poison.message,
-            });
-        }
         use rusqlite::OptionalExtension;
         Ok(self
             .conn

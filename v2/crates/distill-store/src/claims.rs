@@ -162,6 +162,44 @@ fn clear_claims(conn: &rusqlite::Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// An asset UUID started or stopped colliding: what publishes it (its
+/// claimant bundles, its derived output, the paths naming it) is pending,
+/// since the asset is withheld from publication while it collides.
+fn mark_asset_dependents_pending(
+    conn: &rusqlite::Connection,
+    asset: &[u8],
+) -> Result<(), StoreError> {
+    let claimants = {
+        let mut select = conn.prepare_cached(
+            "SELECT DISTINCT claimant FROM source_claims WHERE kind = ?1 AND subject = ?2",
+        )?;
+        let rows = select.query_map(rusqlite::params![AUTHORED, asset], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for claimant in claimants {
+        if let AssetClaimant::Authored { bundle, .. } = decode_asset_claimant(&claimant)? {
+            conn.execute(
+                "INSERT OR IGNORE INTO claim_pending(kind, subject) VALUES (?1, ?2)",
+                rusqlite::params![BUNDLE, bundle.0.as_slice()],
+            )?;
+        }
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO claim_pending(kind, subject)
+         SELECT ?1, ?2 WHERE EXISTS (
+             SELECT 1 FROM source_claims WHERE kind = ?1 AND subject = ?2)",
+        rusqlite::params![DERIVED, asset],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO claim_pending(kind, subject)
+         SELECT DISTINCT kind, subject FROM source_claims WHERE kind = ?1 AND claimant = ?2",
+        rusqlite::params![PRIMARY_PATH, asset],
+    )?;
+    Ok(())
+}
+
 impl InputTxn<'_> {
     /// Replace the claims of every source under `under` (every source when
     /// `None`) with `sources`. A subtree replacement refreshes the
@@ -228,10 +266,10 @@ impl InputTxn<'_> {
         for (kind, subject) in &touched {
             if let Some(group) = collision_group(*kind) {
                 if refreshed.insert((group, subject.clone())) {
-                    conn.execute(
+                    let collided = conn.execute(
                         "DELETE FROM claim_collisions WHERE grp = ?1 AND subject = ?2",
                         rusqlite::params![group, subject],
-                    )?;
+                    )? > 0;
                     let claimants: i64 = conn.query_row(
                         &format!(
                             "SELECT COUNT(DISTINCT claimant) FROM source_claims
@@ -246,6 +284,9 @@ impl InputTxn<'_> {
                             "INSERT INTO claim_collisions(grp, subject) VALUES (?1, ?2)",
                             rusqlite::params![group, subject],
                         )?;
+                    }
+                    if group == ASSET_GROUP && collided != (claimants > 1) {
+                        mark_asset_dependents_pending(conn, subject)?;
                     }
                 }
             }
@@ -320,9 +361,10 @@ fn decode_lineage_claimant(bytes: &[u8]) -> Result<LineageManifestClaimant, Stor
 }
 
 impl StoreReader {
-    /// The canonical version poison of the claims: a malformed skeleton or
-    /// a bundle or asset UUID with more than one claimant.
-    pub fn claims_version_poison(&self) -> Result<Option<VersionPoison>, StoreError> {
+    /// The namespace errors of the claims, in canonical order: every
+    /// malformed skeleton and every bundle or asset UUID with more than one
+    /// claimant.
+    pub fn claims_namespace_errors(&self) -> Result<Vec<VersionPoison>, StoreError> {
         let mut poisons = self
             .query_rows(
                 "SELECT claimant FROM source_claims WHERE kind = 5",
@@ -372,7 +414,7 @@ impl StoreReader {
             };
             poisons.push(poison.map_err(poison_error)?);
         }
-        VersionPoison::select_canonical(poisons).map_err(poison_error)
+        VersionPoison::canonical_set(poisons).map_err(poison_error)
     }
 
     /// The distinct sources claiming `bundle`.

@@ -14,7 +14,7 @@ pub use distill_store::state::{
 };
 pub use distill_store::RetiredTypeReference;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -258,7 +258,8 @@ pub struct MetadataDiagnostics {
     pub stamp: SnapshotStamp,
     pub configuration: ConfigurationStatus,
     pub pipeline: PipelineDiagnostic,
-    pub version_poison: Option<VersionPoison>,
+    /// Every current namespace error (LOCKLESS.md §4), in canonical order.
+    pub namespace_errors: Vec<VersionPoison>,
 }
 
 /// R22/H4 terminology alias. The Cap'n Proto declaration calls the wire
@@ -354,15 +355,13 @@ impl<T> MetadataCall<T> {
     }
 }
 
-/// Namespace-facing metadata result grammar; version poison is a value arm,
-/// never a stringly RPC error or a bootstrap failure.
+/// Namespace-facing metadata result grammar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataNamespaceCall<T> {
     Success(T),
     ReconnectRequired { reason: MetadataReconnectReason },
     LeaseFailure,
     Error(RpcFailure),
-    VersionPoisoned(VersionPoison),
 }
 
 impl<T> MetadataNamespaceCall<T> {
@@ -379,7 +378,6 @@ pub enum RpcResult<T> {
     Success(T),
     ReconnectRequired { reason: ReconnectReason },
     ConfigurationPoisoned(ConfigurationPoison),
-    VersionPoisoned(VersionPoison),
     Failure(RpcFailure),
 }
 
@@ -396,7 +394,6 @@ impl<T> RpcResult<T> {
             Self::Success(value) => RpcResult::Success(map(value)),
             Self::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
             Self::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
-            Self::VersionPoisoned(poison) => RpcResult::VersionPoisoned(poison),
             Self::Failure(error) => RpcResult::Failure(error),
         }
     }
@@ -1686,8 +1683,8 @@ pub struct Commit {
     /// Hubs must reconnect instead of retaining capabilities across that
     /// boundary.
     pub pipeline_epoch_changed: bool,
-    /// `Some(None)` heals version poison; `Some(Some(_))` publishes it.
-    pub version_poison: Option<Option<VersionPoison>>,
+    /// `Some` replaces the namespace errors (LOCKLESS.md §4).
+    pub namespace_errors: Option<Vec<VersionPoison>>,
     /// `Some(None)` clears repair inspection; `Some(Some(_))` publishes the
     /// exact current missing/duplicate lineage basis.
     pub lineage_repair: Option<Option<LineageRepairState>>,

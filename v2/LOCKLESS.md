@@ -463,7 +463,7 @@ should reach zero by the end of phase 6.
       after the input transaction, and then mutates the `Commit`.
     - So the served `Delta` cannot be written in the daemon's transaction
       until refinement becomes a build job that reads the uncommitted view.
-- **Phase 6:** in progress (commits `6f46c9f`–`17981b5`).
+- **Phase 6:** done (commits `6f46c9f`–`dd34248`).
   - **The store belongs to the authority** (`store_cell.rs`).
     - `AuthorityStore` holds the writer in an `UnsafeCell`. `write()`
       panics off the authority. `write_with` sends the write there.
@@ -520,6 +520,25 @@ should reach zero by the end of phase 6.
   - Phase 6 is done: no `Mutex`, `RwLock`, `Condvar` or polling sleep is
     left in distill-store, distill-rpc or distill-daemon. The dev
     supervisor's sleeps go away with it in phase 9.
+
+- **Phase 7:** in progress.
+  - Namespace errors are per-entity. The `errors` table (store `errors.rs`)
+    holds every current scan error, each scoped to its file, bundle or
+    asset. `store_meta.version_poison` and the gates that made every
+    namespace read fail are gone: `entry`, `resolve_path`, tag queries,
+    `resolve_child`, and the RPC `versionPoisoned` result arms (wire
+    protocol 5).
+  - Only what collides is withheld. The coordinator (`Withheld`) holds
+    back a bundle UUID more than one file claims, with its assets, and an
+    asset UUID claimed more than once. Everything else publishes. A
+    withheld asset resolves `Failed` with its error, once. A bundle whose
+    asset set changes republishes even when its bytes did not.
+  - Claims mark an asset's claimant bundles, derived output and paths
+    pending when it starts or stops colliding, so the survivor of a
+    healed collision publishes it again.
+  - A scan the filesystem refused (unreadable subtree, path collision,
+    invalid path) keeps the namespace it had and publishes the errors.
+  - Metadata diagnostics list every namespace error.
 
 ## 7. Test baseline
 

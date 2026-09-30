@@ -1274,7 +1274,6 @@ fn remote_message<T: std::fmt::Debug>(call: RemoteCall<T>) -> String {
         RemoteCall::ConfigurationPoisoned(poison) => {
             format!("daemon configuration poisoned: {}", poison.message)
         }
-        RemoteCall::VersionPoisoned(poison) => format!("daemon version poisoned: {poison}"),
         RemoteCall::LeaseFailure(error) | RemoteCall::Error(error) => error.message,
         other => format!("unexpected RPC result: {other:?}"),
     }

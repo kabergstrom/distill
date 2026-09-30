@@ -12,7 +12,7 @@ use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid}
 use distill_json::AuthoredValue;
 use distill_rpc::{
     ArtifactChunkKind, AuthoringValue, ConfigurationPoison, Hub, PackSession, PathResolveResult,
-    ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector, VersionPoison,
+    ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
 use unicode_normalization::UnicodeNormalization;
@@ -56,7 +56,6 @@ pub enum PackBuildError {
     },
     ReconnectRequired(ReconnectReason),
     ConfigurationPoisoned(Box<ConfigurationPoison>),
-    VersionPoisoned(Box<VersionPoison>),
     Rpc(Box<RpcFailure>),
     BasisMismatch,
     Resolve {
@@ -605,9 +604,6 @@ fn rpc_success<T>(result: RpcResult<T>) -> Result<T, PackBuildError> {
         RpcResult::ReconnectRequired { reason } => Err(PackBuildError::ReconnectRequired(reason)),
         RpcResult::ConfigurationPoisoned(poison) => {
             Err(PackBuildError::ConfigurationPoisoned(Box::new(poison)))
-        }
-        RpcResult::VersionPoisoned(poison) => {
-            Err(PackBuildError::VersionPoisoned(Box::new(poison)))
         }
         RpcResult::Failure(error) => Err(PackBuildError::Rpc(Box::new(error))),
     }

@@ -10,7 +10,7 @@ use distill_store::bundles::{
 };
 use distill_store::files::RootId;
 use distill_store::state::{
-    ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+    ErrorScope, ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -621,49 +621,39 @@ fn fixing_the_file_heals_on_the_next_version() {
     assert!(store.assets_by_tag("stray").unwrap().is_empty());
 }
 
-// ---- version-global poison (§7, §13) ----
+// ---- per-entity namespace errors (LOCKLESS.md §4) ----
 
 #[test]
-fn version_poison_is_global_and_uniform() {
-    // §13: every namespace-facing operation fails with this same error —
-    // never one surviving duplicate, never last-good metadata from a
-    // projection that happens not to touch the colliding rows.
+fn a_namespace_error_leaves_the_rest_of_the_namespace_readable() {
     let (_d, mut store) = store();
     seed(&mut store);
+    let error = version_poison("broken.bundle has no complete skeleton");
     store
-        .input_transaction(|txn| {
-            let poison = version_poison("uuid 0a… authored twice: tex/1.bundle, tex/9.bundle");
-            txn.set_version_poison(Some(&poison))
-        })
+        .input_transaction(|txn| txn.set_namespace_errors([error.clone()]))
         .unwrap();
 
-    assert!(store.version_poison().unwrap().is_some());
-    for err in [
-        store.entry(AssetUuid([10u8; 16])).unwrap_err(),
-        store.resolve_path("tex/1.bundle").unwrap_err(),
-        store.assets_by_tag("hero").unwrap_err(),
-        store.assets_by_tag("no-such-tag").unwrap_err(),
-    ] {
-        match err {
-            StoreError::Poisoned { error } => assert!(error.contains("authored twice")),
-            other => panic!("expected the uniform version poison, got {other:?}"),
-        }
-    }
-
-    // Consumers that merely need the version number still can (§13).
-    let _ = store.input_version();
-    let _ = store.stamp();
+    assert_eq!(store.namespace_errors().unwrap(), vec![error.clone()]);
+    assert_eq!(
+        store
+            .namespace_errors_about(&ErrorScope::File {
+                root_name: "main".into(),
+                path: "broken.bundle".into(),
+            })
+            .unwrap(),
+        vec![error]
+    );
+    assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
+    assert!(store.resolve_path("tex/1.bundle").unwrap().is_some());
 
     // The next version heals.
     store
-        .input_transaction(|txn| txn.set_version_poison(None))
+        .input_transaction(|txn| txn.set_namespace_errors([]))
         .unwrap();
-    assert!(store.version_poison().unwrap().is_none());
-    assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
+    assert!(store.namespace_errors().unwrap().is_empty());
 }
 
 #[test]
-fn scanner_poison_batch_persists_canonical_winner_and_returns_full_set() {
+fn namespace_errors_persist_the_full_set_in_canonical_order() {
     let (_d, mut store) = store();
     let make = |path: &str, byte: u8| {
         VersionPoison::new(
@@ -683,9 +673,9 @@ fn scanner_poison_batch_persists_canonical_winner_and_returns_full_set() {
     let later = make("z.bundle", 2);
     let (diagnostics, _) = store
         .input_transaction(|txn| {
-            txn.set_version_poisons([later.clone(), first.clone(), later.clone()])
+            txn.set_namespace_errors([later.clone(), first.clone(), later.clone()])
         })
         .unwrap();
-    assert_eq!(diagnostics, vec![first.clone(), later]);
-    assert_eq!(store.version_poison().unwrap(), Some(first));
+    assert_eq!(diagnostics, vec![first.clone(), later.clone()]);
+    assert_eq!(store.namespace_errors().unwrap(), vec![first, later]);
 }

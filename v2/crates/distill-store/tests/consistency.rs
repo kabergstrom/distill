@@ -193,12 +193,12 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 [6u8; 32],
                 Some((TypeUuid([3u8; 16]), LogicalHash([5u8; 32]))),
             ))?;
-            Err(StoreError::Poisoned {
+            Err(StoreError::InvalidConfiguration {
                 error: "abort everything".into(),
             })
         })
         .unwrap_err();
-    assert!(matches!(err, StoreError::Poisoned { .. }));
+    assert!(matches!(err, StoreError::InvalidConfiguration { .. }));
 
     // None of it published — readers observe all metadata for a given
     // tree state, or none of it.
@@ -308,9 +308,9 @@ fn pure_metadata_reads_survive_a_pipeline_poison() {
 }
 
 #[test]
-fn version_poison_and_pipeline_poison_are_distinct_gates() {
-    // The version-global poison (§7) blocks the asset namespace even
-    // when the pipeline is healthy — and vice versa.
+fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
+    // A namespace error (LOCKLESS.md §4) is about one entity: the rest of
+    // the namespace and the pipeline stay readable.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     store
@@ -322,23 +322,17 @@ fn version_poison_and_pipeline_poison_are_distinct_gates() {
                 ),
             )?;
             txn.publish_pipeline_epoch(&validated_epoch([1u8; 32], None))?;
-            let poison = version_poison("identity collision");
-            txn.set_version_poison(Some(&poison))
+            txn.set_namespace_errors([version_poison("identity collision")])?;
+            Ok(())
         })
         .unwrap();
 
     // Pipeline healthy…
     assert!(store.pipeline_state().unwrap().unwrap().epoch().is_ok());
-    // …but the namespace is uniformly poisoned.
-    assert!(matches!(
-        store.resolve_path("x"),
-        Err(StoreError::Poisoned { .. })
-    ));
-    assert!(matches!(
-        store.entry(AssetUuid([1u8; 16])),
-        Err(StoreError::Poisoned { .. })
-    ));
-    // CAS reads are pure metadata: valid under both poisons.
+    // …and so is the namespace.
+    assert_eq!(store.resolve_path("x").unwrap(), None);
+    assert!(store.entry(AssetUuid([1u8; 16])).unwrap().is_none());
+    // CAS reads are pure metadata.
     commit(&mut store, 3);
     assert_eq!(
         store.cas_read(blake3::hash(&[3u8; 64]).as_bytes()).unwrap(),

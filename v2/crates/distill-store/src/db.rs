@@ -20,7 +20,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 31;
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -89,6 +89,20 @@ CREATE TABLE source_claims (
     PRIMARY KEY (root_id, path, kind, subject, claimant)
 );
 CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
+-- Per-entity errors (see `errors`): one row per current defect. `family`
+-- is the producer that owns the row (1 = scan namespace); `scope_kind` 1
+-- file, 2 bundle, 3 asset, 4 target, 5 pipeline, 6 configuration, 7 daemon.
+CREATE TABLE errors (
+    family     INTEGER NOT NULL,
+    scope_kind INTEGER NOT NULL CHECK (scope_kind BETWEEN 1 AND 7),
+    scope_id   BLOB NOT NULL,
+    identity   BLOB NOT NULL CHECK (length(identity) = 32),
+    code       INTEGER NOT NULL,
+    record     BLOB NOT NULL,
+    message    TEXT NOT NULL,
+    PRIMARY KEY (family, identity)
+);
+CREATE INDEX errors_by_scope ON errors(scope_kind, scope_id);
 -- Subjects with more than one distinct claimant (group 0 bundles, 1 assets).
 CREATE TABLE claim_collisions (
     grp     INTEGER NOT NULL,

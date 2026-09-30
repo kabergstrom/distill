@@ -156,7 +156,6 @@ struct MetadataUuidListCall {
     reconnectRequired @1 :MetadataReconnectRequired;
     leaseFailure @2 :LeaseFailure;
     error @3 :RpcError;
-    versionPoisoned @4 :VersionPoison;
   }
 }
 
@@ -166,7 +165,6 @@ struct MetadataEntryMetaCall {
     reconnectRequired @1 :MetadataReconnectRequired;
     leaseFailure @2 :LeaseFailure;
     error @3 :RpcError;
-    versionPoisoned @4 :VersionPoison;
   }
 }
 
@@ -186,7 +184,6 @@ struct MetadataPathResolveCall {
     reconnectRequired @1 :MetadataReconnectRequired;
     leaseFailure @2 :LeaseFailure;
     error @3 :RpcError;
-    versionPoisoned @4 :VersionPoison;
   }
 }
 
@@ -196,9 +193,8 @@ struct MetadataAuthoringInspectCall {
     reconnectRequired @1 :MetadataReconnectRequired;
     leaseFailure @2 :LeaseFailure;
     error @3 :RpcError;
-    versionPoisoned @4 :VersionPoison;
-    missing @5 :Void;
-    roleIneligible @6 :AuthoringRoleFailure;
+    missing @4 :Void;
+    roleIneligible @5 :AuthoringRoleFailure;
   }
 }
 
@@ -312,7 +308,6 @@ struct UuidListCall {
     configurationPoisoned @2 :ConfigurationPoison;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
-    versionPoisoned @5 :VersionPoison;
   }
 }
 
@@ -595,18 +590,11 @@ struct PipelineDiagnostic {
   }
 }
 
-struct VersionPoisonDiagnostic {
-  union {
-    healthy @0 :Void;
-    poisoned @1 :VersionPoison;
-  }
-}
-
 struct MetadataDiagnostics {
   stamp @0 :SnapshotStampValue;
   configuration @1 :ConfigurationDiagnostic;
   pipeline @2 :PipelineDiagnostic;
-  versionPoison @3 :VersionPoisonDiagnostic;
+  namespaceErrors @3 :List(VersionPoison);
 }
 
 struct AuthoringValue {
@@ -684,7 +672,6 @@ struct AuthoringInspectCall {
     error @4 :RpcError;
     missing @5 :Void;
     roleIneligible @6 :AuthoringRoleFailure;
-    versionPoisoned @7 :VersionPoison;
   }
 }
 
@@ -713,7 +700,6 @@ struct EntryMetaCall {
     configurationPoisoned @2 :ConfigurationPoison;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
-    versionPoisoned @5 :VersionPoison;
   }
 }
 
@@ -744,7 +730,6 @@ struct ResolveCall {
     configurationPoisoned @2 :ConfigurationPoison;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
-    versionPoisoned @5 :VersionPoison;
   }
 }
 
@@ -771,7 +756,6 @@ struct PathResolveCall {
     configurationPoisoned @2 :ConfigurationPoison;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
-    versionPoisoned @5 :VersionPoison;
   }
 }
 

@@ -205,9 +205,6 @@ fn metadata_namespace_value<T>(
         MetadataNamespaceCall::Error(error) => Err(PackCommandError::Metadata(format!(
             "{operation}: {error:?}"
         ))),
-        MetadataNamespaceCall::VersionPoisoned(poison) => Err(PackCommandError::Metadata(format!(
-            "{operation}: version poisoned: {poison:?}"
-        ))),
     }
 }
 
@@ -219,9 +216,6 @@ fn rpc_value<T>(result: RpcResult<T>, operation: &str) -> Result<T, PackCommandE
         ))),
         RpcResult::ConfigurationPoisoned(poison) => Err(PackCommandError::Connect(format!(
             "{operation}: configuration poisoned: {poison:?}"
-        ))),
-        RpcResult::VersionPoisoned(poison) => Err(PackCommandError::Connect(format!(
-            "{operation}: version poisoned: {poison:?}"
         ))),
         RpcResult::Failure(error) => {
             Err(PackCommandError::Connect(format!("{operation}: {error:?}")))

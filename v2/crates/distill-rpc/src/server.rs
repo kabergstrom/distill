@@ -854,15 +854,10 @@ impl Server {
     }
 
     /// Snapshot-pinned batch requests used by `doctor verify`. This bypasses
-    /// transport capabilities but not configuration/pipeline/version poison;
+    /// transport capabilities but not configuration or pipeline errors;
     /// the daemon still executes each request through the ordinary build core.
     pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
         let txn = self.inner.current_snapshot().map_err(store_failure)?;
-        if let Some(poison) = &txn.version_poison {
-            return Err(RpcFailure::InvalidQuery {
-                detail: format!("cannot verify a poisoned input version: {poison:?}"),
-            });
-        }
         if let ConfigurationStatus::Poisoned(poison) = &txn.configuration {
             return Err(RpcFailure::InvalidQuery {
                 detail: format!("cannot verify poisoned configuration: {poison:?}"),
@@ -1397,7 +1392,6 @@ pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFai
 pub(crate) struct SnapshotTxn {
     snapshot: Option<distill_store::served::StoreSnapshot>,
     pub(crate) stamp: SnapshotStamp,
-    pub(crate) version_poison: Option<VersionPoison>,
     pub(crate) configuration: ConfigurationStatus,
     pub(crate) lineage_repair: Option<LineageRepairState>,
     pipeline_installed_at: InputVersion,
@@ -1740,7 +1734,6 @@ impl Inner {
             }
         }
         let snapshot = self.take_reader()?.begin_snapshot()?;
-        let version_poison = snapshot.version_poison()?;
         let configuration = configuration_status(&snapshot.configuration_state()?);
         let lineage_repair = read_lineage_repair(snapshot.served_blob(SERVED_LINEAGE_REPAIR)?)?;
         let (pipeline_installed_at, pipeline) =
@@ -1748,7 +1741,6 @@ impl Inner {
         let txn = Rc::new(SnapshotTxn {
             stamp: snapshot.stamp(),
             snapshot: Some(snapshot),
-            version_poison,
             configuration,
             lineage_repair,
             pipeline_installed_at,

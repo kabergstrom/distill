@@ -2782,11 +2782,6 @@ fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: Rp
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on capability acquisition: {poison}"),
-        ),
         RpcResult::Failure(error) => write_rpc_result_error_snapshot(result, error),
     }
 }
@@ -2808,11 +2803,6 @@ fn write_authoring_snapshot_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on capability acquisition: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
             result.init_lease_failure(),
             "authoring snapshot lease expired",
@@ -2929,10 +2919,9 @@ fn write_metadata_diagnostics_result(
                     )
                 }
             }
-            let mut version = output.init_version_poison();
-            match &diagnostics.version_poison {
-                None => version.set_healthy(()),
-                Some(poison) => write_version_poison(version.init_poisoned(), poison),
+            let mut errors = output.init_namespace_errors(diagnostics.namespace_errors.len() as u32);
+            for (index, error) in diagnostics.namespace_errors.iter().enumerate() {
+                write_version_poison(errors.reborrow().get(index as u32), error);
             }
         }
         MetadataCall::ReconnectRequired { reason } => {
@@ -3056,9 +3045,6 @@ fn write_metadata_uuid_list_result(
         MetadataNamespaceCall::Error(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
-        MetadataNamespaceCall::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
-        }
     }
 }
 
@@ -3079,9 +3065,6 @@ fn write_metadata_entry_result(
         ),
         MetadataNamespaceCall::Error(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
-        }
-        MetadataNamespaceCall::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
         }
     }
 }
@@ -3114,9 +3097,6 @@ fn write_metadata_path_result(
         MetadataNamespaceCall::Error(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
         }
-        MetadataNamespaceCall::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
-        }
     }
 }
 
@@ -3143,9 +3123,6 @@ fn write_metadata_authoring_inspect_result(
         ),
         MetadataNamespaceCall::Error(error) => {
             write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
-        }
-        MetadataNamespaceCall::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
         }
     }
 }
@@ -3209,9 +3186,6 @@ fn write_uuid_list_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
-        }
         RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
             result.init_lease_failure(),
             "authoring snapshot lease expired",
@@ -3233,9 +3207,6 @@ fn write_target_entry_result(
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
-        }
-        RpcResult::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3265,9 +3236,6 @@ fn write_authoring_inspect_result(
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
-        }
-        RpcResult::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
             result.init_lease_failure(),
@@ -3341,11 +3309,6 @@ fn write_subscribe_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on subscription install: {poison}"),
-        ),
         RpcResult::Failure(error) => write_rpc_result_error_subscribe(result, error),
     }
 }
@@ -3359,11 +3322,6 @@ fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcRes
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on target-global call: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
         }
@@ -3382,11 +3340,6 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on target-global call: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
         }
@@ -3408,11 +3361,6 @@ fn write_bundle_uuid_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on authoring operation: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
         }
@@ -3440,11 +3388,6 @@ fn write_progress_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on authoring operation: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
         }
@@ -3495,11 +3438,6 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on wire-tree fetch: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
         }
@@ -3546,9 +3484,6 @@ fn write_resolve_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
-        }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
         }
@@ -3583,9 +3518,6 @@ fn write_path_result(
         }
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
-        }
-        RpcResult::VersionPoisoned(poison) => {
-            write_version_poison(result.init_version_poisoned(), &poison)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3625,11 +3557,6 @@ fn write_fetch_result(
         RpcResult::ConfigurationPoisoned(poison) => {
             write_poison(result.init_configuration_poisoned(), &poison)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            result.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on immutable fetch: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
         }
@@ -3735,11 +3662,6 @@ fn write_snapshot_configuration_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(output.init_reconnect_required(), reason)
         }
-        RpcResult::VersionPoisoned(poison) => write_error(
-            output.init_error(),
-            RPC_FAILURE,
-            &format!("unexpected version poison on configuration query: {poison}"),
-        ),
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(output.init_lease_failure(), "snapshot lease expired")
         }

@@ -42,7 +42,7 @@ use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
     TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
-use distill_store::served::encode_authored_value;
+use distill_store::served::{encode_authored_value, ResolutionRow};
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
@@ -506,11 +506,12 @@ impl DaemonCoordinator {
             .flatten()
     }
 
-    fn pending_scan_version_poison(&self) -> Option<VersionPoison> {
+    /// The namespace errors of the pending scan rejection.
+    fn pending_scan_errors(&self) -> Vec<VersionPoison> {
         self.scan_rejection
             .borrow_mut()
             .as_ref()
-            .and_then(|pending| pending.rejection.version.clone())
+            .map_or_else(Vec::new, |pending| pending.rejection.version.clone())
     }
 
     fn configuration_without_source_poison(
@@ -621,14 +622,9 @@ impl DaemonCoordinator {
                 Some(&schema_authority),
             )?;
             if !candidate_scan_heals {
-                candidate.version_poison = VersionPoison::select_canonical(
-                    candidate
-                        .version_poison
-                        .take()
-                        .into_iter()
-                        .chain(self.pending_scan_version_poison()),
-                )
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+                candidate
+                        .namespace_errors
+                        .extend(self.pending_scan_errors());
             }
             let mut runtime = lock_pipeline(&self.pipeline);
             let prepared_epoch = {
@@ -1538,7 +1534,7 @@ impl DaemonCoordinator {
                 scanner: &self.scanner,
                 destination: self.lineage_destination(),
                 configuration_poison: self.configuration_poison(),
-                version_poison: self.pending_scan_version_poison(),
+                namespace_errors: self.pending_scan_errors(),
                 authority: authority.as_deref(),
                 fresh: fresh_bundles(&delta),
             };
@@ -1629,14 +1625,9 @@ impl DaemonCoordinator {
             authority.as_deref(),
         )?;
         if !heals_scan_rejection {
-            candidate.version_poison = VersionPoison::select_canonical(
-                candidate
-                    .version_poison
-                    .take()
-                    .into_iter()
-                    .chain(self.pending_scan_version_poison()),
-            )
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            candidate
+                    .namespace_errors
+                    .extend(self.pending_scan_errors());
         }
         candidate.renames.extend_from_slice(renames);
         let base = self.server().current_stamp().version;
@@ -1735,20 +1726,15 @@ impl DaemonCoordinator {
             rejection: rejection.clone(),
             subjects,
         };
-        let indexed_version = self.store.read().claims_version_poison()?;
-        let durable_version = self.store.read()
-            .version_poison()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let baseline_version = match (indexed_version, durable_version) {
-            (Some(indexed), Some(durable)) if indexed.identity == durable.identity => Some(durable),
-            (indexed, _) => indexed,
-        };
-        let version = VersionPoison::select_canonical(
-            baseline_version
-                .into_iter()
-                .chain(rejection.version.clone()),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+        // The scan could not observe the rejected subjects, so the namespace
+        // keeps what it published; only the errors change.
+        let version = self
+            .store
+            .read()
+            .claims_namespace_errors()?
+            .into_iter()
+            .chain(rejection.version.iter().cloned())
+            .collect::<Vec<_>>();
         let source_configuration = self
             .configuration_poison
             .borrow_mut()
@@ -1798,7 +1784,7 @@ impl DaemonCoordinator {
                 };
                 store
                     .input_transaction(|transaction| {
-                        transaction.set_version_poisons(version.clone())?;
+                        transaction.set_namespace_errors(version.iter().cloned())?;
                         match &configuration {
                             ConfigurationStatus::Ready => {
                                 transaction.publish_configuration_ready(generation)?
@@ -1811,7 +1797,7 @@ impl DaemonCoordinator {
                     .map_err(|error| error.to_string())?;
                 let commit = Commit {
                     configuration: Some(configuration.clone()),
-                    version_poison: Some(version.clone()),
+                    namespace_errors: Some(version.clone()),
                     lineage_repair: Some(lineage_repair.clone()),
                     ..Commit::default()
                 };
@@ -1983,7 +1969,7 @@ impl DaemonCoordinator {
 
 #[derive(Clone)]
 struct ScanRejection {
-    version: Option<VersionPoison>,
+    version: Vec<VersionPoison>,
     configuration: Option<ConfigurationPoison>,
 }
 
@@ -1998,7 +1984,7 @@ fn select_scan_rejection(
 ) -> Result<ScanRejection, CoordinatorError> {
     let rejections = rejections.into_iter().collect::<Vec<_>>();
     let version =
-        VersionPoison::select_canonical(rejections.iter().filter_map(|item| item.version.clone()))
+        VersionPoison::canonical_set(rejections.iter().flat_map(|item| item.version.clone()))
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
     let configuration = ConfigurationPoison::select_canonical(
         rejections.into_iter().filter_map(|item| item.configuration),
@@ -2037,7 +2023,7 @@ fn classify_scan_rejection(
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         return Ok(ScanRejection {
-            version: Some(poison),
+            version: vec![poison],
             configuration: None,
         });
     }
@@ -2057,7 +2043,7 @@ fn classify_scan_rejection(
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         return Ok(ScanRejection {
-            version: Some(poison),
+            version: vec![poison],
             configuration: None,
         });
     }
@@ -2077,7 +2063,7 @@ fn classify_scan_rejection(
             },
         };
         return Ok(ScanRejection {
-            version: None,
+            version: Vec::new(),
             configuration: Some(ConfigurationPoison::from_reason(&reason, error.to_string())),
         });
     }
@@ -2101,7 +2087,7 @@ fn classify_scan_rejection(
             },
         };
         return Ok(ScanRejection {
-            version: None,
+            version: Vec::new(),
             configuration: Some(ConfigurationPoison::from_reason(&reason, error.to_string())),
         });
     }
@@ -2146,7 +2132,7 @@ fn classify_scan_rejection(
     let poison = VersionPoison::new(detail, error.to_string())
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
     Ok(ScanRejection {
-        version: Some(poison),
+        version: vec![poison],
         configuration: None,
     })
 }
@@ -2284,6 +2270,114 @@ fn scoped_bundle_poison(
     })
 }
 
+/// What collides is withheld from publication (LOCKLESS.md §4): a bundle
+/// UUID more than one file claims, with every asset it holds, and an asset
+/// UUID claimed more than once. Everything else publishes. A withheld asset
+/// resolves `Failed` with its error until the collision heals.
+#[derive(Debug, Default)]
+struct Withheld {
+    bundles: BTreeSet<BundleUuid>,
+    assets: BTreeMap<AssetUuid, String>,
+}
+
+impl Withheld {
+    /// What `errors` withhold. `sources` name the assets of withheld
+    /// bundles.
+    fn new<'a>(
+        errors: &[VersionPoison],
+        sources: impl IntoIterator<Item = &'a ScannedBundle>,
+    ) -> Self {
+        let mut withheld = Self::default();
+        let mut bundle_errors = BTreeMap::new();
+        for error in errors {
+            match &error.detail {
+                VersionPoisonV1::DuplicateBundleUuid { bundle, .. } => {
+                    withheld.bundles.insert(*bundle);
+                    bundle_errors.insert(*bundle, error.message.clone());
+                }
+                VersionPoisonV1::DuplicateAssetUuid { asset, .. } => {
+                    withheld.assets.insert(*asset, error.message.clone());
+                }
+                _ => {}
+            }
+        }
+        for source in sources {
+            let uuids = match (&source.parsed, &source.namespace_skeleton) {
+                (Ok(bundle), _) => bundle_errors
+                    .get(&bundle.uuid)
+                    .map(|message| (message, bundle.assets.values().map(|entry| entry.uuid).collect::<Vec<_>>())),
+                (Err(_), Some(skeleton)) => bundle_errors
+                    .get(&skeleton.uuid)
+                    .map(|message| (message, skeleton.assets.values().map(|entry| entry.uuid).collect())),
+                (Err(_), None) => None,
+            };
+            if let Some((message, uuids)) = uuids {
+                for uuid in uuids {
+                    withheld
+                        .assets
+                        .entry(uuid)
+                        .or_insert_with(|| message.clone());
+                }
+            }
+        }
+        withheld
+    }
+
+    fn asset(&self, asset: &AssetUuid) -> bool {
+        self.assets.contains_key(asset)
+    }
+
+    /// `source` as it publishes: `None` when its bundle is withheld, else
+    /// without its withheld assets (a withheld primary leaves no primary).
+    fn publishable(&self, source: &Arc<ScannedBundle>) -> Option<Arc<ScannedBundle>> {
+        let Ok(bundle) = &source.parsed else {
+            return Some(Arc::clone(source));
+        };
+        if self.bundles.contains(&bundle.uuid) {
+            return None;
+        }
+        if !bundle.assets.values().any(|entry| self.asset(&entry.uuid)) {
+            return Some(Arc::clone(source));
+        }
+        let mut bundle = bundle.clone();
+        bundle.assets.retain(|_, entry| !self.asset(&entry.uuid));
+        if bundle
+            .primary
+            .as_ref()
+            .is_some_and(|primary| !bundle.assets.contains_key(primary))
+        {
+            bundle.primary = None;
+        }
+        Some(Arc::new(ScannedBundle {
+            parsed: Ok(bundle),
+            ..ScannedBundle::clone(source)
+        }))
+    }
+
+    /// `poison` without its withheld entries; `None` when its bundle is
+    /// withheld.
+    fn publishable_skeleton(&self, mut poison: ScopedBundlePoison) -> Option<ScopedBundlePoison> {
+        if self.bundles.contains(&poison.bundle) {
+            return None;
+        }
+        poison.entries.retain(|entry| !self.asset(&entry.asset));
+        Some(poison)
+    }
+
+    /// The withheld assets whose stored resolution is not yet their
+    /// error: each publishes `Failed` once.
+    fn newly_failed(&self, reader: &StoreReader) -> Result<BTreeMap<AssetUuid, String>, StoreError> {
+        let mut failed = BTreeMap::new();
+        for (asset, message) in &self.assets {
+            let current = reader.asset_resolution(*asset)?;
+            if !matches!(&current, Some(ResolutionRow::Failed(error)) if error == message) {
+                failed.insert(*asset, message.clone());
+            }
+        }
+        Ok(failed)
+    }
+}
+
 /// What `source` claims under `projection` (see [`distill_store::claims`]).
 fn source_claims(
     source: &ScannedBundle,
@@ -2398,8 +2492,8 @@ struct PlanInputs<'a> {
     scanner: &'a RootedScanner,
     destination: LineageDestination,
     configuration_poison: Option<ConfigurationPoison>,
-    /// A version poison outside the claims (a pending scan rejection's).
-    version_poison: Option<VersionPoison>,
+    /// Namespace errors outside the claims (a pending scan rejection's).
+    namespace_errors: Vec<VersionPoison>,
     authority: Option<&'a ProjectSchemaAuthority>,
     /// The bundles this scan read, by (root, path); other claimed sources
     /// are parsed from their stored bytes.
@@ -2464,11 +2558,11 @@ fn incremental_plan(
     reader: &StoreReader,
     inputs: &PlanInputs<'_>,
 ) -> Result<IncrementalScanPlan, CoordinatorError> {
-    let version_poison = VersionPoison::select_canonical(
+    let namespace_errors = VersionPoison::canonical_set(
         reader
-            .claims_version_poison()?
+            .claims_namespace_errors()?
             .into_iter()
-            .chain(inputs.version_poison.clone()),
+            .chain(inputs.namespace_errors.iter().cloned()),
     )
     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
     let (configuration, lineage_repair, lineage_manifest) = indexed_lineage_projection(
@@ -2478,21 +2572,39 @@ fn incremental_plan(
         inputs.configuration_poison.clone(),
     )?;
     let pending = reader.pending_claims()?;
+    // Every source of each pending bundle: a colliding bundle withholds the
+    // assets of all of them.
+    let mut claimed = BTreeMap::new();
+    for bundle in pending.bundles {
+        let sources = reader
+            .bundle_claim_sources(bundle)?
+            .iter()
+            .map(|source| {
+                claimed_source(
+                    reader,
+                    &inputs.fresh,
+                    &source.root_name,
+                    &source.normalized_path,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        claimed.insert(bundle, sources);
+    }
+    let withheld = Withheld::new(
+        &namespace_errors,
+        claimed.values().flatten().map(AsRef::as_ref),
+    );
     let mut bundles = BTreeMap::new();
     let mut bundle_poisons = BTreeMap::new();
-    for bundle in pending.bundles {
-        let source = match reader.bundle_claim_sources(bundle)?.as_slice() {
-            [source] => Some(claimed_source(
-                reader,
-                &inputs.fresh,
-                &source.root_name,
-                &source.normalized_path,
-            )?),
+    for (bundle, sources) in claimed {
+        let source = match sources.as_slice() {
+            [source] => withheld.publishable(source),
             _ => None,
         };
         if let Some(poison) = source
             .as_deref()
             .and_then(|source| scoped_bundle_poison(source, inputs.authority))
+            .and_then(|poison| withheld.publishable_skeleton(poison))
         {
             bundle_poisons.insert(bundle, poison);
         }
@@ -2501,7 +2613,7 @@ fn incremental_plan(
     let mut derived_outputs = BTreeMap::new();
     for child in pending.derived {
         let output = match reader.derived_output_claims(child)?.as_slice() {
-            [output] => Some(DerivedOutputEntry {
+            [output] if !withheld.asset(&child) && !withheld.asset(&output.parent) => Some(DerivedOutputEntry {
                 parent: output.parent,
                 output_key: output.output_key.clone(),
                 terminal_type: output.terminal_type,
@@ -2513,10 +2625,15 @@ fn incremental_plan(
     let paths = pending
         .paths
         .into_iter()
-        .map(|path| Ok((path.clone(), reader.path_claims(&path)?)))
+        .map(|path| {
+            let mut assets = reader.path_claims(&path)?;
+            assets.retain(|asset| !withheld.asset(asset));
+            Ok((path, assets))
+        })
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     Ok(IncrementalScanPlan {
-        version_poison,
+        namespace_errors,
+        withheld,
         configuration,
         lineage_repair,
         lineage_manifest,
@@ -2528,7 +2645,8 @@ fn incremental_plan(
 }
 
 struct IncrementalScanPlan {
-    version_poison: Option<VersionPoison>,
+    namespace_errors: Vec<VersionPoison>,
+    withheld: Withheld,
     configuration: ConfigurationStatus,
     lineage_repair: Option<LineageRepairState>,
     lineage_manifest: Option<VerifiedSchemaLineageManifest>,
@@ -2624,7 +2742,7 @@ fn scan_key_matches(prefix: &ScanKey, key: &ScanKey) -> bool {
 struct ScanCandidate {
     scan: ScanSnapshot,
     renames: Vec<LogicalRename>,
-    version_poison: Option<VersionPoison>,
+    namespace_errors: Vec<VersionPoison>,
     bundle_poisons: BTreeMap<BundleUuid, ScopedBundlePoison>,
     configuration: ConfigurationStatus,
     lineage_repair: Option<LineageRepairState>,
@@ -2729,7 +2847,7 @@ impl ScanCandidate {
                 );
             }
         }
-        let version_poison = VersionPoison::select_canonical(poisons)
+        let namespace_errors = VersionPoison::canonical_set(poisons)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
 
         let mut claimants = lineage_claimants(&parsed);
@@ -2801,7 +2919,7 @@ impl ScanCandidate {
         Ok(Self {
             scan,
             renames: Vec::new(),
-            version_poison,
+            namespace_errors,
             bundle_poisons,
             configuration,
             lineage_repair,
@@ -2816,7 +2934,7 @@ fn projected_derived_outputs(
 ) -> Result<
     (
         BTreeMap<AssetUuid, DerivedOutputEntry>,
-        Option<VersionPoison>,
+        Vec<VersionPoison>,
     ),
     StoreError,
 > {
@@ -2843,9 +2961,8 @@ fn projected_derived_outputs(
                 claims.entry(child).or_default().push(claimant);
                 if let Some(existing) = outputs.insert(child, output.clone()) {
                     if existing != output {
-                        // The claimant table below publishes the closed typed
-                        // collision; keeping either row here is harmless
-                        // because poisoned versions expose no namespace.
+                        // The claimant table below publishes the collision,
+                        // which withholds the child.
                     }
                 }
             }
@@ -2885,7 +3002,7 @@ fn projected_derived_outputs(
             poisons.push(
                 VersionPoison::new(
                     VersionPoisonV1::DuplicateAssetUuid { asset, claimants },
-                    format!("authored/derived asset UUID collision at {asset}"),
+                    format!("duplicate asset UUID {asset}"),
                 )
                 .map_err(|error| StoreError::InvalidConfiguration {
                     error: format!("invalid derived-output collision: {error}"),
@@ -2893,12 +3010,7 @@ fn projected_derived_outputs(
             );
         }
     }
-    let poison = VersionPoison::select_canonical(poisons).map_err(|error| {
-        StoreError::InvalidConfiguration {
-            error: format!("invalid derived-output collision set: {error}"),
-        }
-    })?;
-    Ok((outputs, poison))
+    Ok((outputs, poisons))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2991,10 +3103,11 @@ impl BundleSummary {
 }
 
 fn candidate_bundle_summaries(
-    candidate: &ScanCandidate,
+    published: &[Arc<ScannedBundle>],
+    bundle_poisons: &BTreeMap<BundleUuid, ScopedBundlePoison>,
 ) -> Result<BTreeMap<BundleUuid, BundleSummary>, StoreError> {
     let mut summaries = BTreeMap::new();
-    for source in candidate.scan.bundle_rows() {
+    for source in published {
         let Ok(bundle) = &source.parsed else {
             continue;
         };
@@ -3017,7 +3130,7 @@ fn candidate_bundle_summaries(
             },
         );
     }
-    for poison in candidate.bundle_poisons.values() {
+    for poison in bundle_poisons.values() {
         summaries.insert(
             poison.bundle,
             BundleSummary {
@@ -3032,6 +3145,29 @@ fn candidate_bundle_summaries(
     Ok(summaries)
 }
 
+/// The assets each published bundle holds.
+fn published_bundle_assets(
+    published: &[Arc<ScannedBundle>],
+    bundle_poisons: &BTreeMap<BundleUuid, ScopedBundlePoison>,
+) -> BTreeMap<BundleUuid, BTreeSet<AssetUuid>> {
+    let mut assets = BTreeMap::<BundleUuid, BTreeSet<AssetUuid>>::new();
+    for source in published {
+        if let Ok(bundle) = &source.parsed {
+            assets
+                .entry(bundle.uuid)
+                .or_default()
+                .extend(bundle.assets.values().map(|entry| entry.uuid));
+        }
+    }
+    for poison in bundle_poisons.values() {
+        assets
+            .entry(poison.bundle)
+            .or_default()
+            .extend(poison.entries.iter().map(|entry| entry.asset));
+    }
+    assets
+}
+
 #[allow(clippy::too_many_arguments)] // The scan transaction receives each publication input explicitly.
 fn publish_scan(
     store: &Arc<AuthorityStore>,
@@ -3043,17 +3179,34 @@ fn publish_scan(
     tag_epoch: [u8; 32],
     claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
-    let (derived_outputs, derived_poison) = projected_derived_outputs(&candidate, projection)?;
-    candidate.version_poison = VersionPoison::select_canonical(
-        candidate
-            .version_poison
-            .take()
+    let (derived_outputs, derived_errors) = projected_derived_outputs(&candidate, projection)?;
+    candidate.namespace_errors = VersionPoison::canonical_set(
+        std::mem::take(&mut candidate.namespace_errors)
             .into_iter()
-            .chain(derived_poison),
+            .chain(derived_errors),
     )
     .map_err(|error| StoreError::InvalidConfiguration {
-        error: format!("invalid derived-output collision poison: {error}"),
+        error: format!("invalid namespace error: {error}"),
     })?;
+    let withheld = Withheld::new(&candidate.namespace_errors, candidate.scan.bundle_rows());
+    let derived_outputs = derived_outputs
+        .into_iter()
+        .filter(|(child, output)| !withheld.asset(child) && !withheld.asset(&output.parent))
+        .collect::<BTreeMap<_, _>>();
+    let published = candidate
+        .scan
+        .bundles
+        .values()
+        .filter_map(|source| withheld.publishable(source))
+        .collect::<Vec<_>>();
+    candidate.bundle_poisons = std::mem::take(&mut candidate.bundle_poisons)
+        .into_iter()
+        .filter_map(|(bundle, poison)| {
+            withheld
+                .publishable_skeleton(poison)
+                .map(|poison| (bundle, poison))
+        })
+        .collect();
     let mut store = store.write();
     if store.input_version() != base {
         return Err(StoreError::InvalidConfiguration {
@@ -3090,26 +3243,34 @@ fn publish_scan(
             },
         );
     }
-    let current_bundle_summaries = if candidate.version_poison.is_none() {
-        candidate_bundle_summaries(&candidate)?
-    } else {
-        BTreeMap::new()
-    };
+    let current_bundle_summaries = candidate_bundle_summaries(&published, &candidate.bundle_poisons)?;
+    // A bundle whose assets changed without its bytes (an asset started or
+    // stopped colliding) republishes too.
+    let mut old_bundle_assets = BTreeMap::<BundleUuid, BTreeSet<AssetUuid>>::new();
+    for (asset, bundle) in &old_asset_bundles {
+        old_bundle_assets.entry(*bundle).or_default().insert(*asset);
+    }
+    let current_bundle_assets = published_bundle_assets(&published, &candidate.bundle_poisons);
+    let assets_changed =
+        |bundle: &BundleUuid| old_bundle_assets.get(bundle) != current_bundle_assets.get(bundle);
     let changed_bundles = current_bundle_summaries
         .iter()
         .filter_map(|(bundle, current)| {
-            (old_bundle_summaries.get(bundle) != Some(current)).then_some(*bundle)
+            (old_bundle_summaries.get(bundle) != Some(current) || assets_changed(bundle))
+                .then_some(*bundle)
         })
         .collect::<BTreeSet<_>>();
     let rpc_changed_bundles = current_bundle_summaries
         .iter()
         .filter_map(|(bundle, current)| {
-            old_bundle_summaries
+            (old_bundle_summaries
                 .get(bundle)
                 .is_none_or(|old| !current.rpc_equivalent(old))
-                .then_some(*bundle)
+                || assets_changed(bundle))
+            .then_some(*bundle)
         })
         .collect::<BTreeSet<_>>();
+    let newly_failed = withheld.newly_failed(&store)?;
     let mut generation = match store.configuration_state()? {
         ConfigurationState::Ready(epoch) => epoch.generation,
         ConfigurationState::Poisoned { last_good, .. } => {
@@ -3141,7 +3302,7 @@ fn publish_scan(
             .map(|basis| basis.manifest_hash));
     let waiting = match manifest_hash {
         Some(manifest_hash) => retired_waiting_projection(
-            candidate.scan.bundle_rows(),
+            published.iter().map(AsRef::as_ref),
             &store.retired_type_uuids()?,
             manifest_hash,
             SnapshotStamp {
@@ -3164,6 +3325,9 @@ fn publish_scan(
         .collect::<BTreeSet<_>>();
     let mut commit = rpc_commit(
         &candidate,
+        &published,
+        &withheld,
+        &newly_failed,
         &old_asset_bundles,
         &old_paths,
         projection,
@@ -3214,11 +3378,11 @@ fn publish_scan(
             &candidate.scan.encoded_diagnostic_rows(),
         )?;
         transaction.set_clean_watermark(newest_mtime)?;
-        transaction.set_version_poisons(candidate.version_poison.clone())?;
+        transaction.set_namespace_errors(candidate.namespace_errors.iter().cloned())?;
         if waiting.is_none() {
             transaction.clear_derived_outputs()?;
         }
-        if candidate.version_poison.is_none() && waiting.is_none() {
+        if waiting.is_none() {
             for (child, output) in &derived_outputs {
                 transaction.set_derived_output(
                     *child,
@@ -3269,82 +3433,80 @@ fn publish_scan(
             healed_retired = transaction.clear_retired_type_referenced()?;
         }
 
-        if candidate.version_poison.is_none() {
-            for bundle in old_bundle_summaries.keys() {
-                if !current_bundle_summaries.contains_key(bundle)
-                    || publishable_changed_bundles.contains(bundle)
-                {
-                    transaction.remove_bundle(*bundle)?;
-                }
+        for bundle in old_bundle_summaries.keys() {
+            if !current_bundle_summaries.contains_key(bundle)
+                || publishable_changed_bundles.contains(bundle)
+            {
+                transaction.remove_bundle(*bundle)?;
             }
-            for source in candidate.scan.bundle_rows() {
-                let Ok(bundle) = &source.parsed else {
-                    continue;
-                };
-                if !publishable_changed_bundles.contains(&bundle.uuid) {
-                    continue;
-                }
-                let root = *root_ids
-                    .entry(source.root_name.clone())
-                    .or_insert(transaction.intern_root(&source.root_name)?);
-                let summary = &current_bundle_summaries[&bundle.uuid];
-                transaction.upsert_bundle(&BundleMeta {
-                    bundle: bundle.uuid,
-                    root,
-                    path: source.normalized_path.clone(),
-                    format_version: bundle.format_version,
-                    content_hash: ContentHash(source.file_hash.0),
-                    origin: summary.origin.clone(),
-                })?;
-                for (hash, schema) in &bundle.schemas {
-                    let snapshot =
-                        distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-                            StoreError::InvalidConfiguration {
-                                error: format!("cannot serialize verified schema {hash}: {error}"),
-                            }
-                        })?;
-                    transaction.put_schema(*hash, &snapshot)?;
-                }
-                for (local_id, entry) in &bundle.assets {
-                    transaction.upsert_asset(&AssetRecord {
-                        asset: entry.uuid,
-                        bundle: bundle.uuid,
-                        local_id: local_id.clone(),
-                        type_uuid: entry.type_uuid,
-                        logical_hash: entry.schema_hash,
-                        authoring_only: entry.authoring_only,
-                        tags: BTreeMap::new(),
-                        served: Some(served_authoring(entry, projection)?),
+        }
+        for source in &published {
+            let Ok(bundle) = &source.parsed else {
+                continue;
+            };
+            if !publishable_changed_bundles.contains(&bundle.uuid) {
+                continue;
+            }
+            let root = *root_ids
+                .entry(source.root_name.clone())
+                .or_insert(transaction.intern_root(&source.root_name)?);
+            let summary = &current_bundle_summaries[&bundle.uuid];
+            transaction.upsert_bundle(&BundleMeta {
+                bundle: bundle.uuid,
+                root,
+                path: source.normalized_path.clone(),
+                format_version: bundle.format_version,
+                content_hash: ContentHash(source.file_hash.0),
+                origin: summary.origin.clone(),
+            })?;
+            for (hash, schema) in &bundle.schemas {
+                let snapshot =
+                    distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
+                        StoreError::InvalidConfiguration {
+                            error: format!("cannot serialize verified schema {hash}: {error}"),
+                        }
                     })?;
-                    transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
-                }
-                if let Some(primary) = &bundle.primary {
-                    transaction.set_path_entry(
-                        &source.normalized_path,
-                        root,
-                        bundle.assets[primary].uuid,
-                    )?;
-                }
+                transaction.put_schema(*hash, &snapshot)?;
             }
-            for poison in candidate.bundle_poisons.values() {
-                if !publishable_changed_bundles.contains(&poison.bundle) {
-                    continue;
-                }
-                let root = *root_ids
-                    .entry(poison.root_name.clone())
-                    .or_insert(transaction.intern_root(&poison.root_name)?);
-                transaction.poison_bundle(
-                    &StoreNamespaceSkeleton {
-                        bundle: poison.bundle,
-                        root,
-                        path: poison.normalized_path.clone(),
-                        format_version: poison.format_version,
-                        content_hash: poison.content_hash,
-                        entries: poison.entries.clone(),
-                    },
-                    &poison.message,
+            for (local_id, entry) in &bundle.assets {
+                transaction.upsert_asset(&AssetRecord {
+                    asset: entry.uuid,
+                    bundle: bundle.uuid,
+                    local_id: local_id.clone(),
+                    type_uuid: entry.type_uuid,
+                    logical_hash: entry.schema_hash,
+                    authoring_only: entry.authoring_only,
+                    tags: BTreeMap::new(),
+                    served: Some(served_authoring(entry, projection)?),
+                })?;
+                transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
+            }
+            if let Some(primary) = &bundle.primary {
+                transaction.set_path_entry(
+                    &source.normalized_path,
+                    root,
+                    bundle.assets[primary].uuid,
                 )?;
             }
+        }
+        for poison in candidate.bundle_poisons.values() {
+            if !publishable_changed_bundles.contains(&poison.bundle) {
+                continue;
+            }
+            let root = *root_ids
+                .entry(poison.root_name.clone())
+                .or_insert(transaction.intern_root(&poison.root_name)?);
+            transaction.poison_bundle(
+                &StoreNamespaceSkeleton {
+                    bundle: poison.bundle,
+                    root,
+                    path: poison.normalized_path.clone(),
+                    format_version: poison.format_version,
+                    content_hash: poison.content_hash,
+                    entries: poison.entries.clone(),
+                },
+                &poison.message,
+            )?;
         }
         for rename in &candidate.renames {
             let root = *root_ids
@@ -3593,7 +3755,7 @@ fn publish_incremental_scan(
             observation,
             schema_transition,
         )?;
-        transaction.set_version_poisons(plan.version_poison.clone())?;
+        transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
         match &plan.configuration {
             ConfigurationStatus::Ready => {
                 transaction.publish_configuration_ready(configuration_generation)?;
@@ -3631,88 +3793,86 @@ fn publish_incremental_scan(
         } else if schema_transition.is_none() {
             healed_retired = transaction.clear_retired_type_referenced()?;
         }
-        if plan.version_poison.is_none() {
-            for bundle_uuid in &changed_bundles {
-                transaction.remove_bundle(*bundle_uuid)?;
-                let Some(source) = &plan.bundles[bundle_uuid] else {
-                    continue;
-                };
-                if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
-                    let root = *root_ids
-                        .entry(poison.root_name.clone())
-                        .or_insert(transaction.intern_root(&poison.root_name)?);
-                    transaction.poison_bundle(
-                        &StoreNamespaceSkeleton {
-                            bundle: poison.bundle,
-                            root,
-                            path: poison.normalized_path.clone(),
-                            format_version: poison.format_version,
-                            content_hash: poison.content_hash,
-                            entries: poison.entries.clone(),
-                        },
-                        &poison.message,
-                    )?;
-                    continue;
-                }
-                let bundle = source
-                    .parsed
-                    .as_ref()
-                    .expect("indexed current bundle parsed successfully");
-                let summary = bundle_summary(source)?;
+        for bundle_uuid in &changed_bundles {
+            transaction.remove_bundle(*bundle_uuid)?;
+            let Some(source) = &plan.bundles[bundle_uuid] else {
+                continue;
+            };
+            if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
                 let root = *root_ids
-                    .entry(source.root_name.clone())
-                    .or_insert(transaction.intern_root(&source.root_name)?);
-                transaction.upsert_bundle(&BundleMeta {
-                    bundle: bundle.uuid,
-                    root,
-                    path: source.normalized_path.clone(),
-                    format_version: bundle.format_version,
-                    content_hash: ContentHash(source.file_hash.0),
-                    origin: summary.origin,
-                })?;
-                for (hash, schema) in &bundle.schemas {
-                    let snapshot =
-                        distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-                            StoreError::InvalidConfiguration {
-                                error: format!("cannot serialize verified schema {hash}: {error}"),
-                            }
-                        })?;
-                    transaction.put_schema(*hash, &snapshot)?;
-                }
-                for (local_id, entry) in &bundle.assets {
-                    transaction.upsert_asset(&AssetRecord {
-                        asset: entry.uuid,
-                        bundle: bundle.uuid,
-                        local_id: local_id.clone(),
-                        type_uuid: entry.type_uuid,
-                        logical_hash: entry.schema_hash,
-                        authoring_only: entry.authoring_only,
-                        tags: BTreeMap::new(),
-                        served: Some(served_authoring(entry, projection)?),
-                    })?;
-                    transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
-                }
-                if let Some(primary) = &bundle.primary {
-                    transaction.set_path_entry(
-                        &source.normalized_path,
+                    .entry(poison.root_name.clone())
+                    .or_insert(transaction.intern_root(&poison.root_name)?);
+                transaction.poison_bundle(
+                    &StoreNamespaceSkeleton {
+                        bundle: poison.bundle,
                         root,
-                        bundle.assets[primary].uuid,
-                    )?;
-                }
+                        path: poison.normalized_path.clone(),
+                        format_version: poison.format_version,
+                        content_hash: poison.content_hash,
+                        entries: poison.entries.clone(),
+                    },
+                    &poison.message,
+                )?;
+                continue;
             }
-            for (child, current) in &plan.derived_outputs {
-                match current {
-                    Some(entry) => {
-                        transaction.set_derived_output(
-                            *child,
-                            entry.parent,
-                            &entry.output_key,
-                            entry.terminal_type,
-                        )?
-                    }
-                    None => {
-                        transaction.remove_derived_output(*child)?;
-                    }
+            let bundle = source
+                .parsed
+                .as_ref()
+                .expect("indexed current bundle parsed successfully");
+            let summary = bundle_summary(source)?;
+            let root = *root_ids
+                .entry(source.root_name.clone())
+                .or_insert(transaction.intern_root(&source.root_name)?);
+            transaction.upsert_bundle(&BundleMeta {
+                bundle: bundle.uuid,
+                root,
+                path: source.normalized_path.clone(),
+                format_version: bundle.format_version,
+                content_hash: ContentHash(source.file_hash.0),
+                origin: summary.origin,
+            })?;
+            for (hash, schema) in &bundle.schemas {
+                let snapshot =
+                    distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
+                        StoreError::InvalidConfiguration {
+                            error: format!("cannot serialize verified schema {hash}: {error}"),
+                        }
+                    })?;
+                transaction.put_schema(*hash, &snapshot)?;
+            }
+            for (local_id, entry) in &bundle.assets {
+                transaction.upsert_asset(&AssetRecord {
+                    asset: entry.uuid,
+                    bundle: bundle.uuid,
+                    local_id: local_id.clone(),
+                    type_uuid: entry.type_uuid,
+                    logical_hash: entry.schema_hash,
+                    authoring_only: entry.authoring_only,
+                    tags: BTreeMap::new(),
+                    served: Some(served_authoring(entry, projection)?),
+                })?;
+                transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
+            }
+            if let Some(primary) = &bundle.primary {
+                transaction.set_path_entry(
+                    &source.normalized_path,
+                    root,
+                    bundle.assets[primary].uuid,
+                )?;
+            }
+        }
+        for (child, current) in &plan.derived_outputs {
+            match current {
+                Some(entry) => {
+                    transaction.set_derived_output(
+                        *child,
+                        entry.parent,
+                        &entry.output_key,
+                        entry.terminal_type,
+                    )?
+                }
+                None => {
+                    transaction.remove_derived_output(*child)?;
                 }
             }
         }
@@ -3722,9 +3882,7 @@ fn publish_incremental_scan(
                 .or_insert(transaction.intern_root(&rename.root_name)?);
             transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
         }
-        if plan.version_poison.is_none() {
-            transaction.clear_pending_claims()?;
-        }
+        transaction.clear_pending_claims()?;
         Ok(commit)
     })?;
     if healed_retired {
@@ -3797,7 +3955,7 @@ fn prepare_incremental_publication(
     let mut commit = Commit {
         configuration: Some(plan.configuration.clone()),
         pipeline: Some(pipeline_diagnostic(stored_pipeline)),
-        version_poison: Some(plan.version_poison.clone()),
+        namespace_errors: Some(plan.namespace_errors.clone()),
         lineage_repair: Some(plan.lineage_repair.clone()),
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
@@ -3875,121 +4033,146 @@ fn prepare_incremental_publication(
         .map(|path| Ok((path.clone(), store.path_assets(path)?)))
         .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
     let mut changed_bundles = BTreeSet::new();
-    if plan.version_poison.is_none() {
-        for (bundle_uuid, source) in &plan.bundles {
-            if waiting
+    for (bundle_uuid, source) in &plan.bundles {
+        if waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.bundles.contains(bundle_uuid))
+        {
+            continue;
+        }
+        let old = &durable_bundles[bundle_uuid];
+        let current_summary = if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
+            Some(BundleSummary {
+                root_name: poison.root_name.clone(),
+                path: poison.normalized_path.clone(),
+                format_version: poison.format_version,
+                content_hash: poison.content_hash,
+                origin: None,
+            })
+        } else {
+            source
                 .as_ref()
-                .is_some_and(|waiting| waiting.bundles.contains(bundle_uuid))
-            {
-                continue;
-            }
-            let old = &durable_bundles[bundle_uuid];
-            let current_summary = if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
-                Some(BundleSummary {
-                    root_name: poison.root_name.clone(),
-                    path: poison.normalized_path.clone(),
-                    format_version: poison.format_version,
-                    content_hash: poison.content_hash,
-                    origin: None,
-                })
-            } else {
-                source
-                    .as_ref()
-                    .map(|source| bundle_summary(source))
-                    .transpose()?
-            };
-            if old.summary == current_summary {
-                continue;
-            }
-            changed_bundles.insert(*bundle_uuid);
-            let mut current_assets = BTreeSet::new();
-            if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
-                for entry in &poison.entries {
-                    current_assets.insert(entry.asset);
-                    commit.assets.push(AssetMutation::Set {
-                        uuid: entry.asset,
-                        resolution: StoredResolve::Failed {
-                            error: poison.message.clone(),
-                        },
-                        delta: AssetDeltaState::Changed,
-                    });
-                    commit
-                        .tag_poisons
-                        .as_mut()
-                        .expect("incremental scan initializes tag poisons")
-                        .insert(entry.asset, poison.bundle);
-                    if old.assets.contains(&entry.asset) {
-                        commit
-                            .authoring
-                            .push(AuthoringMutation::Remove { uuid: entry.asset });
-                    }
-                }
-            } else if let Some(source) = source {
-                let bundle = source
-                    .parsed
-                    .as_ref()
-                    .expect("indexed current bundle parsed successfully");
-                for (local_id, entry) in &bundle.assets {
-                    current_assets.insert(entry.uuid);
-                    commit.assets.push(AssetMutation::Set {
-                        uuid: entry.uuid,
-                        resolution: StoredResolve::Drifted {
-                            input: DriftedInput::Asset(entry.uuid),
-                        },
-                        delta: AssetDeltaState::Changed,
-                    });
-                    commit.authoring.push(AuthoringMutation::Set(rpc_entry(
-                        source.normalized_path.clone(),
-                        bundle,
-                        local_id,
-                        entry,
-                        projection.interface(entry.type_uuid).terminal,
-                    )?));
-                }
-            }
-            for asset in old.assets.difference(&current_assets) {
+                .map(|source| bundle_summary(source))
+                .transpose()?
+        };
+        let published_assets = match (plan.bundle_poisons.get(bundle_uuid), source) {
+            (Some(poison), _) => poison.entries.iter().map(|entry| entry.asset).collect(),
+            (None, Some(source)) => source
+                .parsed
+                .as_ref()
+                .map(|bundle| bundle.assets.values().map(|entry| entry.uuid).collect())
+                .unwrap_or_default(),
+            (None, None) => BTreeSet::new(),
+        };
+        if old.summary == current_summary && old.assets == published_assets {
+            continue;
+        }
+        changed_bundles.insert(*bundle_uuid);
+        // A withheld asset is not deleted: it resolves to its error.
+        let mut current_assets = old
+            .assets
+            .iter()
+            .filter(|asset| plan.withheld.asset(asset))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
+            for entry in &poison.entries {
+                current_assets.insert(entry.asset);
                 commit.assets.push(AssetMutation::Set {
-                    uuid: *asset,
-                    resolution: StoredResolve::Deleted,
-                    delta: AssetDeltaState::Deleted,
+                    uuid: entry.asset,
+                    resolution: StoredResolve::Failed {
+                        error: poison.message.clone(),
+                    },
+                    delta: AssetDeltaState::Changed,
                 });
                 commit
-                    .authoring
-                    .push(AuthoringMutation::Remove { uuid: *asset });
+                    .tag_poisons
+                    .as_mut()
+                    .expect("incremental scan initializes tag poisons")
+                    .insert(entry.asset, poison.bundle);
+                if old.assets.contains(&entry.asset) {
+                    commit
+                        .authoring
+                        .push(AuthoringMutation::Remove { uuid: entry.asset });
+                }
+            }
+        } else if let Some(source) = source {
+            let bundle = source
+                .parsed
+                .as_ref()
+                .expect("indexed current bundle parsed successfully");
+            for (local_id, entry) in &bundle.assets {
+                current_assets.insert(entry.uuid);
+                commit.assets.push(AssetMutation::Set {
+                    uuid: entry.uuid,
+                    resolution: StoredResolve::Drifted {
+                        input: DriftedInput::Asset(entry.uuid),
+                    },
+                    delta: AssetDeltaState::Changed,
+                });
+                commit.authoring.push(AuthoringMutation::Set(rpc_entry(
+                    source.normalized_path.clone(),
+                    bundle,
+                    local_id,
+                    entry,
+                    projection.interface(entry.type_uuid).terminal,
+                )?));
             }
         }
-        append_path_mutations(&mut commit, &path_projections, &old_paths, waiting.as_ref());
-        for (child, current) in &plan.derived_outputs {
-            let old = old_derived[child].as_ref();
-            if waiting.as_ref().is_some_and(|waiting| {
-                current
-                    .as_ref()
-                    .is_some_and(|entry| waiting.assets.contains(&entry.parent))
-                    || old.is_some_and(|(parent, _)| waiting.assets.contains(parent))
-            }) {
-                continue;
+        for asset in old.assets.difference(&current_assets) {
+            commit.assets.push(AssetMutation::Set {
+                uuid: *asset,
+                resolution: StoredResolve::Deleted,
+                delta: AssetDeltaState::Deleted,
+            });
+            commit
+                .authoring
+                .push(AuthoringMutation::Remove { uuid: *asset });
+        }
+    }
+    append_path_mutations(&mut commit, &path_projections, &old_paths, waiting.as_ref());
+    for (child, current) in &plan.derived_outputs {
+        let old = old_derived[child].as_ref();
+        if waiting.as_ref().is_some_and(|waiting| {
+            current
+                .as_ref()
+                .is_some_and(|entry| waiting.assets.contains(&entry.parent))
+                || old.is_some_and(|(parent, _)| waiting.assets.contains(parent))
+        }) {
+            continue;
+        }
+        let unchanged = match (old, current) {
+            (None, None) => true,
+            (Some((parent, key)), Some(entry)) => {
+                parent == &entry.parent && key == &entry.output_key
             }
-            let unchanged = match (old, current) {
-                (None, None) => true,
-                (Some((parent, key)), Some(entry)) => {
-                    parent == &entry.parent && key == &entry.output_key
-                }
-                _ => false,
-            };
-            if unchanged {
-                continue;
-            }
-            match current {
-                Some(entry) => commit
-                    .derived_output_mutations
-                    .push(DerivedOutputMutation::Set {
-                        child: *child,
-                        entry: entry.clone(),
-                    }),
-                None => commit
-                    .derived_output_mutations
-                    .push(DerivedOutputMutation::Remove { child: *child }),
-            }
+            _ => false,
+        };
+        if unchanged {
+            continue;
+        }
+        match current {
+            Some(entry) => commit
+                .derived_output_mutations
+                .push(DerivedOutputMutation::Set {
+                    child: *child,
+                    entry: entry.clone(),
+                }),
+            None => commit
+                .derived_output_mutations
+                .push(DerivedOutputMutation::Remove { child: *child }),
+        }
+    }
+    for (asset, error) in plan.withheld.newly_failed(store)? {
+        commit.assets.push(AssetMutation::Set {
+            uuid: asset,
+            resolution: StoredResolve::Failed { error },
+            delta: AssetDeltaState::Changed,
+        });
+        if store.served_entry_meta(asset)?.is_some() {
+            commit
+                .authoring
+                .push(AuthoringMutation::Remove { uuid: asset });
         }
     }
     Ok(IncrementalPublication {
@@ -4144,7 +4327,7 @@ fn publish_incremental_paths_with_schema_transition(
             scanner,
             destination: lineage_destination.clone(),
             configuration_poison: coordinator.configuration_poison(),
-            version_poison: None,
+            namespace_errors: Vec::new(),
             authority: authority.as_deref(),
             fresh: fresh_bundles(&delta),
         };
@@ -4243,8 +4426,12 @@ fn commit_affected_asset_bundles(commit: &Commit) -> BTreeMap<AssetUuid, Option<
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rpc_commit(
     candidate: &ScanCandidate,
+    published: &[Arc<ScannedBundle>],
+    withheld: &Withheld,
+    newly_failed: &BTreeMap<AssetUuid, String>,
     old_asset_bundles: &BTreeMap<AssetUuid, BundleUuid>,
     old_paths: &[(String, distill_store::files::RootId, AssetUuid)],
     projection: &PipelineProjection,
@@ -4255,20 +4442,33 @@ fn rpc_commit(
     let mut commit = Commit {
         configuration: Some(candidate.configuration.clone()),
         pipeline: Some(PipelineDiagnostic::Ready),
-        version_poison: Some(candidate.version_poison.clone()),
+        namespace_errors: Some(candidate.namespace_errors.clone()),
         lineage_repair: Some(candidate.lineage_repair.clone()),
         derived_outputs: Some(derived_outputs),
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
-    if candidate.version_poison.is_some() {
-        return Ok(commit);
-    }
 
+    // A withheld asset is not deleted: it resolves to its error.
     let mut current_assets = old_asset_bundles
         .iter()
         .filter_map(|(asset, bundle)| waiting_bundles.contains(bundle).then_some(*asset))
+        .chain(withheld.assets.keys().copied())
         .collect::<BTreeSet<_>>();
+    for (asset, error) in newly_failed {
+        commit.assets.push(AssetMutation::Set {
+            uuid: *asset,
+            resolution: StoredResolve::Failed {
+                error: error.clone(),
+            },
+            delta: AssetDeltaState::Changed,
+        });
+        if old_asset_bundles.contains_key(asset) {
+            commit
+                .authoring
+                .push(AuthoringMutation::Remove { uuid: *asset });
+        }
+    }
     let mut paths = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
     for (path, _, asset) in old_paths {
         if old_asset_bundles
@@ -4278,7 +4478,7 @@ fn rpc_commit(
             paths.entry(path.clone()).or_default().insert(*asset);
         }
     }
-    for source in candidate.scan.bundle_rows() {
+    for source in published {
         let Ok(bundle) = &source.parsed else {
             continue;
         };

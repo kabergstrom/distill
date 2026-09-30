@@ -97,12 +97,12 @@ fn a_failed_input_transaction_publishes_nothing() {
     let err = store
         .input_transaction::<(), _>(|txn| {
             txn.set_clean_watermark(123)?;
-            Err(StoreError::Poisoned {
+            Err(StoreError::InvalidConfiguration {
                 error: "boom".to_owned(),
             })
         })
         .unwrap_err();
-    assert!(matches!(err, StoreError::Poisoned { .. }));
+    assert!(matches!(err, StoreError::InvalidConfiguration { .. }));
     assert_eq!(store.input_version().0, 0, "the version was never advanced");
     assert_eq!(
         store.clean_watermark().unwrap(),

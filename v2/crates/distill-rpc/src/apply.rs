@@ -130,8 +130,8 @@ fn apply<W: ServedWrite>(
     namespace: impl FnOnce(&mut W) -> Result<(), ApplyError>,
 ) -> Result<(), ApplyError> {
     validate_commit(commit)?;
-    if let Some(Some(poison)) = &commit.version_poison {
-        poison
+    for error in commit.namespace_errors.iter().flatten() {
+        error
             .validate()
             .map_err(|error| AdminError::InvalidVersionPoison { error })?;
     }
@@ -336,8 +336,8 @@ fn write_namespace(txn: &mut InputTxn<'_>, commit: &Commit) -> Result<(), ApplyE
         }
         None => {}
     }
-    if let Some(poison) = &commit.version_poison {
-        txn.set_version_poison(poison.as_ref())?;
+    if let Some(errors) = &commit.namespace_errors {
+        txn.set_namespace_errors(errors.iter().cloned())?;
     }
     Ok(())
 }

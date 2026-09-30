@@ -858,7 +858,7 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
             let stamp = server
                 .commit(Commit {
                     configuration: Some(ConfigurationStatus::Poisoned(poison.clone())),
-                    version_poison: Some(Some(version_poison.clone())),
+                    namespace_errors: Some(vec![version_poison.clone()]),
                     ..Commit::default()
                 })
                 .unwrap();
@@ -921,14 +921,12 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
                 }
                 _ => panic!("expected poisoned diagnostics"),
             }
-            match diagnostics.get_version_poison().unwrap().which().unwrap() {
-                schema::version_poison_diagnostic::Which::Poisoned(value) => {
-                    let value = value.unwrap();
-                    assert_eq!(value.get_code(), version_poison.code as u16);
-                    assert_eq!(value.get_identity().unwrap(), version_poison.identity);
-                }
-                _ => panic!("expected version poison diagnostics"),
-            }
+            let errors = diagnostics.get_namespace_errors().unwrap();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(
+                distill_rpc::capnp_transport::decode_version_poison(errors.get(0)).unwrap(),
+                version_poison
+            );
             let mut query = snapshot.query_request();
             {
                 let mut q = query.get().init_q();
@@ -947,14 +945,10 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
                 .which()
                 .unwrap()
             {
-                schema::metadata_uuid_list_call::Which::VersionPoisoned(value) => {
-                    assert_eq!(
-                        distill_rpc::capnp_transport::decode_version_poison(value.unwrap())
-                            .unwrap(),
-                        version_poison
-                    );
+                schema::metadata_uuid_list_call::Which::Success(value) => {
+                    assert!(value.unwrap().is_empty());
                 }
-                _ => panic!("namespace query must carry the exact version poison"),
+                _ => panic!("a namespace error does not gate the namespace query"),
             }
             let mut noncanonical = snapshot.query_request();
             {

@@ -62,7 +62,7 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
             txn.replace_source_claims(None, &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)])
         })
         .unwrap();
-    let poison = store.claims_version_poison().unwrap().unwrap();
+    let [poison] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
     let VersionPoisonV1::DuplicateBundleUuid { bundle, sources } = poison.detail else {
         panic!("expected a bundle collision, got {poison:?}");
     };
@@ -76,7 +76,7 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
             txn.replace_source_claims(Some(&under("b.bundle")), &[source("b.bundle", 2, 20)])
         })
         .unwrap();
-    assert_eq!(store.claims_version_poison().unwrap(), None);
+    assert!(store.claims_namespace_errors().unwrap().is_empty());
     let pending = store.pending_claims().unwrap();
     assert_eq!(
         pending.bundles.into_iter().collect::<Vec<_>>(),
@@ -122,7 +122,7 @@ fn an_asset_uuid_authored_twice_collides() {
             txn.replace_source_claims(Some(&under("b.bundle")), &[source("b.bundle", 2, 10)])
         })
         .unwrap();
-    let poison = store.claims_version_poison().unwrap().unwrap();
+    let [poison] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
     assert!(
         matches!(
             &poison.detail,
@@ -134,10 +134,20 @@ fn an_asset_uuid_authored_twice_collides() {
     // Both sources derive the same child from the same parent: one claimant.
     assert_eq!(store.derived_output_claims(AssetUuid([110; 16])).unwrap().len(), 1);
 
+    // The collision ending makes the survivor's bundle pending, though its
+    // own claims did not change: it publishes the asset again.
     store
-        .input_transaction(|txn| txn.replace_source_claims(Some(&under("b.bundle")), &[]))
+        .input_transaction(|txn| {
+            txn.clear_pending_claims()?;
+            txn.replace_source_claims(Some(&under("b.bundle")), &[])
+        })
         .unwrap();
-    assert_eq!(store.claims_version_poison().unwrap(), None);
+    assert!(store.claims_namespace_errors().unwrap().is_empty());
+    assert!(store
+        .pending_claims()
+        .unwrap()
+        .bundles
+        .contains(&BundleUuid([1; 16])));
     assert!(store.bundle_claim_sources(BundleUuid([2; 16])).unwrap().is_empty());
 }
 

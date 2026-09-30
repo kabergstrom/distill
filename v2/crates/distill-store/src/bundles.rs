@@ -22,10 +22,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use rusqlite::OptionalExtension;
 
-use crate::db::{meta_get_blob, meta_set_blob, InputTxn, Store, StoreReader};
+use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::files::RootId;
-use crate::state::{InputVersion, VersionPoison};
+use crate::state::InputVersion;
 
 /// One `bundles` row (§13): the physical key, matching `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,9 +404,8 @@ impl InputTxn<'_> {
     /// UUIDs, so resolves against them (old and newly introduced alike)
     /// return the stable `Failed`, and queries whose selectors match the
     /// skeleton's entries fail naming this bundle. A caller that could
-    /// not extract the complete skeleton publishes
-    /// [`InputTxn::set_version_poison`] instead — regardless of what
-    /// prior rows exist.
+    /// not extract the complete skeleton publishes a file-scoped
+    /// namespace error instead ([`InputTxn::set_namespace_errors`]).
     pub fn poison_bundle(
         &mut self,
         skeleton: &NamespaceSkeleton,
@@ -457,36 +456,6 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    /// Set or clear §7/§13's version-global poison.
-    pub fn set_version_poison(&mut self, poison: Option<&VersionPoison>) -> Result<(), StoreError> {
-        match poison {
-            Some(poison) => meta_set_blob(
-                &self.txn,
-                "version_poison",
-                &poison
-                    .persisted_bytes()
-                    .map_err(StoreError::InvalidVersionPoison)?,
-            ),
-            None => {
-                self.txn
-                    .execute("DELETE FROM store_meta WHERE key = 'version_poison'", [])?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Scanner publication boundary for simultaneous version-global defects.
-    /// The full canonical set is returned for doctor diagnostics; only its
-    /// deterministic first row becomes namespace authority.
-    pub fn set_version_poisons(
-        &mut self,
-        poisons: impl IntoIterator<Item = VersionPoison>,
-    ) -> Result<Vec<VersionPoison>, StoreError> {
-        let canonical =
-            VersionPoison::canonical_set(poisons).map_err(StoreError::InvalidVersionPoison)?;
-        self.set_version_poison(canonical.first())?;
-        Ok(canonical)
-    }
 }
 
 impl Store {
@@ -569,15 +538,6 @@ impl Store {
 }
 
 impl StoreReader {
-    fn check_version_poison(&self) -> Result<(), StoreError> {
-        if let Some(poison) = self.version_poison()? {
-            return Err(StoreError::Poisoned {
-                error: poison.message,
-            });
-        }
-        Ok(())
-    }
-
     pub fn tag_index_state(&self, asset: AssetUuid) -> Result<Option<TagIndexState>, StoreError> {
         Ok(self
             .conn
@@ -613,17 +573,6 @@ impl StoreReader {
         rows.map(|row| row.map(|bytes| BundleUuid(blob16(bytes))))
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
-    }
-
-    /// The current version's global poison, if any (§13's
-    /// `MetadataSnapshot::poisoned`).
-    pub fn version_poison(&self) -> Result<Option<VersionPoison>, StoreError> {
-        meta_get_blob(&self.conn, "version_poison")?
-            .map(|bytes| {
-                VersionPoison::from_persisted_bytes(&bytes)
-                    .map_err(StoreError::InvalidVersionPoison)
-            })
-            .transpose()
     }
 
     /// The bundle row at (root name, path), if any.
@@ -848,7 +797,6 @@ impl StoreReader {
     /// recordable miss; a poisoned version or a poisoned owning bundle is
     /// `Err`, never last-good metadata.
     pub fn entry(&self, asset: AssetUuid) -> Result<Option<EntryMeta>, StoreError> {
-        self.check_version_poison()?;
         let row = self
             .conn
             .query_row(
@@ -923,7 +871,6 @@ impl StoreReader {
     /// recordable miss; a path resolvable in more than one asset root is
     /// `Err` (§18), never a tiebreak; version poison is `Err`.
     pub fn resolve_path(&self, path: &str) -> Result<Option<AssetUuid>, StoreError> {
-        self.check_version_poison()?;
         // A poisoned bundle's own path fails naming it (§13): the poison
         // row replaced the file's asset rows, and a Missing here would
         // silently change query semantics.
@@ -1001,7 +948,6 @@ impl StoreReader {
         tag: &str,
         value: Option<&str>,
     ) -> Result<Vec<AssetUuid>, StoreError> {
-        self.check_version_poison()?;
         let poisoned = self.tag_poisoned_bundles(false)?;
         if !poisoned.is_empty() {
             return Err(StoreError::TagIndexPoisoned { bundles: poisoned });
@@ -1042,7 +988,6 @@ impl StoreReader {
         tag: &str,
         value: Option<&str>,
     ) -> Result<Vec<AssetUuid>, StoreError> {
-        self.check_version_poison()?;
         let poisoned = self.tag_poisoned_bundles(true)?;
         if !poisoned.is_empty() {
             return Err(StoreError::TagIndexPoisoned { bundles: poisoned });

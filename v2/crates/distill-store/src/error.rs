@@ -25,10 +25,6 @@ pub enum StoreError {
     /// version. Daemon state is disposable (§2): the caller's move is
     /// `Store::recreate`, never a silent adopt.
     SchemaVersionMismatch { found: u32, supported: u32 },
-    /// §7/§13's version-global poison: the current version advanced
-    /// carrying an identity-validation failure, and every
-    /// namespace-facing operation fails with this same error.
-    Poisoned { error: String },
     /// A served-state publication failed validation inside its
     /// transaction, which rolled back.
     Rejected { detail: String },
@@ -246,7 +242,6 @@ impl fmt::Display for StoreError {
                 "metadata schema version {found} unsupported (this store supports {supported}); \
                  daemon state is disposable — recreate it"
             ),
-            StoreError::Poisoned { error } => write!(f, "version poison: {error}"),
             StoreError::Rejected { detail } => write!(f, "publication rejected: {detail}"),
             StoreError::InvalidVersionPoison(error) => error.fmt(f),
             StoreError::InvalidPipelinePoison(error) => error.fmt(f),
