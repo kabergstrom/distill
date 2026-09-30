@@ -28,7 +28,8 @@ use distill_rpc::{
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
-    AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton, SkeletonEntry,
+    AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton, ServedAuthoring,
+    SkeletonEntry,
 };
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileKind, FileState, PendingFileWork};
@@ -37,6 +38,7 @@ use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
     TypeAuthorityState, ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
+use distill_store::served::encode_authored_value;
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
     InputVersion, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
@@ -3487,7 +3489,12 @@ fn publish_scan(
         }
         if candidate.version_poison.is_none() && waiting.is_none() {
             for (child, output) in &derived_outputs {
-                transaction.set_derived_output(*child, output.parent, &output.output_key)?;
+                transaction.set_derived_output(
+                    *child,
+                    output.parent,
+                    &output.output_key,
+                    output.terminal_type,
+                )?;
             }
         }
 
@@ -3576,6 +3583,7 @@ fn publish_scan(
                         logical_hash: entry.schema_hash,
                         authoring_only: entry.authoring_only,
                         tags: BTreeMap::new(),
+                        served: Some(served_authoring(entry, projection)?),
                     })?;
                     transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
                 }
@@ -4153,6 +4161,7 @@ fn publish_incremental_scan(
                         logical_hash: entry.schema_hash,
                         authoring_only: entry.authoring_only,
                         tags: BTreeMap::new(),
+                        served: Some(served_authoring(entry, projection)?),
                     })?;
                     transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
                 }
@@ -4167,7 +4176,12 @@ fn publish_incremental_scan(
             for (child, current) in &plan.derived_outputs {
                 match current {
                     Some(entry) => {
-                        transaction.set_derived_output(*child, entry.parent, &entry.output_key)?
+                        transaction.set_derived_output(
+                            *child,
+                            entry.parent,
+                            &entry.output_key,
+                            entry.terminal_type,
+                        )?
                     }
                     None => {
                         transaction.remove_derived_output(*child)?;
@@ -4598,6 +4612,20 @@ fn rpc_entry(
         },
         tags: BTreeMap::new(),
         value,
+    })
+}
+
+/// The served authored value and terminal type an asset row carries (LOCKLESS.md
+/// §2.2): the same bytes the RPC authoring entry serves.
+fn served_authoring(
+    entry: &AssetEntry,
+    projection: &PipelineProjection,
+) -> Result<ServedAuthoring, StoreError> {
+    let value = split_authoring_value(&entry.data)?;
+    let blobs = value.blobs.iter().map(|blob| &blob[..]).collect::<Vec<_>>();
+    Ok(ServedAuthoring {
+        authored_value: encode_authored_value(&value.canonical_value, &blobs),
+        terminal_type: projection.interface(entry.type_uuid).terminal,
     })
 }
 

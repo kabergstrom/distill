@@ -72,7 +72,7 @@ fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
 fn declare_child(store: &mut Store, parent: AssetUuid, key: &str) -> AssetUuid {
     let child = AssetUuid::v5(parent, key);
     store
-        .input_transaction(|txn| txn.set_derived_output(child, parent, key))
+        .input_transaction(|txn| txn.set_derived_output(child, parent, key, distill_core::id::TypeUuid([0x51; 16])))
         .unwrap();
     child
 }
@@ -418,7 +418,7 @@ fn derived_output_namespace_replacement_is_atomic_and_complete() {
     store
         .input_transaction(|txn| {
             txn.clear_derived_outputs()?;
-            txn.set_derived_output(next, next_parent, "meshlets")
+            txn.set_derived_output(next, next_parent, "meshlets", distill_core::id::TypeUuid([0x51; 16]))
         })
         .unwrap();
     assert!(store.resolve_child(old).unwrap().is_none());

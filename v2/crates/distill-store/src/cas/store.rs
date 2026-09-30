@@ -347,6 +347,51 @@ impl Store {
         Ok(layout_hash)
     }
 
+    /// Store raw artifact bytes outside a build (embedded RPC stores and
+    /// explicit installs), indexed by their blake3 content hash, together
+    /// with the artifact's typed direct load edges. Idempotent.
+    pub fn put_artifact(
+        &mut self,
+        asset: AssetUuid,
+        bytes: &[u8],
+        load_edges: &[(AssetUuid, distill_core::id::TypeUuid)],
+    ) -> Result<ContentHash, StoreError> {
+        use crate::served::ServedWrite;
+        let hash = ContentHash(*blake3::hash(bytes).as_bytes());
+        if self.extent_of(&hash.0)?.is_none() {
+            let record = Record {
+                kind: RecordKind::ProcessorOutput,
+                asset_uuid: asset,
+                static_input_key: Vec::new(),
+                output_key: String::new(),
+                payload: bytes.to_vec(),
+            };
+            let encoded = encode_record(&record);
+            let locations = self.append_records(std::slice::from_ref(&encoded))?;
+            let (segment, offset) = locations[0];
+            let indexed_len = self
+                .segment_path(segment)
+                .metadata()
+                .map_err(io_err(&self.segment_path(segment)))?
+                .len();
+            let txn = self.read.conn.transaction()?;
+            upsert_extent(
+                &txn,
+                &hash.0,
+                segment,
+                offset + RECORD_HEADER_LEN as u64,
+                bytes.len() as u64,
+            )?;
+            txn.execute(
+                "UPDATE cas_segments SET indexed_len = ?2 WHERE segment_id = ?1",
+                rusqlite::params![segment as i64, indexed_len as i64],
+            )?;
+            txn.commit()?;
+        }
+        self.served_transaction(|txn| txn.record_artifact_load_edges(hash, load_edges))?;
+        Ok(hash)
+    }
+
     /// Commit one build result (§13): payloads first, the result record last,
     /// one fsync per touched segment in record order, then one memo transaction
     /// inserting the extent rows, the candidate-bucket row, and the verified
@@ -762,13 +807,20 @@ impl crate::db::InputTxn<'_> {
         child: AssetUuid,
         parent: AssetUuid,
         output_key: &str,
+        terminal_type: TypeUuid,
     ) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO derived_outputs(child_uuid, parent_uuid, output_key)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO derived_outputs(child_uuid, parent_uuid, output_key, terminal_type)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(child_uuid) DO UPDATE SET
-               parent_uuid = excluded.parent_uuid, output_key = excluded.output_key",
-            rusqlite::params![child.0.as_slice(), parent.0.as_slice(), output_key],
+               parent_uuid = excluded.parent_uuid, output_key = excluded.output_key,
+               terminal_type = excluded.terminal_type",
+            rusqlite::params![
+                child.0.as_slice(),
+                parent.0.as_slice(),
+                output_key,
+                terminal_type.0.as_slice()
+            ],
         )?;
         Ok(())
     }

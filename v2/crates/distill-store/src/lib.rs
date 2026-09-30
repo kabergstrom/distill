@@ -18,6 +18,7 @@ pub mod files;
 pub mod imports;
 pub mod journal;
 pub mod pipeline;
+pub mod served;
 pub mod state;
 
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};

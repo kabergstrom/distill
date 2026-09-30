@@ -98,6 +98,10 @@ fn every_section_13_table_exists() {
         "publication_group_children",
         "codegen_outputs",
         "watched_import_failures",
+        "asset_resolutions",
+        "change_log",
+        "rpc_targets",
+        "artifact_load_edges",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -200,7 +204,9 @@ fn assets_row_shape() {
             "local_id",
             "type_uuid",
             "authoring_only",
-            "logical_hash"
+            "logical_hash",
+            "authored_value",
+            "terminal_type"
         ]
     );
     assert_eq!(columns(&conn, "asset_tags"), ["asset_uuid", "tag", "value"]);
@@ -419,7 +425,7 @@ fn derived_output_namespace_and_assertions_are_separate_tables() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "derived_outputs"),
-        ["child_uuid", "parent_uuid", "output_key"]
+        ["child_uuid", "parent_uuid", "output_key", "terminal_type"]
     );
     assert_eq!(pk_columns(&conn, "derived_outputs"), ["child_uuid"]);
     assert_eq!(

@@ -1373,6 +1373,7 @@ mod tests {
                         logical_hash: LogicalHash(logical_hash.0),
                         authoring_only: false,
                         tags: BTreeMap::new(),
+                        served: None,
                     })?;
                     Ok(root)
                 })

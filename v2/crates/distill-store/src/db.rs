@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 27;
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -81,7 +81,12 @@ CREATE TABLE assets (
     -- NULL only for a poisoned bundle's skeleton rows (§7, §13): the
     -- schema closure may be exactly what failed, and no read path
     -- serves a skeleton row's metadata while the poison stands.
-    logical_hash BLOB
+    logical_hash BLOB,
+    -- The RPC-served authored value (canonical JSON + blob table, see
+    -- `served::encode_authored_value`) and terminal type. NULL for rows the
+    -- RPC namespace does not serve (skeleton rows, daemon-private rows).
+    authored_value BLOB,
+    terminal_type  BLOB
 );
 CREATE INDEX assets_by_bundle ON assets(bundle_uuid);
 CREATE TABLE asset_tags (
@@ -129,7 +134,8 @@ CREATE TABLE result_candidates (
 CREATE TABLE derived_outputs (
     child_uuid  BLOB NOT NULL PRIMARY KEY,
     parent_uuid BLOB NOT NULL,
-    output_key  TEXT NOT NULL
+    output_key  TEXT NOT NULL,
+    terminal_type BLOB
 );
 CREATE TABLE derived_assertions (
     child_uuid  BLOB NOT NULL,
@@ -309,6 +315,45 @@ CREATE TABLE watched_import_failures (
             AND terminal_code BETWEEN 1 AND 4294967295)
         OR (terminal_kind = 3 AND terminal_code IS NULL))
 );
+-- Served RPC state (LOCKLESS.md §2.2). Current-state only: a snapshot
+-- lease reads these inside its own read transaction.
+--
+-- Explicit resolutions. kind: 0 missing, 1 built, 2 drifted, 3 failed,
+-- 4 deleted. An asset with no row resolves Missing.
+CREATE TABLE asset_resolutions (
+    asset_uuid      BLOB NOT NULL PRIMARY KEY,
+    kind            INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 4),
+    content_hash    BLOB,
+    detail          BLOB,
+    deleted_version INTEGER
+);
+-- Publication deltas and fence events, read by every RPC front end after
+-- its cursor. Rows are trimmed by version; `change_log_oldest` in
+-- store_meta is the oldest cursor a subscriber may resume from.
+CREATE TABLE change_log (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    version    INTEGER NOT NULL,
+    kind       INTEGER NOT NULL,
+    asset_uuid BLOB,
+    state      INTEGER,
+    subject    TEXT,
+    detail     BLOB
+);
+CREATE INDEX change_log_by_version ON change_log(version);
+-- The RPC target set and each target's reconnect generation.
+CREATE TABLE rpc_targets (
+    name            TEXT NOT NULL PRIMARY KEY,
+    definition_hash BLOB NOT NULL,
+    generation      INTEGER NOT NULL
+);
+-- The one piece of artifact metadata the DSTL bytes do not carry: each
+-- direct load edge's expected terminal type. Written with the CAS index.
+CREATE TABLE artifact_load_edges (
+    content_hash      BLOB NOT NULL,
+    asset_uuid        BLOB NOT NULL,
+    expected_terminal BLOB NOT NULL,
+    PRIMARY KEY (content_hash, asset_uuid)
+);
 ";
 
 /// A read-only view of the store over one SQLite connection. Every thread
@@ -454,6 +499,32 @@ impl Store {
     /// Open a reader on the same state directory as this writer.
     pub fn reader(&self) -> Result<StoreReader, StoreError> {
         StoreReader::open(self.config.clone())
+    }
+
+    /// Give a fresh, never-published store a caller-chosen instance id and
+    /// starting input version. Embedded RPC stores use this so their stamps
+    /// match the identity their callers were built against; readers opened
+    /// afterwards see it.
+    pub fn adopt_embedded_identity(
+        &mut self,
+        instance: StoreInstanceId,
+        version: InputVersion,
+    ) -> Result<(), StoreError> {
+        let txn = self
+            .read
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if meta_get_u64(&txn, "input_version")?.unwrap_or(0) != 0 {
+            return Err(StoreError::InvalidConfiguration {
+                error: "only a never-published store can adopt an embedded identity".to_owned(),
+            });
+        }
+        meta_set_blob(&txn, "instance_id", &instance.0)?;
+        meta_set_u64(&txn, "input_version", version.0)?;
+        meta_set_u64(&txn, "change_log_oldest", version.0)?;
+        txn.commit()?;
+        self.read.instance_id = instance;
+        Ok(())
     }
 
     /// Wipe the daemon state and start over: state is disposable (§2).

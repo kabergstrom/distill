@@ -56,6 +56,7 @@ fn asset_record(asset_n: u8, bundle_n: u8, tags: &[&str]) -> AssetRecord {
         logical_hash: LogicalHash([8u8; 32]),
         authoring_only: false,
         tags: tags.iter().map(|tag| ((*tag).to_owned(), None)).collect(),
+        served: None,
     }
 }
 
