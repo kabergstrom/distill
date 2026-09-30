@@ -72,7 +72,7 @@ impl Store {
         if unreferenced.is_empty() {
             return Ok(0);
         }
-        let transaction = self.read.conn.transaction()?;
+        let transaction = self.read.conn.savepoint()?;
         for hash in &unreferenced {
             transaction.execute(
                 "DELETE FROM cas_extents WHERE content_hash = ?1",
@@ -92,7 +92,7 @@ impl Store {
         holder: &str,
         hashes: &[[u8; 32]],
     ) -> Result<(), StoreError> {
-        let txn = self.read.conn.transaction()?;
+        let txn = self.read.conn.savepoint()?;
         for hash in hashes {
             txn.execute(
                 "INSERT OR IGNORE INTO pins(kind, holder, content_hash) VALUES (?1, ?2, ?3)",
@@ -165,7 +165,7 @@ impl Store {
 
         // Delete phase: the pin check runs inside the same transaction
         // that deletes the index rows (§13).
-        let txn = self.read.conn.transaction()?;
+        let txn = self.read.conn.savepoint()?;
         for hash in &unit {
             let pinned: Option<i64> = txn
                 .query_row(
@@ -449,7 +449,7 @@ impl Store {
         )?;
 
         // One SQLite transaction flips the index.
-        let txn = self.read.conn.transaction()?;
+        let txn = self.read.conn.savepoint()?;
         txn.execute("DELETE FROM cas_segments", [])?;
         for seg in &new_segments {
             txn.execute(

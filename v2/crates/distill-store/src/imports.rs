@@ -193,7 +193,7 @@ impl Store {
         sources: Option<&[(String, String)]>,
         rows: &[ImportIndexSource],
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        let transaction = self.read.conn.savepoint()?;
         match sources {
             None => transaction.execute_batch(
                 "DELETE FROM import_reads; DELETE FROM import_records;

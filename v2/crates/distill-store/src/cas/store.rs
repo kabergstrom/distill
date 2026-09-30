@@ -331,7 +331,7 @@ impl Store {
             .metadata()
             .map_err(io_err(&self.segment_path(segment)))?
             .len();
-        let txn = self.read.conn.transaction()?;
+        let txn = self.read.conn.savepoint()?;
         upsert_extent(
             &txn,
             &layout_hash.0,
@@ -374,7 +374,7 @@ impl Store {
                 .metadata()
                 .map_err(io_err(&self.segment_path(segment)))?
                 .len();
-            let txn = self.read.conn.transaction()?;
+            let txn = self.read.conn.savepoint()?;
             upsert_extent(
                 &txn,
                 &hash.0,

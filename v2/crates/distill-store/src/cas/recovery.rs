@@ -104,7 +104,7 @@ impl Store {
         let indexed_generation = meta_get_u64(&self.conn, "cas_generation")?.unwrap_or(0);
         if indexed_generation != self.cas.generation {
             report.rebuilt_index = true;
-            let txn = self.read.conn.transaction()?;
+            let txn = self.read.conn.savepoint()?;
             txn.execute("DELETE FROM cas_extents", [])?;
             txn.execute("DELETE FROM result_candidates", [])?;
             txn.execute("DELETE FROM derived_assertions", [])?;
@@ -198,7 +198,7 @@ impl Store {
         }
         if rebuild_for_cursor_drift {
             report.rebuilt_index = true;
-            let transaction = self.read.conn.transaction()?;
+            let transaction = self.read.conn.savepoint()?;
             transaction.execute("DELETE FROM cas_extents", [])?;
             transaction.execute("DELETE FROM result_candidates", [])?;
             transaction.execute("DELETE FROM derived_assertions", [])?;
@@ -294,7 +294,7 @@ impl Store {
             .count();
 
         let mut memo_counter = self.memo_seq().0;
-        let transaction = self.read.conn.transaction()?;
+        let transaction = self.read.conn.savepoint()?;
         for (hash, index) in &last_payload {
             if !covered.contains(hash) {
                 continue;

@@ -221,7 +221,7 @@ impl Store {
             )
             .map_err(persistence)? as u64;
         let generation = active.max(prior) + 1;
-        let txn = self.read.conn.transaction().map_err(persistence)?;
+        let txn = self.read.conn.savepoint().map_err(persistence)?;
         txn.execute("DELETE FROM pending_restart", [])
             .map_err(persistence)?;
         for (key, value) in &rows {

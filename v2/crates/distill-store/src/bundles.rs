@@ -511,7 +511,7 @@ impl Store {
             });
         }
         let mut assets = BTreeSet::new();
-        let txn = self.read.conn.transaction()?;
+        let txn = self.read.conn.savepoint()?;
         for update in updates {
             if !assets.insert(update.asset) {
                 return Err(StoreError::InvalidConfiguration {

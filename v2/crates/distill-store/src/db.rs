@@ -517,6 +517,13 @@ impl std::fmt::Debug for StoreReader {
 pub struct Store {
     pub(crate) read: StoreReader,
     pub(crate) cas: crate::cas::store::CasInner,
+    open_input: Option<OpenInput>,
+}
+
+/// An input opened by [`Store::begin_input`].
+#[derive(Debug, Clone, Copy)]
+struct OpenInput {
+    base: InputVersion,
 }
 
 impl std::fmt::Debug for Store {
@@ -617,6 +624,7 @@ impl Store {
                 instance_id,
             },
             cas: Default::default(),
+            open_input: None,
         };
         store.init_cas()?;
         let recovery = store.recover_cas()?;
@@ -647,7 +655,7 @@ impl Store {
         let txn = self
             .read
             .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            .savepoint()?;
         if meta_get_u64(&txn, "input_version")?.unwrap_or(0) != 0 {
             return Err(StoreError::InvalidConfiguration {
                 error: "only a never-published store can adopt an embedded identity".to_owned(),
@@ -678,18 +686,66 @@ impl Store {
     /// transaction advancing the input version (§13). On any error the
     /// whole transaction rolls back and the version does not advance:
     /// readers only ever observe a complete input version.
+    ///
+    /// Inside an open input ([`Store::begin_input`]) this joins it: its
+    /// writes, and the version it names, commit with that input.
     pub fn input_transaction<T, F>(&mut self, f: F) -> Result<(T, InputVersion), StoreError>
+    where
+        F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
+    {
+        if self.open_input.is_some() {
+            return self.joined_input_transaction(f, true);
+        }
+        self.begin_input()?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.joined_input_transaction(f, true)
+        }));
+        match result {
+            Ok(Ok(out)) => {
+                self.finish_input(true)?;
+                Ok(out)
+            }
+            Ok(Err(error)) => {
+                self.finish_input(false)?;
+                Err(error)
+            }
+            Err(panic) => {
+                let _ = self.finish_input(false);
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    /// Run the same exact-basis validation surface as an input transaction,
+    /// then roll every database mutation back. Coordinators use this before a
+    /// journaled filesystem swap when the authoritative store transition is
+    /// intentionally checked a second time in the publishing transaction.
+    pub fn preview_input_transaction<T, F>(&mut self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
+    {
+        self.joined_input_transaction(f, false).map(|(out, _)| out)
+    }
+
+    /// `f` as a savepoint in the open input (or, with none open, in a
+    /// transaction of its own), kept only when `keep`.
+    fn joined_input_transaction<T, F>(
+        &mut self,
+        f: F,
+        keep: bool,
+    ) -> Result<(T, InputVersion), StoreError>
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
         let instance = self.instance_id();
         let config = Arc::clone(&self.config);
         let state_path = config.state_path.clone();
-        let txn = self
-            .read
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let base = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
+        let open = self.open_input;
+        let txn = self.read.conn.savepoint()?;
+        let base = match open {
+            Some(open) => open.base,
+            None => InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0)),
+        };
         let version = InputVersion(base.0 + 1);
         let mut input_txn = InputTxn {
             txn,
@@ -702,52 +758,84 @@ impl Store {
             config,
         };
         let out = f(&mut input_txn)?;
-        meta_set_u64(&input_txn.txn, "input_version", version.0)?;
-        input_txn.txn.commit()?;
+        if keep {
+            meta_set_u64(&input_txn.txn, "input_version", version.0)?;
+            input_txn.txn.commit()?;
+        }
         Ok((out, version))
     }
 
-    /// Run the same exact-basis validation surface as an input transaction,
-    /// then roll every database mutation back. Coordinators use this before a
-    /// journaled filesystem swap when the authoritative store transition is
-    /// intentionally checked a second time in the publishing transaction.
-    pub fn preview_input_transaction<T, F>(&mut self, f: F) -> Result<T, StoreError>
-    where
-        F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
-    {
-        let instance = self.instance_id();
-        let config = Arc::clone(&self.config);
-        let state_path = config.state_path.clone();
-        let txn = self
-            .read
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let base = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
-        let mut input_txn = InputTxn {
-            txn,
-            base_stamp: SnapshotStamp {
-                instance,
-                version: base,
-            },
-            version: InputVersion(base.0 + 1),
-            state_path,
-            config,
+    /// Open one input that the writes until [`Store::finish_input`] join:
+    /// input transactions, memo and served writes. Other connections see
+    /// none of it until it commits, as one version.
+    pub fn begin_input(&mut self) -> Result<(), StoreError> {
+        assert!(self.open_input.is_none(), "an input is already open");
+        self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let base = match meta_get_u64(&self.read.conn, "input_version") {
+            Ok(version) => InputVersion(version.unwrap_or(0)),
+            Err(error) => {
+                let _ = self.read.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
         };
-        let out = f(&mut input_txn)?;
-        input_txn.txn.rollback()?;
-        Ok(out)
+        self.open_input = Some(OpenInput { base });
+        Ok(())
+    }
+
+    /// Whether an input is open ([`Store::begin_input`]).
+    pub fn input_open(&self) -> bool {
+        self.open_input.is_some()
+    }
+
+    /// Commit (`keep`) or roll back the open input. Returns the version
+    /// the store is at afterwards.
+    pub fn finish_input(&mut self, keep: bool) -> Result<InputVersion, StoreError> {
+        let open = self.open_input.take().expect("an input is open");
+        if keep {
+            match self.read.conn.execute_batch("COMMIT") {
+                Ok(()) => return Ok(self.input_version()),
+                Err(error) => {
+                    let _ = self.read.conn.execute_batch("ROLLBACK");
+                    self.resync_cas_segments()?;
+                    return Err(error.into());
+                }
+            }
+        }
+        self.read.conn.execute_batch("ROLLBACK")?;
+        self.resync_cas_segments()?;
+        Ok(open.base)
+    }
+
+    /// Segments created inside a rolled-back input exist on disk and in the
+    /// manifest; restore their rows. Their unindexed bytes are dead space.
+    fn resync_cas_segments(&mut self) -> Result<(), StoreError> {
+        for segment in &self.cas.segments {
+            self.read.conn.execute(
+                "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(segment_id) DO NOTHING",
+                rusqlite::params![segment.id as i64, segment.name, segment.kind as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Writes that must be durable on their own (the publication journal,
+    /// ahead of the filesystem changes it records) cannot join an input.
+    pub(crate) fn assert_no_open_input(&self) {
+        assert!(
+            self.open_input.is_none(),
+            "a journal write cannot join an open input"
+        );
     }
 
     /// Attach memo state to an input basis without advancing any input
     /// version (§13): build results move only the memo sequence.
     pub(crate) fn memo_transaction<T, F>(&mut self, f: F) -> Result<(T, MemoSeq), StoreError>
     where
-        F: FnOnce(&rusqlite::Transaction<'_>, MemoSeq) -> Result<T, StoreError>,
+        F: FnOnce(&rusqlite::Savepoint<'_>, MemoSeq) -> Result<T, StoreError>,
     {
-        let txn = self
-            .read
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let txn = self.read.conn.savepoint()?;
         let seq = MemoSeq(meta_get_u64(&txn, "memo_seq")?.unwrap_or(0) + 1);
         let out = f(&txn, seq)?;
         meta_set_u64(&txn, "memo_seq", seq.0)?;
@@ -861,7 +949,7 @@ impl StoreReader {
 /// table writes through methods on this; dropping without commit rolls
 /// everything back.
 pub struct InputTxn<'a> {
-    pub(crate) txn: rusqlite::Transaction<'a>,
+    pub(crate) txn: rusqlite::Savepoint<'a>,
     base_stamp: SnapshotStamp,
     version: InputVersion,
     pub(crate) state_path: PathBuf,

@@ -244,7 +244,8 @@ impl Store {
                 detail: "a publication group requires at least one child intent".into(),
             });
         }
-        let txn = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let txn = self.read.conn.savepoint()?;
         txn.execute(
             "INSERT INTO publication_groups(kind, basis, state, retired) VALUES (?1, ?2, 0, 0)",
             rusqlite::params![kind as i64, basis],
@@ -303,7 +304,8 @@ impl Store {
     /// as an abandoned attempt in one durable transaction, including children
     /// such as deletions that do not have a proposal temp.
     pub fn abort_unarmed_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let transaction = self.read.conn.savepoint()?;
         let state: Option<(i64, i64)> = transaction
             .query_row(
                 "SELECT state, retired FROM publication_groups WHERE group_id = ?1",
@@ -337,7 +339,8 @@ impl Store {
     /// healed input version; retirement merely proves no filesystem work is
     /// left implicit.
     pub fn retire_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let transaction = self.read.conn.savepoint()?;
         let state: Option<i64> = transaction
             .query_row(
                 "SELECT state FROM publication_groups WHERE group_id = ?1 AND retired = 0",
@@ -1131,7 +1134,8 @@ impl Store {
                 });
             }
         };
-        let transaction = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let transaction = self.read.conn.savepoint()?;
         if let Some((path, collision_hash)) = reserved_collision {
             let collision_ordinal: u32 = transaction.query_row(
                 "SELECT COALESCE(MAX(CASE WHEN ordinal >= 2 THEN ordinal END) + 1, 2)
@@ -1217,7 +1221,8 @@ impl Store {
         replacement: &Path,
         collision_hash: ContentHash,
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let transaction = self.read.conn.savepoint()?;
         let updated = transaction.execute(
             "UPDATE displaced SET quarantine_path = ?4
              WHERE intent_id = ?1 AND ordinal = ?2 AND quarantine_path = ?3",
@@ -1270,7 +1275,8 @@ impl Store {
         actual: ContentHash,
         state: RenameAsideState,
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let transaction = self.read.conn.savepoint()?;
         let updated = transaction.execute(
             "UPDATE displaced SET content_hash = ?3
              WHERE intent_id = ?1 AND ordinal = ?2",
@@ -1316,7 +1322,8 @@ impl Store {
         state: RenameAsideState,
         restored: bool,
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        self.assert_no_open_input();
+        let transaction = self.read.conn.savepoint()?;
         if restored {
             transaction.execute(
                 "UPDATE displaced SET restored = 1

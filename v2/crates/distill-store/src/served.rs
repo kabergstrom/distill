@@ -1001,7 +1001,7 @@ impl ServedWrite for InputTxn<'_> {
 /// A transaction that changes only served state (fences, diagnostics,
 /// artifact edges) without publishing a new input version.
 pub struct ServedTxn<'a> {
-    txn: rusqlite::Transaction<'a>,
+    txn: rusqlite::Savepoint<'a>,
     version: InputVersion,
 }
 
@@ -1031,7 +1031,7 @@ impl crate::db::Store {
         let txn = self
             .read
             .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            .savepoint()?;
         let version = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
         let mut served = ServedTxn { txn, version };
         let out = f(&mut served)?;

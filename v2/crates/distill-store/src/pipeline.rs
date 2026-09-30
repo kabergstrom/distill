@@ -2176,7 +2176,7 @@ impl Store {
             ));
         }
 
-        let transaction = self.read.conn.transaction()?;
+        let transaction = self.read.conn.savepoint()?;
         let row: Option<(Option<Vec<u8>>, Option<i64>)> = transaction
             .query_row(
                 "SELECT dylib_hash, poison_code FROM pipeline_state WHERE id = 0",

@@ -351,7 +351,7 @@ impl Store {
         under: Option<&[(String, String)]>,
         diagnostics: &[ObservedDiagnostic],
     ) -> Result<(), StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        let transaction = self.read.conn.savepoint()?;
         clear_structure(&transaction, under, false)?;
         insert_diagnostics(&transaction, diagnostics)?;
         transaction.commit()?;
@@ -364,7 +364,7 @@ impl Store {
     /// durable; if any file observation changed, no captured row is cleared
     /// and the whole fold is retried. Rows appended after the prefix survive.
     pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<bool, StoreError> {
-        let transaction = self.read.conn.transaction()?;
+        let transaction = self.read.conn.savepoint()?;
         let mut latest = std::collections::BTreeMap::new();
         for entry in &work.dirty {
             latest.insert((entry.root, entry.path.as_str()), entry);
