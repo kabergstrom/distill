@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -47,6 +47,23 @@ pub enum WatcherAction {
     FullRescan,
     Failed(String),
 }
+
+/// One watcher observation, in arrival order.
+#[derive(Debug, Clone)]
+pub enum WatcherEvent {
+    /// A native event whose paths are all asset paths.
+    Native(Event),
+    /// Paths to reopen: control files, or an event only partly inside the
+    /// asset roots.
+    Invalidate(Vec<PathBuf>),
+    /// Coverage is incomplete; rescan everything.
+    Rescan,
+    /// The native watch can no longer prove coverage.
+    Failed(String),
+}
+
+/// Where the watcher delivers its events (the authority inbox).
+pub type WatcherSink = Arc<dyn Fn(WatcherEvent) + Send + Sync>;
 
 pub struct WatcherQueue {
     capacity: usize,
@@ -96,6 +113,16 @@ impl WatcherQueue {
         assert!(self.scanning, "no watcher scan armed");
         self.scanning = false;
         self.take_action()
+    }
+
+    /// Fold one watcher event into the pending union.
+    pub fn push(&mut self, event: WatcherEvent) {
+        match event {
+            WatcherEvent::Native(event) => self.push_native(event),
+            WatcherEvent::Invalidate(paths) => self.push_invalidations(paths),
+            WatcherEvent::Rescan => self.force_rescan(),
+            WatcherEvent::Failed(message) => self.fail(message),
+        }
     }
 
     pub fn take_live_action(&mut self) -> WatcherAction {
@@ -270,7 +297,8 @@ impl From<notify::Error> for WatcherStartError {
 }
 
 /// Owns the native watcher and its root-reconfiguration monitor. Initial roots
-/// are registered synchronously before `start` returns.
+/// are registered synchronously before `start` returns. The monitor thread
+/// owns the watch coverage; native callbacks forward raw events to it.
 pub struct WatcherThread {
     stop: Arc<AtomicBool>,
     control: WatcherControl,
@@ -278,6 +306,7 @@ pub struct WatcherThread {
 }
 
 enum WatcherCommand {
+    Native(notify::Result<Event>),
     ReplaceControlPaths {
         paths: BTreeSet<PathBuf>,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -287,7 +316,7 @@ enum WatcherCommand {
 
 #[derive(Clone)]
 pub(crate) struct WatcherControl {
-    commands: mpsc::SyncSender<WatcherCommand>,
+    commands: mpsc::Sender<WatcherCommand>,
 }
 
 impl WatcherControl {
@@ -336,7 +365,7 @@ impl WatcherThread {
     pub fn start(
         scanner: RootedScanner,
         control_paths: impl IntoIterator<Item = PathBuf>,
-        queue: Arc<Mutex<WatcherQueue>>,
+        sink: WatcherSink,
     ) -> Result<Self, WatcherStartError> {
         let control_paths = control_paths.into_iter().collect::<BTreeSet<_>>();
         let (asset_roots, quarantine_prefixes) = scanner.watch_coverage();
@@ -344,23 +373,16 @@ impl WatcherThread {
         let quarantine_prefixes = quarantine_prefixes.into_iter().collect::<BTreeSet<_>>();
         let initial_control = control_coverage(&control_paths)
             .map_err(|message| WatcherStartError::Thread(std::io::Error::other(message)))?;
-        let coverage = Arc::new(Mutex::new(WatchCoverage {
+        let mut coverage = WatchCoverage {
             asset_roots: asset_roots.clone(),
             quarantine_prefixes,
             control_paths: initial_control.paths,
-        }));
-        let callback_queue = Arc::clone(&queue);
-        let callback_coverage = Arc::clone(&coverage);
+        };
+        let (commands, command_rx) = mpsc::channel();
+        let native = commands.clone();
         let mut watcher = RecommendedWatcher::new(
-            move |result: notify::Result<Event>| match result {
-                Ok(event) => ingest_native(&callback_queue, &callback_coverage, event),
-                // notify represents incomplete event delivery with an explicit
-                // Rescan flag on an Event.  Callback errors instead mean the
-                // backend can no longer prove coverage (watch loss, resource
-                // exhaustion, or I/O failure); a root scan cannot repair that
-                // native subscription.
-                Err(error) => lock_queue(&callback_queue)
-                    .fail(format!("native watcher coverage failed: {error}")),
+            move |result: notify::Result<Event>| {
+                let _ = native.send(WatcherCommand::Native(result));
             },
             Config::default().with_follow_symlinks(false),
         )?;
@@ -375,7 +397,6 @@ impl WatcherThread {
             watcher.watch(root, RecursiveMode::Recursive)?;
         }
         let mut revision = scanner.revision();
-        let (commands, command_rx) = mpsc::sync_channel(1);
         let control = WatcherControl { commands };
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -387,6 +408,20 @@ impl WatcherThread {
                 while !thread_stop.load(Ordering::Acquire) {
                     match command_rx.recv_timeout(ROOT_RECONFIGURE_POLL) {
                         Ok(WatcherCommand::Stop) => break,
+                        Ok(WatcherCommand::Native(Ok(event))) => {
+                            if let Some(event) = admit_native(&coverage, event) {
+                                sink(event);
+                            }
+                        }
+                        // notify represents incomplete event delivery with an
+                        // explicit Rescan flag on an Event. Callback errors
+                        // instead mean the backend can no longer prove
+                        // coverage (watch loss, resource exhaustion, or I/O
+                        // failure); a root scan cannot repair that native
+                        // subscription.
+                        Ok(WatcherCommand::Native(Err(error))) => sink(WatcherEvent::Failed(
+                            format!("native watcher coverage failed: {error}"),
+                        )),
                         Ok(WatcherCommand::ReplaceControlPaths { paths, reply }) => {
                             let result = control_coverage(&paths).and_then(|next| {
                                 replace_watched_directories(
@@ -397,7 +432,7 @@ impl WatcherThread {
                                     &next.directories,
                                 )?;
                                 watched_controls = next.directories;
-                                lock_coverage(&coverage).control_paths = next.paths;
+                                coverage.control_paths = next.paths;
                                 Ok(())
                             });
                             let _ = reply.send(result);
@@ -418,21 +453,18 @@ impl WatcherThread {
                         &next_assets,
                         &watched_controls,
                     ) {
-                        lock_queue(&queue).fail(format!(
+                        sink(WatcherEvent::Failed(format!(
                             "native watcher cannot cover configured asset roots: {error}"
-                        ));
+                        )));
                         break;
                     }
                     watched_assets = next_assets.clone();
-                    {
-                        let mut coverage = lock_coverage(&coverage);
-                        coverage.asset_roots = next_assets;
-                        coverage.quarantine_prefixes = next_quarantine.into_iter().collect();
-                    }
+                    coverage.asset_roots = next_assets;
+                    coverage.quarantine_prefixes = next_quarantine.into_iter().collect();
                     revision = next_revision;
                     // The candidate scan preceded watcher reconfiguration.
                     // Force one armed catch-up scan to cover that bounded gap.
-                    lock_queue(&queue).force_rescan();
+                    sink(WatcherEvent::Rescan);
                 }
             })
             .map_err(WatcherStartError::Thread)?;
@@ -451,22 +483,21 @@ impl WatcherThread {
 impl Drop for WatcherThread {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.control.commands.try_send(WatcherCommand::Stop);
+        let _ = self.control.commands.send(WatcherCommand::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-fn ingest_native(queue: &Mutex<WatcherQueue>, coverage: &Mutex<WatchCoverage>, mut event: Event) {
+/// Filter one native event through the watch coverage.
+fn admit_native(coverage: &WatchCoverage, mut event: Event) -> Option<WatcherEvent> {
     if event.need_rescan() {
-        lock_queue(queue).force_rescan();
-        return;
+        return Some(WatcherEvent::Rescan);
     }
     if matches!(event.kind, EventKind::Access(_)) {
-        return;
+        return None;
     }
-    let coverage = lock_coverage(coverage);
     let original_len = event.paths.len();
     let mut assets = Vec::new();
     let mut controls = Vec::new();
@@ -487,18 +518,14 @@ fn ingest_native(queue: &Mutex<WatcherQueue>, coverage: &Mutex<WatchCoverage>, m
             assets.push(path.clone());
         }
     }
-    drop(coverage);
-    let preserve_native = controls.is_empty() && assets.len() == original_len;
-    let mut queue = lock_queue(queue);
-    if preserve_native {
+    if controls.is_empty() && assets.len() == original_len {
         event.paths = assets;
-        queue.push_native(event);
-    } else {
-        assets.extend(controls);
-        assets.sort_unstable();
-        assets.dedup();
-        queue.push_invalidations(assets);
+        return Some(WatcherEvent::Native(event));
     }
+    assets.extend(controls);
+    assets.sort_unstable();
+    assets.dedup();
+    Some(WatcherEvent::Invalidate(assets))
 }
 
 fn control_coverage(paths: &BTreeSet<PathBuf>) -> Result<ControlCoverage, String> {
@@ -577,14 +604,3 @@ fn replace_watched_directories(
     Ok(())
 }
 
-fn lock_queue(queue: &Mutex<WatcherQueue>) -> std::sync::MutexGuard<'_, WatcherQueue> {
-    queue
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn lock_coverage(coverage: &Mutex<WatchCoverage>) -> std::sync::MutexGuard<'_, WatchCoverage> {
-    coverage
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}

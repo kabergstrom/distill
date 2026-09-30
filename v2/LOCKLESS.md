@@ -371,15 +371,52 @@ should reach zero by the end of phase 6.
       in `artifact_load_edges`.
     - A read checks those edges against the parsed dependencies.
     - `ArtifactPayloadBackend` is deleted.
-  - **Known gap until phase 4.** The daemon commits its namespace in its own
-    input transaction, and the RPC `Delta` for that commit is applied in a
-    follow-up served transaction (`apply_commit_served`) under the
-    publication mutex.
+  - **Known gap (open until phase 5).** The daemon commits its namespace in
+    its own input transaction. The RPC `Delta` for that commit is applied
+    afterwards, in a second served transaction (`apply_commit_served`), on
+    the same authority step.
     - Readers can see the new version before its served rows.
-    - A snapshot is no longer serialized behind an in-flight publication, so
-      a resolve against a just-superseded version returns `Drifted`, and the
+    - A snapshot is not serialized behind an in-flight publication, so a
+      resolve against a just-superseded version returns `Drifted`, and the
       client must take a fresh snapshot.
     - `game_assets_e2e::resolved_hash` retries for this reason.
+    - This closes once the daemon computes the `Commit` before its own
+      `COMMIT`, which is phase 5's rewrite of the scan/import state.
+- **Phase 4:** done.
+  - **The authority** (`distill-daemon/src/authority.rs`) is one thread per
+    coordinator, blocking on an mpsc inbox. Its messages are `Run(job)`,
+    `Watch(event)`, `Attach(driver factory)`, `Detach` and `Shutdown`.
+  - **Publishing runs on the authority.**
+    - `ExternalStore` exposes `on_authority` and `execute` instead of a
+      publication guard.
+    - `ServerHandle::on_authority` runs a borrowed step there. It is inline
+      when embedded or when already on the authority, and otherwise sends a
+      scoped job and blocks until it has run.
+    - `Server::coordinated_*` assert that they run on the authority.
+    - Hub write / import / reimport, operation and schema-transition
+      completions, and lineage repair do their gate checks on the RPC thread,
+      then send the backend call plus the publication to the authority, which
+      rechecks the base.
+    - Every publishing `DaemonCoordinator` entry point wraps its body in
+      `on_authority`. Tests use `DaemonCoordinator::coordinated_commit`.
+  - **The process loop** is the authority's `Driver`.
+    - It owns the `WatcherQueue`, `ConfigWatch` and codegen.
+    - Startup (config, full scan, imports, retention) runs in the driver
+      factory on the authority, so watcher events that arrive meanwhile wait
+      in the inbox.
+    - The background error is a `tokio::sync::watch`.
+  - **The watcher** sends `WatcherEvent`s through a sink into the inbox. Its
+    coverage is owned by its monitor thread; native callbacks forward raw
+    events there. `watcher.rs` and `process.rs` hold no locks.
+  - **Still polled until phase 6:**
+    - The driver ticks every 40 ms (the debounce) to check for a runtime
+      pipeline poison and to reap drained retired epochs. Both become
+      messages once builds are jobs.
+    - The watcher monitor polls `scanner.revision()` until phase 5 moves the
+      roots into the authority.
+  - **Still blocking:** an RPC authoring call blocks the RPC thread until the
+    authority replies, as the publication mutex did before. Replies become
+    awaited oneshots with the build jobs (phase 6).
 
 ## 7. Test baseline
 
@@ -393,3 +430,5 @@ is unrelated to this work.
 
 End of phase 3: `cargo test --workspace --no-fail-fast` → only the same
 `tool_output_is_drained_while_large_stdin_is_written` failure.
+
+End of phase 4: the same single failure.

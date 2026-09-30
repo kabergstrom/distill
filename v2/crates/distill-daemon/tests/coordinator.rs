@@ -387,7 +387,6 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     });
     let backend = Arc::clone(coordinator.authoring_service());
     let stamp = coordinator
-        .server()
         .coordinated_commit(InputVersion(1), || {
             backend
                 .prepare_write(InputVersion(1), &[operation])
@@ -405,7 +404,6 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
 
     let backend = Arc::clone(coordinator.authoring_service());
     let stamp = coordinator
-        .server()
         .coordinated_commit(InputVersion(2), || {
             backend
                 .prepare_write(InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }])

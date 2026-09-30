@@ -597,6 +597,26 @@ fn validate_progress(events: &[AuthoringProgressEvent]) -> Result<(), String> {
     Ok(())
 }
 
+/// Complete a prepared operation on the authority, still at `base`.
+fn complete_on_authority(
+    server: &Server,
+    base: InputVersion,
+    publication: PreparedOperationPublication,
+    what: &str,
+) -> Result<(), String> {
+    server
+        .authority(|server| {
+            let current = server.inner.current_stamp().version;
+            if current != base {
+                return Err(format!(
+                    "{what} lost its input basis: expected {base:?}, observed {current:?}"
+                ));
+            }
+            complete_publication(server, base, publication, what)
+        })
+        .unwrap_or_else(|AuthorityStopped| Err("the publishing authority stopped".to_owned()))
+}
+
 /// Run a prepared operation's publication against `base`.
 fn complete_publication(
     server: &Server,
@@ -625,16 +645,6 @@ struct ServerOperationCompletion {
 
 impl ProgressCompletion for ServerOperationCompletion {
     fn complete(&self) -> Result<(), String> {
-        self.server.serialized(|| self.complete_locked())
-    }
-
-    fn cancel(&self) -> bool {
-        self.publication.borrow_mut().take().is_some()
-    }
-}
-
-impl ServerOperationCompletion {
-    fn complete_locked(&self) -> Result<(), String> {
         let publication = self
             .publication
             .borrow_mut()
@@ -645,7 +655,11 @@ impl ServerOperationCompletion {
                 "long-running operation lost its publication basis: {gate:?}"
             ));
         }
-        complete_publication(&self.server, self.base, publication, "long-running operation")
+        complete_on_authority(&self.server, self.base, publication, "long-running operation")
+    }
+
+    fn cancel(&self) -> bool {
+        self.publication.borrow_mut().take().is_some()
     }
 }
 
@@ -658,16 +672,6 @@ struct MetadataSchemaTransitionCompletion {
 
 impl ProgressCompletion for MetadataSchemaTransitionCompletion {
     fn complete(&self) -> Result<(), String> {
-        self.server.serialized(|| self.complete_locked())
-    }
-
-    fn cancel(&self) -> bool {
-        self.publication.borrow_mut().take().is_some()
-    }
-}
-
-impl MetadataSchemaTransitionCompletion {
-    fn complete_locked(&self) -> Result<(), String> {
         let publication = self
             .publication
             .borrow_mut()
@@ -678,35 +682,30 @@ impl MetadataSchemaTransitionCompletion {
                 "schema transition lost its metadata binding: {reason:?}"
             ));
         }
-        let current = self.server.inner.current_stamp().version;
-        if current != self.base {
-            return Err(format!(
-                "schema transition lost its input basis: expected {:?}, observed {current:?}",
-                self.base
-            ));
-        }
-        complete_publication(&self.server, self.base, publication, "schema-transition")
+        complete_on_authority(&self.server, self.base, publication, "schema transition")
+    }
+
+    fn cancel(&self) -> bool {
+        self.publication.borrow_mut().take().is_some()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Lineage repair
 
-impl LineageRepair {
-    fn current_inspection(&self) -> Result<LineageRepairInspection, LineageRepairMutationOutcome> {
-        if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
-            return Err(LineageRepairMutationOutcome::ReconnectRequired { reason });
-        }
-        let txn = self
-            .server
-            .inner
-            .current_snapshot()
-            .map_err(|error| LineageRepairMutationOutcome::Failure(store_failure(error)))?;
-        crate::lineage::lineage_inspection(
-            txn.stamp,
-            &txn.configuration,
-            txn.lineage_repair.as_ref(),
-        )
+/// The current lineage inspection as `binding` sees it.
+fn lineage_inspection_now(
+    server: &Server,
+    binding: &MetadataBinding,
+) -> Result<LineageRepairInspection, LineageRepairMutationOutcome> {
+    if let Some(reason) = server.inner.metadata_fence(binding) {
+        return Err(LineageRepairMutationOutcome::ReconnectRequired { reason });
+    }
+    let txn = server
+        .inner
+        .current_snapshot()
+        .map_err(|error| LineageRepairMutationOutcome::Failure(store_failure(error)))?;
+    crate::lineage::lineage_inspection(txn.stamp, &txn.configuration, txn.lineage_repair.as_ref())
         .map_err(|failure| match failure {
             crate::lineage::LineageInspectionFailure::Unavailable(unavailable) => {
                 LineageRepairMutationOutcome::Unavailable(unavailable)
@@ -715,6 +714,71 @@ impl LineageRepair {
                 LineageRepairMutationOutcome::Failure(error)
             }
         })
+}
+
+/// `basis` is still the current inspection.
+fn lineage_preflight(
+    server: &Server,
+    binding: &MetadataBinding,
+    basis: &LineageRepairInspection,
+) -> Result<(), LineageRepairMutationOutcome> {
+    let current = lineage_inspection_now(server, binding)?;
+    if &current != basis {
+        return Err(LineageRepairMutationOutcome::StaleBasis(
+            crate::lineage::lineage_stale(basis, &current),
+        ));
+    }
+    Ok(())
+}
+
+/// On the authority: recheck the inspection, run the backend, publish.
+fn publish_lineage_repair_locked(
+    server: &Server,
+    binding: &MetadataBinding,
+    basis: LineageRepairInspection,
+    prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError>,
+) -> LineageRepairMutationOutcome {
+    if let Err(outcome) = lineage_preflight(server, binding, &basis) {
+        return outcome;
+    }
+    let base = basis.stamp.version;
+    let prepared = match prepare() {
+        Ok(commit) => commit,
+        Err(LineageRepairBackendError::Stale(stale)) => {
+            return LineageRepairMutationOutcome::StaleBasis(stale)
+        }
+        Err(LineageRepairBackendError::Invalid(invalid)) => {
+            return LineageRepairMutationOutcome::Invalid(invalid)
+        }
+        Err(LineageRepairBackendError::Failure(error)) => {
+            return LineageRepairMutationOutcome::Failure(error)
+        }
+    };
+    if !prepared.assets.is_empty()
+        || !prepared.authoring.is_empty()
+        || !prepared.paths.is_empty()
+        || prepared.pipeline.is_some()
+        || prepared.version_poison.is_some()
+        || prepared.configuration != Some(ConfigurationStatus::Ready)
+        || prepared.lineage_repair != Some(None)
+    {
+        return LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
+            code: LineageRepairInvalidCode::WrongBasisState,
+            message: "repair backend publication may only install a rescan-proven Ready state and clear its lineage inspection"
+                .to_owned(),
+        });
+    }
+    match publish_backend_commit(server, base, prepared) {
+        Ok(stamp) => LineageRepairMutationOutcome::Success(LineageRepairCommitted { stamp }),
+        Err(error) => LineageRepairMutationOutcome::Failure(RpcFailure::InvalidAuthoringRequest {
+            detail: format!("lineage repair publication rejected: {error:?}"),
+        }),
+    }
+}
+
+impl LineageRepair {
+    fn current_inspection(&self) -> Result<LineageRepairInspection, LineageRepairMutationOutcome> {
+        lineage_inspection_now(&self.server, &self.binding)
     }
 
     pub fn inspect(&self) -> LineageRepairInspectOutcome {
@@ -788,67 +852,22 @@ impl LineageRepair {
         &self,
         basis: &LineageRepairInspection,
     ) -> Result<(), LineageRepairMutationOutcome> {
-        let current = self.current_inspection()?;
-        if &current != basis {
-            return Err(LineageRepairMutationOutcome::StaleBasis(
-                crate::lineage::lineage_stale(basis, &current),
-            ));
-        }
-        Ok(())
+        lineage_preflight(&self.server, &self.binding, basis)
     }
 
     fn publish_lineage_repair(
         &self,
         basis: LineageRepairInspection,
-        prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError>,
+        prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError> + Send,
     ) -> LineageRepairMutationOutcome {
+        let binding = &*self.binding;
         self.server
-            .serialized(|| self.publish_lineage_repair_locked(basis, prepare))
-    }
-
-    fn publish_lineage_repair_locked(
-        &self,
-        basis: LineageRepairInspection,
-        prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError>,
-    ) -> LineageRepairMutationOutcome {
-        if let Err(outcome) = self.mutation_preflight(&basis) {
-            return outcome;
-        }
-        let base = basis.stamp.version;
-        let prepared = match prepare() {
-            Ok(commit) => commit,
-            Err(LineageRepairBackendError::Stale(stale)) => {
-                return LineageRepairMutationOutcome::StaleBasis(stale)
-            }
-            Err(LineageRepairBackendError::Invalid(invalid)) => {
-                return LineageRepairMutationOutcome::Invalid(invalid)
-            }
-            Err(LineageRepairBackendError::Failure(error)) => {
-                return LineageRepairMutationOutcome::Failure(error)
-            }
-        };
-        if !prepared.assets.is_empty()
-            || !prepared.authoring.is_empty()
-            || !prepared.paths.is_empty()
-            || prepared.pipeline.is_some()
-            || prepared.version_poison.is_some()
-            || prepared.configuration != Some(ConfigurationStatus::Ready)
-            || prepared.lineage_repair != Some(None)
-        {
-            return LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
-                code: LineageRepairInvalidCode::WrongBasisState,
-                message: "repair backend publication may only install a rescan-proven Ready state and clear its lineage inspection"
-                    .to_owned(),
-            });
-        }
-        match publish_backend_commit(&self.server, base, prepared) {
-            Ok(stamp) => LineageRepairMutationOutcome::Success(LineageRepairCommitted { stamp }),
-            Err(error) => {
-                LineageRepairMutationOutcome::Failure(RpcFailure::InvalidAuthoringRequest {
-                    detail: format!("lineage repair publication rejected: {error:?}"),
+            .authority(|server| publish_lineage_repair_locked(server, binding, basis, prepare))
+            .unwrap_or_else(|AuthorityStopped| {
+                LineageRepairMutationOutcome::Failure(RpcFailure::AuthoringBackendUnavailable {
+                    operation: "lineageRepair".to_owned(),
                 })
-            }
-        }
+            })
     }
 }
 
@@ -1244,11 +1263,40 @@ impl Hub {
         }
     }
 
-    pub fn write(&self, base: InputVersion, ops: Vec<AuthoringOp>) -> RpcResult<InputVersion> {
-        self.server.serialized(|| self.write_locked(base, ops))
+    /// On the authority, still at `base`: run the backend's `prepare` and
+    /// publish its commit. `None` when the backend declined.
+    fn prepared<T: Send>(
+        &self,
+        base: InputVersion,
+        prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure> + Send,
+    ) -> Option<RpcResult<T>> {
+        let backend = self.server.inner.handle.authoring_backend();
+        self.server
+            .authority(|server| {
+                let current = server.inner.current_stamp().version;
+                if current != base {
+                    return Some(RpcResult::Failure(RpcFailure::StaleInputVersion {
+                        expected: current,
+                        got: base,
+                    }));
+                }
+                match prepare(&*backend) {
+                    Ok(Some((commit, value))) => Some(match publish_backend_commit(server, base, commit) {
+                        Ok(_) => RpcResult::Success(value),
+                        Err(error) => RpcResult::Failure(error),
+                    }),
+                    Ok(None) => None,
+                    Err(error) => Some(RpcResult::Failure(error)),
+                }
+            })
+            .unwrap_or_else(|AuthorityStopped| {
+                Some(RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
+                    operation: "authority".to_owned(),
+                }))
+            })
     }
 
-    fn write_locked(&self, base: InputVersion, ops: Vec<AuthoringOp>) -> RpcResult<InputVersion> {
+    pub fn write(&self, base: InputVersion, ops: Vec<AuthoringOp>) -> RpcResult<InputVersion> {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
@@ -1266,16 +1314,12 @@ impl Hub {
             });
         }
         let next = InputVersion(base.0 + 1);
-        match self
-            .server
-            .inner
-            .handle
-            .authoring_backend()
-            .prepare_write(base, &ops)
-        {
-            Ok(Some(commit)) => return self.publish(base, commit, next),
-            Ok(None) => {}
-            Err(error) => return RpcResult::Failure(error),
+        if let Some(result) = self.prepared(base, |backend| {
+            Ok(backend
+                .prepare_write(base, &ops)?
+                .map(|commit| (commit, next)))
+        }) {
+            return result;
         }
         if !is_embedded(&self.server) {
             return RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
@@ -1373,50 +1417,30 @@ impl Hub {
         if let Err(detail) = validate_import_request(&request) {
             return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { detail });
         }
-        self.server.serialized(|| self.import_locked(base, &request))
-    }
-
-    fn import_locked(&self, base: InputVersion, request: &ImportRequest) -> RpcResult<BundleUuid> {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
-        let prepared = match self
-            .server
-            .inner
-            .handle
-            .authoring_backend()
-            .prepare_import(base, request)
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return RpcResult::Failure(error),
-        };
-        self.publish(base, prepared.commit, prepared.bundle)
+        self.prepared(base, |backend| {
+            let prepared = backend.prepare_import(base, &request)?;
+            Ok(Some((prepared.commit, prepared.bundle)))
+        })
+        .expect("an import always publishes")
     }
 
     pub fn reimport(&self, base: InputVersion, bundle: BundleUuid) -> RpcResult<BundleUuid> {
-        self.server.serialized(|| self.reimport_locked(base, bundle))
-    }
-
-    fn reimport_locked(&self, base: InputVersion, bundle: BundleUuid) -> RpcResult<BundleUuid> {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
-        let prepared = match self
-            .server
-            .inner
-            .handle
-            .authoring_backend()
-            .prepare_reimport(base, bundle)
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return RpcResult::Failure(error),
-        };
-        if prepared.bundle != bundle {
-            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
-                detail: "reimport backend changed the bundle identity".to_owned(),
-            });
-        }
-        self.publish(base, prepared.commit, prepared.bundle)
+        self.prepared(base, |backend| {
+            let prepared = backend.prepare_reimport(base, bundle)?;
+            if prepared.bundle != bundle {
+                return Err(RpcFailure::InvalidAuthoringRequest {
+                    detail: "reimport backend changed the bundle identity".to_owned(),
+                });
+            }
+            Ok(Some((prepared.commit, prepared.bundle)))
+        })
+        .expect("a reimport always publishes")
     }
 
     pub fn operation(

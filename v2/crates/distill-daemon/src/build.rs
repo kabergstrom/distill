@@ -1130,7 +1130,7 @@ pub(crate) fn doctor_verify_builds(
 }
 
 /// Finish §10 tag indexing against a namespace that has advanced durably but
-/// is still hidden behind the coordinator's RPC publication lock.
+/// is not yet served: the authority applies its RPC delta afterwards.
 pub(crate) fn refine_published_tag_index(
     store_handle: Arc<Mutex<Store>>,
     scanner: RootedScanner,
@@ -5040,7 +5040,6 @@ mod tests {
         let store = coordinator.store();
         let current_snapshot = snapshot_to_json(&project.logical_schema).unwrap();
         coordinator
-            .server()
             .coordinated_commit(InputVersion(1), || {
                 store
                     .lock()

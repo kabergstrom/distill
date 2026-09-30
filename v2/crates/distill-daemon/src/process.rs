@@ -1,12 +1,18 @@
 //! Long-lived daemon process supervisor.
+//!
+//! The process loop runs on the coordinator's authority thread as its
+//! [`Driver`]: the watcher feeds it through the authority inbox, and every
+//! reconciliation it starts publishes from that thread.
 
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::watch;
 
 use distill_schema::{ProjectSchemaAuthority, SchemaAuthorityError};
 use distill_store::state::{
@@ -14,16 +20,21 @@ use distill_store::state::{
     PipelinePoisonOrigin,
 };
 
+use crate::authority::Driver;
 use crate::codegen::CodegenService;
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
 use crate::scanner::DaemonOwnedDirectoryKind;
 use crate::watcher::{
-    WatcherAction, WatcherControl, WatcherQueue, WatcherStartError, WatcherThread,
+    WatcherAction, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink, WatcherStartError,
+    WatcherThread,
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
+/// How often the process loop takes the watcher queue (the debounce) and
+/// checks for a runtime pipeline poison or a drained retired epoch. The
+/// last two become authority messages when builds become jobs (phase 6).
 const DEBOUNCE: Duration = Duration::from_millis(40);
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -32,9 +43,8 @@ pub struct DaemonProcess {
     rpc_address: SocketAddr,
     stop: Arc<AtomicBool>,
     watcher: Option<WatcherThread>,
-    coordinator_thread: Option<JoinHandle<()>>,
     rpc_thread: Option<JoinHandle<Result<(), String>>>,
-    last_background_error: Arc<Mutex<Option<String>>>,
+    last_background_error: watch::Receiver<Option<String>>,
 }
 
 impl DaemonProcess {
@@ -103,60 +113,53 @@ impl DaemonProcess {
                 })?;
         }
         coordinator.attach_build_backend();
-        let mut config_watch = ConfigWatch::new(config.clone());
-        let watcher_queue = Arc::new(Mutex::new(WatcherQueue::new()));
+        let config_watch = ConfigWatch::new(config.clone());
+        let inbox = coordinator.authority_sender().clone();
+        let sink: WatcherSink = {
+            let inbox = inbox.clone();
+            Arc::new(move |event| inbox.watch(event))
+        };
         // Arm both asset and control-file coverage before any candidate scan.
         // Root replacement is synchronously scanned by candidate publication;
         // the watcher then installs the new root and requests one catch-up scan.
-        let watcher = WatcherThread::start(
-            coordinator.scanner(),
-            config_watch.control_paths(),
-            Arc::clone(&watcher_queue),
-        )?;
+        let watcher = WatcherThread::start(coordinator.scanner(), config_watch.control_paths(), sink)?;
         let watcher_control = watcher.control();
-        let mut codegen = CodegenService::new(
+        let codegen = CodegenService::new(
             &coordinator,
             &config.codegen.rs_mod_path,
             config.codegen.auto_codegen,
         )
         .map_err(DaemonProcessError::Codegen)?;
-        // Retain an existing daemon-owned output before the first candidate
-        // performs its mandatory startup scan. Otherwise an authored symlink
-        // to that output can be misclassified as a root escape during the
-        // narrow gap between candidate publication and service construction.
-        config_watch.reconcile(&coordinator, &watcher_control, ControlInvalidation::all())?;
-        let started = Instant::now();
-        coordinator.reconcile_startup(&watcher_queue)?;
-        tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
-        reconcile_imports(&coordinator, true, false)?;
-        tracing::info!(elapsed = ?started.elapsed(), "startup imports reconciled");
-        coordinator.sweep_displaced_retention(unix_seconds())?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let recovery_diagnostic = [
-            coordinator
-                .authoring_service()
-                .take_startup_recovery_diagnostic(),
-            codegen.take_startup_recovery_diagnostic(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        let last_background_error = Arc::new(Mutex::new(
-            (!recovery_diagnostic.is_empty()).then(|| recovery_diagnostic.join("; ")),
-        ));
-        if let Err(error) = codegen.run(&coordinator) {
-            *lock(&last_background_error) = Some(error);
-        }
-        let coordinator_thread = Some(spawn_coordinator_loop(
-            Arc::clone(&coordinator),
-            Arc::clone(&watcher_queue),
-            Arc::clone(&stop),
-            Arc::clone(&last_background_error),
+        let (errors, last_background_error) = watch::channel(None);
+        let (ready, started) = mpsc::sync_channel(1);
+        let mut driver = ProcessDriver {
+            coordinator: Arc::clone(&coordinator),
+            queue: WatcherQueue::new(),
             config_watch,
             watcher_control,
             codegen,
-        ));
+            stop: Arc::clone(&stop),
+            errors,
+            next_tick: Instant::now() + DEBOUNCE,
+            next_retention_sweep: Instant::now() + RETENTION_SWEEP_INTERVAL,
+        };
+        // Startup runs on the authority before the loop: events the watcher
+        // sends meanwhile wait in the inbox for the driver.
+        inbox.attach(Box::new(move || match driver.startup() {
+            Ok(()) => {
+                let _ = ready.send(Ok(()));
+                Some(Box::new(driver) as Box<dyn Driver>)
+            }
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                None
+            }
+        }));
+        started.recv().map_err(|_| {
+            DaemonProcessError::Rpc("the authority stopped during startup".to_owned())
+        })??;
 
         let (rpc_address, rpc_thread) = if serve_rpc {
             let (address_tx, address_rx) = mpsc::sync_channel(1);
@@ -170,11 +173,13 @@ impl DaemonProcess {
                 Ok(Ok(address)) => address,
                 Ok(Err(error)) => {
                     stop.store(true, Ordering::Release);
+                    inbox.detach();
                     let _ = rpc_thread.join();
                     return Err(DaemonProcessError::Rpc(error));
                 }
                 Err(error) => {
                     stop.store(true, Ordering::Release);
+                    inbox.detach();
                     let _ = rpc_thread.join();
                     return Err(DaemonProcessError::Rpc(format!(
                         "RPC startup channel closed: {error}"
@@ -191,7 +196,6 @@ impl DaemonProcess {
             rpc_address,
             stop,
             watcher: Some(watcher),
-            coordinator_thread,
             rpc_thread,
             last_background_error,
         })
@@ -206,7 +210,7 @@ impl DaemonProcess {
     }
 
     pub fn last_background_error(&self) -> Option<String> {
-        lock(&self.last_background_error).clone()
+        self.last_background_error.borrow().clone()
     }
 
     /// Whether a fatal watcher/coordinator failure has stopped the serving
@@ -227,9 +231,7 @@ impl Drop for DaemonProcess {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.watcher.take();
-        if let Some(thread) = self.coordinator_thread.take() {
-            let _ = thread.join();
-        }
+        self.coordinator.authority_sender().detach();
         if let Some(thread) = self.rpc_thread.take() {
             let _ = thread.join();
         }
@@ -285,89 +287,142 @@ impl From<SchemaAuthorityError> for DaemonProcessError {
     }
 }
 
-fn spawn_coordinator_loop(
+/// The process loop, run by the authority.
+struct ProcessDriver {
     coordinator: Arc<DaemonCoordinator>,
-    watcher: Arc<Mutex<WatcherQueue>>,
-    stop: Arc<AtomicBool>,
-    last_error: Arc<Mutex<Option<String>>>,
-    mut config_watch: ConfigWatch,
+    queue: WatcherQueue,
+    config_watch: ConfigWatch,
     watcher_control: WatcherControl,
-    mut codegen: CodegenService,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("distill-coordinator".to_owned())
-        .spawn(move || {
-            let mut next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
-            while !stop.load(Ordering::Acquire) {
-                thread::sleep(DEBOUNCE);
-                let action = lock(&watcher).take_live_action();
-                if let WatcherAction::Failed(message) = &action {
-                    tracing::error!(%message, "watcher failed; stopping the coordinator");
-                    *lock(&last_error) = Some(message.clone());
-                    stop.store(true, Ordering::Release);
-                    break;
+    codegen: CodegenService,
+    stop: Arc<AtomicBool>,
+    errors: watch::Sender<Option<String>>,
+    next_tick: Instant,
+    next_retention_sweep: Instant,
+}
+
+impl ProcessDriver {
+    fn startup(&mut self) -> Result<(), DaemonProcessError> {
+        // Retain an existing daemon-owned output before the first candidate
+        // performs its mandatory startup scan. Otherwise an authored symlink
+        // to that output can be misclassified as a root escape during the
+        // narrow gap between candidate publication and service construction.
+        self.config_watch.reconcile(
+            &self.coordinator,
+            &self.watcher_control,
+            ControlInvalidation::all(),
+        )?;
+        let started = Instant::now();
+        self.coordinator.reconcile_startup(&mut self.queue)?;
+        tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
+        reconcile_imports(&self.coordinator, true, false)?;
+        tracing::info!(elapsed = ?started.elapsed(), "startup imports reconciled");
+        self.coordinator.sweep_displaced_retention(unix_seconds())?;
+
+        let recovery_diagnostic = [
+            self.coordinator
+                .authoring_service()
+                .take_startup_recovery_diagnostic(),
+            self.codegen.take_startup_recovery_diagnostic(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !recovery_diagnostic.is_empty() {
+            self.errors.send_replace(Some(recovery_diagnostic.join("; ")));
+        }
+        if let Err(error) = self.codegen.run(&self.coordinator) {
+            self.errors.send_replace(Some(error));
+        }
+        Ok(())
+    }
+
+    /// One pass of the loop: reconcile what the watcher queued.
+    fn tick(&mut self) -> bool {
+        let action = self.queue.take_live_action();
+        if let WatcherAction::Failed(message) = &action {
+            tracing::error!(%message, "watcher failed; stopping the coordinator");
+            self.errors.send_replace(Some(message.clone()));
+            self.stop.store(true, Ordering::Release);
+            return false;
+        }
+        let retry_action = action.clone();
+        let started = Instant::now();
+        match &action {
+            WatcherAction::Batch(batch) => {
+                tracing::debug!(batch = ?batch, "reconciling watcher batch")
+            }
+            WatcherAction::FullRescan => tracing::info!("reconciling full rescan"),
+            WatcherAction::None | WatcherAction::Failed(_) => {}
+        }
+        let reconciled = !matches!(action, WatcherAction::None);
+        let control_invalidation = match &action {
+            WatcherAction::Batch(batch) => self.config_watch.invalidation_for(batch),
+            WatcherAction::FullRescan => Some(ControlInvalidation::all()),
+            WatcherAction::None | WatcherAction::Failed(_) => None,
+        };
+        let coordinator = &self.coordinator;
+        let result = match control_invalidation {
+            Some(invalidation) => {
+                self.config_watch
+                    .reconcile(coordinator, &self.watcher_control, invalidation)
+            }
+            None => Ok(false),
+        }
+        .and_then(|capabilities_changed| match action {
+            WatcherAction::None => Ok(()),
+            WatcherAction::Batch(batch) => coordinator
+                .reconcile_incremental(&batch)
+                .and_then(|_| reconcile_imports(coordinator, false, capabilities_changed)),
+            WatcherAction::FullRescan => coordinator
+                .reconcile_startup(&mut self.queue)
+                .and_then(|_| reconcile_imports(coordinator, true, false)),
+            WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
+        });
+        let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
+        let retention_result = if Instant::now() >= self.next_retention_sweep {
+            self.next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
+            coordinator
+                .sweep_displaced_retention(unix_seconds())
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let result = result.and(poison_result).and(retention_result);
+        let _ = coordinator.reap_retired_pipeline_epochs();
+        match result {
+            Err(error) => {
+                tracing::warn!(%error, "reconciliation failed; requeued");
+                self.errors.send_replace(Some(error.to_string()));
+                self.queue.requeue_action(retry_action);
+            }
+            Ok(()) => {
+                if reconciled {
+                    tracing::info!(elapsed = ?started.elapsed(), "reconciled");
                 }
-                let retry_action = action.clone();
-                let started = Instant::now();
-                match &action {
-                    WatcherAction::Batch(batch) => {
-                        tracing::debug!(batch = ?batch, "reconciling watcher batch")
-                    }
-                    WatcherAction::FullRescan => tracing::info!("reconciling full rescan"),
-                    WatcherAction::None | WatcherAction::Failed(_) => {}
-                }
-                let reconciled = !matches!(action, WatcherAction::None);
-                let control_invalidation = match &action {
-                    WatcherAction::Batch(batch) => config_watch.invalidation_for(batch),
-                    WatcherAction::FullRescan => Some(ControlInvalidation::all()),
-                    WatcherAction::None | WatcherAction::Failed(_) => None,
-                };
-                let result = control_invalidation
-                    .map_or(Ok(false), |invalidation| {
-                        config_watch.reconcile(&coordinator, &watcher_control, invalidation)
-                    })
-                    .and_then(|capabilities_changed| match action {
-                        WatcherAction::None => Ok(()),
-                        WatcherAction::Batch(batch) => {
-                            coordinator.reconcile_incremental(&batch).and_then(|_| {
-                                reconcile_imports(&coordinator, false, capabilities_changed)
-                            })
-                        }
-                        WatcherAction::FullRescan => coordinator
-                            .reconcile_startup(&watcher)
-                            .and_then(|_| reconcile_imports(&coordinator, true, false)),
-                        WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
-                    });
-                let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
-                let retention_result = if Instant::now() >= next_retention_sweep {
-                    next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
-                    coordinator
-                        .sweep_displaced_retention(unix_seconds())
-                        .map(|_| ())
-                } else {
-                    Ok(())
-                };
-                let result = result.and(poison_result).and(retention_result);
-                let _ = coordinator.reap_retired_pipeline_epochs();
-                match result {
-                    Err(error) => {
-                        tracing::warn!(%error, "reconciliation failed; requeued");
-                        *lock(&last_error) = Some(error.to_string());
-                        lock(&watcher).requeue_action(retry_action);
-                    }
-                    Ok(()) => {
-                        if reconciled {
-                            tracing::info!(elapsed = ?started.elapsed(), "reconciled");
-                        }
-                        if let Err(error) = codegen.run(&coordinator) {
-                            tracing::warn!(%error, "codegen failed");
-                            *lock(&last_error) = Some(error);
-                        }
-                    }
+                if let Err(error) = self.codegen.run(&self.coordinator) {
+                    tracing::warn!(%error, "codegen failed");
+                    self.errors.send_replace(Some(error));
                 }
             }
-        })
-        .expect("failed to start distill coordinator thread")
+        }
+        true
+    }
+}
+
+impl Driver for ProcessDriver {
+    fn watch(&mut self, event: WatcherEvent) {
+        self.queue.push(event);
+    }
+
+    fn deadline(&self) -> Instant {
+        self.next_tick
+    }
+
+    fn fire(&mut self) -> bool {
+        let keep = self.tick();
+        self.next_tick = Instant::now() + DEBOUNCE;
+        keep
+    }
 }
 
 fn unix_seconds() -> i64 {
@@ -940,12 +995,6 @@ fn spawn_rpc_loop(
             })
         })
         .expect("failed to start distill RPC thread")
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

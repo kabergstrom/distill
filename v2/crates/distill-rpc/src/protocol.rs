@@ -965,7 +965,7 @@ pub struct PreparedImportCommit {
 pub trait DeferredOperation: Send + Sync {
     /// Execute the already-validated operation against `base`. The RPC server
     /// invokes this only when the client consumes the terminal Completed
-    /// event, while holding its publication serialization lock.
+    /// event, on the authority thread.
     fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String>;
 }
 
@@ -1027,7 +1027,7 @@ pub trait AuthoringBackend: Send + Sync {
     /// publication. `Ok(None)` retains the in-memory-only implementation used
     /// by embedders and tests that have no filesystem authority.
     ///
-    /// The RPC coordinator invokes this while holding its publication lock;
+    /// The RPC server invokes this on the authority thread;
     /// production implementations must compare their durable store version
     /// with `base`, publish, rescan, and advance that store exactly once before
     /// returning. They must not call back into the [`crate::Server`].
@@ -1059,10 +1059,9 @@ pub trait AuthoringBackend: Send + Sync {
 
     /// Execute the destination-aware durable repair and return its
     /// rescan-proven publication commit. The RPC coordinator invokes this
-    /// only after its second exact inspection CAS and holds publication
-    /// serialization until the returned commit is installed. Implementations
-    /// must not call back into this `Server` while that coordinator lock is
-    /// held.
+    /// only after its second exact inspection CAS, on the authority thread,
+    /// and installs the returned commit before the authority runs anything
+    /// else. Implementations must not publish through this `Server`.
     fn prepare_create_missing_lineage(
         &self,
         _basis: &LineageRepairInspection,

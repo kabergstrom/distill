@@ -233,7 +233,6 @@ fn complete_and_publish(
 ) -> Option<String> {
     let mut terminal_error = None;
     coordinator
-        .server()
         .coordinated_commit(base, || {
             let completed = complete(publication, base);
             terminal_error = completed.terminal_error;
@@ -431,7 +430,6 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
     let store = coordinator.store();
     let new_snapshot = distill_schema::ngp_schema::snapshot_to_json(&new_schema).unwrap();
     coordinator
-        .server()
         .coordinated_commit(InputVersion(1), || {
             store
                 .lock()
@@ -587,7 +585,6 @@ fn disk_migration_temp_failure_does_not_block_later_bundles() {
     let store = coordinator.store();
     let new_snapshot = distill_schema::ngp_schema::snapshot_to_json(&new_schema).unwrap();
     coordinator
-        .server()
         .coordinated_commit(InputVersion(1), || {
             store
                 .lock()

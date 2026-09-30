@@ -467,7 +467,6 @@ fn import_assets(process: &DaemonProcess, assets: &Path) -> [AssetUuid; 3] {
     let base = coordinator.server().current_stamp().version;
     let backend = Arc::clone(coordinator.authoring_service());
     coordinator
-        .server()
         .coordinated_commit(base, || {
             let prepared = backend
                 .prepare_import(

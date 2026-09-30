@@ -150,21 +150,73 @@ impl Drop for EmbeddedWriter {
     }
 }
 
-/// Anything held while a publication is in progress.
-pub trait PublicationGuard {}
+/// A job for the authority thread.
+pub type AuthorityJob = Box<dyn FnOnce() + Send + 'static>;
 
-impl<T> PublicationGuard for T {}
+/// The authority stopped before it ran a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityStopped;
 
-/// The daemon's side of a served store: it owns the writer and serializes
-/// publications. Each daemon publication runs its durable step and then the
-/// RPC projection of the [`Commit`] it returned, under one publication
-/// guard, so no other publication interleaves.
+/// The daemon's side of a served store. One thread, the authority, runs
+/// every publication (LOCKLESS.md §3); front ends on other threads hand
+/// their publishing steps to it and wait for the result.
 pub trait ExternalStore: Send + Sync {
-    /// Hold every other publication off until the guard drops.
-    fn lock_publication(&self) -> Box<dyn PublicationGuard + '_>;
-    /// Exclusive write access to the store. Never called with the
-    /// publication guard's store lock held by the caller.
+    /// Whether the calling thread is the authority.
+    fn on_authority(&self) -> bool;
+    /// Queue `job` on the authority. A job the authority can no longer run
+    /// is dropped unrun.
+    fn execute(&self, job: AuthorityJob);
+    /// Exclusive write access to the store.
     fn with_store(&self, job: &mut dyn FnMut(&mut Store));
+}
+
+/// Runs a borrowed job on another thread through `execute`, blocking until
+/// it ran or was dropped.
+fn run_scoped<T: Send>(
+    execute: impl FnOnce(AuthorityJob),
+    step: impl FnOnce() -> T + Send,
+) -> Result<T, AuthorityStopped> {
+    struct Scoped<F, T> {
+        step: Option<F>,
+        reply: Option<mpsc::SyncSender<std::thread::Result<T>>>,
+    }
+    impl<F: FnOnce() -> T, T> Scoped<F, T> {
+        fn run(mut self) {
+            let step = self.step.take().expect("a scoped job runs once");
+            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
+            if let Some(reply) = self.reply.take() {
+                let _ = reply.send(output);
+            }
+        }
+    }
+    impl<F, T> Drop for Scoped<F, T> {
+        fn drop(&mut self) {
+            // The borrowed step goes before the reply: the waiting caller
+            // wakes only once nothing here refers to its stack.
+            drop(self.step.take());
+            drop(self.reply.take());
+        }
+    }
+    let (reply, result) = mpsc::sync_channel(1);
+    let scoped = Scoped {
+        step: Some(step),
+        reply: Some(reply),
+    };
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || scoped.run());
+    // SAFETY: the job only borrows from this frame, and this function does
+    // not return until the job has run or been dropped: `result` yields only
+    // once the reply sender is sent on or dropped, and `Scoped` drops (or has
+    // consumed) the step first. Extending the trait object's lifetime changes
+    // no layout.
+    let job = unsafe {
+        std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, AuthorityJob>(job)
+    };
+    execute(job);
+    match result.recv() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => Err(AuthorityStopped),
+    }
 }
 
 enum Writer {
@@ -292,12 +344,25 @@ impl ServerHandle {
         matches!(self.writer, Some(Writer::Embedded(_)))
     }
 
-    /// Hold other daemon publications off; embedded publications check
-    /// their base inside the transaction instead.
-    pub(crate) fn lock_publication(&self) -> Option<Box<dyn PublicationGuard + '_>> {
+    /// Whether the calling thread may publish: always when embedded.
+    pub fn is_authority(&self) -> bool {
         match self.writer() {
-            Writer::Embedded(_) => None,
-            Writer::External(store) => Some(store.lock_publication()),
+            Writer::Embedded(_) => true,
+            Writer::External(store) => store.on_authority(),
+        }
+    }
+
+    /// Run `step` as the authority: inline when embedded (publications
+    /// check their base inside the transaction) or already on it, else on
+    /// the authority thread, blocking until it finishes. `step` may borrow.
+    pub fn on_authority<T: Send>(
+        &self,
+        step: impl FnOnce() -> T + Send,
+    ) -> Result<T, AuthorityStopped> {
+        match self.writer() {
+            Writer::Embedded(_) => Ok(step()),
+            Writer::External(store) if store.on_authority() => Ok(step()),
+            Writer::External(store) => run_scoped(|job| store.execute(job), step),
         }
     }
 
@@ -800,6 +865,15 @@ impl Server {
         poison: PipelinePoison,
         persist: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
+        self.assert_authority();
+        self.runtime_pipeline_poison_locked(poison, persist)
+    }
+
+    fn runtime_pipeline_poison_locked(
+        &self,
+        poison: PipelinePoison,
+        persist: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         poison
             .validate()
             .map_err(|error| format!("invalid runtime pipeline poison: {error:?}"))?;
@@ -819,7 +893,6 @@ impl Server {
                 ))
             }
         }
-        let _publication = self.inner.handle.lock_publication();
         persist()?;
         self.inner
             .handle
@@ -1044,18 +1117,31 @@ impl Server {
             .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
-    /// Hold other publications off across a whole coordinator step.
-    pub fn publication_lock(&self) -> PublicationLock<'_> {
-        PublicationLock {
-            server: self,
-            _guard: self.inner.handle.lock_publication(),
-        }
+    /// Run `step` on the authority with that thread's front end
+    /// ([`ServerHandle::on_authority`]).
+    pub(crate) fn authority<T: Send>(
+        &self,
+        step: impl FnOnce(&Server) -> T + Send,
+    ) -> Result<T, AuthorityStopped> {
+        let handle = &self.inner.handle;
+        handle.on_authority(|| step(&Server::attach(handle)))
     }
 
-    /// Run `step` with other publications held off.
-    pub(crate) fn serialized<T>(&self, step: impl FnOnce() -> T) -> T {
-        let _publication = self.inner.handle.lock_publication();
-        step()
+    /// Coordinated publications are the authority's own steps: the daemon
+    /// runs them there ([`ServerHandle::on_authority`]).
+    fn coordinated<T>(
+        &self,
+        step: impl FnOnce(&Server) -> Result<T, CoordinatedCommitError>,
+    ) -> Result<T, CoordinatedCommitError> {
+        self.assert_authority();
+        step(self)
+    }
+
+    fn assert_authority(&self) {
+        assert!(
+            self.inner.handle.is_authority(),
+            "coordinated publications run on the authority thread"
+        );
     }
 
     /// A coordinated publication that may terminate in durable memo state
@@ -1065,7 +1151,7 @@ impl Server {
         base: InputVersion,
         publish: impl FnOnce() -> Result<Option<Commit>, String>,
     ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
-        self.serialized(|| self.coordinated_locked(base, publish, None))
+        self.coordinated(|server| server.coordinated_locked(base, publish, None))
     }
 
     fn coordinated_locked(
@@ -1087,8 +1173,8 @@ impl Server {
         self.publish_locked(base, commit, targets).map(Some)
     }
 
-    /// Apply `commit` as the version after `base`; the caller holds the
-    /// publication off.
+    /// Apply `commit` as the version after `base`; the caller is the
+    /// authority.
     pub(crate) fn publish_locked(
         &self,
         base: InputVersion,
@@ -1117,8 +1203,10 @@ impl Server {
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
         let targets = target_map(replacements)
             .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
-        self.serialized(|| self.coordinated_locked(base, || publish().map(Some), Some(targets)))
-            .map(|stamp| stamp.expect("a coordinated commit always publishes"))
+        self.coordinated(|server| {
+            server.coordinated_locked(base, || publish().map(Some), Some(targets))
+        })
+        .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
     /// Discard cursor history strictly before `oldest_available`.
@@ -1165,28 +1253,6 @@ impl Server {
     pub fn sweep_expired(&self) {
         self.inner.prune_leases();
         self.inner.live_connections();
-    }
-}
-
-/// A held publication ([`Server::publication_lock`]).
-pub struct PublicationLock<'a> {
-    server: &'a Server,
-    _guard: Option<Box<dyn PublicationGuard + 'a>>,
-}
-
-impl PublicationLock<'_> {
-    pub fn current_stamp(&self) -> SnapshotStamp {
-        self.server.current_stamp()
-    }
-
-    pub fn coordinated_commit(
-        &mut self,
-        base: InputVersion,
-        publish: impl FnOnce() -> Result<Commit, String>,
-    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.server
-            .coordinated_locked(base, || publish().map(Some), None)
-            .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 }
 
@@ -2099,8 +2165,8 @@ impl Inner {
 }
 
 /// Publish an authoring-backend commit as the version after `base`. The
-/// caller holds the publication ([`Server::serialized`]) across the
-/// backend's prepare step and this.
+/// caller is the authority ([`Server::authority`]) across the backend's
+/// prepare step and this.
 pub(crate) fn publish_backend_commit(
     server: &Server,
     base: InputVersion,

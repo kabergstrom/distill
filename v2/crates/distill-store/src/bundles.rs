@@ -493,7 +493,7 @@ impl Store {
 
     /// Complete tag extraction after the owning input transaction has made
     /// the candidate namespace readable but before that version is exposed by
-    /// the coordinator's RPC publication lock. This deliberately does not
+    /// the authority's RPC publication step. This deliberately does not
     /// advance the input version: a crash between the namespace transaction
     /// and this refinement leaves the conservative pending poison intact.
     pub fn refine_unpublished_tag_index(

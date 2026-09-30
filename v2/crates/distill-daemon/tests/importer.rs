@@ -233,7 +233,6 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         },
     );
     coordinator
-        .server()
         .coordinated_commit(InputVersion(1), || {
             store
                 .lock()
@@ -254,7 +253,6 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let imported_bundle = Arc::new(std::sync::Mutex::new(None));
     let captured = Arc::clone(&imported_bundle);
     coordinator
-        .server()
         .coordinated_commit(InputVersion(2), || {
             let prepared = backend
                 .prepare_import(
@@ -465,7 +463,6 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         },
     );
     coordinator
-        .server()
         .coordinated_commit(InputVersion(1), || {
             store
                 .lock()

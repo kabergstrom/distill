@@ -1,9 +1,10 @@
 //! Single-writer daemon coordinator.
 //!
-//! Filesystem scans are candidates. Publication happens only through one
-//! server-serialized closure which rechecks the durable store basis, applies
-//! the complete SQLite input transaction, and returns the exact immutable RPC
-//! projection for the same successor version.
+//! Filesystem scans are candidates. Publication happens only on the
+//! authority thread ([`crate::authority`]), through one closure which
+//! rechecks the durable store basis, applies the complete SQLite input
+//! transaction, and returns the exact RPC projection for the same successor
+//! version.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -48,6 +49,7 @@ use distill_store::state::{
 };
 use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
 
+use crate::authority::{Authority, AuthoritySender};
 use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
@@ -108,6 +110,8 @@ pub struct DaemonCoordinator {
     configuration_poison: Mutex<Option<ConfigurationPoison>>,
     operational: Mutex<OperationalRuntime>,
     operational_wake: Condvar,
+    /// Last: stopped (and joined) after everything else is gone.
+    authority: Authority,
 }
 
 struct OperationalRuntime {
@@ -211,12 +215,13 @@ impl DaemonCoordinator {
                 Ok(())
             })?;
         }
+        let authority = Authority::start();
         let server = ServerHandle::open(
             store_config.clone(),
             backend.clone(),
             Arc::new(DaemonStore {
                 store: Arc::clone(&store),
-                publication: Mutex::new(()),
+                authority: authority.sender().clone(),
             }),
         )?;
         let pipeline = CoordinatedPipelineRuntime {
@@ -253,7 +258,29 @@ impl DaemonCoordinator {
             configuration_poison: Mutex::new(None),
             operational: Mutex::new(operational),
             operational_wake: Condvar::new(),
+            authority,
         })
+    }
+
+    /// The authority thread's inbox.
+    pub(crate) fn authority_sender(&self) -> &AuthoritySender {
+        self.authority.sender()
+    }
+
+    /// Run `step` on the authority (inline when already on it).
+    pub fn on_authority<T: Send>(&self, step: impl FnOnce() -> T + Send) -> T {
+        self.server
+            .on_authority(step)
+            .expect("the authority runs while its coordinator is alive")
+    }
+
+    /// Publish one coordinated step against `base` on the authority.
+    pub fn coordinated_commit(
+        &self,
+        base: InputVersion,
+        publish: impl FnOnce() -> Result<Commit, String> + Send,
+    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
+        self.on_authority(|| self.server().coordinated_commit(base, publish))
     }
 
     /// This thread's RPC front end.
@@ -307,33 +334,35 @@ impl DaemonCoordinator {
     pub(crate) fn sync_runtime_pipeline_poison(
         &self,
     ) -> Result<Option<PipelinePoison>, CoordinatorError> {
-        let runtime = lock_pipeline(&self.pipeline);
-        let Some(epoch) = runtime.host.published_ready_epoch() else {
-            return Ok(None);
-        };
-        let observed = match runtime.host.snapshot().epoch() {
-            Ok(_) => return Ok(None),
-            Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => {
-                (epoch.dylib_hash(), poison)
-            }
-            Err(_) => return Ok(None),
-        };
-        let diagnostic = observed.1.clone();
-        self.server()
-            .coordinated_runtime_pipeline_poison(diagnostic, || {
-                let mut store = lock_store(&self.store);
-                match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
-                    Ok(()) => Ok(()),
-                    Err(StoreError::StalePublishedPipeline {
-                        actual: Some(actual),
-                        already_unavailable: true,
-                        ..
-                    }) if actual == observed.0 => Ok(()),
-                    Err(error) => Err(error.to_string()),
+        self.on_authority(|| {
+            let runtime = lock_pipeline(&self.pipeline);
+            let Some(epoch) = runtime.host.published_ready_epoch() else {
+                return Ok(None);
+            };
+            let observed = match runtime.host.snapshot().epoch() {
+                Ok(_) => return Ok(None),
+                Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => {
+                    (epoch.dylib_hash(), poison)
                 }
-            })
-            .map_err(CoordinatorError::RuntimePipeline)?;
-        Ok(Some(observed.1))
+                Err(_) => return Ok(None),
+            };
+            let diagnostic = observed.1.clone();
+            self.server()
+                .coordinated_runtime_pipeline_poison(diagnostic, || {
+                    let mut store = lock_store(&self.store);
+                    match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
+                        Ok(()) => Ok(()),
+                        Err(StoreError::StalePublishedPipeline {
+                            actual: Some(actual),
+                            already_unavailable: true,
+                            ..
+                        }) if actual == observed.0 => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })
+                .map_err(CoordinatorError::RuntimePipeline)?;
+            Ok(Some(observed.1))
+        })
     }
 
     pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
@@ -441,68 +470,76 @@ impl DaemonCoordinator {
         store_config: &StoreConfig,
         max_dependency_depth: usize,
     ) -> Result<(), CoordinatorError> {
-        let scheduler = SchedulerConfig {
-            parallelism: store_config.parallelism,
-            batch_reserved_workers: store_config.batch_reserved_workers,
-            max_dependency_depth,
-        };
-        scheduler
-            .validate()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let replacement_pool = {
-            let operational = self
+        self.on_authority(|| {
+            let scheduler = SchedulerConfig {
+                parallelism: store_config.parallelism,
+                batch_reserved_workers: store_config.batch_reserved_workers,
+                max_dependency_depth,
+            };
+            scheduler
+                .validate()
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            let replacement_pool = {
+                let operational = self
+                    .operational
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (operational.scheduler.config().parallelism != scheduler.parallelism)
+                    .then(|| build_worker_pool(scheduler.parallelism))
+                    .transpose()
+                    .map_err(CoordinatorError::InvalidManifest)?
+            };
+            lock_store(&self.store)
+                .apply_operational_config(store_config)
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            let mut operational = self
                 .operational
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (operational.scheduler.config().parallelism != scheduler.parallelism)
-                .then(|| build_worker_pool(scheduler.parallelism))
-                .transpose()
-                .map_err(CoordinatorError::InvalidManifest)?
-        };
-        lock_store(&self.store)
-            .apply_operational_config(store_config)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let mut operational = self
-            .operational
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        operational
-            .scheduler
-            .reconfigure(scheduler)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        if let Some(worker_pool) = replacement_pool {
-            operational.worker_pool = worker_pool;
-        }
-        operational.scheduler.admit();
-        self.operational_wake.notify_all();
-        Ok(())
+            operational
+                .scheduler
+                .reconfigure(scheduler)
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            if let Some(worker_pool) = replacement_pool {
+                operational.worker_pool = worker_pool;
+            }
+            operational.scheduler.admit();
+            self.operational_wake.notify_all();
+            Ok(())
+        })
     }
 
     pub fn stage_restart_configuration(
         &self,
         changes: &[RestartOnlyChange],
     ) -> Result<PendingRestart, CoordinatorError> {
-        let pending = lock_store(&self.store)
-            .stage_pending_restart(changes)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server().restart_required(pending.keys.clone());
-        Ok(pending)
+        self.on_authority(|| {
+            let pending = lock_store(&self.store)
+                .stage_pending_restart(changes)
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            self.server().restart_required(pending.keys.clone());
+            Ok(pending)
+        })
     }
 
     pub fn clear_restart_configuration(&self) -> Result<(), CoordinatorError> {
-        lock_store(&self.store)
-            .clear_pending_restart()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server().restart_required(Vec::new());
-        Ok(())
+        self.on_authority(|| {
+            lock_store(&self.store)
+                .clear_pending_restart()
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            self.server().restart_required(Vec::new());
+            Ok(())
+        })
     }
 
     /// Run §14's journaled displaced-inode retention sweep using the current
     /// operational-live retention window.
     pub fn sweep_displaced_retention(&self, now_secs: i64) -> Result<usize, CoordinatorError> {
-        lock_store(&self.store)
-            .sweep_displaced(now_secs)
-            .map_err(|error| CoordinatorError::Maintenance(error.to_string()))
+        self.on_authority(|| {
+            lock_store(&self.store)
+                .sweep_displaced(now_secs)
+                .map_err(|error| CoordinatorError::Maintenance(error.to_string()))
+        })
     }
 
     fn configuration_poison(&self) -> Option<ConfigurationPoison> {
@@ -564,358 +601,365 @@ impl DaemonCoordinator {
         reason: DscpV1,
         message: impl Into<String>,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let poison = ConfigurationPoison::from_reason(&reason, message);
-        let previous = {
-            let mut current = self
-                .configuration_poison
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            current.replace(poison)
-        };
-        match self.publish_cached_scan() {
-            Ok(stamp) => Ok(stamp),
-            Err(error) => {
-                *self
+        let message: String = message.into();
+        self.on_authority(|| {
+            let poison = ConfigurationPoison::from_reason(&reason, message);
+            let previous = {
+                let mut current = self
                     .configuration_poison
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
-                Err(error)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                current.replace(poison)
+            };
+            match self.publish_cached_scan() {
+                Ok(stamp) => Ok(stamp),
+                Err(error) => {
+                    *self
+                        .configuration_poison
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+                    Err(error)
+                }
             }
-        }
+        })
     }
 
     pub fn heal_configuration_rejection(&self) -> Result<SnapshotStamp, CoordinatorError> {
-        let previous = self
-            .configuration_poison
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        match self.publish_cached_scan() {
-            Ok(stamp) => Ok(stamp),
-            Err(error) => {
-                *self
-                    .configuration_poison
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
-                Err(error)
+        self.on_authority(|| {
+            let previous = self
+                .configuration_poison
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            match self.publish_cached_scan() {
+                Ok(stamp) => Ok(stamp),
+                Err(error) => {
+                    *self
+                        .configuration_poison
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+                    Err(error)
+                }
             }
-        }
+        })
     }
 
     pub(crate) fn publish_configuration_candidate(
         &self,
         candidate: ConfigurationCandidate,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let ConfigurationCandidate {
-            roots,
-            lineage_destination,
-            targets,
-            build_targets,
-            pipeline_source,
-            mut requirements,
-            schema_authority,
-        } = candidate;
-        let filesystem = self
-            .authoring
-            .prepare_filesystem_candidate(roots, lineage_destination)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let filesystem_changed = !self.scanner.has_same_roots(filesystem.scanner());
-        // Schema, target, or module-only candidates reuse the already
-        // observed asset snapshot. A physical complete scan is reserved for
-        // an actual configured-root replacement; the lineage destination is
-        // projection authority, not filesystem watch coverage.
-        let candidate_scan_heals =
-            filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
-        let scan = if candidate_scan_heals {
-            filesystem.scanner().scan()?
-        } else {
-            lock_scan_snapshot(&self.scan_snapshot).clone()
-        };
-        let installed_snapshot = scan.clone();
-        let destination = filesystem.lineage_destination().clone();
-        let mut candidate = ScanCandidate::build(
-            filesystem.scanner(),
-            &destination,
-            scan,
-            None,
-            Some(&schema_authority),
-        )?;
-        if !candidate_scan_heals {
-            candidate.version_poison = VersionPoison::select_canonical(
-                candidate
-                    .version_poison
-                    .take()
-                    .into_iter()
-                    .chain(self.pending_scan_version_poison()),
-            )
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        }
-        let mut runtime = lock_pipeline(&self.pipeline);
-        let prepared_epoch = {
-            let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
-            host.prepare_candidate(&pipeline_source, &mut requirements, loader)
-        };
-        let authored_types = requirements
-            .schema_registry
-            .keys()
-            .copied()
-            .filter(|type_uuid| !distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
-            .collect::<Vec<_>>();
-        let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
-            Ok(prepared) => {
-                match PipelineProjection::build(
-                    prepared.processor_descriptors(),
-                    prepared.dylib_hash(),
-                    &build_targets,
-                    authored_types,
-                ) {
-                    Err(error) => {
-                        let cleanup = runtime.host.discard_unpublished(prepared);
-                        let poison = cleanup.unwrap_or_else(|| {
-                            PipelinePoison::new(
-                                PipelinePoisonCode::CandidateRegistration,
-                                PipelinePoisonOrigin::CandidateOpen,
-                                CleanupDisposition::CleanedAndClosed,
-                                format!("invalid target-resolved pipeline map: {error:?}"),
+        self.on_authority(|| {
+            let ConfigurationCandidate {
+                roots,
+                lineage_destination,
+                targets,
+                build_targets,
+                pipeline_source,
+                mut requirements,
+                schema_authority,
+            } = candidate;
+            let filesystem = self
+                .authoring
+                .prepare_filesystem_candidate(roots, lineage_destination)
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            let filesystem_changed = !self.scanner.has_same_roots(filesystem.scanner());
+            // Schema, target, or module-only candidates reuse the already
+            // observed asset snapshot. A physical complete scan is reserved for
+            // an actual configured-root replacement; the lineage destination is
+            // projection authority, not filesystem watch coverage.
+            let candidate_scan_heals =
+                filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
+            let scan = if candidate_scan_heals {
+                filesystem.scanner().scan()?
+            } else {
+                lock_scan_snapshot(&self.scan_snapshot).clone()
+            };
+            let installed_snapshot = scan.clone();
+            let destination = filesystem.lineage_destination().clone();
+            let mut candidate = ScanCandidate::build(
+                filesystem.scanner(),
+                &destination,
+                scan,
+                None,
+                Some(&schema_authority),
+            )?;
+            if !candidate_scan_heals {
+                candidate.version_poison = VersionPoison::select_canonical(
+                    candidate
+                        .version_poison
+                        .take()
+                        .into_iter()
+                        .chain(self.pending_scan_version_poison()),
+                )
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            }
+            let mut runtime = lock_pipeline(&self.pipeline);
+            let prepared_epoch = {
+                let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
+                host.prepare_candidate(&pipeline_source, &mut requirements, loader)
+            };
+            let authored_types = requirements
+                .schema_registry
+                .keys()
+                .copied()
+                .filter(|type_uuid| !distill_core::bootstrap::is_bootstrap_control_type(*type_uuid))
+                .collect::<Vec<_>>();
+            let (pipeline, mut prepared_epoch, projection) = match prepared_epoch {
+                Ok(prepared) => {
+                    match PipelineProjection::build(
+                        prepared.processor_descriptors(),
+                        prepared.dylib_hash(),
+                        &build_targets,
+                        authored_types,
+                    ) {
+                        Err(error) => {
+                            let cleanup = runtime.host.discard_unpublished(prepared);
+                            let poison = cleanup.unwrap_or_else(|| {
+                                PipelinePoison::new(
+                                    PipelinePoisonCode::CandidateRegistration,
+                                    PipelinePoisonOrigin::CandidateOpen,
+                                    CleanupDisposition::CleanedAndClosed,
+                                    format!("invalid target-resolved pipeline map: {error:?}"),
+                                )
+                                .expect("candidate-registration cleanup tuple is valid")
+                            });
+                            (
+                                ConfigurationPipelinePublication::Poison(poison),
+                                None,
+                                PipelineProjection::default(),
                             )
-                            .expect("candidate-registration cleanup tuple is valid")
-                        });
-                        (
-                            ConfigurationPipelinePublication::Poison(poison),
-                            None,
-                            PipelineProjection::default(),
-                        )
-                    }
-                    Ok(projection) => {
-                        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
-                            Ok(stored) => stored,
-                            Err(error) => {
+                        }
+                        Ok(projection) => {
+                            let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+                                Ok(stored) => stored,
+                                Err(error) => {
+                                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                                        drop(runtime);
+                                        return self.publish_pipeline_rejection(poison);
+                                    }
+                                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
+                                }
+                            };
+                            if let Err(error) = self.authoring.prepare_pipeline_importers(
+                                EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
+                            ) {
                                 if let Some(poison) = runtime.host.discard_unpublished(prepared) {
                                     drop(runtime);
                                     return self.publish_pipeline_rejection(poison);
                                 }
-                                return Err(CoordinatorError::InvalidManifest(error.to_string()));
+                                return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
                             }
-                        };
-                        if let Err(error) = self.authoring.prepare_pipeline_importers(
-                            EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
-                        ) {
-                            if let Some(poison) = runtime.host.discard_unpublished(prepared) {
-                                drop(runtime);
-                                return self.publish_pipeline_rejection(poison);
-                            }
-                            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
+                            let tools = prepared.tool_epoch();
+                            (
+                                ConfigurationPipelinePublication::Epoch {
+                                    epoch: stored,
+                                    tools,
+                                },
+                                Some(prepared),
+                                projection,
+                            )
                         }
-                        let tools = prepared.tool_epoch();
-                        (
-                            ConfigurationPipelinePublication::Epoch {
-                                epoch: stored,
-                                tools,
-                            },
-                            Some(prepared),
-                            projection,
-                        )
                     }
                 }
-            }
-            Err(poison) => (
-                ConfigurationPipelinePublication::Poison(poison),
-                None,
-                PipelineProjection::default(),
-            ),
-        };
-        let installed_projection = match ScanProjectionIndex::build(
-            &installed_snapshot,
-            &projection,
-            Some(&schema_authority),
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
+                Err(poison) => (
+                    ConfigurationPipelinePublication::Poison(poison),
+                    None,
+                    PipelineProjection::default(),
+                ),
+            };
+            let installed_projection = match ScanProjectionIndex::build(
+                &installed_snapshot,
+                &projection,
+                Some(&schema_authority),
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                        drop(runtime);
+                        return self.publish_pipeline_rejection(poison);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
-        let filesystem = Arc::new(Mutex::new(Some(filesystem)));
-        let captured = Arc::clone(&filesystem);
-        let tag_epoch = schema_authority.source_hash();
-        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let base = self.server().current_stamp().version;
-        let store = Arc::clone(&self.store);
-        let fallback_bundles = match lock_store(&store).all_asset_bundles() {
-            Ok(bundles) => bundles,
-            Err(error) => {
-                if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
+            };
+            let filesystem = Arc::new(Mutex::new(Some(filesystem)));
+            let captured = Arc::clone(&filesystem);
+            let tag_epoch = schema_authority.source_hash();
+            let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+            let base = self.server().current_stamp().version;
+            let store = Arc::clone(&self.store);
+            let fallback_bundles = match lock_store(&store).all_asset_bundles() {
+                Ok(bundles) => bundles,
+                Err(error) => {
+                    if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                        drop(runtime);
+                        return self.publish_pipeline_rejection(poison);
+                    }
+                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
                 }
-                return Err(CoordinatorError::InvalidManifest(error.to_string()));
-            }
-        };
-        let authoring = Arc::clone(&self.authoring);
-        let cleanup_failure = Arc::new(Mutex::new(None));
-        let captured_cleanup_failure = Arc::clone(&cleanup_failure);
-        let result = self
-            .server()
-            .coordinated_replace_target_set(base, targets, || {
-                let mut commit = publish_scan(
-                    &store,
-                    base,
-                    candidate,
-                    true,
-                    Some(&pipeline),
-                    &projection,
-                    tag_epoch,
-                )
-                .map_err(|error| error.to_string())?;
-                let published_pipeline = commit
-                    .pipeline
-                    .clone()
-                    .expect("scan commit always carries pipeline diagnostics");
-                let filesystem: AuthoringFilesystemCandidate = captured
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .expect("configuration candidate installs once");
-                self.scanner.replace_from(filesystem.scanner());
-                authoring.install_filesystem_candidate(filesystem);
-                *lock_scan_snapshot(&self.scan_snapshot) = installed_snapshot;
-                *lock_scan_projection(&self.scan_projection) = installed_projection;
-                self.scan_initialized.store(true, Ordering::Release);
-                if candidate_scan_heals {
-                    self.scan_rejection
+            };
+            let authoring = Arc::clone(&self.authoring);
+            let cleanup_failure = Arc::new(Mutex::new(None));
+            let captured_cleanup_failure = Arc::clone(&cleanup_failure);
+            let result = self
+                .server()
+                .coordinated_replace_target_set(base, targets, || {
+                    let mut commit = publish_scan(
+                        &store,
+                        base,
+                        candidate,
+                        true,
+                        Some(&pipeline),
+                        &projection,
+                        tag_epoch,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let published_pipeline = commit
+                        .pipeline
+                        .clone()
+                        .expect("scan commit always carries pipeline diagnostics");
+                    let filesystem: AuthoringFilesystemCandidate = captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("configuration candidate installs once");
+                    self.scanner.replace_from(filesystem.scanner());
+                    authoring.install_filesystem_candidate(filesystem);
+                    *lock_scan_snapshot(&self.scan_snapshot) = installed_snapshot;
+                    *lock_scan_projection(&self.scan_projection) = installed_projection;
+                    self.scan_initialized.store(true, Ordering::Release);
+                    if candidate_scan_heals {
+                        self.scan_rejection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        self.scan_healthy.store(true, Ordering::Release);
+                    }
+                    *self
+                        .lineage_destination
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = destination;
+                    *self
+                        .schema_authority
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Arc::clone(&schema_authority));
+                    *self
+                        .build_targets
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = build_targets.clone();
+                    authoring.install_pipeline_projection(projection.clone());
+                    self.configuration_poison
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
-                    self.scan_healthy.store(true, Ordering::Release);
+                    match (&pipeline, prepared_epoch.take(), published_pipeline) {
+                        (
+                            ConfigurationPipelinePublication::Epoch { .. },
+                            Some(prepared),
+                            PipelineDiagnostic::Ready,
+                        ) => {
+                            let importers = EpochAuthoringImporter::all(&prepared);
+                            record_cleanup_failure(
+                                &captured_cleanup_failure,
+                                discard_pending(&mut runtime),
+                            );
+                            runtime.host.install_ready(prepared);
+                            authoring
+                                .replace_pipeline_importers(importers)
+                                .expect("candidate importer metadata was prevalidated");
+                        }
+                        (
+                            ConfigurationPipelinePublication::Epoch { epoch, .. },
+                            Some(prepared),
+                            PipelineDiagnostic::SchemaAcceptanceRequired(_)
+                            | PipelineDiagnostic::RetiredTypeReferenced(_),
+                        ) => {
+                            record_cleanup_failure(
+                                &captured_cleanup_failure,
+                                discard_pending(&mut runtime),
+                            );
+                            let fence = PipelinePoison::new(
+                                PipelinePoisonCode::CandidateValidation,
+                                PipelinePoisonOrigin::CandidateOpen,
+                                CleanupDisposition::None,
+                                "pipeline candidate requires explicit schema acceptance",
+                            )
+                            .expect("schema-acceptance fence is valid");
+                            runtime.host.install_poison(fence);
+                            runtime.pending = Some(PendingPipelineEpoch {
+                                loaded: prepared,
+                                stored: epoch.clone(),
+                            });
+                            authoring.install_pipeline_importers(BTreeMap::new());
+                        }
+                        (
+                            ConfigurationPipelinePublication::Epoch { .. },
+                            Some(prepared),
+                            PipelineDiagnostic::Poisoned(error),
+                        ) => {
+                            record_cleanup_failure(
+                                &captured_cleanup_failure,
+                                runtime.host.discard_unpublished(prepared),
+                            );
+                            record_cleanup_failure(
+                                &captured_cleanup_failure,
+                                discard_pending(&mut runtime),
+                            );
+                            runtime.host.install_poison(error);
+                            authoring.install_pipeline_importers(BTreeMap::new());
+                        }
+                        (
+                            ConfigurationPipelinePublication::Poison(poison),
+                            None,
+                            PipelineDiagnostic::Poisoned(_)
+                            | PipelineDiagnostic::RetiredTypeReferenced(_),
+                        ) => {
+                            record_cleanup_failure(
+                                &captured_cleanup_failure,
+                                discard_pending(&mut runtime),
+                            );
+                            runtime.host.install_poison(poison.clone());
+                            authoring.install_pipeline_importers(BTreeMap::new());
+                        }
+                        _ => unreachable!(
+                            "durable configuration pipeline state must match its prepared candidate"
+                        ),
+                    }
+                    crate::build::refine_published_tag_index(
+                        Arc::clone(&store),
+                        self.scanner.clone(),
+                        Arc::clone(&schema_authority),
+                        runtime.host.snapshot(),
+                        &build_targets,
+                        max_dependency_depth,
+                        &commit_asset_bundles(&commit, &fallback_bundles),
+                    )
+                    .apply(&mut commit);
+                    commit.pipeline_epoch_changed = true;
+                    Ok(commit)
+                });
+            match result {
+                Ok(stamp) => {
+                    let poison = cleanup_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(poison) = poison {
+                        drop(runtime);
+                        self.publish_pipeline_rejection(poison)
+                    } else {
+                        Ok(stamp)
+                    }
                 }
-                *self
-                    .lineage_destination
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = destination;
-                *self
-                    .schema_authority
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(Arc::clone(&schema_authority));
-                *self
-                    .build_targets
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = build_targets.clone();
-                authoring.install_pipeline_projection(projection.clone());
-                self.configuration_poison
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                match (&pipeline, prepared_epoch.take(), published_pipeline) {
-                    (
-                        ConfigurationPipelinePublication::Epoch { .. },
-                        Some(prepared),
-                        PipelineDiagnostic::Ready,
-                    ) => {
-                        let importers = EpochAuthoringImporter::all(&prepared);
-                        record_cleanup_failure(
-                            &captured_cleanup_failure,
-                            discard_pending(&mut runtime),
-                        );
-                        runtime.host.install_ready(prepared);
-                        authoring
-                            .replace_pipeline_importers(importers)
-                            .expect("candidate importer metadata was prevalidated");
+                Err(error) => {
+                    if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                        drop(runtime);
+                        return self.publish_pipeline_rejection(poison);
                     }
-                    (
-                        ConfigurationPipelinePublication::Epoch { epoch, .. },
-                        Some(prepared),
-                        PipelineDiagnostic::SchemaAcceptanceRequired(_)
-                        | PipelineDiagnostic::RetiredTypeReferenced(_),
-                    ) => {
-                        record_cleanup_failure(
-                            &captured_cleanup_failure,
-                            discard_pending(&mut runtime),
-                        );
-                        let fence = PipelinePoison::new(
-                            PipelinePoisonCode::CandidateValidation,
-                            PipelinePoisonOrigin::CandidateOpen,
-                            CleanupDisposition::None,
-                            "pipeline candidate requires explicit schema acceptance",
-                        )
-                        .expect("schema-acceptance fence is valid");
-                        runtime.host.install_poison(fence);
-                        runtime.pending = Some(PendingPipelineEpoch {
-                            loaded: prepared,
-                            stored: epoch.clone(),
-                        });
-                        authoring.install_pipeline_importers(BTreeMap::new());
-                    }
-                    (
-                        ConfigurationPipelinePublication::Epoch { .. },
-                        Some(prepared),
-                        PipelineDiagnostic::Poisoned(error),
-                    ) => {
-                        record_cleanup_failure(
-                            &captured_cleanup_failure,
-                            runtime.host.discard_unpublished(prepared),
-                        );
-                        record_cleanup_failure(
-                            &captured_cleanup_failure,
-                            discard_pending(&mut runtime),
-                        );
-                        runtime.host.install_poison(error);
-                        authoring.install_pipeline_importers(BTreeMap::new());
-                    }
-                    (
-                        ConfigurationPipelinePublication::Poison(poison),
-                        None,
-                        PipelineDiagnostic::Poisoned(_)
-                        | PipelineDiagnostic::RetiredTypeReferenced(_),
-                    ) => {
-                        record_cleanup_failure(
-                            &captured_cleanup_failure,
-                            discard_pending(&mut runtime),
-                        );
-                        runtime.host.install_poison(poison.clone());
-                        authoring.install_pipeline_importers(BTreeMap::new());
-                    }
-                    _ => unreachable!(
-                        "durable configuration pipeline state must match its prepared candidate"
-                    ),
-                }
-                crate::build::refine_published_tag_index(
-                    Arc::clone(&store),
-                    self.scanner.clone(),
-                    Arc::clone(&schema_authority),
-                    runtime.host.snapshot(),
-                    &build_targets,
-                    max_dependency_depth,
-                    &commit_asset_bundles(&commit, &fallback_bundles),
-                )
-                .apply(&mut commit);
-                commit.pipeline_epoch_changed = true;
-                Ok(commit)
-            });
-        match result {
-            Ok(stamp) => {
-                let poison = cleanup_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                if let Some(poison) = poison {
-                    drop(runtime);
-                    self.publish_pipeline_rejection(poison)
-                } else {
-                    Ok(stamp)
+                    Err(CoordinatorError::Coordinated(error))
                 }
             }
-            Err(error) => {
-                if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
-                }
-                Err(CoordinatorError::Coordinated(error))
-            }
-        }
+        })
     }
 
     /// Stage, attest, durably publish, and only then expose one pipeline
@@ -926,178 +970,180 @@ impl DaemonCoordinator {
         source: &std::path::Path,
         mut requirements: CandidateRequirements,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let base = self.server().current_stamp().version;
-        let mut runtime = lock_pipeline(&self.pipeline);
-        let prepared = {
-            let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
-            host.prepare_candidate(source, &mut requirements, loader)
-        };
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(poison) => {
-                drop(runtime);
-                return self.publish_pipeline_rejection(poison);
-            }
-        };
+        self.on_authority(|| {
+            let base = self.server().current_stamp().version;
+            let mut runtime = lock_pipeline(&self.pipeline);
+            let prepared = {
+                let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
+                host.prepare_candidate(source, &mut requirements, loader)
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(poison) => {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
+            };
 
-        let stored = match stored_pipeline_epoch(&prepared, &requirements) {
-            Ok(stored) => stored,
-            Err(error) => {
-                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
-                }
-                return Err(CoordinatorError::InvalidManifest(error.to_string()));
-            }
-        };
-        if let Err(error) =
-            self.authoring
-                .prepare_pipeline_importers(EpochAuthoringImporter::metadata_only(
-                    prepared.importer_descriptors(),
-                ))
-        {
-            if let Some(poison) = runtime.host.discard_unpublished(prepared) {
-                drop(runtime);
-                return self.publish_pipeline_rejection(poison);
-            }
-            return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
-        }
-        let store = Arc::clone(&self.store);
-        let tools = prepared.tool_epoch();
-        let authority = match self.schema_authority() {
-            Some(authority) => authority,
-            None => {
-                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
-                }
-                return Err(CoordinatorError::InvalidManifest(
-                    "pipeline publication requires project schema authority".to_owned(),
-                ));
-            }
-        };
-        let tag_epoch = authority.source_hash();
-        let asset_bundles = match lock_store(&store).all_asset_bundles() {
-            Ok(bundles) => bundles,
-            Err(error) => {
-                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
-                }
-                return Err(CoordinatorError::InvalidManifest(error.to_string()));
-            }
-        };
-        let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
-        let targets = self
-            .build_targets
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let scanner = self.scanner.clone();
-        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let mut prepared = Some(prepared);
-        let cleanup_failure = Arc::new(Mutex::new(None));
-        let captured_cleanup_failure = Arc::clone(&cleanup_failure);
-        let result = self.server().coordinated_commit(base, || {
-            let mut durable = lock_store(&store);
-            if durable.input_version() != base {
-                return Err(format!(
-                    "durable pipeline basis is {:?}, expected {base:?}",
-                    durable.input_version()
-                ));
-            }
-            let mut acceptance = None;
-            durable
-                .input_transaction(|transaction| {
-                    acceptance = Some(transaction.pipeline_acceptance_requirement(&stored)?);
-                    if transaction.publish_pipeline_epoch(&stored)? {
-                        transaction.publish_tool_epoch(&tools)?;
-                    }
-                    for asset in &assets {
-                        transaction.set_tag_index_pending(*asset, tag_epoch)?;
-                    }
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
-            drop(durable);
-            let candidate = prepared
-                .take()
-                .expect("pipeline candidate is installed once");
-            let diagnostic = match acceptance.expect("pipeline outcome is captured in-transaction")
-            {
-                None => {
-                    let importers = EpochAuthoringImporter::all(&candidate);
-                    record_cleanup_failure(
-                        &captured_cleanup_failure,
-                        discard_pending(&mut runtime),
-                    );
-                    runtime.host.install_ready(candidate);
-                    self.authoring
-                        .replace_pipeline_importers(importers)
-                        .expect("candidate importer metadata was prevalidated");
-                    PipelineDiagnostic::Ready
-                }
-                Some(required) => {
-                    record_cleanup_failure(
-                        &captured_cleanup_failure,
-                        discard_pending(&mut runtime),
-                    );
-                    let fence = PipelinePoison::new(
-                        PipelinePoisonCode::CandidateValidation,
-                        PipelinePoisonOrigin::CandidateOpen,
-                        CleanupDisposition::None,
-                        "pipeline candidate requires explicit schema acceptance",
-                    )
-                    .expect("schema-acceptance fence is a valid candidate poison");
-                    runtime.host.install_poison(fence);
-                    runtime.pending = Some(PendingPipelineEpoch {
-                        loaded: candidate,
-                        stored: stored.clone(),
-                    });
-                    self.authoring.install_pipeline_importers(BTreeMap::new());
-                    PipelineDiagnostic::SchemaAcceptanceRequired(required)
-                }
-            };
-            let mut commit = Commit {
-                pipeline: Some(diagnostic),
-                pipeline_epoch_changed: true,
-                ..Commit::default()
-            };
-            crate::build::refine_published_tag_index(
-                Arc::clone(&store),
-                scanner,
-                Arc::clone(&authority),
-                runtime.host.snapshot(),
-                &targets,
-                max_dependency_depth,
-                &asset_bundles,
-            )
-            .apply(&mut commit);
-            Ok(commit)
-        });
-        match result {
-            Ok(stamp) => {
-                let poison = cleanup_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                if let Some(poison) = poison {
-                    drop(runtime);
-                    self.publish_pipeline_rejection(poison)
-                } else {
-                    Ok(stamp)
-                }
-            }
-            Err(error) => {
-                if let Some(candidate) = prepared.take() {
-                    if let Some(poison) = runtime.host.discard_unpublished(candidate) {
+            let stored = match stored_pipeline_epoch(&prepared, &requirements) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
                         drop(runtime);
                         return self.publish_pipeline_rejection(poison);
                     }
+                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
                 }
-                Err(CoordinatorError::Coordinated(error))
+            };
+            if let Err(error) =
+                self.authoring
+                    .prepare_pipeline_importers(EpochAuthoringImporter::metadata_only(
+                        prepared.importer_descriptors(),
+                    ))
+            {
+                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    drop(runtime);
+                    return self.publish_pipeline_rejection(poison);
+                }
+                return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
             }
-        }
+            let store = Arc::clone(&self.store);
+            let tools = prepared.tool_epoch();
+            let authority = match self.schema_authority() {
+                Some(authority) => authority,
+                None => {
+                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                        drop(runtime);
+                        return self.publish_pipeline_rejection(poison);
+                    }
+                    return Err(CoordinatorError::InvalidManifest(
+                        "pipeline publication requires project schema authority".to_owned(),
+                    ));
+                }
+            };
+            let tag_epoch = authority.source_hash();
+            let asset_bundles = match lock_store(&store).all_asset_bundles() {
+                Ok(bundles) => bundles,
+                Err(error) => {
+                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                        drop(runtime);
+                        return self.publish_pipeline_rejection(poison);
+                    }
+                    return Err(CoordinatorError::InvalidManifest(error.to_string()));
+                }
+            };
+            let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
+            let targets = self
+                .build_targets
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let scanner = self.scanner.clone();
+            let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+            let mut prepared = Some(prepared);
+            let cleanup_failure = Arc::new(Mutex::new(None));
+            let captured_cleanup_failure = Arc::clone(&cleanup_failure);
+            let result = self.server().coordinated_commit(base, || {
+                let mut durable = lock_store(&store);
+                if durable.input_version() != base {
+                    return Err(format!(
+                        "durable pipeline basis is {:?}, expected {base:?}",
+                        durable.input_version()
+                    ));
+                }
+                let mut acceptance = None;
+                durable
+                    .input_transaction(|transaction| {
+                        acceptance = Some(transaction.pipeline_acceptance_requirement(&stored)?);
+                        if transaction.publish_pipeline_epoch(&stored)? {
+                            transaction.publish_tool_epoch(&tools)?;
+                        }
+                        for asset in &assets {
+                            transaction.set_tag_index_pending(*asset, tag_epoch)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                drop(durable);
+                let candidate = prepared
+                    .take()
+                    .expect("pipeline candidate is installed once");
+                let diagnostic = match acceptance.expect("pipeline outcome is captured in-transaction")
+                {
+                    None => {
+                        let importers = EpochAuthoringImporter::all(&candidate);
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            discard_pending(&mut runtime),
+                        );
+                        runtime.host.install_ready(candidate);
+                        self.authoring
+                            .replace_pipeline_importers(importers)
+                            .expect("candidate importer metadata was prevalidated");
+                        PipelineDiagnostic::Ready
+                    }
+                    Some(required) => {
+                        record_cleanup_failure(
+                            &captured_cleanup_failure,
+                            discard_pending(&mut runtime),
+                        );
+                        let fence = PipelinePoison::new(
+                            PipelinePoisonCode::CandidateValidation,
+                            PipelinePoisonOrigin::CandidateOpen,
+                            CleanupDisposition::None,
+                            "pipeline candidate requires explicit schema acceptance",
+                        )
+                        .expect("schema-acceptance fence is a valid candidate poison");
+                        runtime.host.install_poison(fence);
+                        runtime.pending = Some(PendingPipelineEpoch {
+                            loaded: candidate,
+                            stored: stored.clone(),
+                        });
+                        self.authoring.install_pipeline_importers(BTreeMap::new());
+                        PipelineDiagnostic::SchemaAcceptanceRequired(required)
+                    }
+                };
+                let mut commit = Commit {
+                    pipeline: Some(diagnostic),
+                    pipeline_epoch_changed: true,
+                    ..Commit::default()
+                };
+                crate::build::refine_published_tag_index(
+                    Arc::clone(&store),
+                    scanner,
+                    Arc::clone(&authority),
+                    runtime.host.snapshot(),
+                    &targets,
+                    max_dependency_depth,
+                    &asset_bundles,
+                )
+                .apply(&mut commit);
+                Ok(commit)
+            });
+            match result {
+                Ok(stamp) => {
+                    let poison = cleanup_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(poison) = poison {
+                        drop(runtime);
+                        self.publish_pipeline_rejection(poison)
+                    } else {
+                        Ok(stamp)
+                    }
+                }
+                Err(error) => {
+                    if let Some(candidate) = prepared.take() {
+                        if let Some(poison) = runtime.host.discard_unpublished(candidate) {
+                            drop(runtime);
+                            return self.publish_pipeline_rejection(poison);
+                        }
+                    }
+                    Err(CoordinatorError::Coordinated(error))
+                }
+            }
+        })
     }
 
     /// Publish a candidate-input failure which occurs before a module can be
@@ -1108,14 +1154,18 @@ impl DaemonCoordinator {
         &self,
         poison: PipelinePoison,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.publish_pipeline_rejection_inner(poison, false)
+        self.on_authority(|| {
+            self.publish_pipeline_rejection_inner(poison, false)
+        })
     }
 
     pub(crate) fn publish_pipeline_rejection_healing_configuration(
         &self,
         poison: PipelinePoison,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        self.publish_pipeline_rejection_inner(poison, true)
+        self.on_authority(|| {
+            self.publish_pipeline_rejection_inner(poison, true)
+        })
     }
 
     pub(crate) fn pending_schema_transition_context(
@@ -1149,161 +1199,163 @@ impl DaemonCoordinator {
         planned: &PlannedSchemaTransition,
         quarantine: &QuarantineDriver,
     ) -> Result<distill_rpc::DeferredOperationResult, String> {
-        // Keep the exact unpublished candidate reserved through durable
-        // manifest replacement, rescan, and promotion. Ordinary pipeline
-        // staging takes the same mutex, so it cannot replace the candidate
-        // between the store CAS and live installation.
-        let mut runtime = lock_pipeline(&self.pipeline);
-        let (candidate, tools, prepared_importers) = {
-            let pending = runtime.pending.as_ref().ok_or_else(|| {
-                "no loaded pipeline candidate awaits schema acceptance".to_owned()
-            })?;
-            let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
-                .map_err(|error| error.to_string())?;
-            if actual != planned.request.candidate {
-                return Err("loaded schema candidate identity is stale".to_owned());
-            }
-            let importers = self
-                .authoring
-                .prepare_pipeline_importers(EpochAuthoringImporter::all(&pending.loaded))
-                .map_err(|error| format!("candidate importer metadata is invalid: {error:?}"))?;
-            (
-                pending.stored.clone(),
-                pending.loaded.tool_epoch(),
-                importers,
-            )
-        };
-        let transition = IncrementalSchemaTransition {
-            planned,
-            candidate: &candidate,
-            tools: &tools,
-        };
-
-        let temp = plan_same_dir_temp(&planned.target)?;
-        let plan = JournalIntentPlan {
-            target_path: planned
-                .target
-                .to_str()
-                .ok_or_else(|| "schema manifest path is not lossless UTF-8".to_owned())?
-                .to_owned(),
-            temp_path: temp
-                .to_str()
-                .ok_or_else(|| "schema manifest temp path is not lossless UTF-8".to_owned())?
-                .to_owned(),
-            conflict_path: unique_sibling(&planned.target, "conflict")
-                .to_str()
-                .ok_or_else(|| "schema manifest conflict path is not lossless UTF-8".to_owned())?
-                .to_owned(),
-            pre_image_hash: Some(planned.preimage),
-            proposed_hash: planned.proposed.manifest_hash(),
-        };
-        let group_id = {
-            let mut store = lock_store(&self.store);
-            if store.input_version() != base
-                || store
-                    .schema_manifest_basis()
-                    .map_err(|error| error.to_string())?
-                    .as_ref()
-                    != Some(&planned.request.manifest)
-            {
-                return Err("schema transition durable basis is stale".to_owned());
-            }
-            store
-                .preview_input_transaction(|transaction| {
-                    apply_schema_transition(transaction, &transition).map(|_| ())
-                })
-                .map_err(|error| error.to_string())?;
-            let mut publication = quarantine
-                .admit_publication(&mut store)
-                .map_err(|error| error.to_string())?;
-            let basis = SchemaTransitionJournalBasis {
-                base,
-                target: planned.target.clone(),
-                old_manifest_hash: planned.preimage,
-                proposed_manifest_hash: planned.proposed.manifest_hash(),
-            }
-            .encode()?;
-            let group = publication
-                .record_group(PublicationGroupKind::SchemaTransition, &basis, &[plan])
-                .map_err(|error| error.to_string())?;
-            write_planned_temp(&temp, &planned.proposed_bytes)?;
-            publication
-                .arm_group(group.group_id)
-                .map_err(|error| error.to_string())?;
-            let outcome = publication
-                .resume_group_replace(group.child_intents[0], &planned.target)
-                .map_err(|error| error.to_string())?;
-            if outcome != RenameAsideOutcome::Installed {
-                publication
-                    .retire_group(group.group_id)
+        self.on_authority(|| {
+            // Keep the exact unpublished candidate reserved through durable
+            // manifest replacement, rescan, and promotion. Ordinary pipeline
+            // staging takes the same mutex, so it cannot replace the candidate
+            // between the store CAS and live installation.
+            let mut runtime = lock_pipeline(&self.pipeline);
+            let (candidate, tools, prepared_importers) = {
+                let pending = runtime.pending.as_ref().ok_or_else(|| {
+                    "no loaded pipeline candidate awaits schema acceptance".to_owned()
+                })?;
+                let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
                     .map_err(|error| error.to_string())?;
-                return Err(
-                    "schema manifest changed concurrently; its bytes were preserved".to_owned(),
-                );
+                if actual != planned.request.candidate {
+                    return Err("loaded schema candidate identity is stale".to_owned());
+                }
+                let importers = self
+                    .authoring
+                    .prepare_pipeline_importers(EpochAuthoringImporter::all(&pending.loaded))
+                    .map_err(|error| format!("candidate importer metadata is invalid: {error:?}"))?;
+                (
+                    pending.stored.clone(),
+                    pending.loaded.tool_epoch(),
+                    importers,
+                )
+            };
+            let transition = IncrementalSchemaTransition {
+                planned,
+                candidate: &candidate,
+                tools: &tools,
+            };
+
+            let temp = plan_same_dir_temp(&planned.target)?;
+            let plan = JournalIntentPlan {
+                target_path: planned
+                    .target
+                    .to_str()
+                    .ok_or_else(|| "schema manifest path is not lossless UTF-8".to_owned())?
+                    .to_owned(),
+                temp_path: temp
+                    .to_str()
+                    .ok_or_else(|| "schema manifest temp path is not lossless UTF-8".to_owned())?
+                    .to_owned(),
+                conflict_path: unique_sibling(&planned.target, "conflict")
+                    .to_str()
+                    .ok_or_else(|| "schema manifest conflict path is not lossless UTF-8".to_owned())?
+                    .to_owned(),
+                pre_image_hash: Some(planned.preimage),
+                proposed_hash: planned.proposed.manifest_hash(),
+            };
+            let group_id = {
+                let mut store = lock_store(&self.store);
+                if store.input_version() != base
+                    || store
+                        .schema_manifest_basis()
+                        .map_err(|error| error.to_string())?
+                        .as_ref()
+                        != Some(&planned.request.manifest)
+                {
+                    return Err("schema transition durable basis is stale".to_owned());
+                }
+                store
+                    .preview_input_transaction(|transaction| {
+                        apply_schema_transition(transaction, &transition).map(|_| ())
+                    })
+                    .map_err(|error| error.to_string())?;
+                let mut publication = quarantine
+                    .admit_publication(&mut store)
+                    .map_err(|error| error.to_string())?;
+                let basis = SchemaTransitionJournalBasis {
+                    base,
+                    target: planned.target.clone(),
+                    old_manifest_hash: planned.preimage,
+                    proposed_manifest_hash: planned.proposed.manifest_hash(),
+                }
+                .encode()?;
+                let group = publication
+                    .record_group(PublicationGroupKind::SchemaTransition, &basis, &[plan])
+                    .map_err(|error| error.to_string())?;
+                write_planned_temp(&temp, &planned.proposed_bytes)?;
+                publication
+                    .arm_group(group.group_id)
+                    .map_err(|error| error.to_string())?;
+                let outcome = publication
+                    .resume_group_replace(group.child_intents[0], &planned.target)
+                    .map_err(|error| error.to_string())?;
+                if outcome != RenameAsideOutcome::Installed {
+                    publication
+                        .retire_group(group.group_id)
+                        .map_err(|error| error.to_string())?;
+                    return Err(
+                        "schema manifest changed concurrently; its bytes were preserved".to_owned(),
+                    );
+                }
+                group.group_id
+            };
+
+            let projection = self.authoring.pipeline_projection();
+            let mut transition_paths = planned.waiting_paths.clone();
+            transition_paths.push(planned.target.clone());
+            transition_paths.sort();
+            transition_paths.dedup();
+            let commit = publish_incremental_paths_with_schema_transition(
+                &self.scanner,
+                &self.scan_snapshot,
+                &transition_paths,
+                &self
+                    .lineage_destination
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                &self.store,
+                base,
+                &projection,
+                Some(self),
+                Some(&transition),
+            )?;
+
+            let mut terminal_errors = Vec::new();
+            if let Err(error) = lock_store(&self.store).retire_publication_group(group_id) {
+                terminal_errors.push(format!(
+                    "schema transition committed but journal retirement failed: {error}"
+                ));
             }
-            group.group_id
-        };
 
-        let projection = self.authoring.pipeline_projection();
-        let mut transition_paths = planned.waiting_paths.clone();
-        transition_paths.push(planned.target.clone());
-        transition_paths.sort();
-        transition_paths.dedup();
-        let commit = publish_incremental_paths_with_schema_transition(
-            &self.scanner,
-            &self.scan_snapshot,
-            &transition_paths,
-            &self
-                .lineage_destination
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            &self.store,
-            base,
-            &projection,
-            Some(self),
-            Some(&transition),
-        )?;
-
-        let mut terminal_errors = Vec::new();
-        if let Err(error) = lock_store(&self.store).retire_publication_group(group_id) {
-            terminal_errors.push(format!(
-                "schema transition committed but journal retirement failed: {error}"
-            ));
-        }
-
-        if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
-            match runtime.pending.take() {
-                Some(pending) => {
-                    match PipelineCandidateIdentity::try_from(pending.stored.epoch()) {
-                        Ok(actual) if actual == planned.request.candidate => {
-                            runtime.host.install_ready(pending.loaded);
-                            self.authoring
-                                .install_pipeline_importers(prepared_importers);
-                        }
-                        Ok(_) => {
-                            runtime.pending = Some(pending);
-                            terminal_errors.push(
-                                "schema transition committed but the reserved candidate identity changed"
-                                    .to_owned(),
-                            );
-                        }
-                        Err(error) => {
-                            runtime.pending = Some(pending);
-                            terminal_errors.push(format!(
-                                "schema transition committed but the reserved candidate identity became invalid: {error}"
-                            ));
+            if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
+                match runtime.pending.take() {
+                    Some(pending) => {
+                        match PipelineCandidateIdentity::try_from(pending.stored.epoch()) {
+                            Ok(actual) if actual == planned.request.candidate => {
+                                runtime.host.install_ready(pending.loaded);
+                                self.authoring
+                                    .install_pipeline_importers(prepared_importers);
+                            }
+                            Ok(_) => {
+                                runtime.pending = Some(pending);
+                                terminal_errors.push(
+                                    "schema transition committed but the reserved candidate identity changed"
+                                        .to_owned(),
+                                );
+                            }
+                            Err(error) => {
+                                runtime.pending = Some(pending);
+                                terminal_errors.push(format!(
+                                    "schema transition committed but the reserved candidate identity became invalid: {error}"
+                                ));
+                            }
                         }
                     }
+                    None => terminal_errors.push(
+                        "schema transition committed but the reserved candidate disappeared".to_owned(),
+                    ),
                 }
-                None => terminal_errors.push(
-                    "schema transition committed but the reserved candidate disappeared".to_owned(),
-                ),
             }
-        }
 
-        Ok(distill_rpc::DeferredOperationResult {
-            commit,
-            terminal_error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
+            Ok(distill_rpc::DeferredOperationResult {
+                commit,
+                terminal_error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
+            })
         })
     }
 
@@ -1391,48 +1443,48 @@ impl DaemonCoordinator {
 
     /// Reconcile one complete identity-checked namespace scan.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
-        match self.scanner.scan() {
-            Ok(scan) if self.scan_healthy.load(Ordering::Acquire) => {
-                let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
-                if scan.same_namespace_observation(&baseline) {
-                    // Warning-grade exclusions are scanner state, not authored
-                    // input: refresh them without minting an input version.
-                    *baseline = scan;
-                    // Never take the publication lock under the scan
-                    // snapshot (see `Server::publication_lock`).
-                    drop(baseline);
-                    Ok(self.server().current_stamp())
-                } else {
-                    drop(baseline);
-                    self.publish_scan(scan)
+        self.on_authority(|| {
+            match self.scanner.scan() {
+                Ok(scan) if self.scan_healthy.load(Ordering::Acquire) => {
+                    let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
+                    if scan.same_namespace_observation(&baseline) {
+                        // Warning-grade exclusions are scanner state, not authored
+                        // input: refresh them without minting an input version.
+                        *baseline = scan;
+                        drop(baseline);
+                        Ok(self.server().current_stamp())
+                    } else {
+                        drop(baseline);
+                        self.publish_scan(scan)
+                    }
+                }
+                Ok(scan) => self.publish_scan(scan),
+                Err(error) => {
+                    self.scan_healthy.store(false, Ordering::Release);
+                    self.publish_scan_rejection(&error, true)
                 }
             }
-            Ok(scan) => self.publish_scan(scan),
-            Err(error) => {
-                self.scan_healthy.store(false, Ordering::Release);
-                self.publish_scan_rejection(&error, true)
-            }
-        }
+        })
     }
 
-    /// Arm the watcher before startup/recovery traversal. Precise events are
-    /// replayed incrementally after the scan commits; only admitted overflow
-    /// repeats the complete scan.
+    /// Full startup/recovery scan. Events already queued are replayed
+    /// incrementally after the scan commits; only admitted overflow repeats
+    /// the complete scan. Later events wait in the authority inbox.
     pub fn reconcile_startup(
         &self,
-        watcher: &Mutex<WatcherQueue>,
+        queue: &mut WatcherQueue,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         loop {
-            lock_watcher(watcher).arm_scan();
+            queue.arm_scan();
             let scan = self.reconcile_full_scan();
-            let action = lock_watcher(watcher).finish_scan();
+            let action = queue.finish_scan();
             let stamp = match scan {
                 Ok(stamp) => stamp,
                 Err(error) => {
                     // Always release scan ownership. Preserve anything that
                     // arrived while traversal was active so a caller that
                     // retries can still reconcile the complete event union.
-                    lock_watcher(watcher).requeue_action(action);
+                    queue.requeue_action(action);
                     return Err(error);
                 }
             };
@@ -1453,202 +1505,201 @@ impl DaemonCoordinator {
         &self,
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let pending_subjects = self
-            .scan_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|pending| pending.subjects.clone())
-            .unwrap_or_default();
-        let event_keys = batch
-            .paths
-            .iter()
-            .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
-            .collect::<Vec<_>>();
-        let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
-            prefix.0 == candidate.0
-                && (prefix.1.is_empty()
-                    || candidate.1 == prefix.1
-                    || candidate
-                        .1
-                        .strip_prefix(&prefix.1)
-                        .is_some_and(|suffix| suffix.starts_with('/')))
-        };
-        let heals_pending_rejection = pending_subjects.iter().any(|subject| {
-            let physical_overlap = batch.paths.iter().any(|event| {
-                event == subject || subject.starts_with(event) || event.starts_with(subject)
-            });
-            physical_overlap
-                || self
-                    .scanner
-                    .event_path_key(subject)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|subject_key| {
-                        event_keys.iter().any(|event_key| {
-                            logical_contains(&subject_key, event_key)
-                                || logical_contains(event_key, &subject_key)
+        self.on_authority(|| {
+            let pending_subjects = self
+                .scan_rejection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|pending| pending.subjects.clone())
+                .unwrap_or_default();
+            let event_keys = batch
+                .paths
+                .iter()
+                .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
+                .collect::<Vec<_>>();
+            let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
+                prefix.0 == candidate.0
+                    && (prefix.1.is_empty()
+                        || candidate.1 == prefix.1
+                        || candidate
+                            .1
+                            .strip_prefix(&prefix.1)
+                            .is_some_and(|suffix| suffix.starts_with('/')))
+            };
+            let heals_pending_rejection = pending_subjects.iter().any(|subject| {
+                let physical_overlap = batch.paths.iter().any(|event| {
+                    event == subject || subject.starts_with(event) || event.starts_with(subject)
+                });
+                physical_overlap
+                    || self
+                        .scanner
+                        .event_path_key(subject)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|subject_key| {
+                            event_keys.iter().any(|event_key| {
+                                logical_contains(&subject_key, event_key)
+                                    || logical_contains(event_key, &subject_key)
+                            })
                         })
-                    })
-        });
-        let mut scan_paths = batch.paths.clone();
-        if heals_pending_rejection {
-            // Revalidate the complete rejected subject set, but no unrelated
-            // root or subtree. This lets independently repaired defects heal
-            // across separate native batches without falling back to a full
-            // scan.
-            scan_paths.extend(pending_subjects);
-            scan_paths.sort_unstable();
-            scan_paths.dedup();
-        }
-        let mut renames = Vec::new();
-        for rename in &batch.renames {
-            let from = self.scanner.event_path_key(&rename.from)?;
-            let to = self.scanner.event_path_key(&rename.to)?;
-            if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
-                if from_root == to_root {
-                    renames.push(LogicalRename {
-                        root_name: from_root,
-                        from_path,
-                        to_path,
-                    });
-                }
-            }
-        }
-        // Publication lock before the scan snapshot: authoring imports take
-        // the snapshot inside the publication lock (`Server::publication_lock`).
-        let server = self.server();
-        let mut publication = server.publication_lock();
-        let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
-        let delta = match self.scanner.scan_incremental_delta(&baseline, &scan_paths) {
-            Ok(None) => return Ok(publication.current_stamp()),
-            Ok(Some(delta)) => delta,
-            Err(error) => {
-                drop(baseline);
-                drop(publication);
-                self.scan_healthy.store(false, Ordering::Release);
-                return self.publish_scan_rejection(&error, heals_pending_rejection);
-            }
-        };
-        let healed_rejection = heals_pending_rejection
-            .then(|| {
-                self.scan_rejection
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-            })
-            .flatten();
-        if delta.is_same_namespace_observation(&baseline)
-            && renames.is_empty()
-            && self.scan_healthy.load(Ordering::Acquire)
-        {
-            // Diagnostics are replaced with their affected subtree even when
-            // the authored namespace itself did not change.
-            baseline.apply_delta(delta);
-            return Ok(publication.current_stamp());
-        }
-        let projection = self.authoring.pipeline_projection();
-        let authority = self.schema_authority();
-        let mut index = lock_scan_projection(&self.scan_projection);
-        let checkpoint = index.checkpoint(delta.affected_prefixes());
-        let prepared = index
-            .replace_delta(&delta, &projection, authority.as_deref())
-            .and_then(|_| {
-                index.incremental_plan(
-                    &self.scanner,
-                    &self.lineage_destination(),
-                    self.configuration_poison(),
-                )
             });
-        let mut plan = match prepared {
-            Ok(plan) => plan,
-            Err(error) => {
-                index.restore(checkpoint)?;
-                if let Some(rejection) = healed_rejection {
-                    *self
-                        .scan_rejection
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
-                }
-                return Err(error);
+            let mut scan_paths = batch.paths.clone();
+            if heals_pending_rejection {
+                // Revalidate the complete rejected subject set, but no unrelated
+                // root or subtree. This lets independently repaired defects heal
+                // across separate native batches without falling back to a full
+                // scan.
+                scan_paths.extend(pending_subjects);
+                scan_paths.sort_unstable();
+                scan_paths.dedup();
             }
-        };
-        plan.version_poison = VersionPoison::select_canonical(
-            plan.version_poison
-                .take()
-                .into_iter()
-                .chain(self.pending_scan_version_poison()),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let base = publication.current_stamp().version;
-        let store = Arc::clone(&self.store);
-        let tag_epoch = authority
-            .as_ref()
-            .map_or([0; 32], |authority| authority.source_hash());
-        let pipeline = self.pipeline_snapshot();
-        let targets = self
-            .build_targets
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let scanner = self.scanner.clone();
-        let result = publication.coordinated_commit(base, || {
-            let mut commit = publish_incremental_scan(
-                &store,
-                base,
-                &baseline,
-                &delta,
-                &plan,
-                &renames,
-                &projection,
-                tag_epoch,
-                None,
-            )
-            .map_err(|error| error.to_string())?;
-            if let Some(authority) = authority {
-                let affected = commit_affected_asset_bundles(&commit);
-                if !affected.is_empty() {
-                    crate::build::refine_published_tag_index_incremental(
-                        Arc::clone(&store),
-                        scanner,
-                        authority,
-                        pipeline,
-                        &targets,
-                        max_dependency_depth,
-                        &affected,
-                    )
-                    .apply_incremental(&mut commit);
+            let mut renames = Vec::new();
+            for rename in &batch.renames {
+                let from = self.scanner.event_path_key(&rename.from)?;
+                let to = self.scanner.event_path_key(&rename.to)?;
+                if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
+                    if from_root == to_root {
+                        renames.push(LogicalRename {
+                            root_name: from_root,
+                            from_path,
+                            to_path,
+                        });
+                    }
                 }
             }
-            Ok(commit)
-        });
-        match result {
-            Ok(stamp) => {
-                baseline.apply_delta(delta);
-                if plan.version_poison.is_none() {
-                    index.clear_published_pending();
+            // On the authority: no other publication interleaves with this step.
+            let server = self.server();
+            let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
+            let delta = match self.scanner.scan_incremental_delta(&baseline, &scan_paths) {
+                Ok(None) => return Ok(server.current_stamp()),
+                Ok(Some(delta)) => delta,
+                Err(error) => {
+                    drop(baseline);
+                    self.scan_healthy.store(false, Ordering::Release);
+                    return self.publish_scan_rejection(&error, heals_pending_rejection);
                 }
-                self.scan_healthy.store(
+            };
+            let healed_rejection = heals_pending_rejection
+                .then(|| {
                     self.scan_rejection
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_none(),
-                    Ordering::Release,
-                );
-                Ok(stamp)
+                        .take()
+                })
+                .flatten();
+            if delta.is_same_namespace_observation(&baseline)
+                && renames.is_empty()
+                && self.scan_healthy.load(Ordering::Acquire)
+            {
+                // Diagnostics are replaced with their affected subtree even when
+                // the authored namespace itself did not change.
+                baseline.apply_delta(delta);
+                return Ok(server.current_stamp());
             }
-            Err(error) => {
-                index.restore(checkpoint)?;
-                if let Some(rejection) = healed_rejection {
-                    *self
-                        .scan_rejection
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+            let projection = self.authoring.pipeline_projection();
+            let authority = self.schema_authority();
+            let mut index = lock_scan_projection(&self.scan_projection);
+            let checkpoint = index.checkpoint(delta.affected_prefixes());
+            let prepared = index
+                .replace_delta(&delta, &projection, authority.as_deref())
+                .and_then(|_| {
+                    index.incremental_plan(
+                        &self.scanner,
+                        &self.lineage_destination(),
+                        self.configuration_poison(),
+                    )
+                });
+            let mut plan = match prepared {
+                Ok(plan) => plan,
+                Err(error) => {
+                    index.restore(checkpoint)?;
+                    if let Some(rejection) = healed_rejection {
+                        *self
+                            .scan_rejection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                    }
+                    return Err(error);
                 }
-                Err(CoordinatorError::Coordinated(error))
+            };
+            plan.version_poison = VersionPoison::select_canonical(
+                plan.version_poison
+                    .take()
+                    .into_iter()
+                    .chain(self.pending_scan_version_poison()),
+            )
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            let base = server.current_stamp().version;
+            let store = Arc::clone(&self.store);
+            let tag_epoch = authority
+                .as_ref()
+                .map_or([0; 32], |authority| authority.source_hash());
+            let pipeline = self.pipeline_snapshot();
+            let targets = self
+                .build_targets
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let max_dependency_depth = self.operational_configuration().max_dependency_depth;
+            let scanner = self.scanner.clone();
+            let result = server.coordinated_commit(base, || {
+                let mut commit = publish_incremental_scan(
+                    &store,
+                    base,
+                    &baseline,
+                    &delta,
+                    &plan,
+                    &renames,
+                    &projection,
+                    tag_epoch,
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+                if let Some(authority) = authority {
+                    let affected = commit_affected_asset_bundles(&commit);
+                    if !affected.is_empty() {
+                        crate::build::refine_published_tag_index_incremental(
+                            Arc::clone(&store),
+                            scanner,
+                            authority,
+                            pipeline,
+                            &targets,
+                            max_dependency_depth,
+                            &affected,
+                        )
+                        .apply_incremental(&mut commit);
+                    }
+                }
+                Ok(commit)
+            });
+            match result {
+                Ok(stamp) => {
+                    baseline.apply_delta(delta);
+                    if plan.version_poison.is_none() {
+                        index.clear_published_pending();
+                    }
+                    self.scan_healthy.store(
+                        self.scan_rejection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_none(),
+                        Ordering::Release,
+                    );
+                    Ok(stamp)
+                }
+                Err(error) => {
+                    index.restore(checkpoint)?;
+                    if let Some(rejection) = healed_rejection {
+                        *self
+                            .scan_rejection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                    }
+                    Err(CoordinatorError::Coordinated(error))
+                }
             }
-        }
+        })
     }
 
     fn publish_cached_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
@@ -1874,11 +1925,13 @@ impl DaemonCoordinator {
     /// Each bundle publishes as its own version so a later conflict cannot
     /// roll back an earlier per-file success.
     pub fn reconcile_watched_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let pending = self
-            .authoring
-            .watched_imports_needing_reimport()
-            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_watched_import_bundles(pending)
+        self.on_authority(|| {
+            let pending = self
+                .authoring
+                .watched_imports_needing_reimport()
+                .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+            self.reconcile_watched_import_bundles(pending)
+        })
     }
 
     /// Watcher-batch variant that revalidates only read sets capable of
@@ -1888,15 +1941,17 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let pending = if capabilities_changed {
-            self.authoring
-                .watched_imports_affected_by_capabilities(&work.dirty, &work.renames)
-        } else {
-            self.authoring
-                .watched_imports_affected_by(&work.dirty, &work.renames)
-        }
-        .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_watched_import_bundles(pending)
+        self.on_authority(|| {
+            let pending = if capabilities_changed {
+                self.authoring
+                    .watched_imports_affected_by_capabilities(&work.dirty, &work.renames)
+            } else {
+                self.authoring
+                    .watched_imports_affected_by(&work.dirty, &work.renames)
+            }
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+            self.reconcile_watched_import_bundles(pending)
+        })
     }
 
     fn reconcile_watched_import_bundles(
@@ -1930,27 +1985,31 @@ impl DaemonCoordinator {
     }
 
     pub fn acknowledge_file_work(&self, work: &PendingFileWork) -> Result<(), CoordinatorError> {
-        if work.is_empty() {
-            return Ok(());
-        }
-        match lock_store(&self.store).acknowledge_file_work(work) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(CoordinatorError::InvalidManifest(
-                "watcher work observation changed before acknowledgement".to_owned(),
-            )),
-            Err(error) => Err(CoordinatorError::InvalidManifest(error.to_string())),
-        }
+        self.on_authority(|| {
+            if work.is_empty() {
+                return Ok(());
+            }
+            match lock_store(&self.store).acknowledge_file_work(work) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(CoordinatorError::InvalidManifest(
+                    "watcher work observation changed before acknowledgement".to_owned(),
+                )),
+                Err(error) => Err(CoordinatorError::InvalidManifest(error.to_string())),
+            }
+        })
     }
 
     /// Discover and apply authored directory-import rules. Every generated
     /// bundle is a separate journaled/versioned fold; orphaned prior outputs
     /// are deliberately retained and therefore never appear as deletion work.
     pub fn reconcile_directory_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let tasks = self
-            .authoring
-            .directory_import_tasks()
-            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_directory_import_tasks(tasks)
+        self.on_authority(|| {
+            let tasks = self
+                .authoring
+                .directory_import_tasks()
+                .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+            self.reconcile_directory_import_tasks(tasks)
+        })
     }
 
     pub fn reconcile_directory_imports_affected(
@@ -1958,15 +2017,17 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let tasks = if capabilities_changed {
-            self.authoring
-                .directory_import_tasks_affected_by_capabilities(&work.dirty, &work.renames)
-        } else {
-            self.authoring
-                .directory_import_tasks_affected_by(&work.dirty, &work.renames)
-        }
-        .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_directory_import_tasks(tasks)
+        self.on_authority(|| {
+            let tasks = if capabilities_changed {
+                self.authoring
+                    .directory_import_tasks_affected_by_capabilities(&work.dirty, &work.renames)
+            } else {
+                self.authoring
+                    .directory_import_tasks_affected_by(&work.dirty, &work.renames)
+            }
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+            self.reconcile_directory_import_tasks(tasks)
+        })
     }
 
     fn reconcile_directory_import_tasks(
@@ -4293,8 +4354,8 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
     }
 }
 
-/// Reobserve authored paths and advance the durable projection while the RPC
-/// server holds its publication lock.
+/// Reobserve authored paths and advance the durable projection, on the
+/// authority.
 #[allow(clippy::too_many_arguments)] // The authoring boundary passes each publication authority explicitly.
 pub(crate) fn publish_incremental_paths(
     scanner: &RootedScanner,
@@ -4880,31 +4941,25 @@ fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// The daemon side of the RPC server's store: publications are serialized
-/// by `publication`, writes go through the shared store mutex.
+/// The daemon side of the RPC server's store: publications run on the
+/// authority, writes go through the shared store mutex.
 struct DaemonStore {
     store: Arc<Mutex<Store>>,
-    publication: Mutex<()>,
+    authority: AuthoritySender,
 }
 
 impl distill_rpc::ExternalStore for DaemonStore {
-    fn lock_publication(&self) -> Box<dyn distill_rpc::PublicationGuard + '_> {
-        Box::new(
-            self.publication
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+    fn on_authority(&self) -> bool {
+        self.authority.on_authority()
+    }
+
+    fn execute(&self, job: distill_rpc::AuthorityJob) {
+        self.authority.execute(job);
     }
 
     fn with_store(&self, job: &mut dyn FnMut(&mut Store)) {
         job(&mut lock_store(&self.store));
     }
-}
-
-fn lock_watcher(watcher: &Mutex<WatcherQueue>) -> MutexGuard<'_, WatcherQueue> {
-    watcher
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn lock_scan_snapshot(snapshot: &Mutex<ScanSnapshot>) -> MutexGuard<'_, ScanSnapshot> {

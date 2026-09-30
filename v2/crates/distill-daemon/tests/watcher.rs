@@ -3,12 +3,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use distill_daemon::scanner::{AssetRoot, RootedScanner};
-use distill_daemon::watcher::{WatcherAction, WatcherQueue, WatcherThread};
+use distill_daemon::watcher::{WatcherAction, WatcherQueue, WatcherSink, WatcherThread};
 use notify::event::{CreateKind, ModifyKind, RenameMode};
 use notify::{Event, EventKind};
 
 fn create(path: impl Into<PathBuf>) -> Event {
     Event::new(EventKind::Create(CreateKind::File)).add_path(path.into())
+}
+
+fn sink(queue: &Arc<Mutex<WatcherQueue>>) -> WatcherSink {
+    let queue = Arc::clone(queue);
+    Arc::new(move |event| queue.lock().unwrap().push(event))
 }
 
 fn wait_for_action(queue: &Mutex<WatcherQueue>) -> WatcherAction {
@@ -172,7 +177,7 @@ fn native_watcher_reports_create_without_scanning() {
     )])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner, [], Arc::clone(&queue)).unwrap();
+    let _watcher = WatcherThread::start(scanner, [], sink(&queue)).unwrap();
     let path = root.join("source.txt");
 
     std::fs::write(&path, b"first").unwrap();
@@ -199,7 +204,7 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
     )])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner.clone(), [], Arc::clone(&queue)).unwrap();
+    let _watcher = WatcherThread::start(scanner.clone(), [], sink(&queue)).unwrap();
 
     scanner
         .replace_roots([AssetRoot::new(
@@ -233,7 +238,7 @@ fn native_watcher_admits_exact_control_files_but_not_siblings_or_quarantine() {
     std::fs::write(&control, b"initial").unwrap();
     let scanner = RootedScanner::new([AssetRoot::new("main", &root, &quarantine)]).unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner, [control.clone()], Arc::clone(&queue)).unwrap();
+    let _watcher = WatcherThread::start(scanner, [control.clone()], sink(&queue)).unwrap();
 
     std::fs::create_dir(&quarantine).unwrap();
     std::fs::write(quarantine.join("intent"), b"displaced").unwrap();
@@ -264,7 +269,7 @@ fn native_watcher_maps_parent_introduction_to_missing_control_without_a_scan() {
     )])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner, [control.clone()], Arc::clone(&queue)).unwrap();
+    let _watcher = WatcherThread::start(scanner, [control.clone()], sink(&queue)).unwrap();
 
     let staging = temp.path().join("staging");
     std::fs::create_dir_all(staging.join("generated")).unwrap();

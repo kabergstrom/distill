@@ -92,9 +92,8 @@ impl AuthoringService {
             LongRunningOp::Doctor(payload) => {
                 let request =
                     DoctorRequest::decode(payload).map_err(|error| invalid(error.to_string()))?;
-                // Snapshot the RPC-owned request set while prepare_operation is
-                // outside the server publication lock. The deferred completion
-                // runs under that lock and must never re-enter it.
+                // Snapshot the served request set now, on the RPC thread; the
+                // deferred completion runs later on the authority.
                 let build_requests = if request == DoctorRequest::Verify {
                     match runtime.tag_index_coordinator.upgrade() {
                         Some(coordinator) => coordinator
