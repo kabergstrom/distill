@@ -584,6 +584,65 @@ should reach zero by the end of phase 6.
     pipeline's debug `.so` went from 286 MB to 104 MB (the rest is
     rafx-shader-processor).
 
+- **Phase 9:** done (commits `a8cf6d5`, `f5bfd2f`, `67dabbb`; newgameplus
+  `187b47b`, `1578a9f`, `a870c2b`; deferred-ngp `bb12d86`, `b8eeee1`).
+  - **`distill-daemon/src/bootstrap.rs`**, shared by the CLI and the tests:
+    - `init` writes the schema-lineage manifest (every project type active
+      at one epoch, its current logical hash) and the schema seed (one
+      authoring-only entry per project type holding its zero value, derived
+      from the logical schema) beside `assets.lineage_manifest`, only when
+      the bytes change. Identities derive from the lineage destination, so
+      reruns are byte-identical. It refuses to replace a manifest that
+      recorded schema transitions (more than one epoch for a type).
+    - `import` imports through a running daemon's RPC hub
+      (`RemoteHub::import`, new in distill-rpc), retrying while the daemon
+      starts, its pipeline is unavailable or the base moved.
+    - `engine_args` gives `--distill-rpc --distill-target
+      --distill-target-hash` for a target (the configured address, so a
+      fixed port).
+  - **CLI:** `distilld init <config>`, `distilld import <config> <source>
+    <dest> --importer <id> --settings <json> [--root] [--target]
+    [--no-watch] [--if-missing] [--wait]`, `distilld engine-args <config>
+    [target]`. `--settings` is required: the RPC import takes explicit
+    settings and has no "importer default" spelling.
+  - `game_assets_e2e` bootstraps through `init` (a rerun writes nothing)
+    and imports through the RPC hub.
+  - **source-walk `--pipeline-manifest <crate>`** walks the pipeline crate
+    plus each path dependency that declares `#[asset(uuid)]` types (depends
+    on distill-asset and its sources spell `asset(uuid`), and writes
+    `<target-dir>/distill-pipeline-schema.json`: real layouts under the
+    rustc identity, `source_hashes` with the pipeline crate's hash. For
+    that, deferred-ngp's importer settings and imported source became
+    `#[distill_asset::asset]` types (`GlslSettings`, `GlslSource`, same
+    TYPE_UUID bytes); they existed only in the harness's schema before.
+  - **start-engine.sh** `--distill-config <toml> --distill-pipeline <crate>
+    [--distill-imports <file>]`: builds the pipeline cdylib, runs
+    source-walk into the pipeline's target dir, `distilld init`, starts
+    `distilld <config>` in the background (log, pid file, stopped by the
+    next launch or a failed one), imports listed sources without a bundle,
+    and appends `distilld engine-args`. Linux only.
+  - **deferred-ngp:** `tools/distill/dev` is deleted. `tools/distill/`
+    holds `distill.toml` (paths relative to it; the loader already resolved
+    them against the config's directory) and `imports` (tonemap.comp,
+    lighting.comp).
+  - **The dev supervisor is deleted** (`dev.rs`, `distilld dev`,
+    `DevLaunchConfig`, 8 tests). The daemon watches its schema file and
+    pipeline module itself (`ConfigWatch`) and adopts new ones. The
+    supervisor was the only thing that rebuilt on source change: it ran
+    source-walk in watch mode and `cargo watch` over the pipeline and
+    gameplay packages. Now a pipeline edit needs `cargo build` plus a
+    source-walk rerun (the schema's source hash must match the module),
+    and the game module is rebuilt by the user's cargo as without the
+    supervisor.
+  - **Headless check:** pipeline build, source-walk (5 s), `init`, daemon
+    on 127.0.0.1:9910, `import` of tonemap.comp and lighting.comp; an RPC
+    client resolving the bundles as target `dev` saw `Built`, then a new
+    content hash within ~0.6 s of appending a line to tonemap.comp and to
+    lighting.comp's include `gbuffer_common.glsl`.
+  - **Deferred:** the imports list is a start-engine.sh file format, not
+    daemon config. A daemon-side "importer default settings" import is not
+    in the protocol.
+
 ## 7. Test baseline
 
 Recorded at the start of phase 0; see `git log` for updates.
@@ -600,3 +659,6 @@ End of phase 3: `cargo test --workspace --no-fail-fast` → only the same
 End of phase 4: the same single failure.
 
 End of phase 8: 1151 passed, the same single failure.
+
+End of phase 9: 1144 passed (the supervisor's 8 tests removed, 1 bootstrap
+test added), the same single failure.
