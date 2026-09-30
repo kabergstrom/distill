@@ -1,8 +1,9 @@
 //! Client capabilities over one front end ([`Server`]): target-bound hubs
-//! and snapshots, metadata bootstraps, pack sessions,
-//! delta streams and progress completions. Every call reads the store
-//! through the capability's pinned read transaction (snapshots) or the front
-//! end's current-state reader (fences, CAS).
+//! and snapshots, metadata bootstraps, delta streams and progress
+//! completions. Every call reads the store through the capability's own
+//! read transaction (snapshots) or the front end's current-state reader
+//! (fences, CAS). A snapshot holds nothing else: an artifact removed from
+//! the CAS after it resolved is a cache miss for the client to retry.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,7 +21,7 @@ use crate::persist::decode_drifted_input;
 use crate::server::{
     authoring_entry, entry_role, history_deltas, is_embedded, pipeline_failure,
     publish_backend_commit, store_failure, BuildKey, BuildResolution, ConnectionState,
-    MetadataBinding, PackSessionLease, SnapshotTxn, ViewLease, DEFAULT_CHUNK_SIZE,
+    MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
     path_glob_matches, valid_identifier, valid_logical_path, valid_logical_path_prefix,
@@ -47,7 +48,7 @@ pub struct MetadataSnapshot {
     server: Server,
     binding: Rc<MetadataBinding>,
     basis: MetadataBasis,
-    lease: Rc<ViewLease>,
+    hold: Rc<SnapshotHold>,
 }
 
 #[derive(Clone)]
@@ -55,7 +56,7 @@ pub struct MetadataAuthoringSnapshot {
     server: Server,
     binding: Rc<MetadataBinding>,
     basis: MetadataBasis,
-    lease: Rc<ViewLease>,
+    hold: Rc<SnapshotHold>,
 }
 
 #[derive(Clone)]
@@ -63,17 +64,7 @@ pub struct Snapshot {
     server: Server,
     connection: Rc<RefCell<ConnectionState>>,
     basis: RpcBasis,
-    lease: Rc<ViewLease>,
-}
-
-/// A single bounded pack-build scope attached to one snapshot lease. Calls
-/// renew both the snapshot and its target connection; expiration or drop
-/// releases every CAS pin held under the distinct pack-session pin class.
-pub struct PackSession {
-    server: Server,
-    connection: Rc<RefCell<ConnectionState>>,
-    lease: Rc<ViewLease>,
-    state: Rc<PackSessionLease>,
+    hold: Rc<SnapshotHold>,
 }
 
 #[derive(Clone)]
@@ -81,26 +72,13 @@ pub struct AuthoringSnapshot {
     server: Server,
     connection: Rc<RefCell<ConnectionState>>,
     basis: RpcBasis,
-    lease: Rc<ViewLease>,
+    hold: Rc<SnapshotHold>,
 }
 
 #[derive(Clone)]
 pub struct DeltaStream {
     server: Server,
     connection: Rc<RefCell<ConnectionState>>,
-}
-
-impl Drop for PackSession {
-    fn drop(&mut self) {
-        self.state.expire();
-        let mut slot = self.lease.pack_session.borrow_mut();
-        if slot
-            .as_ref()
-            .is_some_and(|state| Rc::ptr_eq(state, &self.state))
-        {
-            slot.take();
-        }
-    }
 }
 
 impl fmt::Debug for Hub {
@@ -154,12 +132,6 @@ impl fmt::Debug for AuthoringSnapshot {
 impl fmt::Debug for DeltaStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeltaStream").finish_non_exhaustive()
-    }
-}
-
-impl fmt::Debug for PackSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PackSession").finish_non_exhaustive()
     }
 }
 
@@ -242,18 +214,6 @@ fn load_wire_tree(reader: &StoreReader, hash: LayoutHash) -> Result<Arc<[u8]>, R
         Err(StoreError::NotFound { .. }) => Err(RpcFailure::WireTreeNotFound { hash }),
         Err(error) => Err(store_failure(error)),
     }
-}
-
-/// Pin an artifact and its layout to a snapshot lease; the artifact must
-/// exist with its recorded edges.
-fn pin_artifact(
-    reader: &StoreReader,
-    lease: &ViewLease,
-    hash: ContentHash,
-) -> Result<ArtifactPayload, RpcFailure> {
-    let (payload, layout_hash) = load_artifact(reader, hash)?;
-    lease.pin(&[hash.0, layout_hash.0])?;
-    Ok(payload)
 }
 
 pub(crate) fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> ChunkStream {
@@ -524,7 +484,7 @@ fn authoring_gate(
     base: InputVersion,
 ) -> Option<AuthoringGate> {
     if !connection.alive() {
-        return Some(AuthoringGate::Failure(RpcFailure::LeaseExpired));
+        return Some(AuthoringGate::Failure(RpcFailure::ConnectionClosed));
     }
     if let Some(reason) = server.inner.generation_fence(connection) {
         return Some(AuthoringGate::Reconnect(reason));
@@ -693,26 +653,26 @@ impl MetadataHub {
         self.binding.id
     }
 
-    fn lease(&self) -> Result<(MetadataBasis, Rc<ViewLease>), MetadataCall<()>> {
+    fn open(&self) -> Result<(MetadataBasis, Rc<SnapshotHold>), MetadataCall<()>> {
         let txn = self
             .server
             .inner
             .current_snapshot()
             .map_err(|error| MetadataCall::Error(store_failure(error)))?;
         let basis = metadata_basis(&self.binding, txn.stamp);
-        Ok((basis, self.server.inner.register_view_lease(txn, false)))
+        Ok((basis, self.server.inner.register_snapshot(txn)))
     }
 
     pub fn snapshot(&self) -> MetadataCall<MetadataSnapshot> {
         if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
             return MetadataCall::ReconnectRequired { reason };
         }
-        match self.lease() {
-            Ok((basis, lease)) => MetadataCall::Success(MetadataSnapshot {
+        match self.open() {
+            Ok((basis, hold)) => MetadataCall::Success(MetadataSnapshot {
                 server: self.server.clone(),
                 binding: self.binding.clone(),
                 basis,
-                lease,
+                hold,
             }),
             Err(failure) => failure.retype(),
         }
@@ -722,12 +682,12 @@ impl MetadataHub {
         if let Some(reason) = self.server.inner.metadata_fence(&self.binding) {
             return MetadataCall::ReconnectRequired { reason };
         }
-        match self.lease() {
-            Ok((basis, lease)) => MetadataCall::Success(MetadataAuthoringSnapshot {
+        match self.open() {
+            Ok((basis, hold)) => MetadataCall::Success(MetadataAuthoringSnapshot {
                 server: self.server.clone(),
                 binding: self.binding.clone(),
                 basis,
-                lease,
+                hold,
             }),
             Err(failure) => failure.retype(),
         }
@@ -763,7 +723,7 @@ impl<T> MetadataCall<T> {
         match self {
             Self::Success(_) => unreachable!("only failures are retyped"),
             Self::ReconnectRequired { reason } => MetadataCall::ReconnectRequired { reason },
-            Self::LeaseFailure => MetadataCall::LeaseFailure,
+            Self::SnapshotExpired => MetadataCall::SnapshotExpired,
             Self::Error(error) => MetadataCall::Error(error),
         }
     }
@@ -773,7 +733,7 @@ impl<T> MetadataCall<T> {
 struct MetadataView<'a> {
     server: &'a Server,
     binding: &'a MetadataBinding,
-    lease: &'a ViewLease,
+    hold: &'a SnapshotHold,
 }
 
 impl MetadataView<'_> {
@@ -781,8 +741,8 @@ impl MetadataView<'_> {
         if let Some(reason) = self.server.inner.metadata_fence(self.binding) {
             return Some(MetadataCall::ReconnectRequired { reason });
         }
-        if !self.lease.alive() {
-            return Some(MetadataCall::LeaseFailure);
+        if !self.hold.alive() {
+            return Some(MetadataCall::SnapshotExpired);
         }
         None
     }
@@ -791,8 +751,8 @@ impl MetadataView<'_> {
         if let Some(reason) = self.server.inner.metadata_fence(self.binding) {
             return Err(MetadataNamespaceCall::ReconnectRequired { reason });
         }
-        let Some(txn) = self.lease.txn() else {
-            return Err(MetadataNamespaceCall::LeaseFailure);
+        let Some(txn) = self.hold.txn() else {
+            return Err(MetadataNamespaceCall::SnapshotExpired);
         };
         Ok(txn)
     }
@@ -815,7 +775,7 @@ impl MetadataView<'_> {
         MetadataNamespaceCall::Success(query_pure_metadata(&entries, query))
     }
 
-    fn refresh(&self) -> Result<(MetadataBasis, Rc<ViewLease>), MetadataCall<()>> {
+    fn refresh(&self) -> Result<(MetadataBasis, Rc<SnapshotHold>), MetadataCall<()>> {
         if let Some(result) = self.preflight() {
             return Err(result);
         }
@@ -825,7 +785,7 @@ impl MetadataView<'_> {
             .current_snapshot()
             .map_err(|error| MetadataCall::Error(store_failure(error)))?;
         let basis = metadata_basis(self.binding, txn.stamp);
-        Ok((basis, self.server.inner.register_view_lease(txn, false)))
+        Ok((basis, self.server.inner.register_snapshot(txn)))
     }
 }
 
@@ -834,7 +794,7 @@ impl MetadataSnapshot {
         MetadataView {
             server: &self.server,
             binding: &self.binding,
-            lease: &self.lease,
+            hold: &self.hold,
         }
     }
 
@@ -853,8 +813,8 @@ impl MetadataSnapshot {
         if let Some(result) = self.view().preflight() {
             return result;
         }
-        let Some(txn) = self.lease.txn() else {
-            return MetadataCall::LeaseFailure;
+        let Some(txn) = self.hold.txn() else {
+            return MetadataCall::SnapshotExpired;
         };
         MetadataCall::Success(MetadataDiagnostics {
             stamp: self.basis.snapshot,
@@ -894,18 +854,23 @@ impl MetadataSnapshot {
 
     pub fn refresh(&self) -> MetadataCall<MetadataSnapshot> {
         match self.view().refresh() {
-            Ok((basis, lease)) => MetadataCall::Success(Self {
+            Ok((basis, hold)) => MetadataCall::Success(Self {
                 server: self.server.clone(),
                 binding: self.binding.clone(),
                 basis,
-                lease,
+                hold,
             }),
             Err(failure) => failure.retype(),
         }
     }
 
-    pub fn expire_lease(&self) {
-        self.lease.expire();
+    pub fn expire(&self) {
+        self.hold.expire();
+    }
+
+    /// Release this snapshot once its TTL passes (on the RPC `LocalSet`).
+    pub(crate) fn expire_later(&self) {
+        self.hold.expire_later();
     }
 }
 
@@ -914,7 +879,7 @@ impl MetadataAuthoringSnapshot {
         MetadataView {
             server: &self.server,
             binding: &self.binding,
-            lease: &self.lease,
+            hold: &self.hold,
         }
     }
 
@@ -947,18 +912,23 @@ impl MetadataAuthoringSnapshot {
 
     pub fn refresh(&self) -> MetadataCall<MetadataAuthoringSnapshot> {
         match self.view().refresh() {
-            Ok((basis, lease)) => MetadataCall::Success(Self {
+            Ok((basis, hold)) => MetadataCall::Success(Self {
                 server: self.server.clone(),
                 binding: self.binding.clone(),
                 basis,
-                lease,
+                hold,
             }),
             Err(failure) => failure.retype(),
         }
     }
 
-    pub fn expire_lease(&self) {
-        self.lease.expire();
+    pub fn expire(&self) {
+        self.hold.expire();
+    }
+
+    /// Release this snapshot once its TTL passes (on the RPC `LocalSet`).
+    pub(crate) fn expire_later(&self) {
+        self.hold.expire_later();
     }
 }
 
@@ -981,7 +951,7 @@ impl Hub {
         self.server.inner.pump();
         let connection = self.connection.borrow();
         if !connection.alive() {
-            return Some(RpcResult::Failure(RpcFailure::LeaseExpired));
+            return Some(RpcResult::Failure(RpcFailure::ConnectionClosed));
         }
         self.server
             .inner
@@ -1517,7 +1487,7 @@ fn snapshot_from(
         basis: RpcBasis {
             snapshot: txn.stamp,
         },
-        lease: server.inner.register_view_lease(txn, true),
+        hold: server.inner.register_snapshot(txn),
     }
 }
 
@@ -1532,7 +1502,7 @@ fn authoring_snapshot_from(
         basis: RpcBasis {
             snapshot: txn.stamp,
         },
-        lease: server.inner.register_view_lease(txn, false),
+        hold: server.inner.register_snapshot(txn),
     }
 }
 
@@ -1655,11 +1625,11 @@ impl Snapshot {
             return Err(RpcResult::ReconnectRequired { reason });
         }
         if !connection.alive() {
-            return Err(RpcResult::Failure(RpcFailure::LeaseExpired));
+            return Err(RpcResult::Failure(RpcFailure::ConnectionClosed));
         }
-        self.lease
+        self.hold
             .txn()
-            .ok_or(RpcResult::Failure(RpcFailure::LeaseExpired))
+            .ok_or(RpcResult::Failure(RpcFailure::SnapshotExpired))
     }
 
     pub fn version(&self) -> RpcResult<InputVersion> {
@@ -1680,53 +1650,27 @@ impl Snapshot {
         &self.basis
     }
 
-    pub fn expire_lease(&self) {
-        self.lease.expire();
+    pub fn expire(&self) {
+        self.hold.expire();
     }
 
-    /// Open the sole renewable pack-build scope for this snapshot. The scope
-    /// remains bounded by the snapshot/connection policy and owns a distinct
-    /// durable pin holder that is released on drop or lease expiry.
-    pub fn open_pack_session(&self) -> RpcResult<PackSession> {
-        if let Err(result) = self.preflight::<PackSession>() {
-            return result;
-        }
-        let session_state = {
-            let mut slot = self.lease.pack_session.borrow_mut();
-            if slot.is_some() {
-                return RpcResult::Failure(RpcFailure::ResourceLimit {
-                    resource: "pack sessions per snapshot".to_owned(),
-                    limit: 1,
-                });
-            }
-            let state = self.server.inner.open_pack_session_lease();
-            *slot = Some(Rc::clone(&state));
-            state
-        };
-        let session = PackSession {
-            server: self.server.clone(),
-            connection: Rc::clone(&self.connection),
-            lease: Rc::clone(&self.lease),
-            state: session_state,
-        };
-        match session.keep_alive() {
-            RpcResult::Success(()) => RpcResult::Success(session),
-            other => other.retype(),
-        }
+    /// Release this snapshot once its TTL passes (on the RPC `LocalSet`).
+    pub(crate) fn expire_later(&self) {
+        self.hold.expire_later();
     }
 
     pub fn refresh(&self) -> RpcResult<Snapshot> {
         {
             let connection = self.connection.borrow();
             if !connection.alive() {
-                return RpcResult::Failure(RpcFailure::LeaseExpired);
+                return RpcResult::Failure(RpcFailure::ConnectionClosed);
             }
             if let Some(reason) = self.server.inner.generation_fence(&connection) {
                 return RpcResult::ReconnectRequired { reason };
             }
         }
-        if !self.lease.alive() {
-            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        if !self.hold.alive() {
+            return RpcResult::Failure(RpcFailure::SnapshotExpired);
         }
         let txn = rpc_try!(self.server.inner.current_snapshot());
         RpcResult::Success(snapshot_from(&self.server, &self.connection, txn))
@@ -1934,7 +1878,7 @@ impl Snapshot {
         let value = match resolution {
             Some(VersionResolve::Built(content_hash)) => {
                 if let Err(error) =
-                    pin_artifact(&self.server.inner.reader, &self.lease, content_hash)
+                    load_artifact(&self.server.inner.reader, content_hash)
                 {
                     return done(RpcResult::Failure(error));
                 }
@@ -1981,7 +1925,7 @@ impl Snapshot {
         });
         if let Ok(BuildResolution::Built(content_hash)) = &outcome {
             if let Err(error) =
-                pin_artifact(&self.server.inner.reader, &self.lease, *content_hash)
+                load_artifact(&self.server.inner.reader, *content_hash)
             {
                 outcome = Err(error);
             }
@@ -1999,7 +1943,7 @@ impl Snapshot {
             Err(RpcResult::ReconnectRequired { reason }) => {
                 return Some(RpcResult::ReconnectRequired { reason });
             }
-            Err(_) => outcome = Err(RpcFailure::LeaseExpired),
+            Err(_) => outcome = Err(RpcFailure::SnapshotExpired),
         }
         match outcome {
             Ok(resolution) => {
@@ -2054,51 +1998,11 @@ impl Snapshot {
         if let Err(result) = self.preflight::<TerminalEvent<ChunkStream>>() {
             return result;
         }
-        match pin_artifact(&self.server.inner.reader, &self.lease, hash) {
-            Ok(payload) => RpcResult::Success(TerminalEvent {
+        match load_artifact(&self.server.inner.reader, hash) {
+            Ok((payload, _)) => RpcResult::Success(TerminalEvent {
                 basis: self.basis.clone(),
                 value: chunk_payload(&payload, DEFAULT_CHUNK_SIZE),
             }),
-            Err(error) => RpcResult::Failure(error),
-        }
-    }
-}
-
-impl<T> RpcResult<T> {
-    fn retype<U>(self) -> RpcResult<U> {
-        match self {
-            Self::Success(_) => unreachable!("only failures are retyped"),
-            Self::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
-            Self::ConfigurationFailed(error) => RpcResult::ConfigurationFailed(error),
-            Self::Failure(error) => RpcResult::Failure(error),
-        }
-    }
-}
-
-impl PackSession {
-    /// Extend the fixed snapshot and connection deadlines. Renewal never
-    /// revives an expired capability and preserves every generation fence.
-    pub fn keep_alive(&self) -> RpcResult<()> {
-        let deadline = self.server.inner.handle.deadline();
-        let mut connection = self.connection.borrow_mut();
-        if let Some(reason) = self.server.inner.generation_fence(&connection) {
-            return RpcResult::ReconnectRequired { reason };
-        }
-        if !connection.alive() || !self.lease.renew(deadline) {
-            return RpcResult::Failure(RpcFailure::LeaseExpired);
-        }
-        connection.deadline = deadline;
-        RpcResult::Success(())
-    }
-
-    /// Add immutable CAS objects to this scope's PackSession pin holder.
-    pub fn pin(&self, hashes: &[[u8; 32]]) -> RpcResult<()> {
-        match self.keep_alive() {
-            RpcResult::Success(()) => {}
-            other => return other,
-        }
-        match self.state.pin(hashes) {
-            Ok(()) => RpcResult::Success(()),
             Err(error) => RpcResult::Failure(error),
         }
     }
@@ -2122,11 +2026,11 @@ impl AuthoringSnapshot {
             return Err(RpcResult::ReconnectRequired { reason });
         }
         if !connection.alive() {
-            return Err(RpcResult::Failure(RpcFailure::LeaseExpired));
+            return Err(RpcResult::Failure(RpcFailure::ConnectionClosed));
         }
-        self.lease
+        self.hold
             .txn()
-            .ok_or(RpcResult::Failure(RpcFailure::LeaseExpired))
+            .ok_or(RpcResult::Failure(RpcFailure::SnapshotExpired))
     }
 
     pub fn version(&self) -> RpcResult<InputVersion> {
@@ -2140,8 +2044,13 @@ impl AuthoringSnapshot {
         &self.basis
     }
 
-    pub fn expire_lease(&self) {
-        self.lease.expire();
+    pub fn expire(&self) {
+        self.hold.expire();
+    }
+
+    /// Release this snapshot once its TTL passes (on the RPC `LocalSet`).
+    pub(crate) fn expire_later(&self) {
+        self.hold.expire_later();
     }
 
     pub fn query(&self, query: AssetQuery) -> RpcResult<Vec<AssetUuid>> {
@@ -2179,14 +2088,14 @@ impl AuthoringSnapshot {
         {
             let connection = self.connection.borrow();
             if !connection.alive() {
-                return RpcResult::Failure(RpcFailure::LeaseExpired);
+                return RpcResult::Failure(RpcFailure::ConnectionClosed);
             }
             if let Some(reason) = self.server.inner.generation_fence(&connection) {
                 return RpcResult::ReconnectRequired { reason };
             }
         }
-        if !self.lease.alive() {
-            return RpcResult::Failure(RpcFailure::LeaseExpired);
+        if !self.hold.alive() {
+            return RpcResult::Failure(RpcFailure::SnapshotExpired);
         }
         let txn = rpc_try!(self.server.inner.current_snapshot());
         RpcResult::Success(authoring_snapshot_from(&self.server, &self.connection, txn))
@@ -2214,7 +2123,7 @@ impl DeltaStream {
         loop {
             let mut published = self.server.inner.subscribe_published();
             self.server.inner.pump();
-            let (notify, deadline) = {
+            let notify = {
                 let mut connection = self.connection.borrow_mut();
                 if !connection.alive() {
                     connection.expire();
@@ -2223,10 +2132,7 @@ impl DeltaStream {
                 if let Some(event) = connection.queue.pop_front() {
                     return Some(event);
                 }
-                (
-                    Rc::clone(&connection.notify),
-                    tokio::time::Instant::from_std(connection.deadline),
-                )
+                Rc::clone(&connection.notify)
             };
             tokio::select! {
                 _ = notify.notified() => {}
@@ -2234,10 +2140,6 @@ impl DeltaStream {
                     if changed.is_err() {
                         return None;
                     }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    self.connection.borrow_mut().expire();
-                    return None;
                 }
             }
         }

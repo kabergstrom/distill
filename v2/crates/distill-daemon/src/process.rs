@@ -38,9 +38,9 @@ const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How often the loop runs its CAS pass (eviction, compaction, dead
 /// segment deletion).
 const CAS_PASS_INTERVAL: Duration = Duration::from_secs(10);
-/// How long a dead segment's file outlives the read bound: the snapshot
-/// expiry (30 s) plus a margin.
-const CAS_DELETE_GRACE: Duration = Duration::from_secs(30 + 10);
+/// How much longer than a snapshot's TTL a dead segment's file stays: no
+/// snapshot that could read it is left by then.
+const CAS_DELETE_MARGIN: Duration = Duration::from_secs(10);
 
 pub struct DaemonProcess {
     coordinator: Arc<DaemonCoordinator>,
@@ -162,7 +162,9 @@ impl DaemonProcess {
             due: Some(Instant::now()),
             publications: 0,
             next_idle_pass: Instant::now() + IDLE_PASS_INTERVAL,
-            cas_sweeper: SegmentSweeper::new(CAS_DELETE_GRACE),
+            cas_sweeper: SegmentSweeper::new(
+                coordinator.server_handle().snapshot_policy().ttl + CAS_DELETE_MARGIN,
+            ),
             next_cas_pass: Instant::now() + CAS_PASS_INTERVAL,
         };
         // Startup runs on the loop thread before the loop: events the

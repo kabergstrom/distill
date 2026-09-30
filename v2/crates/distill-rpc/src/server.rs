@@ -3,7 +3,7 @@
 //! A [`ServerHandle`] is the shared, `Send + Sync` identity of one served
 //! store: its configuration, publication signal, and backends. Every thread
 //! that serves clients has its own cheap front end ([`Server`]) holding a
-//! store reader, its connections, leases, and subscription queues. A
+//! store reader, its connections, snapshots, and subscription queues. A
 //! snapshot is an open read transaction; subscriptions follow the store's
 //! change log. Every thread writes through its own writer of the store
 //! ([`SharedStore`]); SQLite's write lock orders them.
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,47 +40,44 @@ use crate::*;
 
 pub(crate) const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_PENDING_STREAM_EVENTS: usize = 1024;
-const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_MAX_SNAPSHOT_LEASES: usize = 1024;
+/// How long a snapshot capability served over the wire lives.
+pub const DEFAULT_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_SNAPSHOTS: usize = 1024;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const MAX_IDLE_READERS: usize = 4;
 pub const MAX_SUBSCRIBED_ASSETS: usize = 4096;
 pub const MAX_SUBSCRIBED_PATHS: usize = 4096;
 
-/// Resource bounds for target-bound RPC capabilities. Snapshot leases are
-/// absolute: clients obtain a fresh capability through `refresh`. Hub
-/// connections use the same deadline and reconnect after expiry. Bounds
-/// apply per front end.
+/// Bounds on one front end's capabilities. A snapshot served over the wire
+/// expires `ttl` after it opens, whatever its use; clients open another.
+/// Past either count the oldest snapshot or connection is released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeasePolicy {
+pub struct SnapshotPolicy {
     pub ttl: Duration,
-    pub max_snapshot_leases: usize,
+    pub max_snapshots: usize,
     pub max_connections: usize,
 }
 
-impl Default for LeasePolicy {
+impl Default for SnapshotPolicy {
     fn default() -> Self {
         Self {
-            ttl: DEFAULT_LEASE_TTL,
-            max_snapshot_leases: DEFAULT_MAX_SNAPSHOT_LEASES,
+            ttl: DEFAULT_SNAPSHOT_TTL,
+            max_snapshots: DEFAULT_MAX_SNAPSHOTS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
 
-impl LeasePolicy {
+impl SnapshotPolicy {
     fn validate(self) -> Result<Self, &'static str> {
         if self.ttl.is_zero() {
-            return Err("RPC lease TTL must be nonzero");
+            return Err("RPC snapshot TTL must be nonzero");
         }
         if Instant::now().checked_add(self.ttl).is_none() {
-            return Err("RPC lease TTL is too large");
+            return Err("RPC snapshot TTL is too large");
         }
-        if self.ttl.as_nanos() > u128::from(u64::MAX) {
-            return Err("RPC lease TTL is too large");
-        }
-        if self.max_snapshot_leases == 0 {
-            return Err("RPC snapshot lease bound must be nonzero");
+        if self.max_snapshots == 0 {
+            return Err("RPC snapshot bound must be nonzero");
         }
         if self.max_connections == 0 {
             return Err("RPC connection bound must be nonzero");
@@ -162,13 +159,9 @@ pub struct ServerHandle {
     published: watch::Sender<u64>,
     authoring_backend: Arc<dyn AuthoringBackend>,
     build_backend: OnceLock<Arc<dyn BuildBackend>>,
-    lease_backend: OnceLock<Arc<dyn ArtifactLeaseBackend>>,
     on_publish: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    next_lease_id: AtomicU64,
-    next_connection_id: AtomicU64,
-    lease_ttl_nanos: AtomicU64,
-    max_snapshot_leases: AtomicUsize,
-    max_connections: AtomicUsize,
+    /// What each front end starts with.
+    policy: SnapshotPolicy,
     /// Every thread writes through its own writer of this store.
     store: Option<Arc<SharedStore>>,
     embedded_dir: Option<PathBuf>,
@@ -200,7 +193,6 @@ impl ServerHandle {
         store: Arc<SharedStore>,
         embedded_dir: Option<PathBuf>,
     ) -> Arc<Self> {
-        let policy = LeasePolicy::default();
         Arc::new(Self {
             id: NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed),
             instance,
@@ -208,13 +200,8 @@ impl ServerHandle {
             published: watch::Sender::new(0),
             authoring_backend,
             build_backend: OnceLock::new(),
-            lease_backend: OnceLock::new(),
             on_publish: OnceLock::new(),
-            next_lease_id: AtomicU64::new(1),
-            next_connection_id: AtomicU64::new(1),
-            lease_ttl_nanos: AtomicU64::new(policy.ttl.as_nanos() as u64),
-            max_snapshot_leases: AtomicUsize::new(policy.max_snapshot_leases),
-            max_connections: AtomicUsize::new(policy.max_connections),
+            policy: SnapshotPolicy::default(),
             store: Some(store),
             embedded_dir,
         })
@@ -266,18 +253,10 @@ impl ServerHandle {
         self.published.subscribe()
     }
 
-    fn lease_policy(&self) -> LeasePolicy {
-        LeasePolicy {
-            ttl: Duration::from_nanos(self.lease_ttl_nanos.load(Ordering::Relaxed)),
-            max_snapshot_leases: self.max_snapshot_leases.load(Ordering::Relaxed),
-            max_connections: self.max_connections.load(Ordering::Relaxed),
-        }
-    }
-
-    pub(crate) fn deadline(&self) -> Instant {
-        Instant::now()
-            .checked_add(self.lease_policy().ttl)
-            .expect("validated RPC lease TTL must fit in Instant")
+    /// The snapshot policy front ends start with. A snapshot never
+    /// outlives its TTL, so storage it reads stays for that long.
+    pub fn snapshot_policy(&self) -> SnapshotPolicy {
+        self.policy
     }
 
     pub(crate) fn authoring_backend(&self) -> Arc<dyn AuthoringBackend> {
@@ -289,21 +268,6 @@ impl ServerHandle {
             .get()
             .cloned()
             .unwrap_or_else(|| Arc::new(UnavailableBuildBackend))
-    }
-
-    fn lease_backend(&self) -> Arc<dyn ArtifactLeaseBackend> {
-        self.lease_backend
-            .get()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(UnpinnedArtifactLeases))
-    }
-
-    fn next_connection_id(&self) -> u64 {
-        self.next_connection_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn next_lease_id(&self) -> u64 {
-        self.next_lease_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Publish `commit` as the version after `base` (when given).
@@ -450,17 +414,7 @@ impl<W: ServedWrite> ServedWriteObj for W {
 
 struct UnavailableBuildBackend;
 
-struct UnpinnedArtifactLeases;
-
 struct UnavailableAuthoringBackend;
-
-impl ArtifactLeaseBackend for UnpinnedArtifactLeases {
-    fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn release_lease(&self, _holder: u64) {}
-}
 
 impl BuildBackend for UnavailableBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
@@ -535,7 +489,10 @@ pub(crate) struct Inner {
     /// Snapshots of one version share a read transaction.
     current_txn: RefCell<Weak<SnapshotTxn>>,
     connections: RefCell<Vec<Weak<RefCell<ConnectionState>>>>,
-    leases: RefCell<VecDeque<Weak<ViewLease>>>,
+    /// Open snapshots, oldest first, for the snapshot bound.
+    snapshots: RefCell<VecDeque<Weak<SnapshotHold>>>,
+    policy: Cell<SnapshotPolicy>,
+    next_connection_id: Cell<u64>,
     pub(crate) build_results: RefCell<HashMap<BuildKey, BuildResolution>>,
     /// The last change-log row this front end has delivered.
     cursor: Cell<i64>,
@@ -636,7 +593,9 @@ impl Server {
                 idle_readers: RefCell::new(Vec::new()),
                 current_txn: RefCell::new(Weak::new()),
                 connections: RefCell::new(Vec::new()),
-                leases: RefCell::new(VecDeque::new()),
+                snapshots: RefCell::new(VecDeque::new()),
+                policy: Cell::new(handle.policy),
+                next_connection_id: Cell::new(1),
                 build_results: RefCell::new(HashMap::new()),
                 cursor: Cell::new(cursor),
                 handle: Arc::clone(handle),
@@ -650,24 +609,19 @@ impl Server {
         Arc::clone(&self.inner.handle)
     }
 
-    /// Replace the capability resource policy. Lowering a bound expires this
-    /// front end's oldest leases or connections immediately; other front
-    /// ends apply it on their next call.
-    pub fn install_lease_policy(&self, policy: LeasePolicy) -> Result<(), &'static str> {
-        let policy = policy.validate()?;
-        let handle = &self.inner.handle;
-        handle
-            .lease_ttl_nanos
-            .store(policy.ttl.as_nanos() as u64, Ordering::Relaxed);
-        handle
-            .max_snapshot_leases
-            .store(policy.max_snapshot_leases, Ordering::Relaxed);
-        handle
-            .max_connections
-            .store(policy.max_connections, Ordering::Relaxed);
-        self.inner.enforce_lease_bound(0);
+    /// Replace this front end's snapshot policy. Lowering a bound releases
+    /// the oldest snapshots or connections at once.
+    pub fn install_snapshot_policy(&self, policy: SnapshotPolicy) -> Result<(), &'static str> {
+        self.inner.policy.set(policy.validate()?);
+        self.inner.enforce_snapshot_bound(0);
         self.inner.enforce_connection_bound(0);
         Ok(())
+    }
+
+    /// How many snapshots this front end holds open.
+    pub fn open_snapshots(&self) -> usize {
+        self.inner.enforce_snapshot_bound(0);
+        self.inner.snapshots.borrow().len()
     }
 
     /// Install the lazy-build implementation. Install backends once, before
@@ -675,13 +629,6 @@ impl Server {
     pub fn install_build_backend(&self, backend: Arc<dyn BuildBackend>) {
         if self.inner.handle.build_backend.set(backend).is_err() {
             panic!("the RPC build backend is already installed");
-        }
-    }
-
-    /// Install the daemon CAS lease ledger before accepting client snapshots.
-    pub fn install_artifact_lease_backend(&self, backend: Arc<dyn ArtifactLeaseBackend>) {
-        if self.inner.handle.lease_backend.set(backend).is_err() {
-            panic!("the RPC artifact lease backend is already installed");
         }
     }
 
@@ -1124,13 +1071,6 @@ impl Server {
             .write_served(false, move |txn| txn.restart(&keys));
         self.current_stamp()
     }
-
-    /// Expire every lease and connection past its deadline. Transports call
-    /// this periodically; calls also expire lazily.
-    pub fn sweep_expired(&self) {
-        self.inner.prune_leases();
-        self.inner.live_connections();
-    }
 }
 
 /// The name-to-definition map of a target set, rejecting duplicate names.
@@ -1195,9 +1135,9 @@ pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFai
 }
 
 // ---------------------------------------------------------------------------
-// Snapshots and leases
+// Snapshots
 
-/// One read transaction pinning one input version, shared by every lease of
+/// One read transaction pinning one input version, shared by every snapshot of
 /// that version on this front end. The immutable facts are read once.
 pub(crate) struct SnapshotTxn {
     snapshot: Option<distill_store::served::StoreSnapshot>,
@@ -1242,129 +1182,44 @@ pub(crate) enum BuildResolution {
     Drifted(DriftedInput),
 }
 
-pub(crate) struct ArtifactLease {
-    holder: u64,
-    backend: Arc<dyn ArtifactLeaseBackend>,
-    alive: Cell<bool>,
+/// A snapshot capability's read transaction, until it is released: on drop,
+/// on eviction past the snapshot bound, or when its expiry timer fires.
+pub(crate) type SnapshotSlot = Rc<RefCell<Option<Rc<SnapshotTxn>>>>;
+
+/// What one snapshot capability (and its clones) holds.
+pub(crate) struct SnapshotHold {
+    slot: SnapshotSlot,
+    ttl: Duration,
 }
 
-impl ArtifactLease {
-    fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
-        if !self.alive.get() {
-            return Err(RpcFailure::LeaseExpired);
-        }
-        self.backend
-            .pin_lease(self.holder, hashes)
-            .map_err(|detail| RpcFailure::InvalidQuery {
-                detail: format!("cannot pin resolved artifact to snapshot lease: {detail}"),
-            })
-    }
-
-    fn expire(&self) {
-        if self.alive.replace(false) {
-            self.backend.release_lease(self.holder);
-        }
-    }
-}
-
-impl Drop for ArtifactLease {
-    fn drop(&mut self) {
-        self.expire();
-    }
-}
-
-pub(crate) struct PackSessionLease {
-    holder: u64,
-    backend: Arc<dyn ArtifactLeaseBackend>,
-    alive: Cell<bool>,
-}
-
-impl PackSessionLease {
-    pub(crate) fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
-        if !self.alive.get() {
-            return Err(RpcFailure::LeaseExpired);
-        }
-        self.backend
-            .pin_pack_session(self.holder, hashes)
-            .map_err(|detail| RpcFailure::InvalidQuery {
-                detail: format!("cannot pin artifact to pack-build session: {detail}"),
-            })
-    }
-
-    pub(crate) fn expire(&self) {
-        if self.alive.replace(false) {
-            self.backend.release_pack_session(self.holder);
-        }
-    }
-}
-
-impl Drop for PackSessionLease {
-    fn drop(&mut self) {
-        self.expire();
-    }
-}
-
-/// Everything one snapshot capability retains. Expiry drops the read
-/// transaction and releases every CAS pin.
-pub(crate) struct ViewLease {
-    deadline: Cell<Instant>,
-    active: Cell<bool>,
-    txn: RefCell<Option<Rc<SnapshotTxn>>>,
-    artifact: Option<ArtifactLease>,
-    pub(crate) pack_session: RefCell<Option<Rc<PackSessionLease>>>,
-}
-
-impl ViewLease {
+impl SnapshotHold {
     pub(crate) fn alive(&self) -> bool {
-        if self.active.get() && Instant::now() < self.deadline.get() {
-            return true;
-        }
-        self.expire();
-        false
+        self.slot.borrow().is_some()
     }
 
     pub(crate) fn txn(&self) -> Option<Rc<SnapshotTxn>> {
-        if !self.alive() {
-            return None;
-        }
-        self.txn.borrow().clone()
+        self.slot.borrow().clone()
     }
 
     pub(crate) fn expire(&self) {
-        if !self.active.replace(false) {
-            return;
-        }
-        let txn = self.txn.borrow_mut().take();
+        let txn = self.slot.borrow_mut().take();
         drop(txn);
-        if let Some(artifact) = &self.artifact {
-            artifact.expire();
-        }
-        let pack_session = self.pack_session.borrow_mut().take();
-        if let Some(pack_session) = pack_session {
-            pack_session.expire();
-        }
     }
 
-    pub(crate) fn renew(&self, deadline: Instant) -> bool {
-        if !self.alive() {
-            return false;
-        }
-        self.deadline.set(deadline);
-        true
-    }
-
-    pub(crate) fn pin(&self, hashes: &[[u8; 32]]) -> Result<(), RpcFailure> {
-        if !self.alive() {
-            return Err(RpcFailure::LeaseExpired);
-        }
-        self.artifact
-            .as_ref()
-            .ok_or(RpcFailure::LeaseExpired)?
-            .pin(hashes)
+    /// Release the snapshot once its TTL passes. Call on the RPC thread's
+    /// `LocalSet`.
+    pub(crate) fn expire_later(&self) {
+        let slot = Rc::clone(&self.slot);
+        let ttl = self.ttl;
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(ttl).await;
+            let txn = slot.borrow_mut().take();
+            drop(txn);
+        });
     }
 }
 
-impl Drop for ViewLease {
+impl Drop for SnapshotHold {
     fn drop(&mut self) {
         self.expire();
     }
@@ -1383,7 +1238,6 @@ pub(crate) struct ConnectionState {
     seen_seq: i64,
     /// A reconnect event was delivered; no further deltas are.
     fenced: bool,
-    pub(crate) deadline: Instant,
     active: bool,
     pub(crate) subscribed_assets: BTreeSet<AssetUuid>,
     pub(crate) subscribed_paths: BTreeSet<String>,
@@ -1394,7 +1248,7 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     pub(crate) fn alive(&self) -> bool {
-        self.active && Instant::now() < self.deadline
+        self.active
     }
 
     pub(crate) fn expire(&mut self) {
@@ -1586,56 +1440,38 @@ impl Inner {
         }
     }
 
-    /// Lease one snapshot of the current version.
-    pub(crate) fn register_view_lease(
-        self: &Rc<Self>,
-        txn: Rc<SnapshotTxn>,
-        with_artifacts: bool,
-    ) -> Rc<ViewLease> {
-        let lease = Rc::new(ViewLease {
-            deadline: Cell::new(self.handle.deadline()),
-            active: Cell::new(true),
-            txn: RefCell::new(Some(txn)),
-            artifact: with_artifacts.then(|| ArtifactLease {
-                holder: self.handle.next_lease_id(),
-                backend: self.handle.lease_backend(),
-                alive: Cell::new(true),
-            }),
-            pack_session: RefCell::new(None),
+    /// Hold one snapshot of the current version.
+    pub(crate) fn register_snapshot(self: &Rc<Self>, txn: Rc<SnapshotTxn>) -> Rc<SnapshotHold> {
+        let hold = Rc::new(SnapshotHold {
+            slot: Rc::new(RefCell::new(Some(txn))),
+            ttl: self.policy.get().ttl,
         });
-        self.enforce_lease_bound(1);
-        self.leases.borrow_mut().push_back(Rc::downgrade(&lease));
-        lease
+        self.enforce_snapshot_bound(1);
+        self.snapshots.borrow_mut().push_back(Rc::downgrade(&hold));
+        hold
     }
 
-    pub(crate) fn open_pack_session_lease(&self) -> Rc<PackSessionLease> {
-        Rc::new(PackSessionLease {
-            holder: self.handle.next_lease_id(),
-            backend: self.handle.lease_backend(),
-            alive: Cell::new(true),
-        })
+    fn connection_id(&self) -> u64 {
+        let id = self.next_connection_id.get();
+        self.next_connection_id.set(id + 1);
+        id
     }
 
-    fn prune_leases(&self) {
-        self.leases.borrow_mut().retain(|lease| match lease.upgrade() {
-            Some(lease) => lease.alive(),
-            None => false,
-        });
-    }
-
-    fn enforce_lease_bound(&self, reserve: usize) {
-        self.prune_leases();
-        let max = self.handle.lease_policy().max_snapshot_leases;
+    fn enforce_snapshot_bound(&self, reserve: usize) {
+        self.snapshots
+            .borrow_mut()
+            .retain(|hold| hold.upgrade().is_some_and(|hold| hold.alive()));
+        let max = self.policy.get().max_snapshots;
         loop {
             let oldest = {
-                let mut leases = self.leases.borrow_mut();
-                if leases.len() + reserve <= max {
+                let mut snapshots = self.snapshots.borrow_mut();
+                if snapshots.len() + reserve <= max {
                     break;
                 }
-                leases.pop_front()
+                snapshots.pop_front()
             };
-            if let Some(lease) = oldest.and_then(|lease| lease.upgrade()) {
-                lease.expire();
+            if let Some(hold) = oldest.and_then(|hold| hold.upgrade()) {
+                hold.expire();
             }
         }
     }
@@ -1660,7 +1496,7 @@ impl Inner {
     }
 
     fn enforce_connection_bound(&self, reserve: usize) {
-        let max = self.handle.lease_policy().max_connections;
+        let max = self.policy.get().max_connections;
         let mut live = self.live_connections();
         while live.len() + reserve > max {
             live.remove(0).borrow_mut().expire();
@@ -1679,14 +1515,13 @@ impl Inner {
         self.pump_until(Some(head));
         self.enforce_connection_bound(1);
         let connection = Rc::new(RefCell::new(ConnectionState {
-            id: self.handle.next_connection_id(),
+            id: self.connection_id(),
             target,
             target_generation,
             protocol_epoch: fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION),
             pipeline_generation: fences.pipeline_generation,
             seen_seq: head,
             fenced: false,
-            deadline: self.handle.deadline(),
             active: true,
             subscribed_assets: BTreeSet::new(),
             subscribed_paths: BTreeSet::new(),
@@ -1864,7 +1699,7 @@ impl Root {
 impl Server {
     fn metadata_binding(&self, protocol_epoch: u32) -> Rc<MetadataBinding> {
         Rc::new(MetadataBinding {
-            id: self.inner.handle.next_connection_id(),
+            id: self.inner.connection_id(),
             protocol_epoch,
         })
     }
@@ -1992,7 +1827,7 @@ pub(crate) fn is_embedded(server: &Server) -> bool {
 }
 
 #[cfg(test)]
-mod lease_tests {
+mod bound_tests {
     use super::*;
 
     fn connect(server: &Server) -> Hub {
@@ -2004,16 +1839,16 @@ mod lease_tests {
     }
 
     #[test]
-    fn capability_churn_keeps_lease_bookkeeping_within_active_bounds() {
+    fn capability_churn_keeps_bookkeeping_within_active_bounds() {
         let server = Server::new(
             StoreInstanceId([9; 16]),
             vec![TargetDefinition::new("dev", TargetDefinitionHash([7; 32]))],
         )
         .unwrap();
         server
-            .install_lease_policy(LeasePolicy {
+            .install_snapshot_policy(SnapshotPolicy {
                 ttl: Duration::from_secs(60 * 60),
-                max_snapshot_leases: 1,
+                max_snapshots: 1,
                 max_connections: 1,
             })
             .unwrap();
@@ -2027,8 +1862,8 @@ mod lease_tests {
             });
         }
         assert!(
-            server.inner.leases.borrow().len() <= 1,
-            "evicted snapshot leases accumulated despite a one-lease bound"
+            server.inner.snapshots.borrow().len() <= 1,
+            "evicted snapshots accumulated despite a one-snapshot bound"
         );
 
         let mut hubs = vec![first_hub];

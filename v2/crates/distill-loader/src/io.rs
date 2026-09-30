@@ -85,7 +85,8 @@ pub enum AssetDeltaState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectReason {
-    LeaseExpired,
+    /// The connection to the daemon closed.
+    ConnectionLost,
     TargetDefinitionChanged,
     StoreInstanceChanged,
     ProtocolEpochChanged,
@@ -120,6 +121,12 @@ pub enum IoEvent {
     RequestError {
         req: ReqId,
         message: String,
+        basis: IoBasis,
+    },
+    /// The request's snapshot expired, or an artifact it resolved left the
+    /// daemon's cache: retry the round at a new snapshot.
+    SnapshotExpired {
+        req: ReqId,
         basis: IoBasis,
     },
     ConnectionError {

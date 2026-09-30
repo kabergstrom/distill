@@ -31,11 +31,6 @@ struct ReconnectRequired {
   reason @0 :ReconnectReason;
 }
 
-struct LeaseFailure {
-  code @0 :UInt16;
-  message @1 :Text;
-}
-
 struct RpcError {
   code @0 :UInt16;
   message @1 :Text;
@@ -105,7 +100,7 @@ struct MetadataSnapshotCall {
   union {
     success @0 :MetadataSnapshot;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -114,7 +109,7 @@ struct MetadataAuthoringSnapshotCall {
   union {
     success @0 :MetadataAuthoringSnapshot;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -123,7 +118,7 @@ struct MetadataDiagnosticsCall {
   union {
     success @0 :MetadataDiagnostics;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -132,7 +127,7 @@ struct MetadataUInt64Call {
   union {
     success @0 :UInt64;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -141,7 +136,7 @@ struct MetadataChunkStreamCall {
   union {
     success @0 :ChunkStream;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -150,7 +145,7 @@ struct MetadataUuidListCall {
   union {
     success @0 :List(Uuid);
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -159,7 +154,7 @@ struct MetadataEntryMetaCall {
   union {
     success @0 :PureMetadataEntry;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -178,7 +173,7 @@ struct MetadataPathResolveCall {
   union {
     success @0 :PathResolveResult;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
   }
 }
@@ -187,7 +182,7 @@ struct MetadataAuthoringInspectCall {
   union {
     success @0 :AuthoringInspection;
     reconnectRequired @1 :MetadataReconnectRequired;
-    leaseFailure @2 :LeaseFailure;
+    snapshotExpired @2 :Void;
     error @3 :RpcError;
     missing @4 :Void;
     roleIneligible @5 :AuthoringRoleFailure;
@@ -199,7 +194,7 @@ struct SnapshotCall {
     success @0 :Snapshot;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -209,7 +204,7 @@ struct AuthoringSnapshotCall {
     success @0 :AuthoringSnapshot;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -219,7 +214,7 @@ struct SubscribeCall {
     success @0 :Subscription;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -229,7 +224,7 @@ struct VoidCall {
     success @0 :Void;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -239,7 +234,7 @@ struct UInt64Call {
     success @0 :UInt64;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -253,7 +248,7 @@ struct UuidCall {
     success @0 :Uuid;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -282,7 +277,7 @@ struct ProgressCall {
     success @0 :ProgressStream;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -292,7 +287,7 @@ struct DataCall {
     success @0 :Data;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -302,7 +297,7 @@ struct UuidListCall {
     success @0 :List(Uuid);
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -613,7 +608,7 @@ struct AuthoringInspectCall {
     success @0 :AuthoringInspection;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
     missing @5 :Void;
     roleIneligible @6 :AuthoringRoleFailure;
@@ -643,7 +638,7 @@ struct EntryMetaCall {
     success @0 :EntryMeta;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -673,7 +668,7 @@ struct ResolveCall {
     success @0 :TerminalResolve;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -699,7 +694,7 @@ struct PathResolveCall {
     success @0 :TerminalPathResolve;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }
@@ -729,7 +724,7 @@ struct ChunkStreamCall {
     success @0 :TerminalFetch;
     reconnectRequired @1 :ReconnectRequired;
     configurationFailed @2 :ConfigurationError;
-    leaseFailure @3 :LeaseFailure;
+    snapshotExpired @3 :Void;
     error @4 :RpcError;
   }
 }

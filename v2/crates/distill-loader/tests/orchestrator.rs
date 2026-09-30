@@ -1034,6 +1034,51 @@ fn fetch_request_error_terminally_fails_its_candidate() {
 }
 
 #[test]
+fn an_expired_snapshot_retries_the_round_a_bounded_number_of_times() {
+    let token = ModuleEpochToken::new(61);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 61, &token);
+    let asset_uuid = uuid(61);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (hash, _) = artifact::<A>(asset_uuid, &[]);
+
+    // An expired snapshot at resolve, then a missing blob at fetch: each
+    // restarts the round at a new snapshot.
+    let sweeps = loader.io().sweeps;
+    let (req, basis) = loader.io().resolve_for(asset_uuid);
+    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().sweeps, sweeps + 1);
+    let (retry, _) = loader.io().resolve_for(asset_uuid);
+    assert_ne!(retry, req);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    let (req, basis) = loader.io().fetch_for(hash);
+    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().sweeps, sweeps + 2);
+    assert_eq!(loader.status(&handle), LoadStatus::Resolving);
+
+    let (req, basis) = loader.io().resolve_for(asset_uuid);
+    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.io().sweeps, sweeps + 3);
+    assert!(!loader.take_diagnostics().iter().any(
+        |diagnostic| matches!(diagnostic, LoaderDiagnostic::ComponentPoisoned { .. })
+    ));
+    let (req, basis) = loader.io().resolve_for(asset_uuid);
+    loader.io_mut().push(IoEvent::SnapshotExpired { req, basis });
+    loader.process(&mut storage).unwrap();
+    assert!(loader.take_diagnostics().iter().any(|diagnostic| matches!(
+        diagnostic,
+        LoaderDiagnostic::ComponentPoisoned { failures, .. }
+            if failures.iter().any(|(_, failure)| format!("{failure:?}").contains("kept expiring"))
+    )));
+}
+
+#[test]
 fn pending_member_defers_the_whole_dependency_component() {
     let token = ModuleEpochToken::new(2);
     let mut loader = Loader::new(mock_io());

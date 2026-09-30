@@ -9,8 +9,8 @@ use distill_loader::{
 };
 use distill_rpc::capnp_transport::StagedListener;
 use distill_rpc::{
-    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, LeasePolicy,
-    PathMutation, Server, StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
+    ArtifactPayload, AssetDeltaState, AssetMutation, Commit, ConnectRequest, PathMutation,
+    Server, SnapshotPolicy, StoreInstanceId, StoredResolve, TargetDefinition, TargetDefinitionHash,
 };
 use distill_wire::artifact::{content_hash, parse_artifact, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -331,21 +331,73 @@ fn rpc_io_accepts_multiple_asset_subscriptions_on_one_delta_stream() {
 }
 
 #[test]
-fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
+fn rpc_io_reports_an_expired_snapshot_and_the_next_round_reads_a_new_one() {
+    let Fixture {
+        server,
+        request,
+        asset,
+        hash,
+        ..
+    } = fixture();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let handle = server.handle();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let front = Server::attach(&handle);
+            front
+                .install_snapshot_policy(SnapshotPolicy {
+                    ttl: Duration::from_millis(100),
+                    ..SnapshotPolicy::default()
+                })
+                .unwrap();
+            let listener = StagedListener::bind(front.root(), "127.0.0.1:0")
+                .await
+                .unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            listener.accept_one().await.unwrap().await.unwrap().unwrap();
+        });
+    });
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    let basis = io.begin_sweep();
+    std::thread::sleep(Duration::from_millis(250));
+    io.resolve(ReqId(1), asset, &basis);
+    assert!(matches!(
+        poll_until(&mut io, 1).as_slice(),
+        [IoEvent::SnapshotExpired { req: ReqId(1), basis: expired }] if expired == &basis
+    ));
+
+    // Nothing was published: the new round's snapshot has the same basis.
+    let basis = io.begin_sweep();
+    io.resolve(ReqId(2), asset, &basis);
+    assert!(matches!(
+        poll_until(&mut io, 1).as_slice(),
+        [IoEvent::Resolved {
+            req: ReqId(2),
+            result: ResolveResult::Built { content_hash },
+            ..
+        }] if *content_hash == hash
+    ));
+
+    drop(io);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
     let Fixture {
         server,
         request,
         asset,
         ..
     } = fixture();
-    server
-        .install_lease_policy(LeasePolicy {
-            ttl: Duration::from_millis(150),
-            max_snapshot_leases: 8,
-            max_connections: 8,
-        })
-        .unwrap();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = server.handle();
+    let evicting = request.clone();
     let (stalled_ready_tx, stalled_ready_rx) = std::sync::mpsc::sync_channel(1);
     let (release_stall_tx, release_stall_rx) = std::sync::mpsc::channel();
     let root = server.root();
@@ -355,6 +407,14 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&runtime, async move {
+            // One connection at a time: a new one closes the oldest.
+            let front = Server::attach(&handle);
+            front
+                .install_snapshot_policy(SnapshotPolicy {
+                    max_connections: 1,
+                    ..SnapshotPolicy::default()
+                })
+                .unwrap();
             let listener = StagedListener::bind(root.clone(), "127.0.0.1:0")
                 .await
                 .unwrap();
@@ -363,6 +423,8 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
             let first = listener.accept_one().await.unwrap();
             let second = listener.accept_one().await.unwrap();
             drop(listener);
+            close_rx.await.unwrap();
+            let _closing = front.root().connect(evicting);
 
             let failed_listener = tokio::net::TcpListener::bind(address).await.unwrap();
             stalled_ready_tx.send(()).unwrap();
@@ -391,11 +453,13 @@ fn rpc_io_reports_lease_expiry_for_rebind_and_restores_subscriptions() {
         .iter()
         .any(|event| matches!(event, IoEvent::TargetBound { .. })));
     io.subscribe(asset);
+    std::thread::sleep(Duration::from_millis(100));
+    close_tx.send(()).unwrap();
 
     assert!(poll_until(&mut io, 1).iter().any(|event| matches!(
         event,
         IoEvent::ReconnectRequired {
-            reason: distill_loader::ReconnectReason::LeaseExpired
+            reason: distill_loader::ReconnectReason::ConnectionLost
         }
     )));
     stalled_ready_rx.recv().unwrap();

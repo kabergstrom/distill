@@ -41,6 +41,9 @@ use crate::storage::{
 };
 use crate::IoBasis;
 
+/// Rounds retried at a new snapshot before the request fails.
+const MAX_SWEEP_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadStatus {
     Unloaded,
@@ -390,6 +393,8 @@ pub struct Loader<I: LoaderIO> {
     dirty: BTreeSet<AssetUuid>,
     dirty_paths: BTreeSet<String>,
     sweep: Option<Sweep>,
+    /// Rounds restarted since a sweep last completed.
+    sweep_retries: u32,
     pending: Vec<PendingComponent>,
     diagnostics: Vec<LoaderDiagnostic>,
     next_handle: u64,
@@ -416,6 +421,7 @@ impl<I: LoaderIO> Loader<I> {
             dirty: BTreeSet::new(),
             dirty_paths: BTreeSet::new(),
             sweep: None,
+            sweep_retries: 0,
             pending: Vec::new(),
             diagnostics: Vec::new(),
             next_handle: 1,
@@ -1249,6 +1255,24 @@ impl<I: LoaderIO> Loader<I> {
                 };
                 self.accept_fetched(asset_uuid, content_hash, artifact, basis);
             }
+            IoEvent::SnapshotExpired { req, basis } => {
+                if self.sweep_retries >= MAX_SWEEP_RETRIES {
+                    let message = "the daemon snapshot kept expiring".to_owned();
+                    return self.handle_event(IoEvent::RequestError { req, message, basis }, storage);
+                }
+                let disposition = self.requests.complete(req, &basis);
+                if disposition != CompletionDisposition::Accepted {
+                    self.diagnostics
+                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    return Ok(());
+                }
+                // Retry the round at a new snapshot.
+                if let Some(sweep) = self.sweep.as_ref().filter(|sweep| sweep.basis == basis) {
+                    self.dirty_paths.extend(sweep.pending_paths.iter().cloned());
+                    self.sweep_retries += 1;
+                    self.restart_sweep();
+                }
+            }
             IoEvent::RequestError {
                 req,
                 message,
@@ -1935,6 +1959,7 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let mut sweep = self.sweep.take().expect("checked Some");
+        self.sweep_retries = 0;
         let processed_dirty = std::mem::take(&mut sweep.dirty_seeds);
         for decision in decisions {
             match decision {

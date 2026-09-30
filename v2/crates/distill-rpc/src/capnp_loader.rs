@@ -26,7 +26,8 @@ pub enum RemoteCall<T> {
     Success(T),
     ReconnectRequired(ReconnectReason),
     ConfigurationFailed(ConfigurationError),
-    LeaseFailure(RemoteError),
+    /// The snapshot expired or was released: open a new one.
+    SnapshotExpired,
     Error(RemoteError),
 }
 
@@ -83,9 +84,7 @@ impl RemoteHub {
             schema::snapshot_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::snapshot_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::snapshot_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::snapshot_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -110,9 +109,7 @@ impl RemoteHub {
             schema::data_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::data_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::data_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::data_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
         }
     }
@@ -155,9 +152,7 @@ impl RemoteHub {
             schema::subscribe_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::subscribe_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::subscribe_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::subscribe_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -191,9 +186,7 @@ impl RemoteHub {
             schema::void_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::void_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::void_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::void_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
         }
     }
@@ -237,9 +230,7 @@ impl RemoteHub {
             schema::uuid_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::uuid_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::uuid_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::uuid_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
         }
     }
@@ -278,9 +269,7 @@ impl RemoteSnapshot {
             schema::u_int64_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::u_int64_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::u_int64_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::u_int64_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -304,9 +293,7 @@ impl RemoteSnapshot {
             schema::snapshot_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::snapshot_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::snapshot_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::snapshot_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -355,9 +342,7 @@ impl RemoteSnapshot {
             schema::chunk_stream_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::chunk_stream_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::chunk_stream_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::chunk_stream_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -388,9 +373,7 @@ impl RemoteSnapshot {
             schema::resolve_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::resolve_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::resolve_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::resolve_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -421,9 +404,7 @@ impl RemoteSnapshot {
             schema::path_resolve_call::Which::ConfigurationFailed(value) => Ok(
                 RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
-            schema::path_resolve_call::Which::LeaseFailure(value) => {
-                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
-            }
+            schema::path_resolve_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::path_resolve_call::Which::Error(value) => {
                 Ok(RemoteCall::Error(decode_error(value?)?))
             }
@@ -681,13 +662,6 @@ fn decode_error(value: schema::rpc_error::Reader<'_>) -> Result<RemoteError, cap
     Ok(RemoteError {
         code: value.get_code(),
         message: text(value.get_message()?, "rpc.error")?,
-    })
-}
-
-fn decode_lease(value: schema::lease_failure::Reader<'_>) -> Result<RemoteError, capnp::Error> {
-    Ok(RemoteError {
-        code: value.get_code(),
-        message: text(value.get_message()?, "rpc.leaseFailure")?,
     })
 }
 

@@ -138,30 +138,6 @@ impl BuildBackend for LifecycleBuildBackend {
     }
 }
 
-struct RecordingArtifactLeases {
-    events: Arc<Mutex<Vec<&'static str>>>,
-}
-
-impl ArtifactLeaseBackend for RecordingArtifactLeases {
-    fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
-        self.events.lock().unwrap().push("pin");
-        Ok(())
-    }
-
-    fn release_lease(&self, _holder: u64) {
-        self.events.lock().unwrap().push("release");
-    }
-
-    fn pin_pack_session(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
-        self.events.lock().unwrap().push("pack-pin");
-        Ok(())
-    }
-
-    fn release_pack_session(&self, _holder: u64) {
-        self.events.lock().unwrap().push("pack-release");
-    }
-}
-
 impl BuildBackend for DepthLimitedBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
         *self.calls.lock().unwrap() += 1;
@@ -203,13 +179,10 @@ fn dependency_depth_exhaustion_is_typed_and_never_memoized() {
 }
 
 #[test]
-fn resolve_pins_before_build_release_and_snapshot_clones_share_one_lease() {
+fn snapshot_clones_share_one_read_transaction() {
     let server = server_with(&[(1, false)]);
     let events = Arc::new(Mutex::new(Vec::new()));
     server.install_build_backend(Arc::new(LifecycleBuildBackend {
-        events: Arc::clone(&events),
-    }));
-    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
         events: Arc::clone(&events),
     }));
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
@@ -233,148 +206,21 @@ fn resolve_pins_before_build_release_and_snapshot_clones_share_one_lease() {
         snapshot.resolve(entry.uuid),
         RpcResult::Success(_)
     ));
+    assert_eq!(&events.lock().unwrap()[..], &["finish"]);
+    clone.expire();
     assert_eq!(
-        &events.lock().unwrap()[..2],
-        &["pin", "finish"],
-        "the caller lease must be durable before the in-flight pin is released"
-    );
-    drop(snapshot);
-    assert!(!events.lock().unwrap().contains(&"release"));
-    clone.expire_lease();
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| **event == "release")
-            .count(),
-        1
-    );
-    drop(clone);
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| **event == "release")
-            .count(),
-        1,
-        "expiry and final drop release a shared lease only once"
+        snapshot.version(),
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
 }
 
 #[test]
-fn pack_session_is_single_renewable_and_releases_its_distinct_pin_scope() {
+fn snapshot_and_connection_bounds_release_the_oldest_capabilities() {
     let server = server_with(&[]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
-        events: Arc::clone(&events),
-    }));
     server
-        .install_lease_policy(LeasePolicy {
-            ttl: Duration::from_millis(80),
-            max_snapshot_leases: 8,
-            max_connections: 8,
-        })
-        .unwrap();
-    let snapshot = snapshot(&connect(&server, &[]));
-    let session = snapshot.open_pack_session().success().unwrap();
-    assert!(matches!(
-        snapshot.open_pack_session(),
-        RpcResult::Failure(RpcFailure::ResourceLimit {
-            resource,
-            limit: 1
-        }) if resource == "pack sessions per snapshot"
-    ));
-    assert_eq!(session.pin(&[[7; 32]]), RpcResult::Success(()));
-
-    for _ in 0..4 {
-        std::thread::sleep(Duration::from_millis(45));
-        assert_eq!(session.keep_alive(), RpcResult::Success(()));
-    }
-    assert_eq!(snapshot.version(), RpcResult::Success(InputVersion(0)));
-    drop(session);
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| **event == "pack-release")
-            .count(),
-        1
-    );
-
-    let session = snapshot.open_pack_session().success().unwrap();
-    assert_eq!(session.pin(&[[8; 32]]), RpcResult::Success(()));
-    snapshot.expire_lease();
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| **event == "pack-release")
-            .count(),
-        2,
-        "snapshot expiry must clean up an abandoned pack-session pin"
-    );
-    drop(session);
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| **event == "pack-release")
-            .count(),
-        2,
-        "scope drop after lease expiry must not release twice"
-    );
-}
-
-#[test]
-fn snapshot_leases_expire_by_deadline_and_new_connections_mint_fresh_leases() {
-    let server = server_with(&[]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
-        events: Arc::clone(&events),
-    }));
-    server
-        .install_lease_policy(LeasePolicy {
-            ttl: Duration::from_millis(50),
-            max_snapshot_leases: 8,
-            max_connections: 8,
-        })
-        .unwrap();
-    let hub = connect(&server, &[]);
-    let first = snapshot(&hub);
-    let wait_started = std::time::Instant::now();
-    while !events.lock().unwrap().contains(&"release") {
-        assert!(
-            wait_started.elapsed() < Duration::from_secs(2),
-            "snapshot CAS lease was not released at its deadline"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-        server.sweep_expired();
-    }
-
-    assert_eq!(
-        first.version(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
-    );
-    let refreshed = snapshot(&connect(&server, &[]));
-    assert_eq!(refreshed.version(), RpcResult::Success(InputVersion(0)));
-}
-
-#[test]
-fn snapshot_and_connection_bounds_expire_the_oldest_capabilities() {
-    let server = server_with(&[]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    server.install_artifact_lease_backend(Arc::new(RecordingArtifactLeases {
-        events: Arc::clone(&events),
-    }));
-    server
-        .install_lease_policy(LeasePolicy {
+        .install_snapshot_policy(SnapshotPolicy {
             ttl: Duration::from_secs(60),
-            max_snapshot_leases: 1,
+            max_snapshots: 1,
             max_connections: 2,
         })
         .unwrap();
@@ -383,35 +229,25 @@ fn snapshot_and_connection_bounds_expire_the_oldest_capabilities() {
     let second_snapshot = snapshot(&first_hub);
     assert_eq!(
         first_snapshot.version(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
     assert_eq!(
         second_snapshot.version(),
         RpcResult::Success(InputVersion(0))
     );
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| **event == "release")
-            .count(),
-        1,
-        "snapshot-cap eviction must release the old CAS holder immediately"
-    );
 
     let second_hub = connect(&server, &[]);
     assert!(matches!(first_hub.snapshot(), RpcResult::Success(_)));
     server
-        .install_lease_policy(LeasePolicy {
+        .install_snapshot_policy(SnapshotPolicy {
             ttl: Duration::from_secs(60),
-            max_snapshot_leases: 1,
+            max_snapshots: 1,
             max_connections: 1,
         })
         .unwrap();
     assert!(matches!(
         first_hub.snapshot(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::ConnectionClosed)
     ));
     assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
 }
@@ -422,9 +258,9 @@ async fn connection_cap_terminates_an_already_waiting_delta_stream() {
         .run_until(async {
     let server = server_with(&[]);
     server
-        .install_lease_policy(LeasePolicy {
+        .install_snapshot_policy(SnapshotPolicy {
             ttl: Duration::from_secs(60),
-            max_snapshot_leases: 8,
+            max_snapshots: 8,
             max_connections: 1,
         })
         .unwrap();
@@ -452,7 +288,7 @@ async fn connection_cap_terminates_an_already_waiting_delta_stream() {
     );
     assert!(matches!(
         first_hub.snapshot(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::ConnectionClosed)
     ));
     assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
         })
@@ -1358,26 +1194,26 @@ fn authoring_snapshot_refreshes_to_a_successor_stamp_without_tearing() {
 }
 
 #[test]
-fn every_authoring_snapshot_method_is_lease_and_generation_fenced() {
+fn every_authoring_snapshot_method_is_expiry_and_generation_fenced() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);
     let expired = authoring_snapshot(&hub);
-    expired.expire_lease();
+    expired.expire();
     assert_eq!(
         expired.version(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
     assert_eq!(
         expired.query(AssetQuery::default()),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
     assert_eq!(
         expired.inspect(asset_id(1)),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     );
     assert!(matches!(
         expired.refresh(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     ));
 
     let stale = authoring_snapshot(&hub);
@@ -2588,22 +2424,22 @@ fn expired_and_foreign_snapshots_fail_without_serving_data() {
         RpcResult::Failure(RpcFailure::ForeignSnapshot)
     );
 
-    first.expire_lease();
+    first.expire();
     assert!(matches!(
         first.resolve(asset_id(1)),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     ));
     assert!(matches!(
         first.resolve_path("a.asset"),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     ));
     assert!(matches!(
         first.fetch(content_hash(1)),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     ));
     assert!(matches!(
         first.refresh(),
-        RpcResult::Failure(RpcFailure::LeaseExpired)
+        RpcResult::Failure(RpcFailure::SnapshotExpired)
     ));
 }
 

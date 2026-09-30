@@ -48,6 +48,19 @@ const WIRE_INVALID_INSTANCE: u16 = 1003;
 const WIRE_INVALID_UTF8: u16 = 1004;
 const WIRE_INVALID_VALUE: u16 = 1005;
 const RPC_FAILURE: u16 = 3000;
+/// `RpcError.code` of a fetch whose artifact left the CAS: a cache miss,
+/// retried at a new snapshot.
+pub const ARTIFACT_NOT_FOUND: u16 = 3001;
+/// `RpcError.code` of a call on a connection closed to admit a newer one.
+pub const CONNECTION_CLOSED: u16 = 3002;
+
+fn failure_code(error: &RpcFailure) -> u16 {
+    match error {
+        RpcFailure::ArtifactNotFound { .. } => ARTIFACT_NOT_FOUND,
+        RpcFailure::ConnectionClosed => CONNECTION_CLOSED,
+        _ => RPC_FAILURE,
+    }
+}
 
 #[derive(Debug)]
 pub enum TransportError {
@@ -82,7 +95,6 @@ impl From<capnp::Error> for TransportError {
 
 /// A listener whose address passed the loopback-only configuration staging
 /// gate before any socket was opened.
-const LEASE_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct StagedListener {
     listener: TcpListener,
@@ -147,16 +159,11 @@ impl StagedListener {
         F: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
-        // Capability leases expire lazily on use; the sweep releases the
-        // CAS pins of abandoned ones.
-        let mut sweep = tokio::time::interval(LEASE_SWEEP_PERIOD);
-        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 // Dropping a Tokio JoinHandle detaches the task; the
                 // connection's own RpcSystem continues until disconnect.
                 result = self.accept_one() => drop(result?),
-                _ = sweep.tick() => self.root.server().sweep_expired(),
                 () = &mut shutdown => return Ok(()),
             }
         }
@@ -2416,6 +2423,7 @@ fn read_bundle_source(
 fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: RpcResult<Snapshot>) {
     match outcome {
         RpcResult::Success(snapshot) => {
+            snapshot.expire_later();
             let client: schema::snapshot::Client =
                 capnp_rpc::new_client(SnapshotService { snapshot });
             let mut result = result;
@@ -2432,11 +2440,12 @@ fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: Rp
 }
 
 fn write_authoring_snapshot_result(
-    result: schema::authoring_snapshot_call::Builder<'_>,
+    mut result: schema::authoring_snapshot_call::Builder<'_>,
     outcome: RpcResult<AuthoringSnapshot>,
 ) {
     match outcome {
         RpcResult::Success(snapshot) => {
+            snapshot.expire_later();
             let client: schema::authoring_snapshot::Client =
                 capnp_rpc::new_client(AuthoringSnapshotService { snapshot });
             let mut result = result;
@@ -2448,22 +2457,20 @@ fn write_authoring_snapshot_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
-            result.init_lease_failure(),
-            "authoring snapshot lease expired",
-        ),
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_metadata_snapshot_result(
-    result: schema::metadata_snapshot_call::Builder<'_>,
+    mut result: schema::metadata_snapshot_call::Builder<'_>,
     outcome: MetadataCall<MetadataSnapshot>,
 ) {
     match outcome {
         MetadataCall::Success(snapshot) => {
+            snapshot.expire_later();
             let client: schema::metadata_snapshot::Client =
                 capnp_rpc::new_client(MetadataSnapshotService { snapshot });
             let mut result = result;
@@ -2472,22 +2479,20 @@ fn write_metadata_snapshot_result(
         MetadataCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_metadata_authoring_snapshot_result(
-    result: schema::metadata_authoring_snapshot_call::Builder<'_>,
+    mut result: schema::metadata_authoring_snapshot_call::Builder<'_>,
     outcome: MetadataCall<MetadataAuthoringSnapshot>,
 ) {
     match outcome {
         MetadataCall::Success(snapshot) => {
+            snapshot.expire_later();
             let client: schema::metadata_authoring_snapshot::Client =
                 capnp_rpc::new_client(MetadataAuthoringSnapshotService { snapshot });
             let mut result = result;
@@ -2496,22 +2501,20 @@ fn write_metadata_authoring_snapshot_result(
         MetadataCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata authoring snapshot lease expired",
-        ),
+        MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_metadata_authoring_refresh_result(
-    result: schema::metadata_authoring_snapshot_call::Builder<'_>,
+    mut result: schema::metadata_authoring_snapshot_call::Builder<'_>,
     outcome: MetadataCall<MetadataAuthoringSnapshot>,
 ) {
     match outcome {
         MetadataCall::Success(snapshot) => {
+            snapshot.expire_later();
             let client: schema::metadata_authoring_snapshot::Client =
                 capnp_rpc::new_client(MetadataAuthoringSnapshotService { snapshot });
             let mut result = result;
@@ -2520,12 +2523,9 @@ fn write_metadata_authoring_refresh_result(
         MetadataCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata authoring snapshot lease expired",
-        ),
+        MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2560,12 +2560,9 @@ fn write_metadata_diagnostics_result(
         MetadataCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
     Ok(())
@@ -2580,12 +2577,9 @@ fn write_metadata_uint64_result(
         MetadataCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2604,12 +2598,9 @@ fn write_metadata_uuid_list_result(
         MetadataNamespaceCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataNamespaceCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2625,18 +2616,15 @@ fn write_metadata_entry_result(
         MetadataNamespaceCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataNamespaceCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_metadata_path_result(
-    result: schema::metadata_path_resolve_call::Builder<'_>,
+    mut result: schema::metadata_path_resolve_call::Builder<'_>,
     outcome: MetadataNamespaceCall<PathResolveResult>,
 ) {
     match outcome {
@@ -2656,12 +2644,9 @@ fn write_metadata_path_result(
         MetadataNamespaceCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataNamespaceCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2683,12 +2668,9 @@ fn write_metadata_authoring_inspect_result(
         MetadataNamespaceCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataNamespaceCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataNamespaceCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataNamespaceCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2752,12 +2734,9 @@ fn write_uuid_list_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
-            result.init_lease_failure(),
-            "authoring snapshot lease expired",
-        ),
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2774,11 +2753,11 @@ fn write_target_entry_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2803,12 +2782,9 @@ fn write_authoring_inspect_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
-            result.init_lease_failure(),
-            "authoring snapshot lease expired",
-        ),
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2888,11 +2864,11 @@ fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcRes
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2906,11 +2882,11 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2927,11 +2903,11 @@ fn write_bundle_uuid_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "connection lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2954,11 +2930,11 @@ fn write_progress_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "connection lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -2972,17 +2948,17 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "connection lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_resolve_result(
-    result: schema::resolve_call::Builder<'_>,
+    mut result: schema::resolve_call::Builder<'_>,
     outcome: RpcResult<crate::TerminalEvent<ResolveResult>>,
 ) {
     match outcome {
@@ -3018,17 +2994,17 @@ fn write_resolve_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_path_result(
-    result: schema::path_resolve_call::Builder<'_>,
+    mut result: schema::path_resolve_call::Builder<'_>,
     outcome: RpcResult<crate::TerminalEvent<PathResolveResult>>,
 ) {
     match outcome {
@@ -3053,17 +3029,17 @@ fn write_path_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_fetch_result(
-    result: schema::chunk_stream_call::Builder<'_>,
+    mut result: schema::chunk_stream_call::Builder<'_>,
     outcome: RpcResult<crate::TerminalEvent<ChunkStream>>,
 ) {
     match outcome {
@@ -3091,17 +3067,17 @@ fn write_fetch_result(
         RpcResult::ConfigurationFailed(error) => {
             write_configuration_error(result.init_configuration_failed(), &error)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            result.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
 
 fn write_metadata_fetch_result(
-    result: schema::metadata_chunk_stream_call::Builder<'_>,
+    mut result: schema::metadata_chunk_stream_call::Builder<'_>,
     outcome: MetadataCall<ChunkStream>,
 ) {
     match outcome {
@@ -3115,12 +3091,9 @@ fn write_metadata_fetch_result(
         MetadataCall::ReconnectRequired { reason } => {
             write_metadata_reconnect(result.init_reconnect_required(), reason)
         }
-        MetadataCall::LeaseFailure => write_lease_failure(
-            result.init_lease_failure(),
-            "metadata snapshot lease expired",
-        ),
+        MetadataCall::SnapshotExpired => result.set_snapshot_expired(()),
         MetadataCall::Error(error) => {
-            write_error(result.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -3196,11 +3169,11 @@ fn write_snapshot_configuration_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(output.init_reconnect_required(), reason)
         }
-        RpcResult::Failure(RpcFailure::LeaseExpired) => {
-            write_lease_failure(output.init_lease_failure(), "snapshot lease expired")
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => {
+            output.set_snapshot_expired(())
         }
         RpcResult::Failure(error) => {
-            write_error(output.init_error(), RPC_FAILURE, &format!("{error:?}"))
+            write_error(output.init_error(), failure_code(&error), &format!("{error:?}"))
         }
     }
 }
@@ -3491,11 +3464,6 @@ fn write_wire_error(output: schema::rpc_error::Builder<'_>, failure: &WireFailur
     write_error(output, failure.code, failure.message.as_str());
 }
 
-fn write_lease_failure(mut output: schema::lease_failure::Builder<'_>, message: &str) {
-    output.set_code(1);
-    output.set_message(message);
-}
-
 fn write_connect_error(mut result: schema::connect_call::Builder<'_>, error: &crate::ConnectError) {
     match error {
         crate::ConnectError::ProtocolMismatch { expected, got } => {
@@ -3523,15 +3491,12 @@ fn write_rpc_result_error_snapshot(
     mut result: schema::snapshot_call::Builder<'_>,
     error: RpcFailure,
 ) {
-    if error == RpcFailure::LeaseExpired {
-        write_lease_failure(
-            result.reborrow().init_lease_failure(),
-            "snapshot lease expired",
-        );
+    if error == RpcFailure::SnapshotExpired {
+        result.reborrow().set_snapshot_expired(());
     } else {
         write_error(
             result.init_error(),
-            RPC_FAILURE,
+            failure_code(&error),
             format!("{error:?}").as_str(),
         );
     }
@@ -3541,15 +3506,12 @@ fn write_rpc_result_error_subscribe(
     mut result: schema::subscribe_call::Builder<'_>,
     error: RpcFailure,
 ) {
-    if error == RpcFailure::LeaseExpired {
-        write_lease_failure(
-            result.reborrow().init_lease_failure(),
-            "snapshot lease expired",
-        );
+    if error == RpcFailure::SnapshotExpired {
+        result.reborrow().set_snapshot_expired(());
     } else {
         write_error(
             result.init_error(),
-            RPC_FAILURE,
+            failure_code(&error),
             format!("{error:?}").as_str(),
         );
     }

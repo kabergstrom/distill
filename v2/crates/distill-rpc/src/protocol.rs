@@ -12,7 +12,7 @@ pub use distill_store::state::{
     SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
 };
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -151,7 +151,10 @@ pub enum MetadataReconnectReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcFailure {
-    LeaseExpired,
+    /// The snapshot expired or was released: open a new one.
+    SnapshotExpired,
+    /// The connection was closed to admit a newer one: reconnect.
+    ConnectionClosed,
     PipelineUnavailable(Box<PipelineUnavailableDiagnostic>),
     BuildDepthExceeded {
         limit: usize,
@@ -211,7 +214,7 @@ pub enum RpcFailure {
 pub enum MetadataCall<T> {
     Success(T),
     ReconnectRequired { reason: MetadataReconnectReason },
-    LeaseFailure,
+    SnapshotExpired,
     Error(RpcFailure),
 }
 
@@ -227,7 +230,7 @@ impl<T> MetadataCall<T> {
         match self {
             Self::Success(value) => MetadataCall::Success(map(value)),
             Self::ReconnectRequired { reason } => MetadataCall::ReconnectRequired { reason },
-            Self::LeaseFailure => MetadataCall::LeaseFailure,
+            Self::SnapshotExpired => MetadataCall::SnapshotExpired,
             Self::Error(error) => MetadataCall::Error(error),
         }
     }
@@ -238,7 +241,7 @@ impl<T> MetadataCall<T> {
 pub enum MetadataNamespaceCall<T> {
     Success(T),
     ReconnectRequired { reason: MetadataReconnectReason },
-    LeaseFailure,
+    SnapshotExpired,
     Error(RpcFailure),
 }
 
@@ -838,29 +841,9 @@ pub trait BuildBackend: Send + Sync {
 
     /// Notification that the server has either installed or rejected the
     /// publication returned by [`Self::build`]. A durable backend uses this
-    /// boundary to release its in-flight CAS pins and run maintenance only
-    /// after the caller's lease has been pinned.
+    /// boundary to run maintenance once the result is served.
     fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
         Ok(())
-    }
-}
-
-/// Storage hook for §13's pin-before-response rule. The RPC crate owns lease
-/// lifetime while the daemon owns the durable CAS, so this deliberately small
-/// interface is the only coupling between them.
-pub trait ArtifactLeaseBackend: Send + Sync {
-    fn pin_lease(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String>;
-    fn release_lease(&self, holder: u64);
-
-    /// Pins retained only while a bounded, renewable pack-build session is
-    /// alive. Backends that do not distinguish durable pin classes can use
-    /// the ordinary lease implementation.
-    fn pin_pack_session(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
-        self.pin_lease(holder, hashes)
-    }
-
-    fn release_pack_session(&self, holder: u64) {
-        self.release_lease(holder);
     }
 }
 

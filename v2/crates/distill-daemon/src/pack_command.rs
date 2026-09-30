@@ -12,7 +12,8 @@ use distill_pack::builder::{
 };
 use distill_rpc::{
     AuthoringEntryRole, AuthoringInspectResult, ConnectOutcome, ConnectRequest, MetadataCall,
-    MetadataConnectOutcome, MetadataNamespaceCall, RpcResult, SnapshotStamp, TargetDefinitionHash,
+    MetadataConnectOutcome, MetadataNamespaceCall, RpcFailure, RpcResult, SnapshotStamp,
+    TargetDefinitionHash,
     PROTOCOL_VERSION,
 };
 
@@ -117,7 +118,9 @@ fn build_pack_from_process(
         if snapshot.stamp() != definition_stamp {
             continue;
         }
-        return build_publish_and_activate_pack(
+        // An artifact that left the CAS mid-build is a cache miss: build
+        // again at a new snapshot.
+        match build_publish_and_activate_pack(
             destination,
             &definition,
             &PackBuildTarget {
@@ -127,8 +130,17 @@ fn build_pack_from_process(
             &encoder_identity(),
             &snapshot,
             &hub,
-        )
-        .map_err(Into::into);
+        ) {
+            Err(PackBuildError::Rpc(failure))
+                if matches!(
+                    *failure,
+                    RpcFailure::ArtifactNotFound { .. } | RpcFailure::SnapshotExpired
+                ) =>
+            {
+                continue
+            }
+            result => return result.map_err(Into::into),
+        }
     }
     Err(PackCommandError::UnstableBasis)
 }
@@ -181,8 +193,8 @@ fn metadata_value<T>(result: MetadataCall<T>, operation: &str) -> Result<T, Pack
         MetadataCall::ReconnectRequired { reason } => Err(PackCommandError::Metadata(format!(
             "{operation}: reconnect required: {reason:?}"
         ))),
-        MetadataCall::LeaseFailure => Err(PackCommandError::Metadata(format!(
-            "{operation}: snapshot lease expired"
+        MetadataCall::SnapshotExpired => Err(PackCommandError::Metadata(format!(
+            "{operation}: snapshot expired"
         ))),
         MetadataCall::Error(error) => Err(PackCommandError::Metadata(format!(
             "{operation}: {error:?}"
@@ -199,8 +211,8 @@ fn metadata_namespace_value<T>(
         MetadataNamespaceCall::ReconnectRequired { reason } => Err(PackCommandError::Metadata(
             format!("{operation}: reconnect required: {reason:?}"),
         )),
-        MetadataNamespaceCall::LeaseFailure => Err(PackCommandError::Metadata(format!(
-            "{operation}: snapshot lease expired"
+        MetadataNamespaceCall::SnapshotExpired => Err(PackCommandError::Metadata(format!(
+            "{operation}: snapshot expired"
         ))),
         MetadataNamespaceCall::Error(error) => Err(PackCommandError::Metadata(format!(
             "{operation}: {error:?}"

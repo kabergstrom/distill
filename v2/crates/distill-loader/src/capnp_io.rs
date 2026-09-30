@@ -14,7 +14,9 @@ use std::time::Duration;
 use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSubscription};
-use distill_rpc::capnp_transport::{CapnpClient, RemoteConnectOutcome};
+use distill_rpc::capnp_transport::{
+    CapnpClient, RemoteConnectOutcome, ARTIFACT_NOT_FOUND, CONNECTION_CLOSED,
+};
 use distill_rpc::{AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, StreamEvent};
 use tokio::sync::{mpsc, watch};
 
@@ -484,7 +486,8 @@ impl Driver {
         match command {
             Command::BindTarget(target) => self.begin_reconnect(target),
             Command::BeginSweep { reply } => {
-                let basis = match self.snapshot.refresh().await {
+                // Each round reads one snapshot of its own.
+                let basis = match self.hub.snapshot().await {
                     Ok(RemoteCall::Success(snapshot)) => {
                         self.snapshot = snapshot;
                         Some(io_basis(self.snapshot.basis()))
@@ -497,7 +500,7 @@ impl Driver {
                         let _ = send_event(
                             &self.events,
                             IoEvent::ReconnectRequired {
-                                reason: ReconnectReason::LeaseExpired,
+                                reason: ReconnectReason::ConnectionLost,
                             },
                         )
                         .await;
@@ -736,7 +739,7 @@ impl Driver {
                 let _ = send_event(
                     &self.events,
                     IoEvent::ReconnectRequired {
-                        reason: ReconnectReason::LeaseExpired,
+                        reason: ReconnectReason::ConnectionLost,
                     },
                 )
                 .await;
@@ -766,7 +769,7 @@ impl Driver {
                         let _ = send_event(
                             &events,
                             IoEvent::ReconnectRequired {
-                                reason: ReconnectReason::LeaseExpired,
+                                reason: ReconnectReason::ConnectionLost,
                             },
                         )
                         .await;
@@ -1248,8 +1251,12 @@ fn remote_request_event<T: std::fmt::Debug>(
         RemoteCall::ReconnectRequired(reason) => IoEvent::ReconnectRequired {
             reason: reconnect_reason(reason),
         },
-        RemoteCall::LeaseFailure(_) => IoEvent::ReconnectRequired {
-            reason: ReconnectReason::LeaseExpired,
+        RemoteCall::SnapshotExpired => IoEvent::SnapshotExpired { req, basis },
+        RemoteCall::Error(error) if error.code == ARTIFACT_NOT_FOUND => {
+            IoEvent::SnapshotExpired { req, basis }
+        }
+        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => IoEvent::ReconnectRequired {
+            reason: ReconnectReason::ConnectionLost,
         },
         other => request_error(req, basis, remote_message(other)),
     }
@@ -1260,8 +1267,8 @@ fn connection_event<T: std::fmt::Debug>(call: RemoteCall<T>) -> IoEvent {
         RemoteCall::ReconnectRequired(reason) => IoEvent::ReconnectRequired {
             reason: reconnect_reason(reason),
         },
-        RemoteCall::LeaseFailure(_) => IoEvent::ReconnectRequired {
-            reason: ReconnectReason::LeaseExpired,
+        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => IoEvent::ReconnectRequired {
+            reason: ReconnectReason::ConnectionLost,
         },
         other => IoEvent::ConnectionError {
             message: remote_message(other),
@@ -1274,7 +1281,8 @@ fn remote_message<T: std::fmt::Debug>(call: RemoteCall<T>) -> String {
         RemoteCall::ConfigurationFailed(error) => {
             format!("daemon configuration failed: {}", error.message)
         }
-        RemoteCall::LeaseFailure(error) | RemoteCall::Error(error) => error.message,
+        RemoteCall::SnapshotExpired => "the snapshot expired".to_owned(),
+        RemoteCall::Error(error) => error.message,
         other => format!("unexpected RPC result: {other:?}"),
     }
 }

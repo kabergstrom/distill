@@ -27,12 +27,12 @@ pub use apply::{
 };
 pub use capability::{
     AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, MetadataAuthoringSnapshot, MetadataHub,
-    MetadataSnapshot, PackSession, PendingBuild, ResolveStep, Snapshot, import_call_outcome,
+    MetadataSnapshot, PendingBuild, ResolveStep, Snapshot, import_call_outcome,
     write_call_outcome,
 };
 pub use server::{
-    target_map, CoordinatedCommitError, LeasePolicy, Root, Server, ServerHandle, WriteCall,
-    MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
+    target_map, CoordinatedCommitError, Root, Server, ServerHandle, SnapshotPolicy, WriteCall,
+    DEFAULT_SNAPSHOT_TTL, MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use validate::{decode_asset_reference_query, decode_authoring_payload};
 pub use target::{TargetDefinition, TargetSetError};

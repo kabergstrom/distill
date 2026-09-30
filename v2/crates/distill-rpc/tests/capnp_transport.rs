@@ -174,14 +174,14 @@ async fn remote_loader_client_preserves_typed_calls() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn capnp_connection_deadline_ends_delta_stream_and_returns_typed_lease_failure() {
+async fn capnp_snapshots_hard_expire_and_a_closed_connection_releases_them() {
     LocalSet::new()
         .run_until(async {
             let server = server();
             server
-                .install_lease_policy(LeasePolicy {
-                    ttl: std::time::Duration::from_millis(250),
-                    max_snapshot_leases: 1,
+                .install_snapshot_policy(SnapshotPolicy {
+                    ttl: std::time::Duration::from_millis(200),
+                    max_snapshots: 8,
                     max_connections: 8,
                 })
                 .unwrap();
@@ -199,91 +199,53 @@ async fn capnp_connection_deadline_ends_delta_stream_and_returns_typed_lease_fai
                 RemoteConnectOutcome::Connected { hub, .. } => hub,
                 other => panic!("expected connected, got {other:?}"),
             };
-
-            let first_response = hub.snapshot_request().send().promise.await.unwrap();
-            let first_result = first_response.get().unwrap().get_result().unwrap();
-            let first_snapshot = match first_result.which().unwrap() {
-                schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
-                _ => panic!("expected first snapshot"),
+            let open_snapshot = || async {
+                let response = hub.snapshot_request().send().promise.await.unwrap();
+                match response.get().unwrap().get_result().unwrap().which().unwrap() {
+                    schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
+                    _ => panic!("expected a snapshot"),
+                }
             };
-            let second_response = hub.snapshot_request().send().promise.await.unwrap();
-            assert!(matches!(
-                second_response
-                    .get()
-                    .unwrap()
-                    .get_result()
-                    .unwrap()
-                    .which()
-                    .unwrap(),
-                schema::snapshot_call::Which::Success(_)
-            ));
-            let expired_snapshot = first_snapshot
-                .version_request()
-                .send()
-                .promise
-                .await
-                .unwrap();
-            assert!(matches!(
-                expired_snapshot
-                    .get()
-                    .unwrap()
-                    .get_result()
-                    .unwrap()
-                    .which()
-                    .unwrap(),
-                schema::u_int64_call::Which::LeaseFailure(_)
-            ));
-
-            let mut subscribe = hub.subscribe_request();
-            {
-                let mut params = subscribe.get();
-                params.set_since(0);
-                params.reborrow().init_assets(0);
-                params.init_paths(0);
-            }
-            let response = subscribe.send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            let installed = match result.which().unwrap() {
-                schema::subscribe_call::Which::Success(installed) => installed.unwrap(),
-                _ => panic!("expected subscription"),
+            let version = |snapshot: schema::snapshot::Client| async move {
+                let response = snapshot.version_request().send().promise.await.unwrap();
+                matches!(
+                    response.get().unwrap().get_result().unwrap().which().unwrap(),
+                    schema::u_int64_call::Which::Success(_)
+                )
             };
-            let deltas = installed.get_deltas().unwrap();
-            let initial = deltas.next_request().send().promise.await.unwrap();
-            assert!(!initial.get().unwrap().get_done());
 
-            let pending = deltas.next_request().send().promise;
-            let ended = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
-                .await
-                .expect("leased DeltaStream remained blocked past its deadline")
+            // Use does not extend a snapshot: it expires at its TTL.
+            let first = open_snapshot().await;
+            assert!(version(first.clone()).await);
+            assert_eq!(server.open_snapshots(), 1);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(version(first.clone()).await);
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            assert_eq!(server.open_snapshots(), 0);
+            let response = first.version_request().send().promise.await.unwrap();
+            assert!(matches!(
+                response.get().unwrap().get_result().unwrap().which().unwrap(),
+                schema::u_int64_call::Which::SnapshotExpired(())
+            ));
+
+            // Closing the connection releases the snapshots it held.
+            server
+                .install_snapshot_policy(SnapshotPolicy {
+                    ttl: std::time::Duration::from_secs(60),
+                    max_snapshots: 8,
+                    max_connections: 8,
+                })
                 .unwrap();
-            assert!(ended.get().unwrap().get_done());
-
-            let response = hub.snapshot_request().send().promise.await.unwrap();
-            let result = response.get().unwrap().get_result().unwrap();
-            assert!(matches!(
-                result.which().unwrap(),
-                schema::snapshot_call::Which::LeaseFailure(_)
-            ));
-            let mut wire_tree = hub.wire_tree_request();
-            wire_tree.get().set_layout_hash(&[0; 32]);
-            let response = wire_tree.send().promise.await.unwrap();
-            assert!(matches!(
-                response
-                    .get()
-                    .unwrap()
-                    .get_result()
-                    .unwrap()
-                    .which()
-                    .unwrap(),
-                schema::data_call::Which::LeaseFailure(_)
-            ));
-
-            drop(client);
+            let second = open_snapshot().await;
+            assert!(version(second.clone()).await);
+            assert_eq!(server.open_snapshots(), 1);
+            drop((second, first, hub, client));
             tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
+            assert_eq!(server.open_snapshots(), 0);
         })
         .await;
 }
@@ -411,7 +373,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
             body.contains("configurationFailed @2"),
             "{name} configuration ordinal"
         );
-        assert!(body.contains("leaseFailure @3"), "{name} lease ordinal");
+        assert!(body.contains("snapshotExpired @3"), "{name} expiry ordinal");
         assert!(body.contains("error @4"), "{name} error ordinal");
     }
     assert!(!source.contains("Reattest"));
@@ -427,7 +389,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
         "success @0 :AuthoringInspection",
         "reconnectRequired @1 :ReconnectRequired",
         "configurationFailed @2 :ConfigurationError",
-        "leaseFailure @3 :LeaseFailure",
+        "snapshotExpired @3 :Void",
         "error @4 :RpcError",
         "missing @5 :Void",
         "roleIneligible @6 :AuthoringRoleFailure",

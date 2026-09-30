@@ -38,7 +38,7 @@ use distill_migrate::{
 };
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
-    decode_asset_reference_query, decode_authoring_payload, ArtifactLeaseBackend, ArtifactPayload,
+    decode_asset_reference_query, decode_authoring_payload, ArtifactPayload,
     AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication,
     BuildBackend, BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree,
     BuildWorkClass, Commit, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure,
@@ -249,22 +249,6 @@ impl BuildBackend for CoordinatorBuildBackend {
     fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
         Ok(())
     }
-}
-
-// Nothing pins CAS content any more: a blob evicted under a reader is a
-// cache miss.
-impl ArtifactLeaseBackend for CoordinatorBuildBackend {
-    fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn release_lease(&self, _holder: u64) {}
-
-    fn pin_pack_session(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn release_pack_session(&self, _holder: u64) {}
 }
 
 #[derive(Debug, Clone)]
