@@ -3,7 +3,9 @@
 //! consumed dirty queue and rename log (§14's discipline).
 
 use distill_core::id::ContentHash;
-use distill_store::files::{FileKind, FileState, LogicalPathState};
+use distill_store::files::{
+    FileKind, FileObservation, FileState, LogicalPathState, ObservedDiagnostic, ObservedDirectory,
+};
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreConfig};
 
@@ -242,4 +244,90 @@ fn clean_watermark_roundtrips_durably() {
     drop(store);
     let store = Store::open(config).unwrap();
     assert_eq!(store.clean_watermark().unwrap(), Some(1_720_000_000));
+}
+
+// ---- scan observation tables ----
+
+#[test]
+fn a_transaction_view_reads_its_own_uncommitted_scan_rows() {
+    let (_d, mut store) = store();
+    let observation = FileObservation {
+        state: file_state(7),
+        raw_path: b"\0tex/Rock.bundle".to_vec(),
+        symlink_target: Some(b"/project/tex/rock.bundle".to_vec()),
+    };
+    let failed = store.input_transaction::<(), _>(|txn| {
+        let root = txn.intern_root("main")?;
+        txn.upsert_file(root, "tex/rock.bundle", &observation, InputVersion(1))?;
+        txn.set_bundle_file(root, "tex/rock.bundle", b"bundle bytes")?;
+        let view = txn.reader();
+        let row = view.observed_file("main", "tex/rock.bundle")?.unwrap();
+        assert_eq!(row.file, observation);
+        assert_eq!(
+            view.symlinks_targeting(b"/project/tex")?
+                .into_iter()
+                .map(|row| row.path)
+                .collect::<Vec<_>>(),
+            ["tex/rock.bundle"]
+        );
+        assert_eq!(
+            view.bundle_file("main", "tex/rock.bundle")?.as_deref(),
+            Some(&b"bundle bytes"[..])
+        );
+        Err(distill_store::StoreError::Rejected {
+            detail: "roll back".to_owned(),
+        })
+    });
+    assert!(failed.is_err());
+    assert_eq!(store.observed_file("main", "tex/rock.bundle").unwrap(), None);
+    assert_eq!(store.bundle_file("main", "tex/rock.bundle").unwrap(), None);
+}
+
+#[test]
+fn scan_structure_is_replaced_per_subtree() {
+    let (_d, mut store) = store();
+    let directory = |path: &str| ObservedDirectory {
+        root_name: "main".to_owned(),
+        path: path.to_owned(),
+        canonical_path: format!("/project/{path}").into_bytes(),
+        physical_path: format!("/project/{path}").into_bytes(),
+    };
+    let diagnostic = |path: &str| ObservedDiagnostic {
+        root_name: "main".to_owned(),
+        path: path.to_owned(),
+        detail: path.as_bytes().to_vec(),
+    };
+    store
+        .input_transaction(|txn| {
+            txn.replace_scan_structure(
+                None,
+                &[directory(""), directory("a"), directory("a/b"), directory("ab")],
+                &[diagnostic("a/x"), diagnostic("ab/y")],
+            )
+        })
+        .unwrap();
+    store
+        .input_transaction(|txn| {
+            txn.replace_scan_structure(
+                Some(&[("main".to_owned(), "a".to_owned())]),
+                &[directory("a")],
+                &[],
+            )
+        })
+        .unwrap();
+    let paths = store
+        .observed_directories()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["", "a", "ab"], "only the a/ subtree was replaced");
+    assert_eq!(
+        store.directory_by_canonical(b"/project/ab").unwrap(),
+        Some(directory("ab"))
+    );
+    store
+        .replace_scan_diagnostics(None, &[diagnostic("c")])
+        .unwrap();
+    assert_eq!(store.scan_diagnostics().unwrap(), [diagnostic("c")]);
 }

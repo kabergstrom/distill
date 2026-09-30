@@ -178,7 +178,7 @@ impl Store {
         candidate: &StoreConfig,
     ) -> Result<(), ConfigValidationError> {
         candidate.validate_scheduler()?;
-        let config = &mut self.read.config;
+        let config = std::sync::Arc::make_mut(&mut self.read.config);
         config.displaced_retention_days = candidate.displaced_retention_days;
         config.segment_size = candidate.segment_size;
         config.cache_limit = candidate.cache_limit;
@@ -250,7 +250,7 @@ impl Store {
 impl StoreReader {
 
     pub fn operational_config(&self) -> StoreConfig {
-        self.config.clone()
+        (*self.config).clone()
     }
 
     pub fn pending_restart(&self) -> Result<Option<PendingRestart>, StoreError> {

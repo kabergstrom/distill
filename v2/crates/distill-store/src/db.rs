@@ -4,7 +4,10 @@
 //! advance the memo sequence, readers only ever observe a complete
 //! version.
 
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -394,11 +397,59 @@ CREATE TABLE artifact_load_edges (
 /// database content: every accessor reads the committed state visible to
 /// this connection.
 pub struct StoreReader {
-    pub(crate) conn: Connection,
-    pub(crate) config: StoreConfig,
+    pub(crate) conn: ReaderConn,
+    pub(crate) config: Arc<StoreConfig>,
     instance_id: StoreInstanceId,
 }
 
+/// The connection a [`StoreReader`] reads through: its own, or the open
+/// transaction a [`ReadView`] borrows from the writer.
+pub(crate) enum ReaderConn {
+    Owned(Connection),
+    /// Valid while the [`ReadView`] holding this reader lives.
+    Lent(NonNull<Connection>),
+}
+
+// SAFETY: a lent connection exists only inside a `ReadView`, which is not
+// `Send` (it holds a borrow of the `!Sync` connection), so only the owned
+// case ever crosses threads.
+unsafe impl Send for ReaderConn {}
+
+impl std::ops::Deref for ReaderConn {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Owned(conn) => conn,
+            // SAFETY: see `Lent`.
+            Self::Lent(conn) => unsafe { conn.as_ref() },
+        }
+    }
+}
+
+impl std::ops::DerefMut for ReaderConn {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Owned(conn) => conn,
+            Self::Lent(_) => unreachable!("a writer always owns its connection"),
+        }
+    }
+}
+
+/// Every [`StoreReader`] query, run inside an open [`InputTxn`]: reads see
+/// the transaction's own uncommitted writes.
+pub struct ReadView<'a> {
+    reader: StoreReader,
+    _txn: PhantomData<&'a Connection>,
+}
+
+impl std::ops::Deref for ReadView<'_> {
+    type Target = StoreReader;
+
+    fn deref(&self) -> &StoreReader {
+        &self.reader
+    }
+}
 impl std::fmt::Debug for StoreReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoreReader")
@@ -510,8 +561,8 @@ impl Store {
 
         let mut store = Store {
             read: StoreReader {
-                conn,
-                config,
+                conn: ReaderConn::Owned(conn),
+                config: Arc::new(config),
                 instance_id,
             },
             cas: Default::default(),
@@ -530,7 +581,7 @@ impl Store {
 
     /// Open a reader on the same state directory as this writer.
     pub fn reader(&self) -> Result<StoreReader, StoreError> {
-        StoreReader::open(self.config.clone())
+        StoreReader::open((*self.config).clone())
     }
 
     /// Give a fresh, never-published store a caller-chosen instance id and
@@ -581,7 +632,8 @@ impl Store {
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
         let instance = self.instance_id();
-        let state_path = self.config.state_path.clone();
+        let config = Arc::clone(&self.config);
+        let state_path = config.state_path.clone();
         let txn = self
             .read
             .conn
@@ -596,6 +648,7 @@ impl Store {
             },
             version,
             state_path,
+            config,
         };
         let out = f(&mut input_txn)?;
         meta_set_u64(&input_txn.txn, "input_version", version.0)?;
@@ -612,7 +665,8 @@ impl Store {
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
         let instance = self.instance_id();
-        let state_path = self.config.state_path.clone();
+        let config = Arc::clone(&self.config);
+        let state_path = config.state_path.clone();
         let txn = self
             .read
             .conn
@@ -626,6 +680,7 @@ impl Store {
             },
             version: InputVersion(base.0 + 1),
             state_path,
+            config,
         };
         let out = f(&mut input_txn)?;
         input_txn.txn.rollback()?;
@@ -684,8 +739,8 @@ impl StoreReader {
             }
         };
         Ok(StoreReader {
-            conn,
-            config,
+            conn: ReaderConn::Owned(conn),
+            config: Arc::new(config),
             instance_id,
         })
     }
@@ -755,6 +810,7 @@ pub struct InputTxn<'a> {
     base_stamp: SnapshotStamp,
     version: InputVersion,
     pub(crate) state_path: PathBuf,
+    config: Arc<StoreConfig>,
 }
 
 impl InputTxn<'_> {
@@ -763,6 +819,18 @@ impl InputTxn<'_> {
     /// stamp; a bare or stale version can never authorize publication.
     pub fn base_stamp(&self) -> SnapshotStamp {
         self.base_stamp
+    }
+
+    /// Read through this transaction, seeing its writes so far.
+    pub fn reader(&self) -> ReadView<'_> {
+        ReadView {
+            reader: StoreReader {
+                conn: ReaderConn::Lent(NonNull::from(&*self.txn)),
+                config: Arc::clone(&self.config),
+                instance_id: self.base_stamp.instance,
+            },
+            _txn: PhantomData,
+        }
     }
 
     /// The version this transaction will publish on commit.
