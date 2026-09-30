@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash};
 use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 use crate::capnp_transport::{
@@ -11,7 +11,7 @@ use crate::capnp_transport::{
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AuthoringEntryRole,
-    ConfigurationError, Delta, DriftedInput, PathResolveFailure, PathResolveResult,
+    ConfigurationError, Delta, DriftedInput, ImportRequest, PathResolveFailure, PathResolveResult,
     ReconnectReason, ResolveResult, RpcBasis, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
 
@@ -195,6 +195,52 @@ impl RemoteHub {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
             }
             schema::void_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
+        }
+    }
+
+    /// Run `request` through the hub's authoring `import` at `base`; the
+    /// destination bundle's identity on success.
+    pub async fn import(
+        &self,
+        base: InputVersion,
+        request: &ImportRequest,
+    ) -> Result<RemoteCall<BundleUuid>, capnp::Error> {
+        let mut call = self.client.import_request();
+        {
+            let mut params = call.get();
+            params.set_base(base.0);
+            let mut wire = params.init_request();
+            wire.set_importer(request.importer.as_str());
+            let mut sources = wire.reborrow().init_sources(request.sources.len() as u32);
+            for (index, source) in request.sources.iter().enumerate() {
+                sources.set(index as u32, source.as_str());
+            }
+            wire.set_dest(request.dest.as_str());
+            wire.set_watch(request.watch);
+            wire.set_root(request.root.as_str());
+            let mut settings = wire.init_settings();
+            settings.set_canonical_value(&request.settings.canonical_value);
+            let mut blobs = settings.init_blobs(request.settings.blobs.len() as u32);
+            for (index, blob) in request.settings.blobs.iter().enumerate() {
+                blobs.set(index as u32, blob);
+            }
+        }
+        let response = call.send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::uuid_call::Which::Success(uuid) => Ok(RemoteCall::Success(BundleUuid(
+                fixed::<16>(uuid?.get_bytes()?, "import.bundle")?,
+            ))),
+            schema::uuid_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::uuid_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::uuid_call::Which::LeaseFailure(value) => {
+                Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
+            }
+            schema::uuid_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
         }
     }
 }
