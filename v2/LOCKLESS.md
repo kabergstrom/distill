@@ -28,18 +28,26 @@ at f10f599, not from the older design documents.
 4. **One state change = one transaction.** Validation and every fallible
    step run *before* `COMMIT`. After a commit, the only work left is
    infallible: sending notifications.
-5. **A snapshot is a version number.**
-   - Namespace rows carry `[valid_from, valid_to)` input versions.
-   - A snapshot read is an ordinary query with the predicate
-     `valid_from <= :v AND (valid_to IS NULL OR valid_to > :v)`.
-   - No read transaction is held across RPC calls.
-   - A lease is a row. Version GC deletes rows whose `valid_to` is at or
-     below the oldest leased version.
+5. **A snapshot handle is an open read transaction.**
+   - A client's snapshot lease owns its own read-only connection with a
+     `BEGIN` + first read, so it sees one committed `input_version` for as
+     long as the lease exists. When the lease ends, the transaction ends.
+   - Tables stay current-state. There are no versioned rows and no way to
+     address an arbitrary historical version.
+   - A snapshot is a **metadata** snapshot. It does not pin file contents
+     or build inputs. A cook or load that finds its data changed (and no CAS
+     blob for it) fails as `Drifted`, and the client retries with a new
+     snapshot. Builds always run against current state; a mismatch with the
+     snapshot's recorded inputs is `Drifted`.
+   - Clients normally hold one snapshot, but nothing enforces it; the lease
+     cap bounds open connections.
 6. **Publication is a transaction.** It bumps `input_version`, writes the
-   versioned rows, and appends `change_log` rows. The authority then sends
-   `Published(version)` to the RPC thread. Each subscriber cursor catches up
-   by reading `change_log WHERE version > cursor` on the RPC thread's own
-   connection.
+   current-state rows, and appends `change_log` rows. The authority then
+   broadcasts the new change-log sequence (`tokio::sync::watch`). Each
+   subscriber catches up by reading `change_log WHERE seq > cursor` on its
+   front end's own connection. `change_log` is trimmed by count; the oldest
+   available cursor lives in `store_meta`, and a cursor older than it gets a
+   reconnect event.
 
 ## 2. What exists today, and where it goes
 
@@ -79,25 +87,32 @@ survive only in lease `Arc`s. The `pipeline` field is an
 `Arc<RwLock<PipelineDiagnostic>>` that is mutated in place, so a poison
 leaks into old snapshots.
 
+Every field is served from current-state tables, read inside the lease's
+read transaction:
+
 | Field | Destination |
 |---|---|
 | `current` | `store_meta.input_version`. `advance_empty_version` also becomes a real transaction. |
-| `views[*].assets` (`VersionResolve` Built/Drifted/Failed/Deleted{at}) | new versioned table `asset_resolution` |
-| `views[*].authoring` | versioned `bundles` / `assets` / `asset_tags` / `schemas`. Authored values are read from the bundle file, verified by `content_hash`, and parsed through a content-addressed cache. |
-| `views[*].paths` | versioned `path_index`, which keeps multiple rows per path for ambiguity |
-| `views[*].derived_outputs` | versioned `derived_outputs` (+ `terminal_type` column) |
-| `views[*].tag_poisons`, `version_poison`, `configuration`, `pipeline`, `lineage_repair` | the `errors` table (§4) plus versioned singleton rows |
-| `history`, `oldest_available_cursor` | `change_log(version, kind, subject, change)`, pruned with version GC |
-| `build_results` (cleared on every commit) | `resolutions(target, asset, version) → outcome`, written by the authority after a build commit, and pruned with version GC |
-| `artifacts` (hash → asset, layout, load edges) | `artifact_meta`, written in the same transaction as the CAS index |
+| `views[*].assets` (Built/Drifted/Failed/Deleted{at}) | An `assets` row → `Drifted{Asset}`; a derived output → `Drifted{Asset(parent)}`; otherwise a row in new table `asset_resolutions(asset, kind, content_hash, error, deleted_at)`; no row → Missing. |
+| `views[*].authoring` | `bundles` / `assets` / `asset_tags` / `schemas`. New `assets` columns hold the encoded authored value (canonical JSON + blobs) and `terminal_type`, so a snapshot never reads a file. |
+| `views[*].paths` | `path_index`; several roots at one path is the ambiguity. |
+| `views[*].derived_outputs` | `derived_outputs` (+ `terminal_type` column) |
+| `tag_poisons`, `version_poison`, `configuration`, `pipeline` | `asset_tag_index.poison`, the persisted version poison, `configuration_state`, `pipeline_state` (then §4's `errors`) |
+| `lineage_repair` | new persisted repair-state columns next to `configuration_state` |
+| `history`, `oldest_available_cursor` | `change_log(seq, version, kind, subject)` trimmed to 4096 rows; the oldest cursor in `store_meta` |
+| `build_results` (cleared on every commit) | `resolutions(version, target, asset, outcome)`, written by the authority after a build, pruned on publication |
+| `artifacts` (hash → asset, layout, load edges) | The DSTL bytes in the CAS already carry everything but `ServedLoadEdge.expected_terminal`, which goes in `artifact_load_edges(content_hash, asset, expected_terminal)`, written in the CAS index transaction. |
 | `wire_trees` | presence in `cas_extents` |
-| `pipeline_generation`, `targets[*].target_generation` | columns on `pipeline_state` / `pipeline_target_set` |
+| `pipeline_generation`, `targets[*].target_generation`, `protocol_epoch` | `store_meta` / `pipeline_target_set` columns |
 | `restart_required_keys` | `pending_restart` |
-| `connections`, subscriptions, queues, `ViewLease`, pack sessions | ephemeral, owned by the RPC thread. Durable pins stay in `pins`, and a lease's version pin becomes a `pins` row. |
+| `connections`, subscriptions, queues, `ViewLease`, pack sessions | ephemeral, owned by the RPC front end. Durable pins stay in `pins`. |
 
-`Commit` mutation lists stop existing. A backend writes rows directly inside
-the authority's transaction, and the RPC server reads rows. The store-less
-`Server::new` test mode goes away. RPC tests run against a tempdir store.
+`Commit` survives for now as the typed publication delta. It is applied to
+these tables inside the publishing `input_transaction`, before `COMMIT`,
+which removes the commit-then-fallible sites in `commit_locked`. The
+store-less `Server::new` test mode becomes an embedded mode: the server
+owns a tempdir store and `server.commit(Commit)` maps onto the same
+tables, so the ~50 rpc test call sites keep working.
 
 ### 2.3 Daemon state
 
@@ -185,21 +200,29 @@ work. If that work fails, SQLite and memory diverge:
     It builds dependency reads *inline* on the same worker with a per-job
     content-addressed memo, and encodes the artifacts.
   - It returns the encoded records.
-  - The authority appends to the CAS, indexes, and writes `artifact_meta`
-    and `resolutions` in one transaction, then replies with the hash.
+  - The authority appends to the CAS, indexes, and writes
+    `artifact_load_edges` and `resolutions` in one transaction, then
+    replies with the hash. If the build's input version is not the
+    snapshot's and its trace disagrees with the snapshot, the reply is
+    `Drifted` and the client retries on a fresh snapshot.
   - A trace read no longer snapshots the whole project
     (`StoreTraceSource::capture` is O(project) per callback today). It is
     a point query on the worker's reader.
-- **rpc** is a single `LocalSet` thread. It owns connections, subscriptions,
-  lease timers, pack sessions, and the in-flight build map, all without
-  `Send`. It has its own `StoreReader`. On `Published(v)` it reads the
-  `change_log` and fans deltas out to subscribers. Lease expiry uses
-  `tokio::time`, and the `distill-rpc-lease-expiry` thread is deleted.
+- **rpc front ends** are cheap, `!Send`, per-thread values
+  (`Rc<RefCell<…>>` state on a `LocalSet`). Each owns its connections,
+  subscriptions, lease timers, pack sessions, and in-flight build map, a
+  `StoreReader` for current-state and fence reads, and one read-transaction
+  connection per snapshot lease. Authoring and build requests go to the
+  authority over a channel with oneshot replies. Several front ends can
+  coexist (the daemon's RPC thread, a test thread). On a change-log `watch`
+  tick they read `change_log` and fan deltas out. Lease expiry is checked
+  lazily on access plus `tokio::time`, and the `distill-rpc-lease-expiry`
+  thread is deleted.
 - **watcher** forwards `notify` events to the authority inbox. It holds no
   queue state.
 - **CAS compaction** is authority-only. Retired segment files are deleted
   only after the jobs dispatched before the retirement have completed and
-  no lease pins an older generation. Readers resolve segment names from
+  no snapshot lease predates the retirement. Readers resolve segment names from
   `cas_segments`.
 
 ## 4. Error model: per-entity rows instead of poisons
@@ -208,8 +231,8 @@ Today the model has `VersionPoison`, `PipelinePoison`, `ConfigurationPoison`
 and `ScopedBundlePoison` (about 290 mentions). A single `VersionPoison`
 freezes *every* bundle, asset and path update and blocks all resolves.
 
-The replacement is one table, `errors(scope_kind, scope_id, code, message,
-valid_from, valid_to)`, where scope is one of file, bundle, asset, target,
+The replacement is one table, `errors(scope_kind, scope_id, code, message)`
+(current state; cleared when the entity heals), where scope is one of file, bundle, asset, target,
 pipeline, config, or daemon.
 
 - An asset collision fails the colliding assets only. Everything else
@@ -281,18 +304,20 @@ baseline failures) and the deferred-ngp hot-reload scenario still working
    - `Arc<Mutex<Store>>` still wraps the writer during this phase. Readers
      are opened per thread wherever code only reads (build pool, trace
      source, codegen context, RPC fetch).
-2. **Versioned namespace and change log.**
-   - Add `valid_from` / `valid_to` columns, plus `asset_resolution`,
-     `change_log`, `artifact_meta`, `resolutions`, and `errors` (for now
-     mirroring the poisons).
-   - Every publication writes them in its existing transaction.
+2. **Current-state tables and change log.**
+   - Add the `assets` value/terminal columns, `derived_outputs.terminal_type`,
+     `asset_resolutions`, `change_log`, `resolutions`,
+     `artifact_load_edges`, lineage repair state, and the generation /
+     epoch fences.
+   - Every publication writes them in its existing transaction (applying
+     `Commit` before `COMMIT`).
 3. **RPC reads the database.**
-   - Replace `VersionView` and `ServerState` with queries on an RPC-thread
-     `StoreReader`, and leases with version pins.
+   - Replace `VersionView` and `ServerState` with queries; a snapshot lease
+     is a read transaction on its own connection.
    - Subscriptions read `change_log`.
-   - Delete `commit_locked`, `Commit`, and the history deque.
-   - Connection and lease state moves to the `LocalSet`; the expiry thread
-     is deleted.
+   - Delete `commit_locked` and the history deque.
+   - Connection and lease state moves to per-thread front ends; the expiry
+     thread is deleted.
 4. **Authority thread.**
    - The coordinator loop becomes the authority. The watcher feeds it
      through a channel.
