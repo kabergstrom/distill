@@ -800,6 +800,10 @@ impl StoreReader {
         &self.config.state_path
     }
 
+    pub fn config(&self) -> &StoreConfig {
+        &self.config
+    }
+
     /// Rebuild every SQLite index from authoritative table rows. This is a
     /// maintenance action only; callers publish its input-version event in the
     /// same transaction boundary as their other doctor result state.

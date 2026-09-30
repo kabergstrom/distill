@@ -124,12 +124,16 @@ impl DaemonProcess {
         // the watcher then installs the new root and requests one catch-up scan.
         let watcher = WatcherThread::start(coordinator.scanner(), config_watch.control_paths(), sink)?;
         let watcher_control = watcher.control();
-        let codegen = CodegenService::new(
-            &coordinator,
-            &config.codegen.rs_mod_path,
-            config.codegen.auto_codegen,
-        )
-        .map_err(DaemonProcessError::Codegen)?;
+        // Codegen recovery writes the store: it starts on the authority.
+        let codegen = coordinator
+            .on_authority(|| {
+                CodegenService::new(
+                    &coordinator,
+                    &config.codegen.rs_mod_path,
+                    config.codegen.auto_codegen,
+                )
+            })
+            .map_err(DaemonProcessError::Codegen)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let (errors, last_background_error) = watch::channel(None);

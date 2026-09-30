@@ -55,6 +55,26 @@ impl AuthoritySender {
         CURRENT.get() == self.id
     }
 
+    /// Run `step` as this authority: inline when already on it, else on
+    /// the authority thread, blocking until it has run.
+    pub(crate) fn run<T: Send>(
+        &self,
+        step: impl FnOnce() -> T + Send,
+    ) -> Result<T, distill_rpc::AuthorityStopped> {
+        if self.on_authority() {
+            Ok(step())
+        } else {
+            distill_rpc::run_scoped(|job| self.execute(job), step)
+        }
+    }
+
+    /// Called on the authority before it blocks on work it handed to
+    /// another thread: that thread acts as the authority while it runs
+    /// the work (the store and publications are the blocked authority's).
+    pub(crate) fn lend(&self) -> Option<Lent> {
+        self.on_authority().then_some(Lent(self.id))
+    }
+
     /// Queue `job`; a stopped authority drops it unrun.
     pub(crate) fn execute(&self, job: AuthorityJob) {
         let _ = self.inbox.send(Message::Run(job));
@@ -158,5 +178,28 @@ fn run(messages: mpsc::Receiver<Message>) {
             Some(Message::Detach) => driver = None,
             Some(Message::Shutdown) => break,
         }
+    }
+}
+
+/// An authority's identity, lent to the thread running work the authority
+/// waits on ([`AuthoritySender::lend`]).
+pub(crate) struct Lent(u64);
+
+impl Lent {
+    /// Act as the lending authority until the guard drops.
+    pub(crate) fn enter(self) -> LentGuard {
+        LentGuard {
+            previous: CURRENT.replace(self.0),
+        }
+    }
+}
+
+pub(crate) struct LentGuard {
+    previous: u64,
+}
+
+impl Drop for LentGuard {
+    fn drop(&mut self) {
+        CURRENT.set(self.previous);
     }
 }

@@ -299,9 +299,7 @@ fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
         destination_root: "main".into(),
         destination_path: "renamed.bundle".into(),
     };
-    let prepared = coordinator
-        .authoring_service()
-        .prepare_operation(base, &LongRunningOp::RenameWithFixups(request.encode()))
+    let prepared = coordinator.on_authority(|| coordinator.authoring_service().prepare_operation(base, &LongRunningOp::RenameWithFixups(request.encode())))
         .unwrap();
 
     assert!(assets.join("old.bundle").exists());
@@ -324,7 +322,7 @@ fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
         AuthoredValue::Str("renamed.bundle".into())
     );
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(2)
     );
     assert_eq!(
@@ -432,8 +430,7 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
     coordinator
         .coordinated_commit(InputVersion(1), || {
             store
-                .lock()
-                .unwrap()
+                .write()
                 .input_transaction(|transaction| {
                     transaction.put_schema(new_hash, &new_snapshot)?;
                     transaction.project_verified_lineage_manifest(&manifest)
@@ -447,12 +444,10 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
     let request = DiskMigrationRequest {
         bundles: vec![BundleUuid([91; 16])],
     };
-    let prepared = coordinator
-        .authoring_service()
-        .prepare_operation(
+    let prepared = coordinator.on_authority(|| coordinator.authoring_service().prepare_operation(
             base,
             &LongRunningOp::DiskMigration(request.encode().unwrap()),
-        )
+        ))
         .unwrap();
     assert_eq!(
         complete_and_publish(&coordinator, prepared.publication, base),
@@ -471,7 +466,7 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
     assert!(migrated.schemas.contains_key(&old_hash));
     assert!(migrated.schemas.contains_key(&new_hash));
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(3)
     );
 }
@@ -587,8 +582,7 @@ fn disk_migration_temp_failure_does_not_block_later_bundles() {
     coordinator
         .coordinated_commit(InputVersion(1), || {
             store
-                .lock()
-                .unwrap()
+                .write()
                 .input_transaction(|transaction| {
                     transaction.put_schema(new_hash, &new_snapshot)?;
                     transaction.project_verified_lineage_manifest(&manifest)
@@ -602,12 +596,10 @@ fn disk_migration_temp_failure_does_not_block_later_bundles() {
     let request = DiskMigrationRequest {
         bundles: vec![failing_bundle, migrating_bundle],
     };
-    let prepared = coordinator
-        .authoring_service()
-        .prepare_operation(
+    let prepared = coordinator.on_authority(|| coordinator.authoring_service().prepare_operation(
             base,
             &LongRunningOp::DiskMigration(request.encode().unwrap()),
-        )
+        ))
         .unwrap();
     // Remove the first proposal's parent after read-only planning. Creating
     // its same-directory temp now fails before the group is armed. The
@@ -646,7 +638,7 @@ fn disk_migration_temp_failure_does_not_block_later_bundles() {
         object([("value", AuthoredValue::UInt(42))])
     );
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(3)
     );
 }

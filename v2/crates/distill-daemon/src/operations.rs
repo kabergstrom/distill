@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_bundle::{Bundle, EntryLineageV1, LineageStamp};
@@ -36,6 +36,7 @@ use distill_store::pipeline::{
 use distill_store::state::PipelineState;
 use distill_store::Store;
 
+use crate::store_cell::AuthorityStore;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::build::CurrentLoadService;
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
@@ -151,8 +152,7 @@ impl AuthoringService {
         let (cached_schemas, snapshot) = {
             let store = self
                 .store
-                .lock()
-                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+                .read();
             require_base(&store, base)?;
             (
                 store.all_schemas().map_err(invalid)?,
@@ -218,8 +218,7 @@ impl AuthoringService {
     ) -> Result<Vec<OperationFile>, RpcFailure> {
         let store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .read();
         require_base(&store, base)?;
         let moving = store
             .bundle(request.bundle)
@@ -300,8 +299,7 @@ impl AuthoringService {
         let all = {
             let store = self
                 .store
-                .lock()
-                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+                .read();
             require_base(&store, base)?;
             store
                 .all_bundles()
@@ -411,8 +409,7 @@ impl AuthoringService {
         let accepted_lineage = {
             let store = self
                 .store
-                .lock()
-                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+                .read();
             require_base(&store, base)?;
             if store.schema_manifest_basis().map_err(invalid)?.as_ref() != Some(&request.manifest) {
                 return Err(invalid("schema transition manifest basis is stale"));
@@ -445,12 +442,7 @@ impl AuthoringService {
                 .map_err(invalid)?
         };
 
-        let snapshot = crate::scanner::ScanSnapshot::load_bundles(
-            &**self
-                .store
-                .lock()
-                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?,
-        )
+        let snapshot = crate::scanner::ScanSnapshot::load_bundles(&self.store.read())
         .map_err(invalid)?;
         let claimants = snapshot.lineage_claimants();
         let [claimant] = claimants.as_slice() else {
@@ -665,7 +657,7 @@ mod transition_proof_tests {
 
 #[derive(Clone)]
 struct OperationRuntime {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     scanner: RootedScanner,
     quarantine: QuarantineDriver,
     lineage_destination: LineageDestination,
@@ -828,8 +820,7 @@ impl OperationRuntime {
         }
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| "store mutex is poisoned".to_owned())?;
+            .write();
         require_base(&store, base).map_err(|error| format!("{error:?}"))?;
         let mut staged = Vec::with_capacity(files.len());
         for file in files {
@@ -941,8 +932,7 @@ impl OperationRuntime {
 
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| "store mutex is poisoned".to_owned())?;
+            .write();
         require_base(&store, base).map_err(|error| format!("{error:?}"))?;
         let mut failures = initial_failures.to_vec();
         let mut attempted_paths = Vec::with_capacity(files.len());
@@ -1101,8 +1091,7 @@ impl OperationRuntime {
             let published = crate::scanner::ScanSnapshot::load(
                 &**self
                     .store
-                    .lock()
-                    .map_err(|_| "store mutex is poisoned".to_owned())?,
+                    .write(),
             )
             .map_err(|error| error.to_string())?;
             let mismatch = !observed.same_observation(&published);
@@ -1129,8 +1118,7 @@ impl OperationRuntime {
         };
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| "store mutex is poisoned".to_owned())?;
+            .write();
         require_base(&store, base).map_err(|error| format!("{error:?}"))?;
         let terminal_error = match request {
             DoctorRequest::Verify => {
@@ -1217,8 +1205,7 @@ impl OperationRuntime {
     ) -> Result<DeferredOperationResult, String> {
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| "store mutex is poisoned".to_owned())?;
+            .write();
         require_base(&store, base).map_err(|error| format!("{error:?}"))?;
         store
             .input_transaction(|_| Ok(()))

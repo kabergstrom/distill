@@ -50,6 +50,7 @@ use distill_store::state::{
 };
 use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError, StoreReader};
 
+use crate::store_cell::AuthorityStore;
 use crate::authority::{Authority, AuthoritySender};
 use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
@@ -96,7 +97,7 @@ pub(crate) struct ConfigurationCandidate {
 }
 
 pub struct DaemonCoordinator {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     scanner: RootedScanner,
     scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
@@ -179,15 +180,6 @@ impl DaemonCoordinator {
     ) -> Result<Self, CoordinatorInitError> {
         let module_state_path = store_config.state_path.join("pipeline-host");
         let state_path = store_config.state_path.clone();
-        let mut opened_store = Store::open(store_config.clone())?;
-        // Claims follow the pipeline projection; the first full publication
-        // rewrites them.
-        opened_store.clear_source_claims()?;
-        if opened_store.pending_restart()?.is_some() {
-            opened_store
-                .input_transaction(|transaction| transaction.adopt_pending_restart().map(|_| ()))?;
-        }
-        let store = Arc::new(Mutex::new(opened_store));
         let host = ModuleHost::new(&module_state_path).map_err(CoordinatorInitError::ModuleIo)?;
         let scanner = RootedScanner::new(roots.clone())?;
         scanner.retain_daemon_owned_directory(DaemonOwnedDirectoryKind::State, &state_path)?;
@@ -199,24 +191,40 @@ impl DaemonCoordinator {
             DaemonOwnedDirectoryKind::ModuleStaging,
             module_state_path.join("modules"),
         )?;
-        let backend = Arc::new(AuthoringService::new(
-            Arc::clone(&store),
-            roots,
-            scanner.clone(),
-            lineage_destination.clone(),
-        )?);
         let target_set = distill_rpc::target_map(targets)?;
-        {
-            let mut store = lock_store(&store);
-            let version = store.input_version();
-            store.served_transaction(|transaction| {
-                use distill_store::served::ServedWrite;
-                transaction.init_change_log_oldest(version)?;
-                distill_rpc::publish_target_set(transaction, &target_set)?;
-                Ok(())
-            })?;
-        }
+        // The store belongs to the authority from the start: it is opened
+        // and first written there.
         let authority = Authority::start();
+        let sender = authority.sender().clone();
+        let (store, backend) = authority
+            .sender()
+            .run(|| -> Result<_, CoordinatorInitError> {
+                let mut opened_store = Store::open(store_config.clone())?;
+                // Claims follow the pipeline projection; the first full
+                // publication rewrites them.
+                opened_store.clear_source_claims()?;
+                if opened_store.pending_restart()?.is_some() {
+                    opened_store.input_transaction(|transaction| {
+                        transaction.adopt_pending_restart().map(|_| ())
+                    })?;
+                }
+                let version = opened_store.input_version();
+                opened_store.served_transaction(|transaction| {
+                    use distill_store::served::ServedWrite;
+                    transaction.init_change_log_oldest(version)?;
+                    distill_rpc::publish_target_set(transaction, &target_set)?;
+                    Ok(())
+                })?;
+                let store = Arc::new(AuthorityStore::new(opened_store, sender));
+                let backend = Arc::new(AuthoringService::new(
+                    Arc::clone(&store),
+                    roots,
+                    scanner.clone(),
+                    lineage_destination.clone(),
+                )?);
+                Ok((store, backend))
+            })
+            .expect("the authority runs while its coordinator opens")?;
         let server = ServerHandle::open(
             store_config.clone(),
             backend.clone(),
@@ -301,7 +309,7 @@ impl DaemonCoordinator {
         self.authoring.attach_tag_index_coordinator(self);
     }
 
-    pub fn store(&self) -> Arc<Mutex<Store>> {
+    pub fn store(&self) -> Arc<AuthorityStore> {
         Arc::clone(&self.store)
     }
 
@@ -312,14 +320,14 @@ impl DaemonCoordinator {
     /// Current non-fatal filesystem exclusions in canonical rooted-path
     /// order. These rows are also reported by `doctor verify`.
     pub fn scan_diagnostics(&self) -> Result<Vec<ScanDiagnostic>, CoordinatorError> {
-        ScanSnapshot::load_diagnostics(&lock_store(&self.store))
+        ScanSnapshot::load_diagnostics(&self.store.read())
             .map(|scan| scan.diagnostic_rows().cloned().collect())
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
     /// The published observation, from the store's scan tables.
     fn published_scan(&self) -> Result<ScanSnapshot, CoordinatorError> {
-        ScanSnapshot::load(&lock_store(&self.store))
+        ScanSnapshot::load(&self.store.read())
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
@@ -353,7 +361,7 @@ impl DaemonCoordinator {
             let diagnostic = observed.1.clone();
             self.server()
                 .coordinated_runtime_pipeline_poison(diagnostic, || {
-                    let mut store = lock_store(&self.store);
+                    let mut store = self.store.write();
                     match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
                         Ok(()) => Ok(()),
                         Err(StoreError::StalePublishedPipeline {
@@ -445,9 +453,13 @@ impl DaemonCoordinator {
         let worker_pool = Arc::clone(&operational.worker_pool);
         drop(operational);
 
+        // An authority that waits here lends itself to the worker, whose
+        // store writes would otherwise wait on it.
+        let lent = self.authority_sender().lend();
         let coordinator = Arc::clone(self);
         let (sender, receiver) = mpsc::sync_channel(1);
         worker_pool.spawn_fifo(move || {
+            let _authority = lent.map(crate::authority::Lent::enter);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
             let mut operational = coordinator
                 .operational
@@ -493,7 +505,7 @@ impl DaemonCoordinator {
                     .transpose()
                     .map_err(CoordinatorError::InvalidManifest)?
             };
-            lock_store(&self.store)
+            self.store.write()
                 .apply_operational_config(store_config)
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
             let mut operational = self
@@ -518,7 +530,7 @@ impl DaemonCoordinator {
         changes: &[RestartOnlyChange],
     ) -> Result<PendingRestart, CoordinatorError> {
         self.on_authority(|| {
-            let pending = lock_store(&self.store)
+            let pending = self.store.write()
                 .stage_pending_restart(changes)
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
             self.server().restart_required(pending.keys.clone());
@@ -528,7 +540,7 @@ impl DaemonCoordinator {
 
     pub fn clear_restart_configuration(&self) -> Result<(), CoordinatorError> {
         self.on_authority(|| {
-            lock_store(&self.store)
+            self.store.write()
                 .clear_pending_restart()
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
             self.server().restart_required(Vec::new());
@@ -540,7 +552,7 @@ impl DaemonCoordinator {
     /// operational-live retention window.
     pub fn sweep_displaced_retention(&self, now_secs: i64) -> Result<usize, CoordinatorError> {
         self.on_authority(|| {
-            lock_store(&self.store)
+            self.store.write()
                 .sweep_displaced(now_secs)
                 .map_err(|error| CoordinatorError::Maintenance(error.to_string()))
         })
@@ -580,7 +592,7 @@ impl DaemonCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
-        let lineage = claimed_lineage(&lock_store(&self.store), &BTreeMap::new())?;
+        let lineage = claimed_lineage(&self.store.read(), &BTreeMap::new())?;
         indexed_lineage_projection(
             &lineage,
             &self.scanner,
@@ -790,7 +802,7 @@ impl DaemonCoordinator {
             let max_dependency_depth = self.operational_configuration().max_dependency_depth;
             let base = self.server().current_stamp().version;
             let store = Arc::clone(&self.store);
-            let fallback_bundles = match lock_store(&store).all_asset_bundles() {
+            let fallback_bundles = match store.read().all_asset_bundles() {
                 Ok(bundles) => bundles,
                 Err(error) => {
                     if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
@@ -1024,7 +1036,7 @@ impl DaemonCoordinator {
                 }
             };
             let tag_epoch = authority.source_hash();
-            let asset_bundles = match lock_store(&store).all_asset_bundles() {
+            let asset_bundles = match store.read().all_asset_bundles() {
                 Ok(bundles) => bundles,
                 Err(error) => {
                     if let Some(poison) = runtime.host.discard_unpublished(prepared) {
@@ -1046,7 +1058,7 @@ impl DaemonCoordinator {
             let cleanup_failure = Arc::new(Mutex::new(None));
             let captured_cleanup_failure = Arc::clone(&cleanup_failure);
             let result = self.server().coordinated_commit(base, || {
-                let mut durable = lock_store(&store);
+                let mut durable = store.write();
                 if durable.input_version() != base {
                     return Err(format!(
                         "durable pipeline basis is {:?}, expected {base:?}",
@@ -1251,7 +1263,7 @@ impl DaemonCoordinator {
                 proposed_hash: planned.proposed.manifest_hash(),
             };
             let group_id = {
-                let mut store = lock_store(&self.store);
+                let mut store = self.store.write();
                 if store.input_version() != base
                     || store
                         .schema_manifest_basis()
@@ -1317,7 +1329,7 @@ impl DaemonCoordinator {
             )?;
 
             let mut terminal_errors = Vec::new();
-            if let Err(error) = lock_store(&self.store).retire_publication_group(group_id) {
+            if let Err(error) = self.store.write().retire_publication_group(group_id) {
                 terminal_errors.push(format!(
                     "schema transition committed but journal retirement failed: {error}"
                 ));
@@ -1372,7 +1384,7 @@ impl DaemonCoordinator {
         let store = Arc::clone(&self.store);
         let diagnostic = poison.clone();
         let result = self.server().coordinated_commit(base, || {
-            let mut store = lock_store(&store);
+            let mut store = store.write();
             if store.input_version() != base {
                 return Err(format!(
                     "durable pipeline-poison basis is {:?}, expected {base:?}",
@@ -1450,7 +1462,7 @@ impl DaemonCoordinator {
                     if self.scan_healthy.load(Ordering::Acquire)
                         && self.scan_initialized.load(Ordering::Acquire) =>
                 {
-                    let mut store = lock_store(&self.store);
+                    let mut store = self.store.write();
                     if scan.same_namespace_observation(&ScanSnapshot::load(&store)?) {
                         // Warning-grade exclusions are scanner state, not authored
                         // input: refresh them without minting an input version.
@@ -1575,7 +1587,7 @@ impl DaemonCoordinator {
             // On the authority: no other publication interleaves with this step.
             let server = self.server();
             let (delta, baseline) = {
-                let store = lock_store(&self.store);
+                let store = self.store.read();
                 let stored = StoredBaseline::new(&store);
                 let delta = self.scanner.scan_incremental_delta(&stored, &scan_paths);
                 stored.finish()?;
@@ -1607,7 +1619,7 @@ impl DaemonCoordinator {
             {
                 // Diagnostics are replaced with their affected subtree even when
                 // the authored namespace itself did not change.
-                lock_store(&self.store).replace_scan_diagnostics(
+                self.store.write().replace_scan_diagnostics(
                     Some(delta.affected_prefixes()),
                     &delta.observed().encoded_diagnostic_rows(),
                 )?;
@@ -1762,7 +1774,7 @@ impl DaemonCoordinator {
             .clone();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let scanner = self.scanner.clone();
-        let fallback_bundles = lock_store(&store)
+        let fallback_bundles = store.read()
             .all_asset_bundles()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let stamp = self
@@ -1845,8 +1857,8 @@ impl DaemonCoordinator {
             rejection: rejection.clone(),
             subjects,
         };
-        let indexed_version = lock_store(&self.store).claims_version_poison()?;
-        let durable_version = lock_store(&self.store)
+        let indexed_version = self.store.read().claims_version_poison()?;
+        let durable_version = self.store.read()
             .version_poison()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let baseline_version = match (indexed_version, durable_version) {
@@ -1871,7 +1883,7 @@ impl DaemonCoordinator {
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let (configuration, lineage_repair) = if self.scan_initialized.load(Ordering::Acquire) {
-            let lineage = claimed_lineage(&lock_store(&self.store), &BTreeMap::new())?;
+            let lineage = claimed_lineage(&self.store.read(), &BTreeMap::new())?;
             let (configuration, repair, _) = indexed_lineage_projection(
                 &lineage,
                 &self.scanner,
@@ -1891,7 +1903,7 @@ impl DaemonCoordinator {
         let stamp = self
             .server()
             .coordinated_commit(base, || {
-                let mut store = lock_store(&store);
+                let mut store = store.write();
                 if store.input_version() != base {
                     return Err(format!(
                         "durable rejected-scan basis is {:?}, expected {base:?}",
@@ -2032,7 +2044,7 @@ impl DaemonCoordinator {
 
 
     pub fn pending_file_work(&self) -> Result<PendingFileWork, CoordinatorError> {
-        lock_store(&self.store)
+        self.store.read()
             .pending_file_work()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
@@ -2042,7 +2054,7 @@ impl DaemonCoordinator {
             if work.is_empty() {
                 return Ok(());
             }
-            match lock_store(&self.store).acknowledge_file_work(work) {
+            match self.store.write().acknowledge_file_work(work) {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(CoordinatorError::InvalidManifest(
                     "watcher work observation changed before acknowledgement".to_owned(),
@@ -3146,7 +3158,7 @@ fn candidate_bundle_summaries(
 
 #[allow(clippy::too_many_arguments)] // The scan transaction receives each publication input explicitly.
 fn publish_scan(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<AuthorityStore>,
     base: InputVersion,
     mut candidate: ScanCandidate,
     advance_configuration: bool,
@@ -3166,7 +3178,7 @@ fn publish_scan(
     .map_err(|error| StoreError::InvalidConfiguration {
         error: format!("invalid derived-output collision poison: {error}"),
     })?;
-    let mut store = lock_store(store);
+    let mut store = store.write();
     if store.input_version() != base {
         return Err(StoreError::InvalidConfiguration {
             error: format!(
@@ -3629,7 +3641,7 @@ fn apply_schema_transition(
 /// failed publication rolls both back.
 #[allow(clippy::too_many_arguments)] // The transaction receives each independently pinned publication authority.
 fn publish_incremental_scan(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<AuthorityStore>,
     base: InputVersion,
     baseline: &ScanSnapshot,
     delta: &ScanDelta,
@@ -3641,7 +3653,7 @@ fn publish_incremental_scan(
     schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<Commit, StoreError> {
     let file_mutations = incremental_file_mutations(baseline, delta);
-    let mut store = lock_store(store);
+    let mut store = store.write();
     if store.input_version() != base {
         return Err(StoreError::InvalidConfiguration {
             error: format!(
@@ -4198,7 +4210,7 @@ pub(crate) fn publish_incremental_paths(
     scanner: &RootedScanner,
     paths: &[PathBuf],
     lineage_destination: &LineageDestination,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<AuthorityStore>,
     base: InputVersion,
     projection: &PipelineProjection,
     coordinator: Option<&DaemonCoordinator>,
@@ -4220,14 +4232,14 @@ fn publish_incremental_paths_with_schema_transition(
     scanner: &RootedScanner,
     paths: &[PathBuf],
     lineage_destination: &LineageDestination,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<AuthorityStore>,
     base: InputVersion,
     projection: &PipelineProjection,
     coordinator: Option<&DaemonCoordinator>,
     schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<Commit, String> {
     let (delta, baseline) = {
-        let store = lock_store(store);
+        let store = store.read();
         let stored = StoredBaseline::new(&store);
         let delta = scanner.scan_incremental_delta(&stored, paths);
         stored.finish().map_err(|error| error.to_string())?;
@@ -4303,7 +4315,7 @@ fn publish_incremental_paths_with_schema_transition(
     }
 
     drop(baseline);
-    let mut scan = ScanSnapshot::load(&lock_store(store)).map_err(|error| error.to_string())?;
+    let mut scan = ScanSnapshot::load(&store.read()).map_err(|error| error.to_string())?;
     scan.apply_delta(delta);
     let claims = bundle_claims(scan.bundle_rows(), projection, authority.as_deref())
         .map_err(|error| error.to_string())?;
@@ -4761,14 +4773,10 @@ fn invalid_manifest<T>(detail: &str) -> Result<T, CoordinatorError> {
     Err(CoordinatorError::InvalidManifest(detail.to_owned()))
 }
 
-fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
-    store.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
 /// The daemon side of the RPC server's store: publications run on the
 /// authority, writes go through the shared store mutex.
 struct DaemonStore {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     authority: AuthoritySender,
 }
 
@@ -4781,8 +4789,10 @@ impl distill_rpc::ExternalStore for DaemonStore {
         self.authority.execute(job);
     }
 
-    fn with_store(&self, job: &mut dyn FnMut(&mut Store)) {
-        job(&mut lock_store(&self.store));
+    fn with_store(&self, job: &mut (dyn FnMut(&mut Store) + Send)) {
+        self.store
+            .write_with(|store| job(store))
+            .expect("the authority runs while its store is served");
     }
 }
 

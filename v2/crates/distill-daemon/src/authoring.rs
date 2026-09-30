@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
@@ -25,8 +25,9 @@ use distill_store::journal::{
     CreationRecoveryOutcome, DeletionRecoveryOutcome, JournalIntentPlan, PublicationGroupKind,
     RenameAsideOutcome,
 };
-use distill_store::Store;
+use distill_store::StoreReader;
 
+use crate::store_cell::{AuthorityStore, WriteGuard};
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
 use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
@@ -40,7 +41,7 @@ use crate::quarantine::{
 use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanError};
 
 pub struct AuthoringService {
-    pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) store: Arc<AuthorityStore>,
     pub(crate) scanner: RootedScanner,
     roots: RwLock<Vec<AssetRoot>>,
     quarantine: RwLock<QuarantineDriver>,
@@ -76,7 +77,7 @@ impl AuthoringFilesystemCandidate {
 
 impl AuthoringService {
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<AuthorityStore>,
         roots: Vec<AssetRoot>,
         scanner: RootedScanner,
         lineage_destination: LineageDestination,
@@ -97,9 +98,7 @@ impl AuthoringService {
             )?;
         }
         let startup_recovery_diagnostic = {
-            let mut store = store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut store = store.write();
             let recovered = quarantine.reconcile_non_codegen(&mut store)?;
             material_recovery_diagnostic(&recovered)
         };
@@ -300,7 +299,7 @@ impl AuthoringService {
         base: InputVersion,
         operations: &[AuthoringOp],
     ) -> Result<Commit, RpcFailure> {
-        let store = self.lock_store()?;
+        let store = self.write_store()?;
         require_base(&store, base)?;
         let planned = self.plan_bundle_mutation(&store, operations)?;
         drop(store);
@@ -323,7 +322,7 @@ impl AuthoringService {
         preimage: Option<ContentHash>,
         proposed: Option<Vec<u8>>,
     ) -> Result<Commit, RpcFailure> {
-        let mut store = self.lock_store()?;
+        let mut store = self.write_store()?;
         require_base(&store, base)?;
         let temp = proposed
             .as_ref()
@@ -390,7 +389,7 @@ impl AuthoringService {
 
     fn plan_bundle_mutation(
         &self,
-        store: &Store,
+        store: &StoreReader,
         operations: &[AuthoringOp],
     ) -> Result<PlannedBundleMutation, RpcFailure> {
         let mut seen = BTreeSet::new();
@@ -542,7 +541,7 @@ impl AuthoringService {
 
     fn apply_set(
         &self,
-        store: &Store,
+        store: &StoreReader,
         bundle: &mut Bundle,
         entry: &AuthoringEntry,
     ) -> Result<(), RpcFailure> {
@@ -615,10 +614,8 @@ impl AuthoringService {
         Ok(())
     }
 
-    fn lock_store(&self) -> Result<MutexGuard<'_, Store>, RpcFailure> {
-        self.store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))
+    fn write_store(&self) -> Result<WriteGuard<'_>, RpcFailure> {
+        Ok(self.store.write())
     }
 }
 
@@ -702,7 +699,7 @@ struct PlannedBundleMutation {
     proposed: Option<Vec<u8>>,
 }
 
-pub(crate) fn require_base(store: &Store, base: InputVersion) -> Result<(), RpcFailure> {
+pub(crate) fn require_base(store: &StoreReader, base: InputVersion) -> Result<(), RpcFailure> {
     let expected = store.input_version();
     if expected != base {
         return Err(RpcFailure::StaleInputVersion {

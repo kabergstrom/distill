@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use distill_build::import::{
     fold_import, DirectoryOrigin, FileDep, FoldRequest, IdentitySource, ImportBackend,
@@ -37,13 +37,13 @@ use distill_store::imports::{
     WatchedImportTerminal,
 };
 use distill_store::journal::PublicationGroupKind;
-use distill_store::Store;
+use distill_store::{Store, StoreReader};
 use globset::Glob;
 
+use crate::store_cell::AuthorityStore;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::scanner::{RootedScanner, ScanError};
 use distill_store::files::{FileKind, ObservedFile};
-use distill_store::StoreReader;
 
 pub trait AuthoringImporter: Send + Sync {
     fn id(&self) -> &str;
@@ -250,7 +250,7 @@ impl AuthoringService {
 
     fn index_import_bundle(
         &self,
-        store: &Store,
+        store: &StoreReader,
         meta: &BundleMeta,
     ) -> Result<ImportIndexSource, RpcFailure> {
         let root_name = store
@@ -296,7 +296,7 @@ impl AuthoringService {
 
     /// Every indexed directory-import rules asset, decoded, in (bundle,
     /// asset) order.
-    fn directory_rule_entries(&self, store: &Store) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
+    fn directory_rule_entries(&self, store: &StoreReader) -> Result<Vec<DirectoryRuleEntry>, RpcFailure> {
         let mut entries = Vec::new();
         for source in store.directory_rule_sources().map_err(invalid)? {
             let Some(meta) = store.bundle(source.rules_bundle).map_err(invalid)? else {
@@ -359,8 +359,7 @@ impl AuthoringService {
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .write();
         let capabilities = self.importer_capabilities()?;
         if work.is_none() {
             self.import_index_ready.store(false, Ordering::Release);
@@ -431,8 +430,7 @@ impl AuthoringService {
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .write();
         let capabilities = self.importer_capabilities()?;
         if work.is_none() {
             self.import_index_ready.store(false, Ordering::Release);
@@ -722,8 +720,7 @@ impl AuthoringService {
         )?;
         let store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .read();
         require_base(&store, base)?;
         let destination = self.resolve_directory_destination(
             &store,
@@ -769,7 +766,7 @@ impl AuthoringService {
 
     fn directory_task_needs_run(
         &self,
-        store: &Store,
+        store: &StoreReader,
         task: &DirectoryImportTask,
         capabilities: &BTreeMap<String, [u8; 32]>,
     ) -> Result<bool, RpcFailure> {
@@ -871,8 +868,7 @@ impl AuthoringService {
         let dest = normalize_path(&request.dest).map_err(invalid)?;
         let store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .read();
         require_base(&store, base)?;
         let destination = self.resolve_explicit_destination(&store, &dest, &request.root)?;
         let prior = destination
@@ -915,8 +911,7 @@ impl AuthoringService {
         let watched = {
             let store = self
                 .store
-                .lock()
-                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+                .read();
             require_base(&store, base)?;
             let mut watched = Vec::new();
             for meta in store.all_bundles().map_err(invalid)? {
@@ -969,8 +964,7 @@ impl AuthoringService {
     ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .read();
         require_base(&store, base)?;
         let meta = store
             .bundle(bundle)
@@ -1178,9 +1172,7 @@ impl AuthoringService {
         if run_base != base {
             let store = self
                 .store
-                .lock()
-                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))
-                .map_err(ImportExecutionError::unmemoized)?;
+                .read();
             require_base(&store, base).map_err(ImportExecutionError::unmemoized)?;
             if !destination_unchanged(&store, &destination)? {
                 return Err(ImportExecutionError::unmemoized(RpcFailure::StaleInputVersion {
@@ -1244,9 +1236,7 @@ impl AuthoringService {
 
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))
-            .map_err(ImportExecutionError::unmemoized)?;
+            .write();
         require_base(&store, base).map_err(ImportExecutionError::unmemoized)?;
         let capabilities = self
             .importer_capabilities()
@@ -1360,8 +1350,7 @@ impl AuthoringService {
         }
         let mut store = self
             .store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
+            .write();
         // On the authority: nothing publishes between the revalidation above
         // and this record, whatever version the attempt ran at.
         let memo_seq = store.memo_seq();
@@ -1425,7 +1414,7 @@ impl AuthoringService {
 
     fn resolve_explicit_destination(
         &self,
-        store: &Store,
+        store: &StoreReader,
         path: &str,
         requested_root: &str,
     ) -> Result<ImportDestination, RpcFailure> {
@@ -1480,7 +1469,7 @@ impl AuthoringService {
 
     fn resolve_directory_destination(
         &self,
-        store: &Store,
+        store: &StoreReader,
         root: &str,
         path: &str,
     ) -> Result<ImportDestination, RpcFailure> {
@@ -1524,7 +1513,7 @@ impl AuthoringService {
         })
     }
 
-    fn cached_bundle(&self, store: &Store, meta: &BundleMeta) -> Result<Bundle, RpcFailure> {
+    fn cached_bundle(&self, store: &StoreReader, meta: &BundleMeta) -> Result<Bundle, RpcFailure> {
         let root = store
             .root_name(meta.root)
             .map_err(invalid)?
@@ -1543,7 +1532,7 @@ impl AuthoringService {
 
     fn read_prior_import_cached(
         &self,
-        store: &Store,
+        store: &StoreReader,
         meta: &BundleMeta,
     ) -> Result<PriorImport, RpcFailure> {
         let bundle = self.cached_bundle(store, meta)?;
@@ -1552,7 +1541,7 @@ impl AuthoringService {
 
     fn read_prior_import(
         &self,
-        store: &Store,
+        store: &StoreReader,
         meta: &BundleMeta,
     ) -> Result<PriorImport, RpcFailure> {
         let root = store
@@ -1665,7 +1654,7 @@ fn directory_groups(
 }
 
 fn dirty_bundle_keys(
-    store: &Store,
+    store: &StoreReader,
     dirty: &[distill_store::files::DirtyEntry],
 ) -> Result<BTreeSet<(String, String)>, RpcFailure> {
     dirty
@@ -1923,14 +1912,10 @@ impl<'a> RootedImportBackend<'a> {
     /// A backend on its own store connection.
     fn open(
         scanner: &'a RootedScanner,
-        store: &Mutex<Store>,
+        store: &AuthorityStore,
         capabilities: &'a BTreeMap<String, [u8; 32]>,
     ) -> Result<Self, RpcFailure> {
-        let reader = store
-            .lock()
-            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?
-            .reader()
-            .map_err(invalid)?;
+        let reader = store.open_reader().map_err(invalid)?;
         Ok(Self {
             scanner,
             rows: ImportRows::Owned(reader),
@@ -2176,7 +2161,7 @@ fn dep_failure(dep: &FileDep) -> Option<&distill_build::trace::StableFailureFing
 }
 
 fn build_import_bundle(
-    store: &Store,
+    store: &StoreReader,
     importer: &RegisteredImporter,
     imported: &ImportedBundle,
     prior: Option<&Bundle>,
@@ -2255,7 +2240,7 @@ fn build_import_bundle(
 }
 
 fn current_type_schema(
-    store: &Store,
+    store: &StoreReader,
     type_uuid: TypeUuid,
 ) -> Result<(LogicalHash, LogicalSchema, LineageStamp), RpcFailure> {
     if is_bootstrap_control_type(type_uuid) {
@@ -3267,7 +3252,7 @@ struct ImportRunFailure {
 
 /// Whether the bundle at `destination` is still the one the run read.
 fn destination_unchanged(
-    store: &Store,
+    store: &StoreReader,
     destination: &ImportDestination,
 ) -> Result<bool, ImportExecutionError> {
     let current = match &destination.meta {

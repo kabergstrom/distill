@@ -48,7 +48,7 @@ fn accept_schema_transition_promotes_the_real_pending_candidate_atomically() {
     let server = coordinator.server();
     let required = {
         let store = coordinator.store();
-        let store = store.lock().unwrap();
+        let store = store.read();
         match store.pipeline_state().unwrap().unwrap() {
             PipelineState::SchemaAcceptanceRequired { required, .. } => required,
             state => panic!("real module staging did not retain a pending candidate: {state:?}"),
@@ -90,7 +90,7 @@ fn accept_schema_transition_promotes_the_real_pending_candidate_atomically() {
     let next = InputVersion(base.0 + 1);
     assert_eq!(server.current_stamp().version, next);
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert_eq!(store.input_version(), next);
     assert_eq!(store.lineage_current(PROJECT_TYPE).unwrap(), Some(accepted));
     let lineage = store.lineage(PROJECT_TYPE).unwrap();

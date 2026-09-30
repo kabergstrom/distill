@@ -31,7 +31,7 @@ pub use capability::{
     MetadataHub, MetadataSnapshot, PackSession, PendingBuild, ResolveStep, Snapshot,
 };
 pub use server::{
-    target_map, AuthorityJob, AuthorityStopped, CoordinatedCommitError, ExternalStore, LeasePolicy, Root, Server, ServerHandle,
+    target_map, run_scoped, AuthorityJob, AuthorityStopped, CoordinatedCommitError, ExternalStore, LeasePolicy, Root, Server, ServerHandle,
     MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use validate::{decode_asset_reference_query, decode_authoring_payload};

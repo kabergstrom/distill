@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use distill_build::codegen::{
     CodegenAttempt, CodegenCoordinator, CodegenFailure, CodegenPublication, CodegenPublisher,
@@ -24,8 +24,9 @@ use distill_store::journal::{
     NoReplaceMoveError, PublicationGroupKind, RenameAsideOutcome,
 };
 use distill_store::state::InputVersion;
-use distill_store::{Store, StoreError};
+use distill_store::{Store, StoreError, StoreReader};
 
+use crate::store_cell::{AuthorityStore, WriteGuard};
 use crate::callbacks::{
     CallbackInvokeError, CodegenAsset, CodegenContextError, PipelineCodegenContext,
 };
@@ -52,7 +53,7 @@ impl CodegenService {
     ) -> Result<Self, String> {
         let pending_codegen = {
             let store_handle = daemon.store();
-            let store = lock_store(&store_handle)?;
+            let store = write_store(&store_handle)?;
             store
                 .unfinished_publication_groups()
                 .map_err(|error| error.to_string())?
@@ -119,7 +120,7 @@ impl CodegenService {
         let snapshot = daemon.pipeline_snapshot();
         let epoch = snapshot.epoch().map_err(|poison| poison.to_string())?;
         let store_handle = daemon.store();
-        let basis = lock_store(&store_handle)?.input_version();
+        let basis = write_store(&store_handle)?.input_version();
         if self.last_attempted == Some(basis) {
             return Ok(());
         }
@@ -193,7 +194,7 @@ impl CodegenService {
             .with_root(output.quarantine_root())
             .map_err(|error| error.to_string())?;
         let store = daemon.store();
-        let mut store = lock_store(&store)?;
+        let mut store = write_store(&store)?;
         let mut filesystem = OutputJournalFilesystem::new(output);
         let publication = quarantine
             .admit_codegen_publication(&mut store, &mut filesystem)
@@ -209,7 +210,7 @@ fn retryable_codegen_callback_failure(error: &CallbackInvokeError<CodegenFailure
 }
 
 struct AuthoredCodegenContext {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     scanner: RootedScanner,
     basis: InputVersion,
     trace: Vec<TraceOp>,
@@ -217,7 +218,7 @@ struct AuthoredCodegenContext {
 }
 
 impl AuthoredCodegenContext {
-    fn new(store: Arc<Mutex<Store>>, scanner: RootedScanner, basis: InputVersion) -> Self {
+    fn new(store: Arc<AuthorityStore>, scanner: RootedScanner, basis: InputVersion) -> Self {
         Self {
             store,
             scanner,
@@ -261,9 +262,7 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
         }
         let store_handle = Arc::clone(&self.store);
         let result = {
-            let store = store_handle.lock().map_err(|_| {
-                CodegenContextError::Failed("durable store mutex is poisoned".into())
-            })?;
+            let store = store_handle.write();
             self.check_basis(&store)?;
             query_results(&store, &query).map_err(CodegenContextError::Failed)?
         };
@@ -280,9 +279,7 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
         }
         let store_handle = Arc::clone(&self.store);
         let loaded = {
-            let store = store_handle.lock().map_err(|_| {
-                CodegenContextError::Failed("durable store mutex is poisoned".into())
-            })?;
+            let store = store_handle.write();
             self.check_basis(&store)?;
             load_authored_asset(&store, &self.scanner, asset)
         };
@@ -297,7 +294,7 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
 }
 
 struct CodegenWorld<'a> {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     scanner: RootedScanner,
     output: &'a OutputDirectory,
     quarantine: QuarantineDriver,
@@ -305,16 +302,11 @@ struct CodegenWorld<'a> {
 
 impl CodegenSnapshot<InputVersion> for CodegenWorld<'_> {
     fn current_basis(&self) -> InputVersion {
-        self.store
-            .lock()
-            .map(|store| store.input_version())
-            .unwrap_or(InputVersion(u64::MAX))
+        self.store.read().input_version()
     }
 
     fn observe(&self, op: &TraceOp) -> bool {
-        let Ok(store) = self.store.lock() else {
-            return false;
-        };
+        let store = self.store.read();
         match op {
             TraceOp::Query { query, observed } => query_results(&store, query)
                 .map(|results| Observed::Ok(asset_query_result_hash(&results)) == *observed)
@@ -348,7 +340,7 @@ impl CodegenWorld<'_> {
     ) -> Result<(), String> {
         self.output.verify()?;
         let mut filesystem = OutputJournalFilesystem::new(self.output);
-        let mut store = lock_store(&self.store)?;
+        let mut store = write_store(&self.store)?;
         if store.input_version() != basis {
             return Err("codegen input version changed before publication".into());
         }
@@ -569,7 +561,7 @@ fn validate_unit_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn query_results(store: &Store, query: &AssetQuery) -> Result<Vec<AssetUuid>, String> {
+fn query_results(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUuid>, String> {
     if query.terminal_type.is_some() {
         return Err("target-dependent terminal_type is unavailable to Rust codegen".into());
     }
@@ -644,7 +636,7 @@ fn query_results(store: &Store, query: &AssetQuery) -> Result<Vec<AssetUuid>, St
 }
 
 fn load_authored_asset(
-    store: &Store,
+    store: &StoreReader,
     scanner: &RootedScanner,
     asset: AssetUuid,
 ) -> Result<Option<(BundleFileHash, CodegenAsset)>, String> {
@@ -693,7 +685,7 @@ fn load_authored_asset(
 }
 
 fn observe_authored_asset(
-    store: &Store,
+    store: &StoreReader,
     scanner: &RootedScanner,
     asset: AssetUuid,
 ) -> Result<Option<BundleFileHash>, String> {
@@ -1170,10 +1162,8 @@ fn path_text(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("journal path is not lossless UTF-8: {}", path.display()))
 }
 
-fn lock_store(store: &Arc<Mutex<Store>>) -> Result<MutexGuard<'_, Store>, String> {
-    store
-        .lock()
-        .map_err(|_| "durable store mutex is poisoned".to_owned())
+fn write_store(store: &Arc<AuthorityStore>) -> Result<WriteGuard<'_>, String> {
+    Ok(store.write())
 }
 
 #[cfg(test)]
@@ -1190,7 +1180,7 @@ mod tests {
     fn publication_world(
         temp: &tempfile::TempDir,
     ) -> (
-        Arc<Mutex<Store>>,
+        Arc<AuthorityStore>,
         RootedScanner,
         OutputDirectory,
         QuarantineDriver,
@@ -1206,7 +1196,7 @@ mod tests {
         .unwrap();
         let output = OutputDirectory::open(&output).unwrap();
         let quarantine = QuarantineDriver::new([output.quarantine_root()]).unwrap();
-        let store = Arc::new(Mutex::new(
+        let store = Arc::new(AuthorityStore::on_this_thread(
             Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
         ));
         (store, scanner, output, quarantine)
@@ -1230,7 +1220,7 @@ mod tests {
     fn complete_namespace_publishes_diffs_and_skips_unchanged_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let (store, scanner, output, quarantine) = publication_world(&temp);
-        let basis = store.lock().unwrap().input_version();
+        let basis = store.write().input_version();
         let first = generated(1, b"pub const VALUE: u8 = 1;\n");
         let second = generated(2, b"pub const VALUE: u8 = 2;\n");
         let first_path = output.path.join(first.relative_path());
@@ -1245,7 +1235,7 @@ mod tests {
         world
             .publish_files(basis, &[first.clone(), second.clone()])
             .unwrap();
-        let first_memo = store.lock().unwrap().memo_seq();
+        let first_memo = store.write().memo_seq();
         assert_eq!(fs::read(&first_path).unwrap(), first.bytes());
         assert_eq!(fs::read(&second_path).unwrap(), second.bytes());
         assert_eq!(
@@ -1260,19 +1250,19 @@ mod tests {
         world
             .publish_files(basis, &[first.clone(), second])
             .unwrap();
-        assert_eq!(store.lock().unwrap().memo_seq(), first_memo);
+        assert_eq!(store.write().memo_seq(), first_memo);
 
         world.publish_files(basis, &[first]).unwrap();
         assert!(first_path.exists());
         assert!(!second_path.exists());
-        assert_eq!(store.lock().unwrap().codegen_outputs().unwrap().len(), 2);
+        assert_eq!(store.write().codegen_outputs().unwrap().len(), 2);
     }
 
     #[test]
     fn hand_edits_and_unknown_generated_names_are_never_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let (store, scanner, output, quarantine) = publication_world(&temp);
-        let basis = store.lock().unwrap().input_version();
+        let basis = store.write().input_version();
         let file = generated(3, b"original\n");
         let target = output.path.join(file.relative_path());
         let mut world = CodegenWorld {
@@ -1282,7 +1272,7 @@ mod tests {
             quarantine,
         };
         world.publish_files(basis, &[file]).unwrap();
-        let expected = store.lock().unwrap().codegen_outputs().unwrap();
+        let expected = store.write().codegen_outputs().unwrap();
 
         fs::write(&target, b"human edit\n").unwrap();
         assert!(world
@@ -1290,7 +1280,7 @@ mod tests {
             .unwrap_err()
             .contains("edited outside distill"));
         assert_eq!(fs::read(&target).unwrap(), b"human edit\n");
-        assert_eq!(store.lock().unwrap().codegen_outputs().unwrap(), expected);
+        assert_eq!(store.write().codegen_outputs().unwrap(), expected);
 
         fs::write(&target, b"original\n").unwrap();
         fs::write(
@@ -1349,11 +1339,11 @@ mod tests {
         })
         .unwrap();
         fs::write(assets.join("shader.bundle"), &bytes).unwrap();
-        let store = Arc::new(Mutex::new(
+        let store = Arc::new(AuthorityStore::on_this_thread(
             Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
         ));
         let basis = {
-            let mut store = store.lock().unwrap();
+            let mut store = store.write();
             let (root, _) = store
                 .input_transaction(|transaction| {
                     let root = transaction.intern_root("main")?;
@@ -1435,7 +1425,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let (store, scanner, output, quarantine) = publication_world(&temp);
-        let basis = store.lock().unwrap().input_version();
+        let basis = store.write().input_version();
         let initial = generated(4, b"initial\n");
         let replacement = generated(4, b"replacement\n");
         let relative = initial.relative_path().to_owned();
@@ -1469,7 +1459,7 @@ mod tests {
         let proposal = output.path.join(".mod.proposed");
         let proposed_hash = ContentHash(*blake3::hash(b"pub mod shader;\n").as_bytes());
         let group = {
-            let mut store = store.lock().unwrap();
+            let mut store = store.write();
             let basis = CodegenPublicationBasis::new(
                 store.input_version(),
                 BTreeMap::new(),
@@ -1490,7 +1480,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut store = store.lock().unwrap();
+        let mut store = store.write();
         let mut filesystem = OutputJournalFilesystem::new(&output);
         let publication = quarantine
             .admit_codegen_publication(&mut store, &mut filesystem)
@@ -1525,7 +1515,7 @@ mod tests {
         fs::write(&proposal, b"pub mod shader;\n").unwrap();
         let proposed_hash = ContentHash(*blake3::hash(b"pub mod shader;\n").as_bytes());
         let group = {
-            let mut store = store.lock().unwrap();
+            let mut store = store.write();
             let basis = CodegenPublicationBasis::new(
                 store.input_version(),
                 BTreeMap::new(),
@@ -1548,7 +1538,7 @@ mod tests {
             group
         };
 
-        let mut store = store.lock().unwrap();
+        let mut store = store.write();
         let mut filesystem = OutputJournalFilesystem::new(&output);
         let publication = quarantine
             .admit_codegen_publication(&mut store, &mut filesystem)
@@ -1584,7 +1574,7 @@ mod tests {
         let proposed = output.write_same_dir_temp(&target, proposed_bytes).unwrap();
         let outputs = BTreeMap::from([("mod.rs".to_owned(), proposed_hash)]);
         {
-            let mut store = store.lock().unwrap();
+            let mut store = store.write();
             let basis = CodegenPublicationBasis::new(
                 store.input_version(),
                 BTreeMap::new(),
@@ -1612,7 +1602,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         symlink(&outside, &output.path).unwrap();
 
-        let mut store = store.lock().unwrap();
+        let mut store = store.write();
         let mut filesystem = OutputJournalFilesystem::new(&output);
         let error = match quarantine.admit_codegen_publication(&mut store, &mut filesystem) {
             Ok(_) => panic!("replacement output path must reject recovery"),

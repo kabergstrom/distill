@@ -1,7 +1,8 @@
 //! Snapshot-pinned lazy build execution and durable build-import caching.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use distill_build::artifact_encode::{
     encode_artifact_value, ArtifactEncodeError, ArtifactValueSpec, EncodedArtifact,
@@ -57,10 +58,11 @@ use distill_store::cas::record::{
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::RegisteredTool;
-use distill_store::{Store, StoreError};
+use distill_store::{Store, StoreError, StoreReader};
 use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERSION};
 use distill_wire::encode::EncodeError;
 
+use crate::store_cell::{AuthorityStore, ReadGuard};
 use crate::callbacks::{
     CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
     ProcessContextError, ProcessOutputs,
@@ -144,27 +146,51 @@ impl PublishedTagIndex {
 
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
-    active_builds: Mutex<usize>,
+    /// Builds in flight, plus [`CAS_MAINTENANCE`] while the cache sweep runs.
+    active_builds: AtomicUsize,
 }
+
+/// Set in `active_builds` while the CAS cache sweep runs: it starts only
+/// when no build is in flight, and no build starts until it ends, so no
+/// build reads a candidate the sweep evicts.
+const CAS_MAINTENANCE: usize = 1 << (usize::BITS - 1);
 
 impl CoordinatorBuildBackend {
     pub(crate) fn new(coordinator: &Arc<DaemonCoordinator>) -> Self {
         Self {
             coordinator: Arc::downgrade(coordinator),
-            active_builds: Mutex::new(0),
+            active_builds: AtomicUsize::new(0),
+        }
+    }
+
+    fn enter_build(&self) {
+        let mut current = self.active_builds.load(Ordering::Acquire);
+        loop {
+            if current & CAS_MAINTENANCE != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                current = self.active_builds.load(Ordering::Acquire);
+                continue;
+            }
+            let next = current
+                .checked_add(1)
+                .filter(|next| next & CAS_MAINTENANCE == 0)
+                .expect("active build count exhausted");
+            match self.active_builds.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 }
 
 impl BuildBackend for CoordinatorBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        {
-            let mut active = self
-                .active_builds
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *active = active.checked_add(1).expect("active build count exhausted");
-        }
+        self.enter_build();
         let coordinator =
             self.coordinator
                 .upgrade()
@@ -205,12 +231,12 @@ impl BuildBackend for CoordinatorBuildBackend {
                 hashes.extend(publication.wire_trees.iter().map(|tree| tree.layout_hash.0));
                 coordinator
                     .store()
-                    .lock()
+                    .write_with(|store| {
+                        store.pin(PinKind::InFlight, &build_pin_holder(request), &hashes)
+                    })
                     .map_err(|_| RpcFailure::AuthoringBackendUnavailable {
-                        operation: "pin completed build: durable store mutex is poisoned"
-                            .to_owned(),
+                        operation: "pin completed build: the authority stopped".to_owned(),
                     })?
-                    .pin(PinKind::InFlight, &build_pin_holder(request), &hashes)
                     .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
                         operation: format!("pin completed build: {error}"),
                     })?;
@@ -279,48 +305,50 @@ impl BuildBackend for CoordinatorBuildBackend {
     }
 
     fn build_finished(&self, request: &BuildRequest) -> Result<(), RpcFailure> {
-        let mut active = self
-            .active_builds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *active = active
-            .checked_sub(1)
-            .expect("build_finished called without a matching build");
-        let run_maintenance = *active == 0;
+        let previous = self.active_builds.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous & !CAS_MAINTENANCE != 0,
+            "build_finished called without a matching build"
+        );
         let Some(coordinator) = self.coordinator.upgrade() else {
             return Ok(());
         };
-        let store_handle = coordinator.store();
-        let mut store =
-            store_handle
-                .lock()
-                .map_err(|_| RpcFailure::AuthoringBackendUnavailable {
-                    operation: "finish build: durable store mutex is poisoned".to_owned(),
-                })?;
-        store
-            .unpin_holder(PinKind::InFlight, &build_pin_holder(request))
+        let stopped = |_| RpcFailure::AuthoringBackendUnavailable {
+            operation: "finish build: the authority stopped".to_owned(),
+        };
+        coordinator
+            .store()
+            .write_with(|store| store.unpin_holder(PinKind::InFlight, &build_pin_holder(request)))
+            .map_err(stopped)?
             .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
                 operation: format!("release completed build pin: {error}"),
             })?;
-        if !run_maintenance {
+        if previous != 1
+            || self
+                .active_builds
+                .compare_exchange(0, CAS_MAINTENANCE, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             return Ok(());
         }
-        // Keep the zero-count gate locked through maintenance. A new build
-        // cannot read a candidate between the last activity check and an
-        // eviction that would otherwise treat it as unreferenced.
-        let sweep = store.enforce_cache_limit().map_err(|error| {
-            RpcFailure::AuthoringBackendUnavailable {
-                operation: format!("enforce CAS cache limit: {error}"),
+        let sweep = coordinator.store().write_with(|store| {
+            let sweep = store.enforce_cache_limit().map_err(|error| {
+                RpcFailure::AuthoringBackendUnavailable {
+                    operation: format!("enforce CAS cache limit: {error}"),
+                }
+            })?;
+            if sweep.evicted != 0 {
+                store
+                    .compact()
+                    .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
+                        operation: format!("compact CAS after eviction: {error}"),
+                    })?;
             }
-        })?;
-        if sweep.evicted != 0 {
-            store
-                .compact()
-                .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
-                    operation: format!("compact CAS after eviction: {error}"),
-                })?;
-        }
-        Ok(())
+            Ok(())
+        });
+        self.active_builds
+            .fetch_and(!CAS_MAINTENANCE, Ordering::Release);
+        sweep.map_err(stopped)?
     }
 }
 
@@ -332,9 +360,8 @@ impl ArtifactLeaseBackend for CoordinatorBuildBackend {
             .ok_or_else(|| "build coordinator stopped".to_owned())?;
         coordinator
             .store()
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?
-            .pin(PinKind::Lease, &format!("rpc-lease-{holder}"), hashes)
+            .write_with(|store| store.pin(PinKind::Lease, &format!("rpc-lease-{holder}"), hashes))
+            .map_err(|_| "the authority stopped".to_owned())?
             .map_err(|error| error.to_string())
     }
 
@@ -342,11 +369,9 @@ impl ArtifactLeaseBackend for CoordinatorBuildBackend {
         let Some(coordinator) = self.coordinator.upgrade() else {
             return;
         };
-        let store_handle = coordinator.store();
-        let Ok(mut store) = store_handle.lock() else {
-            return;
-        };
-        let _ = store.unpin_holder(PinKind::Lease, &format!("rpc-lease-{holder}"));
+        let _ = coordinator.store().write_with(|store| {
+            store.unpin_holder(PinKind::Lease, &format!("rpc-lease-{holder}"))
+        });
     }
 
     fn pin_pack_session(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
@@ -356,13 +381,14 @@ impl ArtifactLeaseBackend for CoordinatorBuildBackend {
             .ok_or_else(|| "build coordinator stopped".to_owned())?;
         coordinator
             .store()
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?
-            .pin(
-                PinKind::PackSession,
-                &format!("rpc-pack-session-{holder}"),
-                hashes,
-            )
+            .write_with(|store| {
+                store.pin(
+                    PinKind::PackSession,
+                    &format!("rpc-pack-session-{holder}"),
+                    hashes,
+                )
+            })
+            .map_err(|_| "the authority stopped".to_owned())?
             .map_err(|error| error.to_string())
     }
 
@@ -370,11 +396,9 @@ impl ArtifactLeaseBackend for CoordinatorBuildBackend {
         let Some(coordinator) = self.coordinator.upgrade() else {
             return;
         };
-        let store_handle = coordinator.store();
-        let Ok(mut store) = store_handle.lock() else {
-            return;
-        };
-        let _ = store.unpin_holder(PinKind::PackSession, &format!("rpc-pack-session-{holder}"));
+        let _ = coordinator.store().write_with(|store| {
+            store.unpin_holder(PinKind::PackSession, &format!("rpc-pack-session-{holder}"))
+        });
     }
 }
 
@@ -435,7 +459,7 @@ struct NodePublication {
 }
 
 struct BuildContext {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     store_instance: distill_store::state::StoreInstanceId,
     drifted_input: DriftedInput,
     scanner: RootedScanner,
@@ -456,7 +480,7 @@ struct BuildContext {
 }
 
 struct CurrentLoadRuntime<'a> {
-    store: &'a Arc<Mutex<Store>>,
+    store: &'a Arc<AuthorityStore>,
     store_instance: distill_store::state::StoreInstanceId,
     drifted_input: &'a DriftedInput,
     pipeline: &'a PipelineSnapshot,
@@ -477,11 +501,10 @@ impl<'a> CurrentLoadRuntime<'a> {
 
 fn lock_current_load_store<'a>(
     runtime: &'a CurrentLoadRuntime<'_>,
-) -> Result<MutexGuard<'a, Store>, BuildError> {
+) -> Result<ReadGuard<'a>, BuildError> {
     let store = runtime
         .store
-        .lock()
-        .map_err(|_| BuildError::Infrastructure("durable store mutex is poisoned".to_owned()))?;
+        .read();
     if store.instance_id() != runtime.store_instance || store.input_version() != runtime.basis {
         return Err(BuildError::Drifted(runtime.drifted_input.clone()));
     }
@@ -496,7 +519,7 @@ pub(crate) struct CurrentDiskValue {
 }
 
 pub(crate) struct CurrentLoadService {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     store_instance: distill_store::state::StoreInstanceId,
     basis: distill_store::state::InputVersion,
     pipeline: PipelineSnapshot,
@@ -512,9 +535,7 @@ impl CurrentLoadService {
         let scanner = coordinator.scanner();
         let pipeline = coordinator.pipeline_snapshot();
         let (store_instance, source) = {
-            let durable = store
-                .lock()
-                .map_err(|_| "durable store mutex is poisoned".to_owned())?;
+            let durable = store.read();
             if durable.input_version() != basis {
                 return Err(format!(
                     "disk-migration basis drifted: expected {basis:?}, observed {:?}",
@@ -595,7 +616,7 @@ struct PinnedToolEpoch {
 
 impl PinnedToolEpoch {
     fn capture(
-        store: &Store,
+        store: &StoreReader,
         basis: distill_store::state::InputVersion,
     ) -> Result<Self, BuildError> {
         let hashes = store
@@ -628,15 +649,32 @@ impl ToolEpochSnapshot for PinnedToolEpoch {
     }
 }
 
-fn lock_build_store(context: &BuildContext) -> Result<MutexGuard<'_, Store>, BuildError> {
+fn lock_build_store(context: &BuildContext) -> Result<ReadGuard<'_>, BuildError> {
     let store = context
         .store
-        .lock()
-        .map_err(|_| BuildError::Infrastructure("durable store mutex is poisoned".to_owned()))?;
+        .read();
     if store.instance_id() != context.store_instance || store.input_version() != context.basis {
         return Err(BuildError::Drifted(context.drifted_input.clone()));
     }
     Ok(store)
+}
+
+/// Run a build's write on the authority, still at the build's basis.
+fn write_build_store<R: Send>(
+    context: &BuildContext,
+    write: impl FnOnce(&mut Store) -> Result<R, StoreError> + Send,
+) -> Result<R, BuildError> {
+    let (instance, basis) = (context.store_instance, context.basis);
+    let drifted = &context.drifted_input;
+    context
+        .store
+        .write_with(|store| {
+            if store.instance_id() != instance || store.input_version() != basis {
+                return Err(BuildError::Drifted(drifted.clone()));
+            }
+            write(store).map_err(BuildError::infrastructure)
+        })
+        .map_err(|_| BuildError::Infrastructure("the authority stopped".to_owned()))?
 }
 
 fn ensure_build_basis(context: &BuildContext) -> Result<(), BuildError> {
@@ -1013,9 +1051,7 @@ fn build_with_runtime_mode(
     let store_handle = coordinator.store();
     let scanner = coordinator.scanner();
     let (root, tools, execution_root) = {
-        let store = store_handle.lock().map_err(|_| {
-            BuildError::Infrastructure("durable store mutex is poisoned".to_owned())
-        })?;
+        let store = store_handle.read();
         if store.instance_id() != request.basis.instance
             || store.input_version() != request.basis.version
         {
@@ -1132,7 +1168,7 @@ pub(crate) fn doctor_verify_builds(
 /// Finish §10 tag indexing against a namespace that has advanced durably but
 /// is not yet served: the authority applies its RPC delta afterwards.
 pub(crate) fn refine_published_tag_index(
-    store_handle: Arc<Mutex<Store>>,
+    store_handle: Arc<AuthorityStore>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -1156,7 +1192,7 @@ pub(crate) fn refine_published_tag_index(
 /// publication. Deleted identities become bounded removals; unrelated tag
 /// rows and cached traces are not enumerated.
 pub(crate) fn refine_published_tag_index_incremental(
-    store_handle: Arc<Mutex<Store>>,
+    store_handle: Arc<AuthorityStore>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -1187,7 +1223,7 @@ pub(crate) fn refine_published_tag_index_incremental(
 }
 
 fn try_refine_published_tag_index(
-    store_handle: Arc<Mutex<Store>>,
+    store_handle: Arc<AuthorityStore>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -1197,9 +1233,7 @@ fn try_refine_published_tag_index(
 ) -> Result<PublishedTagIndex, String> {
     let tag_epoch = authority.source_hash();
     let (store_instance, basis, assets, tools, execution_root) = {
-        let store = store_handle
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?;
+        let store = store_handle.read();
         (
             store.instance_id(),
             store.input_version(),
@@ -1293,9 +1327,7 @@ fn try_refine_published_tag_index(
             || "no build target is published".to_owned(),
             |error| error.to_string(),
         );
-        let store = store_handle
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?;
+        let store = store_handle.read();
         for asset in assets {
             let direct = (|| {
                 let loaded = load_asset(&store, &scanner, asset)
@@ -1357,8 +1389,7 @@ fn try_refine_published_tag_index(
         }
     }
     store_handle
-        .lock()
-        .map_err(|_| "durable store mutex is poisoned".to_owned())?
+        .write()
         .refine_unpublished_tag_index(basis, &updates)
         .map_err(|error| format!("publish tag index: {error}"))?;
     Ok(PublishedTagIndex {
@@ -2216,12 +2247,9 @@ fn commit_processor_stage(
     debug: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), BuildError> {
     for output in outputs {
-        lock_build_store(context)?
-            .put_wire_tree(&output.project.dswl_bytes)
-            .map_err(BuildError::infrastructure)?;
+        write_build_store(context, |store| store.put_wire_tree(&output.project.dswl_bytes))?;
     }
-    lock_build_store(context)?
-        .commit_build(BuildCommit {
+    write_build_store(context, |store| store.commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
@@ -2245,8 +2273,7 @@ fn commit_processor_stage(
                     })
                     .collect(),
             },
-        })
-        .map_err(BuildError::infrastructure)?;
+        }))?;
     Ok(())
 }
 
@@ -2258,16 +2285,14 @@ fn commit_processor_failure(
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = build_failure_cause(trace, facts)?;
-    lock_build_store(context)?
-        .commit_build(BuildCommit {
+    write_build_store(context, |store| store.commit_build(BuildCommit {
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
             static_inputs_canonical: static_inputs_canonical_bytes(static_inputs),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
-        })
-        .map_err(BuildError::infrastructure)?;
+        }))?;
     Ok(())
 }
 
@@ -2351,9 +2376,7 @@ fn prepare_outputs(
     let mut wire_trees = BTreeMap::new();
     for output in &outputs {
         verify_encoded_output(output)?;
-        lock_build_store(context)?
-            .put_wire_tree(&output.project.dswl_bytes)
-            .map_err(BuildError::infrastructure)?;
+        write_build_store(context, |store| store.put_wire_tree(&output.project.dswl_bytes))?;
         wire_trees.insert(
             output.project.layout_hash,
             BuildWireTree {
@@ -2916,16 +2939,14 @@ fn commit_build_import_failure(
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = build_failure_cause(trace, facts)?;
-    lock_build_store(context)?
-        .commit_build(BuildCommit {
+    write_build_store(context, |store| store.commit_build(BuildCommit {
             key_kind: KeyKind::BuildImport,
             static_input_key: key,
             asset_uuid: loaded.entry.uuid,
             static_inputs_canonical: Vec::new(),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
-        })
-        .map_err(BuildError::infrastructure)?;
+        }))?;
     Ok(())
 }
 
@@ -3468,8 +3489,7 @@ fn encode_or_hydrate(
             };
             let detail = facts.digest().map_err(BuildError::failed)?;
             if !context.verify_fresh {
-                lock_build_store(context)?
-                    .commit_build(BuildCommit {
+                write_build_store(context, |store| store.commit_build(BuildCommit {
                         key_kind: KeyKind::BuildImport,
                         static_input_key: key,
                         asset_uuid: loaded.entry.uuid,
@@ -3481,8 +3501,7 @@ fn encode_or_hydrate(
                                 detail,
                             }),
                         },
-                    })
-                    .map_err(BuildError::infrastructure)?;
+                    }))?;
             }
             return Err(BuildError::Failed(format!(
                 "asset {} failed validation: {diagnostics:?}",
@@ -3547,11 +3566,8 @@ fn encode_or_hydrate(
         terminal_type,
     );
     if !context.verify_fresh {
-        lock_build_store(context)?
-            .put_wire_tree(&project.dswl_bytes)
-            .map_err(BuildError::infrastructure)?;
-        lock_build_store(context)?
-            .commit_build(BuildCommit {
+        write_build_store(context, |store| store.put_wire_tree(&project.dswl_bytes))?;
+        write_build_store(context, |store| store.commit_build(BuildCommit {
                 key_kind: KeyKind::BuildImport,
                 static_input_key: key,
                 asset_uuid: loaded.entry.uuid,
@@ -3566,8 +3582,7 @@ fn encode_or_hydrate(
                     }],
                     aux: Vec::new(),
                 },
-            })
-            .map_err(BuildError::infrastructure)?;
+            }))?;
     }
     Ok((bytes, references, Some(current_value)))
 }
@@ -3674,7 +3689,7 @@ fn resolve_query(
 }
 
 fn load_asset(
-    store: &Store,
+    store: &StoreReader,
     scanner: &RootedScanner,
     asset: AssetUuid,
 ) -> Result<LoadedAsset, BuildError> {
@@ -3816,7 +3831,7 @@ struct MigrationControlRecord {
 }
 
 fn capture_migration_controls(
-    store: &Store,
+    store: &StoreReader,
     scanner: &RootedScanner,
 ) -> Result<BTreeMap<AssetUuid, MigrationControlRecord>, BuildError> {
     let mut records = BTreeMap::new();
@@ -3898,7 +3913,7 @@ fn capture_migration_controls(
 }
 
 impl StoreTraceSource {
-    fn capture(store: &Store, basis: TraceCaptureBasis<'_>) -> Result<Self, BuildError> {
+    fn capture(store: &StoreReader, basis: TraceCaptureBasis<'_>) -> Result<Self, BuildError> {
         let bundle_rows = store.all_bundles().map_err(BuildError::infrastructure)?;
         let bundles = bundle_rows
             .iter()
@@ -4091,7 +4106,7 @@ impl StoreTraceSource {
 
 impl CurrentLoadSource {
     fn capture(
-        store: &Store,
+        store: &StoreReader,
         scanner: &RootedScanner,
         epoch: Option<&PipelineEpoch>,
         dylib_hash: Option<[u8; 32]>,
@@ -4868,7 +4883,7 @@ mod tests {
 
     struct StoreLockProbeProcessor {
         calls: Arc<AtomicUsize>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<AuthorityStore>,
         observed_unlocked: Arc<AtomicBool>,
     }
 
@@ -4880,7 +4895,7 @@ mod tests {
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.observed_unlocked
-                .store(self.store.try_lock().is_ok(), Ordering::SeqCst);
+                .store(!crate::store_cell::guard_held(), Ordering::SeqCst);
             let AuthoredValue::Object(fields) = &input else {
                 panic!("processor input is a struct");
             };
@@ -5042,8 +5057,7 @@ mod tests {
         coordinator
             .coordinated_commit(InputVersion(1), || {
                 store
-                    .lock()
-                    .unwrap()
+                    .write()
                     .input_transaction(|transaction| {
                         transaction.put_schema(project.logical_hash, &current_snapshot)?;
                         transaction.project_verified_lineage_manifest(&manifest)
@@ -5067,19 +5081,20 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
-        refine_published_tag_index(
-            coordinator.store(),
-            coordinator.scanner(),
-            Arc::clone(&authority),
-            coordinator.pipeline_snapshot(),
-            &BTreeMap::from([("dev".to_owned(), build_target)]),
-            64,
-            &BTreeMap::from([(ASSET, BUNDLE)]),
-        );
+        coordinator.on_authority(|| {
+            refine_published_tag_index(
+                coordinator.store(),
+                coordinator.scanner(),
+                Arc::clone(&authority),
+                coordinator.pipeline_snapshot(),
+                &BTreeMap::from([("dev".to_owned(), build_target)]),
+                64,
+                &BTreeMap::from([(ASSET, BUNDLE)]),
+            )
+        });
         let indexed = coordinator
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .tag_index_state(ASSET)
             .unwrap()
             .unwrap();
@@ -5425,8 +5440,7 @@ mod tests {
             assert_eq!(
                 coordinator
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .cas_read(&artifact.content_hash.0)
                     .unwrap(),
                 distill_wire::artifact::assemble_artifact(&artifact.payload.structural, &blobs),
@@ -5441,14 +5455,13 @@ mod tests {
             assert_eq!(
                 coordinator
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .wire_tree_read(wire_tree.layout_hash)
                     .unwrap(),
                 wire_tree.bytes.to_vec(),
             );
         }
-        let first_memo = coordinator.store().lock().unwrap().memo_seq();
+        let first_memo = coordinator.store().read().memo_seq();
         let import_key = build_import_digest(&BuildImportInputs {
             asset: ASSET,
             bundle: BUNDLE,
@@ -5465,8 +5478,7 @@ mod tests {
         });
         let import_candidates = coordinator
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .lookup_candidates(KeyKind::BuildImport, &import_key)
             .unwrap();
         let distill_store::cas::record::ResultOutcome::Success { outputs, .. } =
@@ -5529,7 +5541,7 @@ mod tests {
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
-        assert_eq!(coordinator.store().lock().unwrap().memo_seq(), first_memo);
+        assert_eq!(coordinator.store().read().memo_seq(), first_memo);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 

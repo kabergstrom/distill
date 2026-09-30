@@ -235,8 +235,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     coordinator
         .coordinated_commit(InputVersion(1), || {
             store
-                .lock()
-                .unwrap()
+                .write()
                 .input_transaction(|transaction| {
                     transaction.project_verified_lineage_manifest(&manifest)
                 })
@@ -281,17 +280,13 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(first.assets["asset"].data, AuthoredValue::UInt(7));
     assert_eq!(first.assets["$settings"].data, AuthoredValue::UInt(3));
     assert!(first.assets.contains_key("$record"));
-    assert!(coordinator
-        .authoring_service()
-        .watched_imports_needing_reimport()
+    assert!(coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
         .unwrap()
         .is_empty());
 
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     assert_eq!(
-        coordinator
-            .authoring_service()
-            .watched_imports_needing_reimport()
+        coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
             .unwrap(),
         vec![imported_bundle]
     );
@@ -311,7 +306,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(second.assets["asset"].data, AuthoredValue::UInt(8));
     assert_eq!(second.assets["$settings"].data, AuthoredValue::UInt(3));
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(5)
     );
 
@@ -325,8 +320,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
     let failed = coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .watched_import_failure(imported_bundle)
         .unwrap()
         .expect("stable failed attempt is retained");
@@ -335,19 +329,17 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         distill_store::imports::WatchedImportTerminal::Importer { code: 3 }
     );
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(6),
         "memoizing a failure is not an input event"
     );
     let failed_memo = failed.memo_seq;
-    assert!(coordinator
-        .authoring_service()
-        .watched_imports_needing_reimport()
+    assert!(coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
         .unwrap()
         .is_empty());
     assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
     assert_eq!(
-        coordinator.store().lock().unwrap().memo_seq(),
+        coordinator.store().read().memo_seq(),
         failed_memo,
         "an unchanged failure must not spin"
     );
@@ -365,15 +357,14 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     );
     assert!(coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .watched_import_failure(imported_bundle)
         .unwrap()
         .is_none());
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(9));
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(8)
     );
 
@@ -388,17 +379,14 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(
         coordinator
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .watched_import_failure(imported_bundle)
             .unwrap()
             .unwrap()
             .terminal,
         distill_store::imports::WatchedImportTerminal::Dependency
     );
-    assert!(coordinator
-        .authoring_service()
-        .watched_imports_needing_reimport()
+    assert!(coordinator.on_authority(|| coordinator.authoring_service().watched_imports_needing_reimport())
         .unwrap()
         .is_empty());
     std::fs::write(assets.join("source.txt"), b"10").unwrap();
@@ -415,7 +403,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(10));
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(11)
     );
 }
@@ -465,8 +453,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     coordinator
         .coordinated_commit(InputVersion(1), || {
             store
-                .lock()
-                .unwrap()
+                .write()
                 .input_transaction(|transaction| {
                     transaction.project_verified_lineage_manifest(&manifest)
                 })
@@ -487,8 +474,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     assert_eq!(generated.assets["$settings"].data, AuthoredValue::UInt(5));
     let meta = coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .bundle(generated.uuid)
         .unwrap()
         .unwrap();
@@ -517,8 +503,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     coordinator.acknowledge_file_work(&work).unwrap();
     let failure = coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .watched_import_failure(generated.uuid)
         .unwrap()
         .expect("listing loss is durable orphan state");
@@ -532,7 +517,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .unwrap()
         .is_empty());
     assert_eq!(
-        coordinator.store().lock().unwrap().memo_seq(),
+        coordinator.store().read().memo_seq(),
         orphan_memo,
         "an unchanged orphan must not spin memo state"
     );
@@ -546,8 +531,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     coordinator.reconcile_directory_imports().unwrap();
     assert!(coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .watched_import_failure(generated.uuid)
         .unwrap()
         .is_none());
@@ -565,8 +549,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     assert_eq!(
         coordinator
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .watched_import_failure(generated.uuid)
             .unwrap()
             .unwrap()
@@ -580,8 +563,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     coordinator.reconcile_directory_imports().unwrap();
     assert!(coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .watched_import_failure(generated.uuid)
         .unwrap()
         .is_none());

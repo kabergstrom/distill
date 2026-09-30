@@ -227,7 +227,7 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
 
     {
         let store = coordinator.store();
-        let store = store.lock().unwrap();
+        let store = store.read();
         assert!(store.version_poison().unwrap().is_none());
         assert!(matches!(
             store.entry(AssetUuid([94; 16])).unwrap_err(),
@@ -244,7 +244,7 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
         })
         .unwrap();
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert!(store.version_poison().unwrap().is_none());
     assert!(store.entry(AssetUuid([94; 16])).unwrap().is_some());
 }
@@ -287,7 +287,7 @@ fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
 
     let coordinator = coordinator(&temp);
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert_eq!(store.input_version(), InputVersion(1));
     assert!(store.pending_restart().unwrap().is_none());
     assert!(matches!(
@@ -311,7 +311,7 @@ fn full_scan_publishes_one_store_and_rpc_version_with_missing_lineage_repair_bas
     assert_eq!(stamp.version, InputVersion(1));
     assert_eq!(coordinator.server().current_stamp(), stamp);
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert_eq!(store.input_version(), InputVersion(1));
     assert!(store.bundle(bundle).unwrap().is_some());
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
@@ -351,7 +351,7 @@ fn watcher_trigger_reconciles_an_offline_delete_in_exactly_one_version() {
     assert_eq!(stamp.version, InputVersion(2));
 
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert!(store.bundle(bundle).unwrap().is_none());
     assert!(store.entry(asset).unwrap().is_none());
     assert_eq!(store.input_version(), InputVersion(2));
@@ -398,7 +398,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
     assert_eq!(
-        coordinator.store().lock().unwrap().input_version(),
+        coordinator.store().read().input_version(),
         InputVersion(2)
     );
 
@@ -414,7 +414,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     assert_eq!(stamp.version, InputVersion(3));
     assert!(!bundle_path.exists());
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert_eq!(store.input_version(), InputVersion(3));
     assert!(store.bundle(bundle_uuid).unwrap().is_none());
     assert!(store.entry(asset_uuid).unwrap().is_none());
@@ -439,8 +439,7 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
     let store = coordinator.store();
     assert!(matches!(
         store
-            .lock()
-            .unwrap()
+            .read()
             .version_poison()
             .unwrap()
             .unwrap()
@@ -453,7 +452,7 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
         coordinator.reconcile_full_scan().unwrap().version,
         InputVersion(2)
     );
-    assert!(store.lock().unwrap().version_poison().unwrap().is_none());
+    assert!(store.read().version_poison().unwrap().is_none());
 }
 
 #[cfg(unix)]
@@ -495,8 +494,7 @@ fn incremental_scan_poison_heals_when_observation_returns_to_last_good() {
     );
     assert!(coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .version_poison()
         .unwrap()
         .is_none());
@@ -534,8 +532,7 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
         .unwrap();
     assert!(coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .version_poison()
         .unwrap()
         .is_some());
@@ -549,8 +546,7 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
         .unwrap();
     assert!(coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .version_poison()
         .unwrap()
         .is_none());
@@ -572,8 +568,7 @@ fn configuration_scan_rejection_preserves_existing_version_poison() {
     coordinator.reconcile_full_scan().unwrap();
     let initial = coordinator
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .version_poison()
         .unwrap()
         .unwrap();
@@ -590,8 +585,7 @@ fn configuration_scan_rejection_preserves_existing_version_poison() {
     assert_eq!(
         coordinator
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .version_poison()
             .unwrap()
             .unwrap(),
@@ -616,7 +610,7 @@ fn directory_alias_publishes_configuration_poison_without_aborting_the_version()
     );
     let store = coordinator.store();
     assert!(matches!(
-        store.lock().unwrap().configuration_state().unwrap(),
+        store.read().configuration_state().unwrap(),
         ConfigurationState::Poisoned { reason, .. }
             if matches!(reason.detail.as_ref(), DscpV1::DirectoryAlias { .. })
     ));
@@ -657,7 +651,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
         }] if root_name == "main" && normalized_path == "daemon-state-alias"
     ));
     let store = coordinator.store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert!(matches!(
         store.configuration_state().unwrap(),
         ConfigurationState::Ready(_)

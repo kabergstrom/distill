@@ -167,12 +167,12 @@ pub trait ExternalStore: Send + Sync {
     /// is dropped unrun.
     fn execute(&self, job: AuthorityJob);
     /// Exclusive write access to the store.
-    fn with_store(&self, job: &mut dyn FnMut(&mut Store));
+    fn with_store(&self, job: &mut (dyn FnMut(&mut Store) + Send));
 }
 
 /// Runs a borrowed job on another thread through `execute`, blocking until
 /// it ran or was dropped.
-fn run_scoped<T: Send>(
+pub fn run_scoped<T: Send>(
     execute: impl FnOnce(AuthorityJob),
     step: impl FnOnce() -> T + Send,
 ) -> Result<T, AuthorityStopped> {

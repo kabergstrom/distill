@@ -10,7 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::bootstrap::{is_bootstrap_control_type, SCHEMA_LINEAGE_MANIFEST_TYPE_UUID};
@@ -30,20 +30,21 @@ use distill_store::journal::{
 };
 use distill_store::Store;
 
+use crate::store_cell::{AuthorityStore, WriteGuard};
 use crate::quarantine::{PublicationDriver, QuarantineDriver, QuarantineError, QuarantineRoot};
 use crate::scanner::{AssetRoot, RootedScanner, ScanError, ScanSnapshot};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct LineageRepairBackend {
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     scanner: RootedScanner,
     quarantine: QuarantineDriver,
 }
 
 impl LineageRepairBackend {
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<AuthorityStore>,
         roots: impl IntoIterator<Item = AssetRoot>,
     ) -> Result<Self, LineageRepairBackendInitError> {
         let roots = roots.into_iter().collect::<Vec<_>>();
@@ -90,7 +91,7 @@ impl LineageRepairBackend {
             ));
         };
         let proposed = validate_manifest_bundle(proposed_bytes)?;
-        let mut store = lock_store(&self.store)?;
+        let mut store = write_store(&self.store)?;
         require_store_basis(&store, basis)?;
         let mut publication = self
             .quarantine
@@ -211,7 +212,7 @@ impl LineageRepairBackend {
                 "selected survivor is not an exact claimant",
             ));
         }
-        let mut store = lock_store(&self.store)?;
+        let mut store = write_store(&self.store)?;
         require_store_basis(&store, basis)?;
         let mut publication = self
             .quarantine
@@ -868,12 +869,10 @@ fn retire_if_terminal(
     }
 }
 
-fn lock_store(
-    store: &Arc<Mutex<Store>>,
-) -> Result<std::sync::MutexGuard<'_, Store>, LineageRepairBackendError> {
-    store
-        .lock()
-        .map_err(|_| failure("durable store coordinator mutex is poisoned"))
+fn write_store(
+    store: &Arc<AuthorityStore>,
+) -> Result<WriteGuard<'_>, LineageRepairBackendError> {
+    Ok(store.write())
 }
 
 fn destination_stale_code(

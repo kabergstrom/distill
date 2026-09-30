@@ -30,6 +30,7 @@ pub mod process;
 pub mod quarantine;
 pub mod scanner;
 pub mod scheduler;
+pub mod store_cell;
 mod tool_resolver;
 pub mod watcher;
 #[cfg(not(unix))]

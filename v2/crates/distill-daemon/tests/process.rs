@@ -146,8 +146,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
         process
             .coordinator()
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .pipeline_state()
             .unwrap(),
         Some(PipelineState::Poisoned { .. })
@@ -163,8 +162,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
         process
             .coordinator()
             .store()
-            .lock()
-            .unwrap()
+            .read()
             .pipeline_state()
             .unwrap(),
         Some(PipelineState::Poisoned { .. })
@@ -212,7 +210,7 @@ fn startup_recovers_non_codegen_publication_before_the_initial_scan() {
 
     assert_eq!(std::fs::read(&target).unwrap(), b"new");
     let store = process.coordinator().store();
-    let store = store.lock().unwrap();
+    let store = store.read();
     assert!(store.unfinished_publication_groups().unwrap().is_empty());
     assert!(store
         .all_files()
@@ -264,8 +262,7 @@ fn startup_surfaces_an_abandoned_unarmed_authoring_group() {
     assert!(process
         .coordinator()
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .unfinished_publication_groups()
         .unwrap()
         .is_empty());
@@ -301,8 +298,7 @@ fn disabled_existing_codegen_output_is_still_excluded() {
     assert!(process
         .coordinator()
         .store()
-        .lock()
-        .unwrap()
+        .read()
         .all_files()
         .unwrap()
         .iter()
@@ -377,8 +373,7 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
                 process
                     .coordinator()
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Poisoned { reason, .. }
@@ -404,8 +399,7 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
             let state = process
                 .coordinator()
                 .store()
-                .lock()
-                .unwrap()
+                .read()
                 .configuration_state()
                 .unwrap();
             version > poisoned
@@ -431,8 +425,7 @@ fn valid_configuration_with_malformed_schema_retains_lineage_configuration_poiso
                 process
                     .coordinator()
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Poisoned { reason, .. }
@@ -447,7 +440,7 @@ fn valid_configuration_with_malformed_schema_retains_lineage_configuration_poiso
     wait_until(
         || {
             let store = process.coordinator().store();
-            let store = store.lock().unwrap();
+            let store = store.read();
             matches!(
                 store.configuration_state().unwrap(),
                 ConfigurationState::Poisoned { reason, .. }
@@ -482,8 +475,7 @@ fn simultaneous_configuration_defects_choose_canonical_authority() {
                 process
                     .coordinator()
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Poisoned { reason, .. }
@@ -513,8 +505,7 @@ fn schema_bound_target_mismatches_publish_configuration_poison() {
                 process
                     .coordinator()
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Poisoned { reason, .. }
@@ -552,12 +543,10 @@ fn operational_configuration_applies_live_without_an_input_version() {
         before
     );
     assert_eq!(
+        // The operational config lives on the writer.
         process
             .coordinator()
-            .store()
-            .lock()
-            .unwrap()
-            .operational_config()
+            .on_authority(|| process.coordinator().store().read().operational_config())
             .parallelism,
         3
     );
@@ -576,8 +565,7 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
             process
                 .coordinator()
                 .store()
-                .lock()
-                .unwrap()
+                .read()
                 .pending_restart()
                 .unwrap()
                 .is_some_and(|pending| pending.keys == ["codegen.auto_codegen"])
@@ -676,8 +664,7 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
                 && process
                     .coordinator()
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .all_files()
                     .unwrap()
                     .iter()
@@ -784,8 +771,7 @@ fn malformed_schema_is_a_stable_pipeline_poison_and_a_valid_edit_retries() {
                 process
                     .coordinator()
                     .store()
-                    .lock()
-                    .unwrap()
+                    .read()
                     .pipeline_state()
                     .unwrap(),
                 Some(PipelineState::Poisoned { error, .. })

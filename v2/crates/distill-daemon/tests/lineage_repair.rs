@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use distill_daemon::store_cell::AuthorityStore;
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
 use distill_core::bootstrap::{
@@ -103,7 +105,7 @@ fn ordinary_bundle(bundle: u8) -> Bundle {
 struct Harness {
     _temp: tempfile::TempDir,
     root: std::path::PathBuf,
-    store: Arc<Mutex<Store>>,
+    store: Arc<AuthorityStore>,
     backend: LineageRepairBackend,
 }
 
@@ -112,7 +114,7 @@ impl Harness {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("assets");
         std::fs::create_dir(&root).unwrap();
-        let store = Arc::new(Mutex::new(
+        let store = Arc::new(AuthorityStore::on_this_thread(
             Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
         ));
         let backend = LineageRepairBackend::new(
@@ -133,7 +135,7 @@ impl Harness {
     }
 
     fn inspection(&self, state: LineageRepairState) -> LineageRepairInspection {
-        let store = self.store.lock().unwrap();
+        let store = self.store.write();
         LineageRepairInspection {
             instance: store.instance_id(),
             stamp: store.stamp(),
@@ -172,7 +174,7 @@ fn missing_manifest_creation_is_no_replace_rescan_proven_and_store_durable() {
         std::fs::read(harness.root.join("control/lineage.bundle")).unwrap(),
         bytes
     );
-    assert_eq!(harness.store.lock().unwrap().input_version().0, 1);
+    assert_eq!(harness.store.write().input_version().0, 1);
     assert_eq!(
         harness.scanner().scan().unwrap().lineage_claimants().len(),
         1
@@ -261,7 +263,7 @@ fn occupied_opaque_creation_retains_exact_raw_preimage_in_quarantine() {
         .unwrap();
 
     assert_eq!(std::fs::read(target).unwrap(), proposed);
-    let quarantined = harness.store.lock().unwrap().quarantined_entries().unwrap();
+    let quarantined = harness.store.write().quarantined_entries().unwrap();
     assert_eq!(quarantined.len(), 1);
     assert_eq!(
         std::fs::read(&quarantined[0].path).unwrap(),
@@ -290,7 +292,7 @@ fn duplicate_repair_keeps_the_explicit_survivor_and_quarantines_other_file() {
     assert_eq!(commit.configuration, Some(ConfigurationStatus::Ready));
     assert_eq!(scanner.scan().unwrap().lineage_claimants(), [survivor]);
     assert!(!harness.root.join(removed_path).exists());
-    assert_eq!(harness.store.lock().unwrap().input_version().0, 1);
+    assert_eq!(harness.store.write().input_version().0, 1);
 }
 
 #[test]
