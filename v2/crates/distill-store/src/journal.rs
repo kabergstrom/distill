@@ -337,8 +337,8 @@ impl Store {
     /// healed input version; retirement merely proves no filesystem work is
     /// left implicit.
     pub fn retire_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
-        let state: Option<i64> = self
-            .conn
+        let transaction = self.read.conn.transaction()?;
+        let state: Option<i64> = transaction
             .query_row(
                 "SELECT state FROM publication_groups WHERE group_id = ?1 AND retired = 0",
                 [group_id],
@@ -351,7 +351,7 @@ impl Store {
                 detail: "only an armed publication group may retire normally".into(),
             });
         }
-        let pending: i64 = self.conn.query_row(
+        let pending: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM publication_group_children c
              JOIN write_intents w ON w.intent_id = c.intent_id
              WHERE c.group_id = ?1 AND w.retired = 0",
@@ -364,7 +364,7 @@ impl Store {
                 detail: format!("publication group still has {pending} unfinished children"),
             });
         }
-        let changed = self.conn.execute(
+        let changed = transaction.execute(
             "UPDATE publication_groups SET retired = 1
              WHERE group_id = ?1 AND retired = 0",
             [group_id],
@@ -375,6 +375,7 @@ impl Store {
                 detail: "no unfinished publication group with this id".into(),
             });
         }
+        transaction.commit()?;
         Ok(())
     }
 
