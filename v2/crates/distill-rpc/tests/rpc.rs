@@ -681,6 +681,7 @@ impl AuthoringBackend for DurableWriteBackend {
         &self,
         base: InputVersion,
         _operations: &[AuthoringOp],
+        _force_lossy: bool,
     ) -> Result<Option<Commit>, RpcFailure> {
         self.bases.lock().unwrap().push(base);
         Ok(Some(Commit::default()))
@@ -726,7 +727,8 @@ fn durable_write_backend_owns_the_committed_projection() {
     assert_eq!(
         hub.write(
             InputVersion(8),
-            vec![AuthoringOp::Remove { uuid: asset_id(7) }]
+            vec![AuthoringOp::Remove { uuid: asset_id(7) }],
+            false
         ),
         RpcResult::Success(InputVersion(9))
     );
@@ -775,7 +777,7 @@ fn coordinator_can_project_daemon_controls_but_hub_cannot_write_them_directly() 
         RpcResult::Success(AuthoringInspectResult::Inspection(_))
     ));
     assert!(matches!(
-        hub.write(InputVersion(1), vec![AuthoringOp::Set(control)]),
+        hub.write(InputVersion(1), vec![AuthoringOp::Set(control)], false),
         RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { .. })
     ));
     assert_eq!(server.current_stamp().version, InputVersion(1));
@@ -1854,7 +1856,7 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
     );
     assert_reconnect(pinned.entry(entry.uuid), reason);
     assert_reconnect(pinned.resolve(entry.uuid), reason);
-    assert_reconnect(hub.write(stamp.version, Vec::new()), reason);
+    assert_reconnect(hub.write(stamp.version, Vec::new(), false), reason);
     assert_eq!(
         server.root().connect(request_for(7, 3, &[(1, false)])),
         ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelineFailure(
@@ -2366,7 +2368,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     entry.type_uuid = type_id(1);
     entry.terminal_type = type_id(1);
     assert_eq!(
-        hub.write(InputVersion(0), vec![AuthoringOp::Set(entry.clone())]),
+        hub.write(InputVersion(0), vec![AuthoringOp::Set(entry.clone())], false),
         RpcResult::Success(InputVersion(1))
     );
     assert_eq!(
@@ -2390,7 +2392,8 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
     assert!(matches!(
         hub.write(
             InputVersion(0),
-            vec![AuthoringOp::Remove { uuid: entry.uuid }]
+            vec![AuthoringOp::Remove { uuid: entry.uuid }],
+            false
         ),
         RpcResult::Failure(RpcFailure::StaleInputVersion {
             expected: InputVersion(1),
@@ -2488,7 +2491,7 @@ fn hub_authoring_and_wire_tree_surface_is_versioned_typed_and_generation_first()
         .replace_target(target_with(8, &[(2, false)]))
         .unwrap();
     let reconnect = ReconnectReason::TargetDefinitionChanged;
-    assert_reconnect(hub.write(InputVersion(99), vec![]), reconnect);
+    assert_reconnect(hub.write(InputVersion(99), vec![], false), reconnect);
     assert_reconnect(
         snapshot.query(AssetQuery {
             path_prefix: Some("../invalid".to_owned()),

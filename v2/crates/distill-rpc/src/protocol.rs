@@ -12,7 +12,7 @@ pub use distill_store::state::{
     SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
 };
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -186,6 +186,16 @@ pub enum RpcFailure {
         got: InputVersion,
     },
     InvalidAuthoringRequest {
+        detail: String,
+    },
+    /// The write would drop data held under the on-disk schema: the
+    /// named fields hold non-default values, or no automatic plan or
+    /// migration function covers the schema change. `force_lossy` on the
+    /// write overrides.
+    LossyWrite {
+        type_uuid: TypeUuid,
+        asset: AssetUuid,
+        fields: Vec<String>,
         detail: String,
     },
     AuthoringBackendUnavailable {
@@ -695,6 +705,7 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         &self,
         _base: InputVersion,
         _operations: &[AuthoringOp],
+        _force_lossy: bool,
     ) -> Result<Option<Commit>, RpcFailure> {
         Ok(None)
     }

@@ -1058,8 +1058,15 @@ impl Hub {
         })
     }
 
-    pub fn write(&self, base: InputVersion, ops: Vec<AuthoringOp>) -> RpcResult<InputVersion> {
-        match self.write_call(base, ops) {
+    /// `force_lossy` writes even when data held under the on-disk schema
+    /// would be dropped (see [`RpcFailure::LossyWrite`]).
+    pub fn write(
+        &self,
+        base: InputVersion,
+        ops: Vec<AuthoringOp>,
+        force_lossy: bool,
+    ) -> RpcResult<InputVersion> {
+        match self.write_call(base, ops, force_lossy) {
             Ok(call) => write_call_outcome(call.run()),
             Err(result) => result,
         }
@@ -1073,6 +1080,7 @@ impl Hub {
         &self,
         base: InputVersion,
         ops: Vec<AuthoringOp>,
+        force_lossy: bool,
     ) -> Result<AuthorityCall<Option<RpcResult<InputVersion>>>, RpcResult<InputVersion>> {
         if let Some(result) = self.authoring_gate(base) {
             return Err(result);
@@ -1092,11 +1100,11 @@ impl Hub {
         }
         let next = InputVersion(base.0 + 1);
         if is_embedded(&self.server) {
-            return Err(self.embedded_write(base, ops, next));
+            return Err(self.embedded_write(base, ops, force_lossy, next));
         }
         Ok(self.prepared_call(base, move |backend| {
             Ok(backend
-                .prepare_write(base, &ops)?
+                .prepare_write(base, &ops, force_lossy)?
                 .map(|commit| (commit, next)))
         }))
     }
@@ -1105,12 +1113,13 @@ impl Hub {
         &self,
         base: InputVersion,
         ops: Vec<AuthoringOp>,
+        force_lossy: bool,
         next: InputVersion,
     ) -> RpcResult<InputVersion> {
         let backend_ops = ops.clone();
         if let Some(result) = self.prepared(base, move |backend| {
             Ok(backend
-                .prepare_write(base, &backend_ops)?
+                .prepare_write(base, &backend_ops, force_lossy)?
                 .map(|commit| (commit, next)))
         }) {
             return result;

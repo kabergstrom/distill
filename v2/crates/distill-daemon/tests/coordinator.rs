@@ -399,7 +399,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let stamp = coordinator
         .coordinated_commit(InputVersion(1), || {
             backend
-                .prepare_write(InputVersion(1), &[operation])
+                .prepare_write(InputVersion(1), &[operation], false)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or_else(|| "production authoring returned no commit".to_owned())
         })
@@ -416,7 +416,7 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let stamp = coordinator
         .coordinated_commit(InputVersion(2), || {
             backend
-                .prepare_write(InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }])
+                .prepare_write(InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or_else(|| "production authoring returned no commit".to_owned())
         })
@@ -444,7 +444,7 @@ fn a_coordinated_publication_is_invisible_until_it_commits_whole() {
     let stamp = coordinator
         .coordinated_commit(InputVersion(1), || {
             let commit = backend
-                .prepare_write(InputVersion(1), &[AuthoringOp::Remove { uuid: asset_uuid }])
+                .prepare_write(InputVersion(1), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or_else(|| "production authoring returned no commit".to_owned())?;
             // The namespace is written, but not yet as a version anyone else
@@ -746,4 +746,160 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     assert!(std::str::from_utf8(&events[2].payload)
         .unwrap()
         .contains("daemon-owned-directory-alias"));
+}
+
+fn u8_struct(fields: &[&str]) -> LogicalSchema {
+    LogicalSchema {
+        root: SchemaNode::Struct {
+            rev: 0,
+            fields: fields
+                .iter()
+                .map(|name| (name.to_string(), 0, SchemaNode::Primitive(PrimitiveKind::U8)))
+                .collect(),
+        },
+    }
+}
+
+fn u8_object(fields: &[(&str, u64)]) -> AuthoredValue {
+    AuthoredValue::Object(
+        fields
+            .iter()
+            .map(|(name, value)| (name.to_string(), AuthoredValue::UInt((*value).into())))
+            .collect(),
+    )
+}
+
+/// Stores `stored` under its schema, then writes `written` over it under
+/// another one.
+fn rewrite_under_a_new_schema(
+    stored: (LogicalSchema, AuthoredValue),
+    written: (LogicalSchema, AuthoredValue),
+    force_lossy: bool,
+) -> Result<AuthoredValue, distill_rpc::RpcFailure> {
+    let temp = tempfile::tempdir().unwrap();
+    let coordinator = coordinator(&temp);
+    let type_uuid = TypeUuid([71; 16]);
+    let (bundle_uuid, asset_uuid) = (BundleUuid([73; 16]), AssetUuid([72; 16]));
+    let (schema, data) = stored;
+    let schema_hash = node_hash(&schema.root).unwrap();
+    let bundle_path = temp.path().join("assets/ordinary.bundle");
+    let bytes = distill_bundle::write_bundle(&Bundle {
+        format_version: 1,
+        uuid: bundle_uuid,
+        primary: Some("entry".into()),
+        schemas: BTreeMap::from([(schema_hash, schema)]),
+        assets: BTreeMap::from([(
+            "entry".into(),
+            AssetEntry {
+                uuid: asset_uuid,
+                type_uuid,
+                schema_hash,
+                authoring_only: false,
+                data,
+            },
+        )]),
+    })
+    .unwrap();
+    std::fs::write(&bundle_path, bytes).unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+
+    let (schema, value) = written;
+    let operation = AuthoringOp::Set(AuthoringEntry {
+        uuid: asset_uuid,
+        bundle: bundle_uuid,
+        local_id: "entry".into(),
+        normalized_path: "ordinary.bundle".into(),
+        type_uuid,
+        terminal_type: type_uuid,
+        schema_hash: node_hash(&schema.root).unwrap(),
+        logical_schema: Arc::from(snapshot_to_json(&schema).unwrap().into_bytes()),
+        role: AuthoringEntryRole::Runtime,
+        tags: BTreeMap::new(),
+        value: RpcAuthoringValue {
+            canonical_value: Arc::from(distill_json::write(&value).unwrap().into_bytes()),
+            blobs: Vec::new(),
+        },
+    });
+    let backend = Arc::clone(coordinator.authoring_service());
+    let mut failure = None;
+    let committed = coordinator.coordinated_commit(InputVersion(1), || {
+        match backend.prepare_write(InputVersion(1), &[operation], force_lossy) {
+            Ok(commit) => commit.ok_or_else(|| "no commit".to_owned()),
+            Err(error) => {
+                failure = Some(error);
+                Err("refused".to_owned())
+            }
+        }
+    });
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    assert_eq!(committed.unwrap().version, InputVersion(2));
+    let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    Ok(rewritten.assets["entry"].data.clone())
+}
+
+#[test]
+fn a_write_that_adds_a_field_is_lossless() {
+    let written = u8_object(&[("a", 1), ("b", 2)]);
+    let result = rewrite_under_a_new_schema(
+        (u8_struct(&["a"]), u8_object(&[("a", 1)])),
+        (u8_struct(&["a", "b"]), written.clone()),
+        false,
+    );
+    assert_eq!(result.unwrap(), written);
+}
+
+#[test]
+fn a_write_may_drop_a_field_that_holds_its_default() {
+    let result = rewrite_under_a_new_schema(
+        (u8_struct(&["a", "b"]), u8_object(&[("a", 1), ("b", 0)])),
+        (u8_struct(&["a"]), u8_object(&[("a", 1)])),
+        false,
+    );
+    assert_eq!(result.unwrap(), u8_object(&[("a", 1)]));
+}
+
+#[test]
+fn a_write_that_drops_data_is_refused_unless_forced() {
+    let stored = (u8_struct(&["a", "b"]), u8_object(&[("a", 1), ("b", 5)]));
+    let written = (u8_struct(&["a"]), u8_object(&[("a", 1)]));
+    match rewrite_under_a_new_schema(stored.clone(), written.clone(), false) {
+        Err(distill_rpc::RpcFailure::LossyWrite {
+            type_uuid,
+            asset,
+            fields,
+            ..
+        }) => {
+            assert_eq!(type_uuid, TypeUuid([71; 16]));
+            assert_eq!(asset, AssetUuid([72; 16]));
+            assert_eq!(fields, ["$.b"]);
+        }
+        other => panic!("expected a lossy-write refusal, got {other:?}"),
+    }
+    assert_eq!(
+        rewrite_under_a_new_schema(stored, written, true).unwrap(),
+        u8_object(&[("a", 1)])
+    );
+}
+
+#[test]
+fn a_write_the_planner_refuses_needs_a_migration_function() {
+    let stored = (u8_struct(&["a"]), u8_object(&[("a", 1)]));
+    let written = (
+        LogicalSchema {
+            root: SchemaNode::Struct {
+                rev: 0,
+                fields: vec![("a".into(), 0, SchemaNode::String)],
+            },
+        },
+        AuthoredValue::Object(BTreeMap::from([(
+            "a".to_owned(),
+            AuthoredValue::Str("one".into()),
+        )])),
+    );
+    assert!(matches!(
+        rewrite_under_a_new_schema(stored, written, false),
+        Err(distill_rpc::RpcFailure::LossyWrite { .. })
+    ));
 }

@@ -15,7 +15,9 @@ use arc_swap::ArcSwap;
 
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
-use distill_core::id::{BundleUuid, ContentHash};
+use distill_core::id::{BundleUuid, ContentHash, LogicalHash};
+use distill_migrate::{lossy_drops, plan_automatic};
+use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
     decode_authoring_payload, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
@@ -202,15 +204,15 @@ impl AuthoringService {
         });
     }
 
-
     fn prepare_direct_write(
         &self,
         base: InputVersion,
         operations: &[AuthoringOp],
+        force_lossy: bool,
     ) -> Result<Commit, RpcFailure> {
         let store = self.write_store()?;
         require_base(&store, base)?;
-        let planned = self.plan_bundle_mutation(&store, operations)?;
+        let planned = self.plan_bundle_mutation(&store, operations, force_lossy)?;
         drop(store);
         self.publish_file(
             base,
@@ -254,6 +256,7 @@ impl AuthoringService {
         &self,
         store: &StoreReader,
         operations: &[AuthoringOp],
+        force_lossy: bool,
     ) -> Result<PlannedBundleMutation, RpcFailure> {
         let mut seen = BTreeSet::new();
         let mut bundle_ids = BTreeSet::new();
@@ -385,7 +388,7 @@ impl AuthoringService {
             let AuthoringOp::Set(entry) = operation else {
                 continue;
             };
-            self.apply_set(store, &mut bundle, entry)?;
+            self.apply_set(store, &mut bundle, entry, force_lossy)?;
         }
         infer_primary(&mut bundle)?;
         let used_schemas = distill_bundle::referenced_schema_hashes(&bundle);
@@ -407,6 +410,7 @@ impl AuthoringService {
         store: &StoreReader,
         bundle: &mut Bundle,
         entry: &AuthoringEntry,
+        force_lossy: bool,
     ) -> Result<(), RpcFailure> {
         if entry.local_id.starts_with('$') || is_bootstrap_control_type(entry.type_uuid) {
             return Err(invalid(
@@ -442,6 +446,11 @@ impl AuthoringService {
             .map_err(invalid)?;
         let data = decode_authoring_payload(entry.schema_hash, &entry.logical_schema, &entry.value)
             .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
+        if !force_lossy {
+            if let Some(existing) = bundle.assets.get(&entry.local_id) {
+                self.check_lossless(bundle, existing, &schema, entry.schema_hash)?;
+            }
+        }
         bundle.schemas.insert(entry.schema_hash, schema);
         bundle.assets.insert(
             entry.local_id.clone(),
@@ -456,7 +465,71 @@ impl AuthoringService {
         Ok(())
     }
 
+    /// A write replacing an entry stored under another schema must not drop
+    /// its data: every field the automatic plan from the stored schema to
+    /// the written one drops must hold its default. A schema change the
+    /// planner refuses needs a registered migration function.
+    fn check_lossless(
+        &self,
+        bundle: &Bundle,
+        existing: &AssetEntry,
+        written: &distill_schema::ngp_schema::LogicalSchema,
+        written_hash: LogicalHash,
+    ) -> Result<(), RpcFailure> {
+        if existing.schema_hash == written_hash {
+            return Ok(());
+        }
+        let stored = bundle
+            .schemas
+            .get(&existing.schema_hash)
+            .ok_or_else(|| invalid("the stored entry's schema snapshot is missing"))?;
+        let lossy = |fields: Vec<String>, detail: String| RpcFailure::LossyWrite {
+            type_uuid: existing.type_uuid,
+            asset: existing.uuid,
+            fields,
+            detail,
+        };
+        match plan_automatic(&stored.root, &written.root) {
+            Ok(ops) => {
+                let fields = lossy_drops(&ops, &stored.root, &existing.data);
+                if fields.is_empty() {
+                    Ok(())
+                } else {
+                    Err(lossy(
+                        fields,
+                        "the written schema drops fields that hold data".to_owned(),
+                    ))
+                }
+            }
+            Err(refusal) => {
+                let key = MigrationKey {
+                    type_uuid: existing.type_uuid,
+                    from: existing.schema_hash,
+                    to: written_hash,
+                };
+                if self.migration_function_registered(&key) {
+                    return Ok(());
+                }
+                Err(lossy(
+                    refusal.reasons.iter().map(|(path, _)| path.clone()).collect(),
+                    format!("no registered migration function and {refusal}"),
+                ))
+            }
+        }
+    }
+
+    fn migration_function_registered(&self, key: &MigrationKey) -> bool {
+        let Some(coordinator) = self.tag_index_coordinator() else {
+            return false;
+        };
+        let snapshot = coordinator.pipeline_snapshot();
+        snapshot
+            .epoch()
+            .is_ok_and(|epoch| epoch.migration_function_keys().contains(&key.id()))
+    }
+
     fn write_store(&self) -> Result<WriteGuard<'_>, RpcFailure> {
+
         Ok(self.store.write())
     }
 }
@@ -466,8 +539,9 @@ impl AuthoringBackend for AuthoringService {
         &self,
         base: InputVersion,
         operations: &[AuthoringOp],
+        force_lossy: bool,
     ) -> Result<Option<Commit>, RpcFailure> {
-        self.prepare_direct_write(base, operations).map(Some)
+        self.prepare_direct_write(base, operations, force_lossy).map(Some)
     }
 
     fn prepare_import(

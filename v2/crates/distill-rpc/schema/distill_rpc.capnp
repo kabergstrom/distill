@@ -772,7 +772,9 @@ interface Hub {
   snapshot @0 () -> (result :SnapshotCall);
   subscribe @1 (since :UInt64, assets :List(Data), paths :List(Text))
             -> (result :SubscribeCall);
-  write @2 (base :UInt64, ops :List(AuthoringOp)) -> (result :UInt64Call);
+  # forceLossy writes even when data held under the on-disk schema would
+  # be dropped.
+  write @2 (base :UInt64, ops :List(AuthoringOp), forceLossy :Bool) -> (result :UInt64Call);
   import @3 (base :UInt64, request :ImportRequest) -> (result :UuidCall);
   reimport @4 (base :UInt64, bundle :Uuid) -> (result :UuidCall);
   operation @5 (base :UInt64, operation :LongRunningOp) -> (result :ProgressCall);

@@ -533,7 +533,11 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            let result = match self.hub.write_call(InputVersion(params.get_base()), ops) {
+            let result = match self.hub.write_call(
+                InputVersion(params.get_base()),
+                ops,
+                params.get_force_lossy(),
+            ) {
                 Ok(call) => crate::write_call_outcome(run_off_thread(call).await?),
                 Err(result) => result,
             };
