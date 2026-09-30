@@ -9,35 +9,7 @@ use distill_migrate::FieldPath;
 
 use crate::query::RootedPath;
 use crate::trace::EntryRole;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u16)]
-pub enum LocalFailureClass {
-    Validator = 1,
-    MigrationPlan = 2,
-    Processor = 3,
-    MigrationFunction = 4,
-    OutputBinding = 5,
-    Importer = 6,
-    ImportIntake = 7,
-    ArtifactEncoding = 8,
-}
-
-impl LocalFailureClass {
-    pub fn from_u16(value: u16) -> Option<Self> {
-        Some(match value {
-            1 => Self::Validator,
-            2 => Self::MigrationPlan,
-            3 => Self::Processor,
-            4 => Self::MigrationFunction,
-            5 => Self::OutputBinding,
-            6 => Self::Importer,
-            7 => Self::ImportIntake,
-            8 => Self::ArtifactEncoding,
-            _ => return None,
-        })
-    }
-}
+pub use distill_pipeline_api::failure::LocalFailureClass;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DslfError {

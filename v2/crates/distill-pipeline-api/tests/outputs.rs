@@ -1,4 +1,4 @@
-use distill_build::outputs::{OutputDecls, OutputError};
+use distill_pipeline_api::outputs::{OutputDecls, OutputError};
 use distill_core::id::TypeUuid;
 
 #[test]

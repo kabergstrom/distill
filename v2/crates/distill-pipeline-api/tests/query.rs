@@ -1,4 +1,4 @@
-use distill_build::query::*;
+use distill_pipeline_api::query::*;
 use distill_core::id::{AssetUuid, BundleUuid};
 
 #[test]

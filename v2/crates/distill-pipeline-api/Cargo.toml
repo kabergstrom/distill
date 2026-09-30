@@ -1,0 +1,14 @@
+[package]
+name = "distill-pipeline-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+globset.workspace = true
+unicode-normalization.workspace = true
+distill-core = { path = "../distill-core" }
+distill-json = { path = "../distill-json" }
+distill-migrate = { path = "../distill-migrate" }
+ngp-schema = { path = "../../../../newgameplus/ngp-schema" }

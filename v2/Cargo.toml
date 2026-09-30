@@ -13,6 +13,7 @@ members = [
     "crates/distill-loader",
     "crates/distill-migrate",
     "crates/distill-pack",
+    "crates/distill-pipeline-api",
     "crates/distill-rpc",
     "crates/distill-schema",
     "crates/distill-store",

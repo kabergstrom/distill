@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use distill_core::id::{AssetUuid, BundleUuid, TypeUuid};
 use distill_json::AuthoredValue;
 
+pub use distill_pipeline_api::import::{ImportEntry, ImportError, ImportOutput, ImportOutputError};
+
 use crate::dslf::DslfV1;
 use crate::query::{
     file_query_result_hash, normalize_identifier, normalize_path, FileQuery, IntakeError, RootName,
@@ -57,11 +59,6 @@ pub trait ImportBackend {
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass>;
     fn enumerate(&mut self, query: &FileQuery) -> Result<Vec<RootedPath>, RawFileFailureClass>;
     fn capability(&mut self, key: &CapabilityKey) -> Option<[u8; 32]>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportError {
-    pub fingerprint: StableFailureFingerprint,
 }
 
 pub struct ImportContext<'a, B: ImportBackend + ?Sized> {
@@ -236,73 +233,6 @@ fn raw_failure(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ImportEntry {
-    pub type_uuid: TypeUuid,
-    pub value: AuthoredValue,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ImportOutput {
-    entries: BTreeMap<String, ImportEntry>,
-    primary: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImportOutputError {
-    InvalidIdentifier(IntakeError),
-    ReservedLocalId,
-    DuplicateLocalId,
-    PrimaryAlreadyDeclared,
-}
-
-impl ImportOutput {
-    pub fn new() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            primary: None,
-        }
-    }
-
-    pub fn entries(&self) -> &BTreeMap<String, ImportEntry> {
-        &self.entries
-    }
-
-    pub fn entry(
-        &mut self,
-        local_id: &str,
-        type_uuid: TypeUuid,
-        value: AuthoredValue,
-    ) -> Result<(), ImportOutputError> {
-        let local_id =
-            normalize_identifier(local_id).map_err(ImportOutputError::InvalidIdentifier)?;
-        if local_id.starts_with('$') {
-            return Err(ImportOutputError::ReservedLocalId);
-        }
-        if self.entries.contains_key(&local_id) {
-            return Err(ImportOutputError::DuplicateLocalId);
-        }
-        self.entries
-            .insert(local_id, ImportEntry { type_uuid, value });
-        Ok(())
-    }
-
-    pub fn primary(&mut self, local_id: &str) -> Result<(), ImportOutputError> {
-        if self.primary.is_some() {
-            return Err(ImportOutputError::PrimaryAlreadyDeclared);
-        }
-        self.primary =
-            Some(normalize_identifier(local_id).map_err(ImportOutputError::InvalidIdentifier)?);
-        Ok(())
-    }
-}
-
-impl Default for ImportOutput {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct ImportedEntry {
     pub uuid: AssetUuid,
     pub type_uuid: TypeUuid,
@@ -364,8 +294,9 @@ pub fn fold_import(
     ids: &mut impl IdentitySource,
 ) -> Result<ImportedBundle, FoldError> {
     let importer = normalize_identifier(&request.importer).map_err(FoldError::InvalidImporter)?;
+    let (output_entries, output_primary) = request.output.into_parts();
     let mut entries = BTreeMap::new();
-    for (local_id, entry) in request.output.entries {
+    for (local_id, entry) in output_entries {
         let uuid = prior
             .and_then(|p| p.entries.get(&local_id))
             .map_or_else(|| ids.next_asset(), |entry| entry.uuid);
@@ -379,7 +310,7 @@ pub fn fold_import(
         );
     }
 
-    let primary = if let Some(declared) = request.output.primary {
+    let primary = if let Some(declared) = output_primary {
         if !entries.contains_key(&declared) {
             return Err(FoldError::DeclaredPrimaryMissing { local_id: declared });
         }

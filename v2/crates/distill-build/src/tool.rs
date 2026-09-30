@@ -10,7 +10,9 @@ use distill_store::pipeline::RegisteredTool;
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreError};
 
-use crate::query::{normalize_identifier, IntakeError};
+pub use distill_pipeline_api::tool::{ToolOutput, ToolRunError};
+
+use crate::query::normalize_identifier;
 use crate::trace::{
     CapabilityKey, Observed, StableFailureFingerprint, ToolLaunchDiagnostic,
     ToolLaunchFailureClass, TraceOp,
@@ -50,30 +52,6 @@ impl ToolEpochSnapshot for StoreToolEpochSnapshot<'_> {
 pub struct ToolRuntimeBinding<'a> {
     /// Daemon-owned directory in which private execution trees are created.
     pub execution_root: &'a Path,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolOutput {
-    pub status: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolRunError {
-    /// Stable ToolEpoch miss. The matching failing trace operation is retained.
-    Stable(StableFailureFingerprint),
-    /// Post-lookup launch failure. The entire attempted trace is discarded.
-    Transient(ToolLaunchDiagnostic),
-    /// Invalid caller input never becomes canonical trace data.
-    InvalidId(IntakeError),
-    /// Store/runtime infrastructure failed before a closed launch outcome
-    /// could be established. The attempted trace is discarded.
-    Infrastructure {
-        id: String,
-        detail: String,
-    },
-    AttemptStopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
