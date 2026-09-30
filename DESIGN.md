@@ -651,7 +651,7 @@ watched schema before calling `register`.
 | `#[asset(skip)]` | field | Excluded from schema, sources, artifacts; `Default` on load |
 | `#[asset(blob)]` | field | Stored in the bundle's binary blob chunk; runtime type is `Blob`, an `Arc`-backed byte range — pack loads borrow the mmap, never copy |
 | `#[asset(tag)]` | field | String-typed field indexed for queries (§10); re-indexed whenever the bundle is dirtied |
-| `#[asset(rev = N)]` | struct, enum variant, or field | Semantic revision: bumped when meaning changes without shape (metres → centimetres). Participates in the logical hash, so the bump is migratable like any structural change — and only by custom edge: the automatic planner hard-stops on a rev mismatch (§11). A variant's rev is carried by the variant's own attribute record (`VariantAttrs`, §5) — exactly one declared carrier |
+| `#[asset(rev = N)]` | struct, enum variant, or field | Semantic revision: bumped when meaning changes without shape (metres → centimetres). Participates in the logical hash, so the bump is migratable like any structural change — and only by custom edge: the automatic planner hard-stops on a rev mismatch (§11). A variant's rev is carried by its own `EnumVariant` TypeDef's `attrs.rev` (§5) — exactly one declared carrier |
 
 The type UUID is stable across renames and refactors, and distinct from schema
 hashes.
@@ -1278,7 +1278,10 @@ distill contains no schema-model code. The refactor, normative here:
 // conventions and become types.
 pub struct Schema {
     pub source_hashes: BTreeMap<String, String>,
-    pub types: Vec<TypeDef>,          // logical only — what hashes and bundles see
+    pub type_ops_hash: String,        // paired generated module TypeOps table
+    pub layout_hashes: BTreeMap<String, String>, // NGP module reload metadata
+    pub rustc_version: String,        // producer metadata, not logical identity
+    pub types: Vec<TypeDef>,          // logical facts + native matching metadata
     pub layouts: Vec<SchemaLayouts>,  // ≥ 1, one per compilation identity
 }
 pub struct TypeDef {                  // logical: target-free
@@ -1290,28 +1293,16 @@ pub struct TypeDef {                  // logical: target-free
     pub fields: Vec<Field>,
     pub generic_parameters: Vec<String>,
     pub generic_argument_ids: Vec<SchemaTypeId>,
+    pub generic_const_arguments: Vec<String>, // native instantiation matching only
     pub has_default: bool,
+    pub has_explicit_discriminants: bool, // enum validation, not a hash gate
 }
 pub struct Field {                    // logical only: today's offset,
     pub id: FieldIdentifier,          // field_size, and FieldShape leave —
     pub type_id: SchemaTypeId,        // layout moves to FieldLayout, shape
     pub attrs: FieldAttrs,            // to identity classification (below)
-    /// Present exactly when this record is an enum VARIANT (an enum
-    /// TypeDef's `fields` are its variant records, each naming its
-    /// payload type): the variant attribute channel. `#[asset(rev)]`
-    /// on a variant is extracted here and nowhere else — a variant
-    /// revision has exactly one declared carrier, so no extractor can
-    /// emit zero, inherit a neighboring field's rev, or accept an
-    /// undeclared spelling. `Some` on a non-variant record, or `None`
-    /// on a variant, is an extraction error.
-    pub variant_attrs: Option<VariantAttrs>,
 }
-pub struct VariantAttrs {
-    pub rev: u32,                     // #[asset(rev = N)] on the variant, 0
-                                      // absent — the grammar's variant rev
-                                      // (the 0x03 node's per-variant rev)
-}
-pub struct TypeAttrs  {               // #[asset(rev = N)], 0 absent
+pub struct TypeAttrs  {               // #[asset(rev = N)], 0 absent; type or variant
     pub rev: u32,
     pub build_only: bool,             // #[asset(build_only)] — load-closure
                                       // policy (§4), never hashed: policy
@@ -1345,16 +1336,27 @@ pub struct FieldLayout { pub offset: Option<u64>, pub field_size: Option<u64> }
 ```
 
 `Schema::merge` dedups **logical** records and attaches layout tables per
-`LayoutIdentity`. Today's merge keeps one fused `TypeDef` on a
-nominal-key hit, silently discarding the other side's layout numbers if
-the walks ran under different compilers — under the split that collision
-is an explicit error, not a silent winner. Existing layout consumers (the
+`LayoutIdentity`. Distinct compilation identities retain distinct tables;
+logical disagreement under one native matching key, or conflicting
+measurements under the same layout identity, is an explicit error rather
+than a silent winner. Existing layout consumers (the
 engine GC, `ngp-reflect`, `migrate.rs`) select the table matching the
 running binary and zip by `SchemaTypeId` — no behavior change, since one
 host table is all that exists until per-target emission lands (§22).
 Container and framework types are classified by **type identity, not by
-`FieldShape`** (Serializability, below); `FieldShape` shrinks engine-side
-rather than growing distill-side.
+`FieldShape`** (Serializability, below); the shared classifier replaces
+the old shape-driven traversal rather than introducing Distill's own model.
+
+Source-walk normalizes repeated analyzer observations before publication.
+Identified records coalesce only when their logical facts and measured
+layouts agree, with references remapped on both sides. Native matching
+distinguishes `usize`/`isize` from fixed-width integers and includes concrete
+const arguments; lifetimes do not distinguish native types. Unresolved
+const arguments and opaque observations do not acquire global matching
+keys. Corresponding opaque fields of an identified parent may agree by
+their modeled facts and same-identity measurements without globally
+interning those opaque records. These are schema merge rules, not new
+module-acceptance fingerprints or a dependency-closure gate.
 
 **Asset shapes are target-invariant, by rule.** Every layout table is
 positionally parallel to the one `types` vector, which is only coherent
@@ -1379,6 +1381,14 @@ layout varies by target. cfg-dependent data belongs behind processors
 
 From these records, two distinct schemas per type are
 derived:
+
+An enum's fields reference `EnumVariant` TypeDefs. A variant's
+`#[asset(rev = N)]` has exactly one carrier: that variant TypeDef's
+`attrs.rev`, not the enclosing enum field's `FieldAttrs.rev`. Both the
+source-walk emitter and logical projection use this existing attribute
+channel; no separate variant-attribute record is needed. Native matching
+metadata and the operational Schema metadata above do not enter DSLH or
+DSWL grammar bytes.
 
 ### Logical schema — identity
 
@@ -8580,8 +8590,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   `#[asset(rev)]` only on structs and fields and the model declared no
   variant channel — extractors could emit zero, inherit a neighboring
   rev, or accept an undeclared attribute. `#[asset(rev)]` is now legal
-  on enum variants, the source model gains `VariantAttrs`, and
-  extraction reads a variant's rev from it alone.
+  on enum variants, and extraction reads only the referenced
+  `EnumVariant` TypeDef's `attrs.rev`. The existing type-attribute channel
+  is reused instead of introducing a separate `VariantAttrs` record.
 - **Codegen identifiers map injectively** (§10, §14, §20): raw
   interpolation of authored identifiers into `<pipeline>.rs` permitted
   traversal and invalid or colliding module names, while bare path
