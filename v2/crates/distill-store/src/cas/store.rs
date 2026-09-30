@@ -512,33 +512,11 @@ impl Store {
             unverified_assertions: unverified,
         })
     }
-
-    /// Record that a memo hit was served, for the LRU eviction policy.
-    /// Lookups are pure reads; whoever selected the hit reports it here.
-    pub fn touch_candidate(
-        &mut self,
-        key_kind: KeyKind,
-        static_key: &[u8; 32],
-        trace_digest: &[u8; 32],
-    ) -> Result<(), StoreError> {
-        self.read.conn.execute(
-            "UPDATE result_candidates SET last_used = ?4
-             WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-            rusqlite::params![
-                key_kind as i64,
-                static_key.as_slice(),
-                trace_digest.as_slice(),
-                now_millis(),
-            ],
-        )?;
-        Ok(())
-    }
 }
 
 impl StoreReader {
     /// The candidate bucket for a static-input key, most recently
-    /// committed first (§13). A pure read: the caller reports the hit it
-    /// serves through [`Store::touch_candidate`].
+    /// committed first (§13). A pure read.
     pub fn lookup_candidates(
         &self,
         key_kind: KeyKind,
@@ -730,11 +708,11 @@ pub(crate) fn upsert_candidate(
 ) -> Result<(), StoreError> {
     txn.execute(
         "INSERT INTO result_candidates(key_kind, static_key, trace_digest, memo_seq,
-                                       segment, offset, len, last_used)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                       segment, offset, len)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(key_kind, static_key, trace_digest) DO UPDATE SET
            memo_seq = excluded.memo_seq, segment = excluded.segment,
-           offset = excluded.offset, len = excluded.len, last_used = excluded.last_used",
+           offset = excluded.offset, len = excluded.len",
         rusqlite::params![
             key_kind as i64,
             static_key.as_slice(),
@@ -743,7 +721,6 @@ pub(crate) fn upsert_candidate(
             segment as i64,
             offset as i64,
             len as i64,
-            now_millis(),
         ],
     )?;
     Ok(())
@@ -764,13 +741,6 @@ pub(crate) fn derived_row_matches(
         )
         .optional()?;
     Ok(matches!(row, Some((p, k)) if p == parent.0.as_slice() && k == output_key))
-}
-
-pub(crate) fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 // ---- derived-output namespace (input-versioned, §9/§13) ----

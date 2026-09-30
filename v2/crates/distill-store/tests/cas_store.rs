@@ -597,7 +597,7 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     .unwrap();
 
     drop(store);
-    let (mut reopened, recovery) = Store::open_with_recovery(config).unwrap();
+    let (reopened, recovery) = Store::open_with_recovery(config).unwrap();
     assert!(recovery.rebuilt_index);
     assert_eq!(
         reopened
@@ -623,7 +623,7 @@ fn commits_survive_reopen() {
     let hash = receipt.outputs[0].1;
     drop(store);
 
-    let mut store = Store::open(config).unwrap();
+    let store = Store::open(config).unwrap();
     assert_eq!(store.cas_read(&hash.0).unwrap(), b"primary artifact bytes");
     let candidates = store
         .lookup_candidates(KeyKind::Processor, &[1u8; 32])

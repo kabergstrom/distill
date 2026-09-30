@@ -90,7 +90,7 @@ fn a_torn_tail_is_truncated_and_the_data_before_it_survives() {
     // The SQLite index still references the (now missing) tail: reopening
     // must reconcile rather than serve dangling extents. The recorded
     // indexed_len exceeds the file: the segment rescans from scratch.
-    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     let report = recovery.clone();
     assert!(
         !report.truncated_tails.is_empty(),
@@ -213,7 +213,7 @@ fn an_unindexed_committed_group_is_adopted_on_reopen() {
     f.sync_all().unwrap();
     drop(f);
 
-    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     let report = &recovery;
     assert_eq!(report.adopted_results, 1, "{report:?}");
     assert_eq!(report.orphaned_payloads, 0);
@@ -298,7 +298,7 @@ fn recovery_checkpoints_cross_segment_groups_atomically() {
         .unwrap();
     drop(connection);
 
-    let mut store = Store::open(config).unwrap();
+    let store = Store::open(config).unwrap();
     assert_eq!(store.cas_read(&hash).unwrap(), bytes);
     assert_eq!(
         store
@@ -329,7 +329,7 @@ fn generation_mismatch_discards_and_rebuilds_the_index() {
     lines[0] = &bumped;
     std::fs::write(cas_dir.join("CURRENT"), lines.join("\n") + "\n").unwrap();
 
-    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     let report = &recovery;
     assert!(report.rebuilt_index, "{report:?}");
     assert_eq!(report.adopted_results, 2, "both groups rescanned");

@@ -371,7 +371,6 @@ fn candidate_buckets_are_keyed_by_key_kind_static_key_and_trace_digest() {
         "segment",
         "offset",
         "len",
-        "last_used",
     ] {
         assert!(
             cols.iter().any(|c| c == required),

@@ -248,34 +248,26 @@ fn a_wire_tree_is_part_of_every_result_that_names_it() {
 // ---- cache-limit sweep ----
 
 #[test]
-fn the_cache_limit_sweep_evicts_lru_first_and_skips_pinned() {
+fn the_cache_limit_sweep_evicts_to_the_cap_and_skips_pinned() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = cfg(&dir);
     config.cache_limit = 3000; // three ~1.2kB results exceed this
     let mut store = Store::open(config).unwrap();
-    // ~1.2kB per result. Commit three; touch #1 so #2 becomes LRU; pin #3.
+    // ~1.2kB per result. Commit three and pin #3.
     let (out1, _, _) = commit_with_aux(&mut store, 1, &[1u8; 1200], b"a");
     let (out2, _, _) = commit_with_aux(&mut store, 2, &[2u8; 1200], b"b");
     let (out3, _, _) = commit_with_aux(&mut store, 3, &[3u8; 1200], b"c");
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    let hit = store
-        .lookup_candidates(KeyKind::Processor, &[1u8; 32])
-        .unwrap()
-        .remove(0);
-    store
-        .touch_candidate(KeyKind::Processor, &[1u8; 32], &hit.trace_digest)
-        .unwrap(); // touch #1
     store.pin(PinKind::Manifest, "current", &[out3]).unwrap();
 
     let report = store.enforce_cache_limit().unwrap();
-    assert!(report.evicted >= 1);
+    assert_eq!(report.evicted, 1, "one eviction reaches the cap");
     assert!(report.live_bytes <= 3000, "{report:?}");
-    // #2 (LRU, unpinned) went first; #1 was touched, #3 is pinned.
-    assert!(matches!(
-        store.cas_read(&out2),
-        Err(StoreError::NotFound { .. })
-    ));
-    assert_eq!(store.cas_read(&out1).unwrap(), vec![1u8; 1200]);
+    // The victim is random among the unpinned results; the pinned one stays.
+    let gone = [out1, out2]
+        .iter()
+        .filter(|hash| matches!(store.cas_read(hash), Err(StoreError::NotFound { .. })))
+        .count();
+    assert_eq!(gone, 1);
     assert_eq!(store.cas_read(&out3).unwrap(), vec![3u8; 1200]);
 }
 
@@ -370,7 +362,7 @@ fn compacted_duplicate_payload_precedes_every_surviving_result() {
     lines[0] = format!("generation {}", generation + 1);
     std::fs::write(&current_path, lines.join("\n") + "\n").unwrap();
 
-    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     assert!(recovery.rebuilt_index);
     assert_eq!(store.cas_read(&hash).unwrap(), b"shared artifact");
     let candidates = store

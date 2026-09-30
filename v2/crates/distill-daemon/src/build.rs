@@ -2016,21 +2016,15 @@ fn hydrate_processor_stage(
     let hit = if context.verify_fresh {
         None
     } else {
-        let mut store = lock_build_store(context)?;
-        let hit = lookup_persisted_candidate(
+        let store = lock_build_store(context)?;
+        lookup_persisted_candidate(
             &store,
             KeyKind::Processor,
             &key,
             loaded.entry.uuid,
             &trace_source,
         )
-        .map_err(BuildError::infrastructure)?;
-        if let Some(hit) = &hit {
-            store
-                .touch_candidate(KeyKind::Processor, &key, &hit.trace_digest)
-                .map_err(BuildError::infrastructure)?;
-        }
-        hit
+        .map_err(BuildError::infrastructure)?
     };
     let Some(hit) = hit else {
         return Ok(None);
@@ -3476,21 +3470,15 @@ fn encode_or_hydrate(
     let hit = if context.verify_fresh {
         None
     } else {
-        let mut store = lock_build_store(context)?;
-        let hit = lookup_persisted_candidate(
+        let store = lock_build_store(context)?;
+        lookup_persisted_candidate(
             &store,
             KeyKind::BuildImport,
             &key,
             loaded.entry.uuid,
             &trace_source,
         )
-        .map_err(BuildError::infrastructure)?;
-        if let Some(hit) = &hit {
-            store
-                .touch_candidate(KeyKind::BuildImport, &key, &hit.trace_digest)
-                .map_err(BuildError::infrastructure)?;
-        }
-        hit
+        .map_err(BuildError::infrastructure)?
     };
     if let Some(hit) = hit {
         return match hit.outcome {

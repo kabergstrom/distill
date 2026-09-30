@@ -203,9 +203,11 @@ impl Store {
         Ok(true)
     }
 
-    /// The LRU sweep (§18's `cas.cache_limit`, operational-live): evict
-    /// least-recently-used unpinned results until the indexed extent
-    /// bytes fit the cap. Pinned units are skipped — the observability
+    /// The cache-limit sweep (§18's `cas.cache_limit`, operational-live):
+    /// evict unpinned results in random order until the indexed extent
+    /// bytes fit the cap. Random rather than LRU: with a working set larger
+    /// than the cap, LRU evicts each result just before its next use and
+    /// the hit rate falls to zero; random eviction degrades gracefully. Pinned units are skipped — the observability
     /// rules are unaffected by the cap.
     pub fn enforce_cache_limit(&mut self) -> Result<EvictionSweep, StoreError> {
         self.prune_unreferenced_extents()?;
@@ -224,15 +226,15 @@ impl Store {
                 live_bytes,
             });
         }
-        let lru: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+        let victims: Vec<(i64, Vec<u8>, Vec<u8>)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT key_kind, static_key, trace_digest FROM result_candidates
-                 ORDER BY last_used ASC, memo_seq ASC",
+                 ORDER BY random()",
             )?;
             let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             mapped.collect::<Result<_, _>>()?
         };
-        for (kind, static_key, trace_digest) in lru {
+        for (kind, static_key, trace_digest) in victims {
             if live_bytes <= self.config.cache_limit {
                 break;
             }

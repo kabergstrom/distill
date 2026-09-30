@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 27;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -124,7 +124,6 @@ CREATE TABLE result_candidates (
     segment      INTEGER NOT NULL,
     offset       INTEGER NOT NULL,
     len          INTEGER NOT NULL,
-    last_used    INTEGER NOT NULL,
     PRIMARY KEY (key_kind, static_key, trace_digest)
 );
 CREATE TABLE derived_outputs (
