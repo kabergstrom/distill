@@ -203,3 +203,65 @@ impl Drop for LentGuard {
         CURRENT.set(self.previous);
     }
 }
+
+/// State only its authority touches: a `RefCell` whose owner is the
+/// authority thread (or a thread it lent itself to while it waits).
+pub(crate) struct AuthorityCell<T> {
+    value: std::cell::UnsafeCell<T>,
+    authority: u64,
+    borrowed: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: the value is reached only through `borrow_mut`, on the authority,
+// which is never running while a thread it lent itself to is; the borrow
+// flag catches any overlap.
+unsafe impl<T: Send> Sync for AuthorityCell<T> {}
+
+impl<T> AuthorityCell<T> {
+    pub(crate) fn new(value: T, authority: &AuthoritySender) -> Self {
+        Self {
+            value: std::cell::UnsafeCell::new(value),
+            authority: authority.id,
+            borrowed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The value. Panics off the authority or while already borrowed.
+    pub(crate) fn borrow_mut(&self) -> AuthorityRef<'_, T> {
+        assert!(
+            CURRENT.get() == self.authority,
+            "authority state is touched only on its authority"
+        );
+        assert!(
+            !self.borrowed.swap(true, Ordering::Acquire),
+            "authority state is already borrowed"
+        );
+        AuthorityRef { cell: self }
+    }
+}
+
+pub(crate) struct AuthorityRef<'a, T> {
+    cell: &'a AuthorityCell<T>,
+}
+
+impl<T> std::ops::Deref for AuthorityRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the guard holds the only borrow, on the authority.
+        unsafe { &*self.cell.value.get() }
+    }
+}
+
+impl<T> std::ops::DerefMut for AuthorityRef<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as above; `&mut self` makes this the only reference.
+        unsafe { &mut *self.cell.value.get() }
+    }
+}
+
+impl<T> Drop for AuthorityRef<'_, T> {
+    fn drop(&mut self) {
+        self.cell.borrowed.store(false, Ordering::Release);
+    }
+}

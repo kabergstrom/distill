@@ -11,7 +11,9 @@ use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
 use distill_core::id::{BundleFileHash, ContentHash};
@@ -195,8 +197,8 @@ struct CanonicalRoot {
 
 #[derive(Debug, Clone)]
 pub struct RootedScanner {
-    roots: Arc<RwLock<BTreeMap<String, CanonicalRoot>>>,
-    daemon_owned: Arc<RwLock<BTreeMap<PathBuf, DaemonOwnedDirectory>>>,
+    roots: Arc<ArcSwap<BTreeMap<String, CanonicalRoot>>>,
+    daemon_owned: Arc<ArcSwap<BTreeMap<PathBuf, DaemonOwnedDirectory>>>,
 }
 
 /// A directory whose contents are produced or retained by the daemon and can
@@ -935,9 +937,9 @@ struct FileIdentity {
 impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
         let roots = roots.into_iter().collect::<Vec<_>>();
-        let daemon_owned = Arc::new(RwLock::new(BTreeMap::new()));
+        let daemon_owned = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
         let scanner = Self {
-            roots: Arc::new(RwLock::new(canonicalize_roots(roots.clone())?)),
+            roots: Arc::new(ArcSwap::from_pointee(canonicalize_roots(roots.clone())?)),
             daemon_owned,
         };
         for root in roots {
@@ -956,7 +958,7 @@ impl RootedScanner {
         roots: impl IntoIterator<Item = AssetRoot>,
     ) -> Result<Self, ScanError> {
         Ok(Self {
-            roots: Arc::new(RwLock::new(canonicalize_roots(roots)?)),
+            roots: Arc::new(ArcSwap::from_pointee(canonicalize_roots(roots)?)),
             daemon_owned: Arc::clone(&self.daemon_owned),
         })
     }
@@ -984,21 +986,21 @@ impl RootedScanner {
             kind,
             path: path.clone(),
         };
-        let mut directories = self
-            .daemon_owned
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match directories.entry(path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(retained);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let current = entry.get();
-                if (retained.kind, &retained.path) < (current.kind, &current.path) {
-                    entry.insert(retained);
+        self.daemon_owned.rcu(|current| {
+            let mut directories = BTreeMap::clone(current);
+            match directories.entry(path.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(retained.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let current = entry.get();
+                    if (retained.kind, &retained.path) < (current.kind, &current.path) {
+                        entry.insert(retained.clone());
+                    }
                 }
             }
-        }
+            directories
+        });
         Ok(())
     }
 
@@ -1025,12 +1027,7 @@ impl RootedScanner {
     }
 
     pub(crate) fn replace_from(&self, replacement: &Self) {
-        let replacement = replacement.root_snapshot();
-        let mut roots = self
-            .roots
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *roots = replacement;
+        self.roots.store(replacement.root_snapshot());
     }
 
     pub(crate) fn has_same_roots(&self, other: &Self) -> bool {
@@ -1093,18 +1090,12 @@ impl RootedScanner {
         Ok(physical)
     }
 
-    fn root_snapshot(&self) -> BTreeMap<String, CanonicalRoot> {
-        self.roots
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn root_snapshot(&self) -> Arc<BTreeMap<String, CanonicalRoot>> {
+        self.roots.load_full()
     }
 
-    fn daemon_owned_snapshot(&self) -> BTreeMap<PathBuf, DaemonOwnedDirectory> {
-        self.daemon_owned
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn daemon_owned_snapshot(&self) -> Arc<BTreeMap<PathBuf, DaemonOwnedDirectory>> {
+        self.daemon_owned.load_full()
     }
 
     /// Locate an observed physical error beneath its configured root and
@@ -1412,7 +1403,7 @@ impl RootedScanner {
         unreachable!("nonempty component walk returns at its final component")
     }
 
-    fn validated_root_snapshot(&self) -> Result<BTreeMap<String, CanonicalRoot>, ScanError> {
+    fn validated_root_snapshot(&self) -> Result<Arc<BTreeMap<String, CanonicalRoot>>, ScanError> {
         let roots = self.root_snapshot();
         let mut errors = Vec::new();
         for root in roots.values() {

@@ -1,6 +1,10 @@
 //! Coordinator-side admission and cooperative descendant execution.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+
+use rayon::ThreadPool;
 
 pub const DEFAULT_DEPENDENCY_DEPTH: usize = 32;
 pub const MAX_DEPENDENCY_DEPTH: usize = 64;
@@ -190,6 +194,130 @@ impl Scheduler {
                 .pop_front()
                 .map(|id| (id, WorkClass::Interactive)),
             WorkClass::Batch => self.batch.pop_front().map(|id| (id, WorkClass::Batch)),
+        }
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+enum Message {
+    Submit { id: u64, class: WorkClass, job: Job },
+    Complete(u64),
+    Reconfigure {
+        config: SchedulerConfig,
+        pool: Option<Arc<ThreadPool>>,
+        reply: mpsc::SyncSender<Result<(), SchedulerConfigError>>,
+    },
+    Config(mpsc::SyncSender<SchedulerConfig>),
+}
+
+/// A [`Scheduler`] on a thread of its own, admitting jobs onto a worker
+/// pool. Jobs and completions arrive as messages; the thread stops once
+/// every handle and every running job is gone.
+pub(crate) struct ScheduledPool {
+    inbox: mpsc::Sender<Message>,
+    next_id: AtomicU64,
+}
+
+impl ScheduledPool {
+    pub(crate) fn start(scheduler: Scheduler, pool: Arc<ThreadPool>) -> std::io::Result<Self> {
+        let (inbox, messages) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("distill-scheduler".to_owned())
+            .spawn(move || admit_jobs(scheduler, pool, messages))?;
+        Ok(Self {
+            inbox,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Queue `job` in `class`; it runs on the pool once admitted.
+    pub(crate) fn submit(&self, class: WorkClass, job: impl FnOnce() + Send + 'static) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let completion = Completion {
+            id,
+            inbox: self.inbox.clone(),
+        };
+        let job: Job = Box::new(move || {
+            let _completion = completion;
+            job();
+        });
+        self.inbox
+            .send(Message::Submit { id, class, job })
+            .expect("the scheduler thread outlives its handles");
+    }
+
+    pub(crate) fn config(&self) -> SchedulerConfig {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.inbox
+            .send(Message::Config(reply))
+            .expect("the scheduler thread outlives its handles");
+        answer.recv().expect("the scheduler thread answers")
+    }
+
+    /// Apply `config`, and move future jobs to `pool` when given.
+    pub(crate) fn reconfigure(
+        &self,
+        config: SchedulerConfig,
+        pool: Option<Arc<ThreadPool>>,
+    ) -> Result<(), SchedulerConfigError> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.inbox
+            .send(Message::Reconfigure {
+                config,
+                pool,
+                reply,
+            })
+            .expect("the scheduler thread outlives its handles");
+        answer.recv().expect("the scheduler thread answers")
+    }
+}
+
+/// Reports a job complete when dropped, so a panicking job frees its slot too.
+struct Completion {
+    id: u64,
+    inbox: mpsc::Sender<Message>,
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        let _ = self.inbox.send(Message::Complete(self.id));
+    }
+}
+
+fn admit_jobs(mut scheduler: Scheduler, mut pool: Arc<ThreadPool>, messages: mpsc::Receiver<Message>) {
+    let mut queued = BTreeMap::<u64, Job>::new();
+    for message in messages {
+        match message {
+            Message::Submit { id, class, job } => {
+                scheduler
+                    .try_enqueue(id, class)
+                    .expect("scheduler job identities are unique");
+                queued.insert(id, job);
+            }
+            Message::Complete(id) => scheduler
+                .complete(id)
+                .expect("scheduled job remains active until its worker returns"),
+            Message::Reconfigure {
+                config,
+                pool: replacement,
+                reply,
+            } => {
+                let result = scheduler.reconfigure(config);
+                if result.is_ok() {
+                    if let Some(replacement) = replacement {
+                        pool = replacement;
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            Message::Config(reply) => {
+                let _ = reply.send(scheduler.config());
+            }
+        }
+        for id in scheduler.admit() {
+            let job = queued.remove(&id).expect("an admitted job was queued");
+            pool.spawn_fifo(job);
         }
     }
 }

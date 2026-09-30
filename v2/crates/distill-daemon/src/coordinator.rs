@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{mpsc, Arc};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use rayon::ThreadPool;
 
@@ -51,7 +53,7 @@ use distill_store::state::{
 use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError, StoreReader};
 
 use crate::store_cell::AuthorityStore;
-use crate::authority::{Authority, AuthoritySender};
+use crate::authority::{Authority, AuthorityCell, AuthorityRef, AuthoritySender};
 use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
@@ -70,7 +72,7 @@ use crate::scanner::{
     AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanDiagnostic, ScanError,
     ScanSnapshot, ScannedBundle, StoredBaseline,
 };
-use crate::scheduler::{Scheduler, SchedulerConfig, WorkClass};
+use crate::scheduler::{ScheduledPool, Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,24 +103,17 @@ pub struct DaemonCoordinator {
     scanner: RootedScanner,
     scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
-    scan_rejection: Mutex<Option<PendingScanRejection>>,
+    scan_rejection: AuthorityCell<Option<PendingScanRejection>>,
     server: Arc<ServerHandle>,
-    lineage_destination: RwLock<LineageDestination>,
+    lineage_destination: ArcSwap<LineageDestination>,
     authoring: Arc<AuthoringService>,
-    pipeline: Mutex<CoordinatedPipelineRuntime>,
-    schema_authority: RwLock<Option<Arc<ProjectSchemaAuthority>>>,
-    build_targets: RwLock<BTreeMap<String, Target>>,
-    configuration_poison: Mutex<Option<ConfigurationPoison>>,
-    operational: Mutex<OperationalRuntime>,
-    operational_wake: Condvar,
+    pipeline: PipelineState,
+    schema_authority: ArcSwapOption<ProjectSchemaAuthority>,
+    build_targets: ArcSwap<BTreeMap<String, Target>>,
+    configuration_poison: AuthorityCell<Option<ConfigurationPoison>>,
+    operational: ScheduledPool,
     /// Last: stopped (and joined) after everything else is gone.
     authority: Authority,
-}
-
-struct OperationalRuntime {
-    scheduler: Scheduler,
-    worker_pool: Arc<ThreadPool>,
-    next_job_id: u64,
 }
 
 struct CoordinatedPipelineRuntime {
@@ -240,28 +235,27 @@ impl DaemonCoordinator {
             batch_reserved_workers: store_config.batch_reserved_workers,
             max_dependency_depth,
         };
-        let operational = OperationalRuntime {
-            scheduler: Scheduler::new(scheduler_config)
+        let operational = ScheduledPool::start(
+            Scheduler::new(scheduler_config)
                 .map_err(|error| CoordinatorInitError::Operational(error.to_string()))?,
-            worker_pool: build_worker_pool(scheduler_config.parallelism)
+            build_worker_pool(scheduler_config.parallelism)
                 .map_err(CoordinatorInitError::Operational)?,
-            next_job_id: 1,
-        };
+        )
+        .map_err(|error| CoordinatorInitError::Operational(error.to_string()))?;
         Ok(Self {
             store,
             scanner,
             scan_initialized: AtomicBool::new(false),
             scan_healthy: AtomicBool::new(true),
-            scan_rejection: Mutex::new(None),
+            scan_rejection: AuthorityCell::new(None, authority.sender()),
             server,
-            lineage_destination: RwLock::new(lineage_destination),
+            lineage_destination: ArcSwap::from_pointee(lineage_destination),
             authoring: backend,
-            pipeline: Mutex::new(pipeline),
-            schema_authority: RwLock::new(None),
-            build_targets: RwLock::new(BTreeMap::new()),
-            configuration_poison: Mutex::new(None),
-            operational: Mutex::new(operational),
-            operational_wake: Condvar::new(),
+            pipeline: PipelineState::new(pipeline, authority.sender()),
+            schema_authority: ArcSwapOption::empty(),
+            build_targets: ArcSwap::from_pointee(BTreeMap::new()),
+            configuration_poison: AuthorityCell::new(None, authority.sender()),
+            operational,
             authority,
         })
     }
@@ -333,7 +327,7 @@ impl DaemonCoordinator {
     }
 
     pub fn pipeline_snapshot(&self) -> PipelineSnapshot {
-        lock_pipeline(&self.pipeline).host.snapshot()
+        PipelineSnapshot::clone(&self.pipeline.published.load())
     }
 
     /// Persist the first runtime poison latched by a published callback
@@ -375,47 +369,36 @@ impl DaemonCoordinator {
     }
 
     pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
-        self.schema_authority
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.schema_authority.load_full()
     }
 
     pub fn build_target(&self, name: &str) -> Option<Target> {
-        self.build_targets
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.build_targets.load()
             .get(name)
             .cloned()
     }
 
     #[cfg(test)]
     pub(crate) fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
-        *self
-            .schema_authority
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(authority);
+        self.schema_authority.store(Some(authority));
     }
 
     #[cfg(test)]
     pub(crate) fn install_build_target_for_test(&self, name: &str, target: Target) {
-        self.build_targets
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name.to_owned(), target);
+        self.build_targets.rcu(|current| {
+            let mut targets = BTreeMap::clone(current);
+            targets.insert(name.to_owned(), target.clone());
+            targets
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn install_pipeline_epoch_for_test(&self, epoch: PipelineEpoch) {
-        lock_pipeline(&self.pipeline).host.install_ready(epoch);
+        self.on_authority(|| lock_pipeline(&self.pipeline).host.install_ready(epoch));
     }
 
     pub fn operational_configuration(&self) -> SchedulerConfig {
-        self.operational
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .scheduler
-            .config()
+        self.operational.config()
     }
 
     pub(crate) fn run_scheduled<R>(
@@ -426,55 +409,20 @@ impl DaemonCoordinator {
     where
         R: Send + 'static,
     {
-        let mut operational = self
-            .operational
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let id = operational.next_job_id;
-        operational.next_job_id = operational
-            .next_job_id
-            .checked_add(1)
-            .expect("scheduler job identity exhausted");
-        operational
-            .scheduler
-            .try_enqueue(id, class)
-            .expect("fresh scheduler job identity is unique");
-        operational.scheduler.admit();
-        self.operational_wake.notify_all();
-        while !operational.scheduler.is_active(id) {
-            operational = self
-                .operational_wake
-                .wait(operational)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        let worker_pool = Arc::clone(&operational.worker_pool);
-        drop(operational);
-
         // An authority that waits here lends itself to the worker, whose
         // store writes would otherwise wait on it.
         let lent = self.authority_sender().lend();
-        let coordinator = Arc::clone(self);
         let (sender, receiver) = mpsc::sync_channel(1);
-        worker_pool.spawn_fifo(move || {
-            let _authority = lent.map(crate::authority::Lent::enter);
+        self.operational.submit(class, move || {
+            let authority = lent.map(crate::authority::Lent::enter);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-            let mut operational = coordinator
-                .operational
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            operational
-                .scheduler
-                .complete(id)
-                .expect("scheduled job remains active until its worker returns");
-            operational.scheduler.admit();
-            coordinator.operational_wake.notify_all();
-            drop(operational);
+            drop(authority);
             let _ = sender.send(outcome);
         });
         match receiver.recv() {
             Ok(Ok(result)) => result,
             Ok(Err(panic)) => std::panic::resume_unwind(panic),
-            Err(_) => panic!("distill build worker stopped before returning job {id}"),
+            Err(_) => panic!("distill build worker stopped before returning its job"),
         }
     }
 
@@ -493,11 +441,7 @@ impl DaemonCoordinator {
                 .validate()
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
             let replacement_pool = {
-                let operational = self
-                    .operational
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (operational.scheduler.config().parallelism != scheduler.parallelism)
+                (self.operational.config().parallelism != scheduler.parallelism)
                     .then(|| build_worker_pool(scheduler.parallelism))
                     .transpose()
                     .map_err(CoordinatorError::InvalidManifest)?
@@ -505,20 +449,9 @@ impl DaemonCoordinator {
             self.store.write()
                 .apply_operational_config(store_config)
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            let mut operational = self
-                .operational
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            operational
-                .scheduler
-                .reconfigure(scheduler)
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-            if let Some(worker_pool) = replacement_pool {
-                operational.worker_pool = worker_pool;
-            }
-            operational.scheduler.admit();
-            self.operational_wake.notify_all();
-            Ok(())
+            self.operational
+                .reconfigure(scheduler, replacement_pool)
+                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
         })
     }
 
@@ -558,13 +491,11 @@ impl DaemonCoordinator {
     fn configuration_poison(&self) -> Option<ConfigurationPoison> {
         let source = self
             .configuration_poison
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .borrow_mut()
             .clone();
         let scan = self
             .scan_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .borrow_mut()
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
         ConfigurationPoison::select_canonical(source.into_iter().chain(scan))
@@ -574,8 +505,7 @@ impl DaemonCoordinator {
 
     fn pending_scan_version_poison(&self) -> Option<VersionPoison> {
         self.scan_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .borrow_mut()
             .as_ref()
             .and_then(|pending| pending.rejection.version.clone())
     }
@@ -585,8 +515,7 @@ impl DaemonCoordinator {
     ) -> Result<(ConfigurationStatus, Option<LineageRepairState>), CoordinatorError> {
         let scan_poison = self
             .scan_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .borrow_mut()
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
         let lineage = claimed_lineage(&self.store.read(), &BTreeMap::new())?;
@@ -600,10 +529,7 @@ impl DaemonCoordinator {
     }
 
     fn lineage_destination(&self) -> LineageDestination {
-        self.lineage_destination
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        LineageDestination::clone(&self.lineage_destination.load())
     }
 
     /// Publish a rejected configuration source as an ordinary input version.
@@ -620,8 +546,7 @@ impl DaemonCoordinator {
             let previous = {
                 let mut current = self
                     .configuration_poison
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .borrow_mut();
                 current.replace(poison)
             };
             match self.publish_cached_scan() {
@@ -629,8 +554,7 @@ impl DaemonCoordinator {
                 Err(error) => {
                     *self
                         .configuration_poison
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+                        .borrow_mut() = previous;
                     Err(error)
                 }
             }
@@ -641,16 +565,14 @@ impl DaemonCoordinator {
         self.on_authority(|| {
             let previous = self
                 .configuration_poison
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .borrow_mut()
                 .take();
             match self.publish_cached_scan() {
                 Ok(stamp) => Ok(stamp),
                 Err(error) => {
                     *self
                         .configuration_poison
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+                        .borrow_mut() = previous;
                     Err(error)
                 }
             }
@@ -832,28 +754,17 @@ impl DaemonCoordinator {
                     self.scan_initialized.store(true, Ordering::Release);
                     if candidate_scan_heals {
                         self.scan_rejection
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .borrow_mut()
                             .take();
                         self.scan_healthy.store(true, Ordering::Release);
                     }
-                    *self
-                        .lineage_destination
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = destination;
-                    *self
-                        .schema_authority
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(Arc::clone(&schema_authority));
-                    *self
-                        .build_targets
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = build_targets.clone();
+                    self.lineage_destination.store(Arc::new(destination));
+                    self.schema_authority
+                        .store(Some(Arc::clone(&schema_authority)));
+                    self.build_targets.store(Arc::new(build_targets.clone()));
                     authoring.install_pipeline_projection(projection.clone());
                     self.configuration_poison
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .borrow_mut()
                         .take();
                     match (&pipeline, prepared_epoch.take(), published_pipeline) {
                         (
@@ -1034,10 +945,7 @@ impl DaemonCoordinator {
             };
             let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
             let targets = self
-                .build_targets
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+                .build_targets.load_full();
             let scanner = self.scanner.clone();
             let max_dependency_depth = self.operational_configuration().max_dependency_depth;
             let mut prepared = Some(prepared);
@@ -1169,24 +1077,26 @@ impl DaemonCoordinator {
         candidate: &PipelineCandidateIdentity,
         type_uuid: TypeUuid,
     ) -> Result<(Option<LogicalHash>, BTreeSet<String>), String> {
-        let runtime = lock_pipeline(&self.pipeline);
-        let pending = runtime
-            .pending
-            .as_ref()
-            .ok_or_else(|| "no loaded pipeline candidate awaits schema acceptance".to_owned())?;
-        let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
-            .map_err(|error| error.to_string())?;
-        if &actual != candidate {
-            return Err("loaded schema candidate identity is stale".to_owned());
-        }
-        Ok((
-            pending.stored.schema_registry.get(&type_uuid).copied(),
-            pending
-                .loaded
-                .migration_function_keys()
-                .into_iter()
-                .collect(),
-        ))
+        self.on_authority(|| {
+            let runtime = lock_pipeline(&self.pipeline);
+            let pending = runtime
+                .pending
+                .as_ref()
+                .ok_or_else(|| "no loaded pipeline candidate awaits schema acceptance".to_owned())?;
+            let actual = PipelineCandidateIdentity::try_from(pending.stored.epoch())
+                .map_err(|error| error.to_string())?;
+            if &actual != candidate {
+                return Err("loaded schema candidate identity is stale".to_owned());
+            }
+            Ok((
+                pending.stored.schema_registry.get(&type_uuid).copied(),
+                pending
+                    .loaded
+                    .migration_function_keys()
+                    .into_iter()
+                    .collect(),
+            ))
+        })
     }
 
     pub(crate) fn publish_schema_transition(
@@ -1198,8 +1108,8 @@ impl DaemonCoordinator {
         self.on_authority(|| {
             // Keep the exact unpublished candidate reserved through durable
             // manifest replacement, rescan, and promotion. Ordinary pipeline
-            // staging takes the same mutex, so it cannot replace the candidate
-            // between the store CAS and live installation.
+            // staging also runs on the authority, so it cannot replace the
+            // candidate between the store CAS and live installation.
             let mut runtime = lock_pipeline(&self.pipeline);
             let (candidate, tools, prepared_importers) = {
                 let pending = runtime.pending.as_ref().ok_or_else(|| {
@@ -1300,9 +1210,7 @@ impl DaemonCoordinator {
                 &self.scanner,
                 &transition_paths,
                 &self
-                    .lineage_destination
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    .lineage_destination.load(),
                 &self.store,
                 base,
                 &projection,
@@ -1422,8 +1330,7 @@ impl DaemonCoordinator {
                 self.authoring.install_pipeline_importers(BTreeMap::new());
                 if heal_configuration {
                     self.configuration_poison
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .borrow_mut()
                         .take();
                 }
                 Ok(stamp)
@@ -1506,8 +1413,7 @@ impl DaemonCoordinator {
         self.on_authority(|| {
             let pending_subjects = self
                 .scan_rejection
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .borrow_mut()
                 .as_ref()
                 .map(|pending| pending.subjects.clone())
                 .unwrap_or_default();
@@ -1590,8 +1496,7 @@ impl DaemonCoordinator {
             let healed_rejection = heals_pending_rejection
                 .then(|| {
                     self.scan_rejection
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .borrow_mut()
                         .take()
                 })
                 .flatten();
@@ -1621,8 +1526,7 @@ impl DaemonCoordinator {
                     if let Some(rejection) = healed_rejection {
                         *self
                             .scan_rejection
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                            .borrow_mut() = Some(rejection);
                     }
                     return Err(error);
                 }
@@ -1642,10 +1546,7 @@ impl DaemonCoordinator {
                 .map_or([0; 32], |authority| authority.source_hash());
             let pipeline = self.pipeline_snapshot();
             let targets = self
-                .build_targets
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+                .build_targets.load_full();
             let max_dependency_depth = self.operational_configuration().max_dependency_depth;
             let scanner = self.scanner.clone();
             let result = server.coordinated_commit(base, || {
@@ -1683,8 +1584,7 @@ impl DaemonCoordinator {
                 Ok(stamp) => {
                     self.scan_healthy.store(
                         self.scan_rejection
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .borrow_mut()
                             .is_none(),
                         Ordering::Release,
                     );
@@ -1694,8 +1594,7 @@ impl DaemonCoordinator {
                     if let Some(rejection) = healed_rejection {
                         *self
                             .scan_rejection
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                            .borrow_mut() = Some(rejection);
                     }
                     Err(CoordinatorError::Coordinated(error))
                 }
@@ -1750,10 +1649,7 @@ impl DaemonCoordinator {
             .map_or([0; 32], |authority| authority.source_hash());
         let pipeline = self.pipeline_snapshot();
         let build_targets = self
-            .build_targets
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .build_targets.load_full();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let scanner = self.scanner.clone();
         let fallback_bundles = store.read()
@@ -1791,14 +1687,12 @@ impl DaemonCoordinator {
         self.scan_initialized.store(true, Ordering::Release);
         if heals_scan_rejection {
             self.scan_rejection
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .borrow_mut()
                 .take();
         }
         self.scan_healthy.store(
             self.scan_rejection
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .borrow_mut()
                 .is_none(),
             Ordering::Release,
         );
@@ -1813,8 +1707,7 @@ impl DaemonCoordinator {
         let observed_rejection = classify_scan_rejection(&self.scanner, error)?;
         let previous_pending = self
             .scan_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .borrow_mut()
             .clone();
         let rejection = if replaces_pending {
             observed_rejection
@@ -1855,8 +1748,7 @@ impl DaemonCoordinator {
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let source_configuration = self
             .configuration_poison
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .borrow_mut()
             .clone();
         let external_configuration = ConfigurationPoison::select_canonical(
             source_configuration
@@ -1925,8 +1817,7 @@ impl DaemonCoordinator {
             .map_err(CoordinatorError::Coordinated)?;
         *self
             .scan_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
+            .borrow_mut() = Some(pending);
         Ok(stamp)
     }
 
@@ -4272,10 +4163,7 @@ fn publish_incremental_paths_with_schema_transition(
                 let affected = commit_affected_asset_bundles(&commit);
                 if !affected.is_empty() {
                     let targets = coordinator
-                        .build_targets
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
+                        .build_targets.load_full();
                     crate::build::refine_published_tag_index_incremental(
                         Arc::clone(store),
                         scanner.clone(),
@@ -4778,12 +4666,54 @@ impl distill_rpc::ExternalStore for DaemonStore {
     }
 }
 
-fn lock_pipeline(
-    pipeline: &Mutex<CoordinatedPipelineRuntime>,
-) -> MutexGuard<'_, CoordinatedPipelineRuntime> {
-    pipeline
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The pipeline runtime, which only the authority touches, and the
+/// snapshot of it that other threads read.
+struct PipelineState {
+    runtime: AuthorityCell<CoordinatedPipelineRuntime>,
+    published: ArcSwap<PipelineSnapshot>,
+}
+
+impl PipelineState {
+    fn new(runtime: CoordinatedPipelineRuntime, authority: &AuthoritySender) -> Self {
+        Self {
+            published: ArcSwap::from_pointee(runtime.host.snapshot()),
+            runtime: AuthorityCell::new(runtime, authority),
+        }
+    }
+}
+
+/// The pipeline runtime, borrowed on the authority. Dropping it publishes
+/// the host's snapshot.
+struct PipelineGuard<'a> {
+    runtime: AuthorityRef<'a, CoordinatedPipelineRuntime>,
+    published: &'a ArcSwap<PipelineSnapshot>,
+}
+
+impl std::ops::Deref for PipelineGuard<'_> {
+    type Target = CoordinatedPipelineRuntime;
+
+    fn deref(&self) -> &CoordinatedPipelineRuntime {
+        &self.runtime
+    }
+}
+
+impl std::ops::DerefMut for PipelineGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CoordinatedPipelineRuntime {
+        &mut self.runtime
+    }
+}
+
+impl Drop for PipelineGuard<'_> {
+    fn drop(&mut self) {
+        self.published.store(Arc::new(self.runtime.host.snapshot()));
+    }
+}
+
+fn lock_pipeline(pipeline: &PipelineState) -> PipelineGuard<'_> {
+    PipelineGuard {
+        runtime: pipeline.runtime.borrow_mut(),
+        published: &pipeline.published,
+    }
 }
 
 fn build_worker_pool(parallelism: usize) -> Result<Arc<ThreadPool>, String> {
