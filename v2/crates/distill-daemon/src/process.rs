@@ -7,7 +7,6 @@
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,7 +40,7 @@ const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub struct DaemonProcess {
     coordinator: Arc<DaemonCoordinator>,
     rpc_address: SocketAddr,
-    stop: Arc<AtomicBool>,
+    stop: Arc<watch::Sender<bool>>,
     watcher: Option<WatcherThread>,
     rpc_thread: Option<JoinHandle<Result<(), String>>>,
     last_background_error: watch::Receiver<Option<String>>,
@@ -135,7 +134,7 @@ impl DaemonProcess {
             })
             .map_err(DaemonProcessError::Codegen)?;
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(watch::Sender::new(false));
         let (errors, last_background_error) = watch::channel(None);
         let (ready, started) = mpsc::sync_channel(1);
         let mut driver = ProcessDriver {
@@ -177,13 +176,13 @@ impl DaemonProcess {
             let rpc_address = match address_rx.recv() {
                 Ok(Ok(address)) => address,
                 Ok(Err(error)) => {
-                    stop.store(true, Ordering::Release);
+                    stop.send_replace(true);
                     inbox.detach();
                     let _ = rpc_thread.join();
                     return Err(DaemonProcessError::Rpc(error));
                 }
                 Err(error) => {
-                    stop.store(true, Ordering::Release);
+                    stop.send_replace(true);
                     inbox.detach();
                     let _ = rpc_thread.join();
                     return Err(DaemonProcessError::Rpc(format!(
@@ -222,7 +221,7 @@ impl DaemonProcess {
     /// loops. The development supervisor uses this to tear down its producer
     /// children instead of remaining alive around a dead daemon.
     pub fn has_stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
+        *self.stop.borrow()
     }
 
     pub fn wait(self) -> ! {
@@ -234,7 +233,7 @@ impl DaemonProcess {
 
 impl Drop for DaemonProcess {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.send_replace(true);
         self.watcher.take();
         self.coordinator.authority_sender().detach();
         if let Some(thread) = self.rpc_thread.take() {
@@ -299,7 +298,7 @@ struct ProcessDriver {
     config_watch: ConfigWatch,
     watcher_control: WatcherControl,
     codegen: CodegenService,
-    stop: Arc<AtomicBool>,
+    stop: Arc<watch::Sender<bool>>,
     errors: watch::Sender<Option<String>>,
     /// When the next pass is due; `None` until something asks for one.
     due: Option<Instant>,
@@ -353,7 +352,7 @@ impl ProcessDriver {
         if let WatcherAction::Failed(message) = &action {
             tracing::error!(%message, "watcher failed; stopping the coordinator");
             self.errors.send_replace(Some(message.clone()));
-            self.stop.store(true, Ordering::Release);
+            self.stop.send_replace(true);
             return false;
         }
         let retry_action = action.clone();
@@ -999,7 +998,7 @@ fn reconcile_imports(
 fn spawn_rpc_loop(
     root: distill_rpc::Root,
     address: SocketAddr,
-    stop: Arc<AtomicBool>,
+    stop: Arc<watch::Sender<bool>>,
     startup: mpsc::SyncSender<Result<SocketAddr, String>>,
 ) -> JoinHandle<Result<(), String>> {
     thread::Builder::new()
@@ -1030,9 +1029,7 @@ fn spawn_rpc_loop(
                     .map_err(|error| error.to_string())?;
                 listener
                     .serve_until(async move {
-                        while !stop.load(Ordering::Acquire) {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
+                        let _ = stop.subscribe().wait_for(|stopped| *stopped).await;
                     })
                     .await
                     .map_err(|error| error.to_string())
