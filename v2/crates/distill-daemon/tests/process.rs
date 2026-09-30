@@ -816,14 +816,14 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-distill-core = {{ path = "{}" }}
-distill-json = {{ path = "{}" }}
-distill-pipeline-api = {{ path = "{}" }}
-distill-schema = {{ path = "{}" }}
-newgameplus-api-macros = {{ path = "{}" }}
+distill-core = {{ path = '{}' }}
+distill-json = {{ path = '{}' }}
+distill-pipeline-api = {{ path = '{}' }}
+distill-schema = {{ path = '{}' }}
+newgameplus-api-macros = {{ path = '{}' }}
 
 [build-dependencies]
-ngp-source-hash = {{ path = "{}" }}
+ngp-source-hash = {{ path = '{}' }}
 "#,
                 path(crates.join("distill-core")),
                 path(crates.join("distill-json")),
