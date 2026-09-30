@@ -26,7 +26,12 @@ fn package() -> ToolExecutionIdentityV2 {
 fn ambient(fingerprint: Option<[u8; 32]>) -> ToolExecutionIdentityV2 {
     ToolExecutionIdentityV2 {
         source: ToolSourceIdentityV2::Ambient {
-            launcher: "/opt/toolchains/dxc".to_owned(),
+            launcher: if cfg!(windows) {
+                r"C:\toolchains\dxc.exe"
+            } else {
+                "/opt/toolchains/dxc"
+            }
+            .to_owned(),
             toolchain_id: "windows-sdk-dxc".to_owned(),
             trusted_fingerprint: fingerprint,
         },

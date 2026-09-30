@@ -311,6 +311,8 @@ mod tests {
         );
     }
 
+    /// Windows has no executable bit: any member may launch.
+    #[cfg(unix)]
     #[test]
     fn package_launcher_must_be_an_executable_member() {
         let directory = tempfile::tempdir().unwrap();

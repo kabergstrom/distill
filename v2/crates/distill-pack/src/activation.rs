@@ -112,15 +112,24 @@ fn publish_immutable(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), P
             }
             Err(error) => return Err(PointerError::Io(error)),
         }
-        File::open(directory)?.sync_all()?;
+        sync_directory(directory)?;
         fs::remove_file(&temp)?;
-        File::open(directory)?.sync_all()?;
+        sync_directory(directory)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// fsync a directory; a no-op on Windows, which has no directory fsync
+/// (NTFS journals directory entries).
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    File::open(directory)?.sync_all()
 }
 
 fn verify_existing(path: &Path, bytes: &[u8]) -> Result<(), PointerError> {
@@ -144,7 +153,7 @@ pub fn activate(directory: &Path, hash: [u8; 32]) -> Result<(), PointerError> {
         file.sync_all()?;
         drop(file);
         fs::rename(&temp, directory.join("pack.current"))?;
-        File::open(directory)?.sync_all()?;
+        sync_directory(directory)?;
         Ok(())
     })();
     if result.is_err() {

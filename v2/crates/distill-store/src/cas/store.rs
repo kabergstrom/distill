@@ -231,7 +231,17 @@ pub(crate) fn read_segment(path: &std::path::Path) -> Result<Vec<u8>, StoreError
 }
 
 /// fsync a directory: segment creation and deletion also fsync the
+/// directory (§13). Windows has no directory fsync (a directory opens only
+/// with backup semantics, and NTFS journals its entries); there it is a
+/// no-op.
+#[cfg(windows)]
+pub fn fsync_dir(_dir: &std::path::Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// fsync a directory: segment creation and deletion also fsync the
 /// directory (§13).
+#[cfg(not(windows))]
 pub fn fsync_dir(dir: &std::path::Path) -> Result<(), StoreError> {
     let f = std::fs::File::open(dir).map_err(|source| StoreError::Io {
         path: dir.to_path_buf(),

@@ -15,14 +15,14 @@ fn valid_config(temp: &tempfile::TempDir) -> String {
         r#"
 [daemon]
 address = "127.0.0.1:0"
-state_path = "{}"
+state_path = '{}'
 
 [assets]
-roots = {{ main = "{}" }}
-schema_path = "{}"
+roots = {{ main = '{}' }}
+schema_path = '{}'
 
 [modules]
-pipeline_dylib = "{}"
+pipeline_dylib = '{}'
 
 [targets.dev]
 os = "macos"
@@ -32,7 +32,7 @@ optimize = false
 debug_info = true
 
 [codegen]
-rs_mod_path = "{}"
+rs_mod_path = '{}'
 auto_codegen = true
 
 [pipeline]

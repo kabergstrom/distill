@@ -726,11 +726,23 @@ struct FileIdentity {
     inode: u64,
 }
 
+#[cfg(unix)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
     FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+    }
+}
+
+/// As the scanner's: the creation time stands in for the file index stable
+/// std lacks on Windows.
+#[cfg(windows)]
+fn file_identity(metadata: &Metadata) -> FileIdentity {
+    use std::os::windows::fs::MetadataExt;
+    FileIdentity {
+        device: 0,
+        inode: metadata.creation_time(),
     }
 }
 
