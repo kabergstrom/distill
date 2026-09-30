@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
@@ -306,7 +305,6 @@ impl From<notify::Error> for WatcherStartError {
 /// are registered synchronously before `start` returns. The monitor thread
 /// owns the watch coverage; native callbacks forward raw events to it.
 pub struct WatcherThread {
-    stop: Arc<AtomicBool>,
     control: WatcherControl,
     thread: Option<JoinHandle<()>>,
 }
@@ -417,13 +415,11 @@ impl WatcherThread {
         }
         let control = WatcherControl { commands };
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("distill-watcher".to_owned())
             .spawn(move || {
                 let mut watcher = watcher;
-                while !thread_stop.load(Ordering::Acquire) {
+                loop {
                     match command_rx.recv() {
                         Ok(WatcherCommand::Stop) => break,
                         Ok(WatcherCommand::Native(Ok(event))) => {
@@ -488,7 +484,6 @@ impl WatcherThread {
             })
             .map_err(WatcherStartError::Thread)?;
         Ok(Self {
-            stop,
             control,
             thread: Some(thread),
         })
@@ -506,7 +501,6 @@ impl WatcherThread {
 
 impl Drop for WatcherThread {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
         let _ = self.control.commands.send(WatcherCommand::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

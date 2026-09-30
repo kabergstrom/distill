@@ -6,7 +6,6 @@
 //! atomic publication.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use distill_build::import::{
@@ -137,10 +136,10 @@ impl RegisteredImporter {
 }
 
 impl AuthoringService {
-    /// Index every bundle's import record and directory rules unless the
-    /// index was built since it was last invalidated.
-    fn ensure_import_index(&self, store: &mut Store) -> Result<(), RpcFailure> {
-        if self.import_index_ready.load(Ordering::Acquire) {
+    /// Index every bundle's import record and directory rules, on `rebuild`
+    /// or if this process has not built the index yet.
+    fn ensure_import_index(&self, store: &mut Store, rebuild: bool) -> Result<(), RpcFailure> {
+        if !rebuild && self.import_index_built.get().is_some() {
             return Ok(());
         }
         // The index is read from the bundles in the transaction that
@@ -153,7 +152,7 @@ impl AuthoringService {
             store.replace_import_index(None, &rows).map_err(invalid)
         })?;
         self.directory_rule_entries(store)?;
-        self.import_index_ready.store(true, Ordering::Release);
+        let _ = self.import_index_built.set(());
         Ok(())
     }
 
@@ -305,10 +304,7 @@ impl AuthoringService {
             .store
             .write();
         let capabilities = self.importer_capabilities()?;
-        if work.is_none() {
-            self.import_index_ready.store(false, Ordering::Release);
-        }
-        self.ensure_import_index(&mut store)?;
+        self.ensure_import_index(&mut store, work.is_none())?;
         let watched = match work {
             Some((dirty, renames)) => {
                 self.refresh_dirty_import_index(&mut store, dirty)?;
@@ -376,10 +372,7 @@ impl AuthoringService {
             .store
             .write();
         let capabilities = self.importer_capabilities()?;
-        if work.is_none() {
-            self.import_index_ready.store(false, Ordering::Release);
-        }
-        self.ensure_import_index(&mut store)?;
+        self.ensure_import_index(&mut store, work.is_none())?;
         let (changed, previous) = match work {
             Some((dirty, _)) => self.refresh_dirty_import_index(&mut store, dirty)?,
             None => Default::default(),

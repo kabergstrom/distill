@@ -8,7 +8,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
@@ -40,9 +39,9 @@ pub struct AuthoringService {
     filesystem: ArcSwap<AuthoringFilesystem>,
     importers: ArcSwap<Importers>,
     pipeline_projection: ArcSwap<PipelineProjection>,
-    /// Whether the store's import index was built since it was last
-    /// invalidated (see `importer`).
-    pub(crate) import_index_ready: AtomicBool,
+    /// Set once this process has built the store's import index (see
+    /// `importer`).
+    pub(crate) import_index_built: OnceLock<()>,
     tag_index_coordinator: OnceLock<Weak<crate::coordinator::DaemonCoordinator>>,
 }
 
@@ -80,7 +79,7 @@ impl AuthoringService {
             filesystem: ArcSwap::from_pointee(AuthoringFilesystem { roots }),
             importers: ArcSwap::from_pointee(Importers::default()),
             pipeline_projection: ArcSwap::from_pointee(PipelineProjection::default()),
-            import_index_ready: AtomicBool::new(false),
+            import_index_built: OnceLock::new(),
             tag_index_coordinator: OnceLock::new(),
         }
     }

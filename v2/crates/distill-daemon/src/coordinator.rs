@@ -8,8 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
@@ -79,10 +78,10 @@ pub(crate) struct ConfigurationCandidate {
 pub struct DaemonCoordinator {
     store: Arc<SharedStore>,
     scanner: RootedScanner,
-    scan_initialized: AtomicBool,
-    scan_healthy: AtomicBool,
+    /// Set once the first scan is published.
+    scan_initialized: OnceLock<()>,
     /// Written by the publishing loop, read by any publication.
-    scan_rejection: Mutex<Option<PendingScanRejection>>,
+    scan: Mutex<ScanHealth>,
     server: Arc<ServerHandle>,
     authoring: Arc<AuthoringService>,
     pipeline: PipelineState,
@@ -187,9 +186,11 @@ impl DaemonCoordinator {
         Ok(Self {
             store,
             scanner,
-            scan_initialized: AtomicBool::new(false),
-            scan_healthy: AtomicBool::new(true),
-            scan_rejection: Mutex::new(None),
+            scan_initialized: OnceLock::new(),
+            scan: Mutex::new(ScanHealth {
+                rejection: None,
+                healthy: true,
+            }),
             server,
             authoring: backend,
             pipeline: PipelineState::new(pipeline),
@@ -406,7 +407,8 @@ impl DaemonCoordinator {
     fn configuration_error(&self) -> Option<ConfigurationError> {
         let source = locked(&self.configuration_error)
             .clone();
-        let scan = locked(&self.scan_rejection)
+        let scan = locked(&self.scan)
+            .rejection
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
         ConfigurationError::select_canonical(source.into_iter().chain(scan))
@@ -416,13 +418,15 @@ impl DaemonCoordinator {
 
     /// The namespace errors of the pending scan rejection.
     fn pending_scan_errors(&self) -> Vec<NamespaceError> {
-        locked(&self.scan_rejection)
+        locked(&self.scan)
+            .rejection
             .as_ref()
             .map_or_else(Vec::new, |pending| pending.rejection.version.clone())
     }
 
     fn configuration_without_source_error(&self) -> ConfigurationStatus {
-        locked(&self.scan_rejection)
+        locked(&self.scan)
+            .rejection
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone())
             .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
@@ -484,7 +488,7 @@ impl DaemonCoordinator {
         // observed asset snapshot. A physical complete scan is reserved for
         // an actual configured-root replacement.
         let candidate_scan_heals =
-            filesystem_changed || !self.scan_initialized.load(Ordering::Acquire);
+            filesystem_changed || self.scan_initialized.get().is_none();
         let scan = if candidate_scan_heals {
             filesystem.scanner().scan()?
         } else {
@@ -624,11 +628,10 @@ impl DaemonCoordinator {
                     .expect("scan commit always carries pipeline diagnostics");
                 self.scanner.replace_from(filesystem.scanner());
                 authoring.install_filesystem_candidate(filesystem);
-                self.scan_initialized.store(true, Ordering::Release);
+                let _ = self.scan_initialized.set(());
                 if candidate_scan_heals {
-                    locked(&self.scan_rejection)
-                        .take();
-                    self.scan_healthy.store(true, Ordering::Release);
+                    locked(&self.scan).rejection.take();
+                    locked(&self.scan).healthy = true;
                 }
                 self.schema_authority
                     .store(Some(Arc::clone(&schema_authority)));
@@ -936,8 +939,8 @@ impl DaemonCoordinator {
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         match self.scanner.scan() {
             Ok(scan)
-                if self.scan_healthy.load(Ordering::Acquire)
-                    && self.scan_initialized.load(Ordering::Acquire) =>
+                if locked(&self.scan).healthy
+                    && self.scan_initialized.get().is_some() =>
             {
                 let mut store = self.store.write();
                 if scan.same_namespace_observation(&ScanSnapshot::load(&store)?) {
@@ -953,7 +956,7 @@ impl DaemonCoordinator {
             }
             Ok(scan) => self.publish_scan(scan),
             Err(error) => {
-                self.scan_healthy.store(false, Ordering::Release);
+                locked(&self.scan).healthy = false;
                 self.publish_scan_rejection(&error, true)
             }
         }
@@ -997,7 +1000,8 @@ impl DaemonCoordinator {
         &self,
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let pending_subjects = locked(&self.scan_rejection)
+        let pending_subjects = locked(&self.scan)
+            .rejection
             .as_ref()
             .map(|pending| pending.subjects.clone())
             .unwrap_or_default();
@@ -1072,20 +1076,17 @@ impl DaemonCoordinator {
                 }
                 Err(error) => {
                     drop(store);
-                    self.scan_healthy.store(false, Ordering::Release);
+                    locked(&self.scan).healthy = false;
                     return self.publish_scan_rejection(&error, heals_pending_rejection);
                 }
             }
         };
         let healed_rejection = heals_pending_rejection
-            .then(|| {
-                locked(&self.scan_rejection)
-                    .take()
-            })
+            .then(|| locked(&self.scan).rejection.take())
             .flatten();
         if delta.is_same_namespace_observation(&baseline)
             && renames.is_empty()
-            && self.scan_healthy.load(Ordering::Acquire)
+            && locked(&self.scan).healthy
         {
             // Diagnostics are replaced with their affected subtree even when
             // the authored namespace itself did not change.
@@ -1107,7 +1108,7 @@ impl DaemonCoordinator {
             Ok(claims) => claims,
             Err(error) => {
                 if let Some(rejection) = healed_rejection {
-                    *locked(&self.scan_rejection) = Some(rejection);
+                    locked(&self.scan).rejection = Some(rejection);
                 }
                 return Err(error);
             }
@@ -1160,16 +1161,15 @@ impl DaemonCoordinator {
         });
         match result {
             Ok(stamp) => {
-                self.scan_healthy.store(
-                    locked(&self.scan_rejection)
-                        .is_none(),
-                    Ordering::Release,
-                );
+                {
+                    let mut scan = locked(&self.scan);
+                    scan.healthy = scan.rejection.is_none();
+                }
                 Ok(stamp)
             }
             Err(error) => {
                 if let Some(rejection) = healed_rejection {
-                    *locked(&self.scan_rejection) = Some(rejection);
+                    locked(&self.scan).rejection = Some(rejection);
                 }
                 Err(CoordinatorError::Coordinated(error))
             }
@@ -1251,16 +1251,14 @@ impl DaemonCoordinator {
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)?;
-        self.scan_initialized.store(true, Ordering::Release);
+        let _ = self.scan_initialized.set(());
         if heals_scan_rejection {
-            locked(&self.scan_rejection)
-                .take();
+            locked(&self.scan).rejection.take();
         }
-        self.scan_healthy.store(
-            locked(&self.scan_rejection)
-                .is_none(),
-            Ordering::Release,
-        );
+        {
+            let mut scan = locked(&self.scan);
+            scan.healthy = scan.rejection.is_none();
+        }
         Ok(stamp)
     }
 
@@ -1270,8 +1268,7 @@ impl DaemonCoordinator {
         replaces_pending: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let observed_rejection = classify_scan_rejection(&self.scanner, error)?;
-        let previous_pending = locked(&self.scan_rejection)
-            .clone();
+        let previous_pending = locked(&self.scan).rejection.clone();
         let rejection = if replaces_pending {
             observed_rejection
         } else {
@@ -1356,7 +1353,7 @@ impl DaemonCoordinator {
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)?;
-        *locked(&self.scan_rejection) = Some(pending);
+        locked(&self.scan).rejection = Some(pending);
         Ok(stamp)
     }
 
@@ -1511,6 +1508,13 @@ impl DaemonCoordinator {
 struct ScanRejection {
     version: Vec<NamespaceError>,
     configuration: Option<ConfigurationError>,
+}
+
+/// The last scan outcome: its pending rejection, and whether the scanner
+/// state matches the published namespace.
+struct ScanHealth {
+    rejection: Option<PendingScanRejection>,
+    healthy: bool,
 }
 
 #[derive(Clone)]

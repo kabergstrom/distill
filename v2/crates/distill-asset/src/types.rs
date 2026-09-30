@@ -4,10 +4,7 @@
 //! the §15 `PlaceholderThunk`.
 
 use core::marker::PhantomData;
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
+use std::sync::{Arc, OnceLock};
 
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_wire::native::{
@@ -99,7 +96,7 @@ pub type EpochToken = ModuleEpochToken;
 
 struct EpochState {
     id: u64,
-    poison_cause: AtomicU8,
+    poison_cause: OnceLock<ModuleEpochPoisonCause>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +110,7 @@ impl ModuleEpochToken {
     pub fn new(id: u64) -> Self {
         Self(Arc::new(EpochState {
             id,
-            poison_cause: AtomicU8::new(0),
+            poison_cause: OnceLock::new(),
         }))
     }
 
@@ -133,21 +130,11 @@ impl ModuleEpochToken {
 
     /// Fence this epoch permanently while latching its first typed cause.
     pub fn poison_with(&self, cause: ModuleEpochPoisonCause) {
-        let _ = self.0.poison_cause.compare_exchange(
-            0,
-            cause as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = self.0.poison_cause.set(cause);
     }
 
     pub fn poison_cause(&self) -> Option<ModuleEpochPoisonCause> {
-        match self.0.poison_cause.load(Ordering::Acquire) {
-            0 => None,
-            1 => Some(ModuleEpochPoisonCause::CallbackPanic),
-            2 => Some(ModuleEpochPoisonCause::CallbackRejected),
-            _ => unreachable!("ModuleEpochToken stores only closed poison-cause tags"),
-        }
+        self.0.poison_cause.get().copied()
     }
 
     pub fn same_epoch(&self, other: &Self) -> bool {
