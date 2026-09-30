@@ -16,7 +16,6 @@ fn valid_config(temp: &tempfile::TempDir) -> String {
 [daemon]
 address = "127.0.0.1:0"
 state_path = "{}"
-displaced_retention_days = 7
 
 [assets]
 roots = {{ main = "{}" }}
@@ -75,8 +74,8 @@ fn parses_and_validates_the_complete_configuration_surface() {
 fn rejects_unknown_keys_nonloopback_and_invalid_scheduler_bounds() {
     let temp = tempfile::tempdir().unwrap();
     let source = valid_config(&temp).replace(
-        "displaced_retention_days = 7",
-        "displaced_retention_days = 7\nunknown = true",
+        "state_path = ",
+        "unknown = true\nstate_path = ",
     );
     assert!(matches!(
         DaemonConfig::parse(temp.path().join("distill.toml"), &source),

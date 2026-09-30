@@ -1,42 +1,34 @@
 //! Durable production authoring backend.
 //!
 //! Direct CRUD is a filesystem publication, never an RPC-only projection:
-//! validate the exact store basis, mutate one canonical bundle, journal the
-//! inode transition, reobserve only the authored paths, and return the commit
+//! validate the exact store basis, mutate one canonical bundle, write it
+//! atomically, reobserve only the authored paths, and return the commit
 //! for that same durable successor version.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
-use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{BundleUuid, ContentHash};
 use distill_rpc::{
     decode_authoring_payload, AuthoringBackend, AuthoringEntry, AuthoringEntryRole, AuthoringOp,
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure,
 };
-use distill_store::journal::{
-    CreationRecoveryOutcome, DeletionRecoveryOutcome, JournalIntentPlan, PublicationGroupKind,
-    RenameAsideOutcome,
-};
 use distill_store::StoreReader;
 
 use crate::store_cell::{AuthorityStore, WriteGuard};
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
-use crate::atomic::{plan_same_dir_temp, unique_sibling, write_planned_temp};
+use crate::atomic::{atomic_write_expecting, remove_expecting};
 use crate::pipeline_map::PipelineProjection;
-use crate::quarantine::{
-    material_recovery_diagnostic, QuarantineDriver, QuarantineError, QuarantineRoot,
-};
-use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanError};
+use crate::scanner::{AssetRoot, RootedScanner, ScanError};
 
 pub struct AuthoringService {
     pub(crate) store: Arc<AuthorityStore>,
@@ -50,12 +42,10 @@ pub struct AuthoringService {
     /// invalidated (see `importer`).
     pub(crate) import_index_ready: AtomicBool,
     tag_index_coordinator: OnceLock<Weak<crate::coordinator::DaemonCoordinator>>,
-    startup_recovery_diagnostic: ArcSwapOption<String>,
 }
 
 struct AuthoringFilesystem {
     roots: Vec<AssetRoot>,
-    quarantine: QuarantineDriver,
 }
 
 /// Registered importers: the daemon's own, and the loaded pipeline's.
@@ -81,48 +71,16 @@ impl AuthoringService {
         store: Arc<AuthorityStore>,
         roots: Vec<AssetRoot>,
         scanner: RootedScanner,
-    ) -> Result<Self, AuthoringServiceInitError> {
-        let quarantine = QuarantineDriver::new(
-            roots
-                .iter()
-                .map(|root| QuarantineRoot::new(&root.path, &root.quarantine_dir)),
-        )?;
-        for root in &roots {
-            fs::create_dir_all(&root.quarantine_dir).map_err(|source| ScanError::Io {
-                path: root.quarantine_dir.clone(),
-                source,
-            })?;
-            scanner.retain_daemon_owned_directory(
-                DaemonOwnedDirectoryKind::Quarantine,
-                &root.quarantine_dir,
-            )?;
-        }
-        let startup_recovery_diagnostic = {
-            let mut store = store.write();
-            let recovered = quarantine.reconcile_non_codegen(&mut store)?;
-            material_recovery_diagnostic(&recovered)
-        };
-        Ok(Self {
+    ) -> Self {
+        Self {
             store,
             scanner,
-            filesystem: ArcSwap::from_pointee(AuthoringFilesystem {
-                roots,
-                quarantine,
-            }),
+            filesystem: ArcSwap::from_pointee(AuthoringFilesystem { roots }),
             importers: ArcSwap::from_pointee(Importers::default()),
             pipeline_projection: ArcSwap::from_pointee(PipelineProjection::default()),
             import_index_ready: AtomicBool::new(false),
             tag_index_coordinator: OnceLock::new(),
-            startup_recovery_diagnostic: ArcSwapOption::new(
-                startup_recovery_diagnostic.map(Arc::new),
-            ),
-        })
-    }
-
-    pub(crate) fn take_startup_recovery_diagnostic(&self) -> Option<String> {
-        self.startup_recovery_diagnostic
-            .swap(None)
-            .map(|diagnostic| (*diagnostic).clone())
+        }
     }
 
     pub(crate) fn attach_tag_index_coordinator(
@@ -157,27 +115,9 @@ impl AuthoringService {
         roots: Vec<AssetRoot>,
     ) -> Result<AuthoringFilesystemCandidate, AuthoringServiceInitError> {
         let scanner = self.scanner.candidate_with_roots(roots.clone())?;
-        let quarantine = QuarantineDriver::new(
-            roots
-                .iter()
-                .map(|root| QuarantineRoot::new(&root.path, &root.quarantine_dir)),
-        )?;
-        for root in &roots {
-            fs::create_dir_all(&root.quarantine_dir).map_err(|source| ScanError::Io {
-                path: root.quarantine_dir.clone(),
-                source,
-            })?;
-            scanner.retain_daemon_owned_directory(
-                DaemonOwnedDirectoryKind::Quarantine,
-                &root.quarantine_dir,
-            )?;
-        }
         Ok(AuthoringFilesystemCandidate {
             scanner,
-            filesystem: AuthoringFilesystem {
-                roots,
-                quarantine,
-            },
+            filesystem: AuthoringFilesystem { roots },
         })
     }
 
@@ -188,10 +128,6 @@ impl AuthoringService {
 
     pub(crate) fn roots_snapshot(&self) -> Vec<AssetRoot> {
         self.filesystem.load().roots.clone()
-    }
-
-    pub(crate) fn quarantine_snapshot(&self) -> QuarantineDriver {
-        self.filesystem.load().quarantine.clone()
     }
 
     pub(crate) fn importers(&self) -> Arc<Importers> {
@@ -278,74 +214,29 @@ impl AuthoringService {
         drop(store);
         self.publish_file(
             base,
-            PublicationGroupKind::AuthoringWrite,
-            &encode_write_basis(base, operations),
             planned.target,
             planned.preimage,
             planned.proposed,
         )
     }
 
+    /// Write or delete one bundle file, then publish the store rows for
+    /// it. The target is re-hashed right before the change; if it no
+    /// longer holds `preimage` the publication fails with a conflict.
     pub(crate) fn publish_file(
         &self,
         base: InputVersion,
-        kind: PublicationGroupKind,
-        basis: &[u8],
         target: PathBuf,
         preimage: Option<ContentHash>,
         proposed: Option<Vec<u8>>,
     ) -> Result<Commit, RpcFailure> {
-        let mut store = self.write_store()?;
+        let store = self.write_store()?;
         require_base(&store, base)?;
-        let temp = proposed
-            .as_ref()
-            .map(|_| plan_same_dir_temp(&target).map_err(invalid))
-            .transpose()?;
-        let proposed_hash = proposed.as_ref().map_or_else(empty_hash, |bytes| {
-            ContentHash(*blake3::hash(bytes).as_bytes())
-        });
-        let plan = JournalIntentPlan {
-            target_path: path_text(&target)?,
-            temp_path: temp
-                .as_deref()
-                .map(path_text)
-                .transpose()?
-                .unwrap_or_default(),
-            conflict_path: path_text(&unique_sibling(&target, "conflict"))?,
-            pre_image_hash: preimage,
-            proposed_hash,
-        };
-
-        let quarantine = self.quarantine_snapshot();
-        let mut publication = quarantine.admit_publication(&mut store).map_err(invalid)?;
-        let group = publication
-            .record_group(kind, basis, &[plan])
-            .map_err(invalid)?;
-        if let (Some(temp), Some(bytes)) = (temp.as_deref(), proposed.as_deref()) {
-            write_planned_temp(temp, bytes).map_err(invalid)?;
-        }
-        publication.arm_group(group.group_id).map_err(invalid)?;
-        let intent = group.child_intents[0];
-        let installed = match (preimage, proposed.as_ref()) {
-            (Some(_), Some(_)) => publication
-                .resume_group_replace(intent, &target)
-                .map(|outcome| outcome == RenameAsideOutcome::Installed),
-            (Some(_), None) => publication
-                .resume_group_delete(intent, &target)
-                .map(|outcome| outcome == DeletionRecoveryOutcome::Deleted),
-            (None, Some(_)) => publication
-                .resume_group_create(intent)
-                .map(|outcome| outcome == CreationRecoveryOutcome::Installed),
-            (None, None) => unreachable!("a new empty bundle is never planned"),
+        match proposed.as_deref() {
+            Some(bytes) => atomic_write_expecting(&target, bytes, preimage.into()),
+            None => remove_expecting(&target, preimage.into()),
         }
         .map_err(invalid)?;
-        publication.retire_group(group.group_id).map_err(invalid)?;
-        if !installed {
-            return Err(invalid(
-                "authoring publication raced with an external edit; every observed inode was preserved",
-            ));
-        }
-        drop(publication);
         drop(store);
 
         publish_incremental_paths(
@@ -665,41 +556,6 @@ fn infer_primary(bundle: &mut Bundle) -> Result<(), RpcFailure> {
     Ok(())
 }
 
-fn encode_write_basis(base: InputVersion, operations: &[AuthoringOp]) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
-    encoder.u64(base.0);
-    encoder.u32(operations.len() as u32);
-    for operation in operations {
-        match operation {
-            AuthoringOp::Set(entry) => {
-                encoder.u8(1);
-                encoder.raw(&entry.uuid.0);
-                encoder.raw(&entry.bundle.0);
-                encoder.str(&entry.local_id);
-                encoder.raw(&entry.schema_hash.0);
-            }
-            AuthoringOp::Remove { uuid } => {
-                encoder.u8(2);
-                encoder.raw(&uuid.0);
-            }
-        }
-    }
-    encoder.into_bytes()
-}
-
-fn path_text(path: &Path) -> Result<String, RpcFailure> {
-    path.to_str().map(str::to_owned).ok_or_else(|| {
-        invalid(format!(
-            "journal path is not lossless UTF-8: {}",
-            path.display()
-        ))
-    })
-}
-
-fn empty_hash() -> ContentHash {
-    ContentHash(*blake3::hash(b"").as_bytes())
-}
-
 pub(crate) fn invalid(error: impl std::fmt::Display) -> RpcFailure {
     RpcFailure::InvalidAuthoringRequest {
         detail: error.to_string(),
@@ -709,7 +565,6 @@ pub(crate) fn invalid(error: impl std::fmt::Display) -> RpcFailure {
 #[derive(Debug)]
 pub enum AuthoringServiceInitError {
     Scan(ScanError),
-    Quarantine(QuarantineError),
 }
 
 impl std::fmt::Display for AuthoringServiceInitError {
@@ -723,11 +578,5 @@ impl std::error::Error for AuthoringServiceInitError {}
 impl From<ScanError> for AuthoringServiceInitError {
     fn from(error: ScanError) -> Self {
         Self::Scan(error)
-    }
-}
-
-impl From<QuarantineError> for AuthoringServiceInitError {
-    fn from(error: QuarantineError) -> Self {
-        Self::Quarantine(error)
     }
 }

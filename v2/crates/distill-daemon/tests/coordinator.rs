@@ -277,11 +277,7 @@ fn coordinator(temp: &tempfile::TempDir) -> DaemonCoordinator {
     std::fs::create_dir_all(&assets).unwrap();
     DaemonCoordinator::open(
         StoreConfig::new(temp.path().join(".distill")),
-        vec![AssetRoot::new(
-            "main",
-            &assets,
-            assets.join(".distill-displaced"),
-        )],
+        vec![AssetRoot::new("main", &assets)],
         vec![target()],
         64,
     )

@@ -319,7 +319,6 @@ enum WatcherCommand {
     },
     ReplaceAssetRoots {
         assets: BTreeSet<PathBuf>,
-        quarantine: BTreeSet<PathBuf>,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     Stop,
@@ -351,12 +350,11 @@ impl WatcherControl {
     /// requests one catch-up scan: the candidate scan that installed them
     /// ran before this coverage.
     pub(crate) fn replace_roots(&self, scanner: &RootedScanner) -> Result<(), String> {
-        let (assets, quarantine) = scanner.watch_coverage();
+        let assets = scanner.watch_coverage();
         let (reply, result) = mpsc::sync_channel(1);
         self.commands
             .send(WatcherCommand::ReplaceAssetRoots {
                 assets: assets.into_iter().collect(),
-                quarantine: quarantine.into_iter().collect(),
                 reply,
             })
             .map_err(|_| "native watcher control thread stopped".to_owned())?;
@@ -369,7 +367,6 @@ impl WatcherControl {
 #[derive(Debug, Default)]
 struct WatchCoverage {
     asset_roots: BTreeSet<PathBuf>,
-    quarantine_prefixes: BTreeSet<PathBuf>,
     control_paths: ControlPathMap,
 }
 
@@ -383,10 +380,6 @@ struct ControlCoverage {
 impl WatchCoverage {
     fn asset_path(&self, path: &Path) -> bool {
         self.asset_roots.iter().any(|root| path.starts_with(root))
-            && !self
-                .quarantine_prefixes
-                .iter()
-                .any(|quarantine| path.starts_with(quarantine))
     }
 }
 
@@ -397,14 +390,11 @@ impl WatcherThread {
         sink: WatcherSink,
     ) -> Result<Self, WatcherStartError> {
         let control_paths = control_paths.into_iter().collect::<BTreeSet<_>>();
-        let (asset_roots, quarantine_prefixes) = scanner.watch_coverage();
-        let asset_roots = asset_roots.into_iter().collect::<BTreeSet<_>>();
-        let quarantine_prefixes = quarantine_prefixes.into_iter().collect::<BTreeSet<_>>();
+        let asset_roots = scanner.watch_coverage().into_iter().collect::<BTreeSet<_>>();
         let initial_control = control_coverage(&control_paths)
             .map_err(|message| WatcherStartError::Thread(std::io::Error::other(message)))?;
         let mut coverage = WatchCoverage {
             asset_roots: asset_roots.clone(),
-            quarantine_prefixes,
             control_paths: initial_control.paths,
         };
         let (commands, command_rx) = mpsc::channel();
@@ -465,14 +455,8 @@ impl WatcherThread {
                             });
                             let _ = reply.send(result);
                         }
-                        Ok(WatcherCommand::ReplaceAssetRoots {
-                            assets,
-                            quarantine,
-                            reply,
-                        }) => {
-                            if assets == watched_assets
-                                && quarantine == coverage.quarantine_prefixes
-                            {
+                        Ok(WatcherCommand::ReplaceAssetRoots { assets, reply }) => {
+                            if assets == watched_assets {
                                 let _ = reply.send(Ok(()));
                                 continue;
                             }
@@ -492,7 +476,6 @@ impl WatcherThread {
                             }
                             watched_assets = assets.clone();
                             coverage.asset_roots = assets;
-                            coverage.quarantine_prefixes = quarantine;
                             // The candidate scan preceded watcher
                             // reconfiguration. Force one armed catch-up scan
                             // to cover that bounded gap.

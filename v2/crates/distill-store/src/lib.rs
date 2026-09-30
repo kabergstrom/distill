@@ -18,7 +18,6 @@ pub mod error;
 pub mod errors;
 pub mod files;
 pub mod imports;
-pub mod journal;
 pub mod pipeline;
 pub mod served;
 pub mod state;

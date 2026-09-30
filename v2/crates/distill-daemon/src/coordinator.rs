@@ -177,7 +177,7 @@ impl DaemonCoordinator {
                     Arc::clone(&store),
                     roots,
                     scanner.clone(),
-                )?);
+                ));
                 Ok((store, backend))
             })
             .expect("the authority runs while its coordinator opens")?;
@@ -440,16 +440,6 @@ impl DaemonCoordinator {
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
             self.server().restart_required(Vec::new());
             Ok(())
-        })
-    }
-
-    /// Run §14's journaled displaced-inode retention sweep using the current
-    /// operational-live retention window.
-    pub fn sweep_displaced_retention(&self, now_secs: i64) -> Result<usize, CoordinatorError> {
-        self.on_authority(|| {
-            self.store.write()
-                .sweep_displaced(now_secs)
-                .map_err(|error| CoordinatorError::Maintenance(error.to_string()))
         })
     }
 
@@ -1567,7 +1557,7 @@ impl DaemonCoordinator {
     }
 
     /// Discover and apply authored directory-import rules. Every generated
-    /// bundle is a separate journaled/versioned fold; orphaned prior outputs
+    /// bundle is a separate versioned fold; orphaned prior outputs
     /// are deliberately retained and therefore never appear as deletion work.
     pub fn reconcile_directory_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let tasks = self
@@ -3818,11 +3808,7 @@ mod scheduler_tests {
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 config,
-                vec![AssetRoot::new(
-                    "main",
-                    &assets,
-                    assets.join(".distill-displaced"),
-                )],
+                vec![AssetRoot::new("main", &assets)],
                 Vec::new(),
                 8,
             )
@@ -3878,11 +3864,7 @@ mod scheduler_tests {
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 config.clone(),
-                vec![AssetRoot::new(
-                    "main",
-                    &assets,
-                    assets.join(".distill-displaced"),
-                )],
+                vec![AssetRoot::new("main", &assets)],
                 Vec::new(),
                 8,
             )

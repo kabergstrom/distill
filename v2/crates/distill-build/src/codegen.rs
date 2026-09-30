@@ -2,9 +2,9 @@
 //!
 //! Generation happens against a pinned basis and returns its complete
 //! outcome-bearing dependency trace.  This coordinator is deliberately
-//! independent of filesystem mechanics: the daemon publisher owns the §14
-//! journaled rename-aside transaction, while this module prevents a stale attempt or
-//! a colliding namespace from reaching that transaction.
+//! independent of filesystem mechanics: the daemon publisher owns the atomic
+//! file writes, while this module keeps a stale attempt or a colliding
+//! namespace from reaching them.
 
 use std::collections::BTreeMap;
 
@@ -77,9 +77,9 @@ impl std::fmt::Display for PublicationError {
 
 impl std::error::Error for PublicationError {}
 
-/// The implementation must publish the complete slice transactionally. It is
-/// passed the attempted basis so the daemon can repeat the basis fence inside
-/// the same transaction that journals and publishes the files.
+/// The implementation must publish the complete slice. It is passed the
+/// attempted basis so the daemon can repeat the basis fence while it holds
+/// the store and writes the files.
 pub trait CodegenPublisher<B> {
     fn publish(
         &mut self,

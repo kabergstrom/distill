@@ -29,19 +29,13 @@ use unicode_normalization::{is_nfc, UnicodeNormalization};
 pub struct AssetRoot {
     pub name: String,
     pub path: PathBuf,
-    pub quarantine_dir: PathBuf,
 }
 
 impl AssetRoot {
-    pub fn new(
-        name: impl Into<String>,
-        path: impl Into<PathBuf>,
-        quarantine_dir: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
             name: name.into(),
             path: path.into(),
-            quarantine_dir: quarantine_dir.into(),
         }
     }
 }
@@ -205,7 +199,6 @@ pub enum DaemonOwnedDirectoryKind {
     ModuleStaging,
     PackageOutput,
     CodegenOutput,
-    Quarantine,
 }
 
 impl std::fmt::Display for DaemonOwnedDirectoryKind {
@@ -215,7 +208,6 @@ impl std::fmt::Display for DaemonOwnedDirectoryKind {
             Self::ModuleStaging => "pipeline module staging",
             Self::PackageOutput => "package output",
             Self::CodegenOutput => "codegen output",
-            Self::Quarantine => "quarantine",
         };
         formatter.write_str(name)
     }
@@ -782,7 +774,6 @@ fn encode_diagnostic(diagnostic: &ScanDiagnostic) -> Vec<u8> {
                 DaemonOwnedDirectoryKind::ModuleStaging => 1,
                 DaemonOwnedDirectoryKind::PackageOutput => 2,
                 DaemonOwnedDirectoryKind::CodegenOutput => 3,
-                DaemonOwnedDirectoryKind::Quarantine => 4,
             });
         }
         ScanDiagnostic::DirectoryCycle {
@@ -815,7 +806,6 @@ fn decode_diagnostic(bytes: &[u8]) -> Option<ScanDiagnostic> {
                 [1] => DaemonOwnedDirectoryKind::ModuleStaging,
                 [2] => DaemonOwnedDirectoryKind::PackageOutput,
                 [3] => DaemonOwnedDirectoryKind::CodegenOutput,
-                [4] => DaemonOwnedDirectoryKind::Quarantine,
                 _ => return None,
             };
             Some(ScanDiagnostic::DaemonOwnedDirectoryAlias {
@@ -900,19 +890,10 @@ impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
         let roots = roots.into_iter().collect::<Vec<_>>();
         let daemon_owned = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-        let scanner = Self {
-            roots: Arc::new(ArcSwap::from_pointee(canonicalize_roots(roots.clone())?)),
+        Ok(Self {
+            roots: Arc::new(ArcSwap::from_pointee(canonicalize_roots(roots)?)),
             daemon_owned,
-        };
-        for root in roots {
-            if root.quarantine_dir.is_dir() {
-                scanner.retain_daemon_owned_directory(
-                    DaemonOwnedDirectoryKind::Quarantine,
-                    root.quarantine_dir,
-                )?;
-            }
-        }
-        Ok(scanner)
+        })
     }
 
     pub(crate) fn candidate_with_roots(
@@ -974,16 +955,7 @@ impl RootedScanner {
         &self,
         roots: impl IntoIterator<Item = AssetRoot>,
     ) -> Result<(), ScanError> {
-        let roots = roots.into_iter().collect::<Vec<_>>();
-        let replacement = self.candidate_with_roots(roots.clone())?;
-        for root in roots {
-            if root.quarantine_dir.is_dir() {
-                self.retain_daemon_owned_directory(
-                    DaemonOwnedDirectoryKind::Quarantine,
-                    root.quarantine_dir,
-                )?;
-            }
-        }
+        let replacement = self.candidate_with_roots(roots)?;
         self.replace_from(&replacement);
         Ok(())
     }
@@ -1005,28 +977,11 @@ impl RootedScanner {
 
     /// Canonical configured roots to hand to the native watcher. Every
     /// delivered path is re-observed and checked against these roots.
-    /// Native-watch roots and the daemon-owned quarantine prefixes nested
-    /// beneath them. The watcher filters the latter before queue admission;
-    /// scanner canonical containment remains the defense-in-depth boundary.
-    pub(crate) fn watch_coverage(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let roots = self.root_snapshot();
-        let watched = roots
+    pub(crate) fn watch_coverage(&self) -> Vec<PathBuf> {
+        self.root_snapshot()
             .values()
             .map(|root| root.canonical_path.clone())
-            .collect();
-        let excluded = roots
-            .values()
-            .map(|root| {
-                root.configured
-                    .quarantine_dir
-                    .strip_prefix(&root.configured.path)
-                    .map_or_else(
-                        |_| root.configured.quarantine_dir.clone(),
-                        |suffix| root.canonical_path.join(suffix),
-                    )
-            })
-            .collect();
-        (watched, excluded)
+            .collect()
     }
 
     /// Translate one native invalidation path to the canonical rooted key
@@ -1413,9 +1368,6 @@ fn scan_pending(
         };
         let identity = file_identity(&metadata);
         if let Some(retained) = daemon_owned.get(&canonical_path) {
-            if retained.kind == DaemonOwnedDirectoryKind::Quarantine {
-                continue;
-            }
             record_daemon_owned_diagnostic(
                 &mut snapshot,
                 &pending.root_name,
@@ -1517,9 +1469,6 @@ fn scan_pending(
             let guard = EntryGuard::new(&physical, &opened);
             if opened.metadata.is_dir() {
                 if let Some(retained) = &opened.daemon_owned {
-                    if retained.kind == DaemonOwnedDirectoryKind::Quarantine {
-                        continue;
-                    }
                     record_daemon_owned_diagnostic(
                         &mut snapshot,
                         &pending.root_name,
@@ -1876,15 +1825,7 @@ fn scan_path_components(
         }
         if let Some(retained) = &opened.daemon_owned {
             let mut snapshot = ScanSnapshot::default();
-            if retained.kind != DaemonOwnedDirectoryKind::Quarantine {
-                record_daemon_owned_diagnostic(
-                    &mut snapshot,
-                    root_name,
-                    &relative,
-                    &physical,
-                    retained,
-                );
-            }
+            record_daemon_owned_diagnostic(&mut snapshot, root_name, &relative, &physical, retained);
             return Ok(Some(snapshot));
         }
         ancestry.insert(parent_canonical_path);

@@ -18,10 +18,6 @@ fn open_creates_the_state_layout() {
     assert!(config.state_path.join("meta.sqlite").is_file());
     assert!(config.state_path.join("cas").is_dir());
     assert!(config.state_path.join("cas/CURRENT").is_file());
-    assert!(
-        !config.state_path.join("displaced").exists(),
-        "quarantine is per watched/output filesystem, never centralized under state_path"
-    );
 }
 
 #[test]
@@ -171,7 +167,6 @@ fn sqlite_runs_in_wal_mode() {
 #[test]
 fn config_defaults_match_section_18() {
     let config = StoreConfig::new("/tmp/x");
-    assert_eq!(config.displaced_retention_days, 7);
     assert_eq!(config.segment_size, 256 * 1024 * 1024);
     assert_eq!(config.cache_limit, 20 * 1024 * 1024 * 1024);
     assert_eq!(config.parallelism, 8);

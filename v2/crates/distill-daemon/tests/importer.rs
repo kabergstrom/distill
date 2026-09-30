@@ -217,11 +217,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     std::fs::write(assets.join("source.txt"), b"7").unwrap();
     let coordinator = DaemonCoordinator::open(
         StoreConfig::new(temp.path().join(".distill")),
-        vec![AssetRoot::new(
-            "main",
-            &assets,
-            assets.join(".distill-displaced"),
-        )],
+        vec![AssetRoot::new("main", &assets)],
         vec![target()],
         64,
     )
@@ -405,11 +401,7 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     std::fs::write(assets.join("foo.src"), b"9").unwrap();
     let coordinator = DaemonCoordinator::open(
         StoreConfig::new(temp.path().join(".distill")),
-        vec![AssetRoot::new(
-            "main",
-            &assets,
-            assets.join(".distill-displaced"),
-        )],
+        vec![AssetRoot::new("main", &assets)],
         vec![target()],
         64,
     )

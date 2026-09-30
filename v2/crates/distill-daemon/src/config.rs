@@ -35,7 +35,6 @@ pub struct DaemonConfig {
 pub struct DaemonSection {
     pub address: SocketAddr,
     pub state_path: PathBuf,
-    pub displaced_retention_days: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,12 +146,6 @@ struct RawConfig {
 struct RawDaemon {
     address: String,
     state_path: PathBuf,
-    #[serde(default = "default_retention")]
-    displaced_retention_days: u32,
-}
-
-const fn default_retention() -> u32 {
-    7
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,7 +265,6 @@ impl DaemonConfig {
 
         let scheduler = StoreConfig {
             state_path: state_path.clone(),
-            displaced_retention_days: raw.daemon.displaced_retention_days,
             segment_size: 1,
             cache_limit: 1,
             parallelism: raw.pipeline.parallelism,
@@ -298,7 +290,6 @@ impl DaemonConfig {
             daemon: DaemonSection {
                 address,
                 state_path,
-                displaced_retention_days: raw.daemon.displaced_retention_days,
             },
             assets: AssetsSection {
                 roots,
@@ -355,7 +346,6 @@ impl DaemonConfig {
     pub fn store_config(&self) -> StoreConfig {
         StoreConfig {
             state_path: self.daemon.state_path.clone(),
-            displaced_retention_days: self.daemon.displaced_retention_days,
             segment_size: self.cas.segment_size,
             cache_limit: self.cas.cache_limit,
             parallelism: self.pipeline.parallelism,
@@ -367,7 +357,7 @@ impl DaemonConfig {
         self.assets
             .roots
             .iter()
-            .map(|(name, path)| AssetRoot::new(name, path, path.join(".distill-displaced")))
+            .map(|(name, path)| AssetRoot::new(name, path))
             .collect()
     }
 
@@ -944,7 +934,6 @@ mod tests {
             daemon: RawDaemon {
                 address: "127.0.0.1:0".to_owned(),
                 state_path: temp.path().join("state"),
-                displaced_retention_days: 7,
             },
             assets: RawAssets {
                 roots: BTreeMap::from([("main".to_owned(), assets)]),

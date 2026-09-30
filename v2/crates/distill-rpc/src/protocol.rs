@@ -12,7 +12,7 @@ pub use distill_store::state::{
     SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
 };
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);
@@ -455,10 +455,6 @@ pub struct RenameWithFixupsRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorRequest {
     Verify,
-    /// Explicitly remove every currently retained displaced inode while
-    /// preserving its audit row. This is distinct from the normal retention
-    /// sweep.
-    Clean,
     RebuildIndexes,
 }
 
@@ -511,7 +507,6 @@ impl DoctorRequest {
         let mut reader = OperationPayloadReader::new(bytes)?;
         let request = match reader.u8()? {
             1 => Self::Verify,
-            2 => Self::Clean,
             3 => Self::RebuildIndexes,
             tag => return Err(OperationPayloadError::InvalidTag(tag)),
         };
@@ -522,7 +517,6 @@ impl DoctorRequest {
     const fn tag(self) -> u8 {
         match self {
             Self::Verify => 1,
-            Self::Clean => 2,
             Self::RebuildIndexes => 3,
         }
     }

@@ -1,5 +1,5 @@
 //! Long-lived daemon infrastructure: pipeline-module epochs, cooperative
-//! scheduling, code-loading policy, and displaced-inode quarantine.
+//! scheduling, code-loading policy.
 
 // The system allocator is installed by distill-pipeline-api.
 
@@ -19,7 +19,6 @@ mod operations;
 pub mod pack_command;
 mod pipeline_map;
 pub mod process;
-pub mod quarantine;
 pub mod scanner;
 pub mod scheduler;
 pub mod store_cell;

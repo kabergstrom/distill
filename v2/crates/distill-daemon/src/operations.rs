@@ -5,12 +5,10 @@
 //! cannot strand the durable store ahead of the RPC coordinator.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use distill_bundle::Bundle;
-use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::ContentHash;
 use distill_json::AuthoredValue;
 use distill_rpc::{
@@ -19,17 +17,12 @@ use distill_rpc::{
     RenameWithFixupsRequest, RpcFailure,
 };
 use distill_schema::ngp_schema::SchemaNode;
-use distill_store::journal::{
-    CreationRecoveryOutcome, DeletionRecoveryOutcome, JournalIntentPlan, PublicationGroupKind,
-    RenameAsideOutcome,
-};
 
 use crate::store_cell::AuthorityStore;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::coordinator::publish_incremental_paths;
-use crate::atomic::{plan_same_dir_temp, unique_sibling, write_planned_temp};
+use crate::atomic::{atomic_write_expecting, remove_expecting, AtomicWriteError};
 use crate::pipeline_map::PipelineProjection;
-use crate::quarantine::QuarantineDriver;
 use crate::scanner::RootedScanner;
 
 impl AuthoringService {
@@ -41,7 +34,6 @@ impl AuthoringService {
         let runtime = OperationRuntime {
             store: Arc::clone(&self.store),
             scanner: self.scanner.clone(),
-            quarantine: self.quarantine_snapshot(),
             pipeline_projection: self.pipeline_projection(),
             tag_index_coordinator: self
                 .tag_index_coordinator()
@@ -58,8 +50,6 @@ impl AuthoringService {
                     &request.destination_path,
                 )?;
                 PlannedOperation::Files {
-                    kind: PublicationGroupKind::AuthoringWrite,
-                    basis: encode_rename_basis(base, &request),
                     files: self.plan_rename_with_fixups(base, &request)?,
                     failures: Vec::new(),
                 }
@@ -194,15 +184,12 @@ impl AuthoringService {
 struct OperationRuntime {
     store: Arc<AuthorityStore>,
     scanner: RootedScanner,
-    quarantine: QuarantineDriver,
     pipeline_projection: PipelineProjection,
     tag_index_coordinator: Weak<crate::coordinator::DaemonCoordinator>,
 }
 
 enum PlannedOperation {
     Files {
-        kind: PublicationGroupKind,
-        basis: Vec<u8>,
         files: Vec<OperationFile>,
         failures: Vec<String>,
     },
@@ -220,14 +207,9 @@ struct DeferredAuthoringOperation {
 impl DeferredOperation for DeferredAuthoringOperation {
     fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String> {
         match &self.planned {
-            PlannedOperation::Files {
-                kind,
-                basis,
-                files,
-                failures,
-            } => self
-                .runtime
-                .publish_files(base, *kind, basis, files, failures),
+            PlannedOperation::Files { files, failures } => {
+                self.runtime.publish_files(base, files, failures)
+            }
             PlannedOperation::Doctor {
                 request,
                 build_requests,
@@ -240,8 +222,6 @@ impl OperationRuntime {
     fn publish_files(
         &self,
         base: InputVersion,
-        kind: PublicationGroupKind,
-        basis: &[u8],
         files: &[OperationFile],
         initial_failures: &[String],
     ) -> Result<DeferredOperationResult, String> {
@@ -251,77 +231,23 @@ impl OperationRuntime {
                 (!initial_failures.is_empty()).then(|| initial_failures.join("; ")),
             );
         }
-        let mut store = self
-            .store
-            .write();
+        let store = self.store.write();
         require_base(&store, base).map_err(|error| format!("{error:?}"))?;
-        let mut staged = Vec::with_capacity(files.len());
-        for file in files {
-            let temp = file
-                .proposed
-                .as_ref()
-                .map(|_| plan_same_dir_temp(&file.target))
-                .transpose()?;
-            staged.push(temp);
-        }
-        let plans = files
-            .iter()
-            .zip(&staged)
-            .map(|(file, temp)| {
-                Ok(JournalIntentPlan {
-                    target_path: path_text(&file.target)?,
-                    temp_path: temp
-                        .as_deref()
-                        .map(path_text)
-                        .transpose()?
-                        .unwrap_or_default(),
-                    conflict_path: path_text(&unique_sibling(&file.target, "conflict"))?,
-                    pre_image_hash: file.preimage,
-                    proposed_hash: file.proposed_hash(),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let mut publication = self
-            .quarantine
-            .admit_publication(&mut store)
-            .map_err(|error| error.to_string())?;
-        let group = publication
-            .record_group(kind, basis, &plans)
-            .map_err(|error| error.to_string())?;
-        for (file, temp) in files.iter().zip(&staged) {
-            if let (Some(bytes), Some(temp)) = (file.proposed.as_deref(), temp.as_deref()) {
-                write_planned_temp(temp, bytes)?;
-            }
-        }
-        publication
-            .arm_group(group.group_id)
-            .map_err(|error| error.to_string())?;
         let mut failures = initial_failures.to_vec();
-        for (file, intent) in files.iter().zip(&group.child_intents) {
-            let installed = match (&file.preimage, &file.proposed) {
-                (Some(_), Some(_)) => publication
-                    .resume_group_replace(*intent, &file.target)
-                    .map(|outcome| outcome == RenameAsideOutcome::Installed),
-                (Some(_), None) => publication
-                    .resume_group_delete(*intent, &file.target)
-                    .map(|outcome| outcome == DeletionRecoveryOutcome::Deleted),
-                (None, Some(_)) => publication
-                    .resume_group_create(*intent)
-                    .map(|outcome| outcome == CreationRecoveryOutcome::Installed),
-                (None, None) => unreachable!("operation file always changes an inode"),
-            }
-            .map_err(|error| error.to_string())?;
-            if !installed {
-                failures.push(format!(
-                    "{} changed concurrently; its observed inode was preserved",
-                    file.target.display()
-                ));
+        for file in files {
+            let expected = file.preimage.into();
+            let changed = match file.proposed.as_deref() {
+                Some(bytes) => atomic_write_expecting(&file.target, bytes, expected),
+                None => remove_expecting(&file.target, expected),
+            };
+            match changed {
+                Ok(()) => {}
+                Err(conflict @ AtomicWriteError::Conflict { .. }) => {
+                    failures.push(conflict.to_string())
+                }
+                Err(error) => return Err(error.to_string()),
             }
         }
-        publication
-            .retire_group(group.group_id)
-            .map_err(|error| error.to_string())?;
-        drop(publication);
         drop(store);
         let changed_paths = files
             .iter()
@@ -399,7 +325,7 @@ impl OperationRuntime {
         } else {
             Vec::new()
         };
-        let mut store = self
+        let store = self
             .store
             .write();
         require_base(&store, base).map_err(|error| format!("{error:?}"))?;
@@ -407,10 +333,6 @@ impl OperationRuntime {
             DoctorRequest::Verify => {
                 store
                     .verify_all_cas_extents()
-                    .map_err(|error| error.to_string())?;
-                let recovered = self
-                    .quarantine
-                    .doctor_verify(&store)
                     .map_err(|error| error.to_string())?;
                 let mut defects = Vec::new();
                 if filesystem_mismatch {
@@ -432,23 +354,7 @@ impl OperationRuntime {
                     ));
                 }
                 defects.extend(build_defects);
-                if !recovered.is_empty() {
-                    defects.push(format!(
-                        "{} recovered edit(s) require attention",
-                        recovered.len()
-                    ));
-                }
                 (!defects.is_empty()).then(|| defects.join("; "))
-            }
-            DoctorRequest::Clean => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|error| error.to_string())?
-                    .as_secs() as i64;
-                store
-                    .clean_all_displaced(now)
-                    .map_err(|error| error.to_string())?;
-                None
             }
             DoctorRequest::RebuildIndexes => {
                 store.rebuild_indexes().map_err(|error| error.to_string())?;
@@ -509,9 +415,6 @@ impl OperationFile {
         }
     }
 
-    fn proposed_hash(&self) -> ContentHash {
-        ContentHash(*blake3::hash(self.proposed.as_deref().unwrap_or_default()).as_bytes())
-    }
 }
 
 fn rewrite_bundle_path_references(
@@ -627,33 +530,13 @@ fn validate_rooted_destination(
     scanner.physical_path(root, path).map(drop).map_err(invalid)
 }
 
-fn encode_rename_basis(base: InputVersion, request: &RenameWithFixupsRequest) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
-    encoder.u64(base.0);
-    encoder.raw(&request.bundle.0);
-    encoder.str(&request.destination_root);
-    encoder.str(&request.destination_path);
-    encoder.into_bytes()
-}
-
 fn operation_summary(operation: &PlannedOperation) -> String {
     match operation {
-        PlannedOperation::Files {
-            kind,
-            files,
-            failures,
-            ..
-        } => format!(
-            "{kind:?}: {} file(s), {} per-file failure(s)",
+        PlannedOperation::Files { files, failures } => format!(
+            "rename: {} file(s), {} per-file failure(s)",
             files.len(),
             failures.len()
         ),
         PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
     }
-}
-
-fn path_text(path: &Path) -> Result<String, String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("path is not lossless UTF-8: {}", path.display()))
 }

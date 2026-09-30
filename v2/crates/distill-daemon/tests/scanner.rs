@@ -35,11 +35,7 @@ fn ordinary_bundle() -> Vec<u8> {
 fn scanner(temp: &tempfile::TempDir) -> RootedScanner {
     let root = temp.path().join("assets");
     std::fs::create_dir_all(&root).unwrap();
-    RootedScanner::new([AssetRoot::new(
-        "main",
-        &root,
-        root.join(".distill-displaced"),
-    )])
+    RootedScanner::new([AssetRoot::new("main", &root)])
     .unwrap()
 }
 
@@ -172,19 +168,11 @@ fn replacement_roots_are_shared_by_existing_scanner_clones() {
     std::fs::write(first.join("old.txt"), b"old").unwrap();
     std::fs::write(second.join("new.txt"), b"new").unwrap();
 
-    let scanner = RootedScanner::new([AssetRoot::new(
-        "main",
-        &first,
-        first.join(".distill-displaced"),
-    )])
+    let scanner = RootedScanner::new([AssetRoot::new("main", &first)])
     .unwrap();
     let watcher_view = scanner.clone();
     scanner
-        .replace_roots([AssetRoot::new(
-            "main",
-            &second,
-            second.join(".distill-displaced"),
-        )])
+        .replace_roots([AssetRoot::new("main", &second)])
         .unwrap();
 
     let scan = watcher_view.scan().unwrap();
@@ -202,8 +190,8 @@ fn same_canonical_directory_under_two_roots_is_never_tiebroken() {
     let root = temp.path().join("assets");
     std::fs::create_dir_all(&root).unwrap();
     let scanner = RootedScanner::new([
-        AssetRoot::new("first", &root, root.join(".q1")),
-        AssetRoot::new("second", &root, root.join(".q2")),
+        AssetRoot::new("first", &root),
+        AssetRoot::new("second", &root),
     ])
     .unwrap();
 
@@ -429,11 +417,7 @@ fn canonical_error_path_maps_to_exact_subject_under_symlinked_root() {
     let configured = temp.path().join("assets");
     std::fs::create_dir_all(real.join("nested")).unwrap();
     symlink(&real, &configured).unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new(
-        "main",
-        &configured,
-        real.join(".distill-displaced"),
-    )])
+    let scanner = RootedScanner::new([AssetRoot::new("main", &configured)])
     .unwrap();
     let canonical = std::fs::canonicalize(&real).unwrap();
 
@@ -488,8 +472,8 @@ fn full_scan_aggregates_independent_root_defects() {
     )
     .unwrap();
     let scanner = RootedScanner::new([
-        AssetRoot::new("first", &first, first.join(".q")),
-        AssetRoot::new("second", &second, second.join(".q")),
+        AssetRoot::new("first", &first),
+        AssetRoot::new("second", &second),
     ])
     .unwrap();
 

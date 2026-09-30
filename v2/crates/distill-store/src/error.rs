@@ -132,22 +132,6 @@ pub enum StoreError {
     Pinned { hash: [u8; 32] },
     /// A malformed result payload (decode failure on lookup or rebuild).
     BadResultPayload { detail: String },
-    /// The write-intent journal was asked about an intent it never
-    /// recorded, or an intent transitioned illegally.
-    BadIntent { intent_id: i64, detail: String },
-    /// A quarantine destination is not on the displaced inode's
-    /// filesystem; copying would lose open-descriptor preservation.
-    CrossFilesystemQuarantine {
-        source: PathBuf,
-        quarantine: PathBuf,
-    },
-    /// Journaled deletion found bytes other than its expected pre-image
-    /// and restored/preserved them instead of publishing deletion.
-    DeleteConflict {
-        intent_id: i64,
-        expected: [u8; 32],
-        actual: [u8; 32],
-    },
 }
 
 impl fmt::Display for StoreError {
@@ -275,21 +259,6 @@ impl fmt::Display for StoreError {
             StoreError::BadResultPayload { detail } => {
                 write!(f, "malformed result payload: {detail}")
             }
-            StoreError::BadIntent { intent_id, detail } => {
-                write!(f, "write intent {intent_id}: {detail}")
-            }
-            StoreError::CrossFilesystemQuarantine { source, quarantine } => write!(
-                f,
-                "quarantine {} is on a different filesystem from displaced inode {}",
-                quarantine.display(),
-                source.display()
-            ),
-            StoreError::DeleteConflict { intent_id, expected, actual } => write!(
-                f,
-                "delete intent {intent_id} displaced bytes {} instead of expected {} and was restored",
-                hex(actual),
-                hex(expected)
-            ),
         }
     }
 }

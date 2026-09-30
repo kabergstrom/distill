@@ -2517,16 +2517,17 @@ fn long_running_operation_payloads_are_canonical_and_closed() {
         rename
     );
 
-    for request in [
-        DoctorRequest::Verify,
-        DoctorRequest::Clean,
-        DoctorRequest::RebuildIndexes,
-    ] {
+    for request in [DoctorRequest::Verify, DoctorRequest::RebuildIndexes] {
         assert_eq!(DoctorRequest::decode(&request.encode()).unwrap(), request);
     }
     assert_eq!(
         DoctorRequest::decode(&[1, 99]),
         Err(OperationPayloadError::InvalidTag(99))
+    );
+    // Tag 2 was the retired displaced-inode clean.
+    assert_eq!(
+        DoctorRequest::decode(&[1, 2]),
+        Err(OperationPayloadError::InvalidTag(2))
     );
 }
 

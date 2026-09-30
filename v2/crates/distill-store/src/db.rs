@@ -20,7 +20,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 33;
+pub const SCHEMA_VERSION: u32 = 34;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -319,44 +319,6 @@ CREATE TABLE pins (
     PRIMARY KEY (kind, holder, content_hash)
 );
 CREATE INDEX pins_by_hash ON pins(content_hash);
-CREATE TABLE write_intents (
-    intent_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    target_path     TEXT NOT NULL,
-    temp_path       TEXT NOT NULL,
-    conflict_path   TEXT NOT NULL,
-    pre_image_hash  BLOB,
-    proposed_hash   BLOB NOT NULL,
-    rename_aside_state INTEGER NOT NULL DEFAULT 0
-        CHECK (rename_aside_state IN (0, 1, 2, 3, 4, 5, 6, 7)),
-    terminal_success INTEGER CHECK (terminal_success IN (0, 1)),
-    retired         INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE displaced (
-    displacement_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    intent_id       INTEGER NOT NULL,
-    ordinal         INTEGER NOT NULL,
-    content_hash    BLOB NOT NULL,
-    origin_path     TEXT NOT NULL,
-    quarantine_path TEXT NOT NULL UNIQUE,
-    quarantined_at  INTEGER NOT NULL,
-    restored        INTEGER NOT NULL DEFAULT 0,
-    cleaned_at      INTEGER,
-    cleanup_reason  TEXT,
-    UNIQUE(intent_id, ordinal)
-);
-CREATE TABLE publication_groups (
-    group_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 8),
-    basis       BLOB NOT NULL,
-    state       INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
-    retired     INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
-);
-CREATE TABLE publication_group_children (
-    group_id    INTEGER NOT NULL,
-    ordinal     INTEGER NOT NULL,
-    intent_id   INTEGER NOT NULL UNIQUE,
-    PRIMARY KEY (group_id, ordinal)
-);
 CREATE TABLE codegen_outputs (
     relative_path TEXT NOT NULL PRIMARY KEY,
     content_hash  BLOB NOT NULL CHECK (length(content_hash) = 32)
@@ -538,9 +500,8 @@ impl Store {
         let db_path = state_path.join("meta.sqlite");
         let conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
-        // FULL: every committed transaction is durable — §14's journal
-        // demands "fsynced before the first rename", and §13's index
-        // rows must never lead the segment fsync they follow.
+        // FULL: every committed transaction is durable; §13's index rows
+        // must never lead the segment fsync they follow.
         conn.pragma_update(None, "synchronous", "FULL")?;
 
         let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -811,15 +772,6 @@ impl Store {
             )?;
         }
         Ok(())
-    }
-
-    /// Writes that must be durable on their own (the publication journal,
-    /// ahead of the filesystem changes it records) cannot join an input.
-    pub(crate) fn assert_no_open_input(&self) {
-        assert!(
-            !matches!(self.input, InputState::Begun { .. }),
-            "a journal write cannot join an open input"
-        );
     }
 
     /// Attach memo state to an input basis without advancing any input

@@ -3,8 +3,6 @@
 //!
 //! - `daemon.state_path` — restart-only (relocation is stop,
 //!   move-or-rebuild, start).
-//! - `daemon.displaced_retention_days` — operational-live: applies at the
-//!   next retention sweep (§14).
 //! - `cas.segment_size` — operational-live: applies to newly rolled
 //!   segments only.
 //! - `cas.cache_limit` — operational-live: eviction policy shifts; the
@@ -35,8 +33,6 @@ type PersistedConfigurationRow = (
 pub struct StoreConfig {
     /// `daemon.state_path` — the `.distill/` directory.
     pub state_path: PathBuf,
-    /// `daemon.displaced_retention_days` (§14 quarantine window).
-    pub displaced_retention_days: u32,
     /// `cas.segment_size` — segments roll at this cap.
     pub segment_size: u64,
     /// `cas.cache_limit` — the eviction size cap.
@@ -52,7 +48,6 @@ impl StoreConfig {
     pub fn new(state_path: impl AsRef<Path>) -> Self {
         StoreConfig {
             state_path: state_path.as_ref().to_path_buf(),
-            displaced_retention_days: 7,
             segment_size: 256 * 1024 * 1024,
             cache_limit: 20 * 1024 * 1024 * 1024,
             parallelism: 8,
@@ -85,8 +80,7 @@ pub fn change_class(key: &str) -> Option<ChangeClass> {
         | "pipeline.max_dependency_depth"
         | "pipeline.batch_reserved_workers"
         | "cas.segment_size"
-        | "cas.cache_limit"
-        | "daemon.displaced_retention_days" => ChangeClass::OperationalLive,
+        | "cas.cache_limit" => ChangeClass::OperationalLive,
         "daemon.state_path" | "daemon.address" | "codegen.rs_mod_path" | "codegen.auto_codegen" => {
             ChangeClass::RestartOnly
         }
@@ -178,7 +172,6 @@ impl Store {
     ) -> Result<(), ConfigValidationError> {
         candidate.validate_scheduler()?;
         let config = std::sync::Arc::make_mut(&mut self.read.config);
-        config.displaced_retention_days = candidate.displaced_retention_days;
         config.segment_size = candidate.segment_size;
         config.cache_limit = candidate.cache_limit;
         config.parallelism = candidate.parallelism;

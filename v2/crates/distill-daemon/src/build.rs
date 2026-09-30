@@ -4212,11 +4212,7 @@ mod tests {
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 StoreConfig::new(temp.path().join("state")),
-                vec![AssetRoot::new(
-                    "main",
-                    &assets,
-                    assets.join(".distill-displaced"),
-                )],
+                vec![AssetRoot::new("main", &assets)],
                 vec![rpc_target(target_hash)],
                 64,
             )
@@ -4436,11 +4432,7 @@ mod tests {
         let coordinator = Arc::new(
             DaemonCoordinator::open(
                 StoreConfig::new(temp.path().join("state")),
-                vec![AssetRoot::new(
-                    "main",
-                    &assets,
-                    assets.join(".distill-displaced"),
-                )],
+                vec![AssetRoot::new("main", &assets)],
                 vec![rpc_target(target_hash)],
                 64,
             )

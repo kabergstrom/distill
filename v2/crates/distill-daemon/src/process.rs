@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -35,7 +35,8 @@ use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePa
 /// checks for a runtime pipeline failure or a drained retired epoch. The
 /// last two become authority messages when builds become jobs (phase 6).
 const DEBOUNCE: Duration = Duration::from_millis(40);
-const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// An idle daemon still runs a pass this often.
+const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub struct DaemonProcess {
     coordinator: Arc<DaemonCoordinator>,
@@ -146,7 +147,7 @@ impl DaemonProcess {
             errors,
             due: Some(Instant::now()),
             publications: 0,
-            next_retention_sweep: Instant::now() + RETENTION_SWEEP_INTERVAL,
+            next_idle_pass: Instant::now() + IDLE_PASS_INTERVAL,
         };
         // Startup runs on the authority before the loop: events the watcher
         // sends meanwhile wait in the inbox for the driver.
@@ -303,7 +304,7 @@ struct ProcessDriver {
     due: Option<Instant>,
     /// The server's publication count the last pass saw.
     publications: u64,
-    next_retention_sweep: Instant,
+    next_idle_pass: Instant,
 }
 
 impl ProcessDriver {
@@ -325,20 +326,6 @@ impl ProcessDriver {
         tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
         reconcile_imports(&self.coordinator, true, false)?;
         tracing::info!(elapsed = ?started.elapsed(), "startup imports reconciled");
-        self.coordinator.sweep_displaced_retention(unix_seconds())?;
-
-        let recovery_diagnostic = [
-            self.coordinator
-                .authoring_service()
-                .take_startup_recovery_diagnostic(),
-            self.codegen.take_startup_recovery_diagnostic(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        if !recovery_diagnostic.is_empty() {
-            self.errors.send_replace(Some(recovery_diagnostic.join("; ")));
-        }
         if let Err(error) = self.codegen.run(&self.coordinator) {
             self.errors.send_replace(Some(error));
         }
@@ -395,15 +382,7 @@ impl ProcessDriver {
             WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
         });
         let failure_result = coordinator.sync_runtime_pipeline_failure().map(|_| ());
-        let retention_result = if Instant::now() >= self.next_retention_sweep {
-            self.next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
-            coordinator
-                .sweep_displaced_retention(unix_seconds())
-                .map(|_| ())
-        } else {
-            Ok(())
-        };
-        let result = result.and(failure_result).and(retention_result);
+        let result = result.and(failure_result);
         let _ = coordinator.reap_retired_pipeline_epochs();
         match result {
             Err(error) => {
@@ -440,11 +419,12 @@ impl Driver for ProcessDriver {
 
     fn deadline(&self) -> Instant {
         self.due
-            .map_or(self.next_retention_sweep, |due| due.min(self.next_retention_sweep))
+            .map_or(self.next_idle_pass, |due| due.min(self.next_idle_pass))
     }
 
     fn fire(&mut self) -> bool {
         self.due = None;
+        self.next_idle_pass = Instant::now() + IDLE_PASS_INTERVAL;
         let keep = self.tick();
         self.publications = self.coordinator.server_handle().publication_count();
         if self.queue.has_pending() {
@@ -465,14 +445,6 @@ impl Driver for ProcessDriver {
             self.schedule(Instant::now());
         }
     }
-}
-
-fn unix_seconds() -> i64 {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    i64::try_from(seconds).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -928,7 +900,6 @@ fn input_configuration_changed(current: &DaemonConfig, candidate: &DaemonConfig)
 fn operational_configuration_changed(current: &DaemonConfig, candidate: &DaemonConfig) -> bool {
     current.pipeline != candidate.pipeline
         || current.cas != candidate.cas
-        || current.daemon.displaced_retention_days != candidate.daemon.displaced_retention_days
 }
 
 fn restart_changes(current: &DaemonConfig, candidate: &DaemonConfig) -> Vec<RestartOnlyChange> {
@@ -960,7 +931,6 @@ fn apply_live_values(active: &mut DaemonConfig, candidate: &DaemonConfig) {
     active.targets = candidate.targets.clone();
     active.pipeline = candidate.pipeline.clone();
     active.cas = candidate.cas.clone();
-    active.daemon.displaced_retention_days = candidate.daemon.displaced_retention_days;
 }
 
 fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {

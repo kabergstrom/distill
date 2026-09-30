@@ -170,11 +170,7 @@ fn native_watcher_reports_create_without_scanning() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");
     std::fs::create_dir(&root).unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new(
-        "main",
-        &root,
-        root.join(".distill-displaced"),
-    )])
+    let scanner = RootedScanner::new([AssetRoot::new("main", &root)])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let _watcher = WatcherThread::start(scanner, [], sink(&queue)).unwrap();
@@ -197,21 +193,13 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
     let second = temp.path().join("second");
     std::fs::create_dir(&first).unwrap();
     std::fs::create_dir(&second).unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new(
-        "main",
-        &first,
-        first.join(".distill-displaced"),
-    )])
+    let scanner = RootedScanner::new([AssetRoot::new("main", &first)])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let watcher = WatcherThread::start(scanner.clone(), [], sink(&queue)).unwrap();
 
     scanner
-        .replace_roots([AssetRoot::new(
-            "main",
-            &second,
-            second.join(".distill-displaced"),
-        )])
+        .replace_roots([AssetRoot::new("main", &second)])
         .unwrap();
     watcher.replace_roots(&scanner).unwrap();
     assert_eq!(wait_for_action(&queue), WatcherAction::FullRescan);
@@ -228,21 +216,18 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
 }
 
 #[test]
-fn native_watcher_admits_exact_control_files_but_not_siblings_or_quarantine() {
+fn native_watcher_admits_exact_control_files_but_not_siblings() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("assets");
     let controls = temp.path().join("controls");
     std::fs::create_dir(&root).unwrap();
     std::fs::create_dir(&controls).unwrap();
-    let quarantine = root.join(".distill-displaced");
     let control = controls.join("distill.toml");
     std::fs::write(&control, b"initial").unwrap();
-    let scanner = RootedScanner::new([AssetRoot::new("main", &root, &quarantine)]).unwrap();
+    let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let _watcher = WatcherThread::start(scanner, [control.clone()], sink(&queue)).unwrap();
 
-    std::fs::create_dir(&quarantine).unwrap();
-    std::fs::write(quarantine.join("intent"), b"displaced").unwrap();
     std::fs::write(controls.join("unrelated.txt"), b"noise").unwrap();
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(
@@ -263,11 +248,7 @@ fn native_watcher_maps_parent_introduction_to_missing_control_without_a_scan() {
     let root = temp.path().join("assets");
     std::fs::create_dir(&root).unwrap();
     let control = temp.path().join("controls/generated/schema.json");
-    let scanner = RootedScanner::new([AssetRoot::new(
-        "main",
-        &root,
-        root.join(".distill-displaced"),
-    )])
+    let scanner = RootedScanner::new([AssetRoot::new("main", &root)])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
     let _watcher = WatcherThread::start(scanner, [control.clone()], sink(&queue)).unwrap();

@@ -75,7 +75,7 @@ fn complete_and_publish(
 }
 
 #[test]
-fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
+fn rename_with_fixups_is_deferred_and_rescanned_as_one_version() {
     let temp = tempfile::tempdir().unwrap();
     let assets = temp.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
@@ -111,11 +111,7 @@ fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
 
     let coordinator = DaemonCoordinator::open(
         StoreConfig::new(temp.path().join(".distill")),
-        vec![AssetRoot::new(
-            "main",
-            &assets,
-            assets.join(".distill-displaced"),
-        )],
+        vec![AssetRoot::new("main", &assets)],
         vec![target()],
         64,
     )

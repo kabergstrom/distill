@@ -5,12 +5,9 @@ use std::time::{Duration, Instant};
 use distill_core::id::ContentHash;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
-use distill_daemon::quarantine::{QuarantineDriver, QuarantineRoot};
 use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
 use distill_schema::ngp_schema::{LayoutIdentity, Schema, SchemaLayouts};
-use distill_store::journal::{JournalIntentPlan, PublicationGroupKind};
 use distill_store::state::{ConfigurationState, DscpV1, PipelineState};
-use distill_store::Store;
 
 fn test_layout_identity() -> LayoutIdentity {
     LayoutIdentity {
@@ -136,96 +133,38 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
 }
 
 #[test]
-fn startup_recovers_non_codegen_publication_before_the_initial_scan() {
+fn a_write_whose_rows_were_never_committed_is_adopted_on_restart() {
     let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
     let config = config(&temp);
-    let assets = std::fs::canonicalize(temp.path().join("assets")).unwrap();
     let target = assets.join("pending.txt");
-    let proposal = assets.join(".pending.proposed");
-    let conflict = assets.join(".pending.conflict");
     std::fs::write(&target, b"old").unwrap();
     let old_hash = ContentHash(*blake3::hash(b"old").as_bytes());
     let new_hash = ContentHash(*blake3::hash(b"new").as_bytes());
-    {
-        let mut store = Store::open(config.store_config()).unwrap();
-        let group = store
-            .record_publication_group(
-                PublicationGroupKind::AuthoringWrite,
-                b"interrupted authoring publication",
-                &[JournalIntentPlan {
-                    target_path: target.to_string_lossy().into_owned(),
-                    temp_path: proposal.to_string_lossy().into_owned(),
-                    conflict_path: conflict.to_string_lossy().into_owned(),
-                    pre_image_hash: Some(old_hash),
-                    proposed_hash: new_hash,
-                }],
-            )
-            .unwrap();
-        // The group is durable before the proposal temp exists.
-        std::fs::write(&proposal, b"new").unwrap();
-        store.arm_publication_group(group.group_id).unwrap();
-    }
-
-    let process = DaemonProcess::start(config).unwrap();
-
-    assert_eq!(std::fs::read(&target).unwrap(), b"new");
-    let store = process.coordinator().store();
-    let store = store.read();
-    assert!(store.unfinished_publication_groups().unwrap().is_empty());
-    assert!(store
-        .all_files()
-        .unwrap()
-        .iter()
-        .any(|(_, path, state)| path == "pending.txt" && state.content_hash == Some(new_hash)));
-    drop(store);
+    let indexed = |process: &DaemonProcess, hash: ContentHash| {
+        process
+            .coordinator()
+            .store()
+            .read()
+            .all_files()
+            .unwrap()
+            .iter()
+            .any(|(_, path, state)| path == "pending.txt" && state.content_hash == Some(hash))
+    };
+    let process = DaemonProcess::start(config.clone()).unwrap();
+    assert!(indexed(&process, old_hash));
     drop(process);
-}
 
-#[test]
-fn startup_surfaces_an_abandoned_unarmed_authoring_group() {
-    let temp = tempfile::tempdir().unwrap();
-    let config = config(&temp);
-    let target = temp.path().join("assets/never-published.txt");
-    let proposal = temp.path().join("assets/.never-published.proposed");
-    let proposed_hash = ContentHash(*blake3::hash(b"new").as_bytes());
-    {
-        let mut store = Store::open(config.store_config()).unwrap();
-        store
-            .record_publication_group(
-                PublicationGroupKind::AuthoringWrite,
-                b"interrupted unarmed publication",
-                &[JournalIntentPlan {
-                    target_path: target.to_string_lossy().into_owned(),
-                    temp_path: proposal.to_string_lossy().into_owned(),
-                    conflict_path: temp
-                        .path()
-                        .join("assets/.never-published.conflict")
-                        .to_string_lossy()
-                        .into_owned(),
-                    pre_image_hash: None,
-                    proposed_hash,
-                }],
-            )
-            .unwrap();
-    }
+    // A publication wrote the file and stopped before its store commit.
+    distill_daemon::atomic::atomic_write(&target, b"new").unwrap();
 
     let process = DaemonProcess::start(config).unwrap();
-
-    let diagnostic = process
-        .last_background_error()
-        .expect("material startup recovery is surfaced");
-    assert!(diagnostic.contains("AuthoringWrite"));
-    assert!(diagnostic.contains("never-published.txt"));
-    assert!(diagnostic.contains("AbandonedUnarmed"));
-    assert!(!target.exists());
-    assert!(!proposal.exists());
-    assert!(process
-        .coordinator()
-        .store()
-        .read()
-        .unfinished_publication_groups()
-        .unwrap()
-        .is_empty());
+    assert!(indexed(&process, new_hash));
+    assert_eq!(
+        std::fs::read_dir(&assets).unwrap().count(),
+        1,
+        "no temp file is left next to the target"
+    );
 }
 
 #[cfg(unix)]
@@ -264,60 +203,6 @@ fn disabled_existing_codegen_output_is_still_excluded() {
         .iter()
         .all(|(_, path, _)| !path.starts_with("generated-alias")));
     assert!(output.join("owned.rs").is_file());
-}
-
-#[test]
-fn startup_runs_the_journaled_displacement_retention_sweep() {
-    let temp = tempfile::tempdir().unwrap();
-    let _ = config(&temp);
-    let config_path = temp.path().join("distill.toml");
-    let source = std::fs::read_to_string(&config_path).unwrap().replace(
-        "address = \"127.0.0.1:0\"",
-        "address = \"127.0.0.1:0\"\ndisplaced_retention_days = 0",
-    );
-    std::fs::write(&config_path, source).unwrap();
-    let config = DaemonConfig::load(&config_path).unwrap();
-    let assets = temp.path().join("assets");
-    let quarantine = assets.join(".distill-displaced");
-    let target = assets.join("old.asset");
-    std::fs::write(&target, b"old").unwrap();
-    let retained = {
-        let mut store = Store::open(config.store_config()).unwrap();
-        let driver = QuarantineDriver::new([QuarantineRoot::new(&assets, &quarantine)]).unwrap();
-        let mut publication = driver.admit_publication(&mut store).unwrap();
-        let group = publication
-            .record_group(
-                PublicationGroupKind::AuthoringWrite,
-                b"retention test",
-                &[JournalIntentPlan {
-                    target_path: target.to_string_lossy().into_owned(),
-                    temp_path: String::new(),
-                    conflict_path: assets.join("old.conflict").to_string_lossy().into_owned(),
-                    pre_image_hash: Some(ContentHash(*blake3::hash(b"old").as_bytes())),
-                    proposed_hash: ContentHash(*blake3::hash(b"").as_bytes()),
-                }],
-            )
-            .unwrap();
-        publication.arm_group(group.group_id).unwrap();
-        publication
-            .resume_group_delete(group.child_intents[0], &target)
-            .unwrap();
-        publication.retire_group(group.group_id).unwrap();
-        drop(publication);
-        store
-            .quarantined_entries()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.intent_id == group.child_intents[0])
-            .unwrap()
-            .path
-    };
-    std::thread::sleep(Duration::from_millis(1_100));
-
-    let process = DaemonProcess::start(config).unwrap();
-
-    assert!(!retained.exists());
-    drop(process);
 }
 
 #[test]

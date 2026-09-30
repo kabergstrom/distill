@@ -28,6 +28,7 @@ fn batch_reservation_has_a_declared_operational_live_change_class() {
         Some(ChangeClass::InputVersionedEpoch)
     );
     assert_eq!(change_class("assets.lineage_manifest"), None);
+    assert_eq!(change_class("daemon.displaced_retention_days"), None);
     assert_eq!(change_class("future.unclassified"), None);
 }
 
@@ -63,7 +64,6 @@ fn operational_store_values_apply_without_copying_restart_state() {
     let (_dir, mut store) = open();
     let original_state_path = store.operational_config().state_path;
     let mut candidate = StoreConfig::new("/a/restart-only/path");
-    candidate.displaced_retention_days = 31;
     candidate.segment_size = 4096;
     candidate.cache_limit = 8192;
     candidate.parallelism = 3;
@@ -72,7 +72,6 @@ fn operational_store_values_apply_without_copying_restart_state() {
     store.apply_operational_config(&candidate).unwrap();
     let applied = store.operational_config();
     assert_eq!(applied.state_path, original_state_path);
-    assert_eq!(applied.displaced_retention_days, 31);
     assert_eq!(applied.segment_size, 4096);
     assert_eq!(applied.cache_limit, 8192);
     assert_eq!(applied.parallelism, 3);

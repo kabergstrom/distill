@@ -3,7 +3,7 @@
 //! `distill-build` owns the deterministic fold and outcome-bearing read-set;
 //! this module supplies the daemon's rooted filesystem authority, importer
 //! registry, `$settings`/`$record` bundle controls, basis revalidation, and
-//! journaled publication.
+//! atomic publication.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
@@ -23,7 +23,6 @@ use distill_core::bootstrap::{
     is_bootstrap_control_type, BootstrapControlSpecV1, BootstrapControlSymbol,
     DIRECTORY_IMPORT_RULES_TYPE_UUID, IMPORT_RECORD_TYPE_UUID,
 };
-use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_rpc::{
@@ -35,7 +34,6 @@ use distill_store::imports::{
     DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport, WatchedImportFailure,
     WatchedImportTerminal,
 };
-use distill_store::journal::PublicationGroupKind;
 use distill_store::{Store, StoreReader};
 use globset::Glob;
 
@@ -51,7 +49,6 @@ pub use distill_pipeline_api::importer::{
 #[derive(Clone)]
 pub(crate) struct RegisteredImporter {
     pub id: String,
-    version: u32,
     settings_type_uuid: TypeUuid,
     settings_schema: LogicalSchema,
     settings_hash: LogicalHash,
@@ -130,7 +127,6 @@ impl RegisteredImporter {
         });
         Ok(Self {
             id,
-            version,
             settings_type_uuid,
             settings_schema,
             settings_hash,
@@ -1233,13 +1229,6 @@ impl AuthoringService {
             }
         }
         let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
-        let basis = encode_import_basis(
-            base,
-            &destination,
-            importer.version,
-            importer.capability_hash,
-            &bytes,
-        );
         if mode == ImportExecutionMode::Verify {
             let observed = self
                 .scanner
@@ -1266,8 +1255,6 @@ impl AuthoringService {
         let commit = self
             .publish_file(
                 base,
-                PublicationGroupKind::Import,
-                &basis,
                 destination.target,
                 preimage,
                 Some(bytes),
@@ -3267,23 +3254,6 @@ fn import_identity_seed(
         encoder.str(path);
         encoder.raw(&capability);
     })
-}
-
-fn encode_import_basis(
-    base: InputVersion,
-    destination: &ImportDestination,
-    importer_version: u32,
-    capability: [u8; 32],
-    proposed: &[u8],
-) -> Vec<u8> {
-    let mut encoder = CanonicalEncoder::new();
-    encoder.u64(base.0);
-    encoder.str(&destination.root);
-    encoder.str(&destination.path);
-    encoder.u32(importer_version);
-    encoder.raw(&capability);
-    encoder.raw(blake3::hash(proposed).as_bytes());
-    encoder.into_bytes()
 }
 
 #[cfg(test)]

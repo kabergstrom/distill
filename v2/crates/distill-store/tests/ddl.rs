@@ -57,8 +57,7 @@ fn every_section_13_table_exists() {
     // result_candidates / derived_outputs / derived_assertions /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
     // row), registrations (the pipeline_state registration list), pins
-    // (the eviction observability rule), write_intents + displaced
-    // (§14's journal and quarantine, which live in daemon state), and
+    // (the eviction observability rule), and
     // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
         "files",
@@ -95,11 +94,7 @@ fn every_section_13_table_exists() {
         "roots",
         "store_meta",
         "pins",
-        "write_intents",
-        "displaced",
         "errors",
-        "publication_groups",
-        "publication_group_children",
         "codegen_outputs",
         "watched_import_failures",
         "asset_resolutions",
@@ -394,62 +389,5 @@ fn dirty_queue_and_rename_log_are_ordered() {
     assert_eq!(
         columns(&conn, "rename_events"),
         ["seq", "root_id", "from_path", "to_path"]
-    );
-}
-
-#[test]
-fn write_intent_journal_shape() {
-    // §14: target path, temp path, conflict path, expected pre-image
-    // hash and proposed content hash. Physical quarantine locations are
-    // one-to-many rows keyed by intent identity, so retained pre-images
-    // cannot alias the original displaced inode.
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "write_intents"),
-        [
-            "intent_id",
-            "target_path",
-            "temp_path",
-            "conflict_path",
-            "pre_image_hash",
-            "proposed_hash",
-            "rename_aside_state",
-            "terminal_success",
-            "retired"
-        ]
-    );
-    assert_eq!(
-        columns(&conn, "displaced"),
-        [
-            "displacement_id",
-            "intent_id",
-            "ordinal",
-            "content_hash",
-            "origin_path",
-            "quarantine_path",
-            "quarantined_at",
-            "restored",
-            "cleaned_at",
-            "cleanup_reason"
-        ]
-    );
-}
-
-#[test]
-fn multi_path_publication_parent_names_its_basis_and_children() {
-    let dir = tempfile::tempdir().unwrap();
-    let conn = open_conn(&dir);
-    assert_eq!(
-        columns(&conn, "publication_groups"),
-        ["group_id", "kind", "basis", "state", "retired"]
-    );
-    assert_eq!(
-        columns(&conn, "publication_group_children"),
-        ["group_id", "ordinal", "intent_id"]
-    );
-    assert_eq!(
-        pk_columns(&conn, "publication_group_children"),
-        ["group_id", "ordinal"]
     );
 }
