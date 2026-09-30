@@ -326,9 +326,20 @@ fn assert_loaded_game_assets(
     let texture = value_for(texture_handle)
         .downcast_ref::<TextureAsset>()
         .expect("texture terminal value used the wrong native type");
-    assert_eq!((texture.width, texture.height), (1, 1));
+    // The fixture cooks the pixel into a 2x2 texture with its 1x1 mip.
+    assert_eq!((texture.width, texture.height, texture.depth), (2, 2, 1));
+    assert_eq!((texture.array_layers, texture.mip_count), (1, 2));
+    assert_eq!(texture.dimension, newgameplus_assets::TEXTURE_DIMENSION_2D);
     assert_eq!(texture.format, newgameplus_assets::FORMAT_R8G8B8A8_UNORM);
-    assert_eq!(texture.data.as_bytes(), [255, 0, 0, 255]);
+    assert_eq!(texture.data.as_bytes(), [255, 0, 0, 255].repeat(5));
+    let layout = texture
+        .layout(newgameplus_assets::format::block(texture.format).unwrap())
+        .unwrap();
+    assert_eq!(layout.total_len, texture.data.len() as u64);
+    assert_eq!(
+        (layout.subresources[1].mip, layout.subresources[1].offset),
+        (1, 16)
+    );
 
     let mesh = value_for(mesh_handle)
         .downcast_ref::<MeshAsset>()
@@ -636,6 +647,10 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             fields: vec![
                 field("width", 3),
                 field("height", 3),
+                field("depth", 3),
+                field("array_layers", 3),
+                field("mip_count", 3),
+                field("dimension", 0),
                 field("format", 0),
                 Field {
                     attrs: FieldAttrs {
@@ -758,6 +773,22 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                             TextureAsset,
                             height
                         )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            depth
+                        )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            array_layers
+                        )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            mip_count
+                        )),
+                        layout_field::<TextureAsset, u8>(std::mem::offset_of!(
+                            TextureAsset,
+                            dimension
+                        )),
                         layout_field::<TextureAsset, u8>(std::mem::offset_of!(
                             TextureAsset,
                             format
@@ -861,19 +892,19 @@ fn write_config(
         r#"
 [daemon]
 address = "127.0.0.1:0"
-state_path = "{}"
+state_path = '{}'
 [assets]
-roots = {{ main = "{}" }}
-schema_path = "{}"
+roots = {{ main = '{}' }}
+schema_path = '{}'
 [modules]
-pipeline_dylib = "{}"
+pipeline_dylib = '{}'
 [targets.dev]
 os = "{}"
 arch = "{}"
 apis = ["vulkan"]
 optimize = false
 [codegen]
-rs_mod_path = "{}"
+rs_mod_path = '{}'
 auto_codegen = false
 [pipeline]
 parallelism = 2
