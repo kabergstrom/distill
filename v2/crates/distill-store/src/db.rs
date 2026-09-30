@@ -20,7 +20,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 30;
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -101,6 +101,32 @@ CREATE TABLE claim_pending (
     subject BLOB NOT NULL,
     PRIMARY KEY (kind, subject)
 );
+-- The import index, derived from each bundle source's import record and
+-- directory rules (see `imports`). `basis` is the daemon's read-set
+-- encoding; `import_reads` names what it observed: kind 0 a path (key),
+-- 1 a listing, 2 an importer capability.
+CREATE TABLE import_records (
+    bundle_uuid BLOB NOT NULL PRIMARY KEY,
+    root_id     INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    basis       BLOB NOT NULL
+);
+CREATE INDEX import_records_by_source ON import_records(root_id, path);
+CREATE TABLE import_reads (
+    bundle_uuid BLOB NOT NULL,
+    kind        INTEGER NOT NULL,
+    key         TEXT NOT NULL,
+    PRIMARY KEY (bundle_uuid, kind, key)
+);
+CREATE INDEX import_reads_by_key ON import_reads(kind, key);
+CREATE TABLE directory_rule_sources (
+    rules_bundle BLOB NOT NULL,
+    rules_asset  BLOB NOT NULL,
+    root_id      INTEGER NOT NULL,
+    path         TEXT NOT NULL,
+    PRIMARY KEY (rules_bundle, rules_asset)
+);
+CREATE INDEX directory_rule_sources_by_source ON directory_rule_sources(root_id, path);
 CREATE TABLE dirty_files (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
     root_id     INTEGER NOT NULL,

@@ -277,7 +277,7 @@ impl InputTxn<'_> {
     }
 }
 
-fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<RootId, StoreError> {
+pub(crate) fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<RootId, StoreError> {
     if let Some(id) = conn
         .query_row("SELECT root_id FROM roots WHERE name = ?1", [name], |r| {
             r.get(0)

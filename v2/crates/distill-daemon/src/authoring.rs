@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
@@ -27,7 +28,7 @@ use distill_store::journal::{
 use distill_store::Store;
 
 use crate::coordinator::{publish_incremental_paths, LineageDestination};
-use crate::importer::{ImportWatchIndex, RegisteredImporter, RegisteredImporters};
+use crate::importer::{RegisteredImporter, RegisteredImporters};
 use crate::lineage_repair::{
     plan_same_dir_temp, unique_sibling, write_planned_temp, LineageRepairBackend,
     LineageRepairBackendInitError,
@@ -48,7 +49,9 @@ pub struct AuthoringService {
     pub(crate) builtin_importers: RwLock<RegisteredImporters>,
     pub(crate) pipeline_importers: RwLock<RegisteredImporters>,
     pipeline_projection: RwLock<PipelineProjection>,
-    pub(crate) import_watch_index: Mutex<ImportWatchIndex>,
+    /// Whether the store's import index was built since it was last
+    /// invalidated (see `importer`).
+    pub(crate) import_index_ready: AtomicBool,
     tag_index_coordinator: RwLock<Weak<crate::coordinator::DaemonCoordinator>>,
     startup_recovery_diagnostic: Mutex<Option<String>>,
 }
@@ -111,7 +114,7 @@ impl AuthoringService {
             builtin_importers: RwLock::new(BTreeMap::new()),
             pipeline_importers: RwLock::new(BTreeMap::new()),
             pipeline_projection: RwLock::new(PipelineProjection::default()),
-            import_watch_index: Mutex::new(ImportWatchIndex::default()),
+            import_index_ready: AtomicBool::new(false),
             tag_index_coordinator: RwLock::new(Weak::new()),
             startup_recovery_diagnostic: Mutex::new(startup_recovery_diagnostic),
         })
