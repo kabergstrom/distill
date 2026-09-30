@@ -81,7 +81,7 @@ fn cook_texture(value: &str) -> Result<AuthoredValue, ProcessorError> {
                 newgameplus_assets::FORMAT_R8G8B8A8_UNORM,
             )),
         ),
-        ("data".to_owned(), bytes_array(&data)),
+        ("data".to_owned(), AuthoredValue::Blob(data)),
     ])))
 }
 

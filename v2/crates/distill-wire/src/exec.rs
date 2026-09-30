@@ -75,6 +75,20 @@ impl Blob {
     }
 }
 
+/// Owns `bytes`.
+impl From<Vec<u8>> for Blob {
+    fn from(bytes: Vec<u8>) -> Blob {
+        let len = bytes.len();
+        Blob::new(Arc::new(bytes), 0, len)
+    }
+}
+
+impl Default for Blob {
+    fn default() -> Blob {
+        Blob::from(Vec::new())
+    }
+}
+
 impl Clone for Blob {
     fn clone(&self) -> Blob {
         Blob {

@@ -328,7 +328,7 @@ fn assert_loaded_game_assets(
         .expect("texture terminal value used the wrong native type");
     assert_eq!((texture.width, texture.height), (1, 1));
     assert_eq!(texture.format, newgameplus_assets::FORMAT_R8G8B8A8_UNORM);
-    assert_eq!(texture.data, [255, 0, 0, 255]);
+    assert_eq!(texture.data.as_bytes(), [255, 0, 0, 255]);
 
     let mesh = value_for(mesh_handle)
         .downcast_ref::<MeshAsset>()
@@ -637,7 +637,13 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                 field("width", 3),
                 field("height", 3),
                 field("format", 0),
-                field("data", 4),
+                Field {
+                    attrs: FieldAttrs {
+                        blob: true,
+                        ..FieldAttrs::default()
+                    },
+                    ..field("data", 5)
+                },
             ],
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
@@ -756,7 +762,7 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                             TextureAsset,
                             format
                         )),
-                        layout_field::<TextureAsset, Vec<u8>>(std::mem::offset_of!(
+                        layout_field::<TextureAsset, distill_asset::Blob>(std::mem::offset_of!(
                             TextureAsset,
                             data
                         )),
