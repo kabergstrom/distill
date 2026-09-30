@@ -1418,7 +1418,7 @@ impl DaemonCoordinator {
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         self.reconcile_watched(
             &pending,
-            |base, bundle| self.authoring.run_reimport_bundle(base, *bundle),
+            |base, bundle| self.authoring.run_watched_reimport(base, *bundle),
             |base, bundle| self.authoring.prepare_watched_reimport(base, *bundle),
         )
     }
@@ -1427,10 +1427,12 @@ impl DaemonCoordinator {
     /// current version; then publish them in order, each in its own input as
     /// its own version. A run that an earlier publication made stale reruns
     /// there, at the version it publishes after.
+    /// A `None` run is deferred: its importer is unavailable (see
+    /// `AuthoringService::defer_unavailable`).
     fn reconcile_watched<T: Sync>(
         &self,
         items: &[T],
-        run: impl Fn(InputVersion, &T) -> Result<ImportRun, RpcFailure> + Sync,
+        run: impl Fn(InputVersion, &T) -> Result<Option<ImportRun>, RpcFailure> + Sync,
         rerun: impl Fn(InputVersion, &T) -> Result<Option<PreparedImportCommit>, RpcFailure> + Sync,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         use rayon::prelude::*;
@@ -1452,7 +1454,8 @@ impl DaemonCoordinator {
                 .server()
                 .coordinated_maybe_commit(current, || {
                     let prepared = match run {
-                        Ok(run) => match self.authoring.publish_watched_import(current, run) {
+                        Ok(None) => Ok(None),
+                        Ok(Some(run)) => match self.authoring.publish_watched_import(current, run) {
                             Err(_) if drifted => rerun(current, item),
                             published => published,
                         },

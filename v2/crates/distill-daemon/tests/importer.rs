@@ -515,3 +515,100 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         .unwrap()
         .is_none());
 }
+
+/// A restart whose pipeline has not installed (or was rejected) finds its
+/// watched imports' importer unregistered. Reconciliation defers them instead
+/// of failing the startup pass, and runs them once the importer registers.
+#[test]
+fn watched_imports_defer_while_their_importer_is_unregistered() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
+    std::fs::write(assets.join("source.txt"), b"7").unwrap();
+    let open = || {
+        DaemonCoordinator::open(
+            StoreConfig::new(temp.path().join(".distill")),
+            vec![AssetRoot::new("main", &assets)],
+            vec![target()],
+            64,
+        )
+        .unwrap()
+    };
+    let imported_bundle = {
+        let coordinator = open();
+        coordinator.reconcile_full_scan().unwrap();
+        publish_schema_registry(&coordinator, schema_hash);
+        coordinator
+            .authoring_service()
+            .register_importer(Arc::new(ByteImporter {
+                schema: schema.clone(),
+            }))
+            .unwrap();
+        let backend = Arc::clone(coordinator.authoring_service());
+        let base = coordinator.server().current_stamp().version;
+        let imported = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&imported);
+        coordinator
+            .coordinated_commit(base, || {
+                let prepared = backend
+                    .prepare_import(
+                        base,
+                        &ImportRequest {
+                            importer: "byte-importer".into(),
+                            sources: vec!["source.txt".into()],
+                            dest: "imported.bundle".into(),
+                            settings: AuthoringValue {
+                                canonical_value: Arc::from(&b"3"[..]),
+                                blobs: Vec::new(),
+                            },
+                            watch: true,
+                            root: "main".into(),
+                        },
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                *captured.lock().unwrap() = Some(prepared.bundle);
+                Ok(prepared.commit)
+            })
+            .unwrap();
+        let bundle = imported.lock().unwrap().unwrap();
+        bundle
+    };
+    let path = assets.join("imported.bundle");
+
+    // Restart with the source edited and no importer registered.
+    std::fs::write(assets.join("source.txt"), b"8").unwrap();
+    let coordinator = open();
+    coordinator.reconcile_full_scan().unwrap();
+    assert_eq!(
+        coordinator
+            .authoring_service()
+            .watched_imports_needing_reimport()
+            .unwrap(),
+        vec![imported_bundle]
+    );
+    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    let unchanged = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(unchanged.assets["asset"].data, AuthoredValue::UInt(7));
+    assert!(
+        coordinator
+            .store()
+            .read()
+            .watched_import_failure(imported_bundle)
+            .unwrap()
+            .is_none(),
+        "a deferred import is not a memoized failure"
+    );
+
+    coordinator
+        .authoring_service()
+        .register_importer(Arc::new(ByteImporter { schema }))
+        .unwrap();
+    assert_eq!(
+        coordinator.reconcile_watched_imports().unwrap(),
+        vec![imported_bundle]
+    );
+    let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(8));
+}

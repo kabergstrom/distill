@@ -604,28 +604,112 @@ impl AuthoringService {
         Ok(())
     }
 
+    /// `None` when the failure was memoized or the import is deferred (see
+    /// [`AuthoringService::defer_unavailable`]).
     pub(crate) fn prepare_watched_directory_import(
         &self,
         base: InputVersion,
         task: &DirectoryImportTask,
     ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
-        let (importer, invocation) = self.directory_import_invocation(base, task)?;
-        match self.execute_import(base, importer, invocation, ImportExecutionMode::Publish) {
-            Ok(prepared) => Ok(Some(prepared)),
+        let result = self
+            .directory_import_invocation(base, task)
+            .map_err(ImportExecutionError::unmemoized)
+            .and_then(|(importer, invocation)| {
+                self.execute_import(base, importer, invocation, ImportExecutionMode::Publish)
+            });
+        match result {
             Err(error) if error.memoized => Ok(None),
-            Err(error) => Err(error.into_rpc()),
+            result => Ok(self
+                .defer_unavailable(&task.importer, &task.destination_path, result)?),
         }
     }
 
-    /// Run a directory import at `base` without publishing it.
+    /// Run a directory import at `base` without publishing it. `None` defers
+    /// it (see [`AuthoringService::defer_unavailable`]).
     pub(crate) fn run_watched_directory_import(
         &self,
         base: InputVersion,
         task: &DirectoryImportTask,
-    ) -> Result<ImportRun, RpcFailure> {
-        let (importer, invocation) = self.directory_import_invocation(base, task)?;
-        self.run_import(base, importer, invocation)
-            .map_err(ImportExecutionError::into_rpc)
+    ) -> Result<Option<ImportRun>, RpcFailure> {
+        let result = self
+            .directory_import_invocation(base, task)
+            .map_err(ImportExecutionError::unmemoized)
+            .and_then(|(importer, invocation)| self.run_import(base, importer, invocation));
+        self.defer_unavailable(&task.importer, &task.destination_path, result)
+    }
+
+    /// Watched reconciliation never fails over an importer that is not
+    /// available: its pipeline has not installed yet (startup, or a rebuild
+    /// in progress), was rejected, or its epoch went away mid-run. The import
+    /// is deferred (`None`), not memoized; its capability dep no longer
+    /// revalidates, so the capability change that installs the importer
+    /// requeues it.
+    fn defer_unavailable<T>(
+        &self,
+        importer: &str,
+        destination: &str,
+        result: Result<T, ImportExecutionError>,
+    ) -> Result<Option<T>, RpcFailure> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.importer_unavailable || !self.importer_registered(importer) => {
+                tracing::warn!(
+                    importer,
+                    path = %destination,
+                    error = ?error.rpc,
+                    "watched import deferred until its importer is registered"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error.into_rpc()),
+        }
+    }
+
+    fn importer_registered(&self, id: &str) -> bool {
+        let Ok(id) = normalize_identifier(id) else {
+            return false;
+        };
+        let importers = self.importers();
+        importers.pipeline.contains_key(&id) || importers.builtin.contains_key(&id)
+    }
+
+    /// The importer id recorded in a watched bundle's import record.
+    fn recorded_importer(&self, bundle: BundleUuid) -> Result<(String, String), RpcFailure> {
+        let store = self.store.read();
+        let meta = store
+            .bundle(bundle)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid(format!("cannot reimport unknown bundle {bundle}")))?;
+        let prior = self.read_prior_import_cached(&store, &meta)?;
+        Ok((prior.model.record.importer.clone(), meta.path.clone()))
+    }
+
+    /// Coordinator-only watched run of `bundle` at `base`. `None` defers it
+    /// (see [`AuthoringService::defer_unavailable`]).
+    pub(crate) fn run_watched_reimport(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<Option<ImportRun>, RpcFailure> {
+        let result = self
+            .reimport_invocation(base, bundle)
+            .map_err(ImportExecutionError::unmemoized)
+            .and_then(|(importer, invocation)| self.run_import(base, importer, invocation));
+        self.defer_reimport(bundle, result)
+    }
+
+    fn defer_reimport<T>(
+        &self,
+        bundle: BundleUuid,
+        result: Result<T, ImportExecutionError>,
+    ) -> Result<Option<T>, RpcFailure> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => match self.recorded_importer(bundle) {
+                Ok((importer, path)) => self.defer_unavailable(&importer, &path, Err(error)),
+                Err(_) => Err(error.into_rpc()),
+            },
+        }
     }
 
     /// Publish a watched run as the version after `base`, which may be
@@ -951,14 +1035,19 @@ impl AuthoringService {
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
-        let (importer, invocation) = self.reimport_invocation(base, bundle)?;
-        match self.execute_import(base, importer, invocation, ImportExecutionMode::Publish) {
-            Ok(prepared) => {
-                debug_assert_eq!(prepared.bundle, bundle);
-                Ok(Some(prepared))
-            }
+        let result = self
+            .reimport_invocation(base, bundle)
+            .map_err(ImportExecutionError::unmemoized)
+            .and_then(|(importer, invocation)| {
+                self.execute_import(base, importer, invocation, ImportExecutionMode::Publish)
+            });
+        match result {
             Err(error) if error.memoized => Ok(None),
-            Err(error) => Err(error.into_rpc()),
+            result => {
+                let prepared = self.defer_reimport(bundle, result)?;
+                debug_assert!(prepared.as_ref().is_none_or(|prepared| prepared.bundle == bundle));
+                Ok(prepared)
+            }
         }
     }
 
@@ -1058,9 +1147,12 @@ impl AuthoringService {
                         )));
                     }
                     AuthoringImporterError::PipelineUnavailable(message) => {
-                        return Err(ImportExecutionError::unmemoized(invalid(format!(
-                            "pipeline importer became unavailable: {message}"
-                        ))));
+                        return Err(ImportExecutionError {
+                            importer_unavailable: true,
+                            ..ImportExecutionError::unmemoized(invalid(format!(
+                                "pipeline importer became unavailable: {message}"
+                            )))
+                        });
                     }
                 };
                 let message = error.message();
@@ -1148,6 +1240,7 @@ impl AuthoringService {
                 return Err(ImportExecutionError {
                     rpc: failure.rpc,
                     memoized,
+                    importer_unavailable: false,
                 });
             }
         };
@@ -3199,6 +3292,8 @@ enum ImportExecutionMode {
 struct ImportExecutionError {
     rpc: RpcFailure,
     memoized: bool,
+    /// The importer's pipeline epoch went away mid-run.
+    importer_unavailable: bool,
 }
 
 impl ImportExecutionError {
@@ -3206,6 +3301,7 @@ impl ImportExecutionError {
         Self {
             rpc,
             memoized: false,
+            importer_unavailable: false,
         }
     }
 
