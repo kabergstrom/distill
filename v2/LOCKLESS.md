@@ -463,6 +463,40 @@ should reach zero by the end of phase 6.
       after the input transaction, and then mutates the `Commit`.
     - So the served `Delta` cannot be written in the daemon's transaction
       until refinement becomes a build job that reads the uncommitted view.
+- **Phase 6:** in progress (commits `6f46c9f`–`17981b5`).
+  - **The store belongs to the authority** (`store_cell.rs`).
+    - `AuthorityStore` holds the writer in an `UnsafeCell`. `write()`
+      panics off the authority. `write_with` sends the write there.
+    - `read()` borrows the writer on the authority. Elsewhere it opens a
+      read transaction on a per-thread cached `StoreReader`.
+    - A thread the authority lends itself to (`AuthoritySender::lend`,
+      used by `run_scheduled`) counts as the authority while the authority
+      waits on it.
+  - **Builds.** Build commits, wire-tree puts, pins and lease releases go
+    through `write_with`. The eviction/compaction gate is an `AtomicUsize`
+    with a maintenance bit, not a lock.
+  - **No locks left.** `Mutex`, `RwLock` and `Condvar` are gone from
+    distill-store, distill-rpc and distill-daemon.
+    - Configuration that is replaced whole and read anywhere is published
+      through `arc-swap`. This covers the authoring roots, quarantine,
+      lineage backend, importers and pipeline projection; the scanner
+      roots and daemon-owned directories; and the coordinator's lineage
+      destination, schema authority and build targets.
+    - Authority-only state lives in an `AuthorityCell` (panics off the
+      authority): the pipeline runtime, scan rejection and configuration
+      poison. Dropping the pipeline guard publishes the host's
+      `PipelineSnapshot` for other threads.
+    - The scheduler is an actor thread (`ScheduledPool`) that admits jobs
+      onto the rayon pool and receives completions as messages.
+    - An epoch's lifecycle is atomics plus a `OnceLock` for the first
+      runtime error. Unloading takes the epoch through `Arc::get_mut`, so
+      an epoch that is still shared is retained (poisoned) rather than
+      unloaded.
+  - **Still open in phase 6:**
+    - The `Delta` gap (tag refinement after the input transaction).
+    - RPC authoring calls still block the RPC thread.
+    - The driver's 40 ms tick for runtime poison and epoch reaping.
+    - The maintenance gate's 1 ms back-off.
 
 ## 7. Test baseline
 
