@@ -114,6 +114,19 @@ fn discard_prepared(
     }
 }
 
+/// Every path that publishes or installs a pipeline failure reports it here:
+/// a rejected candidate leaves its importers unregistered, which is otherwise
+/// only visible to RPC clients.
+fn warn_pipeline_failure(failure: &PipelineFailure, context: &str) {
+    tracing::warn!(
+        code = ?failure.code,
+        origin = ?failure.origin,
+        cleanup = ?failure.cleanup,
+        message = %failure.message,
+        "{context}"
+    );
+}
+
 fn record_cleanup_failure(slot: &mut Option<PipelineFailure>, failure: Option<PipelineFailure>) {
     if let Some(failure) = failure {
         if slot.is_none() {
@@ -295,6 +308,10 @@ impl DaemonCoordinator {
                 }
             })
             .map_err(CoordinatorError::RuntimePipeline)?;
+        warn_pipeline_failure(
+            &observed.1,
+            "published pipeline latched a runtime failure; importers from it are unavailable",
+        );
         Ok(Some(observed.1))
     }
 
@@ -654,6 +671,10 @@ impl DaemonCoordinator {
                         Some(prepared),
                         PipelineDiagnostic::Failed(error),
                     ) => {
+                        warn_pipeline_failure(
+                            &error,
+                            "configuration pipeline epoch failed to publish; importers from it are unavailable",
+                        );
                         record_cleanup_failure(
                             &mut cleanup_failure,
                             runtime.host.discard_unpublished(prepared),
@@ -666,6 +687,10 @@ impl DaemonCoordinator {
                         None,
                         PipelineDiagnostic::Failed(_),
                     ) => {
+                        warn_pipeline_failure(
+                            failure,
+                            "configuration pipeline candidate rejected; importers from it are unavailable",
+                        );
                         runtime.host.install_failure(failure.clone());
                         authoring.install_pipeline_importers(BTreeMap::new());
                     }
@@ -862,11 +887,9 @@ impl DaemonCoordinator {
         failure: PipelineFailure,
         heal_configuration: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        tracing::warn!(
-            code = ?failure.code,
-            origin = ?failure.origin,
-            message = %failure.message,
-            "pipeline candidate rejected; importers from it are unavailable"
+        warn_pipeline_failure(
+            &failure,
+            "pipeline candidate rejected; importers from it are unavailable",
         );
         let healed_configuration = heal_configuration
             .then(|| self.configuration_without_source_error());
