@@ -159,11 +159,8 @@ fn discard_prepared(
     }
 }
 
-fn record_cleanup_failure(slot: &Mutex<Option<PipelinePoison>>, failure: Option<PipelinePoison>) {
+fn record_cleanup_failure(slot: &mut Option<PipelinePoison>, failure: Option<PipelinePoison>) {
     if let Some(failure) = failure {
-        let mut slot = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_none() {
             *slot = Some(failure);
         }
@@ -796,8 +793,6 @@ impl DaemonCoordinator {
                     return Err(error);
                 }
             };
-            let filesystem = Arc::new(Mutex::new(Some(filesystem)));
-            let captured = Arc::clone(&filesystem);
             let tag_epoch = schema_authority.source_hash();
             let max_dependency_depth = self.operational_configuration().max_dependency_depth;
             let base = self.server().current_stamp().version;
@@ -813,8 +808,7 @@ impl DaemonCoordinator {
                 }
             };
             let authoring = Arc::clone(&self.authoring);
-            let cleanup_failure = Arc::new(Mutex::new(None));
-            let captured_cleanup_failure = Arc::clone(&cleanup_failure);
+            let mut cleanup_failure = None;
             let result = self
                 .server()
                 .coordinated_replace_target_set(base, targets, || {
@@ -833,11 +827,6 @@ impl DaemonCoordinator {
                         .pipeline
                         .clone()
                         .expect("scan commit always carries pipeline diagnostics");
-                    let filesystem: AuthoringFilesystemCandidate = captured
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                        .expect("configuration candidate installs once");
                     self.scanner.replace_from(filesystem.scanner());
                     authoring.install_filesystem_candidate(filesystem);
                     self.scan_initialized.store(true, Ordering::Release);
@@ -874,7 +863,7 @@ impl DaemonCoordinator {
                         ) => {
                             let importers = EpochAuthoringImporter::all(&prepared);
                             record_cleanup_failure(
-                                &captured_cleanup_failure,
+                                &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
                             runtime.host.install_ready(prepared);
@@ -889,7 +878,7 @@ impl DaemonCoordinator {
                             | PipelineDiagnostic::RetiredTypeReferenced(_),
                         ) => {
                             record_cleanup_failure(
-                                &captured_cleanup_failure,
+                                &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
                             let fence = PipelinePoison::new(
@@ -912,11 +901,11 @@ impl DaemonCoordinator {
                             PipelineDiagnostic::Poisoned(error),
                         ) => {
                             record_cleanup_failure(
-                                &captured_cleanup_failure,
+                                &mut cleanup_failure,
                                 runtime.host.discard_unpublished(prepared),
                             );
                             record_cleanup_failure(
-                                &captured_cleanup_failure,
+                                &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
                             runtime.host.install_poison(error);
@@ -929,7 +918,7 @@ impl DaemonCoordinator {
                             | PipelineDiagnostic::RetiredTypeReferenced(_),
                         ) => {
                             record_cleanup_failure(
-                                &captured_cleanup_failure,
+                                &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
                             runtime.host.install_poison(poison.clone());
@@ -954,10 +943,7 @@ impl DaemonCoordinator {
                 });
             match result {
                 Ok(stamp) => {
-                    let poison = cleanup_failure
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
+                    let poison = cleanup_failure.take();
                     if let Some(poison) = poison {
                         drop(runtime);
                         self.publish_pipeline_rejection(poison)
@@ -1055,8 +1041,7 @@ impl DaemonCoordinator {
             let scanner = self.scanner.clone();
             let max_dependency_depth = self.operational_configuration().max_dependency_depth;
             let mut prepared = Some(prepared);
-            let cleanup_failure = Arc::new(Mutex::new(None));
-            let captured_cleanup_failure = Arc::clone(&cleanup_failure);
+            let mut cleanup_failure = None;
             let result = self.server().coordinated_commit(base, || {
                 let mut durable = store.write();
                 if durable.input_version() != base {
@@ -1087,7 +1072,7 @@ impl DaemonCoordinator {
                     None => {
                         let importers = EpochAuthoringImporter::all(&candidate);
                         record_cleanup_failure(
-                            &captured_cleanup_failure,
+                            &mut cleanup_failure,
                             discard_pending(&mut runtime),
                         );
                         runtime.host.install_ready(candidate);
@@ -1098,7 +1083,7 @@ impl DaemonCoordinator {
                     }
                     Some(required) => {
                         record_cleanup_failure(
-                            &captured_cleanup_failure,
+                            &mut cleanup_failure,
                             discard_pending(&mut runtime),
                         );
                         let fence = PipelinePoison::new(
@@ -1136,10 +1121,7 @@ impl DaemonCoordinator {
             });
             match result {
                 Ok(stamp) => {
-                    let poison = cleanup_failure
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
+                    let poison = cleanup_failure.take();
                     if let Some(poison) = poison {
                         drop(runtime);
                         self.publish_pipeline_rejection(poison)
