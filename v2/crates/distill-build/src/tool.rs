@@ -373,7 +373,11 @@ fn launch(
     let written = writer
         .join()
         .map_err(|_| LaunchError::Infrastructure("tool stdin writer panicked".to_owned()))?;
-    if let Err(error) = written {
+    // A tool may exit without reading all of its input.
+    if let Err(error) = written.or_else(|error| match error.kind() {
+        std::io::ErrorKind::BrokenPipe => Ok(()),
+        _ => Err(error),
+    }) {
         return Err(LaunchError::Infrastructure(format!(
             "failed to write tool stdin: {error}"
         )));
