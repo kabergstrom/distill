@@ -6,12 +6,10 @@
 //! `distill-build` re-export these types at their old paths.
 
 // The Rust-ABI module boundary transfers ownership of standard-library
-// allocations in both directions. Installing System here makes the declared
-// allocator contract a link-time fact for the daemon and every pipeline cdylib
-// that consumes this interface; a second `#[global_allocator]` is rejected by
-// rustc instead of being able to forge the ABI identity string.
-#[global_allocator]
-static DISTILL_SYSTEM_ALLOCATOR: std::alloc::System = std::alloc::System;
+// allocations in both directions, so the daemon and every module must use
+// the System allocator. `export_pipeline_module_v2!` installs it in the
+// module and `distilld` in the daemon; a library linking this crate (the
+// engine's loader, through distill-build) keeps its own choice.
 
 pub mod callbacks;
 pub mod codegen;

@@ -10,6 +10,11 @@ use distill_daemon::pack_command::build_configured_pack;
 use distill_daemon::process::DaemonProcess;
 use distill_rpc::{AuthoringValue, ImportRequest};
 
+// Pipeline modules allocate with System and hand those allocations to the
+// daemon (see distill-pipeline-api).
+#[global_allocator]
+static SYSTEM: std::alloc::System = std::alloc::System;
+
 const USAGE: &str = "usage:
   distilld [config-path]
   distilld import <config-path> <source> <dest-bundle> --importer <id> --settings <json>

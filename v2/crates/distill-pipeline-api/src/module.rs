@@ -378,6 +378,10 @@ pub fn contain_module_call<T>(
 #[macro_export]
 macro_rules! export_pipeline_module_v2 {
     (register = $register:path, unload = $unload:path $(,)?) => {
+        // The module boundary moves allocations across; see the crate docs.
+        #[global_allocator]
+        static __DISTILL_SYSTEM_ALLOCATOR: ::std::alloc::System = ::std::alloc::System;
+
         unsafe fn __distill_pipeline_register_v2(
             targets: &[$crate::registration::TargetDefinition],
             arena: &mut $crate::registration::RegistrationArena<'_>,
