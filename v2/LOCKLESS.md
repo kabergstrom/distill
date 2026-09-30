@@ -290,7 +290,9 @@ pipeline, config, or daemon.
 9. Subscriptions come from `change_log` (§1.6).
 10. The `scanner` test target compiles again (phase 0).
 11. Engine side (newgameplus): `AssetHandle` becomes GC-tracked and gets a
-    `Default`.
+    `Default`. Done (newgameplus `58e5fce`, deferred-ngp `dcb81ed`): the GC
+    releases requests no traced root reaches; storage still frees their GPU
+    objects; `release_asset` is gone.
 
 ## 6. Phases
 
