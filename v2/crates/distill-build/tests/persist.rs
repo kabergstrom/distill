@@ -60,6 +60,7 @@ impl TraceSource for Snapshot {
 fn commit(store: &mut Store, key: [u8; 32], asset: AssetUuid, trace: Vec<TraceOp>, bytes: &[u8]) {
     store
         .commit_build(BuildCommit {
+            wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: key,
             asset_uuid: asset,

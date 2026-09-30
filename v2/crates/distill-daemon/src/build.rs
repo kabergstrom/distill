@@ -1,7 +1,7 @@
 //! Snapshot-pinned lazy build execution and durable build-import caching.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::sync::{Arc, Weak};
 
 use distill_build::artifact_encode::{
@@ -46,7 +46,6 @@ use distill_rpc::{
     TagProjectionMutation,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
-use distill_store::artifacts::PinKind;
 use distill_store::bundles::{BundleMeta, EntryMeta, TagIndexUpdate};
 use distill_store::cas::record::{
     FailureCause as StoreFailureCause, FailureFingerprint as StoreFailureFingerprint, KeyKind,
@@ -141,48 +140,12 @@ impl PublishedTagIndex {
 
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
-    /// Builds in flight, plus [`CAS_MAINTENANCE`] while the cache sweep runs.
-    active_builds: AtomicUsize,
 }
-
-/// Set in `active_builds` while the CAS cache sweep runs: it starts only
-/// when no build is in flight, and no build starts until it ends, so no
-/// build reads a candidate the sweep evicts. It is set and cleared inside
-/// one authority job, so a job queued after seeing it runs once it is clear.
-const CAS_MAINTENANCE: usize = 1 << (usize::BITS - 1);
 
 impl CoordinatorBuildBackend {
     pub(crate) fn new(coordinator: &Arc<DaemonCoordinator>) -> Self {
         Self {
             coordinator: Arc::downgrade(coordinator),
-            active_builds: AtomicUsize::new(0),
-        }
-    }
-
-    fn enter_build(&self, store: &AuthorityStore) -> Result<(), RpcFailure> {
-        let mut current = self.active_builds.load(Ordering::Acquire);
-        loop {
-            if current & CAS_MAINTENANCE != 0 {
-                // Wait out the sweep's authority job.
-                store.write_with(|_| ()).map_err(|_| RpcFailure::AuthoringBackendUnavailable {
-                    operation: "start build: the authority stopped".to_owned(),
-                })?;
-                current = self.active_builds.load(Ordering::Acquire);
-                continue;
-            }
-            let next = current
-                .checked_add(1)
-                .filter(|next| next & CAS_MAINTENANCE == 0)
-                .expect("active build count exhausted");
-            match self.active_builds.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => current = observed,
-            }
         }
     }
 }
@@ -195,7 +158,6 @@ impl BuildBackend for CoordinatorBuildBackend {
                 .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
                     operation: "build coordinator stopped".to_owned(),
                 })?;
-        self.enter_build(&coordinator.store())?;
         let class = match request.work_class {
             BuildWorkClass::Interactive => WorkClass::Interactive,
             BuildWorkClass::Batch => WorkClass::Batch,
@@ -221,26 +183,7 @@ impl BuildBackend for CoordinatorBuildBackend {
             }
         }
         match result {
-            Ok(publication) => {
-                let mut hashes = publication
-                    .artifacts
-                    .iter()
-                    .map(|artifact| artifact.content_hash.0)
-                    .collect::<Vec<_>>();
-                hashes.extend(publication.wire_trees.iter().map(|tree| tree.layout_hash.0));
-                coordinator
-                    .store()
-                    .write_with(|store| {
-                        store.pin(PinKind::InFlight, &build_pin_holder(request), &hashes)
-                    })
-                    .map_err(|_| RpcFailure::AuthoringBackendUnavailable {
-                        operation: "pin completed build: the authority stopped".to_owned(),
-                    })?
-                    .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
-                        operation: format!("pin completed build: {error}"),
-                    })?;
-                Ok(BuildBackendOutcome::Built(publication))
-            }
+            Ok(publication) => Ok(BuildBackendOutcome::Built(publication)),
             Err(BuildError::Drifted(input)) => Ok(BuildBackendOutcome::Drifted { input }),
             Err(BuildError::DepthExceeded { limit, chain }) => {
                 Err(RpcFailure::BuildDepthExceeded { limit, chain })
@@ -303,118 +246,25 @@ impl BuildBackend for CoordinatorBuildBackend {
         })
     }
 
-    fn build_finished(&self, request: &BuildRequest) -> Result<(), RpcFailure> {
-        let previous = self.active_builds.fetch_sub(1, Ordering::AcqRel);
-        assert!(
-            previous & !CAS_MAINTENANCE != 0,
-            "build_finished called without a matching build"
-        );
-        let Some(coordinator) = self.coordinator.upgrade() else {
-            return Ok(());
-        };
-        let stopped = |_| RpcFailure::AuthoringBackendUnavailable {
-            operation: "finish build: the authority stopped".to_owned(),
-        };
-        coordinator
-            .store()
-            .write_with(|store| store.unpin_holder(PinKind::InFlight, &build_pin_holder(request)))
-            .map_err(stopped)?
-            .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
-                operation: format!("release completed build pin: {error}"),
-            })?;
-        if previous != 1 {
-            return Ok(());
-        }
-        let active_builds = &self.active_builds;
-        let sweep = coordinator.store().write_with(|store| {
-            if active_builds
-                .compare_exchange(0, CAS_MAINTENANCE, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Ok(());
-            }
-            let sweep = sweep_cache(store);
-            active_builds.fetch_and(!CAS_MAINTENANCE, Ordering::Release);
-            sweep
-        });
-        sweep.map_err(stopped)?
+    fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
+        Ok(())
     }
 }
 
-fn sweep_cache(store: &mut Store) -> Result<(), RpcFailure> {
-    let sweep = store
-        .enforce_cache_limit()
-        .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
-            operation: format!("enforce CAS cache limit: {error}"),
-        })?;
-    if sweep.evicted != 0 {
-        store
-            .compact()
-            .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
-                operation: format!("compact CAS after eviction: {error}"),
-            })?;
-    }
-    Ok(())
-}
-
+// Nothing pins CAS content any more: a blob evicted under a reader is a
+// cache miss.
 impl ArtifactLeaseBackend for CoordinatorBuildBackend {
-    fn pin_lease(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
-        let coordinator = self
-            .coordinator
-            .upgrade()
-            .ok_or_else(|| "build coordinator stopped".to_owned())?;
-        coordinator
-            .store()
-            .write_with(|store| store.pin(PinKind::Lease, &format!("rpc-lease-{holder}"), hashes))
-            .map_err(|_| "the authority stopped".to_owned())?
-            .map_err(|error| error.to_string())
+    fn pin_lease(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
+        Ok(())
     }
 
-    fn release_lease(&self, holder: u64) {
-        let Some(coordinator) = self.coordinator.upgrade() else {
-            return;
-        };
-        let _ = coordinator.store().write_with(|store| {
-            store.unpin_holder(PinKind::Lease, &format!("rpc-lease-{holder}"))
-        });
+    fn release_lease(&self, _holder: u64) {}
+
+    fn pin_pack_session(&self, _holder: u64, _hashes: &[[u8; 32]]) -> Result<(), String> {
+        Ok(())
     }
 
-    fn pin_pack_session(&self, holder: u64, hashes: &[[u8; 32]]) -> Result<(), String> {
-        let coordinator = self
-            .coordinator
-            .upgrade()
-            .ok_or_else(|| "build coordinator stopped".to_owned())?;
-        coordinator
-            .store()
-            .write_with(|store| {
-                store.pin(
-                    PinKind::PackSession,
-                    &format!("rpc-pack-session-{holder}"),
-                    hashes,
-                )
-            })
-            .map_err(|_| "the authority stopped".to_owned())?
-            .map_err(|error| error.to_string())
-    }
-
-    fn release_pack_session(&self, holder: u64) {
-        let Some(coordinator) = self.coordinator.upgrade() else {
-            return;
-        };
-        let _ = coordinator.store().write_with(|store| {
-            store.unpin_holder(PinKind::PackSession, &format!("rpc-pack-session-{holder}"))
-        });
-    }
-}
-
-fn build_pin_holder(request: &BuildRequest) -> String {
-    format!(
-        "rpc-build-{:02x?}-{}-{}-{:02x?}",
-        request.basis.instance.0,
-        request.basis.version.0,
-        request.target,
-        request.requested_asset.0
-    )
+    fn release_pack_session(&self, _holder: u64) {}
 }
 
 #[derive(Debug, Clone)]
@@ -2121,10 +1971,11 @@ fn commit_processor_stage(
     outputs: &[EncodedNodeOutput],
     debug: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), BuildError> {
-    for output in outputs {
-        write_build_store(context, |store| store.put_wire_tree(&output.project.dswl_bytes))?;
-    }
     write_build_store(context, |store| store.commit_build(BuildCommit {
+            wire_trees: outputs
+                .iter()
+                .map(|output| output.project.dswl_bytes.clone())
+                .collect(),
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
@@ -2167,6 +2018,7 @@ fn commit_processor_failure(
             static_inputs_canonical: static_inputs_canonical_bytes(static_inputs),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
+            wire_trees: Vec::new(),
         }))?;
     Ok(())
 }
@@ -2759,6 +2611,7 @@ fn commit_build_import_failure(
             static_inputs_canonical: Vec::new(),
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
+            wire_trees: Vec::new(),
         }))?;
     Ok(())
 }
@@ -3101,6 +2954,7 @@ fn encode_or_hydrate(
                                 detail,
                             }),
                         },
+                        wire_trees: Vec::new(),
                     }))?;
             }
             return Err(BuildError::Failed(format!(
@@ -3166,8 +3020,8 @@ fn encode_or_hydrate(
         terminal_type,
     );
     if !context.verify_fresh {
-        write_build_store(context, |store| store.put_wire_tree(&project.dswl_bytes))?;
         write_build_store(context, |store| store.commit_build(BuildCommit {
+                wire_trees: vec![project.dswl_bytes.clone()],
                 key_kind: KeyKind::BuildImport,
                 static_input_key: key,
                 asset_uuid: loaded.entry.uuid,

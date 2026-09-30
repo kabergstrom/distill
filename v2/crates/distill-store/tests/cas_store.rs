@@ -4,7 +4,6 @@
 //! first-class records, and segment rolling.
 
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
-use distill_store::cas::manifest::{read_current, write_current, GenerationManifest, SegmentKind};
 use distill_store::cas::record::{
     decode_record, CapabilityKey, FailureCause, FailureFingerprint, KeyKind, LocalFailureClass,
     ResultOutcome,
@@ -42,6 +41,7 @@ fn namespace_error(message: &str) -> NamespaceError {
 
 fn success_commit(static_key: [u8; 32], trace: &[u8]) -> BuildCommit {
     BuildCommit {
+        wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: static_key,
         asset_uuid: PARENT,
@@ -279,6 +279,7 @@ fn build_import_results_carry_exactly_one_output_row() {
 
     // Exactly one output row commits and is bucket-indexed by DSBI digest.
     let commit = BuildCommit {
+        wire_trees: Vec::new(),
         key_kind: KeyKind::BuildImport,
         static_input_key: [2u8; 32],
         asset_uuid: PARENT,
@@ -311,6 +312,7 @@ fn failure_records_commit_index_and_carry_no_outputs() {
     // the trace.
     let (_d, mut store) = store();
     let commit = BuildCommit {
+        wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [3u8; 32],
         asset_uuid: PARENT,
@@ -347,6 +349,7 @@ fn a_capability_miss_memoizes_with_its_requested_key() {
     let (_d, mut store) = store();
     let key = CapabilityKey::MigrationFn("v2-to-v3".to_owned());
     let commit = BuildCommit {
+        wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [4u8; 32],
         asset_uuid: PARENT,
@@ -377,6 +380,7 @@ fn a_deterministic_local_failure_memoizes_with_an_empty_trace() {
     // operation — trace empty, cause Local, memoized like any failure.
     let (_d, mut store) = store();
     let commit = BuildCommit {
+        wire_trees: Vec::new(),
         key_kind: KeyKind::Processor,
         static_input_key: [5u8; 32],
         asset_uuid: PARENT,
@@ -490,6 +494,7 @@ fn segments_roll_at_the_size_cap() {
 
     for i in 0..4u8 {
         let commit = BuildCommit {
+            wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [i; 32],
             asset_uuid: PARENT,
@@ -527,6 +532,17 @@ fn segments_roll_at_the_size_cap() {
     }
 }
 
+fn oversize_files(config: &StoreConfig) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(config.state_path.join("cas"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("oversize-"))
+        })
+        .collect()
+}
+
 #[test]
 fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     let dir = tempfile::tempdir().unwrap();
@@ -536,6 +552,7 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     let payload = vec![0x5au8; 4096];
     let receipt = store
         .commit_build(BuildCommit {
+            wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [0x33; 32],
             asset_uuid: PARENT,
@@ -553,14 +570,9 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
         })
         .unwrap();
 
-    let current = read_current(&config.state_path.join("cas")).unwrap();
-    let oversized: Vec<_> = current
-        .segments
-        .iter()
-        .filter(|s| s.kind == SegmentKind::Oversize)
-        .collect();
+    let oversized = oversize_files(&config);
     assert_eq!(oversized.len(), 1);
-    let bytes = std::fs::read(config.state_path.join("cas").join(&oversized[0].name)).unwrap();
+    let bytes = std::fs::read(&oversized[0]).unwrap();
     let decoded = decode_record(&bytes, 0, 0).unwrap();
     assert_eq!(
         decoded.encoded_len as usize,
@@ -571,29 +583,19 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     assert_eq!(store.cas_read(&receipt.outputs[0].1 .0).unwrap(), payload);
 
     store.compact().unwrap();
-    let compacted = read_current(&config.state_path.join("cas")).unwrap();
     assert_eq!(
-        compacted
-            .segments
-            .iter()
-            .filter(|s| s.kind == SegmentKind::Oversize)
-            .count(),
+        oversize_files(&config).len(),
         1,
-        "compaction preserves dedicated oversize typing"
+        "compaction leaves a live oversize segment alone"
     );
 
     // Force startup's full segment-scan path, including the oversize
     // payload followed by its result record in another segment.
-    write_current(
-        &config.state_path.join("cas"),
-        &GenerationManifest {
-            generation: compacted.generation + 1,
-            segments: compacted.segments,
-        },
-    )
-    .unwrap();
-
     drop(store);
+    let conn = rusqlite::Connection::open(config.state_path.join("meta.sqlite")).unwrap();
+    conn.execute("UPDATE cas_segments SET indexed_len = indexed_len + 1000000", [])
+        .unwrap();
+    drop(conn);
     let (reopened, recovery) = Store::open_with_recovery(config).unwrap();
     assert!(recovery.rebuilt_index);
     assert_eq!(

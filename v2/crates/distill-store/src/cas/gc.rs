@@ -1,41 +1,34 @@
-//! GC (§13): pins, eviction under the observability rule, the
-//! cache-limit LRU sweep, and Bitcask-style compaction.
+//! GC (§13): eviction, the cache-limit sweep, compaction, and deleting
+//! dead segment files.
 //!
-//! Eviction is always *safe* — everything in the CAS is rebuildable —
-//! but never *observable*: no ContentHash referenced by a manifest
-//! entry, live lease, in-flight build, or open pack-build session may be
-//! removed, the check runs inside the same transaction that deletes the
-//! index rows, and pins hold a build result's whole output table (aux
-//! payloads included) as one unit.
+//! Eviction is always *safe*: everything in the CAS is rebuildable. It
+//! deletes index rows only; a reader that loses the race sees a cache
+//! miss. `cas_refs` says what keeps each extent indexed, with a foreign
+//! key to `cas_extents`, so pruning is one statement inside the write
+//! transaction and can never leave a reference dangling.
 //!
-//! Compaction writes new segments durably, atomically replaces
-//! `CURRENT`, then flips the index in one SQLite transaction; old
-//! segments are deleted last. An interrupted compaction leaves one
-//! generation or the other intact, never a mix: a crash between the
-//! `CURRENT` replace and the index flip is exactly the
-//! generation-mismatch rebuild path. This store performs only transient
-//! per-call reads (no long-lived mmap readers), so no generation pins
-//! outlive the compaction call itself; a future long-lived reader must
-//! take a generation pin before old files may go.
+//! Compaction copies the live records of a mostly-dead sealed segment into
+//! a new segment and repoints the index in one write transaction; it
+//! never rewrites a segment in place. The old segment is then dead, and
+//! [`SegmentSweeper`] deletes its file once no read can still reach it
+//! (see the read bound in [`crate::cas`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
-use distill_wire::artifact::{parse_artifact, ARTIFACT_MAGIC};
-
-use crate::artifacts::PinKind;
-use crate::cas::manifest::{self, GenerationManifest, ManifestSegment, SegmentKind};
-use crate::cas::record::{
-    decode_record, KeyKind, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN,
+use crate::cas::record::{decode_record, KeyKind, RecordKind, RECORD_HEADER_LEN};
+use crate::cas::store::{
+    fsync_dir, read_segment, segment_file_name, segment_open_options, SegmentKind,
+    HOLDER_INSTALLED, HOLDER_RESULT, SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
-use crate::cas::store::{segment_file_name, CasInner, SegmentInfo};
-use crate::db::{meta_set_u64, Store, StoreReader};
+use crate::db::Store;
 use crate::error::StoreError;
 
 /// What a cache-limit sweep did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictionSweep {
-    /// Results evicted (whole units).
+    /// Units evicted (whole results or installs).
     pub evicted: usize,
     /// Extent bytes still indexed after the sweep.
     pub live_bytes: u64,
@@ -44,551 +37,577 @@ pub struct EvictionSweep {
 /// What a compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionReport {
-    pub old_generation: u64,
-    pub new_generation: u64,
-    /// Live records carried into the new generation.
+    /// Live records copied into new segments.
     pub records_copied: usize,
-    /// Segment bytes reclaimed.
+    /// Indexed bytes of the segments that died, less the bytes copied.
     pub reclaimed_bytes: u64,
+    /// Segments that died. Their files stay until [`SegmentSweeper`]
+    /// deletes them.
+    pub dead_segments: Vec<u64>,
+}
+
+/// Delete every extent no `cas_refs` row names. One statement, run in the
+/// caller's write transaction.
+fn prune(txn: &rusqlite::Connection) -> Result<usize, StoreError> {
+    Ok(txn.execute(
+        "DELETE FROM cas_extents WHERE NOT EXISTS
+           (SELECT 1 FROM cas_refs WHERE cas_refs.content_hash = cas_extents.content_hash)",
+        [],
+    )?)
+}
+
+/// Drop one holder's references and the extents only it held.
+fn release_holder(
+    txn: &rusqlite::Connection,
+    holder_kind: i64,
+    holder: &[u8],
+) -> Result<(), StoreError> {
+    let hashes: Vec<Vec<u8>> = {
+        let mut statement = txn.prepare(
+            "SELECT content_hash FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2",
+        )?;
+        let rows = statement.query_map(rusqlite::params![holder_kind, holder], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    txn.execute(
+        "DELETE FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2",
+        rusqlite::params![holder_kind, holder],
+    )?;
+    for hash in hashes {
+        txn.execute(
+            "DELETE FROM cas_extents WHERE content_hash = ?1
+               AND NOT EXISTS (SELECT 1 FROM cas_refs WHERE content_hash = ?1)",
+            [hash],
+        )?;
+    }
+    Ok(())
+}
+
+/// Evict one result row and everything only it held.
+fn evict_result_rows(
+    txn: &rusqlite::Connection,
+    key_kind: i64,
+    static_key: &[u8],
+    trace_digest: &[u8],
+) -> Result<bool, StoreError> {
+    use rusqlite::OptionalExtension;
+    let memo_seq: Option<i64> = txn
+        .query_row(
+            "SELECT memo_seq FROM result_candidates
+             WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
+            rusqlite::params![key_kind, static_key, trace_digest],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(memo_seq) = memo_seq else {
+        return Ok(false);
+    };
+    txn.execute(
+        "DELETE FROM result_candidates
+         WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
+        rusqlite::params![key_kind, static_key, trace_digest],
+    )?;
+    txn.execute("DELETE FROM derived_assertions WHERE memo_seq = ?1", [memo_seq])?;
+    let mut holder = Vec::with_capacity(65);
+    holder.push(key_kind as u8);
+    holder.extend_from_slice(static_key);
+    holder.extend_from_slice(trace_digest);
+    release_holder(txn, HOLDER_RESULT, &holder)?;
+    Ok(true)
+}
+
+/// A record compaction copies, and the index row that points at it.
+enum Moved {
+    /// An extent, and its payload's offset within the record.
+    Extent([u8; 32], u64),
+    Result(i64, Vec<u8>, Vec<u8>),
 }
 
 impl Store {
-
-    /// Remove payload extents that no committed result or explicit pin owns.
-    /// In particular, this retires a wire tree persisted immediately before a
-    /// build that never reached its result commit marker.
+    /// Remove payload extents nothing references: bytes appended by a
+    /// transaction that rolled back, or left by an eviction.
     pub(crate) fn prune_unreferenced_extents(&mut self) -> Result<usize, StoreError> {
-        let referenced = self.referenced_extent_hashes()?;
-        let indexed: Vec<[u8; 32]> = {
-            let mut statement = self.conn.prepare("SELECT content_hash FROM cas_extents")?;
-            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            rows.map(|row| row.map(crate::bundles::blob32))
-                .collect::<Result<_, _>>()?
-        };
-        let unreferenced: Vec<_> = indexed
-            .into_iter()
-            .filter(|hash| !referenced.contains(hash))
-            .collect();
-        if unreferenced.is_empty() {
-            return Ok(0);
-        }
-        let transaction = self.read.conn.savepoint()?;
-        for hash in &unreferenced {
-            transaction.execute(
-                "DELETE FROM cas_extents WHERE content_hash = ?1",
-                [hash.as_slice()],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(unreferenced.len())
-    }
-
-    /// Register pins for a holder (§13's observability sources). Lease
-    /// pins back `resolve`'s pin-before-response rule; manifest pins
-    /// persist across restarts, the rest are ephemeral.
-    pub fn pin(
-        &mut self,
-        kind: PinKind,
-        holder: &str,
-        hashes: &[[u8; 32]],
-    ) -> Result<(), StoreError> {
-        let txn = self.read.conn.savepoint()?;
-        for hash in hashes {
-            txn.execute(
-                "INSERT OR IGNORE INTO pins(kind, holder, content_hash) VALUES (?1, ?2, ?3)",
-                rusqlite::params![kind as i64, holder, hash.as_slice()],
-            )?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    /// Release every pin a holder registered under `kind`.
-    pub fn unpin_holder(&mut self, kind: PinKind, holder: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "DELETE FROM pins WHERE kind = ?1 AND holder = ?2",
-            rusqlite::params![kind as i64, holder],
-        )?;
-        Ok(())
+        self.write_txn(|store| prune(&store.conn))
     }
 
     /// Evict one committed result as a whole unit. `Ok(false)` when the
-    /// candidate does not exist; `Err(Pinned)` — with nothing deleted —
-    /// when any of its output or aux hashes is pinned. Shared extents
-    /// survive while any other candidate still references them.
+    /// candidate does not exist. Shared extents survive while anything
+    /// else still references them.
     pub fn evict_result(
         &mut self,
         key_kind: KeyKind,
         static_key: &[u8; 32],
         trace_digest: &[u8; 32],
     ) -> Result<bool, StoreError> {
-        use rusqlite::OptionalExtension;
-        // Read phase (single-writer discipline: the coordinator owns the
-        // store, so nothing commits between these reads and the
-        // transaction below).
-        let row: Option<(i64, i64, i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT memo_seq, segment, offset, len FROM result_candidates
-                 WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-                rusqlite::params![
-                    key_kind as i64,
-                    static_key.as_slice(),
-                    trace_digest.as_slice()
-                ],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((memo_seq, segment, offset, len)) = row else {
-            return Ok(false);
-        };
-        let unit = self.result_unit_hashes(segment as u64, offset as u64, len as u64)?;
-        let mut still_referenced: HashSet<[u8; 32]> = HashSet::new();
-        let others: Vec<(i64, i64, i64)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT segment, offset, len FROM result_candidates
-                 WHERE NOT (key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3)",
-            )?;
-            let mapped = stmt.query_map(
-                rusqlite::params![
-                    key_kind as i64,
-                    static_key.as_slice(),
-                    trace_digest.as_slice()
-                ],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            mapped.collect::<Result<_, _>>()?
-        };
-        for (seg, off, l) in others {
-            still_referenced.extend(self.result_unit_hashes(seg as u64, off as u64, l as u64)?);
-        }
-
-        // Delete phase: the pin check runs inside the same transaction
-        // that deletes the index rows (§13).
-        let txn = self.read.conn.savepoint()?;
-        for hash in &unit {
-            let pinned: Option<i64> = txn
-                .query_row(
-                    "SELECT 1 FROM pins WHERE content_hash = ?1 LIMIT 1",
-                    [hash.as_slice()],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if pinned.is_some() {
-                return Err(StoreError::Pinned { hash: *hash });
-            }
-        }
-        txn.execute(
-            "DELETE FROM result_candidates
-             WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-            rusqlite::params![
+        self.write_txn(|store| {
+            evict_result_rows(
+                &store.conn,
                 key_kind as i64,
                 static_key.as_slice(),
-                trace_digest.as_slice()
-            ],
-        )?;
-        txn.execute(
-            "DELETE FROM derived_assertions WHERE memo_seq = ?1",
-            [memo_seq],
-        )?;
-        for hash in &unit {
-            if !still_referenced.contains(hash) {
-                txn.execute(
-                    "DELETE FROM cas_extents WHERE content_hash = ?1",
-                    [hash.as_slice()],
-                )?;
-            }
-        }
-        txn.commit()?;
-        Ok(true)
-    }
-
-    /// The cache-limit sweep (§18's `cas.cache_limit`, operational-live):
-    /// evict unpinned results in random order until the indexed extent
-    /// bytes fit the cap. Random rather than LRU: with a working set larger
-    /// than the cap, LRU evicts each result just before its next use and
-    /// the hit rate falls to zero; random eviction degrades gracefully. Pinned units are skipped — the observability
-    /// rules are unaffected by the cap.
-    pub fn enforce_cache_limit(&mut self) -> Result<EvictionSweep, StoreError> {
-        self.prune_unreferenced_extents()?;
-        let live = |store: &Store| -> Result<u64, StoreError> {
-            Ok(store
-                .conn
-                .query_row("SELECT COALESCE(SUM(len), 0) FROM cas_extents", [], |r| {
-                    r.get::<_, i64>(0)
-                })? as u64)
-        };
-        let mut live_bytes = live(self)?;
-        let mut evicted = 0usize;
-        if live_bytes <= self.config.cache_limit {
-            return Ok(EvictionSweep {
-                evicted,
-                live_bytes,
-            });
-        }
-        let victims: Vec<(i64, Vec<u8>, Vec<u8>)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT key_kind, static_key, trace_digest FROM result_candidates
-                 ORDER BY random()",
-            )?;
-            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            mapped.collect::<Result<_, _>>()?
-        };
-        for (kind, static_key, trace_digest) in victims {
-            if live_bytes <= self.config.cache_limit {
-                break;
-            }
-            let key_kind = if kind == KeyKind::BuildImport as i64 {
-                KeyKind::BuildImport
-            } else {
-                KeyKind::Processor
-            };
-            let sk = crate::bundles::blob32(static_key);
-            let td = crate::bundles::blob32(trace_digest);
-            match self.evict_result(key_kind, &sk, &td) {
-                Ok(true) => {
-                    evicted += 1;
-                    live_bytes = live(self)?;
-                }
-                Ok(false) => {}
-                Err(StoreError::Pinned { .. }) => {} // never observable: skip
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(EvictionSweep {
-            evicted,
-            live_bytes,
+                trace_digest.as_slice(),
+            )
         })
     }
 
-    /// Bitcask-style compaction (§13): copy live records into a new
-    /// generation, flip `CURRENT`, flip the index in one transaction,
-    /// then delete the old segments.
-    pub fn compact(&mut self) -> Result<CompactionReport, StoreError> {
-        self.prune_unreferenced_extents()?;
-        let old_generation = self.cas.generation;
-        let new_generation = old_generation + 1;
-        let old_segments = self.cas.segments.clone();
-        let old_bytes: u64 = old_segments
-            .iter()
-            .map(|segment| {
-                let p = self.cas.dir.join(&segment.name);
-                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
-            })
-            .sum();
+    /// Evict one installed artifact or wire tree, and what only it held.
+    pub fn evict_installed(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
+        self.write_txn(|store| release_holder(&store.conn, HOLDER_INSTALLED, hash))
+    }
 
-        // Liveness maps from the index.
-        let mut live_extents: HashMap<[u8; 32], (u64, u64)> = HashMap::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT content_hash, segment, offset FROM cas_extents")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (hash, seg, off) = row?;
-                live_extents.insert(crate::bundles::blob32(hash), (seg as u64, off as u64));
+    /// The cache-limit sweep (§18's `cas.cache_limit`, operational-live):
+    /// evict whole units (results and installs) in random order until the
+    /// indexed extent bytes fit the cap. Random rather than LRU: with a
+    /// working set larger than the cap, LRU evicts each result just before
+    /// its next use and the hit rate falls to zero; random eviction degrades
+    /// gracefully. One write transaction; no segment bytes are read.
+    pub fn enforce_cache_limit(&mut self) -> Result<EvictionSweep, StoreError> {
+        let cache_limit = self.config.cache_limit;
+        self.write_txn(|store| {
+            let txn = &*store.conn;
+            prune(txn)?;
+            let live = || -> Result<u64, StoreError> {
+                Ok(txn.query_row("SELECT COALESCE(SUM(len), 0) FROM cas_extents", [], |r| {
+                    r.get::<_, i64>(0)
+                })? as u64)
+            };
+            let mut live_bytes = live()?;
+            let mut evicted = 0usize;
+            if live_bytes <= cache_limit {
+                return Ok(EvictionSweep {
+                    evicted,
+                    live_bytes,
+                });
             }
-        }
-        // (key_kind, static_key, trace_digest) keyed by (segment, offset).
-        type CandidateKey = (i64, Vec<u8>, Vec<u8>);
-        let mut live_results: HashMap<(u64, u64), CandidateKey> = HashMap::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT segment, offset, key_kind, static_key, trace_digest FROM result_candidates",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, Vec<u8>>(3)?,
-                    r.get::<_, Vec<u8>>(4)?,
-                ))
-            })?;
-            for row in rows {
-                let (seg, off, kind, sk, td) = row?;
-                live_results.insert((seg as u64, off as u64), (kind, sk, td));
-            }
-        }
-
-        // Copy live records into new segment buffers, rolling at the cap.
-        struct NewSegment {
-            id: u64,
-            kind: SegmentKind,
-            bytes: Vec<u8>,
-        }
-        let mut new_segments: Vec<NewSegment> = Vec::new();
-        let mut next_id = self.cas.next_segment_id;
-        let mut extent_moves: Vec<([u8; 32], u64, u64)> = Vec::new(); // hash, new seg, new payload offset
-                                                                      // A candidate's key plus its new (segment, offset, len).
-        type CandidateMove = ((i64, Vec<u8>, Vec<u8>), (u64, u64, u64));
-        let mut candidate_moves: Vec<CandidateMove> = Vec::new();
-        let mut records_copied = 0usize;
-
-        // Payload records precede every result in the compacted generation.
-        // This keeps the log independently rebuildable even when a surviving
-        // result refers to the later of two duplicate payload occurrences.
-        for copy_results in [false, true] {
-            for old_segment in &old_segments {
-                let seg_id = old_segment.id;
-                let path = self.cas.dir.join(&old_segment.name);
-                let data = std::fs::read(&path).map_err(|source| StoreError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-                let mut pos: u64 = 0;
-                while (pos as usize) < data.len() {
-                    let decoded = decode_record(&data[pos as usize..], seg_id, pos)?;
-                    let rec = &decoded.record;
-                    let payload_offset = pos
-                        + RECORD_HEADER_LEN as u64
-                        + rec.static_input_key.len() as u64
-                        + rec.output_key.len() as u64;
-                    let is_result = rec.kind == RecordKind::Result;
-                    let live = if is_result {
-                        live_results.contains_key(&(seg_id, pos))
-                    } else {
-                        live_extents.get(&decoded.content_hash) == Some(&(seg_id, payload_offset))
-                    };
-                    if live && is_result == copy_results {
-                        let oversize = decoded.encoded_len > self.config.segment_size;
-                        let kind = if oversize {
-                            SegmentKind::Oversize
-                        } else {
-                            SegmentKind::Regular
-                        };
-                        let roll = oversize
-                            || match new_segments.last() {
-                                None => true,
-                                Some(s) => {
-                                    s.kind != SegmentKind::Regular
-                                        || (!s.bytes.is_empty()
-                                            && s.bytes.len() as u64 + decoded.encoded_len
-                                                > self.config.segment_size)
-                                }
-                            };
-                        if roll {
-                            new_segments.push(NewSegment {
-                                id: next_id,
-                                kind,
-                                bytes: Vec::new(),
-                            });
-                            next_id += 1;
-                        }
-                        let dst = new_segments.last_mut().expect("destination segment");
-                        let new_offset = dst.bytes.len() as u64;
-                        dst.bytes.extend_from_slice(
-                            &data[pos as usize..(pos + decoded.encoded_len) as usize],
-                        );
-                        records_copied += 1;
-                        match rec.kind {
-                            RecordKind::Result => {
-                                let key = live_results[&(seg_id, pos)].clone();
-                                candidate_moves
-                                    .push((key, (dst.id, new_offset, decoded.encoded_len)));
-                            }
-                            _ => {
-                                let new_payload_offset = new_offset
-                                    + RECORD_HEADER_LEN as u64
-                                    + rec.static_input_key.len() as u64
-                                    + rec.output_key.len() as u64;
-                                extent_moves.push((
-                                    decoded.content_hash,
-                                    dst.id,
-                                    new_payload_offset,
-                                ));
-                            }
-                        }
-                    }
-                    pos += decoded.encoded_len;
+            let victims: Vec<(i64, Vec<u8>)> = {
+                let mut statement = txn.prepare(
+                    "SELECT holder_kind, holder FROM
+                       (SELECT DISTINCT holder_kind, holder FROM cas_refs)
+                     ORDER BY random()",
+                )?;
+                let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for (holder_kind, holder) in victims {
+                if live_bytes <= cache_limit {
+                    break;
                 }
+                if holder_kind == HOLDER_RESULT {
+                    if holder.len() != 65 {
+                        continue;
+                    }
+                    evict_result_rows(txn, i64::from(holder[0]), &holder[1..33], &holder[33..65])?;
+                } else {
+                    release_holder(txn, holder_kind, &holder)?;
+                }
+                evicted += 1;
+                live_bytes = live()?;
             }
-        }
-
-        // Write the new segments durably (§13: new segments durable
-        // before the index flips).
-        for seg in &new_segments {
-            let path = self.cas.dir.join(segment_file_name(seg.id, seg.kind));
-            let mut f = std::fs::File::create(&path).map_err(|source| StoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            f.write_all(&seg.bytes).map_err(|source| StoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            f.sync_all().map_err(|source| StoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        }
-        manifest::fsync_dir(&self.cas.dir)?;
-
-        // Atomically flip CURRENT — the single authority. A crash after
-        // this point and before the SQLite transaction is the
-        // generation-mismatch rebuild path.
-        let new_names: Vec<ManifestSegment> = new_segments
-            .iter()
-            .map(|s| ManifestSegment {
-                kind: s.kind,
-                name: segment_file_name(s.id, s.kind),
+            Ok(EvictionSweep {
+                evicted,
+                live_bytes,
             })
-            .collect();
-        manifest::write_current(
-            &self.cas.dir,
-            &GenerationManifest {
-                generation: new_generation,
-                segments: new_names,
-            },
-        )?;
+        })
+    }
 
-        // One SQLite transaction flips the index.
-        let txn = self.read.conn.savepoint()?;
-        txn.execute("DELETE FROM cas_segments", [])?;
-        for seg in &new_segments {
-            txn.execute(
-                "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    seg.id as i64,
-                    segment_file_name(seg.id, seg.kind),
-                    seg.kind as i64,
-                    seg.bytes.len() as i64
-                ],
-            )?;
+    /// Compact the CAS. A sealed segment (or this writer's own active one)
+    /// that nothing references any more dies; one whose live records fill
+    /// less than half of it has them copied into new segments, the index
+    /// repointed in one write transaction, and then dies. Dead segments are
+    /// returned, not deleted: their files go through [`SegmentSweeper`].
+    pub fn compact(&mut self) -> Result<CompactionReport, StoreError> {
+        struct Candidate {
+            id: u64,
+            name: String,
+            kind: SegmentKind,
+            indexed_len: u64,
+            live: u64,
         }
-        for (hash, seg, offset) in &extent_moves {
-            txn.execute(
-                "UPDATE cas_extents SET segment = ?2, offset = ?3 WHERE content_hash = ?1",
-                rusqlite::params![hash.as_slice(), *seg as i64, *offset as i64],
+        let own = self.cas.active_id();
+        let candidates: Vec<Candidate> = {
+            let mut statement = self.conn.prepare(
+                "SELECT s.segment_id, s.file_name, s.segment_kind, s.indexed_len,
+                   (SELECT COALESCE(SUM(len), 0) FROM cas_extents e
+                      WHERE e.segment = s.segment_id)
+                 + (SELECT COALESCE(SUM(len), 0) FROM result_candidates r
+                      WHERE r.segment = s.segment_id)
+                 FROM cas_segments s
+                 WHERE s.state = ?1 OR s.segment_id = ?2
+                 ORDER BY s.segment_id",
             )?;
-        }
-        for ((kind, sk, td), (seg, offset, len)) in &candidate_moves {
-            txn.execute(
-                "UPDATE result_candidates SET segment = ?4, offset = ?5, len = ?6
-                 WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-                rusqlite::params![
-                    kind,
-                    sk.as_slice(),
-                    td.as_slice(),
-                    *seg as i64,
-                    *offset as i64,
-                    *len as i64
-                ],
+            let rows = statement.query_map(
+                rusqlite::params![SEGMENT_SEALED, own.map_or(-1, |id| id as i64)],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
             )?;
-        }
-        meta_set_u64(&txn, "cas_generation", new_generation)?;
-        txn.commit()?;
-
-        // Old segments go last — no long-lived readers pin the old
-        // generation in this store (module docs).
-        for segment in &old_segments {
-            let path = self.cas.dir.join(&segment.name);
-            if path.exists() {
-                std::fs::remove_file(&path).map_err(|source| StoreError::Io { path, source })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, name, kind, indexed_len, live) = row?;
+                out.push(Candidate {
+                    id: id as u64,
+                    name,
+                    kind: SegmentKind::from_i64(kind).unwrap_or(SegmentKind::Regular),
+                    indexed_len: indexed_len as u64,
+                    live: live as u64,
+                });
             }
-        }
-        manifest::fsync_dir(&self.cas.dir)?;
-
-        let active_len = new_segments
-            .last()
-            .filter(|s| s.kind == SegmentKind::Regular)
-            .map(|s| s.bytes.len() as u64)
-            .unwrap_or(0);
-        let new_bytes: u64 = new_segments.iter().map(|s| s.bytes.len() as u64).sum();
-        self.cas = CasInner {
-            dir: self.cas.dir.clone(),
-            generation: new_generation,
-            segments: new_segments
-                .iter()
-                .map(|s| SegmentInfo {
-                    id: s.id,
-                    name: segment_file_name(s.id, s.kind),
-                    kind: s.kind,
-                })
-                .collect(),
-            active_len,
-            next_segment_id: next_id,
+            out
         };
 
+        let mut victims = Vec::new();
+        // (record bytes, old segment, old record offset, index row).
+        let mut payloads: Vec<(Vec<u8>, u64, u64, Moved)> = Vec::new();
+        let mut results: Vec<(Vec<u8>, u64, u64, Moved)> = Vec::new();
+        for candidate in &candidates {
+            if candidate.live == 0 {
+                victims.push(candidate.id);
+                continue;
+            }
+            if candidate.kind != SegmentKind::Regular || candidate.live * 2 >= candidate.indexed_len
+            {
+                continue;
+            }
+            let extents: HashMap<[u8; 32], u64> = {
+                let mut statement = self
+                    .conn
+                    .prepare("SELECT content_hash, offset FROM cas_extents WHERE segment = ?1")?;
+                let rows = statement.query_map([candidate.id as i64], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                let mut out = HashMap::new();
+                for row in rows {
+                    let (hash, offset) = row?;
+                    out.insert(crate::bundles::blob32(hash), offset as u64);
+                }
+                out
+            };
+            type ResultKey = (i64, Vec<u8>, Vec<u8>);
+            let result_rows: HashMap<u64, ResultKey> = {
+                let mut statement = self.conn.prepare(
+                    "SELECT offset, key_kind, static_key, trace_digest FROM result_candidates
+                     WHERE segment = ?1",
+                )?;
+                let rows = statement.query_map([candidate.id as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+                })?;
+                let mut out = HashMap::new();
+                for row in rows {
+                    let (offset, key) = row?;
+                    out.insert(offset as u64, key);
+                }
+                out
+            };
+            let data = read_segment(&self.cas.dir.join(&candidate.name))?;
+            let end = (candidate.indexed_len as usize).min(data.len());
+            let mut position = 0u64;
+            while (position as usize) < end {
+                let decoded = decode_record(&data[position as usize..end], candidate.id, position)?;
+                let record = &decoded.record;
+                let bytes = data[position as usize..(position + decoded.encoded_len) as usize].to_vec();
+                if record.kind == RecordKind::Result {
+                    if let Some((kind, static_key, trace)) = result_rows.get(&position) {
+                        let moved = Moved::Result(*kind, static_key.clone(), trace.clone());
+                        results.push((bytes, candidate.id, position, moved));
+                    }
+                } else {
+                    let payload_start = RECORD_HEADER_LEN as u64
+                        + record.static_input_key.len() as u64
+                        + record.output_key.len() as u64;
+                    if extents.get(&decoded.content_hash) == Some(&(position + payload_start)) {
+                        let moved = Moved::Extent(decoded.content_hash, payload_start);
+                        payloads.push((bytes, candidate.id, position, moved));
+                    }
+                }
+                position += decoded.encoded_len;
+            }
+            victims.push(candidate.id);
+        }
+        if victims.is_empty() {
+            return Ok(CompactionReport {
+                records_copied: 0,
+                reclaimed_bytes: 0,
+                dead_segments: Vec::new(),
+            });
+        }
+        if own.is_some_and(|own| victims.contains(&own)) {
+            self.cas.forget_active();
+        }
+
+        // Write the copies into new segments, rolling at the cap. Payloads
+        // precede every result, so the new segments alone rebuild.
+        let segment_size = self.config.segment_size;
+        let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut moves = Vec::new();
+        for (bytes, old_segment, old_offset, moved) in payloads.into_iter().chain(results) {
+            let roll = match written.last() {
+                None => true,
+                Some((_, segment)) => {
+                    !segment.is_empty() && segment.len() as u64 + bytes.len() as u64 > segment_size
+                }
+            };
+            if roll {
+                let id = self.write_txn(|store| {
+                    let id = store.create_segment(SegmentKind::Regular)?;
+                    store.conn.execute(
+                        "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
+                        rusqlite::params![id as i64, SEGMENT_SEALED, SEGMENT_OPEN],
+                    )?;
+                    Ok(id)
+                })?;
+                written.push((id, Vec::new()));
+            }
+            let (id, segment) = written.last_mut().expect("a destination segment");
+            let offset = segment.len() as u64;
+            segment.extend_from_slice(&bytes);
+            moves.push((*id, offset, bytes.len() as u64, old_segment, old_offset, moved));
+        }
+        for (id, bytes) in &written {
+            let path = self.cas.dir.join(segment_file_name(*id, SegmentKind::Regular));
+            segment_open_options()
+                .write(true)
+                .open(&path)
+                .and_then(|mut file| {
+                    file.write_all(bytes)?;
+                    file.sync_all()
+                })
+                .map_err(|source| StoreError::Io { path, source })?;
+        }
+
+        let records_copied = moves.len();
+        let copied_bytes: u64 = written.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let dead = self.write_txn(|store| {
+            let txn = &*store.conn;
+            for (segment, offset, len, old_segment, old_offset, moved) in &moves {
+                match moved {
+                    Moved::Extent(hash, payload_start) => {
+                        txn.execute(
+                            "UPDATE cas_extents SET segment = ?2, offset = ?3
+                             WHERE content_hash = ?1 AND segment = ?4 AND offset = ?5",
+                            rusqlite::params![
+                                hash.as_slice(),
+                                *segment as i64,
+                                (*offset + *payload_start) as i64,
+                                *old_segment as i64,
+                                (*old_offset + *payload_start) as i64
+                            ],
+                        )?;
+                    }
+                    Moved::Result(kind, static_key, trace) => {
+                        txn.execute(
+                            "UPDATE result_candidates SET segment = ?4, offset = ?5, len = ?6
+                             WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3
+                               AND segment = ?7 AND offset = ?8",
+                            rusqlite::params![
+                                kind,
+                                static_key.as_slice(),
+                                trace.as_slice(),
+                                *segment as i64,
+                                *offset as i64,
+                                *len as i64,
+                                *old_segment as i64,
+                                *old_offset as i64
+                            ],
+                        )?;
+                    }
+                }
+            }
+            for (id, bytes) in &written {
+                txn.execute(
+                    "UPDATE cas_segments SET indexed_len = ?2 WHERE segment_id = ?1",
+                    rusqlite::params![*id as i64, bytes.len() as i64],
+                )?;
+            }
+            let mut dead = Vec::new();
+            for victim in &victims {
+                let changed = txn.execute(
+                    "UPDATE cas_segments SET state = ?2 WHERE segment_id = ?1
+                       AND NOT EXISTS (SELECT 1 FROM cas_extents WHERE segment = ?1)
+                       AND NOT EXISTS (SELECT 1 FROM result_candidates WHERE segment = ?1)",
+                    rusqlite::params![*victim as i64, SEGMENT_DEAD],
+                )?;
+                if changed != 0 {
+                    dead.push(*victim);
+                }
+            }
+            Ok(dead)
+        })?;
+        let dead_bytes: u64 = candidates
+            .iter()
+            .filter(|candidate| dead.contains(&candidate.id))
+            .map(|candidate| candidate.indexed_len)
+            .sum();
         Ok(CompactionReport {
-            old_generation,
-            new_generation,
             records_copied,
-            reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
+            reclaimed_bytes: dead_bytes.saturating_sub(copied_bytes),
+            dead_segments: dead,
         })
     }
 }
 
-impl StoreReader {
-    fn referenced_extent_hashes(&self) -> Result<HashSet<[u8; 32]>, StoreError> {
-        let candidates: Vec<(i64, i64, i64)> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT segment, offset, len FROM result_candidates")?;
-            let rows =
-                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        let mut referenced = HashSet::new();
-        for (segment, offset, len) in candidates {
-            referenced.extend(self.result_unit_hashes(
-                segment as u64,
-                offset as u64,
-                len as u64,
-            )?);
+/// Deletes dead segment files once no read can still reach them. One
+/// sweeper runs per store, on one thread (the daemon's loop). A segment is
+/// deleted `grace` after the sweep that first saw it dead; `grace` must
+/// exceed the read bound (see [`crate::cas`]). A delete that fails (a
+/// reader on Windows still has the file open) is retried on the next
+/// sweep.
+#[derive(Debug)]
+pub struct SegmentSweeper {
+    grace: Duration,
+    dead_since: HashMap<u64, Instant>,
+}
+
+impl SegmentSweeper {
+    pub fn new(grace: Duration) -> Self {
+        Self {
+            grace,
+            dead_since: HashMap::new(),
         }
-        let pinned: Vec<Vec<u8>> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT DISTINCT content_hash FROM pins")?;
-            let rows = statement.query_map([], |row| row.get(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        referenced.extend(pinned.into_iter().map(crate::bundles::blob32));
-        Ok(referenced)
     }
 
-    /// The whole pin/evict unit of one result record: every output and
-    /// aux ContentHash plus each output artifact's wire-tree LayoutHash
-    /// (§13). The layout is part of the observable artifact and must live
-    /// for exactly as long as any result that names it.
-    fn result_unit_hashes(
-        &self,
-        segment: u64,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<[u8; 32]>, StoreError> {
-        let bytes = self.read_extent(segment, offset, len)?;
-        let decoded = decode_record(&bytes, segment, offset)?;
-        let payload = ResultPayload::decode(&decoded.record.payload)?;
-        let mut hashes = Vec::new();
-        if let ResultOutcome::Success { outputs, aux } = &payload.outcome {
-            for row in outputs {
-                hashes.push(row.content_hash.0);
-                let artifact = self.cas_read(&row.content_hash.0)?;
-                if artifact.starts_with(&ARTIFACT_MAGIC) {
-                    let view = parse_artifact(&artifact).map_err(|error| {
-                        StoreError::BadResultPayload {
-                            detail: format!(
-                                "output {} is not a valid artifact: {error}",
-                                row.output_key
-                            ),
-                        }
-                    })?;
-                    hashes.push(view.layout_hash.0);
+    /// Delete the dead segments whose grace has passed; returns how many.
+    pub fn sweep(&mut self, store: &mut Store) -> Result<usize, StoreError> {
+        let now = Instant::now();
+        let dead: Vec<(u64, String)> = {
+            let mut statement = store
+                .conn
+                .prepare("SELECT segment_id, file_name FROM cas_segments WHERE state = ?1")?;
+            let rows = statement.query_map([SEGMENT_DEAD], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        self.dead_since
+            .retain(|id, _| dead.iter().any(|(dead, _)| dead == id));
+        let mut deleted = Vec::new();
+        for (id, name) in dead {
+            let since = *self.dead_since.entry(id).or_insert(now);
+            if now.duration_since(since) < self.grace {
+                continue;
+            }
+            let path = store.cas.dir.join(&name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => deleted.push(id),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => deleted.push(id),
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "dead segment kept for the next sweep");
                 }
             }
-            for row in aux {
-                hashes.push(row.content_hash.0);
-            }
         }
-        Ok(hashes)
+        if deleted.is_empty() {
+            return Ok(0);
+        }
+        fsync_dir(&store.cas.dir)?;
+        store.write_txn(|store| {
+            for id in &deleted {
+                store.conn.execute(
+                    "DELETE FROM cas_segments WHERE segment_id = ?1 AND state = ?2",
+                    rusqlite::params![*id as i64, SEGMENT_DEAD],
+                )?;
+            }
+            Ok(())
+        })?;
+        for id in &deleted {
+            self.dead_since.remove(id);
+        }
+        Ok(deleted.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
+    use distill_wire::artifact::{write_artifact, ArtifactHeader};
+    use distill_wire::dswl::{dswl_bytes, dswl_hash};
+    use distill_wire::wire::WireNode;
+
+    use crate::cas::record::KeyKind;
+    use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
+    use crate::{Store, StoreConfig, StoreError};
+
+    #[test]
+    fn a_prune_racing_a_commit_never_leaves_a_dangling_reference() {
+        // Writer `a` finds the wire tree installed and does not append it;
+        // before its index transaction, writer `b` evicts the install, which
+        // prunes the extent. `a`'s transaction checks again, appends the tree
+        // after all, and commits a result whose every reference resolves.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+        let node = WireNode::Unit { offset: 0 };
+        let wire_bytes = dswl_bytes(&node).unwrap();
+        let layout = dswl_hash(&node).unwrap();
+        a.put_wire_tree(&wire_bytes).unwrap();
+        let artifact = write_artifact(
+            &ArtifactHeader {
+                asset_uuid: AssetUuid([7; 16]),
+                authored_type: TypeUuid([1; 16]),
+                terminal_type: TypeUuid([2; 16]),
+                encoded_type: TypeUuid([3; 16]),
+                logical_hash: LogicalHash([4; 32]),
+                layout_hash: layout,
+            },
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let mut b = Some(a.open_writer().unwrap());
+        a.before_commit = Some(Box::new(move || {
+            if let Some(mut b) = b.take() {
+                b.evict_installed(&layout.0).unwrap();
+                assert!(matches!(b.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
+            }
+        }));
+        let receipt = a
+            .commit_build(BuildCommit {
+                wire_trees: vec![wire_bytes.clone()],
+                key_kind: KeyKind::Processor,
+                static_input_key: [1; 32],
+                asset_uuid: AssetUuid([7; 16]),
+                static_inputs_canonical: vec![],
+                trace: vec![1],
+                outcome: CommitOutcome::Success {
+                    payload_kind: PayloadKind::ProcessorOutput,
+                    outputs: vec![OutputSpec {
+                        output_key: String::new(),
+                        type_uuids: vec![],
+                        bytes: artifact,
+                    }],
+                    aux: vec![],
+                },
+            })
+            .unwrap();
+        a.before_commit = None;
+        assert_eq!(a.wire_tree_read(layout).unwrap(), wire_bytes);
+
+        let dangling: i64 = a
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM cas_refs r WHERE NOT EXISTS
+                   (SELECT 1 FROM cas_extents e WHERE e.content_hash = r.content_hash)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+        // The foreign key refuses to drop an extent something references.
+        assert!(a
+            .conn
+            .execute(
+                "DELETE FROM cas_extents WHERE content_hash = ?1",
+                [layout.0.as_slice()],
+            )
+            .is_err());
+        assert!(a
+            .evict_result(KeyKind::Processor, &[1; 32], &receipt.trace_digest)
+            .unwrap());
+        assert!(matches!(a.wire_tree_read(layout), Err(StoreError::NotFound { .. })));
     }
 }

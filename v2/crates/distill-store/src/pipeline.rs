@@ -185,7 +185,7 @@ pub(crate) fn cleanup_staged_tool_temps(state_path: &std::path::Path) -> Result<
         }
     }
     if removed {
-        crate::cas::manifest::fsync_dir(&objects)?;
+        crate::cas::store::fsync_dir(&objects)?;
     }
     Ok(())
 }
@@ -237,7 +237,7 @@ fn stage_immutable_file(
             }
         }
         std::fs::remove_file(&tmp).map_err(|source| StoreError::Io { path: tmp, source })?;
-        crate::cas::manifest::fsync_dir(parent)?;
+        crate::cas::store::fsync_dir(parent)?;
     }
     verify_package_file(key, path, metadata)
 }
@@ -595,7 +595,7 @@ impl InputTxn<'_> {
                     match std::fs::hard_link(&object, &member) {
                         Ok(()) => {
                             if let Some(parent) = member.parent() {
-                                crate::cas::manifest::fsync_dir(parent)?;
+                                crate::cas::store::fsync_dir(parent)?;
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

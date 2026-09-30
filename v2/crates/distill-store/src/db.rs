@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::cas::manifest::{self, GenerationManifest};
 use crate::config::StoreConfig;
 use crate::error::StoreError;
 use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
@@ -20,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 34;
+pub const SCHEMA_VERSION: u32 = 35;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -244,17 +243,33 @@ CREATE TABLE derived_assertions (
     memo_seq    INTEGER NOT NULL,
     PRIMARY KEY (child_uuid, memo_seq)
 );
+CREATE INDEX result_candidates_by_segment ON result_candidates(segment);
 CREATE TABLE cas_extents (
     content_hash BLOB NOT NULL PRIMARY KEY,
     segment      INTEGER NOT NULL,
     offset       INTEGER NOT NULL,
     len          INTEGER NOT NULL
 );
+CREATE INDEX cas_extents_by_segment ON cas_extents(segment);
+-- What keeps an extent indexed. holder_kind 0: a result (holder = key_kind
+-- byte, static key, trace digest) names its outputs, aux payloads and
+-- output wire trees. holder_kind 1: an installed artifact or wire tree
+-- (holder = its own hash). An extent no row names is pruned.
+CREATE TABLE cas_refs (
+    holder_kind  INTEGER NOT NULL CHECK (holder_kind IN (0, 1)),
+    holder       BLOB NOT NULL,
+    content_hash BLOB NOT NULL REFERENCES cas_extents(content_hash),
+    PRIMARY KEY (holder_kind, holder, content_hash)
+) WITHOUT ROWID;
+CREATE INDEX cas_refs_by_hash ON cas_refs(content_hash);
+-- Every segment file. state 0: a writer may still append; 1: sealed;
+-- 2: dead, its file deleted once no read can still reach it (see `cas`).
 CREATE TABLE cas_segments (
     segment_id  INTEGER PRIMARY KEY,
     file_name   TEXT NOT NULL,
     segment_kind INTEGER NOT NULL,
-    indexed_len INTEGER NOT NULL
+    indexed_len INTEGER NOT NULL,
+    state       INTEGER NOT NULL CHECK (state IN (0, 1, 2))
 );
 CREATE TABLE pipeline_state (
     id                 INTEGER PRIMARY KEY CHECK (id = 0),
@@ -312,13 +327,6 @@ CREATE TABLE tools (
     input_version  INTEGER NOT NULL,
     PRIMARY KEY (tool_key, input_version)
 );
-CREATE TABLE pins (
-    kind         INTEGER NOT NULL,
-    holder       TEXT NOT NULL,
-    content_hash BLOB NOT NULL,
-    PRIMARY KEY (kind, holder, content_hash)
-);
-CREATE INDEX pins_by_hash ON pins(content_hash);
 CREATE TABLE codegen_outputs (
     relative_path TEXT NOT NULL PRIMARY KEY,
     content_hash  BLOB NOT NULL CHECK (length(content_hash) = 32)
@@ -453,6 +461,12 @@ pub struct Store {
     pub(crate) read: StoreReader,
     pub(crate) cas: crate::cas::store::CasInner,
     input: InputState,
+    /// Held for as long as any writer of this process is open: one process
+    /// per state directory.
+    _state_lock: Arc<std::fs::File>,
+    /// Runs in `commit_build` between the append and the index transaction.
+    #[cfg(test)]
+    pub(crate) before_commit: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// Whether writes join one input ([`Store::arm_input`]).
@@ -492,17 +506,15 @@ impl Store {
         config: StoreConfig,
     ) -> Result<(Store, crate::cas::RecoveryReport), StoreError> {
         let state_path = &config.state_path;
+        let cas_dir = state_path.join("cas");
         create_dir(state_path)?;
         create_dir(&state_path.join("cas"))?;
         create_dir(&state_path.join("tools"))?;
         crate::pipeline::cleanup_staged_tool_temps(state_path)?;
 
+        let state_lock = lock_state_dir(state_path)?;
         let db_path = state_path.join("meta.sqlite");
-        let conn = Connection::open(&db_path)?;
-        conn.pragma_update(None, "journal_mode", "wal")?;
-        // FULL: every committed transaction is durable; §13's index rows
-        // must never lead the segment fsync they follow.
-        conn.pragma_update(None, "synchronous", "FULL")?;
+        let conn = open_writer_connection(&db_path)?;
 
         let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if found == 0 {
@@ -531,40 +543,18 @@ impl Store {
         meta_get_u64_or_init(&conn, "input_version")?;
         meta_get_u64_or_init(&conn, "memo_seq")?;
 
-        // Ephemeral state carries no version and rebuilds from scratch
-        // (§13): lease, in-flight, and pack-session pins die with the
-        // process; only manifest pins persist.
-        conn.execute(
-            "DELETE FROM pins WHERE kind != ?1",
-            [crate::artifacts::PinKind::Manifest as i64],
-        )?;
-
-        // Bootstrap the CAS generation manifest: CURRENT is the single
-        // authority for the active segment set (§13).
-        let cas_dir = state_path.join("cas");
-        if !cas_dir.join("CURRENT").exists() {
-            manifest::write_current(
-                &cas_dir,
-                &GenerationManifest {
-                    generation: 0,
-                    segments: Vec::new(),
-                },
-            )?;
-        }
-        if meta_get_u64(&conn, "cas_generation")?.is_none() {
-            meta_set_u64(&conn, "cas_generation", 0)?;
-        }
-
         let mut store = Store {
             read: StoreReader {
                 conn: ReaderConn::Owned(conn),
                 config: Arc::new(config),
                 instance_id,
             },
-            cas: Default::default(),
+            cas: crate::cas::store::CasInner::new(cas_dir),
             input: InputState::Closed,
+            _state_lock: state_lock,
+            #[cfg(test)]
+            before_commit: None,
         };
-        store.init_cas()?;
         let recovery = store.recover_cas()?;
         tracing::info!(
             path = %store.config.state_path.display(),
@@ -574,6 +564,25 @@ impl Store {
             "store opened"
         );
         Ok((store, recovery))
+    }
+
+    /// Open another writer on this store's state directory, for another
+    /// thread: its own connection and its own CAS segment. Recovery ran
+    /// when this store opened; nothing runs here.
+    pub fn open_writer(&self) -> Result<Store, StoreError> {
+        let conn = open_writer_connection(&self.config.state_path.join("meta.sqlite"))?;
+        Ok(Store {
+            read: StoreReader {
+                conn: ReaderConn::Owned(conn),
+                config: Arc::new((*self.config).clone()),
+                instance_id: self.instance_id(),
+            },
+            cas: crate::cas::store::CasInner::new(self.cas.dir.clone()),
+            input: InputState::Closed,
+            _state_lock: Arc::clone(&self._state_lock),
+            #[cfg(test)]
+            before_commit: None,
+        })
     }
 
     /// Open a reader on the same state directory as this writer.
@@ -590,19 +599,18 @@ impl Store {
         instance: StoreInstanceId,
         version: InputVersion,
     ) -> Result<(), StoreError> {
-        let txn = self
-            .read
-            .conn
-            .savepoint()?;
-        if meta_get_u64(&txn, "input_version")?.unwrap_or(0) != 0 {
-            return Err(StoreError::InvalidConfiguration {
-                error: "only a never-published store can adopt an embedded identity".to_owned(),
-            });
-        }
-        meta_set_blob(&txn, "instance_id", &instance.0)?;
-        meta_set_u64(&txn, "input_version", version.0)?;
-        meta_set_u64(&txn, "change_log_oldest", version.0)?;
-        txn.commit()?;
+        self.write_txn(|store| {
+            let txn = &*store.read.conn;
+            if meta_get_u64(txn, "input_version")?.unwrap_or(0) != 0 {
+                return Err(StoreError::InvalidConfiguration {
+                    error: "only a never-published store can adopt an embedded identity"
+                        .to_owned(),
+                });
+            }
+            meta_set_blob(txn, "instance_id", &instance.0)?;
+            meta_set_u64(txn, "input_version", version.0)?;
+            meta_set_u64(txn, "change_log_oldest", version.0)
+        })?;
         self.read.instance_id = instance;
         Ok(())
     }
@@ -668,7 +676,18 @@ impl Store {
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
-        self.joined_input_transaction(f, false).map(|(out, _)| out)
+        if !self.read.conn.is_autocommit() {
+            return self.joined_input_transaction(f, false).map(|(out, _)| out);
+        }
+        self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.joined_input_transaction(f, false)
+        }));
+        let _ = self.read.conn.execute_batch("ROLLBACK");
+        match out {
+            Ok(out) => out.map(|(out, _)| out),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// `f` as a savepoint in the open input (or, with none open, in a
@@ -750,28 +769,50 @@ impl Store {
                 Ok(()) => return Ok(self.input_version()),
                 Err(error) => {
                     let _ = self.read.conn.execute_batch("ROLLBACK");
-                    self.resync_cas_segments()?;
+                    self.cas.forget_active();
                     return Err(error.into());
                 }
             }
         }
         self.read.conn.execute_batch("ROLLBACK")?;
-        self.resync_cas_segments()?;
+        self.cas.forget_active();
         Ok(base)
     }
 
-    /// Segments created inside a rolled-back input exist on disk and in the
-    /// manifest; restore their rows. Their unindexed bytes are dead space.
-    fn resync_cas_segments(&mut self) -> Result<(), StoreError> {
-        for segment in &self.cas.segments {
-            self.read.conn.execute(
-                "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len)
-                 VALUES (?1, ?2, ?3, 0)
-                 ON CONFLICT(segment_id) DO NOTHING",
-                rusqlite::params![segment.id as i64, segment.name, segment.kind as i64],
-            )?;
+    /// Run `f` as one write transaction: `BEGIN IMMEDIATE` when none is
+    /// open, so the transaction holds SQLite's write lock from its first
+    /// read and never upgrades a read snapshot; inside an open one `f` joins
+    /// it. On failure everything `f` wrote rolls back with the enclosing
+    /// transaction, and this writer forgets its active segment, whose row
+    /// may have been part of it.
+    pub(crate) fn write_txn<T>(
+        &mut self,
+        f: impl FnOnce(&mut Store) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if !self.read.conn.is_autocommit() {
+            let out = f(self);
+            if out.is_err() {
+                self.cas.forget_active();
+            }
+            return out;
         }
-        Ok(())
+        self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let out = match out {
+            Ok(Ok(value)) => match self.read.conn.execute_batch("COMMIT") {
+                Ok(()) => return Ok(value),
+                Err(error) => Err(error.into()),
+            },
+            Ok(Err(error)) => Err(error),
+            Err(panic) => {
+                let _ = self.read.conn.execute_batch("ROLLBACK");
+                self.cas.forget_active();
+                std::panic::resume_unwind(panic)
+            }
+        };
+        let _ = self.read.conn.execute_batch("ROLLBACK");
+        self.cas.forget_active();
+        out
     }
 
     /// Attach memo state to an input basis without advancing any input
@@ -780,12 +821,14 @@ impl Store {
     where
         F: FnOnce(&rusqlite::Savepoint<'_>, MemoSeq) -> Result<T, StoreError>,
     {
-        let txn = self.read.conn.savepoint()?;
-        let seq = MemoSeq(meta_get_u64(&txn, "memo_seq")?.unwrap_or(0) + 1);
-        let out = f(&txn, seq)?;
-        meta_set_u64(&txn, "memo_seq", seq.0)?;
-        txn.commit()?;
-        Ok((out, seq))
+        self.write_txn(|store| {
+            let txn = store.read.conn.savepoint()?;
+            let seq = MemoSeq(meta_get_u64(&txn, "memo_seq")?.unwrap_or(0) + 1);
+            let out = f(&txn, seq)?;
+            meta_set_u64(&txn, "memo_seq", seq.0)?;
+            txn.commit()?;
+            Ok((out, seq))
+        })
     }
 }
 
@@ -929,6 +972,43 @@ impl InputTxn<'_> {
     /// Record §14's clean watermark.
     pub fn set_clean_watermark(&mut self, mtime: i64) -> Result<(), StoreError> {
         meta_set_i64(&self.txn, "clean_watermark", mtime)
+    }
+}
+
+/// A write connection: WAL, a busy timeout (writers queue on SQLite's write
+/// lock), foreign keys, and FULL sync.
+fn open_writer_connection(db_path: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open(db_path)?;
+    conn.pragma_update(None, "journal_mode", "wal")?;
+    conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // FULL: every committed transaction is durable; §13's index rows
+    // must never lead the segment fsync they follow.
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    Ok(conn)
+}
+
+/// How long a writer waits for SQLite's write lock before failing.
+pub(crate) const WRITER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Take the state directory's process lock: one process opens a state
+/// directory at a time, so startup recovery may treat every segment as
+/// its own.
+fn lock_state_dir(state_path: &Path) -> Result<Arc<std::fs::File>, StoreError> {
+    let path = state_path.join("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(Arc::new(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::StateLocked { path }),
+        Err(std::fs::TryLockError::Error(source)) => Err(StoreError::Io { path, source }),
     }
 }
 

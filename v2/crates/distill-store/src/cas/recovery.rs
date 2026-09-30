@@ -1,33 +1,36 @@
-//! Startup recovery (§13): `CURRENT` is the single authority — SQLite
-//! records the generation it indexed, and a mismatch discards the SQLite
-//! artifact index and rebuilds it from the `CURRENT` generation's
-//! segments before any read. Recovery scans forward from the last
-//! indexed offset, verifies each payload against its stored blake3 (not
-//! just CRC), and adopts committed groups or truncates the tail;
-//! payload records not covered by a committed result record publish
-//! nothing; duplicate content hashes keep the last and mark the rest
-//! garbage.
+//! Startup recovery (§13). `cas_segments` names every segment; recovery
+//! runs at open with the state directory's process lock held, so no other
+//! process reads or writes the CAS and every segment is this process's.
+//! Dead segments are deleted at once, open segments are sealed (writers
+//! start new ones), and files no row names — a rolled-back allocation —
+//! are deleted.
+//!
+//! Recovery then scans each segment forward from its last indexed offset,
+//! verifies each payload against its stored blake3 (not just CRC), and
+//! adopts committed groups or truncates the tail; payload records not
+//! covered by a committed result record publish nothing; duplicate
+//! content hashes keep the last and mark the rest garbage. An index that
+//! claims more of a segment than the file holds is discarded and rebuilt
+//! from a full scan.
 
 use std::collections::{HashMap, HashSet};
 
 use distill_core::id::AssetUuid;
-use distill_wire::artifact::{parse_artifact, ARTIFACT_MAGIC};
 
-use crate::cas::manifest;
-use crate::cas::record::{
-    decode_record, Record, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN,
-};
+use crate::cas::record::{decode_record, Record, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN};
 use crate::cas::store::{
-    derived_row_matches, parse_segment_id, upsert_candidate, upsert_extent, CasInner, SegmentInfo,
+    artifact_layout, derived_row_matches, extent_exists, fsync_dir, insert_ref, parse_segment_id,
+    read_segment, result_holder, upsert_candidate, upsert_extent, SegmentKind, HOLDER_RESULT,
+    SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
-use crate::db::{meta_get_u64, meta_set_u64, Store};
+use crate::db::{meta_set_u64, Store};
 use crate::error::StoreError;
 use crate::state::MemoSeq;
 
 /// What startup recovery found and did — the §13 classification, typed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
-    /// The SQLite-recorded generation disagreed with `CURRENT`: the
+    /// The index claimed more of a segment than its file holds: the
     /// artifact index was discarded and rebuilt from a full segment scan.
     pub rebuilt_index: bool,
     /// Committed groups adopted from unindexed segment tails (or the
@@ -42,106 +45,112 @@ pub struct RecoveryReport {
     /// Duplicate content hashes encountered — byte-identical by
     /// definition; the last occurrence wins, the rest are garbage.
     pub duplicate_payloads: usize,
-    /// Segment files on disk but absent from `CURRENT` (interrupted
-    /// roll or compaction leftovers) — deleted; `CURRENT` is authority.
+    /// Segment files no `cas_segments` row names (a rolled-back
+    /// allocation) — deleted.
     pub removed_stray_segments: Vec<String>,
+    /// Dead segments deleted at startup.
+    pub removed_dead_segments: Vec<u64>,
+}
+
+struct SegmentRow {
+    id: u64,
+    name: String,
+    kind: SegmentKind,
+    indexed_len: u64,
+    state: i64,
 }
 
 impl Store {
-    /// Initialize the in-memory CAS cursor from `CURRENT`.
-    pub(crate) fn init_cas(&mut self) -> Result<(), StoreError> {
-        let dir = self.config.state_path.join("cas");
-        let current = manifest::read_current(&dir)?;
-        let mut segments = Vec::with_capacity(current.segments.len());
-        for segment in &current.segments {
-            let id = parse_segment_id(&segment.name, segment.kind).ok_or_else(|| {
-                StoreError::BadGenerationManifest {
-                    path: manifest::current_path(&dir),
-                    detail: format!(
-                        "unparseable {:?} segment name `{}`",
-                        segment.kind, segment.name
-                    ),
-                }
-            })?;
-            segments.push(SegmentInfo {
-                id,
-                name: segment.name.clone(),
-                kind: segment.kind,
-            });
-        }
-        let next_segment_id = segments
-            .iter()
-            .map(|s| s.id)
-            .max()
-            .map(|id| id + 1)
-            .unwrap_or(0);
-        let active_len = match segments.last() {
-            Some(segment) if segment.kind == manifest::SegmentKind::Regular => {
-                let path = dir.join(&segment.name);
-                std::fs::metadata(&path)
-                    .map_err(|source| StoreError::Io { path, source })?
-                    .len()
-            }
-            _ => 0,
-        };
-        self.cas = CasInner {
-            dir,
-            generation: current.generation,
-            segments,
-            active_len,
-            next_segment_id,
-        };
-        Ok(())
-    }
-
     /// §13 startup recovery. Runs before any read; leaves the index
     /// consistent with the (possibly truncated) segments.
     pub(crate) fn recover_cas(&mut self) -> Result<RecoveryReport, StoreError> {
         let mut report = RecoveryReport::default();
+        let dir = self.cas.dir.clone();
+        let io = |path: &std::path::Path| {
+            let path = path.to_path_buf();
+            move |source| StoreError::Io { path, source }
+        };
 
-        // 1. CURRENT is the single authority: a generation mismatch
-        //    discards the whole artifact index before any read.
-        let indexed_generation = meta_get_u64(&self.conn, "cas_generation")?.unwrap_or(0);
-        if indexed_generation != self.cas.generation {
-            report.rebuilt_index = true;
-            let txn = self.read.conn.savepoint()?;
-            txn.execute("DELETE FROM cas_extents", [])?;
-            txn.execute("DELETE FROM result_candidates", [])?;
-            txn.execute("DELETE FROM derived_assertions", [])?;
-            txn.execute("DELETE FROM cas_segments", [])?;
-            meta_set_u64(&txn, "cas_generation", self.cas.generation)?;
-            txn.commit()?;
-        }
-
-        // 2. Remove stray segment files CURRENT does not name — an
-        //    interrupted roll or a completed compaction's leftovers.
-        //    Deletion fsyncs the directory (§13).
-        let named: std::collections::HashSet<&str> =
-            self.cas.segments.iter().map(|s| s.name.as_str()).collect();
-        let entries = std::fs::read_dir(&self.cas.dir).map_err(|source| StoreError::Io {
-            path: self.cas.dir.clone(),
-            source,
-        })?;
-        let mut removed_any = false;
-        for entry in entries {
-            let entry = entry.map_err(|source| StoreError::Io {
-                path: self.cas.dir.clone(),
-                source,
+        let rows: Vec<SegmentRow> = {
+            let mut statement = self.conn.prepare(
+                "SELECT segment_id, file_name, segment_kind, indexed_len, state
+                 FROM cas_segments ORDER BY segment_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
             })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_stray_segment = name.ends_with(".dsr") && !named.contains(name.as_str());
-            let is_stale_tmp = name == "CURRENT.tmp";
-            if is_stray_segment || is_stale_tmp {
-                let path = entry.path();
-                std::fs::remove_file(&path).map_err(|source| StoreError::Io { path, source })?;
-                removed_any = true;
-                if is_stray_segment {
-                    report.removed_stray_segments.push(name);
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, name, kind, indexed_len, state) = row?;
+                out.push(SegmentRow {
+                    id: id as u64,
+                    kind: SegmentKind::from_i64(kind)
+                        .filter(|kind| parse_segment_id(&name, *kind) == Some(id as u64))
+                        .ok_or_else(|| StoreError::BadRecord {
+                            segment: id as u64,
+                            offset: 0,
+                            detail: format!("segment row names an invalid file `{name}`"),
+                        })?,
+                    name,
+                    indexed_len: indexed_len as u64,
+                    state,
+                });
+            }
+            out
+        };
+
+        // 1. Dead segments go now: no other process can be reading them.
+        //    Open segments are sealed; this process's writers start new ones.
+        let mut live = Vec::new();
+        for row in rows {
+            if row.state == SEGMENT_DEAD {
+                let path = dir.join(&row.name);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io(&path)(error)),
                 }
+                report.removed_dead_segments.push(row.id);
+            } else {
+                live.push(row);
+            }
+        }
+        let dead = report.removed_dead_segments.clone();
+        self.write_txn(|store| {
+            for id in &dead {
+                store
+                    .conn
+                    .execute("DELETE FROM cas_segments WHERE segment_id = ?1", [*id as i64])?;
+            }
+            store.conn.execute(
+                "UPDATE cas_segments SET state = ?1 WHERE state = ?2",
+                [SEGMENT_SEALED, SEGMENT_OPEN],
+            )?;
+            Ok(())
+        })?;
+
+        // 2. Remove segment files no row names. Deletion fsyncs the
+        //    directory (§13).
+        let named: HashSet<&str> = live.iter().map(|row| row.name.as_str()).collect();
+        let mut removed_any = !report.removed_dead_segments.is_empty();
+        for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
+            let entry = entry.map_err(io(&dir))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".dsr") && !named.contains(name.as_str()) {
+                let path = entry.path();
+                std::fs::remove_file(&path).map_err(io(&path))?;
+                removed_any = true;
+                report.removed_stray_segments.push(name);
             }
         }
         if removed_any {
-            manifest::fsync_dir(&self.cas.dir)?;
+            fsync_dir(&dir)?;
         }
         report.removed_stray_segments.sort();
 
@@ -150,7 +159,8 @@ impl Store {
         //    advance an earlier segment past payloads whose result marker is
         //    in a later segment.
         struct ScanRange {
-            segment: SegmentInfo,
+            id: u64,
+            kind: SegmentKind,
             path: std::path::PathBuf,
             start: u64,
             file_len: u64,
@@ -166,45 +176,36 @@ impl Store {
             result: Option<ResultPayload>,
         }
 
-        use rusqlite::OptionalExtension;
-        let segments = self.cas.segments.clone();
-        let mut ranges = Vec::with_capacity(segments.len());
+        let mut ranges = Vec::with_capacity(live.len());
         let mut rebuild_for_cursor_drift = false;
-        for segment in &segments {
-            let path = self.cas.dir.join(&segment.name);
-            let file_len = std::fs::metadata(&path)
-                .map_err(|source| StoreError::Io {
-                    path: path.clone(),
-                    source,
-                })?
-                .len();
-            let start = self
-                .conn
-                .query_row(
-                    "SELECT indexed_len FROM cas_segments WHERE segment_id = ?1",
-                    [segment.id as i64],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-                .unwrap_or(0) as u64;
-            rebuild_for_cursor_drift |= start > file_len;
+        for row in &live {
+            let path = dir.join(&row.name);
+            let file_len = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(io(&path)(error)),
+            };
+            rebuild_for_cursor_drift |= row.indexed_len > file_len;
             ranges.push(ScanRange {
-                segment: segment.clone(),
+                id: row.id,
+                kind: row.kind,
                 path,
-                start,
+                start: row.indexed_len,
                 file_len,
-                valid_end: start.min(file_len),
+                valid_end: row.indexed_len.min(file_len),
             });
         }
         if rebuild_for_cursor_drift {
             report.rebuilt_index = true;
-            let transaction = self.read.conn.savepoint()?;
-            transaction.execute("DELETE FROM cas_extents", [])?;
-            transaction.execute("DELETE FROM result_candidates", [])?;
-            transaction.execute("DELETE FROM derived_assertions", [])?;
-            transaction.execute("DELETE FROM cas_segments", [])?;
-            meta_set_u64(&transaction, "cas_generation", self.cas.generation)?;
-            transaction.commit()?;
+            self.write_txn(|store| {
+                let txn = &*store.conn;
+                txn.execute("DELETE FROM cas_refs", [])?;
+                txn.execute("DELETE FROM cas_extents", [])?;
+                txn.execute("DELETE FROM result_candidates", [])?;
+                txn.execute("DELETE FROM derived_assertions", [])?;
+                txn.execute("UPDATE cas_segments SET indexed_len = 0", [])?;
+                Ok(())
+            })?;
             for range in &mut ranges {
                 range.start = 0;
                 range.valid_end = 0;
@@ -217,17 +218,13 @@ impl Store {
             if range.start == range.file_len {
                 continue;
             }
-            let bytes = std::fs::read(&range.path).map_err(|source| StoreError::Io {
-                path: range.path.clone(),
-                source,
-            })?;
+            let bytes = read_segment(&range.path)?;
             let mut position = range.start;
             while position < range.file_len {
-                if range.segment.kind == manifest::SegmentKind::Oversize && position > 0 {
+                if range.kind == SegmentKind::Oversize && position > 0 {
                     break;
                 }
-                let Ok(decoded) =
-                    decode_record(&bytes[position as usize..], range.segment.id, position)
+                let Ok(decoded) = decode_record(&bytes[position as usize..], range.id, position)
                 else {
                     break;
                 };
@@ -248,7 +245,7 @@ impl Store {
                     + decoded.record.output_key.len() as u64;
                 let encoded_len = decoded.encoded_len;
                 scanned.push(ScannedRecord {
-                    segment: range.segment.id,
+                    segment: range.id,
                     offset: position,
                     payload_offset,
                     encoded_len,
@@ -261,9 +258,8 @@ impl Store {
             }
         }
 
-        // Build global coverage before indexing. This accepts a compacted log
-        // whose selected duplicate payload appears after an older result, and
-        // it makes wire-tree ownership follow the artifacts that name it.
+        // Build global coverage before indexing. Wire-tree ownership follows
+        // the artifacts that name it.
         let mut last_payload = HashMap::new();
         let mut covered = HashSet::new();
         for (index, row) in scanned.iter().enumerate() {
@@ -276,17 +272,31 @@ impl Store {
                 last_payload.insert(row.content_hash, index);
             }
         }
-        let direct_outputs: Vec<_> = covered.iter().copied().collect();
-        for hash in direct_outputs {
-            let Some(index) = last_payload.get(&hash) else {
+        // Each adopted result's unit: outputs, aux, and the outputs' wire
+        // trees, read from this scan or from the existing index.
+        let mut units = Vec::new();
+        for row in &scanned {
+            let Some(result) = &row.result else {
+                units.push(Vec::new());
                 continue;
             };
-            let bytes = &scanned[*index].record.payload;
-            if bytes.starts_with(&ARTIFACT_MAGIC) {
-                if let Ok(artifact) = parse_artifact(bytes) {
-                    covered.insert(artifact.layout_hash.0);
+            let mut unit = Vec::new();
+            if let ResultOutcome::Success { outputs, aux } = &result.outcome {
+                for output in outputs {
+                    unit.push(output.content_hash.0);
+                    let layout = match last_payload.get(&output.content_hash.0) {
+                        Some(index) => artifact_layout(&scanned[*index].record.payload),
+                        None => self
+                            .cas_read(&output.content_hash.0)
+                            .ok()
+                            .and_then(|bytes| artifact_layout(&bytes)),
+                    };
+                    unit.extend(layout);
                 }
+                unit.extend(aux.iter().map(|auxiliary| auxiliary.content_hash.0));
             }
+            covered.extend(unit.iter().copied());
+            units.push(unit);
         }
         report.orphaned_payloads = last_payload
             .keys()
@@ -294,112 +304,103 @@ impl Store {
             .count();
 
         let mut memo_counter = self.memo_seq().0;
-        let transaction = self.read.conn.savepoint()?;
-        for (hash, index) in &last_payload {
-            if !covered.contains(hash) {
-                continue;
+        let mut adopted = 0usize;
+        self.write_txn(|store| {
+            let transaction = &*store.conn;
+            for (hash, index) in &last_payload {
+                if !covered.contains(hash) {
+                    continue;
+                }
+                let row = &scanned[*index];
+                upsert_extent(
+                    transaction,
+                    hash,
+                    row.segment,
+                    row.payload_offset,
+                    row.record.payload.len() as u64,
+                )?;
             }
-            let row = &scanned[*index];
-            upsert_extent(
-                &transaction,
-                hash,
-                row.segment,
-                row.payload_offset,
-                row.record.payload.len() as u64,
-            )?;
-        }
-        for row in &scanned {
-            let Some(payload) = &row.result else {
-                continue;
-            };
-            memo_counter += 1;
-            report.adopted_results += 1;
-            upsert_candidate(
-                &transaction,
-                payload.key_kind,
-                &crate::bundles::blob32(row.record.static_input_key.clone()),
-                &payload.trace_digest(),
-                MemoSeq(memo_counter),
-                row.segment,
-                row.offset,
-                row.encoded_len,
-            )?;
-            if let ResultOutcome::Success { outputs, .. } = &payload.outcome {
-                for output in outputs {
-                    if output.output_key.is_empty() {
-                        continue;
-                    }
-                    let child = AssetUuid::v5(row.record.asset_uuid, &output.output_key);
-                    if derived_row_matches(
-                        &transaction,
-                        child,
-                        row.record.asset_uuid,
-                        &output.output_key,
-                    )? {
-                        transaction.execute(
-                            "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
-                             VALUES (?1, ?2, ?3, ?4)
-                             ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
-                            rusqlite::params![
-                                child.0.as_slice(),
-                                row.record.asset_uuid.0.as_slice(),
-                                output.output_key,
-                                memo_counter as i64,
-                            ],
-                        )?;
+            for (row, unit) in scanned.iter().zip(&units) {
+                let Some(payload) = &row.result else {
+                    continue;
+                };
+                let mut complete = true;
+                for hash in unit {
+                    complete &= extent_exists(transaction, hash)?;
+                }
+                if !complete {
+                    // A result whose outputs are gone publishes nothing.
+                    continue;
+                }
+                memo_counter += 1;
+                adopted += 1;
+                let static_key = crate::bundles::blob32(row.record.static_input_key.clone());
+                let trace_digest = payload.trace_digest();
+                upsert_candidate(
+                    transaction,
+                    payload.key_kind,
+                    &static_key,
+                    &trace_digest,
+                    MemoSeq(memo_counter),
+                    row.segment,
+                    row.offset,
+                    row.encoded_len,
+                )?;
+                let holder = result_holder(payload.key_kind, &static_key, &trace_digest);
+                for hash in unit {
+                    insert_ref(transaction, HOLDER_RESULT, &holder, hash)?;
+                }
+                if let ResultOutcome::Success { outputs, .. } = &payload.outcome {
+                    for output in outputs {
+                        if output.output_key.is_empty() {
+                            continue;
+                        }
+                        let child = AssetUuid::v5(row.record.asset_uuid, &output.output_key);
+                        if derived_row_matches(
+                            transaction,
+                            child,
+                            row.record.asset_uuid,
+                            &output.output_key,
+                        )? {
+                            transaction.execute(
+                                "INSERT INTO derived_assertions(child_uuid, parent_uuid, output_key, memo_seq)
+                                 VALUES (?1, ?2, ?3, ?4)
+                                 ON CONFLICT(child_uuid, memo_seq) DO NOTHING",
+                                rusqlite::params![
+                                    child.0.as_slice(),
+                                    row.record.asset_uuid.0.as_slice(),
+                                    output.output_key,
+                                    memo_counter as i64,
+                                ],
+                            )?;
+                        }
                     }
                 }
             }
-        }
-        for range in &ranges {
-            if range.start == range.file_len {
-                continue;
+            for range in &ranges {
+                if range.start == range.file_len {
+                    continue;
+                }
+                transaction.execute(
+                    "UPDATE cas_segments SET indexed_len = ?2 WHERE segment_id = ?1",
+                    rusqlite::params![range.id as i64, range.valid_end as i64],
+                )?;
             }
-            transaction.execute(
-                "INSERT INTO cas_segments(segment_id, file_name, segment_kind, indexed_len)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(segment_id) DO UPDATE SET
-                   file_name = excluded.file_name, segment_kind = excluded.segment_kind,
-                   indexed_len = excluded.indexed_len",
-                rusqlite::params![
-                    range.segment.id as i64,
-                    range.segment.name,
-                    range.segment.kind as i64,
-                    range.valid_end as i64,
-                ],
-            )?;
-        }
-        meta_set_u64(&transaction, "memo_seq", memo_counter)?;
-        transaction.commit()?;
+            meta_set_u64(transaction, "memo_seq", memo_counter)
+        })?;
+        report.adopted_results = adopted;
 
         for range in &ranges {
             if range.valid_end >= range.file_len {
                 continue;
             }
-            report
-                .truncated_tails
-                .push((range.segment.id, range.valid_end));
+            report.truncated_tails.push((range.id, range.valid_end));
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&range.path)
-                .map_err(|source| StoreError::Io {
-                    path: range.path.clone(),
-                    source,
-                })?;
-            file.set_len(range.valid_end)
-                .map_err(|source| StoreError::Io {
-                    path: range.path.clone(),
-                    source,
-                })?;
-            file.sync_all().map_err(|source| StoreError::Io {
-                path: range.path.clone(),
-                source,
-            })?;
-            if segments.last().map(|segment| segment.id) == Some(range.segment.id)
-                && range.segment.kind == manifest::SegmentKind::Regular
-            {
-                self.cas.active_len = range.valid_end;
-            }
+                .map_err(io(&range.path))?;
+            file.set_len(range.valid_end).map_err(io(&range.path))?;
+            file.sync_all().map_err(io(&range.path))?;
         }
         report.orphaned_payloads += self.prune_unreferenced_extents()?;
 

@@ -984,6 +984,19 @@ impl DaemonCoordinator {
         }
     }
 
+    /// The loop's CAS pass: evict to the cache limit, compact, and delete
+    /// the dead segments whose grace has passed.
+    pub(crate) fn maintain_cas(
+        &self,
+        sweeper: &mut distill_store::cas::SegmentSweeper,
+    ) -> Result<(), distill_store::StoreError> {
+        let mut store = self.store.write();
+        store.enforce_cache_limit()?;
+        store.compact()?;
+        sweeper.sweep(&mut store)?;
+        Ok(())
+    }
+
     /// Reconcile one complete identity-checked namespace scan.
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         self.on_authority(|| {

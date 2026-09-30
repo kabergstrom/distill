@@ -67,6 +67,7 @@ fn pipeline_failure(message: &str) -> PipelineFailure {
 fn commit(store: &mut Store, key: u8) {
     store
         .commit_build(BuildCommit {
+            wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
             asset_uuid: AssetUuid([7u8; 16]),

@@ -29,6 +29,7 @@ use crate::watcher::{
     WatcherThread,
 };
 use distill_store::config::RestartOnlyChange;
+use distill_store::cas::SegmentSweeper;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
 /// How often the process loop takes the watcher queue (the debounce) and
@@ -37,6 +38,12 @@ use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePa
 const DEBOUNCE: Duration = Duration::from_millis(40);
 /// An idle daemon still runs a pass this often.
 const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How often the loop runs its CAS pass (eviction, compaction, dead
+/// segment deletion).
+const CAS_PASS_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a dead segment's file outlives the read bound: the snapshot
+/// expiry (30 s) plus a margin.
+const CAS_DELETE_GRACE: Duration = Duration::from_secs(30 + 10);
 
 pub struct DaemonProcess {
     coordinator: Arc<DaemonCoordinator>,
@@ -148,6 +155,8 @@ impl DaemonProcess {
             due: Some(Instant::now()),
             publications: 0,
             next_idle_pass: Instant::now() + IDLE_PASS_INTERVAL,
+            cas_sweeper: SegmentSweeper::new(CAS_DELETE_GRACE),
+            next_cas_pass: Instant::now() + CAS_PASS_INTERVAL,
         };
         // Startup runs on the authority before the loop: events the watcher
         // sends meanwhile wait in the inbox for the driver.
@@ -305,6 +314,8 @@ struct ProcessDriver {
     /// The server's publication count the last pass saw.
     publications: u64,
     next_idle_pass: Instant,
+    cas_sweeper: SegmentSweeper,
+    next_cas_pass: Instant,
 }
 
 impl ProcessDriver {
@@ -419,9 +430,20 @@ impl Driver for ProcessDriver {
     fn deadline(&self) -> Instant {
         self.due
             .map_or(self.next_idle_pass, |due| due.min(self.next_idle_pass))
+            .min(self.next_cas_pass)
     }
 
     fn fire(&mut self) -> bool {
+        let now = Instant::now();
+        if now >= self.next_cas_pass {
+            self.next_cas_pass = now + CAS_PASS_INTERVAL;
+            if let Err(error) = self.coordinator.maintain_cas(&mut self.cas_sweeper) {
+                tracing::warn!(%error, "CAS maintenance failed");
+            }
+            if self.due.is_none_or(|due| due > now) && now < self.next_idle_pass {
+                return true;
+            }
+        }
         self.due = None;
         self.next_idle_pass = Instant::now() + IDLE_PASS_INTERVAL;
         let keep = self.tick();

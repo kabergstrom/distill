@@ -1026,14 +1026,13 @@ impl crate::db::Store {
     where
         F: FnOnce(&mut ServedTxn<'_>) -> Result<T, StoreError>,
     {
-        let txn = self
-            .read
-            .conn
-            .savepoint()?;
-        let version = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
-        let mut served = ServedTxn { txn, version };
-        let out = f(&mut served)?;
-        served.txn.commit()?;
-        Ok(out)
+        self.write_txn(|store| {
+            let txn = store.read.conn.savepoint()?;
+            let version = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
+            let mut served = ServedTxn { txn, version };
+            let out = f(&mut served)?;
+            served.txn.commit()?;
+            Ok(out)
+        })
     }
 }

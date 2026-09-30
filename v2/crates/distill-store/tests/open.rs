@@ -17,7 +17,11 @@ fn open_creates_the_state_layout() {
     let _store = Store::open(config.clone()).unwrap();
     assert!(config.state_path.join("meta.sqlite").is_file());
     assert!(config.state_path.join("cas").is_dir());
-    assert!(config.state_path.join("cas/CURRENT").is_file());
+    // One process per state directory.
+    assert!(matches!(
+        Store::open(config.clone()),
+        Err(StoreError::StateLocked { .. })
+    ));
 }
 
 #[test]

@@ -53,11 +53,11 @@ fn every_section_13_table_exists() {
     let got = tables(&conn);
     // The §13 table inventory, plus the store-internal tables §13/§14
     // require: store_meta (instance id, counters, watermark, poisons,
-    // indexed CAS generation), asset_tags (the `assets` search tags),
+    // CAS segment ids), asset_tags (the `assets` search tags),
     // result_candidates / derived_outputs / derived_assertions /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
-    // row), registrations (the pipeline_state registration list), pins
-    // (the eviction observability rule), and
+    // row), cas_refs (what keeps each extent indexed), registrations (the
+    // pipeline_state registration list), and
     // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
         "files",
@@ -84,6 +84,7 @@ fn every_section_13_table_exists() {
         "derived_assertions",
         "cas_extents",
         "cas_segments",
+        "cas_refs",
         "pipeline_state",
         "pipeline_schema_registry",
         "pipeline_target_set",
@@ -93,7 +94,6 @@ fn every_section_13_table_exists() {
         "tools",
         "roots",
         "store_meta",
-        "pins",
         "errors",
         "codegen_outputs",
         "watched_import_failures",
@@ -357,7 +357,7 @@ fn cas_segments_are_typed_regular_or_oversize() {
     let conn = open_conn(&dir);
     assert_eq!(
         columns(&conn, "cas_segments"),
-        ["segment_id", "file_name", "segment_kind", "indexed_len"]
+        ["segment_id", "file_name", "segment_kind", "indexed_len", "state"]
     );
 }
 

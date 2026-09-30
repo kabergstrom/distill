@@ -89,8 +89,8 @@ pub enum StoreError {
     /// A codegen filesystem publication was prepared from a different set of
     /// daemon-owned pre-images than the store currently records.
     CodegenStateDrift,
-    /// The `CURRENT` generation manifest is malformed or unreadable.
-    BadGenerationManifest { path: PathBuf, detail: String },
+    /// Another process holds the state directory.
+    StateLocked { path: PathBuf },
     /// A CAS frame failed validation at the stated segment offset:
     /// framing, CRC, or blake3 (§13's recovery verification).
     BadRecord {
@@ -126,10 +126,8 @@ pub enum StoreError {
     },
     /// A build-import result must carry exactly one output row (§13).
     BuildImportOutputArity { got: usize },
-    /// Eviction refused: the result's outputs are pinned by a manifest
-    /// entry, live lease, in-flight build, or open pack-build session —
-    /// the observability rule (§13).
-    Pinned { hash: [u8; 32] },
+    /// A build commit names a wire tree the CAS does not hold.
+    MissingWireTree { hash: [u8; 32] },
     /// A malformed result payload (decode failure on lookup or rebuild).
     BadResultPayload { detail: String },
 }
@@ -221,8 +219,8 @@ impl fmt::Display for StoreError {
             StoreError::CodegenStateDrift => {
                 write!(f, "codegen output pre-image state changed before publication")
             }
-            StoreError::BadGenerationManifest { path, detail } => {
-                write!(f, "bad CURRENT manifest at {}: {detail}", path.display())
+            StoreError::StateLocked { path } => {
+                write!(f, "state directory is in use by another process ({})", path.display())
             }
             StoreError::BadRecord { segment, offset, detail } => {
                 write!(f, "bad CAS record in segment {segment} at offset {offset}: {detail}")
@@ -253,8 +251,8 @@ impl fmt::Display for StoreError {
             StoreError::BuildImportOutputArity { got } => {
                 write!(f, "a build-import result carries exactly one output row, got {got}")
             }
-            StoreError::Pinned { hash } => {
-                write!(f, "hash {} is pinned and may not be evicted", hex(hash))
+            StoreError::MissingWireTree { hash } => {
+                write!(f, "wire tree {} is not in the CAS", hex(hash))
             }
             StoreError::BadResultPayload { detail } => {
                 write!(f, "malformed result payload: {detail}")

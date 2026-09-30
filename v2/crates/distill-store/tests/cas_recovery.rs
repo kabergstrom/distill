@@ -1,7 +1,7 @@
 //! §13 crash-safety: torn-write detection and tail truncation, the
 //! result record as commit marker (uncovered payloads publish nothing),
-//! generation-mismatch index rebuild, duplicate classification, and
-//! stray-segment cleanup — each asserted through the typed
+//! index-drift rebuild, duplicate classification, and
+//! stray- and dead-segment cleanup — each asserted through the typed
 //! `RecoveryReport` and post-recovery reads.
 
 use distill_core::id::AssetUuid;
@@ -18,6 +18,7 @@ fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
 fn commit(store: &mut Store, key: u8, bytes: &[u8]) -> [u8; 32] {
     store
         .commit_build(BuildCommit {
+            wire_trees: Vec::new(),
             key_kind: KeyKind::Processor,
             static_input_key: [key; 32],
             asset_uuid: PARENT,
@@ -35,6 +36,14 @@ fn commit(store: &mut Store, key: u8, bytes: &[u8]) -> [u8; 32] {
         })
         .unwrap();
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Make the index claim more of every segment than its file holds, which
+/// forces the full rebuild on the next open.
+fn force_rebuild(dir: &tempfile::TempDir) {
+    let conn = rusqlite::Connection::open(dir.path().join(".distill/meta.sqlite")).unwrap();
+    conn.execute("UPDATE cas_segments SET indexed_len = indexed_len + 1000000", [])
+        .unwrap();
 }
 
 fn segment_files(dir: &tempfile::TempDir) -> Vec<std::path::PathBuf> {
@@ -248,7 +257,8 @@ fn recovery_checkpoints_cross_segment_groups_atomically() {
     let connection = rusqlite::Connection::open(&database_path).unwrap();
     connection
         .execute_batch(
-            "DELETE FROM cas_extents;
+            "DELETE FROM cas_refs;
+             DELETE FROM cas_extents;
              DELETE FROM result_candidates;
              DELETE FROM derived_assertions;
              UPDATE cas_segments SET indexed_len = 0;",
@@ -310,24 +320,15 @@ fn recovery_checkpoints_cross_segment_groups_atomically() {
 }
 
 #[test]
-fn generation_mismatch_discards_and_rebuilds_the_index() {
-    // §13: CURRENT is the single authority — SQLite records the
-    // generation it indexed, and a mismatch discards the SQLite artifact
-    // index and rebuilds it from the CURRENT generation's segments
-    // before any read.
+fn index_drift_discards_and_rebuilds_the_index() {
+    // An index that claims more of a segment than its file holds is
+    // discarded and rebuilt from the segments before any read.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     let hash1 = commit(&mut store, 1, b"first artifact");
     let hash2 = commit(&mut store, 2, b"second artifact");
     drop(store);
-
-    // Bump the generation in CURRENT without touching SQLite.
-    let cas_dir = dir.path().join(".distill/cas");
-    let current = std::fs::read_to_string(cas_dir.join("CURRENT")).unwrap();
-    let mut lines: Vec<&str> = current.lines().collect();
-    let bumped = "generation 42".to_owned();
-    lines[0] = &bumped;
-    std::fs::write(cas_dir.join("CURRENT"), lines.join("\n") + "\n").unwrap();
+    force_rebuild(&dir);
 
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     let report = &recovery;
@@ -351,7 +352,7 @@ fn generation_mismatch_discards_and_rebuilds_the_index() {
         1
     );
 
-    // And the mismatch healed: next open is quiet.
+    // And the drift healed: next open is quiet.
     drop(store);
     assert!(
         !Store::open_with_recovery(cfg(&dir))
@@ -372,14 +373,7 @@ fn duplicate_content_hashes_keep_the_last_and_count_the_rest_garbage() {
     drop(store);
 
     // Force a full rebuild so the scan sees both occurrences.
-    let cas_dir = dir.path().join(".distill/cas");
-    let current = std::fs::read_to_string(cas_dir.join("CURRENT")).unwrap();
-    let rest: Vec<&str> = current.lines().skip(1).collect();
-    std::fs::write(
-        cas_dir.join("CURRENT"),
-        format!("generation 9\n{}\n", rest.join("\n")),
-    )
-    .unwrap();
+    force_rebuild(&dir);
 
     let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     let report = &recovery;
@@ -394,17 +388,16 @@ fn duplicate_content_hashes_keep_the_last_and_count_the_rest_garbage() {
 }
 
 #[test]
-fn stray_segment_files_are_removed_current_is_authority() {
+fn stray_segment_files_are_removed() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     commit(&mut store, 1, b"artifact");
     drop(store);
 
-    // Drop a segment-shaped stray (an interrupted roll: file created,
-    // CURRENT never updated).
+    // Drop a segment-shaped stray (a rolled-back allocation: file created,
+    // row never committed).
     let cas_dir = dir.path().join(".distill/cas");
     std::fs::write(cas_dir.join("seg-00000000000000ff.dsr"), b"garbage").unwrap();
-    std::fs::write(cas_dir.join("CURRENT.tmp"), b"half-written").unwrap();
 
     let (_store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     assert_eq!(
@@ -412,18 +405,30 @@ fn stray_segment_files_are_removed_current_is_authority() {
         vec!["seg-00000000000000ff.dsr".to_owned()]
     );
     assert!(!cas_dir.join("seg-00000000000000ff.dsr").exists());
-    assert!(!cas_dir.join("CURRENT.tmp").exists());
 }
 
 #[test]
-fn a_corrupt_current_manifest_is_a_typed_error() {
+fn dead_segments_are_deleted_at_startup() {
+    // The state lock guarantees no other process reads the store, so a
+    // dead segment needs no grace period at open.
     let dir = tempfile::tempdir().unwrap();
-    drop(Store::open(cfg(&dir)).unwrap());
-    std::fs::write(dir.path().join(".distill/cas/CURRENT"), "not a manifest\n").unwrap();
-    match Store::open(cfg(&dir)) {
-        Err(StoreError::BadGenerationManifest { .. }) => {}
-        other => panic!("expected BadGenerationManifest, got {other:?}"),
-    }
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let (_, digest) = {
+        let hash = commit(&mut store, 1, &[1u8; 4096]);
+        let candidates = store.lookup_candidates(KeyKind::Processor, &[1; 32]).unwrap();
+        (hash, candidates[0].trace_digest)
+    };
+    assert!(store
+        .evict_result(KeyKind::Processor, &[1; 32], &digest)
+        .unwrap());
+    let dead = store.compact().unwrap().dead_segments;
+    assert_eq!(dead.len(), 1);
+    let files = segment_files(&dir);
+    drop(store);
+
+    let (_store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    assert_eq!(recovery.removed_dead_segments, dead);
+    assert_eq!(segment_files(&dir).len(), files.len() - 1);
 }
 
 #[test]
