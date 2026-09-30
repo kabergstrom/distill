@@ -15,9 +15,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
-
 use crate::config::ConfigValidationError;
+use crate::current::Current;
 use crate::served::StoreSnapshot;
 use crate::state::StoreInstanceId;
 use crate::{Store, StoreConfig, StoreError, StoreReader};
@@ -52,7 +51,7 @@ struct HeldWriter {
 pub struct SharedStore {
     id: u64,
     instance: StoreInstanceId,
-    config: ArcSwap<StoreConfig>,
+    config: Current<StoreConfig>,
     /// Writers no thread holds. Held only to push or pop one.
     idle: Mutex<Vec<Store>>,
     /// Everything a new writer needs besides its connection.
@@ -70,7 +69,7 @@ impl SharedStore {
         Self {
             id: NEXT_SHARED_ID.fetch_add(1, Ordering::Relaxed),
             instance: store.instance_id(),
-            config: ArcSwap::new(Arc::clone(&store.read.config)),
+            config: Current::from_arc(Arc::clone(&store.read.config)),
             template: WriterTemplate {
                 cas_dir: store.cas.dir.clone(),
                 state_lock: Arc::clone(&store._state_lock),
@@ -84,7 +83,7 @@ impl SharedStore {
     }
 
     pub fn config(&self) -> Arc<StoreConfig> {
-        self.config.load_full()
+        self.config.load()
     }
 
     /// Apply the operational-live subset of `candidate` to every writer,
@@ -207,7 +206,7 @@ impl SharedStore {
 
     fn open_writer(&self) -> Result<Store, StoreError> {
         Store::open_sibling(
-            self.config.load_full(),
+            self.config.load(),
             self.instance,
             self.template.cas_dir.clone(),
             Arc::clone(&self.template.state_lock),

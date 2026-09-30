@@ -738,6 +738,12 @@ should reach zero by the end of phase 6.
     - `DaemonCoordinator::scan` (pending rejection and health) and
       `configuration_error`: written by the loop, read by publications on
       other threads.
+    - `Current<T>` (distill-store), a `Mutex<Arc<T>>` held only to clone
+      or swap the `Arc`, replaces `arc-swap` for configuration replaced
+      whole: the store config, scanner roots and daemon-owned
+      directories, authoring roots, importers and pipeline projection,
+      build targets and the published `PipelineSnapshot`. The schema
+      authority is a `Mutex<Option<Arc<_>>>`.
   - **Tests:** 1044 passed, 1 failed (the known
     `tool_output_is_drained_while_large_stdin_is_written`); newgameplus
     lib 61 passed.

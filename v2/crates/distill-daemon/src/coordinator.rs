@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
 
 use rayon::ThreadPool;
 
@@ -42,7 +41,7 @@ use distill_store::state::{
     PipelineState as StoredPipelineState, ReadableBundleSource, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
-use distill_store::{SharedStore, Store, StoreConfig, StoreError, StoreReader};
+use distill_store::{Current, SharedStore, Store, StoreConfig, StoreError, StoreReader};
 
 use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
@@ -85,8 +84,8 @@ pub struct DaemonCoordinator {
     server: Arc<ServerHandle>,
     authoring: Arc<AuthoringService>,
     pipeline: PipelineState,
-    schema_authority: ArcSwapOption<ProjectSchemaAuthority>,
-    build_targets: ArcSwap<BTreeMap<String, Target>>,
+    schema_authority: Mutex<Option<Arc<ProjectSchemaAuthority>>>,
+    build_targets: Current<BTreeMap<String, Target>>,
     configuration_error: Mutex<Option<ConfigurationError>>,
     operational: ScheduledPool,
 }
@@ -194,8 +193,8 @@ impl DaemonCoordinator {
             server,
             authoring: backend,
             pipeline: PipelineState::new(pipeline),
-            schema_authority: ArcSwapOption::empty(),
-            build_targets: ArcSwap::from_pointee(BTreeMap::new()),
+            schema_authority: Mutex::new(None),
+            build_targets: Current::new(BTreeMap::new()),
             configuration_error: Mutex::new(None),
             operational,
         })
@@ -300,7 +299,7 @@ impl DaemonCoordinator {
     }
 
     pub fn schema_authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
-        self.schema_authority.load_full()
+        locked(&self.schema_authority).clone()
     }
 
     pub fn build_target(&self, name: &str) -> Option<Target> {
@@ -311,12 +310,12 @@ impl DaemonCoordinator {
 
     #[cfg(test)]
     pub(crate) fn install_schema_authority_for_test(&self, authority: Arc<ProjectSchemaAuthority>) {
-        self.schema_authority.store(Some(authority));
+        *locked(&self.schema_authority) = Some(authority);
     }
 
     #[cfg(test)]
     pub(crate) fn install_build_target_for_test(&self, name: &str, target: Target) {
-        self.build_targets.rcu(|current| {
+        self.build_targets.update(|current| {
             let mut targets = BTreeMap::clone(current);
             targets.insert(name.to_owned(), target.clone());
             targets
@@ -633,8 +632,7 @@ impl DaemonCoordinator {
                     locked(&self.scan).rejection.take();
                     locked(&self.scan).healthy = true;
                 }
-                self.schema_authority
-                    .store(Some(Arc::clone(&schema_authority)));
+                *locked(&self.schema_authority) = Some(Arc::clone(&schema_authority));
                 self.build_targets.store(Arc::new(build_targets.clone()));
                 authoring.install_pipeline_projection(projection.clone());
                 locked(&self.configuration_error)
@@ -779,7 +777,7 @@ impl DaemonCoordinator {
         };
         let assets = asset_bundles.keys().copied().collect::<Vec<_>>();
         let targets = self
-            .build_targets.load_full();
+            .build_targets.load();
         let scanner = self.scanner.clone();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let mut prepared = Some(prepared);
@@ -1126,7 +1124,7 @@ impl DaemonCoordinator {
             .map_or([0; 32], |authority| authority.source_hash());
         let pipeline = self.pipeline_snapshot();
         let targets = self
-            .build_targets.load_full();
+            .build_targets.load();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let scanner = self.scanner.clone();
         let result = server.coordinated_commit(base, || {
@@ -1216,7 +1214,7 @@ impl DaemonCoordinator {
             .map_or([0; 32], |authority| authority.source_hash());
         let pipeline = self.pipeline_snapshot();
         let build_targets = self
-            .build_targets.load_full();
+            .build_targets.load();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let scanner = self.scanner.clone();
         let fallback_bundles = store.read()
@@ -3282,7 +3280,7 @@ pub(crate) fn publish_incremental_paths(
             let affected = commit_affected_asset_bundles(&commit);
             if !affected.is_empty() {
                 let targets = coordinator
-                    .build_targets.load_full();
+                    .build_targets.load();
                 crate::build::refine_published_tag_index_incremental(
                     Arc::clone(store),
                     scanner.clone(),
@@ -3609,13 +3607,13 @@ struct PipelineState {
     /// Taken to prepare, install or fail an epoch; never while waiting on
     /// SQLite's write lock with a transaction open.
     runtime: Mutex<CoordinatedPipelineRuntime>,
-    published: ArcSwap<PipelineSnapshot>,
+    published: Current<PipelineSnapshot>,
 }
 
 impl PipelineState {
     fn new(runtime: CoordinatedPipelineRuntime) -> Self {
         Self {
-            published: ArcSwap::from_pointee(runtime.host.snapshot()),
+            published: Current::new(runtime.host.snapshot()),
             runtime: Mutex::new(runtime),
         }
     }
@@ -3625,7 +3623,7 @@ impl PipelineState {
 /// snapshot.
 struct PipelineGuard<'a> {
     runtime: MutexGuard<'a, CoordinatedPipelineRuntime>,
-    published: &'a ArcSwap<PipelineSnapshot>,
+    published: &'a Current<PipelineSnapshot>,
 }
 
 impl std::ops::Deref for PipelineGuard<'_> {

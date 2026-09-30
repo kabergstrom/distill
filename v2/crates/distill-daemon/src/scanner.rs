@@ -13,10 +13,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 
 use distill_core::id::{BundleFileHash, ContentHash};
 use distill_store::db::StoreReader;
+use distill_store::Current;
 use distill_store::error::StoreError;
 use distill_store::files::{
     FileKind, FileObservation, FileState, ObservedBundleFile, ObservedDiagnostic, ObservedDirectory,
@@ -187,8 +187,8 @@ struct CanonicalRoot {
 
 #[derive(Debug, Clone)]
 pub struct RootedScanner {
-    roots: Arc<ArcSwap<BTreeMap<String, CanonicalRoot>>>,
-    daemon_owned: Arc<ArcSwap<BTreeMap<PathBuf, DaemonOwnedDirectory>>>,
+    roots: Arc<Current<BTreeMap<String, CanonicalRoot>>>,
+    daemon_owned: Arc<Current<BTreeMap<PathBuf, DaemonOwnedDirectory>>>,
 }
 
 /// A directory whose contents are produced or retained by the daemon and can
@@ -889,9 +889,9 @@ struct FileIdentity {
 impl RootedScanner {
     pub fn new(roots: impl IntoIterator<Item = AssetRoot>) -> Result<Self, ScanError> {
         let roots = roots.into_iter().collect::<Vec<_>>();
-        let daemon_owned = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        let daemon_owned = Arc::new(Current::new(BTreeMap::new()));
         Ok(Self {
-            roots: Arc::new(ArcSwap::from_pointee(canonicalize_roots(roots)?)),
+            roots: Arc::new(Current::new(canonicalize_roots(roots)?)),
             daemon_owned,
         })
     }
@@ -901,7 +901,7 @@ impl RootedScanner {
         roots: impl IntoIterator<Item = AssetRoot>,
     ) -> Result<Self, ScanError> {
         Ok(Self {
-            roots: Arc::new(ArcSwap::from_pointee(canonicalize_roots(roots)?)),
+            roots: Arc::new(Current::new(canonicalize_roots(roots)?)),
             daemon_owned: Arc::clone(&self.daemon_owned),
         })
     }
@@ -929,7 +929,7 @@ impl RootedScanner {
             kind,
             path: path.clone(),
         };
-        self.daemon_owned.rcu(|current| {
+        self.daemon_owned.update(|current| {
             let mut directories = BTreeMap::clone(current);
             match directories.entry(path.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1008,11 +1008,11 @@ impl RootedScanner {
     }
 
     fn root_snapshot(&self) -> Arc<BTreeMap<String, CanonicalRoot>> {
-        self.roots.load_full()
+        self.roots.load()
     }
 
     fn daemon_owned_snapshot(&self) -> Arc<BTreeMap<PathBuf, DaemonOwnedDirectory>> {
-        self.daemon_owned.load_full()
+        self.daemon_owned.load()
     }
 
     /// Locate an observed physical error beneath its configured root and

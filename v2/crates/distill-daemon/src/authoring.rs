@@ -10,7 +10,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
-use arc_swap::ArcSwap;
 
 use distill_bundle::{AssetEntry, Bundle, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
@@ -23,7 +22,7 @@ use distill_rpc::{
     PreparedOperationCommit, RpcFailure,
 };
 use distill_store::shared::WriteGuard;
-use distill_store::{SharedStore, StoreReader};
+use distill_store::{Current, SharedStore, StoreReader};
 
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
@@ -36,9 +35,9 @@ pub struct AuthoringService {
     pub(crate) scanner: RootedScanner,
     /// The asset roots and what hangs off them, replaced together when the
     /// configuration changes.
-    filesystem: ArcSwap<AuthoringFilesystem>,
-    importers: ArcSwap<Importers>,
-    pipeline_projection: ArcSwap<PipelineProjection>,
+    filesystem: Current<AuthoringFilesystem>,
+    importers: Current<Importers>,
+    pipeline_projection: Current<PipelineProjection>,
     /// Set once this process has built the store's import index (see
     /// `importer`).
     pub(crate) import_index_built: OnceLock<()>,
@@ -76,9 +75,9 @@ impl AuthoringService {
         Self {
             store,
             scanner,
-            filesystem: ArcSwap::from_pointee(AuthoringFilesystem { roots }),
-            importers: ArcSwap::from_pointee(Importers::default()),
-            pipeline_projection: ArcSwap::from_pointee(PipelineProjection::default()),
+            filesystem: Current::new(AuthoringFilesystem { roots }),
+            importers: Current::new(Importers::default()),
+            pipeline_projection: Current::new(PipelineProjection::default()),
             import_index_built: OnceLock::new(),
             tag_index_coordinator: OnceLock::new(),
         }
@@ -104,7 +103,7 @@ impl AuthoringService {
     }
 
     pub(crate) fn pipeline_projection(&self) -> PipelineProjection {
-        (**self.pipeline_projection.load()).clone()
+        PipelineProjection::clone(&self.pipeline_projection.load())
     }
 
     pub(crate) fn install_pipeline_projection(&self, projection: PipelineProjection) {
@@ -132,7 +131,7 @@ impl AuthoringService {
     }
 
     pub(crate) fn importers(&self) -> Arc<Importers> {
-        self.importers.load_full()
+        self.importers.load()
     }
 
     pub fn register_importer(
@@ -141,7 +140,7 @@ impl AuthoringService {
     ) -> Result<(), RpcFailure> {
         let registered = RegisteredImporter::validate(importer)?;
         let mut duplicate = false;
-        self.importers.rcu(|current| {
+        self.importers.update(|current| {
             duplicate = current.builtin.contains_key(&registered.id)
                 || current.pipeline.contains_key(&registered.id);
             let mut next = Importers::clone(current);
@@ -193,7 +192,7 @@ impl AuthoringService {
     /// were prepared keeps its id: the pipeline's importer of that id is
     /// left out.
     pub(crate) fn install_pipeline_importers(&self, next: RegisteredImporters) {
-        self.importers.rcu(|current| {
+        self.importers.update(|current| {
             let mut pipeline = next.clone();
             pipeline.retain(|id, _| !current.builtin.contains_key(id));
             Importers {

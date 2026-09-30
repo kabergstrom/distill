@@ -12,7 +12,6 @@ path = "src/bin/distill-daemon.rs"
 [dependencies]
 tracing.workspace = true
 tracing-subscriber.workspace = true
-arc-swap = "1.7"
 blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-bundle = { path = "../distill-bundle" }

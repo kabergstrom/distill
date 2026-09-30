@@ -16,7 +16,6 @@ blake3 = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 getrandom = "0.2"
 unicode-normalization.workspace = true
-arc-swap = "1.7"
 
 [dev-dependencies]
 tempfile = "3"

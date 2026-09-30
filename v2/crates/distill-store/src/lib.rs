@@ -12,6 +12,7 @@ pub mod cas;
 pub mod claims;
 pub mod codegen;
 pub mod config;
+pub mod current;
 pub mod db;
 pub mod error;
 pub mod errors;
@@ -22,6 +23,7 @@ pub mod served;
 pub mod shared;
 pub mod state;
 
+pub use current::Current;
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
 pub use db::{InputTxn, Store, StoreReader, SCHEMA_VERSION};
 pub use error::StoreError;
