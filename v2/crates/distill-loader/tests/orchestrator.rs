@@ -679,6 +679,36 @@ fn storage_repopulation_refetches_unchanged_content_with_stable_handle() {
 }
 
 #[test]
+fn released_repopulation_handle_is_visible_to_engine_storage_cleanup() {
+    let token = ModuleEpochToken::new(63);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 63, &token);
+    let asset_uuid = uuid(63);
+    let mut storage = Storage::default();
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    loader.process(&mut storage).unwrap();
+    let (hash, first_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, first_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+    let id = handle.id();
+    assert!(loader.handle_is_live(id));
+    loader.begin_storage_repopulation(&mut storage);
+    assert!(
+        loader.handle_is_live(id),
+        "repopulation does not release a live handle"
+    );
+    drop(handle);
+    loader.process(&mut storage).unwrap();
+    assert!(
+        !loader.handle_is_live(id),
+        "storage can now retire the adoption-less GPU slot"
+    );
+}
+
+#[test]
 fn repeated_storage_repopulation_abandons_old_device_pending_uploads() {
     let token = ModuleEpochToken::new(61);
     let mut loader = Loader::new(mock_io());

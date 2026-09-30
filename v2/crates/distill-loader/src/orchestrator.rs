@@ -585,6 +585,13 @@ impl<I: LoaderIO> Loader<I> {
             .map_or(LoadStatus::Unloaded, |slot| slot.status)
     }
 
+    /// Whether an engine-storage handle still belongs to this loader. Storage
+    /// may retain stable slots without an adoption during device repopulation.
+    /// A slot disappears only after the loader has processed its last release.
+    pub fn handle_is_live(&self, handle: HandleId) -> bool {
+        self.slots.contains_key(&handle)
+    }
+
     pub fn manifest_entry(&self, uuid: AssetUuid) -> Option<&ManifestEntry> {
         self.manifest.get(&uuid)
     }
