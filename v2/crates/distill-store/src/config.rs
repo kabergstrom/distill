@@ -275,8 +275,15 @@ impl StoreReader {
     }
 
     pub fn configuration_state(&self) -> Result<ConfigurationState, StoreError> {
-        let row: Option<PersistedConfigurationRow> = self
-            .conn
+        read_configuration_state(&self.conn)
+    }
+}
+
+pub(crate) fn read_configuration_state(
+    conn: &rusqlite::Connection,
+) -> Result<ConfigurationState, StoreError> {
+    {
+        let row: Option<PersistedConfigurationRow> = conn
             .query_row(
                 "SELECT active_generation, poison_code, poison_detail_version, poison_detail,
                         poison_reason_hash, poison_message

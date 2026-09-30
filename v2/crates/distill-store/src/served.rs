@@ -602,6 +602,71 @@ pub trait ServedWrite {
     #[doc(hidden)]
     fn served_conn(&self) -> &Connection;
 
+    /// The input version this transaction's change-log rows belong to: the
+    /// version being published, or the current one for served-only writes.
+    fn change_version(&self) -> InputVersion;
+
+    /// A served diagnostic blob as this transaction sees it.
+    fn txn_served_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        meta_get_blob(self.served_conn(), key)
+    }
+
+    /// The configuration state as this transaction sees it.
+    fn txn_configuration_state(&self) -> Result<crate::state::ConfigurationState, StoreError> {
+        crate::config::read_configuration_state(self.served_conn())
+    }
+
+    /// The reconnect fences as this transaction sees them.
+    fn txn_rpc_fences(&self) -> Result<RpcFences, StoreError> {
+        let conn = self.served_conn();
+        Ok(RpcFences {
+            protocol_epoch: meta_get_u64(conn, RPC_PROTOCOL_EPOCH)?.map(|epoch| epoch as u32),
+            pipeline_generation: meta_get_u64(conn, RPC_PIPELINE_GENERATION)?.unwrap_or(0),
+        })
+    }
+
+    /// Every RPC target row as this transaction sees them.
+    fn txn_rpc_targets(&self) -> Result<Vec<RpcTargetRow>, StoreError> {
+        let mut statement = self.served_conn().prepare_cached(
+            "SELECT name, definition_hash, generation FROM rpc_targets ORDER BY name",
+        )?;
+        let rows = statement.query_map([], rpc_target_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Every asset that carries a served authoring value.
+    fn txn_served_assets(&self) -> Result<Vec<AssetUuid>, StoreError> {
+        let mut statement = self.served_conn().prepare_cached(
+            "SELECT asset_uuid FROM assets WHERE authored_value IS NOT NULL ORDER BY asset_uuid",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Whether `asset` carries a served authoring value.
+    fn txn_is_served_asset(&self, asset: AssetUuid) -> Result<bool, StoreError> {
+        Ok(self.served_conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1 AND authored_value IS NOT NULL)",
+            [asset.0.as_slice()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The tag-index poison text of `asset`, if any.
+    fn txn_tag_poison(&self, asset: AssetUuid) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .served_conn()
+            .query_row(
+                "SELECT poison FROM asset_tag_index WHERE asset_uuid = ?1",
+                [asset.0.as_slice()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Replace (`Some`) or remove (`None`) an explicit resolution row.
     fn set_asset_resolution(
         &mut self,
@@ -917,6 +982,10 @@ impl ServedWrite for InputTxn<'_> {
     fn served_conn(&self) -> &Connection {
         &self.txn
     }
+
+    fn change_version(&self) -> InputVersion {
+        self.version()
+    }
 }
 
 /// A transaction that changes only served state (fences, diagnostics,
@@ -936,6 +1005,10 @@ impl ServedTxn<'_> {
 impl ServedWrite for ServedTxn<'_> {
     fn served_conn(&self) -> &Connection {
         &self.txn
+    }
+
+    fn change_version(&self) -> InputVersion {
+        self.version
     }
 }
 

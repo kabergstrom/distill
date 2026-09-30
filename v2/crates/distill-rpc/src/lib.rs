@@ -11,6 +11,7 @@ pub mod distill_rpc_capnp {
 }
 pub mod capnp_loader;
 pub mod capnp_transport;
+mod persist;
 mod protocol;
 mod server;
 mod target;
