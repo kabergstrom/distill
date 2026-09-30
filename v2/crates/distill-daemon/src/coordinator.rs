@@ -4931,14 +4931,12 @@ mod scheduler_tests {
             loader: DynamicPipelineModuleLoader,
             pending: None,
         };
-        let epoch = crate::epoch::empty_test_epoch();
-        let observed = epoch.clone();
-        let mut prepared = Some(epoch);
+        let mut prepared = Some(crate::epoch::empty_test_epoch());
 
-        discard_prepared(&mut runtime, &mut prepared);
-
+        // Unloaded, not retained: a failed unload keeps the epoch, poisoned.
+        assert_eq!(discard_prepared(&mut runtime, &mut prepared), None);
         assert!(prepared.is_none());
-        assert!(observed.status().unloaded);
+        assert_eq!(runtime.host.retired_count(), 0);
     }
 
     #[test]

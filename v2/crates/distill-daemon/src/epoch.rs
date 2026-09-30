@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, OnceLock};
 
 use distill_asset::{ModuleEpochPoisonCause, ModuleEpochToken};
 use distill_core::id::TypeUuid;
@@ -275,7 +275,7 @@ pub struct CandidateRegistrationArena {
 }
 
 // SAFETY: every intrusive node originates in a `Send` capsule; the arena has
-// exclusive access while unpublished and is mutex-protected after publication.
+// exclusive access while unpublished and is only read after publication.
 unsafe impl Send for CandidateRegistrationArena {}
 
 impl std::fmt::Debug for CandidateRegistrationArena {
@@ -835,23 +835,28 @@ struct EpochInner {
     tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     accepting: AtomicBool,
     active_jobs: AtomicUsize,
-    lifecycle: Mutex<EpochLifecycle>,
-    registration_arena: Mutex<Option<CandidateRegistrationArena>>,
-    module: Mutex<Option<Box<dyn LoadedPipelineModule>>>,
+    draining: AtomicBool,
+    unloaded: AtomicBool,
+    /// The first runtime failure; it fences the epoch for good.
+    runtime_error: OnceLock<(PipelinePoisonCode, String)>,
+    /// Read through `&self` once published; torn down only with the epoch
+    /// exclusively held (see `unload_epoch`) or in `Drop`.
+    registration_arena: Option<CandidateRegistrationArena>,
+    /// Touched only with the epoch exclusively held, or in `Drop`.
+    module: Option<Box<dyn LoadedPipelineModule>>,
 }
+
+// SAFETY: the module is reached only through `&mut EpochInner`. The arena's
+// published nodes are immutable until cleanup, which also needs `&mut`, so
+// shared reads of them from several workers do not race; the callbacks they
+// hold are already copied out and called from any worker.
+unsafe impl Sync for EpochInner {}
 
 struct PreparedEpochRegistration {
     target_set: CanonicalTargetSet,
     registration: RegistrationSet,
     tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     arena: CandidateRegistrationArena,
-}
-
-#[derive(Default)]
-struct EpochLifecycle {
-    draining: bool,
-    runtime_error: Option<(PipelinePoisonCode, String)>,
-    unloaded: bool,
 }
 
 impl PipelineEpoch {
@@ -884,9 +889,11 @@ impl PipelineEpoch {
             tools,
             accepting: AtomicBool::new(true),
             active_jobs: AtomicUsize::new(0),
-            lifecycle: Mutex::new(EpochLifecycle::default()),
-            registration_arena: Mutex::new(Some(arena)),
-            module: Mutex::new(Some(module)),
+            draining: AtomicBool::new(false),
+            unloaded: AtomicBool::new(false),
+            runtime_error: OnceLock::new(),
+            registration_arena: Some(arena),
+            module: Some(module),
         }))
     }
 
@@ -910,7 +917,8 @@ impl PipelineEpoch {
     /// value whose lifetime is not already represented by a `PipelineEpoch`
     /// `Arc` pin.
     pub fn module_pin(&self) -> ModuleEpochPin {
-        lock_unpoisoned(&self.0.registration_arena)
+        self.0
+            .registration_arena
             .as_ref()
             .expect("published epoch registration arena must be resident")
             .owner_pin()
@@ -1284,8 +1292,7 @@ impl PipelineEpoch {
     }
 
     fn callback_rows(&self) -> Vec<(*const u8, CallbackHandle)> {
-        let arena = lock_unpoisoned(&self.0.registration_arena);
-        let Some(arena) = arena.as_ref() else {
+        let Some(arena) = self.0.registration_arena.as_ref() else {
             return Vec::new();
         };
         let mut rows = Vec::with_capacity(arena.installed_len);
@@ -1334,7 +1341,7 @@ impl PipelineEpoch {
 
     pub fn begin_drain(&self) {
         self.0.accepting.store(false, Ordering::Release);
-        lock_unpoisoned(&self.0.lifecycle).draining = true;
+        self.0.draining.store(true, Ordering::Release);
     }
 
     /// Report any contained module callback failure, including drop/free/update
@@ -1352,21 +1359,19 @@ impl PipelineEpoch {
 
     pub fn drain_complete(&self) -> bool {
         self.0.observe_token_poison();
-        let lifecycle = lock_unpoisoned(&self.0.lifecycle);
-        lifecycle.draining
-            && lifecycle.runtime_error.is_none()
+        self.0.draining.load(Ordering::Acquire)
+            && self.0.runtime_error.get().is_none()
             && self.0.active_jobs.load(Ordering::Acquire) == 0
     }
 
     pub fn status(&self) -> EpochStatus {
         self.0.observe_token_poison();
-        let lifecycle = lock_unpoisoned(&self.0.lifecycle);
         EpochStatus {
             accepting_new_work: self.0.accepting.load(Ordering::Acquire),
             active_jobs: self.0.active_jobs.load(Ordering::Acquire),
-            draining: lifecycle.draining,
-            poisoned: lifecycle.runtime_error.is_some(),
-            unloaded: lifecycle.unloaded,
+            draining: self.0.draining.load(Ordering::Acquire),
+            poisoned: self.0.runtime_error.get().is_some(),
+            unloaded: self.0.unloaded.load(Ordering::Acquire),
         }
     }
 }
@@ -1394,15 +1399,11 @@ impl EpochInner {
             _ => ModuleEpochPoisonCause::CallbackRejected,
         });
         self.accepting.store(false, Ordering::Release);
-        let mut lifecycle = lock_unpoisoned(&self.lifecycle);
-        if lifecycle.runtime_error.is_none() {
-            lifecycle.runtime_error = Some((code, detail));
-        }
+        let _ = self.runtime_error.set((code, detail));
     }
 
     fn rejection(&self) -> EpochWorkError {
-        let lifecycle = lock_unpoisoned(&self.lifecycle);
-        match &lifecycle.runtime_error {
+        match self.runtime_error.get() {
             Some((code, detail)) => EpochWorkError::Poisoned(pipeline_poison(
                 *code,
                 PipelinePoisonOrigin::PublishedRuntime,
@@ -1417,16 +1418,8 @@ impl EpochInner {
 impl Drop for EpochInner {
     fn drop(&mut self) {
         if self.token.is_poisoned() {
-            let arena = self
-                .registration_arena
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            let module = self
-                .module
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            let arena = self.registration_arena.take();
+            let module = self.module.take();
             if let Some(module) = module {
                 // A poisoned image may contain half-torn-down state. Its
                 // library handle is intentionally leaked rather than allowing
@@ -1473,8 +1466,7 @@ impl PipelineSnapshot {
             PublishedState::Poisoned(error) => Err(error.clone()),
             PublishedState::Ready(epoch) => {
                 epoch.0.observe_token_poison();
-                let lifecycle = lock_unpoisoned(&epoch.0.lifecycle);
-                if let Some((code, detail)) = &lifecycle.runtime_error {
+                if let Some((code, detail)) = epoch.0.runtime_error.get() {
                     Err(pipeline_poison(
                         *code,
                         PipelinePoisonOrigin::PublishedRuntime,
@@ -1666,7 +1658,7 @@ impl ModuleHost {
         let mut outcomes = Vec::with_capacity(self.retired.len());
         let mut index = 0;
         while index < self.retired.len() {
-            let epoch = &self.retired[index];
+            let epoch = &mut self.retired[index];
             epoch.0.observe_token_poison();
             let id = epoch.id();
             if epoch.status().poisoned {
@@ -1713,8 +1705,7 @@ impl ModuleHost {
 
     pub fn retired_poison(&self, id: u64) -> Option<PipelinePoison> {
         let epoch = self.retired.iter().find(|epoch| epoch.id() == id)?;
-        let lifecycle = lock_unpoisoned(&epoch.0.lifecycle);
-        let (code, message) = lifecycle.runtime_error.as_ref()?;
+        let (code, message) = epoch.0.runtime_error.get()?;
         Some(pipeline_poison(
             *code,
             PipelinePoisonOrigin::PublishedRuntime,
@@ -1781,9 +1772,9 @@ impl ModuleHost {
         self.published = Some(PublishedState::Ready(epoch));
     }
 
-    pub(crate) fn discard_unpublished(&mut self, epoch: PipelineEpoch) -> Option<PipelinePoison> {
+    pub(crate) fn discard_unpublished(&mut self, mut epoch: PipelineEpoch) -> Option<PipelinePoison> {
         epoch.begin_drain();
-        match unload_epoch(&epoch) {
+        match unload_epoch(&mut epoch) {
             Ok(()) => None,
             Err(error) => {
                 // This image never became published runtime. Fence and retain
@@ -2191,9 +2182,13 @@ fn discard_candidate(
     }
 }
 
-fn unload_epoch(epoch: &PipelineEpoch) -> Result<(), EpochCleanupError> {
-    let mut arena_guard = lock_unpoisoned(&epoch.0.registration_arena);
-    let arena = arena_guard.as_mut().ok_or_else(|| EpochCleanupError {
+/// Tear down an epoch nothing else holds.
+fn unload_epoch(epoch: &mut PipelineEpoch) -> Result<(), EpochCleanupError> {
+    let epoch = Arc::get_mut(&mut epoch.0).ok_or_else(|| EpochCleanupError {
+        disposition: CandidateCleanupDisposition::TokenPinned,
+        detail: "the epoch is still shared".to_owned(),
+    })?;
+    let arena = epoch.registration_arena.as_mut().ok_or_else(|| EpochCleanupError {
         disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
         detail: "registration arena is absent".to_owned(),
     })?;
@@ -2203,8 +2198,7 @@ fn unload_epoch(epoch: &PipelineEpoch) -> Result<(), EpochCleanupError> {
         detail: error.to_string(),
     })?;
 
-    let mut module_guard = lock_unpoisoned(&epoch.0.module);
-    let module = module_guard.as_mut().ok_or_else(|| EpochCleanupError {
+    let module = epoch.module.as_mut().ok_or_else(|| EpochCleanupError {
         disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
         detail: "module handle is absent".to_owned(),
     })?;
@@ -2212,7 +2206,7 @@ fn unload_epoch(epoch: &PipelineEpoch) -> Result<(), EpochCleanupError> {
         disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
         detail: error.to_string(),
     })?;
-    if epoch.0.token.is_poisoned() {
+    if epoch.token.is_poisoned() {
         return Err(EpochCleanupError {
             disposition: CandidateCleanupDisposition::TokenPoisoned,
             detail: "epoch token was poisoned before dlclose".to_owned(),
@@ -2231,16 +2225,10 @@ fn unload_epoch(epoch: &PipelineEpoch) -> Result<(), EpochCleanupError> {
             detail: ModuleCallError::boundary_panic("dlclose").to_string(),
         }
     })?;
-    module_guard.take();
-    arena_guard.take();
-    lock_unpoisoned(&epoch.0.lifecycle).unloaded = true;
+    epoch.module.take();
+    epoch.registration_arena.take();
+    epoch.unloaded.store(true, Ordering::Release);
     Ok(())
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -2590,7 +2578,7 @@ mod callback_tests {
 
     #[test]
     fn import_host_callback_panic_is_typed_without_poisoning_the_epoch() {
-        let epoch = callback_test_epoch(|arena| {
+        let mut epoch = callback_test_epoch(|arena| {
             arena
                 .register_importer(
                     ImporterDescriptor {
@@ -2622,7 +2610,7 @@ mod callback_tests {
         assert!(!status.poisoned);
 
         epoch.begin_drain();
-        assert!(unload_epoch(&epoch).is_ok());
+        assert!(unload_epoch(&mut epoch).is_ok());
     }
 
     struct Process;
@@ -2761,7 +2749,7 @@ mod callback_tests {
 
     #[test]
     fn codegen_host_callback_panic_is_typed_without_poisoning_the_epoch() {
-        let epoch = callback_test_epoch(|arena| {
+        let mut epoch = callback_test_epoch(|arena| {
             arena
                 .register_codegen(
                     CodegenDescriptor {
@@ -2784,7 +2772,7 @@ mod callback_tests {
         assert!(!status.poisoned);
 
         epoch.begin_drain();
-        assert!(unload_epoch(&epoch).is_ok());
+        assert!(unload_epoch(&mut epoch).is_ok());
     }
 
     struct Defaults;
@@ -2914,7 +2902,7 @@ mod callback_tests {
             target_definition_hash: [1; 32],
         }])
         .unwrap();
-        let epoch = PipelineEpoch::new(
+        let mut epoch = PipelineEpoch::new(
             91,
             StagedModule {
                 path: PathBuf::from("pipeline-test"),
@@ -2975,7 +2963,7 @@ mod callback_tests {
         assert_eq!(generated[0].asset(), AssetUuid([7; 16]));
 
         epoch.begin_drain();
-        assert!(unload_epoch(&epoch).is_ok());
+        assert!(unload_epoch(&mut epoch).is_ok());
     }
 
     #[test]
