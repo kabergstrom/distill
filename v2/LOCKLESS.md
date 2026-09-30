@@ -371,7 +371,7 @@ should reach zero by the end of phase 6.
       in `artifact_load_edges`.
     - A read checks those edges against the parsed dependencies.
     - `ArtifactPayloadBackend` is deleted.
-  - **Known gap (open until phase 6; see phase 5).** The daemon commits its namespace in
+  - **Known gap (closed in phase 6, `e3fcf76`).** The daemon committed its namespace in
     its own input transaction. The RPC `Delta` for that commit is applied
     afterwards, in a second served transaction (`apply_commit_served`), on
     the same authority step.
@@ -492,8 +492,22 @@ should reach zero by the end of phase 6.
       runtime error. Unloading takes the epoch through `Arc::get_mut`, so
       an epoch that is still shared is retained (poisoned) rather than
       unloaded.
+  - **One input per coordinated publication (closes the `Delta` gap).**
+    - Every store write is a savepoint. `Store::arm_input` makes the next
+      input transaction begin one outer transaction (`BEGIN IMMEDIATE`)
+      that later writes join: the daemon's namespace, tag refinement's
+      build and tag-index writes, and the server's served `Delta`.
+      `finish_input` commits or rolls it back.
+    - `Server::coordinated_*` arms it around the daemon's step and
+      notifies subscribers once it commits. A reader on another connection
+      sees the old version until then
+      (`a_coordinated_publication_is_invisible_until_it_commits_whole`).
+    - Journal writes that must be durable ahead of their filesystem change
+      (record group, journaled moves) run before the input begins and
+      panic after it. Retire and abort may join.
+    - A rollback restores the `cas_segments` rows of segments created
+      inside the input; their unindexed bytes are dead space.
   - **Still open in phase 6:**
-    - The `Delta` gap (tag refinement after the input transaction).
     - RPC authoring calls still block the RPC thread.
     - The driver's 40 ms tick for runtime poison and epoch reaping.
     - The maintenance gate's 1 ms back-off.
