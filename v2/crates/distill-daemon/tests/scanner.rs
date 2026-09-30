@@ -442,7 +442,7 @@ fn incremental_native_spelling_rename_replaces_the_old_claim() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].normalized_path, "caf\u{e9}.txt");
     assert_eq!(
-        rows[0].raw_relative_path,
+        *rows[0].raw_relative_path(),
         PlatformPathBytes::Unix("caf\u{e9}.txt".as_bytes().to_vec())
     );
 }

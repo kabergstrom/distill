@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 distill-core = { path = "../distill-core" }
 distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }

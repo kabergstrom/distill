@@ -422,6 +422,13 @@ impl Store {
         };
         store.init_cas()?;
         store.last_recovery = store.recover_cas()?;
+        tracing::info!(
+            path = %store.config.state_path.display(),
+            input_version = store.input_version,
+            memo_seq = store.memo_seq,
+            recovery = ?store.last_recovery,
+            "store opened"
+        );
         Ok(store)
     }
 

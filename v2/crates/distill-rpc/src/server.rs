@@ -3316,6 +3316,7 @@ impl Snapshot {
                         .read()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .clone();
+                    let build_started = std::time::Instant::now();
                     let mut outcome = backend.build(&request).and_then(|outcome| match outcome {
                         BuildBackendOutcome::Built(publication) => self
                             .server
@@ -3326,6 +3327,13 @@ impl Snapshot {
                             Ok(BuildResolution::Drifted(input))
                         }
                     });
+                    tracing::debug!(
+                        asset = %uuid,
+                        target = %request.target,
+                        elapsed = ?build_started.elapsed(),
+                        built = matches!(outcome, Ok(BuildResolution::Built(_))),
+                        "build finished"
+                    );
                     if let Ok(BuildResolution::Built(content_hash)) = &outcome {
                         let state = self.server.lock();
                         outcome = match state.artifacts.get(content_hash) {

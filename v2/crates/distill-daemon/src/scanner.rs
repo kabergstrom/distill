@@ -245,6 +245,14 @@ pub struct ScannedFile {
     raw_relative_path: PlatformPathBytes,
 }
 
+impl ScannedFile {
+    /// The on-disk spelling of the path relative to its root, before
+    /// normalization.
+    pub fn raw_relative_path(&self) -> &PlatformPathBytes {
+        &self.raw_relative_path
+    }
+}
+
 /// A `.bundle` candidate remains in the report even when its envelope is
 /// malformed. The coordinator, not traversal, decides whether the current
 /// bytes yield a complete namespace skeleton or version-global poison.

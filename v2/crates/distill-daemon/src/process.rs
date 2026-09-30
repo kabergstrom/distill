@@ -125,8 +125,11 @@ impl DaemonProcess {
         // to that output can be misclassified as a root escape during the
         // narrow gap between candidate publication and service construction.
         config_watch.reconcile(&coordinator, &watcher_control, ControlInvalidation::all())?;
+        let started = Instant::now();
         coordinator.reconcile_startup(&watcher_queue)?;
+        tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
         reconcile_imports(&coordinator, true, false)?;
+        tracing::info!(elapsed = ?started.elapsed(), "startup imports reconciled");
         coordinator.sweep_displaced_retention(unix_seconds())?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -299,11 +302,21 @@ fn spawn_coordinator_loop(
                 thread::sleep(DEBOUNCE);
                 let action = lock(&watcher).take_live_action();
                 if let WatcherAction::Failed(message) = &action {
+                    tracing::error!(%message, "watcher failed; stopping the coordinator");
                     *lock(&last_error) = Some(message.clone());
                     stop.store(true, Ordering::Release);
                     break;
                 }
                 let retry_action = action.clone();
+                let started = Instant::now();
+                match &action {
+                    WatcherAction::Batch(batch) => {
+                        tracing::debug!(batch = ?batch, "reconciling watcher batch")
+                    }
+                    WatcherAction::FullRescan => tracing::info!("reconciling full rescan"),
+                    WatcherAction::None | WatcherAction::Failed(_) => {}
+                }
+                let reconciled = !matches!(action, WatcherAction::None);
                 let control_invalidation = match &action {
                     WatcherAction::Batch(batch) => config_watch.invalidation_for(batch),
                     WatcherAction::FullRescan => Some(ControlInvalidation::all()),
@@ -338,11 +351,16 @@ fn spawn_coordinator_loop(
                 let _ = coordinator.reap_retired_pipeline_epochs();
                 match result {
                     Err(error) => {
+                        tracing::warn!(%error, "reconciliation failed; requeued");
                         *lock(&last_error) = Some(error.to_string());
                         lock(&watcher).requeue_action(retry_action);
                     }
                     Ok(()) => {
+                        if reconciled {
+                            tracing::info!(elapsed = ?started.elapsed(), "reconciled");
+                        }
                         if let Err(error) = codegen.run(&coordinator) {
+                            tracing::warn!(%error, "codegen failed");
                             *lock(&last_error) = Some(error);
                         }
                     }

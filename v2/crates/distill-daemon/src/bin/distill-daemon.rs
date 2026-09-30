@@ -7,6 +7,13 @@ use distill_daemon::pack_command::build_configured_pack;
 use distill_daemon::process::DaemonProcess;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let mut args = std::env::args_os().skip(1);
     let Some(first) = args.next() else {
         return run_daemon(PathBuf::from("distill.toml"));

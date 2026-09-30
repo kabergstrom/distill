@@ -10,6 +10,8 @@ name = "distilld"
 path = "src/bin/distill-daemon.rs"
 
 [dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
 blake3 = { workspace = true }
 distill-asset = { path = "../distill-asset" }
 distill-bundle = { path = "../distill-bundle" }
