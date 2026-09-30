@@ -148,6 +148,7 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
             fetch_memory_budget: budget,
             spool_threshold: budget,
             spool_directory: Some(spool.path().to_owned()),
+            ..RpcIoConfig::default()
         },
     )
     .unwrap();
@@ -447,7 +448,16 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
         epoch: distill_loader::GameModuleEpoch(1),
         target_definition_hash: request.target_definition_hash.0,
     };
-    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    // Report the first failed rebind: the stalled attempt is released on it.
+    let mut io = RpcIo::connect_with_config(
+        address_rx.recv().unwrap(),
+        request,
+        RpcIoConfig {
+            target_rejection_after: 1,
+            ..RpcIoConfig::default()
+        },
+    )
+    .unwrap();
     io.bind_target(target.clone());
     assert!(poll_until(&mut io, 1)
         .iter()
