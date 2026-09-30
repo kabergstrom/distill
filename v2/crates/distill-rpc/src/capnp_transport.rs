@@ -689,10 +689,20 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            write_bundle_uuid_result(
-                results.get().init_result(),
-                self.hub.import(InputVersion(params.get_base()), request),
-            );
+            let result = match self.hub.import_prepare(InputVersion(params.get_base()), request) {
+                // The importer runs on a blocking worker, never on the
+                // single-threaded capnp-rpc driver.
+                Ok(pending) => {
+                    let finished = tokio::task::spawn_blocking(move || pending.run())
+                        .await
+                        .map_err(|error| {
+                            capnp::Error::failed(format!("import worker failed: {error}"))
+                        })?;
+                    self.hub.import_finish(finished)
+                }
+                Err(result) => result,
+            };
+            write_bundle_uuid_result(results.get().init_result(), result);
             Ok(())
         }
     }
@@ -718,10 +728,20 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            write_bundle_uuid_result(
-                results.get().init_result(),
-                self.hub.reimport(InputVersion(params.get_base()), bundle),
-            );
+            let result = match self.hub.reimport_prepare(InputVersion(params.get_base()), bundle) {
+                // The importer runs on a blocking worker, never on the
+                // single-threaded capnp-rpc driver.
+                Ok(pending) => {
+                    let finished = tokio::task::spawn_blocking(move || pending.run())
+                        .await
+                        .map_err(|error| {
+                            capnp::Error::failed(format!("import worker failed: {error}"))
+                        })?;
+                    self.hub.import_finish(finished)
+                }
+                Err(result) => result,
+            };
+            write_bundle_uuid_result(results.get().init_result(), result);
             Ok(())
         }
     }

@@ -647,20 +647,20 @@ impl AuthoringBackend for AuthoringService {
         self.prepare_reimport_bundle(base, bundle)
     }
 
-    fn run_import<'a>(
-        &'a self,
+    fn run_import(
+        self: Arc<Self>,
         base: InputVersion,
         request: ImportRequest,
-    ) -> Result<ImportJob<'a>, RpcFailure> {
+    ) -> Result<ImportJob, RpcFailure> {
         let run = self.run_import_request(base, &request)?;
         Ok(Box::new(move || self.publish_import_run(base, run)))
     }
 
-    fn run_reimport<'a>(
-        &'a self,
+    fn run_reimport(
+        self: Arc<Self>,
         base: InputVersion,
         bundle: BundleUuid,
-    ) -> Result<ImportJob<'a>, RpcFailure> {
+    ) -> Result<ImportJob, RpcFailure> {
         let run = self.run_reimport_bundle(base, bundle)?;
         Ok(Box::new(move || self.publish_import_run(base, run)))
     }

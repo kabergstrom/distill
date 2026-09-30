@@ -1414,45 +1414,78 @@ impl Hub {
     }
 
     pub fn import(&self, base: InputVersion, request: ImportRequest) -> RpcResult<BundleUuid> {
-        if let Err(detail) = validate_import_request(&request) {
-            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { detail });
+        match self.import_prepare(base, request) {
+            Ok(pending) => self.import_finish(pending.run()),
+            Err(result) => result,
         }
-        if let Some(result) = self.authoring_gate(base) {
-            return result;
-        }
-        // The importer runs here, off the authority; the authority only
-        // publishes, and only while still at `base`.
-        let backend = self.server.inner.handle.authoring_backend();
-        let job = match backend.run_import(base, request) {
-            Ok(job) => job,
-            Err(error) => return RpcResult::Failure(error),
-        };
-        self.prepared(base, move |_| {
-            let prepared = job()?;
-            Ok(Some((prepared.commit, prepared.bundle)))
-        })
-        .expect("an import always publishes")
     }
 
     pub fn reimport(&self, base: InputVersion, bundle: BundleUuid) -> RpcResult<BundleUuid> {
-        if let Some(result) = self.authoring_gate(base) {
-            return result;
+        match self.reimport_prepare(base, bundle) {
+            Ok(pending) => self.import_finish(pending.run()),
+            Err(result) => result,
         }
-        let backend = self.server.inner.handle.authoring_backend();
-        let job = match backend.run_reimport(base, bundle) {
+    }
+
+    /// Check an import request. The returned [`PendingImport`] runs the
+    /// importer; transports run it off the RPC thread and hand the result
+    /// to [`Hub::import_finish`].
+    pub fn import_prepare(
+        &self,
+        base: InputVersion,
+        request: ImportRequest,
+    ) -> Result<PendingImport, RpcResult<BundleUuid>> {
+        if let Err(detail) = validate_import_request(&request) {
+            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest { detail }));
+        }
+        if let Some(result) = self.authoring_gate(base) {
+            return Err(result);
+        }
+        Ok(PendingImport {
+            base,
+            backend: self.server.inner.handle.authoring_backend(),
+            work: ImportWork::Import(request),
+        })
+    }
+
+    /// [`Hub::import_prepare`] for a reimport.
+    pub fn reimport_prepare(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<PendingImport, RpcResult<BundleUuid>> {
+        if let Some(result) = self.authoring_gate(base) {
+            return Err(result);
+        }
+        Ok(PendingImport {
+            base,
+            backend: self.server.inner.handle.authoring_backend(),
+            work: ImportWork::Reimport(bundle),
+        })
+    }
+
+    /// Publish a finished import on the authority, only while still at
+    /// its base.
+    pub fn import_finish(&self, finished: FinishedImport) -> RpcResult<BundleUuid> {
+        let FinishedImport {
+            base,
+            reimport,
+            job,
+        } = finished;
+        let job = match job {
             Ok(job) => job,
             Err(error) => return RpcResult::Failure(error),
         };
         self.prepared(base, move |_| {
             let prepared = job()?;
-            if prepared.bundle != bundle {
+            if reimport.is_some_and(|bundle| bundle != prepared.bundle) {
                 return Err(RpcFailure::InvalidAuthoringRequest {
                     detail: "reimport backend changed the bundle identity".to_owned(),
                 });
             }
             Ok(Some((prepared.commit, prepared.bundle)))
         })
-        .expect("a reimport always publishes")
+        .expect("an import always publishes")
     }
 
     pub fn operation(
@@ -1687,6 +1720,51 @@ fn authoring_snapshot_from(
 }
 
 // ---------------------------------------------------------------------------
+/// An import the hub accepted. It is `Send`: transports run it off the RPC
+/// thread and hand the result back to [`Hub::import_finish`].
+pub struct PendingImport {
+    base: InputVersion,
+    backend: Arc<dyn AuthoringBackend>,
+    work: ImportWork,
+}
+
+enum ImportWork {
+    Import(ImportRequest),
+    Reimport(BundleUuid),
+}
+
+impl fmt::Debug for PendingImport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingImport")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingImport {
+    /// Run the importer.
+    pub fn run(self) -> FinishedImport {
+        let (reimport, job) = match self.work {
+            ImportWork::Import(request) => (None, self.backend.run_import(self.base, request)),
+            ImportWork::Reimport(bundle) => {
+                (Some(bundle), self.backend.run_reimport(self.base, bundle))
+            }
+        };
+        FinishedImport {
+            base: self.base,
+            reimport,
+            job,
+        }
+    }
+}
+
+/// A [`PendingImport`]'s result: the step that publishes it.
+pub struct FinishedImport {
+    base: InputVersion,
+    reimport: Option<BundleUuid>,
+    job: Result<ImportJob, RpcFailure>,
+}
+
 // Snapshot
 
 /// A lazy build the server needs before it can answer a resolve. It is
