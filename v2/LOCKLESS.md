@@ -197,6 +197,11 @@ a connection of its own, and SQLite's write lock orders the writers.
 - **CAS reclamation** deletes a retired segment once no read transaction
   can still see it: the daemon waits the snapshot TTL plus a margin.
 - **Module epochs** unload when the last clone of their token drops.
+- **rebuild** (`distilld` only, when the config has `[[rebuild]]` jobs)
+  watches each job's dep-info inputs with its own `notify` watcher and
+  runs the job's steps as child processes, one at a time. It touches no
+  store state: the daemon adopts the pipeline module and schema the steps
+  write through the ordinary watch.
 - The only atomics are ID and temp-name sequences.
 
 ## 4. Error model: per-entity rows instead of poisons

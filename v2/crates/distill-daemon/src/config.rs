@@ -29,6 +29,21 @@ pub struct DaemonConfig {
     pub codegen: CodegenSection,
     pub pipeline: PipelineSection,
     pub cas: CasSection,
+    /// Rebuild-on-save jobs (`crate::rebuild`); read at startup only.
+    pub rebuild: Vec<RebuildJob>,
+}
+
+/// One `[[rebuild]]` job: see `crate::rebuild`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildJob {
+    pub name: String,
+    /// Cargo's dep-info for the job's artifact.
+    pub dep_info: PathBuf,
+    /// Each step's program and arguments. A program with a path separator
+    /// is relative to `working_dir`; a bare name is looked up in `PATH`.
+    pub steps: Vec<Vec<String>>,
+    /// The configuration file's directory; steps run here.
+    pub working_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +128,7 @@ pub enum DaemonConfigError {
         observed: Box<LayoutIdentity>,
     },
     Target(String),
+    Rebuild(String),
 }
 
 pub(crate) struct StagedExecutionCandidate {
@@ -139,6 +155,8 @@ struct RawConfig {
     codegen: RawCodegen,
     pipeline: RawPipeline,
     cas: RawCas,
+    #[serde(default)]
+    rebuild: Vec<RawRebuild>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +225,14 @@ struct RawPipeline {
 
 const fn default_dependency_depth() -> usize {
     DEFAULT_DEPENDENCY_DEPTH
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRebuild {
+    name: String,
+    dep_info: PathBuf,
+    steps: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +310,7 @@ impl DaemonConfig {
             .map_err(|error| DaemonConfigError::InvalidByteSize(error.to_string()))?;
         let cache_limit = parse_byte_size(&raw.cas.cache_limit)
             .map_err(|error| DaemonConfigError::InvalidByteSize(error.to_string()))?;
+        let rebuild = rebuild_jobs(raw.rebuild, base)?;
 
         Ok(Self {
             source_path,
@@ -310,6 +337,7 @@ impl DaemonConfig {
                 segment_size,
                 cache_limit,
             },
+            rebuild,
         })
     }
 
@@ -853,6 +881,32 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), DaemonConfigError
     Ok(())
 }
 
+fn rebuild_jobs(raw: Vec<RawRebuild>, base: &Path) -> Result<Vec<RebuildJob>, DaemonConfigError> {
+    let mut names = BTreeSet::new();
+    raw.into_iter()
+        .map(|job| {
+            if job.name.is_empty() || !names.insert(job.name.clone()) {
+                return Err(DaemonConfigError::Rebuild(format!(
+                    "rebuild job name {:?} is empty or repeated",
+                    job.name
+                )));
+            }
+            if job.steps.is_empty() || job.steps.iter().any(Vec::is_empty) {
+                return Err(DaemonConfigError::Rebuild(format!(
+                    "rebuild job {:?} needs steps, each with a program",
+                    job.name
+                )));
+            }
+            Ok(RebuildJob {
+                dep_info: resolve(base, &job.dep_info)?,
+                name: job.name,
+                steps: job.steps,
+                working_dir: base.to_path_buf(),
+            })
+        })
+        .collect()
+}
+
 fn resolve(base: &Path, path: &Path) -> Result<PathBuf, DaemonConfigError> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
@@ -965,6 +1019,7 @@ mod tests {
                 segment_size: "1MiB".to_owned(),
                 cache_limit: "8MiB".to_owned(),
             },
+            rebuild: Vec::new(),
         };
 
         let errors = validate_raw_candidate(&raw, temp.path());

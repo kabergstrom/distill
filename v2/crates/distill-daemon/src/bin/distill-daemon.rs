@@ -53,8 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_daemon(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(path)?;
+    let rebuild = config.rebuild.clone();
     let process = DaemonProcess::start(config)?;
     eprintln!("distill daemon listening on {}", process.rpc_address());
+    #[cfg(unix)]
+    let _rebuilder = distill_daemon::rebuild::Rebuilder::start(rebuild)?;
+    #[cfg(not(unix))]
+    if !rebuild.is_empty() {
+        return Err("[[rebuild]] jobs run on Unix hosts only".into());
+    }
     process.wait()
 }
 
