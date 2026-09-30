@@ -78,6 +78,9 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
         source_hashes: [("test-marker".to_owned(), marker.to_owned())]
             .into_iter()
             .collect(),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
         types: Vec::new(),
         layouts: vec![SchemaLayouts {
             identity: test_layout_identity(),

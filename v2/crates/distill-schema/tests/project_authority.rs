@@ -60,6 +60,8 @@ fn project_schema() -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: false,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
         TypeDef {
             id: SchemaTypeId(1),
@@ -71,6 +73,8 @@ fn project_schema() -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
         TypeDef {
             id: SchemaTypeId(2),
@@ -82,6 +86,8 @@ fn project_schema() -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
     ];
     let layouts = vec![
@@ -118,6 +124,9 @@ fn project_schema() -> Schema {
     ];
     Schema {
         source_hashes: Default::default(),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
         types,
         layouts: vec![SchemaLayouts {
             identity: test_layout_identity(),
@@ -129,6 +138,9 @@ fn project_schema() -> Schema {
 fn tagged_schema() -> Schema {
     Schema {
         source_hashes: Default::default(),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
         types: vec![
             TypeDef {
                 id: SchemaTypeId(0),
@@ -147,6 +159,8 @@ fn tagged_schema() -> Schema {
                 generic_parameters: Vec::new(),
                 generic_argument_ids: Vec::new(),
                 has_default: false,
+                generic_const_arguments: Vec::new(),
+                has_explicit_discriminants: false,
             },
             TypeDef {
                 id: SchemaTypeId(1),
@@ -158,6 +172,8 @@ fn tagged_schema() -> Schema {
                 generic_parameters: Vec::new(),
                 generic_argument_ids: Vec::new(),
                 has_default: true,
+                generic_const_arguments: Vec::new(),
+                has_explicit_discriminants: false,
             },
         ],
         layouts: vec![SchemaLayouts {

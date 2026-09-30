@@ -16,4 +16,4 @@ warning: unused import: `Blob`
 1 | use distill_asset::{asset, Blob};
   |                            ^^^^
   |
-  = note: `#[warn(unused_imports)]` on by default
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -129,6 +129,9 @@ fn accept_schema_transition_promotes_the_real_pending_candidate_atomically() {
 fn project_schema(source_identity: (String, String)) -> Schema {
     Schema {
         source_hashes: BTreeMap::from([source_identity]),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
         types: vec![
             TypeDef {
                 id: SchemaTypeId(0),
@@ -144,6 +147,8 @@ fn project_schema(source_identity: (String, String)) -> Schema {
                 generic_parameters: Vec::new(),
                 generic_argument_ids: Vec::new(),
                 has_default: true,
+                generic_const_arguments: Vec::new(),
+                has_explicit_discriminants: false,
             },
             TypeDef {
                 id: SchemaTypeId(1),
@@ -155,6 +160,8 @@ fn project_schema(source_identity: (String, String)) -> Schema {
                 generic_parameters: Vec::new(),
                 generic_argument_ids: Vec::new(),
                 has_default: true,
+                generic_const_arguments: Vec::new(),
+                has_explicit_discriminants: false,
             },
         ],
         layouts: vec![SchemaLayouts {
@@ -287,7 +294,9 @@ fn build_pipeline_fixture() -> PathBuf {
         .ancestors()
         .nth(2)
         .unwrap();
-    let target_dir = workspace.join("target/schema-transition-pipeline-fixture");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target/schema-transition-pipeline-fixture"));
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .current_dir(workspace)

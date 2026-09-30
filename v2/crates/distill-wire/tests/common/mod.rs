@@ -351,6 +351,8 @@ pub fn ty(id: usize, kind: PrimitiveType, name: Option<&str>, krate: &str) -> Ty
         generic_parameters: vec![],
         generic_argument_ids: vec![],
         has_default: false,
+        generic_const_arguments: Vec::new(),
+        has_explicit_discriminants: false,
     }
 }
 
@@ -605,6 +607,9 @@ pub fn schema(entries: Vec<(TypeDef, TypeLayout)>) -> Schema {
     }
     Schema {
         source_hashes: Default::default(),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
         types,
         layouts: vec![SchemaLayouts {
             identity: test_identity(),

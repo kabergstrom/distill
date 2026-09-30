@@ -501,7 +501,9 @@ fn build_pipeline_fixture() -> PathBuf {
         .ancestors()
         .nth(2)
         .unwrap();
-    let target_dir = workspace.join("target/game-assets-pipeline-fixture");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target/game-assets-pipeline-fixture"));
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .current_dir(workspace)
@@ -556,6 +558,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
         generic_parameters: Vec::new(),
         generic_argument_ids: Vec::new(),
         has_default: true,
+        generic_const_arguments: Vec::new(),
+        has_explicit_discriminants: false,
     };
     let field = |name: &str, type_id: usize| Field {
         id: FieldIdentifier::Name(name.into()),
@@ -577,6 +581,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
         leaf(2, PrimitiveType::String, "alloc", "String"),
         leaf(3, PrimitiveType::U32, "core", "u32"),
@@ -595,6 +601,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: vec![SchemaTypeId(0)],
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
         leaf(5, PrimitiveType::Struct, "distill_asset", "Blob"),
     ];
@@ -616,6 +624,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         });
     }
     types.extend([
@@ -634,6 +644,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
         TypeDef {
             id: SchemaTypeId(10),
@@ -650,6 +662,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: true,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
         TypeDef {
             id: SchemaTypeId(11),
@@ -667,6 +681,8 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             generic_parameters: Vec::new(),
             generic_argument_ids: Vec::new(),
             has_default: false,
+            generic_const_arguments: Vec::new(),
+            has_explicit_discriminants: false,
         },
     ]);
     let string_layout = TypeLayout {
@@ -695,6 +711,9 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
     };
     Schema {
         source_hashes: BTreeMap::from([source_identity]),
+        type_ops_hash: String::new(),
+        layout_hashes: Default::default(),
+        rustc_version: String::new(),
         types,
         layouts: vec![SchemaLayouts {
             identity: host_layout_identity(),

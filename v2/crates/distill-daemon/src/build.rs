@@ -4473,6 +4473,9 @@ mod tests {
         ProjectSchemaAuthority::from_schema(
             Schema {
                 source_hashes: BTreeMap::new(),
+                type_ops_hash: String::new(),
+                layout_hashes: Default::default(),
+                rustc_version: String::new(),
                 types: vec![
                     TypeDef {
                         id: SchemaTypeId(0),
@@ -4488,6 +4491,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: false,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                     TypeDef {
                         id: SchemaTypeId(1),
@@ -4499,6 +4504,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: true,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                     TypeDef {
                         id: SchemaTypeId(2),
@@ -4514,6 +4521,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: false,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                     TypeDef {
                         id: SchemaTypeId(3),
@@ -4529,6 +4538,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: false,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                 ],
                 layouts: vec![SchemaLayouts {
@@ -4583,6 +4594,9 @@ mod tests {
         ProjectSchemaAuthority::from_schema(
             Schema {
                 source_hashes: BTreeMap::new(),
+                type_ops_hash: String::new(),
+                layout_hashes: Default::default(),
+                rustc_version: String::new(),
                 types: vec![
                     TypeDef {
                         id: SchemaTypeId(0),
@@ -4598,6 +4612,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: false,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                     TypeDef {
                         id: SchemaTypeId(1),
@@ -4609,6 +4625,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: true,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                     TypeDef {
                         id: SchemaTypeId(2),
@@ -4624,6 +4642,8 @@ mod tests {
                         generic_parameters: Vec::new(),
                         generic_argument_ids: Vec::new(),
                         has_default: false,
+                        generic_const_arguments: Vec::new(),
+                        has_explicit_discriminants: false,
                     },
                 ],
                 layouts: vec![SchemaLayouts {

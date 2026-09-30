@@ -61,7 +61,9 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
         .ancestors()
         .nth(2)
         .unwrap();
-    let target_dir = workspace.join("target/pipeline-module-fixture");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target/pipeline-module-fixture"));
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .current_dir(workspace)

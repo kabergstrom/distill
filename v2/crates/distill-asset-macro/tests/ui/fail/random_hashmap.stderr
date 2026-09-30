@@ -4,7 +4,14 @@ error[E0277]: the trait bound `HashMap<u32, u32>: AssetReflect` is not satisfied
 6 |     map: HashMap<u32, u32>,
   |          ^^^^^^^^^^^^^^^^^ the trait `AssetReflect` is not implemented for `HashMap<u32, u32>`
   |
-  = help: the trait `AssetReflect` is implemented for `HashMap<K, V, DeterministicState>`
+help: the trait `AssetReflect` is implemented for `HashMap<K, V, DeterministicState>`
+ --> $WORKSPACE/crates/distill-asset/src/reflect.rs
+  |
+  | / unsafe impl<K, V> AssetReflect for HashMap<K, V, DeterministicState>
+  | | where
+  | |     K: AssetReflect + Eq + Hash,
+  | |     V: AssetReflect,
+  | |____________________^
 
 error[E0277]: the trait bound `HashMap<u32, u32>: AssetReflect` is not satisfied
  --> tests/ui/fail/random_hashmap.rs:4:1
@@ -12,5 +19,12 @@ error[E0277]: the trait bound `HashMap<u32, u32>: AssetReflect` is not satisfied
 4 | #[asset(uuid = "f99dd1b7-d22f-4942-80c1-3d679e074962")]
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `AssetReflect` is not implemented for `HashMap<u32, u32>`
   |
-  = help: the trait `AssetReflect` is implemented for `HashMap<K, V, DeterministicState>`
+help: the trait `AssetReflect` is implemented for `HashMap<K, V, DeterministicState>`
+ --> $WORKSPACE/crates/distill-asset/src/reflect.rs
+  |
+  | / unsafe impl<K, V> AssetReflect for HashMap<K, V, DeterministicState>
+  | | where
+  | |     K: AssetReflect + Eq + Hash,
+  | |     V: AssetReflect,
+  | |____________________^
   = note: this error originates in the attribute macro `asset` (in Nightly builds, run with -Z macro-backtrace for more info)
