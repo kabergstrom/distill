@@ -23,19 +23,19 @@ fn config_source(temp: &tempfile::TempDir) -> String {
         r#"
 [daemon]
 address = "127.0.0.1:0"
-state_path = "{}"
+state_path = '{}'
 [assets]
-roots = {{ main = "{}" }}
-schema_path = "{}"
+roots = {{ main = '{}' }}
+schema_path = '{}'
 [modules]
-pipeline_dylib = "{}"
+pipeline_dylib = '{}'
 [targets.dev]
 os = "macos"
 arch = "aarch64"
 apis = ["vulkan"]
 optimize = false
 [codegen]
-rs_mod_path = "{}"
+rs_mod_path = '{}'
 auto_codegen = false
 [pipeline]
 parallelism = 2
@@ -631,5 +631,504 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
         process.coordinator().server().current_stamp().version.0,
         failed.0 + 1
     );
+    assert!(process.last_background_error().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline swaps gated on the watched schema (ngp_module_host::SourceGate).
+//
+// One standalone pipeline crate is built in three variants, in the same
+// directory so their source and layout hashes are comparable:
+// - `v1`: importer version 1;
+// - `v2`: importer version 2 and a new struct (a layout change);
+// - `v3`: importer version 3, otherwise `v2` (a fn-body-only change: same
+//   layout hash as `v2`).
+// The importer writes its version into the imported value, so a capability-
+// driven reimport is visible in the bundle.
+
+const GATE_SETTINGS_TYPE: [u8; 16] = [0xa0; 16];
+const GATE_SOURCE_TYPE: [u8; 16] = [0xa1; 16];
+const GATE_CRATE: &str = "distill_gate_fixture";
+
+struct GateVariant {
+    dylib: std::path::PathBuf,
+    source_hash: String,
+    layout_hash: String,
+}
+
+struct GateVariants {
+    v1: GateVariant,
+    v2: GateVariant,
+    v3: GateVariant,
+}
+
+fn gate_fixture_source(version: u32, layout_marker: bool) -> String {
+    let marker = if layout_marker {
+        "pub struct LayoutMarker {\n    pub value: u32,\n}\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"use std::collections::{{BTreeMap, BTreeSet}};
+
+use distill_core::id::TypeUuid;
+use distill_json::AuthoredValue;
+use distill_pipeline_api::callbacks::ImporterDescriptor;
+use distill_pipeline_api::import::ImportOutput;
+use distill_pipeline_api::importer::{{
+    AuthoringImportContext, AuthoringImporter, AuthoringImporterError,
+}};
+use distill_pipeline_api::registration::{{ModuleCallError, RegistrationArena, TargetDefinition}};
+use distill_schema::ngp_schema::{{LogicalSchema, PrimitiveKind, SchemaNode}};
+
+const SETTINGS_TYPE: TypeUuid = TypeUuid([0xa0; 16]);
+const SOURCE_TYPE: TypeUuid = TypeUuid([0xa1; 16]);
+
+#[derive(newgameplus_api_macros::NgpSourceIdentity)]
+pub struct SourceIdentity;
+
+{marker}
+fn importer_version() -> u32 {{
+    {version}
+}}
+
+fn settings_schema() -> SchemaNode {{
+    SchemaNode::Struct {{
+        rev: 0,
+        fields: vec![("value".to_owned(), 0, SchemaNode::Primitive(PrimitiveKind::U8))],
+    }}
+}}
+
+fn settings_value() -> AuthoredValue {{
+    AuthoredValue::Object(BTreeMap::from([("value".to_owned(), AuthoredValue::UInt(0))]))
+}}
+
+struct GateImporter;
+
+impl AuthoringImporter for GateImporter {{
+    fn id(&self) -> &str {{
+        "gate-fixture"
+    }}
+
+    fn version(&self) -> u32 {{
+        importer_version()
+    }}
+
+    fn settings_type_uuid(&self) -> TypeUuid {{
+        SETTINGS_TYPE
+    }}
+
+    fn settings_schema(&self) -> &LogicalSchema {{
+        static SETTINGS: std::sync::OnceLock<LogicalSchema> = std::sync::OnceLock::new();
+        SETTINGS.get_or_init(|| LogicalSchema {{ root: settings_schema() }})
+    }}
+
+    fn default_settings(&self) -> AuthoredValue {{
+        settings_value()
+    }}
+
+    fn import(
+        &self,
+        context: &mut dyn AuthoringImportContext,
+        _settings: &AuthoredValue,
+    ) -> Result<ImportOutput, AuthoringImporterError> {{
+        let source = context
+            .sources()
+            .first()
+            .map(|source| source.path.clone())
+            .ok_or_else(|| AuthoringImporterError::rejected(1, "no source"))?;
+        let bytes = context.read(&source)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut output = ImportOutput::new();
+        output
+            .entry(
+                "main",
+                SOURCE_TYPE,
+                AuthoredValue::Object(BTreeMap::from([(
+                    "value".to_owned(),
+                    AuthoredValue::Str(format!("v{{}}:{{text}}", importer_version())),
+                )])),
+            )
+            .map_err(|error| AuthoringImporterError::rejected(2, format!("{{error:?}}")))?;
+        output
+            .primary("main")
+            .map_err(|error| AuthoringImporterError::rejected(3, format!("{{error:?}}")))?;
+        Ok(output)
+    }}
+}}
+
+fn register(
+    targets: &[TargetDefinition],
+    arena: &mut RegistrationArena,
+) -> Result<BTreeSet<String>, ModuleCallError> {{
+    arena
+        .register_importer(
+            ImporterDescriptor {{
+                id: "gate-fixture".to_owned(),
+                version: importer_version(),
+                settings_type_uuid: SETTINGS_TYPE,
+                settings_schema: LogicalSchema {{ root: settings_schema() }},
+                default_settings: settings_value(),
+            }},
+            GateImporter,
+        )
+        .into_result()?;
+    Ok(targets.iter().map(|target| target.name.clone()).collect())
+}}
+
+fn unload() -> Result<(), ModuleCallError> {{
+    Ok(())
+}}
+
+distill_pipeline_api::export_pipeline_module_v2!(register = register, unload = unload);
+"#
+    )
+}
+
+/// Build the three variants once per test binary (they share one cargo
+/// output path, so building is serialized here).
+fn gate_variants() -> &'static GateVariants {
+    static VARIANTS: std::sync::OnceLock<GateVariants> = std::sync::OnceLock::new();
+    VARIANTS.get_or_init(|| {
+        let daemon = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates = daemon.parent().unwrap();
+        let workspace = crates.parent().unwrap();
+        let newgameplus = workspace.join("../../newgameplus");
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| workspace.join("target/gate-fixture"));
+        let root = target_dir.join("distill-gate-fixture");
+        let crate_dir = root.join("crate");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let path = |p: std::path::PathBuf| std::fs::canonicalize(p).unwrap().display().to_string();
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "distill-gate-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+distill-core = {{ path = "{}" }}
+distill-json = {{ path = "{}" }}
+distill-pipeline-api = {{ path = "{}" }}
+distill-schema = {{ path = "{}" }}
+newgameplus-api-macros = {{ path = "{}" }}
+
+[build-dependencies]
+ngp-source-hash = {{ path = "{}" }}
+"#,
+                path(crates.join("distill-core")),
+                path(crates.join("distill-json")),
+                path(crates.join("distill-pipeline-api")),
+                path(crates.join("distill-schema")),
+                path(newgameplus.join("newgameplus-api-macros")),
+                path(newgameplus.join("ngp-source-hash")),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("build.rs"),
+            "fn main() {\n    ngp_source_hash::build_script_main();\n}\n",
+        )
+        .unwrap();
+        // Resolve offline to the versions the workspace already uses.
+        if !crate_dir.join("Cargo.lock").exists() {
+            std::fs::copy(workspace.join("Cargo.lock"), crate_dir.join("Cargo.lock")).unwrap();
+        }
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let built = if cfg!(target_os = "windows") {
+            "distill_gate_fixture.dll"
+        } else if cfg!(target_os = "macos") {
+            "libdistill_gate_fixture.dylib"
+        } else {
+            "libdistill_gate_fixture.so"
+        };
+        let build = |name: &str, version: u32, layout_marker: bool| {
+            std::fs::write(
+                crate_dir.join("src/lib.rs"),
+                gate_fixture_source(version, layout_marker),
+            )
+            .unwrap();
+            let output = std::process::Command::new(&cargo)
+                .current_dir(&crate_dir)
+                .env("CARGO_TARGET_DIR", &target_dir)
+                .args(["build", "--offline"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "gate fixture build failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let dylib = root.join(format!("{name}-{built}"));
+            std::fs::copy(target_dir.join("debug").join(built), &dylib).unwrap();
+            let staged = ngp_module_host::stage_copy_to(
+                &dylib,
+                &root.join(format!("{name}-identity-{}-{built}", std::process::id())),
+            )
+            .unwrap();
+            // SAFETY: the fixture was compiled just above from the source
+            // written here; it is opened only to read its identity exports.
+            let library = unsafe { ngp_module_host::HostedLibrary::open(staged.clone()) }.unwrap();
+            // SAFETY: the fixture derives NgpSourceIdentity.
+            let identity = unsafe { ngp_module_host::read_reload_identity(&library) }.unwrap();
+            library.close();
+            let _ = std::fs::remove_file(staged.path());
+            assert_eq!(identity.source.crate_name, GATE_CRATE);
+            assert!(!identity.layout_hash.is_empty(), "NgpSourceIdentity exports a layout hash");
+            GateVariant {
+                dylib,
+                source_hash: identity.source.source_hash,
+                layout_hash: identity.layout_hash,
+            }
+        };
+        let v1 = build("v1", 1, false);
+        let v2 = build("v2", 2, true);
+        let v3 = build("v3", 3, true);
+        assert_ne!(v1.source_hash, v2.source_hash);
+        assert_ne!(v1.layout_hash, v2.layout_hash, "a new struct changes the layout hash");
+        assert_ne!(v2.source_hash, v3.source_hash);
+        assert_eq!(v2.layout_hash, v3.layout_hash, "a fn body keeps the layout hash");
+        GateVariants { v1, v2, v3 }
+    })
+}
+
+fn write_gate_schema(temp: &tempfile::TempDir, variant: &GateVariant) {
+    use distill_core::id::TypeUuid;
+    use distill_schema::ngp_schema::{
+        Field, FieldAttrs, FieldIdentifier, FieldLayout, PrimitiveType, SchemaTypeId, TypeAttrs,
+        TypeDef, TypeLayout, TypePath,
+    };
+    let path = |krate: &str, name: &str| TypePath {
+        name: Some(name.into()),
+        containing_type: None,
+        modules: Vec::new(),
+        krate: krate.into(),
+    };
+    let type_def = |id, kind, path, uuid, attrs, fields| TypeDef {
+        id: SchemaTypeId(id),
+        kind,
+        path,
+        uuid,
+        attrs,
+        fields,
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        has_default: true,
+        generic_const_arguments: Vec::new(),
+        has_explicit_discriminants: false,
+    };
+    let field = |name: &str, type_id| Field {
+        id: FieldIdentifier::Name(name.into()),
+        type_id: SchemaTypeId(type_id),
+        attrs: FieldAttrs::default(),
+    };
+    let layout = |size: usize, align: usize, fields: Vec<(usize, usize)>| TypeLayout {
+        size: Some(size as u64),
+        align: Some(align as u64),
+        layout_complete: true,
+        tag_encoding: None,
+        fields: fields
+            .into_iter()
+            .map(|(offset, size)| FieldLayout {
+                offset: Some(offset as u64),
+                field_size: Some(size as u64),
+            })
+            .collect(),
+    };
+    let string = std::mem::size_of::<String>();
+    let schema = Schema {
+        source_hashes: [(GATE_CRATE.to_owned(), variant.source_hash.clone())]
+            .into_iter()
+            .collect(),
+        type_ops_hash: String::new(),
+        layout_hashes: [(GATE_CRATE.to_owned(), variant.layout_hash.clone())]
+            .into_iter()
+            .collect(),
+        rustc_version: String::new(),
+        types: vec![
+            type_def(0, PrimitiveType::U8, path("core", "u8"), None, TypeAttrs::default(), Vec::new()),
+            type_def(
+                1,
+                PrimitiveType::Struct,
+                path(GATE_CRATE, "GateSettings"),
+                Some(TypeUuid(GATE_SETTINGS_TYPE)),
+                TypeAttrs {
+                    build_only: true,
+                    ..TypeAttrs::default()
+                },
+                vec![field("value", 0)],
+            ),
+            type_def(2, PrimitiveType::String, path("alloc", "String"), None, TypeAttrs::default(), Vec::new()),
+            type_def(
+                3,
+                PrimitiveType::Struct,
+                path(GATE_CRATE, "GateSource"),
+                Some(TypeUuid(GATE_SOURCE_TYPE)),
+                TypeAttrs::default(),
+                vec![field("value", 2)],
+            ),
+        ],
+        layouts: vec![SchemaLayouts {
+            identity: test_layout_identity(),
+            layouts: vec![
+                layout(1, 1, Vec::new()),
+                layout(1, 1, vec![(0, 1)]),
+                layout(string, std::mem::align_of::<String>(), Vec::new()),
+                layout(string, std::mem::align_of::<String>(), vec![(0, string)]),
+            ],
+        }],
+    };
+    let schema_path = temp.path().join("schema.json");
+    let staging = temp.path().join("schema.json.next");
+    std::fs::write(&staging, serde_json::to_vec(&schema).unwrap()).unwrap();
+    std::fs::rename(staging, schema_path).unwrap();
+}
+
+/// Replace the watched pipeline as cargo would: a complete new file.
+fn install_gate_pipeline(temp: &tempfile::TempDir, variant: &GateVariant) {
+    let staging = temp.path().join("pipeline.so.next");
+    std::fs::copy(&variant.dylib, &staging).unwrap();
+    std::fs::rename(staging, temp.path().join("pipeline.so")).unwrap();
+}
+
+fn start_gate_daemon(temp: &tempfile::TempDir, variant: &GateVariant) -> DaemonProcess {
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("note.txt"), b"note").unwrap();
+    install_gate_pipeline(temp, variant);
+    write_gate_schema(temp, variant);
+    let path = temp.path().join("distill.toml");
+    std::fs::write(&path, config_source(temp)).unwrap();
+    let config = DaemonConfig::load(path).unwrap();
+    let process = DaemonProcess::start(config.clone()).unwrap();
+    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(variant)));
+    distill_daemon::bootstrap::import(
+        &config,
+        process.rpc_address(),
+        None,
+        &distill_rpc::ImportRequest {
+            importer: "gate-fixture".into(),
+            sources: vec!["note.txt".into()],
+            dest: "note.bundle".into(),
+            settings: distill_rpc::AuthoringValue {
+                canonical_value: std::sync::Arc::from(&b"{\"value\":0}"[..]),
+                blobs: Vec::new(),
+            },
+            watch: true,
+            root: "main".into(),
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    process
+}
+
+fn dylib_hash(variant: &GateVariant) -> [u8; 32] {
+    *blake3::hash(&std::fs::read(&variant.dylib).unwrap()).as_bytes()
+}
+
+fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
+    match process.coordinator().store().read().pipeline_state().unwrap() {
+        Some(PipelineState::Ready(epoch)) => Some(epoch.dylib_hash),
+        _ => None,
+    }
+}
+
+fn pipeline_generation(process: &DaemonProcess) -> u64 {
+    process
+        .coordinator()
+        .store()
+        .read()
+        .rpc_fences()
+        .unwrap()
+        .pipeline_generation
+}
+
+fn imported_value(temp: &tempfile::TempDir) -> Option<String> {
+    let bytes = std::fs::read(temp.path().join("assets/note.bundle")).ok()?;
+    let bundle = distill_bundle::parse_bundle(&bytes).ok()?;
+    match &bundle.assets.get("main")?.data {
+        distill_json::AuthoredValue::Object(fields) => match fields.get("value") {
+            Some(distill_json::AuthoredValue::Str(value)) => Some(value.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn wait_long(mut predicate: impl FnMut() -> bool, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !predicate() {
+        assert!(Instant::now() < deadline, "{message}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn pipeline_ahead_of_its_schema_keeps_serving_until_the_schema_catches_up() {
+    let variants = gate_variants();
+    let temp = tempfile::tempdir().unwrap();
+    let process = start_gate_daemon(&temp, &variants.v1);
+    assert_eq!(imported_value(&temp).as_deref(), Some("v1:note"));
+    // Let the watcher publish the import's own bundle write first.
+    std::thread::sleep(Duration::from_millis(300));
+    let generation = pipeline_generation(&process);
+    let before = process.coordinator().server().current_stamp().version;
+
+    // Cargo rewrote the dylib; source-walk hasn't rewritten the schema yet,
+    // and the layout changed: the candidate waits, nothing is published.
+    install_gate_pipeline(&temp, &variants.v2);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(process.coordinator().server().current_stamp().version, before);
+    assert_eq!(pipeline_generation(&process), generation);
+    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v1)));
+    assert!(process.last_background_error().is_none());
+    assert_eq!(imported_value(&temp).as_deref(), Some("v1:note"));
+
+    // Source-walk catches up: exactly one pipeline epoch change, and the
+    // new importer version reimports the watched import.
+    write_gate_schema(&temp, &variants.v2);
+    wait_long(
+        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v2)),
+        "the matching schema did not adopt the waiting pipeline",
+    );
+    wait_long(
+        || imported_value(&temp).as_deref() == Some("v2:note"),
+        "the new importer version did not reimport the watched import",
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(pipeline_generation(&process), generation + 1);
+    assert!(process.last_background_error().is_none());
+}
+
+#[test]
+fn pipeline_with_an_unchanged_layout_is_adopted_ahead_of_source_walk() {
+    let variants = gate_variants();
+    let temp = tempfile::tempdir().unwrap();
+    let process = start_gate_daemon(&temp, &variants.v2);
+    assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
+    let generation = pipeline_generation(&process);
+
+    // Only fn bodies changed: the schema already describes this build.
+    install_gate_pipeline(&temp, &variants.v3);
+    wait_long(
+        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3)),
+        "a layout-preserving pipeline was not adopted ahead of source-walk",
+    );
+    wait_long(
+        || imported_value(&temp).as_deref() == Some("v3:note"),
+        "the new importer version did not reimport the watched import",
+    );
+    assert_eq!(pipeline_generation(&process), generation + 1);
     assert!(process.last_background_error().is_none());
 }

@@ -468,6 +468,7 @@ impl DaemonConfig {
         Ok(CandidateRequirements {
             module_abi: host_module_abi_identity(),
             source_hashes: authority.schema().source_hashes.clone(),
+            layout_hashes: authority.schema().layout_hashes.clone(),
             schema_registry: authority
                 .logical_registry()
                 .map_err(|error| DaemonConfigError::Target(error.to_string()))?,
@@ -508,6 +509,7 @@ impl DaemonConfig {
         let requirements = CandidateRequirements {
             module_abi: host_module_abi_identity(),
             source_hashes: authority.schema().source_hashes.clone(),
+            layout_hashes: authority.schema().layout_hashes.clone(),
             schema_registry,
             targets: targets
                 .iter()

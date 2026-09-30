@@ -126,6 +126,7 @@ impl DaemonProcess {
                 coordinator.server_handle().snapshot_policy().ttl + CAS_DELETE_MARGIN,
             ),
             next_cas_pass: Instant::now() + CAS_PASS_INTERVAL,
+            capabilities_pending: false,
         };
         // Startup runs on the loop thread before the loop: events the
         // watcher sends meanwhile wait in its inbox.
@@ -294,6 +295,11 @@ struct ProcessLoop {
     next_idle_pass: Instant,
     cas_sweeper: SegmentSweeper,
     next_cas_pass: Instant,
+    /// An accepted configuration candidate changed the importer registry or
+    /// its capabilities, and the capability-driven reimport has not yet
+    /// completed. A requeued pass keeps it: the configuration watch reports
+    /// the change only once.
+    capabilities_pending: bool,
 }
 
 impl ProcessLoop {
@@ -360,6 +366,10 @@ impl ProcessLoop {
             }
             None => Ok(false),
         }
+        .map(|changed| {
+            self.capabilities_pending |= changed;
+            self.capabilities_pending
+        })
         .and_then(|capabilities_changed| match action {
             WatcherAction::None => Ok(()),
             WatcherAction::Batch(batch) => coordinator
@@ -379,6 +389,7 @@ impl ProcessLoop {
                 self.queue.requeue_action(retry_action);
             }
             Ok(()) => {
+                self.capabilities_pending = false;
                 if reconciled {
                     tracing::info!(elapsed = ?started.elapsed(), "reconciled");
                 }
@@ -747,7 +758,7 @@ impl ConfigWatch {
                         return Ok(false);
                     }
                 };
-                coordinator.publish_configuration_candidate(
+                let published = coordinator.publish_configuration_candidate(
                     crate::coordinator::ConfigurationCandidate {
                         roots: candidate.asset_roots(),
                         targets: staged.targets,
@@ -756,7 +767,22 @@ impl ConfigWatch {
                         requirements: staged.requirements,
                         schema_authority: Arc::clone(authority),
                     },
-                )?;
+                );
+                match published {
+                    Err(CoordinatorError::PipelineAwaitingSchema(detail)) => {
+                        // Not a failure: the Ready epoch keeps serving. The
+                        // observed state stays, so the schema write
+                        // source-walk is about to make re-runs this whole
+                        // candidate; the caches hold what was just read.
+                        tracing::warn!(%detail, "pipeline candidate waits for source-walk");
+                        self.cached_schema = Some(schema.clone());
+                        self.cached_pipeline = Some(pipeline_state);
+                        return Ok(false);
+                    }
+                    published => {
+                        published?;
+                    }
+                }
             }
             Ok(_) if self.rejected => {
                 coordinator.heal_configuration_rejection()?;

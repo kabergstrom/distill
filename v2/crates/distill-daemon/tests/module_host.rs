@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -221,6 +221,7 @@ fn requirements(tag: u8) -> CandidateRequirements {
         source_hashes: [("pipeline".to_owned(), format!("{tag:016x}"))]
             .into_iter()
             .collect(),
+        layout_hashes: BTreeMap::new(),
         schema_registry,
         targets: vec![TargetDefinition {
             name: "desktop".into(),
@@ -960,6 +961,44 @@ fn missing_or_wrong_module_source_identity_is_rejected_before_abi_and_register()
             failure.message
         );
     }
+}
+
+#[test]
+fn module_ahead_of_its_schema_waits_while_a_ready_epoch_serves() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pipeline.dylib");
+    write_module(&source, 2);
+    let mut host = module_host(temp.path().join("state")).unwrap();
+    let ready = host
+        .publish_candidate(
+            &source,
+            requirements(2),
+            &mut FakeLoader {
+                module: Some(fake_module(2, Arc::new(Mutex::new(Calls::default())))),
+                open_error: None,
+            },
+        )
+        .unwrap();
+
+    // The rebuilt module (source hash 3) meets a schema source-walk has not
+    // rewritten yet (still 2), and its layout hash is unknown.
+    write_module(&source, 3);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let kept = host
+        .publish_candidate(
+            &source,
+            requirements(2),
+            &mut FakeLoader {
+                module: Some(fake_module(3, calls.clone())),
+                open_error: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(kept.id(), ready.id());
+    assert_eq!(host.snapshot().epoch().unwrap().id(), ready.id());
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.register, 0);
+    assert_eq!(calls.dlclose, 1);
 }
 
 #[test]

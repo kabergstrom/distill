@@ -105,6 +105,7 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
     let requirements = CandidateRequirements {
         module_abi: host_module_abi_identity(),
         source_hashes: BTreeMap::from([(source_identity.crate_name, source_identity.source_hash)]),
+        layout_hashes: BTreeMap::new(),
         schema_registry: BTreeMap::new(),
         targets: vec![TargetDefinition {
             name: "desktop".to_owned(),

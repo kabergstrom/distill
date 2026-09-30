@@ -46,7 +46,8 @@ use distill_store::{Current, SharedStore, Store, StoreConfig, StoreError, StoreR
 use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
-    stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
+    stored_pipeline_epoch, CandidateRejection, CandidateRequirements, ModuleHost, PipelineEpoch,
+    PipelineSnapshot,
 };
 use crate::importer::ImportRun;
 use crate::module_loader::DynamicPipelineModuleLoader;
@@ -525,6 +526,16 @@ impl DaemonCoordinator {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
             host.prepare_candidate(&pipeline_source, &mut requirements, loader)
         };
+        // Nothing of this candidate is observable yet (the filesystem and
+        // scan candidates are staged, not installed), so a module waiting for
+        // source-walk leaves the whole configuration candidate pending.
+        let prepared_epoch = match prepared_epoch {
+            Err(CandidateRejection::AwaitingSchema(detail)) => {
+                return Err(CoordinatorError::PipelineAwaitingSchema(detail))
+            }
+            Err(CandidateRejection::Failed(failure)) => Err(failure),
+            Ok(prepared) => Ok(prepared),
+        };
         let authored_types = requirements
             .schema_registry
             .keys()
@@ -747,7 +758,10 @@ impl DaemonCoordinator {
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
-            Err(failure) => {
+            Err(CandidateRejection::AwaitingSchema(detail)) => {
+                return Err(CoordinatorError::PipelineAwaitingSchema(detail));
+            }
+            Err(CandidateRejection::Failed(failure)) => {
                 drop(runtime);
                 return self.publish_pipeline_rejection(failure);
             }
@@ -1461,8 +1475,17 @@ impl DaemonCoordinator {
                         },
                         Err(_) if drifted => rerun(current, item),
                         Err(error) => Err(error),
-                    }
-                    .map_err(|error| format!("{error:?}"))?;
+                    };
+                    // An importer missing from the current registry fails
+                    // this import alone: the rest of the pass still runs,
+                    // and a registry change (capabilities) retries it.
+                    let prepared = match prepared {
+                        Err(error) if crate::importer::is_unregistered_importer(&error) => {
+                            tracing::warn!(?error, "watched import skipped");
+                            return Ok(None);
+                        }
+                        prepared => prepared.map_err(|error| format!("{error:?}"))?,
+                    };
                     Ok(prepared.map(|prepared| {
                         bundle = Some(prepared.bundle);
                         prepared.commit
@@ -1758,6 +1781,10 @@ pub enum CoordinatorError {
     Coordinated(CoordinatedCommitError),
     RuntimePipeline(String),
     Maintenance(String),
+    /// The pipeline candidate's source is ahead of the watched schema
+    /// (`CandidateRejection::AwaitingSchema`). Nothing was published: the
+    /// Ready epoch keeps serving until a schema write retries the candidate.
+    PipelineAwaitingSchema(String),
 }
 
 impl std::fmt::Display for CoordinatorError {

@@ -197,6 +197,15 @@ a connection of its own, and SQLite's write lock orders the writers.
 - **CAS reclamation** deletes a retired segment once no read transaction
   can still see it: the daemon waits the snapshot TTL plus a margin.
 - **Module epochs** unload when the last clone of their token drops.
+- **Pipeline swaps** use New Game Plus's reload gate
+  (`ngp_module_host::SourceGate`). A candidate module whose source hash is
+  the watched schema's loads. One whose source is ahead of the schema but
+  whose layout hash (`__ngp_layout_hash`: the crate with non-const fn items
+  stripped) equals the schema's `layout_hashes` entry loads ahead of
+  source-walk. Any other mismatch leaves the candidate pending while a Ready
+  epoch keeps serving: no input version, no pipeline generation bump, and
+  the next schema or module write retries it. Without a Ready epoch, or for
+  a crate the schema lacks, it is a `CandidateAttestation` failure.
 - **rebuild** (`distilld` only, when the config has `[[rebuild]]` jobs)
   watches each job's dep-info inputs with its own `notify` watcher and
   runs the job's steps as child processes, one at a time. It touches no

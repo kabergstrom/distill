@@ -1426,7 +1426,7 @@ impl AuthoringService {
             .get(&id)
             .or_else(|| importers.builtin.get(&id))
             .cloned()
-            .ok_or_else(|| invalid(format!("importer {id:?} is not registered")))
+            .ok_or_else(|| unregistered_importer(&id))
     }
 
     fn importer_capabilities(&self) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
@@ -1599,6 +1599,24 @@ impl AuthoringService {
         let bundle = distill_bundle::parse_bundle(&bytes).map_err(invalid)?;
         decode_prior_import(bundle)
     }
+}
+
+const UNREGISTERED_IMPORTER_SUFFIX: &str = " is not registered";
+
+fn unregistered_importer(id: &str) -> RpcFailure {
+    invalid(format!("importer {id:?}{UNREGISTERED_IMPORTER_SUFFIX}"))
+}
+
+/// Whether `error` names an importer that neither registry holds, as while
+/// the pipeline epoch that registered it is being replaced or has failed.
+/// A watched import fails on its own then; it is retried when the registry
+/// changes.
+pub(crate) fn is_unregistered_importer(error: &RpcFailure) -> bool {
+    matches!(
+        error,
+        RpcFailure::InvalidAuthoringRequest { detail }
+            if detail.starts_with("importer ") && detail.ends_with(UNREGISTERED_IMPORTER_SUFFIX)
+    )
 }
 
 fn decode_prior_import(bundle: Bundle) -> Result<PriorImport, RpcFailure> {

@@ -556,6 +556,10 @@ impl Drop for CallbackIngressGuard {
 pub struct CandidateRequirements {
     pub module_abi: ModuleAbiIdentity,
     pub source_hashes: BTreeMap<String, String>,
+    /// The watched schema's `layout_hashes`: a module whose source is ahead
+    /// of the schema is still adopted when its layout hash matches (only fn
+    /// bodies changed; see `ngp_module_host::SourceGate`).
+    pub layout_hashes: BTreeMap<String, String>,
     pub schema_registry: BTreeMap<TypeUuid, distill_core::id::LogicalHash>,
     pub targets: Vec<TargetDefinition>,
 }
@@ -585,6 +589,16 @@ fn host_callback_panic(surface: HostCallbackSurface, operation: &str) -> ModuleC
 pub trait LoadedPipelineModule: Send {
     fn source_identity(&mut self)
         -> Result<ngp_module_host::ModuleSourceIdentity, ModuleCallError>;
+    /// Source identity plus the module's layout hash. Without an override
+    /// the layout hash is `""`, which never matches a schema's.
+    fn reload_identity(
+        &mut self,
+    ) -> Result<ngp_module_host::ModuleReloadIdentity, ModuleCallError> {
+        Ok(ngp_module_host::ModuleReloadIdentity {
+            source: self.source_identity()?,
+            layout_hash: String::new(),
+        })
+    }
     fn module_abi(&mut self) -> Result<ModuleAbiIdentity, ModuleCallError>;
     fn register(
         &mut self,
@@ -1269,6 +1283,19 @@ impl PipelineSnapshot {
     }
 }
 
+/// Why [`ModuleHost::prepare_candidate`] produced no epoch.
+#[derive(Debug, Clone)]
+pub enum CandidateRejection {
+    /// The candidate cannot serve; publishing this failure fences the
+    /// pipeline.
+    Failed(PipelineFailure),
+    /// The module's source hash is ahead of the watched schema and its layout
+    /// hash differs (`ngp_module_host::SourceGate::Wait`), while a Ready
+    /// epoch is published. Nothing is published: the Ready epoch keeps
+    /// serving, and the next schema write retries the candidate.
+    AwaitingSchema(String),
+}
+
 pub struct ModuleHost {
     state_dir: PathBuf,
     next_epoch_id: u64,
@@ -1301,6 +1328,9 @@ impl ModuleHost {
     /// Stage and hash the candidate copy, open it, perform both pre-Rust-ABI
     /// probes, then register and validate its target-bound pipeline map as one
     /// unit. No state becomes current before every step succeeds.
+    ///
+    /// A candidate awaiting source-walk (see [`CandidateRejection`]) leaves
+    /// the Ready epoch published and returns it.
     pub fn publish_candidate(
         &mut self,
         source: &Path,
@@ -1312,7 +1342,10 @@ impl ModuleHost {
                 self.install_ready(epoch.clone());
                 Ok(epoch)
             }
-            Err(failure) => {
+            Err(CandidateRejection::AwaitingSchema(_)) => Ok(self
+                .published_ready_epoch()
+                .expect("a candidate waits only while a Ready epoch is published")),
+            Err(CandidateRejection::Failed(failure)) => {
                 self.install_failure(failure.clone());
                 Err(failure)
             }
@@ -1331,36 +1364,36 @@ impl ModuleHost {
         source: &Path,
         requirements: &mut CandidateRequirements,
         loader: &mut dyn PipelineModuleLoader,
-    ) -> Result<PipelineEpoch, PipelineFailure> {
+    ) -> Result<PipelineEpoch, CandidateRejection> {
         let id = self.mint_epoch_id();
         let target_set = match validate_requirements(requirements) {
             Ok(target_set) => target_set,
             Err(error) => {
-                return Err(candidate_failure_record(
+                return Err(CandidateRejection::Failed(candidate_failure_record(
                     PipelineFailureCode::CandidateValidation,
                     error,
                     CandidateCleanupDisposition::None,
-                ))
+                )))
             }
         };
         let staged = match self.stage_copy(id, source) {
             Ok(staged) => staged,
             Err(error) => {
-                return Err(candidate_failure_record(
+                return Err(CandidateRejection::Failed(candidate_failure_record(
                     PipelineFailureCode::CandidateOpen,
                     error,
                     CandidateCleanupDisposition::None,
-                ))
+                )))
             }
         };
         let mut module = match boundary_call("open", || loader.open_staged(&staged)) {
             Ok(module) => module,
             Err(error) => {
-                return Err(candidate_failure_record(
+                return Err(CandidateRejection::Failed(candidate_failure_record(
                     PipelineFailureCode::CandidateOpen,
                     error.to_string(),
                     CandidateCleanupDisposition::None,
-                ))
+                )))
             }
         };
 
@@ -1376,42 +1409,52 @@ impl ModuleHost {
             Ok(registration) => registration,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
-                return Err(candidate_failure_with_cleanup(
+                // A module ahead of the schema is the normal window between
+                // cargo rewriting the dylib and source-walk rewriting the
+                // schema. With a Ready epoch to keep serving, it is not a
+                // failure: the next schema write retries the candidate.
+                if error.awaiting_schema
+                    && cleanup.disposition == CandidateCleanupDisposition::CleanedAndClosed
+                    && self.published_ready_epoch().is_some()
+                {
+                    return Err(CandidateRejection::AwaitingSchema(error.detail));
+                }
+                return Err(CandidateRejection::Failed(candidate_failure_with_cleanup(
                     error.code,
                     error.detail,
                     cleanup,
-                ));
+                )));
             }
         };
         if token.is_poisoned() {
             let cleanup = discard_candidate(module, registration_arena);
-            return Err(candidate_failure_with_cleanup(
+            return Err(CandidateRejection::Failed(candidate_failure_with_cleanup(
                 PipelineFailureCode::CandidateRegistration,
                 "candidate token was poisoned during registration".to_owned(),
                 cleanup,
-            ));
+            )));
         }
 
         if let Err(error) =
             validate_registered_schema_types(&registration_arena, &requirements.schema_registry)
         {
             let cleanup = discard_candidate(module, registration_arena);
-            return Err(candidate_failure_with_cleanup(
+            return Err(CandidateRejection::Failed(candidate_failure_with_cleanup(
                 PipelineFailureCode::CandidateRegistration,
                 error,
                 cleanup,
-            ));
+            )));
         }
 
         let tools = match resolve_tool_epoch(registration_arena.tool_descriptors()) {
             Ok(tools) => tools,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
-                return Err(candidate_failure_with_cleanup(
+                return Err(CandidateRejection::Failed(candidate_failure_with_cleanup(
                     PipelineFailureCode::CandidateRegistration,
                     format!("tool registration resolution failed: {error}"),
                     cleanup,
-                ));
+                )));
             }
         };
 
@@ -1690,19 +1733,36 @@ fn validate_open_module(
     requirements: &CandidateRequirements,
     registration_arena: &mut CandidateRegistrationArena,
 ) -> Result<RegistrationSet, CandidatePhaseError> {
-    let source = boundary_call("source_identity", || module.source_identity())
+    let identity = boundary_call("source_identity", || module.reload_identity())
         .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
-    let Some(expected_source_hash) = requirements.source_hashes.get(&source.crate_name) else {
-        return Err(CandidatePhaseError::attestation(format!(
-            "module crate `{}` is absent from the watched schema",
-            source.crate_name
-        )));
-    };
-    if expected_source_hash != &source.source_hash {
-        return Err(CandidatePhaseError::attestation(format!(
-            "module source hash mismatch for crate `{}`",
-            source.crate_name
-        )));
+    let crate_name = &identity.source.crate_name;
+    match identity.gate(&requirements.source_hashes, &requirements.layout_hashes) {
+        ngp_module_host::SourceGate::Match => {}
+        ngp_module_host::SourceGate::AheadOfWalk { schema_source_hash } => {
+            tracing::info!(
+                crate_name = %crate_name,
+                module = %identity.source.source_hash,
+                schema = %schema_source_hash,
+                "pipeline source changed but its layout hash matches the schema; \
+                 adopting it ahead of source-walk"
+            );
+        }
+        ngp_module_host::SourceGate::Wait {
+            schema_source_hash: None,
+        } => {
+            return Err(CandidatePhaseError::attestation(format!(
+                "module crate `{crate_name}` is absent from the watched schema"
+            )));
+        }
+        ngp_module_host::SourceGate::Wait {
+            schema_source_hash: Some(schema_source_hash),
+        } => {
+            return Err(CandidatePhaseError::awaiting_schema(format!(
+                "module source hash mismatch for crate `{crate_name}` (module {}, schema \
+                 {schema_source_hash}); waiting for source-walk",
+                identity.source.source_hash
+            )));
+        }
     }
     let module_abi = boundary_call("module_abi", || module.module_abi())
         .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
@@ -1730,6 +1790,9 @@ fn validate_open_module(
 struct CandidatePhaseError {
     code: PipelineFailureCode,
     detail: String,
+    /// The module's source is ahead of the watched schema and its layout
+    /// hash differs: not a failure while a Ready epoch keeps serving.
+    awaiting_schema: bool,
 }
 
 impl CandidatePhaseError {
@@ -1737,6 +1800,14 @@ impl CandidatePhaseError {
         Self {
             code: PipelineFailureCode::CandidateAttestation,
             detail: detail.into(),
+            awaiting_schema: false,
+        }
+    }
+
+    fn awaiting_schema(detail: impl Into<String>) -> Self {
+        Self {
+            awaiting_schema: true,
+            ..Self::attestation(detail)
         }
     }
 
@@ -1744,6 +1815,7 @@ impl CandidatePhaseError {
         Self {
             code: PipelineFailureCode::CandidateRegistration,
             detail: detail.into(),
+            awaiting_schema: false,
         }
     }
 }
