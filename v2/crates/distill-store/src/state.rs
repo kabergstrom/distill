@@ -672,7 +672,7 @@ fn encode_dscp_detail(encoder: &mut CanonicalEncoder, detail: &DscpV1) {
     }
 }
 
-fn encode_lineage_manifest_claimant(
+pub(crate) fn encode_lineage_manifest_claimant(
     encoder: &mut CanonicalEncoder,
     claimant: &LineageManifestClaimant,
 ) {
@@ -1363,12 +1363,25 @@ impl TryFrom<u16> for VersionPoisonCode {
     }
 }
 
-struct VersionPoisonDecoder<'a> {
+pub(crate) struct VersionPoisonDecoder<'a> {
     bytes: &'a [u8],
     cursor: usize,
 }
 
 impl<'a> VersionPoisonDecoder<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    /// Fails unless every byte was consumed.
+    pub(crate) fn finish(&self) -> Result<(), VersionPoisonError> {
+        if self.cursor == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(VersionPoisonError::TrailingBytes)
+        }
+    }
+
     fn take(&mut self, count: usize) -> Result<&'a [u8], VersionPoisonError> {
         let end = self
             .cursor
@@ -1382,7 +1395,7 @@ impl<'a> VersionPoisonDecoder<'a> {
         Ok(value)
     }
 
-    fn u8(&mut self) -> Result<u8, VersionPoisonError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, VersionPoisonError> {
         Ok(self.take(1)?[0])
     }
 
@@ -1394,18 +1407,18 @@ impl<'a> VersionPoisonDecoder<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], VersionPoisonError> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], VersionPoisonError> {
         Ok(self.take(N)?.try_into().unwrap())
     }
 
-    fn string(&mut self) -> Result<String, VersionPoisonError> {
+    pub(crate) fn string(&mut self) -> Result<String, VersionPoisonError> {
         let len = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
         std::str::from_utf8(self.take(len)?)
             .map(str::to_owned)
             .map_err(|_| VersionPoisonError::InvalidUtf8)
     }
 
-    fn source(&mut self) -> Result<ReadableBundleSource, VersionPoisonError> {
+    pub(crate) fn source(&mut self) -> Result<ReadableBundleSource, VersionPoisonError> {
         Ok(ReadableBundleSource {
             root_name: self.string()?,
             normalized_path: self.string()?,
@@ -1426,20 +1439,22 @@ impl<'a> VersionPoisonDecoder<'a> {
         if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
             return Err(VersionPoisonError::Truncated);
         }
-        (0..count)
-            .map(|_| match self.u8()? {
-                1 => Ok(AssetClaimant::Authored {
-                    source: self.source()?,
-                    bundle: BundleUuid(self.array()?),
-                    local_id: self.string()?,
-                }),
-                2 => Ok(AssetClaimant::Derived {
-                    parent: AssetUuid(self.array()?),
-                    output_key: self.string()?,
-                }),
-                other => Err(VersionPoisonError::UnknownClaimantTag(other)),
-            })
-            .collect()
+        (0..count).map(|_| self.claimant()).collect()
+    }
+
+    pub(crate) fn claimant(&mut self) -> Result<AssetClaimant, VersionPoisonError> {
+        match self.u8()? {
+            1 => Ok(AssetClaimant::Authored {
+                source: self.source()?,
+                bundle: BundleUuid(self.array()?),
+                local_id: self.string()?,
+            }),
+            2 => Ok(AssetClaimant::Derived {
+                parent: AssetUuid(self.array()?),
+                output_key: self.string()?,
+            }),
+            other => Err(VersionPoisonError::UnknownClaimantTag(other)),
+        }
     }
 
     fn path_claims(&mut self) -> Result<Vec<PhysicalPathClaim>, VersionPoisonError> {
@@ -1629,7 +1644,7 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
     }
 }
 
-fn encode_asset_claimant(encoder: &mut CanonicalEncoder, claimant: &AssetClaimant) {
+pub(crate) fn encode_asset_claimant(encoder: &mut CanonicalEncoder, claimant: &AssetClaimant) {
     match claimant {
         AssetClaimant::Authored {
             source,
@@ -1675,7 +1690,7 @@ fn encode_bundle_sources(encoder: &mut CanonicalEncoder, sources: &[ReadableBund
     encoder.seq(sources, encode_bundle_source);
 }
 
-fn encode_bundle_source(encoder: &mut CanonicalEncoder, source: &ReadableBundleSource) {
+pub(crate) fn encode_bundle_source(encoder: &mut CanonicalEncoder, source: &ReadableBundleSource) {
     encoder.str(&source.root_name);
     encoder.str(&source.normalized_path);
     encoder.raw(&source.file_hash.0);

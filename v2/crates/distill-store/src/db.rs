@@ -20,7 +20,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 29;
+pub const SCHEMA_VERSION: u32 = 30;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -75,6 +75,31 @@ CREATE TABLE scan_diagnostics (
     path    TEXT NOT NULL,
     detail  BLOB NOT NULL,
     PRIMARY KEY (root_id, path)
+);
+-- What each scanned bundle claims (bundle and asset UUIDs, derived
+-- outputs, primary paths, lineage manifests, malformed skeletons), keyed
+-- by the claiming source. See `claims`.
+CREATE TABLE source_claims (
+    root_id  INTEGER NOT NULL,
+    path     TEXT NOT NULL,
+    kind     INTEGER NOT NULL,
+    subject  BLOB NOT NULL,
+    claimant BLOB NOT NULL,
+    detail   BLOB NOT NULL,
+    PRIMARY KEY (root_id, path, kind, subject, claimant)
+);
+CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
+-- Subjects with more than one distinct claimant (group 0 bundles, 1 assets).
+CREATE TABLE claim_collisions (
+    grp     INTEGER NOT NULL,
+    subject BLOB NOT NULL,
+    PRIMARY KEY (grp, subject)
+);
+-- Claim subjects changed since the last clean publication.
+CREATE TABLE claim_pending (
+    kind    INTEGER NOT NULL,
+    subject BLOB NOT NULL,
+    PRIMARY KEY (kind, subject)
 );
 CREATE TABLE dirty_files (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -404,12 +404,6 @@ impl ScanSnapshot {
         claimants
     }
 
-    pub(crate) fn bundle_entries(
-        &self,
-    ) -> impl Iterator<Item = (&(String, String), &Arc<ScannedBundle>)> {
-        self.bundles.iter()
-    }
-
     pub(crate) fn bundle_at(&self, root: &str, path: &str) -> Option<Arc<ScannedBundle>> {
         self.bundles
             .get(&(root.to_owned(), path.to_owned()))

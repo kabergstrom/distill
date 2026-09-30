@@ -10,6 +10,7 @@
 pub mod artifacts;
 pub mod bundles;
 pub mod cas;
+pub mod claims;
 pub mod codegen;
 pub mod config;
 pub mod db;

@@ -32,6 +32,7 @@ use distill_store::bundles::{
     AssetRecord, BundleMeta, NamespaceSkeleton as StoreNamespaceSkeleton, ServedAuthoring,
     SkeletonEntry,
 };
+use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
 use distill_store::config::{PendingRestart, RestartOnlyChange};
 use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::journal::{JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome};
@@ -47,7 +48,7 @@ use distill_store::state::{
     RetiredTypeReferenced as StoredRetiredTypeReferenced, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
 };
-use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
+use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError, StoreReader};
 
 use crate::authority::{Authority, AuthoritySender};
 use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
@@ -96,7 +97,6 @@ pub(crate) struct ConfigurationCandidate {
 pub struct DaemonCoordinator {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
-    scan_projection: Mutex<ScanProjectionIndex>,
     scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
     scan_rejection: Mutex<Option<PendingScanRejection>>,
@@ -179,6 +179,9 @@ impl DaemonCoordinator {
         let module_state_path = store_config.state_path.join("pipeline-host");
         let state_path = store_config.state_path.clone();
         let mut opened_store = Store::open(store_config.clone())?;
+        // Claims follow the pipeline projection; the first full publication
+        // rewrites them.
+        opened_store.clear_source_claims()?;
         if opened_store.pending_restart()?.is_some() {
             opened_store
                 .input_transaction(|transaction| transaction.adopt_pending_restart().map(|_| ()))?;
@@ -241,7 +244,6 @@ impl DaemonCoordinator {
         Ok(Self {
             store,
             scanner,
-            scan_projection: Mutex::new(ScanProjectionIndex::default()),
             scan_initialized: AtomicBool::new(false),
             scan_healthy: AtomicBool::new(true),
             scan_rejection: Mutex::new(None),
@@ -577,9 +579,9 @@ impl DaemonCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
-        let index = lock_scan_projection(&self.scan_projection);
+        let lineage = claimed_lineage(&lock_store(&self.store), &BTreeMap::new())?;
         indexed_lineage_projection(
-            &index,
+            &lineage,
             &self.scanner,
             &self.lineage_destination(),
             scan_poison,
@@ -675,7 +677,6 @@ impl DaemonCoordinator {
             } else {
                 self.published_scan()?
             };
-            let installed_snapshot = scan.clone();
             let destination = filesystem.lineage_destination().clone();
             let mut candidate = ScanCandidate::build(
                 filesystem.scanner(),
@@ -768,12 +769,12 @@ impl DaemonCoordinator {
                     PipelineProjection::default(),
                 ),
             };
-            let installed_projection = match ScanProjectionIndex::build(
-                &installed_snapshot,
+            let installed_claims = match bundle_claims(
+                candidate.scan.bundle_rows(),
                 &projection,
                 Some(&schema_authority),
             ) {
-                Ok(index) => index,
+                Ok(claims) => claims,
                 Err(error) => {
                     if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
                         drop(runtime);
@@ -812,6 +813,7 @@ impl DaemonCoordinator {
                         Some(&pipeline),
                         &projection,
                         tag_epoch,
+                        &installed_claims,
                     )
                     .map_err(|error| error.to_string())?;
                     let published_pipeline = commit
@@ -825,7 +827,6 @@ impl DaemonCoordinator {
                         .expect("configuration candidate installs once");
                     self.scanner.replace_from(filesystem.scanner());
                     authoring.install_filesystem_candidate(filesystem);
-                    *lock_scan_projection(&self.scan_projection) = installed_projection;
                     self.scan_initialized.store(true, Ordering::Release);
                     if candidate_scan_heals {
                         self.scan_rejection
@@ -1613,21 +1614,15 @@ impl DaemonCoordinator {
             }
             let projection = self.authoring.pipeline_projection();
             let authority = self.schema_authority();
-            let mut index = lock_scan_projection(&self.scan_projection);
-            let checkpoint = index.checkpoint(delta.affected_prefixes());
-            let prepared = index
-                .replace_delta(&delta, &projection, authority.as_deref())
-                .and_then(|_| {
-                    index.incremental_plan(
-                        &self.scanner,
-                        &self.lineage_destination(),
-                        self.configuration_poison(),
-                    )
-                });
-            let mut plan = match prepared {
-                Ok(plan) => plan,
+            let claims = match bundle_claims(
+                delta
+                    .observed_bundle_entries()
+                    .map(|(_, source)| source.as_ref()),
+                &projection,
+                authority.as_deref(),
+            ) {
+                Ok(claims) => claims,
                 Err(error) => {
-                    index.restore(checkpoint)?;
                     if let Some(rejection) = healed_rejection {
                         *self
                             .scan_rejection
@@ -1637,13 +1632,14 @@ impl DaemonCoordinator {
                     return Err(error);
                 }
             };
-            plan.version_poison = VersionPoison::select_canonical(
-                plan.version_poison
-                    .take()
-                    .into_iter()
-                    .chain(self.pending_scan_version_poison()),
-            )
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+            let inputs = PlanInputs {
+                scanner: &self.scanner,
+                destination: self.lineage_destination(),
+                configuration_poison: self.configuration_poison(),
+                version_poison: self.pending_scan_version_poison(),
+                authority: authority.as_deref(),
+                fresh: fresh_bundles(&delta),
+            };
             let base = server.current_stamp().version;
             let store = Arc::clone(&self.store);
             let tag_epoch = authority
@@ -1663,14 +1659,15 @@ impl DaemonCoordinator {
                     base,
                     &baseline,
                     &delta,
-                    &plan,
+                    &claims,
+                    &inputs,
                     &renames,
                     &projection,
                     tag_epoch,
                     None,
                 )
                 .map_err(|error| error.to_string())?;
-                if let Some(authority) = authority {
+                if let Some(authority) = authority.clone() {
                     let affected = commit_affected_asset_bundles(&commit);
                     if !affected.is_empty() {
                         crate::build::refine_published_tag_index_incremental(
@@ -1689,9 +1686,6 @@ impl DaemonCoordinator {
             });
             match result {
                 Ok(stamp) => {
-                    if plan.version_poison.is_none() {
-                        index.clear_published_pending();
-                    }
                     self.scan_healthy.store(
                         self.scan_rejection
                             .lock()
@@ -1702,7 +1696,6 @@ impl DaemonCoordinator {
                     Ok(stamp)
                 }
                 Err(error) => {
-                    index.restore(checkpoint)?;
                     if let Some(rejection) = healed_rejection {
                         *self
                             .scan_rejection
@@ -1730,7 +1723,6 @@ impl DaemonCoordinator {
         renames: &[LogicalRename],
         heals_scan_rejection: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let published_snapshot = scan.clone();
         let authority = self.schema_authority();
         let mut candidate = ScanCandidate::build(
             &self.scanner,
@@ -1753,8 +1745,11 @@ impl DaemonCoordinator {
         let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let projection = self.authoring.pipeline_projection();
-        let published_projection =
-            ScanProjectionIndex::build(&published_snapshot, &projection, authority.as_deref())?;
+        let claims = bundle_claims(
+            candidate.scan.bundle_rows(),
+            &projection,
+            authority.as_deref(),
+        )?;
         let tag_epoch = authority
             .as_ref()
             .map_or([0; 32], |authority| authority.source_hash());
@@ -1772,9 +1767,17 @@ impl DaemonCoordinator {
         let stamp = self
             .server()
             .coordinated_commit(base, || {
-                let mut commit =
-                    publish_scan(&store, base, candidate, false, None, &projection, tag_epoch)
-                        .map_err(|error| error.to_string())?;
+                let mut commit = publish_scan(
+                    &store,
+                    base,
+                    candidate,
+                    false,
+                    None,
+                    &projection,
+                    tag_epoch,
+                    &claims,
+                )
+                .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority {
                     crate::build::refine_published_tag_index(
                         Arc::clone(&store),
@@ -1790,7 +1793,6 @@ impl DaemonCoordinator {
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)?;
-        *lock_scan_projection(&self.scan_projection) = published_projection;
         self.scan_initialized.store(true, Ordering::Release);
         if heals_scan_rejection {
             self.scan_rejection
@@ -1842,7 +1844,7 @@ impl DaemonCoordinator {
             rejection: rejection.clone(),
             subjects,
         };
-        let indexed_version = lock_scan_projection(&self.scan_projection).version_poison()?;
+        let indexed_version = lock_store(&self.store).claims_version_poison()?;
         let durable_version = lock_store(&self.store)
             .version_poison()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
@@ -1868,9 +1870,9 @@ impl DaemonCoordinator {
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let (configuration, lineage_repair) = if self.scan_initialized.load(Ordering::Acquire) {
-            let index = lock_scan_projection(&self.scan_projection);
+            let lineage = claimed_lineage(&lock_store(&self.store), &BTreeMap::new())?;
             let (configuration, repair, _) = indexed_lineage_projection(
-                &index,
+                &lineage,
                 &self.scanner,
                 &self.lineage_destination(),
                 external_configuration,
@@ -2327,24 +2329,6 @@ impl From<StoreError> for CoordinatorError {
 
 type ScanKey = (String, String);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum CollisionKey {
-    Bundle(BundleUuid),
-    Asset(AssetUuid),
-}
-
-#[derive(Debug, Clone)]
-struct IndexedSourceClaims {
-    source: Arc<ScannedBundle>,
-    bundle: Option<BundleUuid>,
-    authored: Vec<(AssetUuid, AssetClaimant)>,
-    derived: Vec<(AssetUuid, AssetClaimant, DerivedOutputEntry)>,
-    lineage: Vec<(LineageManifestClaimant, VerifiedSchemaLineageManifest)>,
-    primary_path: Option<(String, AssetUuid)>,
-    malformed: Option<VersionPoison>,
-    scoped_poison: Option<ScopedBundlePoison>,
-}
-
 #[derive(Debug, Clone)]
 struct ScopedBundlePoison {
     bundle: BundleUuid,
@@ -2401,481 +2385,247 @@ fn scoped_bundle_poison(
     })
 }
 
-impl IndexedSourceClaims {
-    fn build(
-        source: Arc<ScannedBundle>,
-        projection: &PipelineProjection,
-        authority: Option<&ProjectSchemaAuthority>,
-    ) -> Result<Self, CoordinatorError> {
-        let readable = readable_source(&source);
-        let bundle = match &source.parsed {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                if let Some(scoped_poison) = scoped_bundle_poison(&source, authority) {
-                    let mut authored = Vec::with_capacity(scoped_poison.entries.len());
-                    let mut derived = Vec::new();
-                    for entry in &scoped_poison.entries {
-                        authored.push((
-                            entry.asset,
-                            AssetClaimant::Authored {
-                                source: readable.clone(),
-                                bundle: scoped_poison.bundle,
-                                local_id: entry.local_id.clone(),
-                            },
-                        ));
-                        for (child, output) in
-                            projection.derived_outputs([(entry.asset, entry.type_uuid)])
-                        {
-                            derived.push((
-                                child,
-                                AssetClaimant::Derived {
-                                    parent: entry.asset,
-                                    output_key: output.output_key.clone(),
-                                },
-                                output,
-                            ));
-                        }
-                    }
-                    return Ok(Self {
-                        source,
-                        bundle: Some(scoped_poison.bundle),
-                        authored,
-                        derived,
-                        lineage: Vec::new(),
-                        primary_path: None,
-                        malformed: None,
-                        scoped_poison: Some(scoped_poison),
-                    });
+/// What `source` claims under `projection` (see [`distill_store::claims`]).
+fn source_claims(
+    source: &ScannedBundle,
+    projection: &PipelineProjection,
+    authority: Option<&ProjectSchemaAuthority>,
+) -> Result<SourceClaims, CoordinatorError> {
+    let readable = readable_source(source);
+    let mut claims = Vec::new();
+    let authored_claims =
+        |claims: &mut Vec<SourceClaim>, bundle: BundleUuid, local_id: &str, asset, type_uuid| {
+            claims.push(SourceClaim::Authored {
+                asset,
+                claimant: AssetClaimant::Authored {
+                    source: readable.clone(),
+                    bundle,
+                    local_id: local_id.to_owned(),
+                },
+            });
+            for (child, output) in projection.derived_outputs([(asset, type_uuid)]) {
+                claims.push(SourceClaim::DerivedOutput {
+                    child,
+                    output: DerivedOutputClaim {
+                        parent: output.parent,
+                        output_key: output.output_key,
+                        terminal_type: output.terminal_type,
+                    },
+                });
+            }
+        };
+    match &source.parsed {
+        Err(error) => {
+            if let Some(scoped_poison) = scoped_bundle_poison(source, authority) {
+                claims.push(SourceClaim::Bundle {
+                    bundle: scoped_poison.bundle,
+                    source: readable.clone(),
+                });
+                for entry in &scoped_poison.entries {
+                    authored_claims(
+                        &mut claims,
+                        scoped_poison.bundle,
+                        &entry.local_id,
+                        entry.asset,
+                        entry.type_uuid,
+                    );
                 }
+            } else {
                 let poison = VersionPoison::new(
                     VersionPoisonV1::IncompleteSkeleton {
-                        source: readable,
+                        source: readable.clone(),
                         failure: skeleton_failure(error),
                     },
                     error.to_string(),
                 )
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-                return Ok(Self {
-                    source,
-                    bundle: None,
-                    authored: Vec::new(),
-                    derived: Vec::new(),
-                    lineage: Vec::new(),
-                    primary_path: None,
-                    malformed: Some(poison),
-                    scoped_poison: None,
+                claims.push(SourceClaim::Malformed(poison));
+            }
+        }
+        Ok(bundle) => {
+            crate::importer::decoded_directory_origin(bundle).map_err(|error| {
+                CoordinatorError::InvalidManifest(format!(
+                    "invalid import record in {}: {error:?}",
+                    source.normalized_path
+                ))
+            })?;
+            claims.push(SourceClaim::Bundle {
+                bundle: bundle.uuid,
+                source: readable.clone(),
+            });
+            for (local_id, entry) in &bundle.assets {
+                authored_claims(&mut claims, bundle.uuid, local_id, entry.uuid, entry.type_uuid);
+                if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
+                    decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
+                    claims.push(SourceClaim::Lineage(LineageManifestClaimant {
+                        root_name: source.root_name.clone(),
+                        normalized_path: source.normalized_path.clone(),
+                        bundle: bundle.uuid,
+                        local_id: local_id.clone(),
+                        asset: entry.uuid,
+                        file_hash: source.file_hash,
+                    }));
+                }
+            }
+            if let Some(primary) = &bundle.primary {
+                claims.push(SourceClaim::PrimaryPath {
+                    path: source.normalized_path.clone(),
+                    asset: bundle.assets[primary].uuid,
                 });
             }
-        };
-        crate::importer::decoded_directory_origin(bundle).map_err(|error| {
-            CoordinatorError::InvalidManifest(format!(
-                "invalid import record in {}: {error:?}",
-                source.normalized_path
-            ))
+        }
+    }
+    Ok(SourceClaims {
+        root_name: source.root_name.clone(),
+        path: source.normalized_path.clone(),
+        claims,
+    })
+}
+
+/// The claims of every bundle `sources` yields.
+fn bundle_claims<'a>(
+    sources: impl IntoIterator<Item = &'a ScannedBundle>,
+    projection: &PipelineProjection,
+    authority: Option<&ProjectSchemaAuthority>,
+) -> Result<Vec<SourceClaims>, CoordinatorError> {
+    sources
+        .into_iter()
+        .map(|source| source_claims(source, projection, authority))
+        .collect()
+}
+
+/// What the incremental plan reads besides the claims.
+struct PlanInputs<'a> {
+    scanner: &'a RootedScanner,
+    destination: LineageDestination,
+    configuration_poison: Option<ConfigurationPoison>,
+    /// A version poison outside the claims (a pending scan rejection's).
+    version_poison: Option<VersionPoison>,
+    authority: Option<&'a ProjectSchemaAuthority>,
+    /// The bundles this scan read, by (root, path); other claimed sources
+    /// are parsed from their stored bytes.
+    fresh: BTreeMap<ScanKey, Arc<ScannedBundle>>,
+}
+
+fn fresh_bundles(delta: &ScanDelta) -> BTreeMap<ScanKey, Arc<ScannedBundle>> {
+    delta
+        .observed_bundle_entries()
+        .map(|(key, source)| (key.clone(), Arc::clone(source)))
+        .collect()
+}
+
+fn claimed_source(
+    reader: &StoreReader,
+    fresh: &BTreeMap<ScanKey, Arc<ScannedBundle>>,
+    root_name: &str,
+    path: &str,
+) -> Result<Arc<ScannedBundle>, StoreError> {
+    if let Some(source) = fresh.get(&(root_name.to_owned(), path.to_owned())) {
+        return Ok(Arc::clone(source));
+    }
+    let bytes = reader
+        .bundle_file(root_name, path)?
+        .ok_or_else(|| StoreError::InvalidConfiguration {
+            error: format!("claimed bundle {root_name}:{path} has no stored bytes"),
         })?;
-        let mut authored = Vec::with_capacity(bundle.assets.len());
-        let mut derived = Vec::new();
-        let mut lineage = Vec::new();
-        for (local_id, entry) in &bundle.assets {
-            authored.push((
-                entry.uuid,
-                AssetClaimant::Authored {
-                    source: readable.clone(),
-                    bundle: bundle.uuid,
-                    local_id: local_id.clone(),
-                },
-            ));
-            for (child, output) in projection.derived_outputs([(entry.uuid, entry.type_uuid)]) {
-                derived.push((
-                    child,
-                    AssetClaimant::Derived {
-                        parent: entry.uuid,
-                        output_key: output.output_key.clone(),
-                    },
-                    output,
-                ));
-            }
-            if entry.type_uuid == SCHEMA_LINEAGE_MANIFEST_TYPE_UUID {
-                let claimant = LineageManifestClaimant {
-                    root_name: source.root_name.clone(),
-                    normalized_path: source.normalized_path.clone(),
-                    bundle: bundle.uuid,
-                    local_id: local_id.clone(),
-                    asset: entry.uuid,
-                    file_hash: source.file_hash,
-                };
-                let manifest =
-                    decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
-                lineage.push((claimant, manifest));
-            }
-        }
-        let primary_path = bundle
-            .primary
+    Ok(Arc::new(crate::scanner::scanned_bundle(root_name, path, bytes)))
+}
+
+/// The claimed lineage manifests, decoded from their sources.
+fn claimed_lineage(
+    reader: &StoreReader,
+    fresh: &BTreeMap<ScanKey, Arc<ScannedBundle>>,
+) -> Result<BTreeMap<LineageManifestClaimant, VerifiedSchemaLineageManifest>, CoordinatorError> {
+    let mut lineage = BTreeMap::new();
+    for claimant in reader.lineage_claims()? {
+        let source = claimed_source(
+            reader,
+            fresh,
+            &claimant.root_name,
+            &claimant.normalized_path,
+        )?;
+        let entry = source
+            .parsed
             .as_ref()
-            .map(|primary| (source.normalized_path.clone(), bundle.assets[primary].uuid));
-        Ok(Self {
-            source: Arc::clone(&source),
-            bundle: Some(bundle.uuid),
-            authored,
-            derived,
-            lineage,
-            primary_path,
-            malformed: None,
-            scoped_poison: None,
-        })
+            .ok()
+            .and_then(|bundle| bundle.assets.get(&claimant.local_id))
+            .ok_or_else(|| {
+                CoordinatorError::InvalidManifest(format!(
+                    "lineage claimant {}:{} no longer parses",
+                    claimant.root_name, claimant.normalized_path
+                ))
+            })?;
+        let manifest = decode_lineage_manifest(&entry.data, ContentHash(source.file_hash.0))?;
+        lineage.insert(claimant, manifest);
     }
+    Ok(lineage)
 }
 
-#[derive(Debug, Default)]
-struct ProjectionTouches {
-    bundles: BTreeSet<BundleUuid>,
-    assets: BTreeSet<AssetUuid>,
-    derived: BTreeSet<AssetUuid>,
-    paths: BTreeSet<String>,
-}
-
-impl ProjectionTouches {
-    fn extend(&mut self, other: Self) {
-        self.bundles.extend(other.bundles);
-        self.assets.extend(other.assets);
-        self.derived.extend(other.derived);
-        self.paths.extend(other.paths);
-    }
-}
-
-#[derive(Debug, Default)]
-struct ScanProjectionIndex {
-    sources: BTreeMap<ScanKey, IndexedSourceClaims>,
-    bundle_claimants: BTreeMap<BundleUuid, BTreeSet<ReadableBundleSource>>,
-    asset_claimants: BTreeMap<AssetUuid, BTreeSet<AssetClaimant>>,
-    derived_outputs: BTreeMap<AssetUuid, BTreeMap<AssetClaimant, DerivedOutputEntry>>,
-    lineage: BTreeMap<LineageManifestClaimant, VerifiedSchemaLineageManifest>,
-    malformed: BTreeMap<ScanKey, VersionPoison>,
-    collisions: BTreeMap<CollisionKey, VersionPoison>,
-    path_claimants: BTreeMap<String, BTreeSet<AssetUuid>>,
-    pending_bundles: BTreeSet<BundleUuid>,
-    pending_assets: BTreeSet<AssetUuid>,
-    pending_derived: BTreeSet<AssetUuid>,
-    pending_paths: BTreeSet<String>,
-}
-
-struct ProjectionCheckpoint {
-    prefixes: Vec<ScanKey>,
-    sources: Vec<(ScanKey, IndexedSourceClaims)>,
-    pending_bundles: BTreeSet<BundleUuid>,
-    pending_assets: BTreeSet<AssetUuid>,
-    pending_derived: BTreeSet<AssetUuid>,
-    pending_paths: BTreeSet<String>,
-}
-
-impl ScanProjectionIndex {
-    fn checkpoint(&self, prefixes: &[ScanKey]) -> ProjectionCheckpoint {
-        ProjectionCheckpoint {
-            prefixes: prefixes.to_vec(),
-            sources: self
-                .sources
-                .iter()
-                .filter(|(key, _)| prefixes.iter().any(|prefix| scan_key_matches(prefix, key)))
-                .map(|(key, claims)| (key.clone(), claims.clone()))
-                .collect(),
-            pending_bundles: self.pending_bundles.clone(),
-            pending_assets: self.pending_assets.clone(),
-            pending_derived: self.pending_derived.clone(),
-            pending_paths: self.pending_paths.clone(),
-        }
-    }
-
-    fn restore(&mut self, checkpoint: ProjectionCheckpoint) -> Result<(), CoordinatorError> {
-        let current = self
-            .sources
-            .keys()
-            .filter(|key| {
-                checkpoint
-                    .prefixes
-                    .iter()
-                    .any(|prefix| scan_key_matches(prefix, key))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut touched = ProjectionTouches::default();
-        for key in current {
-            touched.extend(self.remove_source(&key));
-        }
-        for (key, claims) in checkpoint.sources {
-            touched.extend(self.insert_source(key, claims)?);
-        }
-        self.refresh_collisions(&touched)?;
-        self.pending_bundles = checkpoint.pending_bundles;
-        self.pending_assets = checkpoint.pending_assets;
-        self.pending_derived = checkpoint.pending_derived;
-        self.pending_paths = checkpoint.pending_paths;
-        Ok(())
-    }
-
-    fn build(
-        scan: &ScanSnapshot,
-        projection: &PipelineProjection,
-        authority: Option<&ProjectSchemaAuthority>,
-    ) -> Result<Self, CoordinatorError> {
-        let mut index = Self::default();
-        let mut touched = ProjectionTouches::default();
-        for (key, source) in scan.bundle_entries() {
-            let claims = IndexedSourceClaims::build(Arc::clone(source), projection, authority)?;
-            touched.extend(index.insert_source(key.clone(), claims)?);
-        }
-        index.refresh_collisions(&touched)?;
-        index.pending_bundles.clear();
-        index.pending_assets.clear();
-        index.pending_derived.clear();
-        index.pending_paths.clear();
-        Ok(index)
-    }
-
-    fn replace_delta(
-        &mut self,
-        delta: &ScanDelta,
-        projection: &PipelineProjection,
-        authority: Option<&ProjectSchemaAuthority>,
-    ) -> Result<ProjectionTouches, CoordinatorError> {
-        let mut touched = ProjectionTouches::default();
-        let removed = self
-            .sources
-            .keys()
-            .filter(|key| {
-                delta
-                    .affected_prefixes()
-                    .iter()
-                    .any(|prefix| scan_key_matches(prefix, key))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in removed {
-            touched.extend(self.remove_source(&key));
-        }
-        for (key, source) in delta.observed_bundle_entries() {
-            let claims = IndexedSourceClaims::build(Arc::clone(source), projection, authority)?;
-            touched.extend(self.insert_source(key.clone(), claims)?);
-        }
-        self.refresh_collisions(&touched)?;
-        self.pending_bundles.extend(&touched.bundles);
-        self.pending_assets.extend(&touched.assets);
-        self.pending_derived.extend(&touched.derived);
-        self.pending_paths.extend(touched.paths.iter().cloned());
-        Ok(touched)
-    }
-
-    fn insert_source(
-        &mut self,
-        key: ScanKey,
-        claims: IndexedSourceClaims,
-    ) -> Result<ProjectionTouches, CoordinatorError> {
-        debug_assert!(!self.sources.contains_key(&key));
-        let mut touched = ProjectionTouches::default();
-        if let Some(poison) = &claims.malformed {
-            self.malformed.insert(key.clone(), poison.clone());
-        }
-        if let Some(bundle) = claims.bundle {
-            touched.bundles.insert(bundle);
-            self.bundle_claimants
-                .entry(bundle)
-                .or_default()
-                .insert(readable_source(&claims.source));
-        }
-        for (asset, claimant) in &claims.authored {
-            touched.assets.insert(*asset);
-            self.asset_claimants
-                .entry(*asset)
-                .or_default()
-                .insert(claimant.clone());
-        }
-        for (asset, claimant, output) in &claims.derived {
-            touched.derived.insert(*asset);
-            self.asset_claimants
-                .entry(*asset)
-                .or_default()
-                .insert(claimant.clone());
-            self.derived_outputs
-                .entry(*asset)
-                .or_default()
-                .insert(claimant.clone(), output.clone());
-        }
-        for (claimant, manifest) in &claims.lineage {
-            self.lineage.insert(claimant.clone(), manifest.clone());
-        }
-        if let Some((path, asset)) = &claims.primary_path {
-            touched.paths.insert(path.clone());
-            self.path_claimants
-                .entry(path.clone())
-                .or_default()
-                .insert(*asset);
-        }
-        self.sources.insert(key, claims);
-        Ok(touched)
-    }
-
-    fn remove_source(&mut self, key: &ScanKey) -> ProjectionTouches {
-        let Some(claims) = self.sources.remove(key) else {
-            return ProjectionTouches::default();
+fn incremental_plan(
+    reader: &StoreReader,
+    inputs: &PlanInputs<'_>,
+) -> Result<IncrementalScanPlan, CoordinatorError> {
+    let version_poison = VersionPoison::select_canonical(
+        reader
+            .claims_version_poison()?
+            .into_iter()
+            .chain(inputs.version_poison.clone()),
+    )
+    .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
+    let (configuration, lineage_repair, lineage_manifest) = indexed_lineage_projection(
+        &claimed_lineage(reader, &inputs.fresh)?,
+        inputs.scanner,
+        &inputs.destination,
+        inputs.configuration_poison.clone(),
+    )?;
+    let pending = reader.pending_claims()?;
+    let mut bundles = BTreeMap::new();
+    let mut bundle_poisons = BTreeMap::new();
+    for bundle in pending.bundles {
+        let source = match reader.bundle_claim_sources(bundle)?.as_slice() {
+            [source] => Some(claimed_source(
+                reader,
+                &inputs.fresh,
+                &source.root_name,
+                &source.normalized_path,
+            )?),
+            _ => None,
         };
-        let mut touched = ProjectionTouches::default();
-        self.malformed.remove(key);
-        if let Some(bundle) = claims.bundle {
-            touched.bundles.insert(bundle);
-            remove_set_value(
-                &mut self.bundle_claimants,
-                &bundle,
-                &readable_source(&claims.source),
-            );
+        if let Some(poison) = source
+            .as_deref()
+            .and_then(|source| scoped_bundle_poison(source, inputs.authority))
+        {
+            bundle_poisons.insert(bundle, poison);
         }
-        for (asset, claimant) in claims.authored {
-            touched.assets.insert(asset);
-            remove_set_value(&mut self.asset_claimants, &asset, &claimant);
-        }
-        for (asset, claimant, _) in claims.derived {
-            touched.derived.insert(asset);
-            remove_set_value(&mut self.asset_claimants, &asset, &claimant);
-            remove_map_value(&mut self.derived_outputs, &asset, &claimant);
-        }
-        for (claimant, _) in claims.lineage {
-            self.lineage.remove(&claimant);
-        }
-        if let Some((path, asset)) = claims.primary_path {
-            touched.paths.insert(path.clone());
-            remove_set_value(&mut self.path_claimants, &path, &asset);
-        }
-        touched
+        bundles.insert(bundle, source);
     }
-
-    fn refresh_collisions(&mut self, touched: &ProjectionTouches) -> Result<(), CoordinatorError> {
-        for bundle in &touched.bundles {
-            let key = CollisionKey::Bundle(*bundle);
-            self.collisions.remove(&key);
-            if let Some(sources) = self
-                .bundle_claimants
-                .get(bundle)
-                .filter(|set| set.len() > 1)
-            {
-                let sources = sources.iter().cloned().collect::<Vec<_>>();
-                let poison = VersionPoison::new(
-                    VersionPoisonV1::DuplicateBundleUuid {
-                        bundle: *bundle,
-                        sources,
-                    },
-                    format!("duplicate bundle UUID {bundle}"),
-                )
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-                self.collisions.insert(key, poison);
-            }
-        }
-        for asset in touched.assets.iter().chain(&touched.derived) {
-            let key = CollisionKey::Asset(*asset);
-            self.collisions.remove(&key);
-            if let Some(claimants) = self.asset_claimants.get(asset).filter(|set| set.len() > 1) {
-                let claimants = claimants.iter().cloned().collect::<Vec<_>>();
-                let poison = VersionPoison::new(
-                    VersionPoisonV1::DuplicateAssetUuid {
-                        asset: *asset,
-                        claimants,
-                    },
-                    format!("duplicate asset UUID {asset}"),
-                )
-                .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-                self.collisions.insert(key, poison);
-            }
-        }
-        Ok(())
+    let mut derived_outputs = BTreeMap::new();
+    for child in pending.derived {
+        let output = match reader.derived_output_claims(child)?.as_slice() {
+            [output] => Some(DerivedOutputEntry {
+                parent: output.parent,
+                output_key: output.output_key.clone(),
+                terminal_type: output.terminal_type,
+            }),
+            _ => None,
+        };
+        derived_outputs.insert(child, output);
     }
-
-    fn version_poison(&self) -> Result<Option<VersionPoison>, CoordinatorError> {
-        VersionPoison::select_canonical(
-            self.malformed
-                .values()
-                .chain(self.collisions.values())
-                .cloned(),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
-    }
-
-    fn derived_output(&self, child: AssetUuid) -> Option<DerivedOutputEntry> {
-        self.derived_outputs
-            .get(&child)
-            .and_then(|entries| (entries.len() == 1).then(|| entries.values().next().cloned()))
-            .flatten()
-    }
-
-    fn source_for_bundle(&self, bundle: BundleUuid) -> Option<&IndexedSourceClaims> {
-        let source = self.bundle_claimants.get(&bundle)?;
-        if source.len() != 1 {
-            return None;
-        }
-        let source = source.iter().next().expect("one bundle claimant");
-        self.sources
-            .get(&(source.root_name.clone(), source.normalized_path.clone()))
-    }
-
-    fn incremental_plan(
-        &self,
-        scanner: &RootedScanner,
-        destination: &LineageDestination,
-        external_poison: Option<ConfigurationPoison>,
-    ) -> Result<IncrementalScanPlan, CoordinatorError> {
-        let version_poison = self.version_poison()?;
-        let (configuration, lineage_repair, lineage_manifest) =
-            indexed_lineage_projection(self, scanner, destination, external_poison)?;
-        let bundles = self
-            .pending_bundles
-            .iter()
-            .copied()
-            .map(|bundle| {
-                (
-                    bundle,
-                    self.source_for_bundle(bundle)
-                        .map(|claims| Arc::clone(&claims.source)),
-                )
-            })
-            .collect();
-        let bundle_poisons = self
-            .pending_bundles
-            .iter()
-            .filter_map(|bundle| {
-                self.source_for_bundle(*bundle)
-                    .and_then(|claims| claims.scoped_poison.clone())
-                    .map(|poison| (*bundle, poison))
-            })
-            .collect();
-        let derived_outputs = self
-            .pending_derived
-            .iter()
-            .copied()
-            .map(|child| (child, self.derived_output(child)))
-            .collect();
-        let paths = self
-            .pending_paths
-            .iter()
-            .cloned()
-            .map(|path| {
-                let candidates = self.path_claimants.get(&path).cloned().unwrap_or_default();
-                (path, candidates)
-            })
-            .collect();
-        Ok(IncrementalScanPlan {
-            version_poison,
-            configuration,
-            lineage_repair,
-            lineage_manifest,
-            bundles,
-            bundle_poisons,
-            derived_outputs,
-            paths,
-        })
-    }
-
-    fn clear_published_pending(&mut self) {
-        self.pending_bundles.clear();
-        self.pending_assets.clear();
-        self.pending_derived.clear();
-        self.pending_paths.clear();
-    }
+    let paths = pending
+        .paths
+        .into_iter()
+        .map(|path| Ok((path.clone(), reader.path_claims(&path)?)))
+        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
+    Ok(IncrementalScanPlan {
+        version_poison,
+        configuration,
+        lineage_repair,
+        lineage_manifest,
+        bundles,
+        bundle_poisons,
+        derived_outputs,
+        paths,
+    })
 }
 
 struct IncrementalScanPlan {
@@ -2890,7 +2640,7 @@ struct IncrementalScanPlan {
 }
 
 fn indexed_lineage_projection(
-    index: &ScanProjectionIndex,
+    lineage: &BTreeMap<LineageManifestClaimant, VerifiedSchemaLineageManifest>,
     scanner: &RootedScanner,
     destination: &LineageDestination,
     external_poison: Option<ConfigurationPoison>,
@@ -2902,7 +2652,7 @@ fn indexed_lineage_projection(
     ),
     CoordinatorError,
 > {
-    let (lineage_configuration, mut repair, manifest) = match index.lineage.len() {
+    let (lineage_configuration, mut repair, manifest) = match lineage.len() {
         0 => {
             let reason = DscpV1::MissingLineageManifest;
             let poison = ConfigurationPoison::from_reason(
@@ -2921,8 +2671,7 @@ fn indexed_lineage_projection(
             )
         }
         1 => {
-            let manifest = index
-                .lineage
+            let manifest = lineage
                 .values()
                 .next()
                 .expect("one lineage claimant has one manifest")
@@ -2930,7 +2679,7 @@ fn indexed_lineage_projection(
             (ConfigurationStatus::Ready, None, Some(manifest))
         }
         _ => {
-            let claimants = index.lineage.keys().cloned().collect::<Vec<_>>();
+            let claimants = lineage.keys().cloned().collect::<Vec<_>>();
             let reason = DscpV1::DuplicateLineageManifest {
                 entries: claimants.clone(),
             };
@@ -2973,35 +2722,6 @@ fn scan_key_matches(prefix: &ScanKey, key: &ScanKey) -> bool {
                 .strip_prefix(&prefix.1)
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
-
-fn remove_set_value<K: Ord + Clone, V: Ord>(
-    map: &mut BTreeMap<K, BTreeSet<V>>,
-    key: &K,
-    value: &V,
-) {
-    let empty = map.get_mut(key).is_some_and(|values| {
-        values.remove(value);
-        values.is_empty()
-    });
-    if empty {
-        map.remove(key);
-    }
-}
-
-fn remove_map_value<K: Ord + Clone, V: Ord, T>(
-    map: &mut BTreeMap<K, BTreeMap<V, T>>,
-    key: &K,
-    value: &V,
-) {
-    let empty = map.get_mut(key).is_some_and(|values| {
-        values.remove(value);
-        values.is_empty()
-    });
-    if empty {
-        map.remove(key);
-    }
-}
-
 struct ScanCandidate {
     scan: ScanSnapshot,
     renames: Vec<LogicalRename>,
@@ -3413,6 +3133,7 @@ fn candidate_bundle_summaries(
     Ok(summaries)
 }
 
+#[allow(clippy::too_many_arguments)] // The scan transaction receives each publication input explicitly.
 fn publish_scan(
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
@@ -3421,6 +3142,7 @@ fn publish_scan(
     pipeline: Option<&ConfigurationPipelinePublication>,
     projection: &PipelineProjection,
     tag_epoch: [u8; 32],
+    claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
     let (derived_outputs, derived_poison) = projected_derived_outputs(&candidate, projection)?;
     candidate.version_poison = VersionPoison::select_canonical(
@@ -3556,6 +3278,7 @@ fn publish_scan(
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
     let mut healed_retired = false;
     store.input_transaction(|transaction| {
+        transaction.replace_source_claims(None, claims)?;
         let mut root_ids = BTreeMap::new();
         let mut newest_mtime = 0;
         for (key, file) in candidate.scan.file_observations() {
@@ -3890,13 +3613,17 @@ fn apply_schema_transition(
         })
 }
 
+/// Publish one incremental scan in one input transaction: its file rows and
+/// claims are written first, and the plan is read back from them, so a
+/// failed publication rolls both back.
 #[allow(clippy::too_many_arguments)] // The transaction receives each independently pinned publication authority.
 fn publish_incremental_scan(
     store: &Arc<Mutex<Store>>,
     base: InputVersion,
     baseline: &ScanSnapshot,
     delta: &ScanDelta,
-    plan: &IncrementalScanPlan,
+    claims: &[SourceClaims],
+    inputs: &PlanInputs<'_>,
     renames: &[LogicalRename],
     projection: &PipelineProjection,
     tag_epoch: [u8; 32],
@@ -3912,7 +3639,223 @@ fn publish_incremental_scan(
             ),
         });
     }
-    let watermark = store.clean_watermark()?.unwrap_or(0);
+    let observation =
+        InputVersion(
+            base.0
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidConfiguration {
+                    error: "input version exhausted".to_owned(),
+                })?,
+        );
+    let mut healed_retired = false;
+    let (mut commit, _) = store.input_transaction(|transaction| {
+        let watermark = transaction.reader().clean_watermark()?.unwrap_or(0);
+        let mut root_ids = BTreeMap::new();
+        let mut newest_mtime = watermark;
+        for mutation in &file_mutations {
+            let root = *root_ids
+                .entry(mutation.root_name.clone())
+                .or_insert(transaction.intern_root(&mutation.root_name)?);
+            match &mutation.file {
+                Some(file) => {
+                    transaction.upsert_file(root, &mutation.path, file, observation)?;
+                    if let Some(bundle) = &mutation.bundle {
+                        transaction.set_bundle_file(root, &mutation.path, &bundle.bytes)?;
+                    }
+                    if mutation.dirty {
+                        transaction.push_dirty(root, &mutation.path, true, observation)?;
+                    }
+                    newest_mtime = newest_mtime.max(file.state.mtime);
+                }
+                None => {
+                    transaction.remove_file(root, &mutation.path)?;
+                    transaction.push_dirty(root, &mutation.path, false, observation)?;
+                }
+            }
+        }
+        transaction.replace_scan_structure(
+            Some(delta.affected_prefixes()),
+            &delta.observed().directory_rows(),
+            &delta.observed().encoded_diagnostic_rows(),
+        )?;
+        transaction.set_clean_watermark(newest_mtime)?;
+        transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
+        let IncrementalPublication {
+            plan,
+            mut commit,
+            waiting,
+            changed_bundles,
+            configuration_generation,
+        } = prepare_incremental_publication(
+            &transaction.reader(),
+            delta,
+            inputs,
+            projection,
+            observation,
+            schema_transition,
+        )?;
+        transaction.set_version_poisons(plan.version_poison.clone())?;
+        match &plan.configuration {
+            ConfigurationStatus::Ready => {
+                transaction.publish_configuration_ready(configuration_generation)?;
+            }
+            ConfigurationStatus::Poisoned(poison) => {
+                transaction.publish_configuration_poison(&poison.detail, &poison.message)?;
+            }
+        }
+        if let Some(transition) = schema_transition {
+            if plan.lineage_manifest.as_ref() != Some(&transition.planned.proposed) {
+                return Err(StoreError::InvalidConfiguration {
+                    error: "incremental scan did not reproduce the planned schema manifest"
+                        .to_owned(),
+                });
+            }
+            commit.pipeline = Some(apply_schema_transition(transaction, transition)?);
+            if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
+                transaction.publish_tool_epoch(transition.tools)?;
+            }
+            commit.pipeline_epoch_changed = true;
+        } else if let Some(manifest) = &plan.lineage_manifest {
+            transaction.project_verified_lineage_manifest(manifest)?;
+        }
+        if let Some(waiting) = &waiting {
+            transaction.publish_retired_type_referenced(&waiting.error)?;
+            commit.pipeline = Some(PipelineDiagnostic::RetiredTypeReferenced(
+                distill_rpc::RetiredTypeReferenced {
+                    manifest_hash: BundleFileHash(waiting.error.manifest_hash.0),
+                    basis: waiting.error.basis,
+                    type_uuid: waiting.error.type_uuid,
+                    references: waiting.error.references.clone(),
+                },
+            ));
+            commit.pipeline_epoch_changed = true;
+        } else if schema_transition.is_none() {
+            healed_retired = transaction.clear_retired_type_referenced()?;
+        }
+        if plan.version_poison.is_none() {
+            for bundle_uuid in &changed_bundles {
+                transaction.remove_bundle(*bundle_uuid)?;
+                let Some(source) = &plan.bundles[bundle_uuid] else {
+                    continue;
+                };
+                if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
+                    let root = *root_ids
+                        .entry(poison.root_name.clone())
+                        .or_insert(transaction.intern_root(&poison.root_name)?);
+                    transaction.poison_bundle(
+                        &StoreNamespaceSkeleton {
+                            bundle: poison.bundle,
+                            root,
+                            path: poison.normalized_path.clone(),
+                            format_version: poison.format_version,
+                            content_hash: poison.content_hash,
+                            entries: poison.entries.clone(),
+                        },
+                        &poison.message,
+                    )?;
+                    continue;
+                }
+                let bundle = source
+                    .parsed
+                    .as_ref()
+                    .expect("indexed current bundle parsed successfully");
+                let summary = bundle_summary(source)?;
+                let root = *root_ids
+                    .entry(source.root_name.clone())
+                    .or_insert(transaction.intern_root(&source.root_name)?);
+                transaction.upsert_bundle(&BundleMeta {
+                    bundle: bundle.uuid,
+                    root,
+                    path: source.normalized_path.clone(),
+                    format_version: bundle.format_version,
+                    content_hash: ContentHash(source.file_hash.0),
+                    origin: summary.origin,
+                })?;
+                for (hash, schema) in &bundle.schemas {
+                    let snapshot =
+                        distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
+                            StoreError::InvalidConfiguration {
+                                error: format!("cannot serialize verified schema {hash}: {error}"),
+                            }
+                        })?;
+                    transaction.put_schema(*hash, &snapshot)?;
+                }
+                for (local_id, entry) in &bundle.assets {
+                    transaction.upsert_asset(&AssetRecord {
+                        asset: entry.uuid,
+                        bundle: bundle.uuid,
+                        local_id: local_id.clone(),
+                        type_uuid: entry.type_uuid,
+                        logical_hash: entry.schema_hash,
+                        authoring_only: entry.authoring_only,
+                        tags: BTreeMap::new(),
+                        served: Some(served_authoring(entry, projection)?),
+                    })?;
+                    transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
+                }
+                if let Some(primary) = &bundle.primary {
+                    transaction.set_path_entry(
+                        &source.normalized_path,
+                        root,
+                        bundle.assets[primary].uuid,
+                    )?;
+                }
+            }
+            for (child, current) in &plan.derived_outputs {
+                match current {
+                    Some(entry) => {
+                        transaction.set_derived_output(
+                            *child,
+                            entry.parent,
+                            &entry.output_key,
+                            entry.terminal_type,
+                        )?
+                    }
+                    None => {
+                        transaction.remove_derived_output(*child)?;
+                    }
+                }
+            }
+        }
+        for rename in renames {
+            let root = *root_ids
+                .entry(rename.root_name.clone())
+                .or_insert(transaction.intern_root(&rename.root_name)?);
+            transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
+        }
+        if plan.version_poison.is_none() {
+            transaction.clear_pending_claims()?;
+        }
+        Ok(commit)
+    })?;
+    if healed_retired {
+        commit.pipeline = Some(pipeline_diagnostic(store.pipeline_state()?));
+        commit.pipeline_epoch_changed = true;
+    }
+    Ok(commit)
+}
+
+struct IncrementalPublication {
+    plan: IncrementalScanPlan,
+    commit: Commit,
+    waiting: Option<RetiredWaitingProjection>,
+    changed_bundles: BTreeSet<BundleUuid>,
+    configuration_generation: u64,
+}
+
+/// Plan an incremental publication from the transaction's claims and read
+/// the published rows it replaces.
+fn prepare_incremental_publication(
+    store: &StoreReader,
+    delta: &ScanDelta,
+    inputs: &PlanInputs<'_>,
+    projection: &PipelineProjection,
+    observation: InputVersion,
+    schema_transition: Option<&IncrementalSchemaTransition<'_>>,
+) -> Result<IncrementalPublication, StoreError> {
+    let plan = incremental_plan(store, inputs).map_err(|error| StoreError::InvalidConfiguration {
+        error: error.to_string(),
+    })?;
     let configuration_generation = match store.configuration_state()? {
         ConfigurationState::Ready(epoch) => epoch.generation,
         ConfigurationState::Poisoned { last_good, .. } => {
@@ -3960,14 +3903,6 @@ fn publish_incremental_scan(
         tag_poisons: Some(BTreeMap::new()),
         ..Commit::default()
     };
-    let observation =
-        InputVersion(
-            base.0
-                .checked_add(1)
-                .ok_or_else(|| StoreError::InvalidConfiguration {
-                    error: "input version exhausted".to_owned(),
-                })?,
-        );
     let mut retired_types = store.retired_type_uuids()?;
     if schema_transition.is_some_and(|transition| {
         matches!(
@@ -4158,174 +4093,13 @@ fn publish_incremental_scan(
             }
         }
     }
-
-    let mut healed_retired = false;
-    store.input_transaction(|transaction| {
-        let mut root_ids = BTreeMap::new();
-        let mut newest_mtime = watermark;
-        for mutation in &file_mutations {
-            let root = *root_ids
-                .entry(mutation.root_name.clone())
-                .or_insert(transaction.intern_root(&mutation.root_name)?);
-            match &mutation.file {
-                Some(file) => {
-                    transaction.upsert_file(root, &mutation.path, file, observation)?;
-                    if let Some(bundle) = &mutation.bundle {
-                        transaction.set_bundle_file(root, &mutation.path, &bundle.bytes)?;
-                    }
-                    if mutation.dirty {
-                        transaction.push_dirty(root, &mutation.path, true, observation)?;
-                    }
-                    newest_mtime = newest_mtime.max(file.state.mtime);
-                }
-                None => {
-                    transaction.remove_file(root, &mutation.path)?;
-                    transaction.push_dirty(root, &mutation.path, false, observation)?;
-                }
-            }
-        }
-        transaction.replace_scan_structure(
-            Some(delta.affected_prefixes()),
-            &delta.observed().directory_rows(),
-            &delta.observed().encoded_diagnostic_rows(),
-        )?;
-        transaction.set_clean_watermark(newest_mtime)?;
-        transaction.set_version_poisons(plan.version_poison.clone())?;
-        match &plan.configuration {
-            ConfigurationStatus::Ready => {
-                transaction.publish_configuration_ready(configuration_generation)?;
-            }
-            ConfigurationStatus::Poisoned(poison) => {
-                transaction.publish_configuration_poison(&poison.detail, &poison.message)?;
-            }
-        }
-        if let Some(transition) = schema_transition {
-            if plan.lineage_manifest.as_ref() != Some(&transition.planned.proposed) {
-                return Err(StoreError::InvalidConfiguration {
-                    error: "incremental scan did not reproduce the planned schema manifest"
-                        .to_owned(),
-                });
-            }
-            commit.pipeline = Some(apply_schema_transition(transaction, transition)?);
-            if matches!(commit.pipeline, Some(PipelineDiagnostic::Ready)) {
-                transaction.publish_tool_epoch(transition.tools)?;
-            }
-            commit.pipeline_epoch_changed = true;
-        } else if let Some(manifest) = &plan.lineage_manifest {
-            transaction.project_verified_lineage_manifest(manifest)?;
-        }
-        if let Some(waiting) = &waiting {
-            transaction.publish_retired_type_referenced(&waiting.error)?;
-            commit.pipeline = Some(PipelineDiagnostic::RetiredTypeReferenced(
-                distill_rpc::RetiredTypeReferenced {
-                    manifest_hash: BundleFileHash(waiting.error.manifest_hash.0),
-                    basis: waiting.error.basis,
-                    type_uuid: waiting.error.type_uuid,
-                    references: waiting.error.references.clone(),
-                },
-            ));
-            commit.pipeline_epoch_changed = true;
-        } else if schema_transition.is_none() {
-            healed_retired = transaction.clear_retired_type_referenced()?;
-        }
-        if plan.version_poison.is_none() {
-            for bundle_uuid in &changed_bundles {
-                transaction.remove_bundle(*bundle_uuid)?;
-                let Some(source) = &plan.bundles[bundle_uuid] else {
-                    continue;
-                };
-                if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
-                    let root = *root_ids
-                        .entry(poison.root_name.clone())
-                        .or_insert(transaction.intern_root(&poison.root_name)?);
-                    transaction.poison_bundle(
-                        &StoreNamespaceSkeleton {
-                            bundle: poison.bundle,
-                            root,
-                            path: poison.normalized_path.clone(),
-                            format_version: poison.format_version,
-                            content_hash: poison.content_hash,
-                            entries: poison.entries.clone(),
-                        },
-                        &poison.message,
-                    )?;
-                    continue;
-                }
-                let bundle = source
-                    .parsed
-                    .as_ref()
-                    .expect("indexed current bundle parsed successfully");
-                let summary = bundle_summary(source)?;
-                let root = *root_ids
-                    .entry(source.root_name.clone())
-                    .or_insert(transaction.intern_root(&source.root_name)?);
-                transaction.upsert_bundle(&BundleMeta {
-                    bundle: bundle.uuid,
-                    root,
-                    path: source.normalized_path.clone(),
-                    format_version: bundle.format_version,
-                    content_hash: ContentHash(source.file_hash.0),
-                    origin: summary.origin,
-                })?;
-                for (hash, schema) in &bundle.schemas {
-                    let snapshot =
-                        distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-                            StoreError::InvalidConfiguration {
-                                error: format!("cannot serialize verified schema {hash}: {error}"),
-                            }
-                        })?;
-                    transaction.put_schema(*hash, &snapshot)?;
-                }
-                for (local_id, entry) in &bundle.assets {
-                    transaction.upsert_asset(&AssetRecord {
-                        asset: entry.uuid,
-                        bundle: bundle.uuid,
-                        local_id: local_id.clone(),
-                        type_uuid: entry.type_uuid,
-                        logical_hash: entry.schema_hash,
-                        authoring_only: entry.authoring_only,
-                        tags: BTreeMap::new(),
-                        served: Some(served_authoring(entry, projection)?),
-                    })?;
-                    transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
-                }
-                if let Some(primary) = &bundle.primary {
-                    transaction.set_path_entry(
-                        &source.normalized_path,
-                        root,
-                        bundle.assets[primary].uuid,
-                    )?;
-                }
-            }
-            for (child, current) in &plan.derived_outputs {
-                match current {
-                    Some(entry) => {
-                        transaction.set_derived_output(
-                            *child,
-                            entry.parent,
-                            &entry.output_key,
-                            entry.terminal_type,
-                        )?
-                    }
-                    None => {
-                        transaction.remove_derived_output(*child)?;
-                    }
-                }
-            }
-        }
-        for rename in renames {
-            let root = *root_ids
-                .entry(rename.root_name.clone())
-                .or_insert(transaction.intern_root(&rename.root_name)?);
-            transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
-        }
-        Ok(())
-    })?;
-    if healed_retired {
-        commit.pipeline = Some(pipeline_diagnostic(store.pipeline_state()?));
-        commit.pipeline_epoch_changed = true;
-    }
-    Ok(commit)
+    Ok(IncrementalPublication {
+        plan,
+        commit,
+        waiting,
+        changed_bundles,
+        configuration_generation,
+    })
 }
 
 fn incremental_file_mutations(
@@ -4459,46 +4233,37 @@ fn publish_incremental_paths_with_schema_transition(
         .map_or([0; 32], |authority| authority.source_hash());
 
     if let Some(coordinator) = coordinator {
-        let mut index = lock_scan_projection(&coordinator.scan_projection);
-        let checkpoint = index.checkpoint(delta.affected_prefixes());
-        let plan = match index
-            .replace_delta(&delta, projection, authority.as_deref())
-            .and_then(|_| {
-                index.incremental_plan(
-                    scanner,
-                    lineage_destination,
-                    coordinator.configuration_poison(),
-                )
-            }) {
-            Ok(plan) => plan,
-            Err(error) => {
-                index
-                    .restore(checkpoint)
-                    .map_err(|error| error.to_string())?;
-                return Err(error.to_string());
-            }
+        let claims = bundle_claims(
+            delta
+                .observed_bundle_entries()
+                .map(|(_, source)| source.as_ref()),
+            projection,
+            authority.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        let inputs = PlanInputs {
+            scanner,
+            destination: lineage_destination.clone(),
+            configuration_poison: coordinator.configuration_poison(),
+            version_poison: None,
+            authority: authority.as_deref(),
+            fresh: fresh_bundles(&delta),
         };
-        let mut commit = match publish_incremental_scan(
+        let mut commit = publish_incremental_scan(
             store,
             base,
             &baseline,
             &delta,
-            &plan,
+            &claims,
+            &inputs,
             &[],
             projection,
             tag_epoch,
             schema_transition,
-        ) {
-            Ok(commit) => commit,
-            Err(error) => {
-                index
-                    .restore(checkpoint)
-                    .map_err(|error| error.to_string())?;
-                return Err(error.to_string());
-            }
-        };
+        )
+        .map_err(|error| error.to_string())?;
         if schema_transition.is_none() {
-            if let Some(authority) = authority {
+            if let Some(authority) = authority.clone() {
                 let affected = commit_affected_asset_bundles(&commit);
                 if !affected.is_empty() {
                     let targets = coordinator
@@ -4519,9 +4284,6 @@ fn publish_incremental_paths_with_schema_transition(
                 }
             }
         }
-        if plan.version_poison.is_none() {
-            index.clear_published_pending();
-        }
         return Ok(commit);
     }
 
@@ -4532,6 +4294,8 @@ fn publish_incremental_paths_with_schema_transition(
     drop(baseline);
     let mut scan = ScanSnapshot::load(&lock_store(store)).map_err(|error| error.to_string())?;
     scan.apply_delta(delta);
+    let claims = bundle_claims(scan.bundle_rows(), projection, authority.as_deref())
+        .map_err(|error| error.to_string())?;
     let candidate = ScanCandidate::build(
         scanner,
         lineage_destination,
@@ -4540,8 +4304,17 @@ fn publish_incremental_paths_with_schema_transition(
         authority.as_deref(),
     )
     .map_err(|error| error.to_string())?;
-    let commit = publish_scan(store, base, candidate, false, None, projection, tag_epoch)
-        .map_err(|error| error.to_string())?;
+    let commit = publish_scan(
+        store,
+        base,
+        candidate,
+        false,
+        None,
+        projection,
+        tag_epoch,
+        &claims,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(commit)
 }
 
@@ -5000,14 +4773,6 @@ impl distill_rpc::ExternalStore for DaemonStore {
     fn with_store(&self, job: &mut dyn FnMut(&mut Store)) {
         job(&mut lock_store(&self.store));
     }
-}
-
-fn lock_scan_projection(
-    projection: &Mutex<ScanProjectionIndex>,
-) -> MutexGuard<'_, ScanProjectionIndex> {
-    projection
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn lock_pipeline(

@@ -292,7 +292,7 @@ fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<RootId, StoreE
 
 /// Rows of `table` (aliased `t`, joined to `roots` as `r`) under one
 /// (root name, prefix) subtree bound as `?1`, `?2`.
-const UNDER: &str = "r.name = ?1 AND (?2 = '' OR t.path = ?2
+pub(crate) const UNDER: &str = "r.name = ?1 AND (?2 = '' OR t.path = ?2
      OR (t.path >= ?2 || '/' AND t.path < ?2 || '0'))";
 
 fn clear_structure(
@@ -554,7 +554,7 @@ fn observed_directory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedD
 }
 
 impl StoreReader {
-    fn query_rows<T, P: rusqlite::Params>(
+    pub(crate) fn query_rows<T, P: rusqlite::Params>(
         &self,
         sql: &str,
         params: P,
