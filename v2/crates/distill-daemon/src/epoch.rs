@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use distill_asset::{ModuleEpochPoisonCause, ModuleEpochToken};
@@ -176,22 +175,18 @@ pub type RegistrationResource = ErasedRegistrationCapsule;
 /// A tracked residency capability for a module-owned value. Registration and
 /// generated value constructors use this instead of manufacturing an
 /// untracked token clone; the host can therefore prove that no candidate pin
-/// remains before `dlclose`.
+/// remains before `dlclose`: every pin shares one `Arc`, whose count is the
+/// number of pins.
 #[derive(Clone)]
 pub struct ModuleEpochPin {
     token: ModuleEpochToken,
-    residency: Arc<EpochResidency>,
-}
-
-struct EpochResidency {
-    fenced: AtomicBool,
+    _residency: Arc<()>,
 }
 
 impl std::fmt::Debug for ModuleEpochPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModuleEpochPin")
             .field("token", &self.token)
-            .field("fenced", &self.is_fenced())
             .finish_non_exhaustive()
     }
 }
@@ -200,10 +195,6 @@ impl ModuleEpochPin {
     pub fn token(&self) -> &ModuleEpochToken {
         &self.token
     }
-
-    pub fn is_fenced(&self) -> bool {
-        self.residency.fenced.load(Ordering::Acquire)
-    }
 }
 
 /// Host-owned state minted immediately after a candidate image opens and
@@ -211,7 +202,7 @@ impl ModuleEpochPin {
 /// exclusively through their status thunks in reverse order.
 pub struct CandidateRegistrationArena {
     owner: ModuleEpochToken,
-    residency: Arc<EpochResidency>,
+    residency: Arc<()>,
     head: Option<NonNull<RegistrationCapsuleNode>>,
     installed_len: usize,
     next_installation_seq: u64,
@@ -227,7 +218,6 @@ impl std::fmt::Debug for CandidateRegistrationArena {
         f.debug_struct("CandidateRegistrationArena")
             .field("owner", &self.owner)
             .field("entries", &self.installed_len)
-            .field("fenced", &self.is_fenced())
             .field("pins", &self.pin_count())
             .finish()
     }
@@ -237,9 +227,7 @@ impl CandidateRegistrationArena {
     fn new(owner: ModuleEpochToken) -> Self {
         Self {
             owner,
-            residency: Arc::new(EpochResidency {
-                fenced: AtomicBool::new(false),
-            }),
+            residency: Arc::new(()),
             head: None,
             installed_len: 0,
             next_installation_seq: 0,
@@ -254,7 +242,7 @@ impl CandidateRegistrationArena {
     pub fn owner_pin(&self) -> ModuleEpochPin {
         ModuleEpochPin {
             token: self.owner.clone(),
-            residency: Arc::clone(&self.residency),
+            _residency: Arc::clone(&self.residency),
         }
     }
 
@@ -310,7 +298,6 @@ impl CandidateRegistrationArena {
         // Only after the allocation-free link owns the capsule may any
         // validation reject it. A panic from here is still cleaned by the
         // arena because the node is reachable from `head`.
-        let was_fenced = self.is_fenced();
         let owner_matches = unsafe { node.as_ref().owner.same_epoch(&self.owner) };
         let installed = unsafe {
             node.as_ref()
@@ -320,11 +307,7 @@ impl CandidateRegistrationArena {
         };
         let duplicate = installed.kind != RegistrationKind::Validator
             && Self::contains_registration_from(prior_head, installed.kind, &installed.id);
-        let result = if was_fenced {
-            Err(ModuleCallError::new(
-                "candidate registration arena is fenced",
-            ))
-        } else if !owner_matches {
+        let result = if !owner_matches {
             Err(ModuleCallError::new(
                 "registration capsule belongs to a different module epoch",
             ))
@@ -473,20 +456,11 @@ impl CandidateRegistrationArena {
         self.rejected.as_ref()
     }
 
-    fn fence(&mut self) {
-        self.residency.fenced.store(true, Ordering::Release);
-    }
-
-    fn is_fenced(&self) -> bool {
-        self.residency.fenced.load(Ordering::Acquire)
-    }
-
     fn pin_count(&self) -> usize {
         Arc::strong_count(&self.residency).saturating_sub(1)
     }
 
     fn cleanup_reverse(&mut self) -> Result<(), ModuleCallError> {
-        self.fence();
         let mut errors = Vec::new();
         let mut cursor = self.head.take();
         let mut retained_head: Option<NonNull<RegistrationCapsuleNode>> = None;
@@ -630,42 +604,22 @@ pub trait PipelineModuleLoader {
     ) -> Result<Box<dyn LoadedPipelineModule>, ModuleCallError>;
 }
 
-/// Stable outcome of the explicit teardown attempted for an opened but
-/// unpublished candidate. `CleanedAndClosed` means the candidate failed its
-/// validation but left no resident module state; every other variant means the
-/// complete arena + library bundle was deliberately retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EpochStatus {
-    pub accepting_new_work: bool,
-    pub active_jobs: usize,
-    pub draining: bool,
-    pub poisoned: bool,
-    pub unloaded: bool,
-}
-
-/// Called when an epoch may need its host's attention: a runtime failure
-/// to persist, or a retired epoch that may now unload.
-pub type EpochWake = Arc<dyn Fn() + Send + Sync>;
-
+/// One loaded pipeline module. Every holder (the host's published state, a
+/// snapshot, a running job) owns a clone; a job clones it when it starts and
+/// holds it to the end. Replacing the module drops the host's clone; the
+/// last clone's drop cleans the registrations up in reverse order and closes
+/// the library. That drop happens in host code after the last callback
+/// returned, so no module code is on the stack. An epoch whose token was
+/// poisoned is leaked instead: its library is never closed.
 #[derive(Clone)]
 pub struct PipelineEpoch(Arc<EpochInner>);
-
-impl Drop for PipelineEpoch {
-    fn drop(&mut self) {
-        // A drained, healthy epoch may unload once its last other holder is
-        // gone. (A poisoned one never unloads.)
-        if self.0.draining.load(Ordering::Acquire) && self.0.runtime_error.get().is_none() {
-            self.0.wake();
-        }
-    }
-}
 
 impl std::fmt::Debug for PipelineEpoch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineEpoch")
             .field("id", &self.id())
             .field("dylib_hash", &self.dylib_hash())
-            .field("status", &self.status())
+            .field("failed", &self.runtime_failure().is_some())
             .finish()
     }
 }
@@ -677,10 +631,6 @@ struct EpochInner {
     targets: Vec<TargetDefinition>,
     registration: RegistrationSet,
     tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
-    accepting: AtomicBool,
-    active_jobs: AtomicUsize,
-    draining: AtomicBool,
-    unloaded: AtomicBool,
     /// The first runtime failure; it fences the epoch for good.
     runtime_error: OnceLock<(PipelineFailureCode, String)>,
     /// Read through `&self` once published; torn down only with the epoch
@@ -688,7 +638,6 @@ struct EpochInner {
     registration_arena: Option<CandidateRegistrationArena>,
     /// Touched only with the epoch exclusively held, or in `Drop`.
     module: Option<Box<dyn LoadedPipelineModule>>,
-    wake: OnceLock<EpochWake>,
 }
 
 // SAFETY: the module is reached only through `&mut EpochInner`. The arena's
@@ -732,14 +681,9 @@ impl PipelineEpoch {
                 .collect(),
             registration,
             tools,
-            accepting: AtomicBool::new(true),
-            active_jobs: AtomicUsize::new(0),
-            draining: AtomicBool::new(false),
-            unloaded: AtomicBool::new(false),
             runtime_error: OnceLock::new(),
             registration_arena: Some(arena),
             module: Some(module),
-            wake: OnceLock::new(),
         }))
     }
 
@@ -873,7 +817,7 @@ impl PipelineEpoch {
         distill_build::import::ImportOutput,
         CallbackInvokeError<crate::importer::AuthoringImporterError>,
     > {
-        let _job = self.callback_job()?;
+        self.ensure_healthy()?;
         let Some((pointer, CallbackHandle::Importer { call, .. })) = self
             .callback_rows()
             .into_iter()
@@ -907,7 +851,7 @@ impl PipelineEpoch {
         input: distill_json::AuthoredValue,
         context: &mut dyn PipelineProcessContext,
     ) -> Result<ProcessorProducts, CallbackInvokeError<ProcessorError>> {
-        let _job = self.callback_job()?;
+        self.ensure_healthy()?;
         let Some((pointer, CallbackHandle::Processor { descriptor, call })) = self
             .callback_rows()
             .into_iter()
@@ -1011,7 +955,7 @@ impl PipelineEpoch {
         Vec<distill_build::codegen::GeneratedFile>,
         CallbackInvokeError<distill_build::codegen::CodegenFailure>,
     > {
-        let _job = self.callback_job()?;
+        self.ensure_healthy()?;
         let callbacks = self
             .callback_rows()
             .into_iter()
@@ -1046,7 +990,7 @@ impl PipelineEpoch {
         asset_type: TypeUuid,
         asset: &distill_json::AuthoredValue,
     ) -> Result<Vec<crate::callbacks::Diagnostic>, InfallibleCallbackError> {
-        let _job = self.callback_job()?;
+        self.ensure_healthy()?;
         let callbacks = self
             .callback_rows()
             .into_iter()
@@ -1073,7 +1017,7 @@ impl PipelineEpoch {
         key: &str,
         value: distill_json::AuthoredValue,
     ) -> Result<distill_json::AuthoredValue, CallbackInvokeError<MigrationFunctionError>> {
-        let _job = self.callback_job()?;
+        self.ensure_healthy()?;
         let Some((pointer, CallbackHandle::Migration { call, .. })) = self
             .callback_rows()
             .into_iter()
@@ -1119,7 +1063,7 @@ impl PipelineEpoch {
         at: &distill_migrate::FieldPath,
         parent: bool,
     ) -> Result<Option<distill_json::AuthoredValue>, InfallibleCallbackError> {
-        let _job = self.callback_job()?;
+        self.ensure_healthy()?;
         let Some((pointer, CallbackHandle::Defaults { field, parent: parent_call, .. })) = self
             .callback_rows()
             .into_iter()
@@ -1154,40 +1098,29 @@ impl PipelineEpoch {
         rows
     }
 
-    fn callback_job<E>(&self) -> Result<EpochJobGuard, CallbackInvokeError<E>> {
-        self.try_start_job().map_err(|error| {
-            CallbackInvokeError::Unavailable(match error {
-                EpochWorkError::Failed(failure) => failure.message,
-                EpochWorkError::Retired { epoch_id } => {
-                    format!("pipeline epoch {epoch_id} is retired")
-                }
-            })
-        })
+    fn ensure_healthy<E>(&self) -> Result<(), CallbackInvokeError<E>> {
+        match self.runtime_failure() {
+            Some(failure) => Err(CallbackInvokeError::Unavailable(failure.message)),
+            None => Ok(()),
+        }
     }
 
     fn callback_panicked(&self, kind: &str) {
         self.report_runtime_panic(format!("registered {kind} callback panicked"));
     }
 
-    pub fn try_start_job(&self) -> Result<EpochJobGuard, EpochWorkError> {
+    /// The first runtime failure: once set, no callback of this epoch runs
+    /// again and its library is never closed.
+    pub fn runtime_failure(&self) -> Option<PipelineFailure> {
         self.0.observe_token_poison();
-        if !self.0.accepting.load(Ordering::Acquire) {
-            return Err(self.0.rejection());
-        }
-        self.0.active_jobs.fetch_add(1, Ordering::AcqRel);
-        self.0.observe_token_poison();
-        if !self.0.accepting.load(Ordering::Acquire) {
-            self.0.active_jobs.fetch_sub(1, Ordering::AcqRel);
-            return Err(self.0.rejection());
-        }
-        Ok(EpochJobGuard {
-            epoch: Arc::clone(&self.0),
+        self.0.runtime_error.get().map(|(code, detail)| {
+            pipeline_failure(
+                *code,
+                PipelineFailureOrigin::PublishedRuntime,
+                CandidateCleanupDisposition::PublishedEpochLeaked,
+                detail.clone(),
+            )
         })
-    }
-
-    pub fn begin_drain(&self) {
-        self.0.accepting.store(false, Ordering::Release);
-        self.0.draining.store(true, Ordering::Release);
     }
 
     /// Report any contained module callback failure, including drop/free/update
@@ -1202,33 +1135,9 @@ impl PipelineEpoch {
         self.0
             .poison(PipelineFailureCode::PublishedCallbackPanic, error.into());
     }
-
-    pub fn drain_complete(&self) -> bool {
-        self.0.observe_token_poison();
-        self.0.draining.load(Ordering::Acquire)
-            && self.0.runtime_error.get().is_none()
-            && self.0.active_jobs.load(Ordering::Acquire) == 0
-    }
-
-    pub fn status(&self) -> EpochStatus {
-        self.0.observe_token_poison();
-        EpochStatus {
-            accepting_new_work: self.0.accepting.load(Ordering::Acquire),
-            active_jobs: self.0.active_jobs.load(Ordering::Acquire),
-            draining: self.0.draining.load(Ordering::Acquire),
-            poisoned: self.0.runtime_error.get().is_some(),
-            unloaded: self.0.unloaded.load(Ordering::Acquire),
-        }
-    }
 }
 
 impl EpochInner {
-    fn wake(&self) {
-        if let Some(wake) = self.wake.get() {
-            wake();
-        }
-    }
-
     fn observe_token_poison(&self) {
         if let Some(cause) = self.token.poison_cause() {
             let (code, detail) = match cause {
@@ -1250,27 +1159,68 @@ impl EpochInner {
             PipelineFailureCode::PublishedCallbackPanic => ModuleEpochPoisonCause::CallbackPanic,
             _ => ModuleEpochPoisonCause::CallbackRejected,
         });
-        self.accepting.store(false, Ordering::Release);
-        if self.runtime_error.set((code, detail)).is_ok() {
-            self.wake();
-        }
+        let _ = self.runtime_error.set((code, detail));
     }
 
-    fn rejection(&self) -> EpochWorkError {
-        match self.runtime_error.get() {
-            Some((code, detail)) => EpochWorkError::Failed(pipeline_failure(
-                *code,
-                PipelineFailureOrigin::PublishedRuntime,
-                CandidateCleanupDisposition::PublishedEpochLeaked,
-                detail.clone(),
-            )),
-            None => EpochWorkError::Retired { epoch_id: self.id },
+    /// Clean the registrations up in reverse order, unload the module and
+    /// close the library. On failure the module and arena stay in place.
+    fn unload(&mut self) -> Result<(), EpochCleanupError> {
+        let arena = self.registration_arena.as_mut().ok_or_else(|| EpochCleanupError {
+            disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
+            detail: "registration arena is absent".to_owned(),
+        })?;
+        arena.cleanup_reverse().map_err(|error| EpochCleanupError {
+            disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
+            detail: error.to_string(),
+        })?;
+
+        let module = self.module.as_mut().ok_or_else(|| EpochCleanupError {
+            disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
+            detail: "module handle is absent".to_owned(),
+        })?;
+        boundary_call("unload", || module.unload()).map_err(|error| EpochCleanupError {
+            disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
+            detail: error.to_string(),
+        })?;
+        if self.token.is_poisoned() {
+            return Err(EpochCleanupError {
+                disposition: CandidateCleanupDisposition::TokenPoisoned,
+                detail: "epoch token was poisoned before dlclose".to_owned(),
+            });
         }
+        let pins = arena.pin_count();
+        if pins != 0 {
+            return Err(EpochCleanupError {
+                disposition: CandidateCleanupDisposition::TokenPinned,
+                detail: format!("epoch token retains {pins} residency pin(s)"),
+            });
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).map_err(|_| {
+            EpochCleanupError {
+                disposition: CandidateCleanupDisposition::DlcloseFailed,
+                detail: boundary_panic("dlclose").to_string(),
+            }
+        })?;
+        self.module.take();
+        self.registration_arena.take();
+        Ok(())
     }
 }
 
 impl Drop for EpochInner {
     fn drop(&mut self) {
+        // The last holder is gone: nothing runs module code any more.
+        if self.module.is_some() && !self.token.is_poisoned() {
+            if let Err(error) = self.unload() {
+                self.token.poison();
+                tracing::error!(
+                    epoch = self.id,
+                    disposition = cleanup_disposition_name(error.disposition),
+                    detail = %error.detail,
+                    "pipeline epoch cleanup failed; its library stays loaded"
+                );
+            }
+        }
         if self.token.is_poisoned() {
             let arena = self.registration_arena.take();
             let module = self.module.take();
@@ -1283,26 +1233,6 @@ impl Drop for EpochInner {
             if let Some(arena) = arena {
                 std::mem::forget(arena);
             }
-        }
-    }
-}
-
-pub struct EpochJobGuard {
-    epoch: Arc<EpochInner>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EpochWorkError {
-    Failed(PipelineFailure),
-    Retired { epoch_id: u64 },
-}
-
-impl Drop for EpochJobGuard {
-    fn drop(&mut self) {
-        let previous = self.epoch.active_jobs.fetch_sub(1, Ordering::AcqRel);
-        let drained = previous == 1 && !self.epoch.accepting.load(Ordering::Acquire);
-        if drained || self.epoch.token.is_poisoned() {
-            self.epoch.wake();
         }
     }
 }
@@ -1339,20 +1269,10 @@ impl PipelineSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnloadOutcome {
-    Draining(u64),
-    Pinned(u64),
-    Unloaded(u64),
-    LeakedPoisoned(u64),
-}
-
 pub struct ModuleHost {
     state_dir: PathBuf,
     next_epoch_id: u64,
     published: Option<PublishedState>,
-    retired: Vec<PipelineEpoch>,
-    wake: Option<EpochWake>,
 }
 
 impl ModuleHost {
@@ -1363,21 +1283,7 @@ impl ModuleHost {
             state_dir,
             next_epoch_id: 1,
             published: None,
-            retired: Vec::new(),
-            wake: None,
         })
-    }
-
-    /// Call `wake` when one of this host's epochs needs attention
-    /// ([`ModuleHost::reap_retired`], or persisting a runtime failure).
-    pub(crate) fn set_wake(&mut self, wake: EpochWake) {
-        self.wake = Some(wake);
-    }
-
-    fn attach_wake(&self, epoch: &PipelineEpoch) {
-        if let Some(wake) = &self.wake {
-            let _ = epoch.0.wake.set(Arc::clone(wake));
-        }
     }
 
     pub fn snapshot(&self) -> PipelineSnapshot {
@@ -1524,68 +1430,6 @@ impl ModuleHost {
         Ok(epoch)
     }
 
-    /// Attempt cleanup of every retired image. Runtime failure is checked before
-    /// active jobs or Arc pins: it is a permanent fence, not a delayed unload.
-    pub fn reap_retired(&mut self) -> Vec<UnloadOutcome> {
-        let mut outcomes = Vec::with_capacity(self.retired.len());
-        let mut index = 0;
-        while index < self.retired.len() {
-            let epoch = &mut self.retired[index];
-            epoch.0.observe_token_poison();
-            let id = epoch.id();
-            if epoch.status().poisoned {
-                outcomes.push(UnloadOutcome::LeakedPoisoned(id));
-                index += 1;
-                continue;
-            }
-            if epoch.0.active_jobs.load(Ordering::Acquire) != 0 {
-                outcomes.push(UnloadOutcome::Draining(id));
-                index += 1;
-                continue;
-            }
-            if Arc::strong_count(&epoch.0) != 1 {
-                outcomes.push(UnloadOutcome::Pinned(id));
-                index += 1;
-                continue;
-            }
-
-            match unload_epoch(epoch) {
-                Ok(()) => {
-                    outcomes.push(UnloadOutcome::Unloaded(id));
-                    self.retired.remove(index);
-                }
-                Err(error) => {
-                    epoch.0.poison(
-                        PipelineFailureCode::PublishedCleanup,
-                        format!(
-                            "epoch cleanup disposition={}: {}",
-                            cleanup_disposition_name(error.disposition),
-                            error.detail
-                        ),
-                    );
-                    outcomes.push(UnloadOutcome::LeakedPoisoned(id));
-                    index += 1;
-                }
-            }
-        }
-        outcomes
-    }
-
-    pub fn retired_count(&self) -> usize {
-        self.retired.len()
-    }
-
-    pub fn retired_failure(&self, id: u64) -> Option<PipelineFailure> {
-        let epoch = self.retired.iter().find(|epoch| epoch.id() == id)?;
-        let (code, message) = epoch.0.runtime_error.get()?;
-        Some(pipeline_failure(
-            *code,
-            PipelineFailureOrigin::PublishedRuntime,
-            CandidateCleanupDisposition::PublishedEpochLeaked,
-            message.clone(),
-        ))
-    }
-
     fn mint_epoch_id(&mut self) -> u64 {
         let id = self.next_epoch_id;
         self.next_epoch_id = self
@@ -1634,26 +1478,24 @@ impl ModuleHost {
         }
     }
 
+    /// Replace the published state. The previous epoch unloads once its
+    /// last other holder lets go.
     pub(crate) fn install_failure(&mut self, failure: PipelineFailure) {
-        self.retire_published_ready();
         self.published = Some(PublishedState::Failed(failure));
     }
 
     pub(crate) fn install_ready(&mut self, epoch: PipelineEpoch) {
-        self.attach_wake(&epoch);
-        self.retire_published_ready();
         self.published = Some(PublishedState::Ready(epoch));
     }
 
     pub(crate) fn discard_unpublished(&mut self, mut epoch: PipelineEpoch) -> Option<PipelineFailure> {
-        epoch.begin_drain();
         match unload_epoch(&mut epoch) {
             Ok(()) => None,
             Err(error) => {
-                // This image never became published runtime. Fence and retain
-                // it so EpochInner::drop cannot run module-owned destructors,
-                // but report the candidate-cleanup matrix required at the
-                // publication boundary.
+                // This image never became published runtime. Poison it so
+                // its drop leaks it instead of running module-owned
+                // destructors, and report the candidate-cleanup matrix
+                // required at the publication boundary.
                 epoch.0.token.poison();
                 let failure = candidate_failure_record(
                     PipelineFailureCode::CandidateCleanup,
@@ -1664,16 +1506,8 @@ impl ModuleHost {
                     ),
                     error.disposition,
                 );
-                self.retired.push(epoch);
                 Some(failure)
             }
-        }
-    }
-
-    fn retire_published_ready(&mut self) {
-        if let Some(PublishedState::Ready(epoch)) = self.published.take() {
-            epoch.begin_drain();
-            self.retired.push(epoch);
         }
     }
 }
@@ -2004,7 +1838,6 @@ fn discard_candidate(
     mut module: Box<dyn LoadedPipelineModule>,
     mut arena: CandidateRegistrationArena,
 ) -> CandidateCleanup {
-    arena.fence();
     if let Err(error) = arena.cleanup_reverse() {
         return retain_candidate(
             module,
@@ -2061,47 +1894,7 @@ fn unload_epoch(epoch: &mut PipelineEpoch) -> Result<(), EpochCleanupError> {
         disposition: CandidateCleanupDisposition::TokenPinned,
         detail: "the epoch is still shared".to_owned(),
     })?;
-    let arena = epoch.registration_arena.as_mut().ok_or_else(|| EpochCleanupError {
-        disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
-        detail: "registration arena is absent".to_owned(),
-    })?;
-    arena.fence();
-    arena.cleanup_reverse().map_err(|error| EpochCleanupError {
-        disposition: CandidateCleanupDisposition::RegistrationCleanupFailed,
-        detail: error.to_string(),
-    })?;
-
-    let module = epoch.module.as_mut().ok_or_else(|| EpochCleanupError {
-        disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
-        detail: "module handle is absent".to_owned(),
-    })?;
-    boundary_call("unload", || module.unload()).map_err(|error| EpochCleanupError {
-        disposition: CandidateCleanupDisposition::ModuleUnloadFailed,
-        detail: error.to_string(),
-    })?;
-    if epoch.token.is_poisoned() {
-        return Err(EpochCleanupError {
-            disposition: CandidateCleanupDisposition::TokenPoisoned,
-            detail: "epoch token was poisoned before dlclose".to_owned(),
-        });
-    }
-    let pins = arena.pin_count();
-    if pins != 0 {
-        return Err(EpochCleanupError {
-            disposition: CandidateCleanupDisposition::TokenPinned,
-            detail: format!("epoch token retains {pins} residency pin(s)"),
-        });
-    }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).map_err(|_| {
-        EpochCleanupError {
-            disposition: CandidateCleanupDisposition::DlcloseFailed,
-            detail: boundary_panic("dlclose").to_string(),
-        }
-    })?;
-    epoch.module.take();
-    epoch.registration_arena.take();
-    epoch.unloaded.store(true, Ordering::Release);
-    Ok(())
+    epoch.unload()
 }
 
 #[cfg(test)]
@@ -2314,7 +2107,6 @@ mod lifecycle_tests {
             failure.cleanup,
             CandidateCleanupDisposition::ModuleUnloadFailed
         );
-        assert_eq!(host.retired_count(), 1);
     }
 }
 
@@ -2503,11 +2295,9 @@ mod callback_tests {
             Err(CallbackInvokeError::HostRejected(detail))
                 if detail.contains("import-context")
         ));
-        let status = epoch.status();
-        assert!(status.accepting_new_work);
-        assert!(!status.poisoned);
+        assert!(epoch.runtime_failure().is_none());
+        assert!(!epoch.0.token.is_poisoned());
 
-        epoch.begin_drain();
         assert!(unload_epoch(&mut epoch).is_ok());
     }
 
@@ -2666,11 +2456,9 @@ mod callback_tests {
             Err(CallbackInvokeError::HostRejected(detail))
                 if detail.contains("codegen-context")
         ));
-        let status = epoch.status();
-        assert!(status.accepting_new_work);
-        assert!(!status.poisoned);
+        assert!(epoch.runtime_failure().is_none());
+        assert!(!epoch.0.token.is_poisoned());
 
-        epoch.begin_drain();
         assert!(unload_epoch(&mut epoch).is_ok());
     }
 
@@ -2881,7 +2669,6 @@ mod callback_tests {
         assert_eq!(generated.len(), 1);
         assert_eq!(generated[0].asset(), AssetUuid([7; 16]));
 
-        epoch.begin_drain();
         assert!(unload_epoch(&mut epoch).is_ok());
     }
 

@@ -383,7 +383,6 @@ impl ProcessDriver {
         });
         let failure_result = coordinator.sync_runtime_pipeline_failure().map(|_| ());
         let result = result.and(failure_result);
-        let _ = coordinator.reap_retired_pipeline_epochs();
         match result {
             Err(error) => {
                 tracing::warn!(%error, "reconciliation failed; requeued");

@@ -51,7 +51,6 @@ use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
     stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,
-    UnloadOutcome,
 };
 use crate::importer::ImportRun;
 use crate::module_loader::DynamicPipelineModuleLoader;
@@ -189,9 +188,6 @@ impl DaemonCoordinator {
                 authority: authority.sender().clone(),
             }),
         )?;
-        let mut host = host;
-        let poke = authority.sender().clone();
-        host.set_wake(Arc::new(move || poke.poke()));
         let pipeline = CoordinatedPipelineRuntime {
             host,
             loader: DynamicPipelineModuleLoader,
@@ -986,10 +982,6 @@ impl DaemonCoordinator {
             }
             Err(error) => Err(CoordinatorError::Coordinated(error)),
         }
-    }
-
-    pub fn reap_retired_pipeline_epochs(&self) -> Vec<UnloadOutcome> {
-        lock_pipeline(&self.pipeline).host.reap_retired()
     }
 
     /// Reconcile one complete identity-checked namespace scan.
@@ -3791,10 +3783,9 @@ mod scheduler_tests {
         };
         let mut prepared = Some(crate::epoch::empty_test_epoch());
 
-        // Unloaded, not retained: a failed unload keeps the epoch, poisoned.
+        // Unloaded: a failed unload would poison and leak the epoch.
         assert_eq!(discard_prepared(&mut runtime, &mut prepared), None);
         assert!(prepared.is_none());
-        assert_eq!(runtime.host.retired_count(), 0);
     }
 
     #[test]

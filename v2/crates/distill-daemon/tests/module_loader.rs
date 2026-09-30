@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use distill_daemon::epoch::{
-    CandidateRequirements, ModuleAbiIdentity, ModuleHost, TargetDefinition, UnloadOutcome,
+    CandidateRequirements, ModuleAbiIdentity, ModuleHost, TargetDefinition,
 };
 use distill_daemon::module_loader::{
     decode_module_abi_identity, encode_module_abi_identity, host_interface_closure_manifest,
@@ -127,14 +127,12 @@ fn compiled_pipeline_cdylib_opens_registers_unloads_and_closes() {
         .publish_candidate(&module_path, requirements.clone(), &mut loader)
         .unwrap();
     drop(first);
-    assert_eq!(host.reap_retired(), vec![UnloadOutcome::Unloaded(1)]);
 
     let missing = temp.path().join("missing-module.dylib");
     assert!(host
         .publish_candidate(&missing, requirements, &mut loader)
         .is_err());
     drop(second);
-    assert_eq!(host.reap_retired(), vec![UnloadOutcome::Unloaded(2)]);
 }
 
 fn fixture_library_path(target_dir: &Path) -> PathBuf {

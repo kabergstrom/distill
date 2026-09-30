@@ -7,11 +7,11 @@ use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{LogicalHash, TypeUuid};
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
-    CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements, EpochWorkError,
+    CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements,
     HostCallbackBoundary, HostCallbackSurface, LoadedPipelineModule, ModuleAbiIdentity,
     ModuleCallError, ModuleEpochPin, ModuleHost, PipelineModuleLoader, PipelineFailureCode,
     PipelineFailureOrigin, Registration, RegistrationDisposition, RegistrationKind,
-    RegistrationResource, RegistrationSet, StagedModule, TargetDefinition, UnloadOutcome,
+    RegistrationResource, RegistrationSet, StagedModule, TargetDefinition,
 };
 
 #[distill_asset::asset(uuid = "30112233-4455-6677-8899-aabbccddeeff")]
@@ -691,7 +691,6 @@ fn leaked_unpublished_token_pin_leaks_candidate_after_unload() {
     assert_eq!(calls.dlclose, 0);
     drop(calls);
     let pin = pin_sink.lock().unwrap().take().unwrap();
-    assert!(pin.is_fenced());
     drop(pin);
 }
 
@@ -742,7 +741,7 @@ fn runtime_failure_fences_every_pin_and_permanently_forbids_dlclose() {
         .publish_candidate(&source, requirements(2), &mut loader)
         .unwrap();
     let old_snapshot = host.snapshot();
-    let job = epoch.try_start_job().unwrap();
+    let job = epoch.clone();
 
     let module_value = ErasedValue::new_in(PanickingAssetDrop, epoch.module_token().clone());
     assert!(module_value.destroy().is_err());
@@ -754,10 +753,8 @@ fn runtime_failure_fences_every_pin_and_permanently_forbids_dlclose() {
         PipelineFailureOrigin::PublishedRuntime,
         CandidateCleanupDisposition::PublishedEpochLeaked,
     );
-    assert!(epoch.try_start_job().is_err());
-    epoch.begin_drain();
+    assert!(epoch.runtime_failure().is_some());
     drop(job);
-    assert!(!epoch.drain_complete());
 
     write_module(&source, 3);
     let next_calls = Arc::new(Mutex::new(Calls::default()));
@@ -768,8 +765,7 @@ fn runtime_failure_fences_every_pin_and_permanently_forbids_dlclose() {
     host.publish_candidate(&source, requirements(3), &mut next)
         .unwrap();
     drop(old_snapshot);
-    let outcomes = host.reap_retired();
-    assert!(outcomes.contains(&UnloadOutcome::LeakedPoisoned(epoch.id())));
+    drop(epoch);
     let calls = calls.lock().unwrap();
     assert_eq!(calls.unload, 0);
     assert_eq!(calls.dlclose, 0);
@@ -795,20 +791,20 @@ fn token_panic_cause_maps_to_panic_failure_without_a_second_report() {
 
     let failure = host.snapshot().epoch().unwrap_err();
     assert_eq!(failure.code, PipelineFailureCode::PublishedCallbackPanic);
-    assert!(matches!(
-        epoch.try_start_job(),
-        Err(EpochWorkError::Failed(ref failure))
-            if failure.code == PipelineFailureCode::PublishedCallbackPanic
-    ));
+    assert_eq!(
+        epoch.runtime_failure().unwrap().code,
+        PipelineFailureCode::PublishedCallbackPanic
+    );
 }
 
 #[test]
-fn ordinary_retirement_is_stale_work_not_candidate_failure() {
+fn retired_epoch_unloads_when_the_last_in_flight_job_finishes() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 32);
+    let first_calls = Arc::new(Mutex::new(Calls::default()));
     let mut first_loader = FakeLoader {
-        module: Some(fake_module(32, Arc::new(Mutex::new(Calls::default())))),
+        module: Some(fake_module(32, first_calls.clone())),
         open_error: None,
     };
     let mut host = module_host(temp.path().join("state")).unwrap();
@@ -823,10 +819,15 @@ fn ordinary_retirement_is_stale_work_not_candidate_failure() {
     };
     host.publish_candidate(&source, requirements(33), &mut second_loader)
         .unwrap();
-    assert!(matches!(
-        first.try_start_job(),
-        Err(EpochWorkError::Retired { epoch_id }) if epoch_id == first.id()
-    ));
+    // `first` stands in for a job that started before the swap: it keeps
+    // the old module loaded and callable until it finishes.
+    assert!(first.runtime_failure().is_none());
+    assert_eq!(first_calls.lock().unwrap().unload, 0);
+    drop(first);
+    let calls = first_calls.lock().unwrap();
+    assert_eq!(calls.cleanup_order, ["cook#0"]);
+    assert_eq!(calls.unload, 1);
+    assert_eq!(calls.dlclose, 1);
 }
 
 #[test]
@@ -854,7 +855,7 @@ fn runtime_rejection_and_retirement_cleanup_emit_exact_dspp_records() {
 
     write_module(&source, 23);
     let cleanup_calls = Arc::new(Mutex::new(Calls::default()));
-    let mut cleanup_module = fake_module(23, cleanup_calls);
+    let mut cleanup_module = fake_module(23, cleanup_calls.clone());
     cleanup_module.unload_error = Some("published unload refused");
     let mut cleanup_loader = FakeLoader {
         module: Some(cleanup_module),
@@ -864,7 +865,6 @@ fn runtime_rejection_and_retirement_cleanup_emit_exact_dspp_records() {
     let retiring = cleanup_host
         .publish_candidate(&source, requirements(23), &mut cleanup_loader)
         .unwrap();
-    let retiring_id = retiring.id();
     drop(retiring);
 
     write_module(&source, 24);
@@ -876,16 +876,10 @@ fn runtime_rejection_and_retirement_cleanup_emit_exact_dspp_records() {
     cleanup_host
         .publish_candidate(&source, requirements(24), &mut next_loader)
         .unwrap();
-    assert!(cleanup_host
-        .reap_retired()
-        .contains(&UnloadOutcome::LeakedPoisoned(retiring_id)));
-    let cleanup = cleanup_host.retired_failure(retiring_id).unwrap();
-    assert_failure_fields(
-        &cleanup,
-        PipelineFailureCode::PublishedCleanup,
-        PipelineFailureOrigin::PublishedRuntime,
-        CandidateCleanupDisposition::PublishedEpochLeaked,
-    );
+    // The refused unload leaks the retired library instead of closing it.
+    let calls = cleanup_calls.lock().unwrap();
+    assert_eq!(calls.unload, 1);
+    assert_eq!(calls.dlclose, 0);
 }
 
 #[test]
@@ -912,15 +906,8 @@ fn clean_epoch_waits_for_snapshot_pin_then_unloads_and_closes() {
     host.publish_candidate(&source, requirements(5), &mut next)
         .unwrap();
     drop(epoch);
-    assert!(host
-        .reap_retired()
-        .iter()
-        .any(|outcome| matches!(outcome, UnloadOutcome::Pinned(_))));
+    assert_eq!(calls.lock().unwrap().unload, 0);
     drop(pin);
-    assert!(host
-        .reap_retired()
-        .iter()
-        .any(|outcome| matches!(outcome, UnloadOutcome::Unloaded(_))));
     let calls = calls.lock().unwrap();
     assert_eq!(calls.register, 1);
     assert_eq!(calls.cleanup_order, ["cook#0"]);
