@@ -53,7 +53,6 @@ impl AuthoringService {
         let runtime = OperationRuntime {
             store: Arc::clone(&self.store),
             scanner: self.scanner.clone(),
-            scan_snapshot: Arc::clone(&self.scan_snapshot),
             quarantine: self.quarantine_snapshot(),
             lineage_destination: self.lineage_destination_snapshot(),
             pipeline_projection: self.pipeline_projection(),
@@ -149,18 +148,17 @@ impl AuthoringService {
         &self,
         base: InputVersion,
     ) -> Result<(Vec<OperationFile>, Vec<String>), RpcFailure> {
-        let cached_schemas = {
+        let (cached_schemas, snapshot) = {
             let store = self
                 .store
                 .lock()
                 .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
             require_base(&store, base)?;
-            store.all_schemas().map_err(invalid)?
+            (
+                store.all_schemas().map_err(invalid)?,
+                crate::scanner::ScanSnapshot::load_bundles(&store).map_err(invalid)?,
+            )
         };
-        let snapshot = self
-            .scan_snapshot
-            .lock()
-            .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
         let mut holders = BTreeMap::new();
         let mut failures = Vec::new();
         for (hash, json) in cached_schemas {
@@ -447,10 +445,13 @@ impl AuthoringService {
                 .map_err(invalid)?
         };
 
-        let snapshot = self
-            .scan_snapshot
-            .lock()
-            .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
+        let snapshot = crate::scanner::ScanSnapshot::load_bundles(
+            &**self
+                .store
+                .lock()
+                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?,
+        )
+        .map_err(invalid)?;
         let claimants = snapshot.lineage_claimants();
         let [claimant] = claimants.as_slice() else {
             return Err(invalid(
@@ -666,7 +667,6 @@ mod transition_proof_tests {
 struct OperationRuntime {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
-    scan_snapshot: Arc<Mutex<crate::scanner::ScanSnapshot>>,
     quarantine: QuarantineDriver,
     lineage_destination: LineageDestination,
     pipeline_projection: PipelineProjection,
@@ -905,7 +905,6 @@ impl OperationRuntime {
             .collect::<Vec<_>>();
         let commit = publish_incremental_paths(
             &self.scanner,
-            &self.scan_snapshot,
             &changed_paths,
             &self.lineage_destination,
             &self.store,
@@ -985,7 +984,6 @@ impl OperationRuntime {
 
         let commit = publish_incremental_paths(
             &self.scanner,
-            &self.scan_snapshot,
             &attempted_paths,
             &self.lineage_destination,
             &self.store,
@@ -1100,10 +1098,13 @@ impl OperationRuntime {
             };
         let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
             let observed = self.scanner.scan().map_err(|error| error.to_string())?;
-            let published = self
-                .scan_snapshot
-                .lock()
-                .map_err(|_| "scan snapshot mutex is poisoned".to_owned())?;
+            let published = crate::scanner::ScanSnapshot::load(
+                &**self
+                    .store
+                    .lock()
+                    .map_err(|_| "store mutex is poisoned".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?;
             let mismatch = !observed.same_observation(&published);
             let diagnostics = observed
                 .diagnostic_rows()

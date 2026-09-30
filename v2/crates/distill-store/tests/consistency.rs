@@ -133,7 +133,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                     size: 1,
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
-                },
+                }.into(),
                 distill_store::state::InputVersion(1),
             )?;
             txn.upsert_bundle(&BundleMeta {
@@ -232,7 +232,7 @@ fn wal_readers_only_observe_complete_input_versions() {
                     size: 1,
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
-                },
+                }.into(),
                 distill_store::state::InputVersion(1),
             )
         })
@@ -258,7 +258,7 @@ fn wal_readers_only_observe_complete_input_versions() {
                     size: 2,
                     kind: distill_store::files::FileKind::File,
                     content_hash: None,
-                },
+                }.into(),
                 distill_store::state::InputVersion(2),
             )
         })

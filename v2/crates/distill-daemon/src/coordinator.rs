@@ -33,7 +33,7 @@ use distill_store::bundles::{
     SkeletonEntry,
 };
 use distill_store::config::{PendingRestart, RestartOnlyChange};
-use distill_store::files::{FileKind, FileState, PendingFileWork};
+use distill_store::files::{FileObservation, PendingFileWork};
 use distill_store::journal::{JournalIntentPlan, PublicationGroupKind, RenameAsideOutcome};
 use distill_store::pipeline::{
     AcceptedTypeLineage, SchemaLineageManifest, SchemaReactivationRequest, SchemaRollbackRequest,
@@ -65,7 +65,7 @@ use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::QuarantineDriver;
 use crate::scanner::{
     AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanDelta, ScanDiagnostic, ScanError,
-    ScanSnapshot, ScannedBundle, ScannedFileKind,
+    ScanSnapshot, ScannedBundle, StoredBaseline,
 };
 use crate::scheduler::{Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
@@ -96,7 +96,6 @@ pub(crate) struct ConfigurationCandidate {
 pub struct DaemonCoordinator {
     store: Arc<Mutex<Store>>,
     scanner: RootedScanner,
-    scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     scan_projection: Mutex<ScanProjectionIndex>,
     scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
@@ -196,13 +195,11 @@ impl DaemonCoordinator {
             DaemonOwnedDirectoryKind::ModuleStaging,
             module_state_path.join("modules"),
         )?;
-        let scan_snapshot = Arc::new(Mutex::new(ScanSnapshot::default()));
         let backend = Arc::new(AuthoringService::new(
             Arc::clone(&store),
             roots,
             scanner.clone(),
             lineage_destination.clone(),
-            Arc::clone(&scan_snapshot),
         )?);
         let target_set = distill_rpc::target_map(targets)?;
         {
@@ -244,7 +241,6 @@ impl DaemonCoordinator {
         Ok(Self {
             store,
             scanner,
-            scan_snapshot,
             scan_projection: Mutex::new(ScanProjectionIndex::default()),
             scan_initialized: AtomicBool::new(false),
             scan_healthy: AtomicBool::new(true),
@@ -312,11 +308,16 @@ impl DaemonCoordinator {
 
     /// Current non-fatal filesystem exclusions in canonical rooted-path
     /// order. These rows are also reported by `doctor verify`.
-    pub fn scan_diagnostics(&self) -> Vec<ScanDiagnostic> {
-        lock_scan_snapshot(&self.scan_snapshot)
-            .diagnostic_rows()
-            .cloned()
-            .collect()
+    pub fn scan_diagnostics(&self) -> Result<Vec<ScanDiagnostic>, CoordinatorError> {
+        ScanSnapshot::load_diagnostics(&lock_store(&self.store))
+            .map(|scan| scan.diagnostic_rows().cloned().collect())
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
+    }
+
+    /// The published observation, from the store's scan tables.
+    fn published_scan(&self) -> Result<ScanSnapshot, CoordinatorError> {
+        ScanSnapshot::load(&lock_store(&self.store))
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
     pub fn authoring_service(&self) -> &Arc<AuthoringService> {
@@ -672,7 +673,7 @@ impl DaemonCoordinator {
             let scan = if candidate_scan_heals {
                 filesystem.scanner().scan()?
             } else {
-                lock_scan_snapshot(&self.scan_snapshot).clone()
+                self.published_scan()?
             };
             let installed_snapshot = scan.clone();
             let destination = filesystem.lineage_destination().clone();
@@ -824,7 +825,6 @@ impl DaemonCoordinator {
                         .expect("configuration candidate installs once");
                     self.scanner.replace_from(filesystem.scanner());
                     authoring.install_filesystem_candidate(filesystem);
-                    *lock_scan_snapshot(&self.scan_snapshot) = installed_snapshot;
                     *lock_scan_projection(&self.scan_projection) = installed_projection;
                     self.scan_initialized.store(true, Ordering::Release);
                     if candidate_scan_heals {
@@ -1302,7 +1302,6 @@ impl DaemonCoordinator {
             transition_paths.dedup();
             let commit = publish_incremental_paths_with_schema_transition(
                 &self.scanner,
-                &self.scan_snapshot,
                 &transition_paths,
                 &self
                     .lineage_destination
@@ -1445,16 +1444,19 @@ impl DaemonCoordinator {
     pub fn reconcile_full_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
         self.on_authority(|| {
             match self.scanner.scan() {
-                Ok(scan) if self.scan_healthy.load(Ordering::Acquire) => {
-                    let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
-                    if scan.same_namespace_observation(&baseline) {
+                Ok(scan)
+                    if self.scan_healthy.load(Ordering::Acquire)
+                        && self.scan_initialized.load(Ordering::Acquire) =>
+                {
+                    let mut store = lock_store(&self.store);
+                    if scan.same_namespace_observation(&ScanSnapshot::load(&store)?) {
                         // Warning-grade exclusions are scanner state, not authored
                         // input: refresh them without minting an input version.
-                        *baseline = scan;
-                        drop(baseline);
+                        store.replace_scan_diagnostics(None, &scan.encoded_diagnostic_rows())?;
+                        drop(store);
                         Ok(self.server().current_stamp())
                     } else {
-                        drop(baseline);
+                        drop(store);
                         self.publish_scan(scan)
                     }
                 }
@@ -1570,14 +1572,23 @@ impl DaemonCoordinator {
             }
             // On the authority: no other publication interleaves with this step.
             let server = self.server();
-            let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
-            let delta = match self.scanner.scan_incremental_delta(&baseline, &scan_paths) {
-                Ok(None) => return Ok(server.current_stamp()),
-                Ok(Some(delta)) => delta,
-                Err(error) => {
-                    drop(baseline);
-                    self.scan_healthy.store(false, Ordering::Release);
-                    return self.publish_scan_rejection(&error, heals_pending_rejection);
+            let (delta, baseline) = {
+                let store = lock_store(&self.store);
+                let stored = StoredBaseline::new(&store);
+                let delta = self.scanner.scan_incremental_delta(&stored, &scan_paths);
+                stored.finish()?;
+                match delta {
+                    Ok(None) => return Ok(server.current_stamp()),
+                    // The published rows the delta replaces.
+                    Ok(Some(delta)) => {
+                        let baseline = ScanSnapshot::load_under(&store, delta.affected_prefixes())?;
+                        (delta, baseline)
+                    }
+                    Err(error) => {
+                        drop(store);
+                        self.scan_healthy.store(false, Ordering::Release);
+                        return self.publish_scan_rejection(&error, heals_pending_rejection);
+                    }
                 }
             };
             let healed_rejection = heals_pending_rejection
@@ -1594,7 +1605,10 @@ impl DaemonCoordinator {
             {
                 // Diagnostics are replaced with their affected subtree even when
                 // the authored namespace itself did not change.
-                baseline.apply_delta(delta);
+                lock_store(&self.store).replace_scan_diagnostics(
+                    Some(delta.affected_prefixes()),
+                    &delta.observed().encoded_diagnostic_rows(),
+                )?;
                 return Ok(server.current_stamp());
             }
             let projection = self.authoring.pipeline_projection();
@@ -1675,7 +1689,6 @@ impl DaemonCoordinator {
             });
             match result {
                 Ok(stamp) => {
-                    baseline.apply_delta(delta);
                     if plan.version_poison.is_none() {
                         index.clear_published_pending();
                     }
@@ -1703,7 +1716,7 @@ impl DaemonCoordinator {
     }
 
     fn publish_cached_scan(&self) -> Result<SnapshotStamp, CoordinatorError> {
-        let scan = lock_scan_snapshot(&self.scan_snapshot).clone();
+        let scan = self.published_scan()?;
         self.publish_scan_with_renames(scan, &[], false)
     }
 
@@ -1777,7 +1790,6 @@ impl DaemonCoordinator {
                 Ok(commit)
             })
             .map_err(CoordinatorError::Coordinated)?;
-        *lock_scan_snapshot(&self.scan_snapshot) = published_snapshot;
         *lock_scan_projection(&self.scan_projection) = published_projection;
         self.scan_initialized.store(true, Ordering::Release);
         if heals_scan_rejection {
@@ -2304,6 +2316,12 @@ impl std::error::Error for CoordinatorError {}
 impl From<ScanError> for CoordinatorError {
     fn from(error: ScanError) -> Self {
         Self::Scan(error)
+    }
+}
+
+impl From<StoreError> for CoordinatorError {
+    fn from(error: StoreError) -> Self {
+        Self::InvalidManifest(error.to_string())
     }
 }
 
@@ -3424,7 +3442,11 @@ fn publish_scan(
             ),
         });
     }
-    let old_files = store.all_files()?;
+    let old_files = store
+        .observed_files()?
+        .into_iter()
+        .map(|row| ((row.root_name, row.path), row.file))
+        .collect::<BTreeMap<_, _>>();
     let old_bundles = store.all_bundles()?;
     let old_asset_bundles = store.all_asset_bundles()?;
     let old_paths = store.all_path_entries()?;
@@ -3535,29 +3557,40 @@ fn publish_scan(
     let mut healed_retired = false;
     store.input_transaction(|transaction| {
         let mut root_ids = BTreeMap::new();
-        let mut scanned_keys = BTreeSet::new();
         let mut newest_mtime = 0;
-        for file in candidate.scan.file_rows() {
+        for (key, file) in candidate.scan.file_observations() {
             let root = *root_ids
-                .entry(file.root_name.clone())
-                .or_insert(transaction.intern_root(&file.root_name)?);
-            let state = file_state(file);
-            scanned_keys.insert((root, file.normalized_path.clone()));
-            newest_mtime = newest_mtime.max(file.modified_nanos);
-            let changed = old_files.iter().find_map(|(old_root, path, old)| {
-                (*old_root == root && path == &file.normalized_path).then_some(old != &state)
-            });
-            if changed.unwrap_or(true) {
-                transaction.upsert_file(root, &file.normalized_path, &state, observation)?;
-                transaction.push_dirty(root, &file.normalized_path, true, observation)?;
+                .entry(key.0.clone())
+                .or_insert(transaction.intern_root(&key.0)?);
+            newest_mtime = newest_mtime.max(file.state.mtime);
+            let old = old_files.get(key);
+            if old == Some(&file) {
+                continue;
+            }
+            transaction.upsert_file(root, &key.1, &file, observation)?;
+            if let Some(bundle) = candidate.scan.bundles.get(key) {
+                transaction.set_bundle_file(root, &key.1, &bundle.bytes)?;
+            }
+            if old.is_none_or(|old| old.state != file.state) {
+                transaction.push_dirty(root, &key.1, true, observation)?;
             }
         }
-        for (root, path, _) in &old_files {
-            if !scanned_keys.contains(&(*root, path.clone())) {
-                transaction.remove_file(*root, path)?;
-                transaction.push_dirty(*root, path, false, observation)?;
+        for (root_name, path) in old_files.keys() {
+            if !candidate
+                .scan
+                .files
+                .contains_key(&(root_name.clone(), path.clone()))
+            {
+                let root = transaction.intern_root(root_name)?;
+                transaction.remove_file(root, path)?;
+                transaction.push_dirty(root, path, false, observation)?;
             }
         }
+        transaction.replace_scan_structure(
+            None,
+            &candidate.scan.directory_rows(),
+            &candidate.scan.encoded_diagnostic_rows(),
+        )?;
         transaction.set_clean_watermark(newest_mtime)?;
         transaction.set_version_poisons(candidate.version_poison.clone())?;
         if waiting.is_none() {
@@ -3711,7 +3744,12 @@ fn publish_scan(
 struct IncrementalFileMutation {
     root_name: String,
     path: String,
-    state: Option<FileState>,
+    /// The new row; `None` removes it.
+    file: Option<FileObservation>,
+    /// The bytes of a new or changed `.bundle` row.
+    bundle: Option<Arc<ScannedBundle>>,
+    /// Whether the tree state changed (watcher work for importers).
+    dirty: bool,
 }
 
 #[derive(Debug)]
@@ -3954,7 +3992,7 @@ fn publish_incremental_scan(
             .map(|basis| basis.manifest_hash));
     let mut complete_waiting_scan = None;
     if was_retired || schema_transition.is_some() {
-        let mut next = baseline.clone();
+        let mut next = ScanSnapshot::load(&store)?;
         next.apply_delta(delta.clone());
         complete_waiting_scan = Some(next);
     }
@@ -4129,11 +4167,16 @@ fn publish_incremental_scan(
             let root = *root_ids
                 .entry(mutation.root_name.clone())
                 .or_insert(transaction.intern_root(&mutation.root_name)?);
-            match &mutation.state {
-                Some(state) => {
-                    transaction.upsert_file(root, &mutation.path, state, observation)?;
-                    transaction.push_dirty(root, &mutation.path, true, observation)?;
-                    newest_mtime = newest_mtime.max(state.mtime);
+            match &mutation.file {
+                Some(file) => {
+                    transaction.upsert_file(root, &mutation.path, file, observation)?;
+                    if let Some(bundle) = &mutation.bundle {
+                        transaction.set_bundle_file(root, &mutation.path, &bundle.bytes)?;
+                    }
+                    if mutation.dirty {
+                        transaction.push_dirty(root, &mutation.path, true, observation)?;
+                    }
+                    newest_mtime = newest_mtime.max(file.state.mtime);
                 }
                 None => {
                     transaction.remove_file(root, &mutation.path)?;
@@ -4141,6 +4184,11 @@ fn publish_incremental_scan(
                 }
             }
         }
+        transaction.replace_scan_structure(
+            Some(delta.affected_prefixes()),
+            &delta.observed().directory_rows(),
+            &delta.observed().encoded_diagnostic_rows(),
+        )?;
         transaction.set_clean_watermark(newest_mtime)?;
         transaction.set_version_poisons(plan.version_poison.clone())?;
         match &plan.configuration {
@@ -4284,18 +4332,20 @@ fn incremental_file_mutations(
     baseline: &ScanSnapshot,
     delta: &ScanDelta,
 ) -> Vec<IncrementalFileMutation> {
-    let mut old = BTreeMap::<ScanKey, FileState>::new();
-    for prefix in delta.affected_prefixes() {
-        for (key, file) in baseline.files.range(prefix.clone()..) {
-            if !scan_key_matches(prefix, key) {
-                break;
-            }
-            old.insert(key.clone(), file_state(file));
-        }
-    }
-    let current = delta
-        .observed_file_entries()
-        .map(|(key, file)| (key.clone(), file_state(file)))
+    let old = baseline
+        .file_observations()
+        .filter(|(key, _)| {
+            delta
+                .affected_prefixes()
+                .iter()
+                .any(|prefix| scan_key_matches(prefix, key))
+        })
+        .map(|(key, file)| (key.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    let observed = delta.observed();
+    let current = observed
+        .file_observations()
+        .map(|(key, file)| (key.clone(), file))
         .collect::<BTreeMap<_, _>>();
     old.keys()
         .chain(current.keys())
@@ -4306,9 +4356,11 @@ fn incremental_file_mutations(
             let before = old.get(&key);
             let after = current.get(&key);
             (before != after).then(|| IncrementalFileMutation {
+                dirty: before.map(|file| &file.state) != after.map(|file| &file.state),
+                bundle: after.and_then(|_| observed.bundles.get(&key).cloned()),
+                file: after.cloned(),
                 root_name: key.0,
                 path: key.1,
-                state: after.cloned(),
             })
         })
         .collect()
@@ -4359,7 +4411,6 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
 #[allow(clippy::too_many_arguments)] // The authoring boundary passes each publication authority explicitly.
 pub(crate) fn publish_incremental_paths(
     scanner: &RootedScanner,
-    scan_snapshot: &Mutex<ScanSnapshot>,
     paths: &[PathBuf],
     lineage_destination: &LineageDestination,
     store: &Arc<Mutex<Store>>,
@@ -4369,7 +4420,6 @@ pub(crate) fn publish_incremental_paths(
 ) -> Result<Commit, String> {
     publish_incremental_paths_with_schema_transition(
         scanner,
-        scan_snapshot,
         paths,
         lineage_destination,
         store,
@@ -4383,7 +4433,6 @@ pub(crate) fn publish_incremental_paths(
 #[allow(clippy::too_many_arguments)]
 fn publish_incremental_paths_with_schema_transition(
     scanner: &RootedScanner,
-    scan_snapshot: &Mutex<ScanSnapshot>,
     paths: &[PathBuf],
     lineage_destination: &LineageDestination,
     store: &Arc<Mutex<Store>>,
@@ -4392,13 +4441,18 @@ fn publish_incremental_paths_with_schema_transition(
     coordinator: Option<&DaemonCoordinator>,
     schema_transition: Option<&IncrementalSchemaTransition<'_>>,
 ) -> Result<Commit, String> {
-    let mut baseline = scan_snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let delta = scanner
-        .scan_incremental_delta(&baseline, paths)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "authored path is outside every configured root".to_owned())?;
+    let (delta, baseline) = {
+        let store = lock_store(store);
+        let stored = StoredBaseline::new(&store);
+        let delta = scanner.scan_incremental_delta(&stored, paths);
+        stored.finish().map_err(|error| error.to_string())?;
+        let delta = delta
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "authored path is outside every configured root".to_owned())?;
+        let baseline = ScanSnapshot::load_under(&store, delta.affected_prefixes())
+            .map_err(|error| error.to_string())?;
+        (delta, baseline)
+    };
     let authority = coordinator.and_then(DaemonCoordinator::schema_authority);
     let tag_epoch = authority
         .as_ref()
@@ -4465,7 +4519,6 @@ fn publish_incremental_paths_with_schema_transition(
                 }
             }
         }
-        baseline.apply_delta(delta);
         if plan.version_poison.is_none() {
             index.clear_published_pending();
         }
@@ -4476,19 +4529,19 @@ fn publish_incremental_paths_with_schema_transition(
         return Err("schema transition requires the live daemon coordinator".to_owned());
     }
 
-    let mut scan = baseline.clone();
+    drop(baseline);
+    let mut scan = ScanSnapshot::load(&lock_store(store)).map_err(|error| error.to_string())?;
     scan.apply_delta(delta);
     let candidate = ScanCandidate::build(
         scanner,
         lineage_destination,
-        scan.clone(),
+        scan,
         None,
         authority.as_deref(),
     )
     .map_err(|error| error.to_string())?;
     let commit = publish_scan(store, base, candidate, false, None, projection, tag_epoch)
         .map_err(|error| error.to_string())?;
-    *baseline = scan;
     Ok(commit)
 }
 
@@ -4740,19 +4793,6 @@ fn split_authoring_value(value: &AuthoredValue) -> Result<AuthoringValue, StoreE
     })
 }
 
-fn file_state(file: &crate::scanner::ScannedFile) -> FileState {
-    FileState {
-        mtime: file.modified_nanos,
-        size: file.size,
-        kind: match file.kind {
-            ScannedFileKind::File => FileKind::File,
-            ScannedFileKind::Directory => FileKind::Directory,
-            ScannedFileKind::Symlink => FileKind::Symlink,
-        },
-        content_hash: file.content_hash,
-    }
-}
-
 fn readable_source(source: &crate::scanner::ScannedBundle) -> ReadableBundleSource {
     ReadableBundleSource {
         root_name: source.root_name.clone(),
@@ -4960,12 +5000,6 @@ impl distill_rpc::ExternalStore for DaemonStore {
     fn with_store(&self, job: &mut dyn FnMut(&mut Store)) {
         job(&mut lock_store(&self.store));
     }
-}
-
-fn lock_scan_snapshot(snapshot: &Mutex<ScanSnapshot>) -> MutexGuard<'_, ScanSnapshot> {
-    snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn lock_scan_projection(

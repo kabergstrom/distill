@@ -37,7 +37,9 @@ use distill_store::Store;
 use globset::Glob;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
-use crate::scanner::{RootedScanner, ScanError, ScanSnapshot, ScannedFileKind};
+use crate::scanner::{RootedScanner, ScanError};
+use distill_store::files::{FileKind, ObservedFile};
+use distill_store::StoreReader;
 
 pub trait AuthoringImporter: Send + Sync {
     fn id(&self) -> &str;
@@ -219,7 +221,7 @@ impl AuthoringService {
         index.directories.clear();
         index.bundle_hashes.clear();
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+            RootedImportBackend::new(&self.scanner, store, capabilities);
         for meta in store.all_bundles().map_err(invalid)? {
             self.index_import_bundle(store, index, &mut backend, &meta)?;
         }
@@ -249,17 +251,16 @@ impl AuthoringService {
             return Ok(());
         }
         let sources = {
-            let snapshot = self
-                .scan_snapshot
-                .lock()
-                .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
-            keys.iter()
-                .filter_map(|(root, path)| {
-                    snapshot
-                        .bundle_at(root, path)
-                        .map(|source| ((root.clone(), path.clone()), source))
-                })
-                .collect::<BTreeMap<_, _>>()
+            let mut sources = BTreeMap::new();
+            for (root, path) in &keys {
+                if let Some(bytes) = store.bundle_file(root, path).map_err(invalid)? {
+                    sources.insert(
+                        (root.clone(), path.clone()),
+                        crate::scanner::scanned_bundle(root, path, bytes),
+                    );
+                }
+            }
+            sources
         };
         let changed = keys
             .into_iter()
@@ -283,7 +284,7 @@ impl AuthoringService {
             index.bundle_hashes.remove(key);
         }
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+            RootedImportBackend::new(&self.scanner, store, capabilities);
         for (_key, source) in sources.into_iter().filter(|(key, _)| changed.contains(key)) {
             let Ok(bundle) = &source.parsed else {
                 continue;
@@ -417,7 +418,7 @@ impl AuthoringService {
                 continue;
             };
             let mut backend =
-                RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+                RootedImportBackend::new(&self.scanner, &store, &capabilities);
             if work.is_some_and(|(dirty, renames)| {
                 !read_set_intersects_work(&indexed.basis, dirty, renames, capabilities_changed)
             }) {
@@ -465,7 +466,7 @@ impl AuthoringService {
             .lock()
             .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
         let capabilities = self.importer_capabilities()?;
-        let backend = RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+        let backend = RootedImportBackend::new(&self.scanner, &store, &capabilities);
         let mut index = self
             .import_watch_index
             .lock()
@@ -479,7 +480,7 @@ impl AuthoringService {
         if let Some((dirty, renames)) = work {
             let dirty_bundle_keys = dirty_bundle_keys(&store, dirty)?;
             let changed_bundle_keys =
-                changed_bundle_keys(&index, &self.scan_snapshot, &dirty_bundle_keys)?;
+                changed_bundle_keys(&index, &store, &dirty_bundle_keys)?;
             let previous = index
                 .directories
                 .values()
@@ -598,7 +599,7 @@ impl AuthoringService {
         capabilities: &BTreeMap<String, [u8; 32]>,
     ) -> Result<(), RpcFailure> {
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+            RootedImportBackend::owned(&self.scanner, store.reader().map_err(invalid)?, capabilities);
         for meta in bundles {
             let Some(origin) = &meta.origin else {
                 continue;
@@ -656,7 +657,7 @@ impl AuthoringService {
             return Ok(());
         }
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+            RootedImportBackend::owned(&self.scanner, store.reader().map_err(invalid)?, capabilities);
         for origin in orphaned {
             for bundle in store
                 .bundles_owned_by(origin.rules_bundle)
@@ -813,7 +814,7 @@ impl AuthoringService {
             return Ok(true);
         }
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, capabilities);
+            RootedImportBackend::new(&self.scanner, store, capabilities);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
             Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                 return Ok(true);
@@ -854,7 +855,7 @@ impl AuthoringService {
 
         let capabilities = self.importer_capabilities()?;
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+            RootedImportBackend::open(&self.scanner, &self.store, &capabilities)?;
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
         self.execute_import(
             base,
@@ -1082,7 +1083,8 @@ impl AuthoringService {
             .importer_capabilities()
             .map_err(ImportExecutionError::unmemoized)?;
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+            RootedImportBackend::open(&self.scanner, &self.store, &capabilities)
+                .map_err(ImportExecutionError::unmemoized)?;
         let mut context = ImportContext::new(&importer.id, sources.clone(), &mut backend)
             .map_err(invalid)
             .map_err(ImportExecutionError::unmemoized)?;
@@ -1221,7 +1223,7 @@ impl AuthoringService {
             .importer_capabilities()
             .map_err(ImportExecutionError::unmemoized)?;
         let mut recheck =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+            RootedImportBackend::new(&self.scanner, &store, &capabilities);
         if !revalidate_read_set(&read_set, &mut recheck) {
             return Err(ImportExecutionError::unmemoized(invalid(
                 "import read-set changed before publication; the result was discarded",
@@ -1323,7 +1325,7 @@ impl AuthoringService {
         let basis = encode_attempt_basis(read_set)?;
         let capabilities = self.importer_capabilities()?;
         let mut backend =
-            RootedImportBackend::new(&self.scanner, &self.scan_snapshot, &capabilities);
+            RootedImportBackend::open(&self.scanner, &self.store, &capabilities)?;
         if !revalidate_read_set(read_set, &mut backend) {
             return Ok(false);
         }
@@ -1497,20 +1499,16 @@ impl AuthoringService {
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let snapshot = self
-            .scan_snapshot
-            .lock()
-            .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
-        let source = snapshot
-            .bundle_rows()
-            .find(|source| source.root_name == root && source.normalized_path == meta.path)
-            .ok_or_else(|| invalid("durable bundle is missing from the published scan snapshot"))?;
-        if ContentHash(source.file_hash.0) != meta.content_hash {
+        let bytes = store
+            .bundle_file(&root, &meta.path)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("durable bundle is missing from the published scan"))?;
+        if ContentHash(*blake3::hash(&bytes).as_bytes()) != meta.content_hash {
             return Err(invalid(
-                "published scan snapshot does not match durable bundle metadata",
+                "published scan does not match durable bundle metadata",
             ));
         }
-        source.parsed.clone().map_err(invalid)
+        distill_bundle::parse_bundle(&bytes).map_err(invalid)
     }
 
     fn read_prior_import_cached(
@@ -1653,25 +1651,20 @@ fn dirty_bundle_keys(
 
 fn changed_bundle_keys(
     index: &ImportWatchIndex,
-    snapshot: &Mutex<ScanSnapshot>,
+    store: &Store,
     keys: &BTreeSet<(String, String)>,
 ) -> Result<BTreeSet<(String, String)>, RpcFailure> {
-    let snapshot = snapshot
-        .lock()
-        .map_err(|_| invalid("scan snapshot mutex is poisoned"))?;
-    Ok(keys
-        .iter()
-        .filter(|(root, path)| {
-            index
-                .bundle_hashes
-                .get(&(root.clone(), path.clone()))
-                .copied()
-                != snapshot
-                    .bundle_at(root, path)
-                    .map(|source| ContentHash(source.file_hash.0))
-        })
-        .cloned()
-        .collect())
+    let mut changed = BTreeSet::new();
+    for key in keys {
+        let published = store
+            .observed_file(&key.0, &key.1)
+            .map_err(invalid)?
+            .and_then(|row| row.file.state.content_hash);
+        if index.bundle_hashes.get(key).copied() != published {
+            changed.insert(key.clone());
+        }
+    }
+    Ok(changed)
 }
 
 fn directory_assignment(
@@ -1846,23 +1839,83 @@ impl AuthoringImportContext for TracedImportContext<'_, '_> {
     }
 }
 
+/// Import reads over the published `files` rows and the rooted filesystem.
 struct RootedImportBackend<'a> {
     scanner: &'a RootedScanner,
-    rows: &'a Mutex<ScanSnapshot>,
+    rows: ImportRows<'a>,
     capabilities: &'a BTreeMap<String, [u8; 32]>,
+}
+
+/// The store connection an import backend reads `files` through: the
+/// caller's, or its own when no store lock may be held across the import.
+enum ImportRows<'a> {
+    Borrowed(&'a StoreReader),
+    Owned(StoreReader),
+}
+
+impl std::ops::Deref for ImportRows<'_> {
+    type Target = StoreReader;
+
+    fn deref(&self) -> &StoreReader {
+        match self {
+            Self::Borrowed(reader) => reader,
+            Self::Owned(reader) => reader,
+        }
+    }
 }
 
 impl<'a> RootedImportBackend<'a> {
     fn new(
         scanner: &'a RootedScanner,
-        snapshot: &'a Mutex<ScanSnapshot>,
+        reader: &'a StoreReader,
         capabilities: &'a BTreeMap<String, [u8; 32]>,
     ) -> Self {
         Self {
             scanner,
-            rows: snapshot,
+            rows: ImportRows::Borrowed(reader),
             capabilities,
         }
+    }
+
+    fn owned(
+        scanner: &'a RootedScanner,
+        reader: StoreReader,
+        capabilities: &'a BTreeMap<String, [u8; 32]>,
+    ) -> Self {
+        Self {
+            scanner,
+            rows: ImportRows::Owned(reader),
+            capabilities,
+        }
+    }
+
+    /// A backend on its own store connection.
+    fn open(
+        scanner: &'a RootedScanner,
+        store: &Mutex<Store>,
+        capabilities: &'a BTreeMap<String, [u8; 32]>,
+    ) -> Result<Self, RpcFailure> {
+        let reader = store
+            .lock()
+            .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?
+            .reader()
+            .map_err(invalid)?;
+        Ok(Self {
+            scanner,
+            rows: ImportRows::Owned(reader),
+            capabilities,
+        })
+    }
+
+    /// The readable (file or symlinked file) rows at `path`.
+    fn files_at(&self, path: &str) -> Result<Vec<ObservedFile>, RawFileFailureClass> {
+        Ok(self
+            .rows
+            .observed_files_at(path)
+            .map_err(|_| RawFileFailureClass::OtherStable)?
+            .into_iter()
+            .filter(|row| matches!(row.file.state.kind, FileKind::File | FileKind::Symlink))
+            .collect())
     }
 
     fn matching_path(
@@ -1873,14 +1926,10 @@ impl<'a> RootedImportBackend<'a> {
         if !query_matches(query, path) {
             return Ok(BTreeSet::new());
         }
-        self.rows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .files_at(path)
+        self.files_at(path)?
             .into_iter()
-            .filter(|file| matches!(file.kind, ScannedFileKind::File | ScannedFileKind::Symlink))
-            .map(|file| {
-                RootedPath::new(&file.root_name, &file.normalized_path)
+            .map(|row| {
+                RootedPath::new(&row.root_name, &row.path)
                     .map_err(|_| RawFileFailureClass::OtherStable)
             })
             .collect()
@@ -1890,15 +1939,11 @@ impl<'a> RootedImportBackend<'a> {
 impl ImportBackend for RootedImportBackend<'_> {
     fn read(&mut self, path: &str) -> Result<(RootedPath, Vec<u8>), RawFileFailureClass> {
         let matches = self
-            .rows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .files_at(path)
+            .files_at(path)?
             .into_iter()
-            .filter(|file| file.content_hash.is_some())
-            .cloned()
+            .filter(|row| row.file.state.content_hash.is_some())
             .collect::<Vec<_>>();
-        let [file] = matches.as_slice() else {
+        let [row] = matches.as_slice() else {
             return Err(if matches.is_empty() {
                 RawFileFailureClass::NotFound
             } else {
@@ -1907,17 +1952,17 @@ impl ImportBackend for RootedImportBackend<'_> {
         };
         let physical = self
             .scanner
-            .physical_path(&file.root_name, path)
+            .physical_path(&row.root_name, path)
             .map_err(scan_failure)?;
         let bytes = self
             .scanner
             .read_identity_checked(&physical)
             .map_err(scan_failure)?;
-        if Some(ContentHash(*blake3::hash(&bytes).as_bytes())) != file.content_hash {
+        if Some(ContentHash(*blake3::hash(&bytes).as_bytes())) != row.file.state.content_hash {
             return Err(RawFileFailureClass::OtherStable);
         }
         Ok((
-            RootedPath::new(&file.root_name, path).map_err(|_| RawFileFailureClass::OtherStable)?,
+            RootedPath::new(&row.root_name, path).map_err(|_| RawFileFailureClass::OtherStable)?,
             bytes,
         ))
     }
@@ -1925,11 +1970,10 @@ impl ImportBackend for RootedImportBackend<'_> {
     fn probe(&mut self, path: &str) -> Result<Option<RootName>, RawFileFailureClass> {
         let roots = self
             .rows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .files_at(path)
+            .observed_files_at(path)
+            .map_err(|_| RawFileFailureClass::OtherStable)?
             .into_iter()
-            .map(|file| file.root_name.clone())
+            .map(|row| row.root_name)
             .collect::<BTreeSet<_>>();
         match roots.iter().collect::<Vec<_>>().as_slice() {
             [] => Ok(None),
@@ -1949,27 +1993,27 @@ impl ImportBackend for RootedImportBackend<'_> {
             .map_err(|_| RawFileFailureClass::OtherStable)?;
         let rows = self
             .rows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .observed_files()
+            .map_err(|_| RawFileFailureClass::ListingFailed)?;
         let mut results = Vec::new();
-        for file in rows.file_rows() {
-            if !matches!(file.kind, ScannedFileKind::File | ScannedFileKind::Symlink) {
+        for row in rows {
+            if !matches!(row.file.state.kind, FileKind::File | FileKind::Symlink) {
                 continue;
             }
             let prefix_matches = query.path_prefix.as_ref().is_none_or(|prefix| {
-                file.normalized_path == *prefix
-                    || file
-                        .normalized_path
+                row.path == *prefix
+                    || row
+                        .path
                         .strip_prefix(prefix)
                         .is_some_and(|suffix| suffix.starts_with('/'))
             });
             if prefix_matches
                 && matcher
                     .as_ref()
-                    .is_none_or(|matcher| matcher.is_match(&file.normalized_path))
+                    .is_none_or(|matcher| matcher.is_match(&row.path))
             {
                 results.push(
-                    RootedPath::new(&file.root_name, &file.normalized_path)
+                    RootedPath::new(&row.root_name, &row.path)
                         .map_err(|_| RawFileFailureClass::OtherStable)?,
                 );
             }

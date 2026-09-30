@@ -58,8 +58,8 @@ fn file_rows_roundtrip_and_are_keyed_per_root() {
         .input_transaction(|txn| {
             let main = txn.intern_root("main")?;
             let engine = txn.intern_root("engine")?;
-            txn.upsert_file(main, "tex/rock.bundle", &file_state(100), InputVersion(1))?;
-            txn.upsert_file(engine, "tex/rock.bundle", &file_state(200), InputVersion(1))?;
+            txn.upsert_file(main, "tex/rock.bundle", &file_state(100).into(), InputVersion(1))?;
+            txn.upsert_file(engine, "tex/rock.bundle", &file_state(200).into(), InputVersion(1))?;
             Ok((main, engine))
         })
         .unwrap();
@@ -91,8 +91,8 @@ fn upsert_replaces_and_remove_deletes() {
     let (root, _) = store
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
-            txn.upsert_file(root, "a.bundle", &file_state(1), InputVersion(1))?;
-            txn.upsert_file(root, "a.bundle", &file_state(2), InputVersion(1))?;
+            txn.upsert_file(root, "a.bundle", &file_state(1).into(), InputVersion(1))?;
+            txn.upsert_file(root, "a.bundle", &file_state(2).into(), InputVersion(1))?;
             Ok(root)
         })
         .unwrap();
@@ -126,7 +126,7 @@ fn logical_path_index_has_three_states() {
     let (main, _) = store
         .input_transaction(|txn| {
             let main = txn.intern_root("main")?;
-            txn.upsert_file(main, "tex/rock.bundle", &file_state(1), InputVersion(1))?;
+            txn.upsert_file(main, "tex/rock.bundle", &file_state(1).into(), InputVersion(1))?;
             Ok(main)
         })
         .unwrap();
@@ -138,7 +138,7 @@ fn logical_path_index_has_three_states() {
     let (engine, _) = store
         .input_transaction(|txn| {
             let engine = txn.intern_root("engine")?;
-            txn.upsert_file(engine, "tex/rock.bundle", &file_state(2), InputVersion(2))?;
+            txn.upsert_file(engine, "tex/rock.bundle", &file_state(2).into(), InputVersion(2))?;
             Ok(engine)
         })
         .unwrap();
@@ -210,7 +210,7 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
     let (root, _) = store
         .input_transaction(|transaction| {
             let root = transaction.intern_root("main")?;
-            transaction.upsert_file(root, "source.txt", &file_state(1), InputVersion(1))?;
+            transaction.upsert_file(root, "source.txt", &file_state(1).into(), InputVersion(1))?;
             transaction.push_dirty(root, "source.txt", true, InputVersion(1))?;
             Ok(root)
         })
@@ -218,7 +218,7 @@ fn stale_observation_cannot_acknowledge_newer_work_for_the_same_path() {
     let stale = store.pending_file_work().unwrap();
     store
         .input_transaction(|transaction| {
-            transaction.upsert_file(root, "source.txt", &file_state(2), InputVersion(2))?;
+            transaction.upsert_file(root, "source.txt", &file_state(2).into(), InputVersion(2))?;
             transaction.push_dirty(root, "source.txt", true, InputVersion(2))
         })
         .unwrap();

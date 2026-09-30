@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -17,6 +18,12 @@ use distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
 use distill_core::id::{BundleFileHash, ContentHash};
 use distill_rpc::{
     LineageManifestClaimant, LineageRepairDestination, OccupiedLineageDestinationKind,
+};
+use distill_store::db::StoreReader;
+use distill_store::error::StoreError;
+use distill_store::files::{
+    FileKind, FileObservation, FileState, ObservedBundleFile, ObservedDiagnostic, ObservedDirectory,
+    ObservedFile,
 };
 use distill_store::state::{PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes};
 use unicode_normalization::{is_nfc, UnicodeNormalization};
@@ -365,15 +372,6 @@ impl ScanSnapshot {
         self.files.values()
     }
 
-    pub(crate) fn files_at(&self, path: &str) -> Vec<&ScannedFile> {
-        self.logical_roots
-            .get(path)
-            .into_iter()
-            .flatten()
-            .filter_map(|root| self.files.get(&(root.clone(), path.to_owned())))
-            .collect()
-    }
-
     pub fn bundle_rows(&self) -> impl Iterator<Item = &ScannedBundle> {
         self.bundles.values().map(AsRef::as_ref)
     }
@@ -478,12 +476,6 @@ impl ScanDelta {
         self.observed.files.values()
     }
 
-    pub(crate) fn observed_file_entries(
-        &self,
-    ) -> impl Iterator<Item = (&(String, String), &ScannedFile)> {
-        self.observed.files.iter()
-    }
-
     pub fn observed_bundles(&self) -> impl Iterator<Item = &ScannedBundle> {
         self.observed.bundles.values().map(AsRef::as_ref)
     }
@@ -516,6 +508,396 @@ impl ScanDelta {
                 && matching_values(&baseline.symlink_aliases, affected)
                     .eq(matching_values(&self.observed.symlink_aliases, affected))
         })
+    }
+}
+
+/// The last published observation an incremental scan is checked against:
+/// either an in-memory [`ScanSnapshot`] or the store's scan tables
+/// ([`StoredBaseline`]).
+pub trait ScanBaseline {
+    /// The on-disk spelling recorded for one rooted path.
+    fn raw_relative_path(&self, root: &str, path: &str) -> Option<PlatformPathBytes>;
+    /// The symlinked files whose canonical target lies at or below `canonical`.
+    fn aliases_affected_by(&self, canonical: &Path) -> Vec<(String, String)>;
+    /// The first traversed directory whose canonical path is `canonical`,
+    /// with its physical path.
+    fn directory_by_target(&self, canonical: &Path) -> Option<(String, String, PathBuf)>;
+}
+
+impl ScanBaseline for ScanSnapshot {
+    fn raw_relative_path(&self, root: &str, path: &str) -> Option<PlatformPathBytes> {
+        self.files
+            .get(&(root.to_owned(), path.to_owned()))
+            .map(|file| file.raw_relative_path.clone())
+    }
+
+    fn aliases_affected_by(&self, canonical: &Path) -> Vec<(String, String)> {
+        aliases_affected_by(&self.aliases_by_target, canonical)
+    }
+
+    fn directory_by_target(&self, canonical: &Path) -> Option<(String, String, PathBuf)> {
+        self.directory_by_target.get(canonical).cloned()
+    }
+}
+
+/// [`ScanBaseline`] over the store's scan tables. A failed query answers as
+/// if the row were absent and is kept for [`StoredBaseline::finish`], which
+/// the caller checks before trusting the delta.
+pub(crate) struct StoredBaseline<'a> {
+    reader: &'a StoreReader,
+    failure: RefCell<Option<StoreError>>,
+}
+
+impl<'a> StoredBaseline<'a> {
+    pub(crate) fn new(reader: &'a StoreReader) -> Self {
+        Self {
+            reader,
+            failure: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<(), StoreError> {
+        self.failure.into_inner().map_or(Ok(()), Err)
+    }
+
+    fn keep<T: Default>(&self, result: Result<T, StoreError>) -> T {
+        result.unwrap_or_else(|error| {
+            self.failure.borrow_mut().get_or_insert(error);
+            T::default()
+        })
+    }
+}
+
+impl ScanBaseline for StoredBaseline<'_> {
+    fn raw_relative_path(&self, root: &str, path: &str) -> Option<PlatformPathBytes> {
+        self.keep(self.reader.observed_file(root, path))
+            .map(|row| decode_raw_path(&row.file.raw_path))
+    }
+
+    fn aliases_affected_by(&self, canonical: &Path) -> Vec<(String, String)> {
+        self.keep(self.reader.symlinks_targeting(&encode_path(canonical)))
+            .into_iter()
+            .filter(|row| {
+                row.file
+                    .symlink_target
+                    .as_deref()
+                    .is_some_and(|target| decode_path(target).starts_with(canonical))
+            })
+            .map(|row| (row.root_name, row.path))
+            .collect()
+    }
+
+    fn directory_by_target(&self, canonical: &Path) -> Option<(String, String, PathBuf)> {
+        self.keep(self.reader.directory_by_canonical(&encode_path(canonical)))
+            .map(|row| (row.root_name, row.path, decode_path(&row.physical_path)))
+    }
+}
+
+impl ScanSnapshot {
+    /// The complete published observation, from the store's scan tables.
+    pub(crate) fn load(reader: &StoreReader) -> Result<Self, StoreError> {
+        Self::from_rows(
+            reader.observed_files()?,
+            reader.observed_directories()?,
+            reader.scan_diagnostics()?,
+            reader.bundle_files()?,
+        )
+    }
+
+    /// The published observation at or below each of `prefixes`.
+    pub(crate) fn load_under(
+        reader: &StoreReader,
+        prefixes: &[(String, String)],
+    ) -> Result<Self, StoreError> {
+        let (mut files, mut directories, mut diagnostics, mut bundles) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (root, prefix) in prefixes {
+            files.extend(reader.observed_files_under(root, prefix)?);
+            directories.extend(reader.observed_directories_under(root, prefix)?);
+            diagnostics.extend(reader.scan_diagnostics_under(root, prefix)?);
+            bundles.extend(reader.bundle_files_under(root, prefix)?);
+        }
+        Self::from_rows(files, directories, diagnostics, bundles)
+    }
+
+    /// Only the diagnostic rows of the published observation.
+    pub(crate) fn load_diagnostics(reader: &StoreReader) -> Result<Self, StoreError> {
+        Self::from_rows(Vec::new(), Vec::new(), reader.scan_diagnostics()?, Vec::new())
+    }
+
+    /// Only the parsed `.bundle` rows of the published observation.
+    pub(crate) fn load_bundles(reader: &StoreReader) -> Result<Self, StoreError> {
+        Self::from_rows(Vec::new(), Vec::new(), Vec::new(), reader.bundle_files()?)
+    }
+
+    fn from_rows(
+        files: Vec<ObservedFile>,
+        directories: Vec<ObservedDirectory>,
+        diagnostics: Vec<ObservedDiagnostic>,
+        bundles: Vec<ObservedBundleFile>,
+    ) -> Result<Self, StoreError> {
+        let mut snapshot = Self::default();
+        for row in files {
+            let key = (row.root_name.clone(), row.path.clone());
+            if let Some(target) = &row.file.symlink_target {
+                snapshot
+                    .symlink_aliases
+                    .insert(key.clone(), decode_path(target));
+            }
+            snapshot.files.insert(
+                key,
+                ScannedFile {
+                    root_name: row.root_name,
+                    normalized_path: row.path,
+                    kind: match row.file.state.kind {
+                        FileKind::File => ScannedFileKind::File,
+                        FileKind::Directory => ScannedFileKind::Directory,
+                        FileKind::Symlink => ScannedFileKind::Symlink,
+                    },
+                    modified_nanos: row.file.state.mtime,
+                    size: row.file.state.size,
+                    content_hash: row.file.state.content_hash,
+                    raw_relative_path: decode_raw_path(&row.file.raw_path),
+                },
+            );
+        }
+        for row in directories {
+            snapshot.directory_observations.insert(
+                (row.root_name, row.path),
+                DirectoryObservation {
+                    canonical_path: decode_path(&row.canonical_path),
+                    physical_path: decode_path(&row.physical_path),
+                },
+            );
+        }
+        for row in diagnostics {
+            let diagnostic = decode_diagnostic(&row.detail).ok_or_else(|| {
+                StoreError::InvalidConfiguration {
+                    error: format!(
+                        "malformed scan diagnostic at {}/{}",
+                        row.root_name, row.path
+                    ),
+                }
+            })?;
+            snapshot
+                .diagnostics
+                .insert((row.root_name, row.path), diagnostic);
+        }
+        for row in bundles {
+            let bundle = scanned_bundle(&row.root_name, &row.path, row.bytes);
+            snapshot
+                .bundles
+                .insert((row.root_name, row.path), Arc::new(bundle));
+        }
+        rebuild_reverse_indexes(&mut snapshot).map_err(|error| {
+            StoreError::InvalidConfiguration {
+                error: format!("published scan tables are inconsistent: {error}"),
+            }
+        })?;
+        Ok(snapshot)
+    }
+
+    /// The `files` row recorded for one scanned path.
+    pub(crate) fn file_observation(&self, key: &(String, String)) -> Option<FileObservation> {
+        let file = self.files.get(key)?;
+        Some(FileObservation {
+            state: FileState {
+                mtime: file.modified_nanos,
+                size: file.size,
+                kind: match file.kind {
+                    ScannedFileKind::File => FileKind::File,
+                    ScannedFileKind::Directory => FileKind::Directory,
+                    ScannedFileKind::Symlink => FileKind::Symlink,
+                },
+                content_hash: file.content_hash,
+            },
+            raw_path: encode_raw_path(&file.raw_relative_path),
+            symlink_target: self.symlink_aliases.get(key).map(|target| encode_path(target)),
+        })
+    }
+
+    /// Every file row key with its `files` observation.
+    pub(crate) fn file_observations(
+        &self,
+    ) -> impl Iterator<Item = (&(String, String), FileObservation)> {
+        self.files.keys().map(|key| {
+            (
+                key,
+                self.file_observation(key)
+                    .expect("a file key has an observation"),
+            )
+        })
+    }
+
+    pub(crate) fn directory_rows(&self) -> Vec<ObservedDirectory> {
+        self.directory_observations
+            .iter()
+            .map(|((root, path), observation)| ObservedDirectory {
+                root_name: root.clone(),
+                path: path.clone(),
+                canonical_path: encode_path(&observation.canonical_path),
+                physical_path: encode_path(&observation.physical_path),
+            })
+            .collect()
+    }
+
+    pub(crate) fn encoded_diagnostic_rows(&self) -> Vec<ObservedDiagnostic> {
+        self.diagnostics
+            .iter()
+            .map(|((root, path), diagnostic)| ObservedDiagnostic {
+                root_name: root.clone(),
+                path: path.clone(),
+                detail: encode_diagnostic(diagnostic),
+            })
+            .collect()
+    }
+}
+
+impl ScanDelta {
+    /// The fresh observation of the affected prefixes.
+    pub(crate) fn observed(&self) -> &ScanSnapshot {
+        &self.observed
+    }
+}
+
+/// A path in the store's encoding: its platform bytes.
+pub(crate) fn encode_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+pub(crate) fn decode_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+fn encode_raw_path(raw: &PlatformPathBytes) -> Vec<u8> {
+    match raw {
+        PlatformPathBytes::Unix(bytes) => [&[0u8][..], bytes].concat(),
+        PlatformPathBytes::Windows(units) => std::iter::once(1u8)
+            .chain(units.iter().flat_map(|unit| unit.to_le_bytes()))
+            .collect(),
+    }
+}
+
+fn decode_raw_path(bytes: &[u8]) -> PlatformPathBytes {
+    match bytes.split_first() {
+        Some((1, units)) => PlatformPathBytes::Windows(
+            units
+                .chunks_exact(2)
+                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                .collect(),
+        ),
+        Some((_, bytes)) => PlatformPathBytes::Unix(bytes.to_vec()),
+        None => PlatformPathBytes::Unix(Vec::new()),
+    }
+}
+
+fn put_field(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(&(field.len() as u32).to_le_bytes());
+    out.extend_from_slice(field);
+}
+
+fn take_field<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let (length, rest) = input.split_first_chunk::<4>()?;
+    let length = u32::from_le_bytes(*length) as usize;
+    let field = rest.get(..length)?;
+    *input = &rest[length..];
+    Some(field)
+}
+
+fn encode_diagnostic(diagnostic: &ScanDiagnostic) -> Vec<u8> {
+    let mut out = Vec::new();
+    match diagnostic {
+        ScanDiagnostic::DaemonOwnedDirectoryAlias {
+            root_name,
+            normalized_path,
+            physical_path,
+            owned_path,
+            kind,
+        } => {
+            out.push(0);
+            put_field(&mut out, root_name.as_bytes());
+            put_field(&mut out, normalized_path.as_bytes());
+            put_field(&mut out, &encode_path(physical_path));
+            put_field(&mut out, &encode_path(owned_path));
+            out.push(match kind {
+                DaemonOwnedDirectoryKind::State => 0,
+                DaemonOwnedDirectoryKind::ModuleStaging => 1,
+                DaemonOwnedDirectoryKind::PackageOutput => 2,
+                DaemonOwnedDirectoryKind::CodegenOutput => 3,
+                DaemonOwnedDirectoryKind::Quarantine => 4,
+            });
+        }
+        ScanDiagnostic::DirectoryCycle {
+            root_name,
+            normalized_path,
+            path_chain,
+        } => {
+            out.push(1);
+            put_field(&mut out, root_name.as_bytes());
+            put_field(&mut out, normalized_path.as_bytes());
+            for path in path_chain {
+                put_field(&mut out, &encode_path(path));
+            }
+        }
+    }
+    out
+}
+
+fn decode_diagnostic(bytes: &[u8]) -> Option<ScanDiagnostic> {
+    let (tag, mut input) = bytes.split_first()?;
+    let text = |field: &[u8]| String::from_utf8(field.to_vec()).ok();
+    let root_name = text(take_field(&mut input)?)?;
+    let normalized_path = text(take_field(&mut input)?)?;
+    match tag {
+        0 => {
+            let physical_path = decode_path(take_field(&mut input)?);
+            let owned_path = decode_path(take_field(&mut input)?);
+            let kind = match input {
+                [0] => DaemonOwnedDirectoryKind::State,
+                [1] => DaemonOwnedDirectoryKind::ModuleStaging,
+                [2] => DaemonOwnedDirectoryKind::PackageOutput,
+                [3] => DaemonOwnedDirectoryKind::CodegenOutput,
+                [4] => DaemonOwnedDirectoryKind::Quarantine,
+                _ => return None,
+            };
+            Some(ScanDiagnostic::DaemonOwnedDirectoryAlias {
+                root_name,
+                normalized_path,
+                physical_path,
+                owned_path,
+                kind,
+            })
+        }
+        1 => {
+            let mut path_chain = Vec::new();
+            while !input.is_empty() {
+                path_chain.push(decode_path(take_field(&mut input)?));
+            }
+            Some(ScanDiagnostic::DirectoryCycle {
+                root_name,
+                normalized_path,
+                path_chain,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn scanned_bundle(root_name: &str, normalized_path: &str, bytes: Vec<u8>) -> ScannedBundle {
+    let parsed = distill_bundle::parse_bundle(&bytes);
+    let namespace_skeleton = parsed
+        .is_err()
+        .then(|| distill_bundle::extract_namespace_skeleton(&bytes).ok())
+        .flatten();
+    ScannedBundle {
+        root_name: root_name.to_owned(),
+        normalized_path: normalized_path.to_owned(),
+        file_hash: BundleFileHash::of_observed_bytes(&bytes),
+        parsed,
+        namespace_skeleton,
+        bytes,
     }
 }
 
@@ -924,9 +1306,9 @@ impl RootedScanner {
     /// Re-observe only native-event paths and directory subtrees, merging the
     /// result into the last complete snapshot without touching unrelated disk
     /// state. `Ok(None)` means every event path was outside configured roots.
-    pub fn scan_incremental_delta(
+    pub fn scan_incremental_delta<B: ScanBaseline + ?Sized>(
         &self,
-        baseline: &ScanSnapshot,
+        baseline: &B,
         event_paths: &[PathBuf],
     ) -> Result<Option<ScanDelta>, ScanError> {
         let roots = self.validated_root_snapshot()?;
@@ -941,14 +1323,14 @@ impl RootedScanner {
                 for component in path.split('/').filter(|component| !component.is_empty()) {
                     canonical_event.push(component);
                 }
-                for alias in aliases_affected_by(&baseline.aliases_by_target, &canonical_event) {
+                for alias in baseline.aliases_affected_by(&canonical_event) {
                     affected.entry(alias).or_default();
                 }
                 let key = (root, path);
                 let physical = affected.entry(key.clone()).or_default();
                 physical.insert(event_path.clone());
-                if let Some(previous) = baseline.files.get(&key) {
-                    if let Some(relative) = platform_path(&previous.raw_relative_path) {
+                if let Some(previous) = baseline.raw_relative_path(&key.0, &key.1) {
+                    if let Some(relative) = platform_path(&previous) {
                         physical.insert(roots[&key.0].canonical_path.join(relative));
                     }
                 }
@@ -1454,19 +1836,7 @@ fn observe_opened_file(
         .and_then(|extension| extension.to_str())
         == Some("bundle")
     {
-        let parsed = distill_bundle::parse_bundle(&bytes);
-        let namespace_skeleton = parsed
-            .is_err()
-            .then(|| distill_bundle::extract_namespace_skeleton(&bytes).ok())
-            .flatten();
-        let bundle = ScannedBundle {
-            root_name: root_name.to_owned(),
-            normalized_path: normalized_path.clone(),
-            file_hash,
-            parsed,
-            namespace_skeleton,
-            bytes,
-        };
+        let bundle = scanned_bundle(root_name, &normalized_path, bytes);
         snapshot
             .bundles
             .insert((root_name.to_owned(), normalized_path), Arc::new(bundle));
@@ -1773,15 +2143,14 @@ fn remove_logical_root(logical: &mut BTreeMap<String, BTreeSet<String>>, path: &
     }
 }
 
-fn validate_incremental_directory_aliases(
-    baseline: &ScanSnapshot,
+fn validate_incremental_directory_aliases<B: ScanBaseline + ?Sized>(
+    baseline: &B,
     affected: &[(String, String)],
     observed: &ScanSnapshot,
 ) -> Result<(), ScanError> {
     for ((root, path), observation) in &observed.directory_observations {
-        let Some((first_root, first_path, first)) = baseline
-            .directory_by_target
-            .get(&observation.canonical_path)
+        let Some((first_root, first_path, first)) =
+            baseline.directory_by_target(&observation.canonical_path)
         else {
             continue;
         };
@@ -1792,7 +2161,7 @@ fn validate_incremental_directory_aliases(
         {
             continue;
         }
-        if first_root != root || first_path != path {
+        if first_root != *root || first_path != *path {
             return Err(ScanError::DirectoryAlias {
                 first_root: first_root.clone(),
                 first: first.clone(),
@@ -2210,4 +2579,50 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
 
 fn file_identity_from_file(_file: &File, metadata: &Metadata) -> std::io::Result<FileIdentity> {
     Ok(file_identity(metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_diagnostics_round_trip_through_their_table_encoding() {
+        let diagnostics = [
+            ScanDiagnostic::DaemonOwnedDirectoryAlias {
+                root_name: "main".to_owned(),
+                normalized_path: "gen/out".to_owned(),
+                physical_path: PathBuf::from("/project/gen/out"),
+                owned_path: PathBuf::from("/project/.distill/codegen"),
+                kind: DaemonOwnedDirectoryKind::CodegenOutput,
+            },
+            ScanDiagnostic::DirectoryCycle {
+                root_name: "main".to_owned(),
+                normalized_path: "a/loop".to_owned(),
+                path_chain: vec![PathBuf::from("/project/a"), PathBuf::from("/project/a/loop")],
+            },
+            ScanDiagnostic::DirectoryCycle {
+                root_name: "main".to_owned(),
+                normalized_path: String::new(),
+                path_chain: Vec::new(),
+            },
+        ];
+        for diagnostic in diagnostics {
+            assert_eq!(
+                decode_diagnostic(&encode_diagnostic(&diagnostic)),
+                Some(diagnostic)
+            );
+        }
+        assert_eq!(decode_diagnostic(&[7]), None);
+    }
+
+    #[test]
+    fn raw_paths_round_trip_through_their_table_encoding() {
+        for raw in [
+            PlatformPathBytes::Unix(b"tex/Rock.bundle".to_vec()),
+            PlatformPathBytes::Unix(Vec::new()),
+            PlatformPathBytes::Windows(vec![0x74, 0x00e9, 0xd83d, 0xde00]),
+        ] {
+            assert_eq!(decode_raw_path(&encode_raw_path(&raw)), raw);
+        }
+    }
 }

@@ -649,7 +649,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
 
     coordinator.reconcile_full_scan().unwrap();
     assert!(matches!(
-        coordinator.scan_diagnostics().as_slice(),
+        coordinator.scan_diagnostics().unwrap().as_slice(),
         [ScanDiagnostic::DaemonOwnedDirectoryAlias {
             root_name,
             normalized_path,
@@ -678,7 +678,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
             renames: Vec::new(),
         })
         .unwrap();
-    assert!(coordinator.scan_diagnostics().is_empty());
+    assert!(coordinator.scan_diagnostics().unwrap().is_empty());
     assert_eq!(coordinator.server().current_stamp().version, version);
     symlink(temp.path().join(".distill"), &alias).unwrap();
     coordinator
@@ -687,7 +687,7 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
             renames: Vec::new(),
         })
         .unwrap();
-    assert_eq!(coordinator.scan_diagnostics().len(), 1);
+    assert_eq!(coordinator.scan_diagnostics().unwrap().len(), 1);
     assert_eq!(coordinator.server().current_stamp().version, version);
 
     let base = coordinator.server().current_stamp().version;

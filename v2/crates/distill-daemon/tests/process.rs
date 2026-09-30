@@ -288,6 +288,7 @@ fn disabled_existing_codegen_output_is_still_excluded() {
     assert!(process
         .coordinator()
         .scan_diagnostics()
+        .unwrap()
         .iter()
         .any(|diagnostic| matches!(
             diagnostic,

@@ -36,12 +36,11 @@ use crate::pipeline_map::PipelineProjection;
 use crate::quarantine::{
     material_recovery_diagnostic, QuarantineDriver, QuarantineError, QuarantineRoot,
 };
-use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanError, ScanSnapshot};
+use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanError};
 
 pub struct AuthoringService {
     pub(crate) store: Arc<Mutex<Store>>,
     pub(crate) scanner: RootedScanner,
-    pub(crate) scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     roots: RwLock<Vec<AssetRoot>>,
     quarantine: RwLock<QuarantineDriver>,
     lineage_destination: RwLock<LineageDestination>,
@@ -78,7 +77,6 @@ impl AuthoringService {
         roots: Vec<AssetRoot>,
         scanner: RootedScanner,
         lineage_destination: LineageDestination,
-        scan_snapshot: Arc<Mutex<ScanSnapshot>>,
     ) -> Result<Self, AuthoringServiceInitError> {
         let quarantine = QuarantineDriver::new(
             roots
@@ -106,7 +104,6 @@ impl AuthoringService {
         Ok(Self {
             store,
             scanner,
-            scan_snapshot,
             roots: RwLock::new(roots),
             quarantine: RwLock::new(quarantine),
             lineage_destination: RwLock::new(lineage_destination),
@@ -378,7 +375,6 @@ impl AuthoringService {
 
         publish_incremental_paths(
             &self.scanner,
-            &self.scan_snapshot,
             std::slice::from_ref(&target),
             &self.lineage_destination_snapshot(),
             &self.store,

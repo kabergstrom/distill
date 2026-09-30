@@ -17,7 +17,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 29;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -39,6 +39,38 @@ CREATE TABLE files (
     kind         INTEGER NOT NULL,
     content_hash BLOB,
     observation  INTEGER NOT NULL,
+    -- The scanner's on-disk spelling of `path`, and a symlink's canonical
+    -- target, in the daemon's platform path encoding.
+    raw_path       BLOB NOT NULL,
+    symlink_target BLOB,
+    PRIMARY KEY (root_id, path)
+);
+CREATE INDEX files_by_path ON files(path);
+CREATE INDEX files_by_symlink_target ON files(symlink_target)
+    WHERE symlink_target IS NOT NULL;
+-- The bytes of every observed `.bundle` file, as read by the scan that
+-- recorded its `files` row.
+CREATE TABLE bundle_files (
+    root_id INTEGER NOT NULL,
+    path    TEXT NOT NULL,
+    bytes   BLOB NOT NULL,
+    PRIMARY KEY (root_id, path)
+);
+-- Every traversed directory (the root itself at path ''), for alias checks.
+CREATE TABLE directories (
+    root_id        INTEGER NOT NULL,
+    path           TEXT NOT NULL,
+    canonical_path BLOB NOT NULL,
+    physical_path  BLOB NOT NULL,
+    PRIMARY KEY (root_id, path)
+);
+CREATE INDEX directories_by_canonical ON directories(canonical_path);
+-- Non-fatal scan exclusions, keyed by rooted path; `detail` is the
+-- daemon's encoding.
+CREATE TABLE scan_diagnostics (
+    root_id INTEGER NOT NULL,
+    path    TEXT NOT NULL,
+    detail  BLOB NOT NULL,
     PRIMARY KEY (root_id, path)
 );
 CREATE TABLE dirty_files (
