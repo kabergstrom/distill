@@ -78,7 +78,8 @@ impl DaemonProcess {
             config.pipeline.max_dependency_depth,
         )?);
         coordinator.attach_build_backend();
-        let config_watch = ConfigWatch::new(config.clone());
+        let mut config_watch = ConfigWatch::new(config.clone());
+        config_watch.rebuilder = Some(crate::rebuild::Rebuilder::start(config.rebuild.clone()));
         let (inbox, messages) = mpsc::channel();
         let sink: WatcherSink = {
             let inbox = inbox.clone();
@@ -553,6 +554,8 @@ struct ConfigWatch {
     cached_pipeline: Option<ArtifactSourceState>,
     rejected: bool,
     source_rejected: bool,
+    /// Runs the active configuration's `[[rebuild]]` jobs.
+    rebuilder: Option<crate::rebuild::Rebuilder>,
 }
 
 impl ConfigWatch {
@@ -568,6 +571,21 @@ impl ConfigWatch {
             cached_pipeline: None,
             rejected: false,
             source_rejected: false,
+            rebuilder: None,
+        }
+    }
+
+    /// Adopt the `[[rebuild]]` jobs of an accepted configuration. They
+    /// depend on neither the schema nor the pipeline module (they build
+    /// those), so they follow the configuration even while either is
+    /// rejected.
+    fn adopt_rebuild_jobs(&mut self, candidate: &DaemonConfig) {
+        if self.active.rebuild == candidate.rebuild {
+            return;
+        }
+        self.active.rebuild = candidate.rebuild.clone();
+        if let Some(rebuilder) = &self.rebuilder {
+            rebuilder.jobs().replace(candidate.rebuild.clone());
         }
     }
 
@@ -628,6 +646,10 @@ impl ConfigWatch {
                 if self.observed.as_ref() == Some(&observation.state) {
                     return Ok(false);
                 }
+                tracing::warn!(
+                    %message,
+                    "configuration rejected; the active one (and its rebuild jobs) stays"
+                );
                 coordinator.publish_configuration_rejection(reason, message)?;
                 self.rejected = true;
                 self.source_rejected = true;
@@ -666,6 +688,7 @@ impl ConfigWatch {
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
         if invalidation.configuration {
+            self.adopt_rebuild_jobs(&candidate);
             watcher
                 .replace_paths([
                     self.path.clone(),
@@ -972,9 +995,16 @@ fn apply_live_values(active: &mut DaemonConfig, candidate: &DaemonConfig) {
     active.cas = candidate.cas.clone();
 }
 
+#[cfg(unix)]
 fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
     use std::os::unix::ffi::OsStrExt;
     ConfigurationSourcePath::Unix(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
+    use std::os::windows::ffi::OsStrExt;
+    ConfigurationSourcePath::Windows(path.as_os_str().encode_wide().collect())
 }
 
 fn reconcile_imports(

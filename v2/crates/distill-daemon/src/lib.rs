@@ -18,13 +18,8 @@ mod operations;
 pub mod pack_command;
 mod pipeline_map;
 pub mod process;
-#[cfg(unix)]
 pub mod rebuild;
 pub mod scanner;
 pub mod scheduler;
 mod tool_resolver;
 pub mod watcher;
-#[cfg(not(unix))]
-compile_error!(
-    "distill-daemon currently supports Unix host processes only; Windows remains a cook target"
-);

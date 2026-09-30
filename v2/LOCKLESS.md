@@ -206,11 +206,13 @@ a connection of its own, and SQLite's write lock orders the writers.
   epoch keeps serving: no input version, no pipeline generation bump, and
   the next schema or module write retries it. Without a Ready epoch, or for
   a crate the schema lacks, it is a `CandidateAttestation` failure.
-- **rebuild** (`distilld` only, when the config has `[[rebuild]]` jobs)
-  watches each job's dep-info inputs with its own `notify` watcher and
-  runs the job's steps as child processes, one at a time. It touches no
-  store state: the daemon adopts the pipeline module and schema the steps
-  write through the ordinary watch.
+- **rebuild** (a serving `distilld`) runs the configuration's `[[rebuild]]`
+  jobs: it watches each job's dep-info inputs with its own `notify` watcher
+  and runs the job's steps as child processes, one at a time (in a process
+  group on Unix, a kill-on-close job object on Windows). The process loop
+  sends it each accepted configuration's jobs over its channel; it touches
+  no store state: the daemon adopts the pipeline module and schema the
+  steps write through the ordinary watch.
 - The only atomics are ID and temp-name sequences.
 
 ## 4. Error model: per-entity rows instead of poisons
