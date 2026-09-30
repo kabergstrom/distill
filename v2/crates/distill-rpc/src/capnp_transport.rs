@@ -757,6 +757,24 @@ impl schema::hub::Server for HubService {
             Ok(())
         }
     }
+
+    fn import_failures(
+        self: capnp::capability::Rc<Self>,
+        _params: schema::hub::ImportFailuresParams,
+        mut results: schema::hub::ImportFailuresResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            if let Some(reason) = self.hub.generation_reconnect() {
+                write_reconnect(
+                    results.get().init_result().init_reconnect_required(),
+                    reason,
+                );
+                return Ok(());
+            }
+            write_import_failures_result(results.get().init_result(), self.hub.import_failures());
+            Ok(())
+        }
+    }
 }
 
 struct SnapshotService {
@@ -2933,6 +2951,34 @@ fn write_progress_result(
         RpcResult::Failure(RpcFailure::SnapshotExpired) => {
             result.set_snapshot_expired(())
         }
+        RpcResult::Failure(error) => {
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_import_failures_result(
+    mut result: schema::import_failures_call::Builder<'_>,
+    outcome: RpcResult<Vec<crate::ImportFailure>>,
+) {
+    match outcome {
+        RpcResult::Success(failures) => {
+            let mut list = result.init_success(failures.len() as u32);
+            for (index, failure) in failures.iter().enumerate() {
+                let mut entry = list.reborrow().get(index as u32);
+                entry.set_bundle(&failure.bundle.0);
+                entry.set_root(failure.root.as_str());
+                entry.set_path(failure.path.as_str());
+                entry.set_message(failure.message.as_str());
+            }
+        }
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => {
             write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }

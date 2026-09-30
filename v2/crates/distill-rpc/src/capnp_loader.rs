@@ -11,7 +11,7 @@ use crate::capnp_transport::{
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AuthoringEntryRole,
-    ConfigurationError, Delta, DriftedInput, ImportRequest, PathResolveFailure, PathResolveResult,
+    ConfigurationError, Delta, DriftedInput, ImportFailure, ImportRequest, PathResolveFailure, PathResolveResult,
     ReconnectReason, ResolveResult, RpcBasis, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
 
@@ -188,6 +188,41 @@ impl RemoteHub {
             ),
             schema::void_call::Which::SnapshotExpired(()) => Ok(RemoteCall::SnapshotExpired),
             schema::void_call::Which::Error(value) => Ok(RemoteCall::Error(decode_error(value?)?)),
+        }
+    }
+
+    /// The current watched-import failures (protocol 10). They publish no
+    /// version, so a client polls this.
+    pub async fn import_failures(
+        &self,
+    ) -> Result<RemoteCall<Vec<ImportFailure>>, capnp::Error> {
+        let response = self.client.import_failures_request().send().promise.await?;
+        let result = response.get()?.get_result()?;
+        match result.which()? {
+            schema::import_failures_call::Which::Success(list) => {
+                let mut failures = Vec::new();
+                for entry in list? {
+                    failures.push(ImportFailure {
+                        bundle: BundleUuid(fixed::<16>(entry.get_bundle()?, "importFailures.bundle")?),
+                        root: entry.get_root()?.to_string()?,
+                        path: entry.get_path()?.to_string()?,
+                        message: entry.get_message()?.to_string()?,
+                    });
+                }
+                Ok(RemoteCall::Success(failures))
+            }
+            schema::import_failures_call::Which::ReconnectRequired(value) => Ok(
+                RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
+            ),
+            schema::import_failures_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
+            ),
+            schema::import_failures_call::Which::SnapshotExpired(()) => {
+                Ok(RemoteCall::SnapshotExpired)
+            }
+            schema::import_failures_call::Which::Error(value) => {
+                Ok(RemoteCall::Error(decode_error(value?)?))
+            }
         }
     }
 

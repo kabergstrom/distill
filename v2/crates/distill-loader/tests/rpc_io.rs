@@ -662,6 +662,41 @@ fn rpc_io_full_completion_channel_does_not_cancel_candidate_publication() {
     server_thread.join().unwrap();
 }
 
+#[test]
+fn rpc_io_polls_import_failures_and_reports_only_changes() {
+    let Fixture {
+        server, request, ..
+    } = fixture();
+    let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+    let root = server.root();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = StagedListener::bind(root, "127.0.0.1:0").await.unwrap();
+            address_tx.send(listener.local_addr().unwrap()).unwrap();
+            listener.accept_one().await.unwrap().await.unwrap().unwrap();
+        });
+    });
+    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let first = loop {
+        if let Some(failures) = io.take_import_failures() {
+            break failures;
+        }
+        assert!(Instant::now() < deadline, "import failures were never polled");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(first.is_empty());
+    // The next poll returns the same list: not a change.
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(io.take_import_failures(), None);
+    drop(io);
+    server_thread.join().unwrap();
+}
+
 fn poll_until(io: &mut RpcIo, minimum: usize) -> Vec<IoEvent> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut events = Vec::new();

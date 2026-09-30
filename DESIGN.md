@@ -6784,6 +6784,7 @@ interface Hub {
   unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
+  importFailures @9 () -> (result :ImportFailuresCall);
 }
 
 interface Snapshot {
@@ -6818,6 +6819,12 @@ bounded `ChunkStream`; the adapter verifies the requested ContentHash and
 serves the authenticated typed load edges with the payload. Wire trees are
 looked up by LayoutHash, returned as canonical DSWL bytes, and rehashed by the
 consumer.
+
+`importFailures` (protocol 10) lists the current watched-import failures:
+bundle, root, path, and message. They are memo state, not input: recording or
+clearing one publishes no version, so runtime clients poll it (the RPC loader
+does once a second). A bundle listed there keeps serving its last good
+contents; its entry clears when a later import succeeds.
 
 Subscriptions are cursor-bound and one connection owns one ordered delta
 stream. Its first installation at `installed >= since` atomically returns the

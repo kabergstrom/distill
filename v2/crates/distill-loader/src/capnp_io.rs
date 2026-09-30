@@ -17,7 +17,9 @@ use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot, RemoteSub
 use distill_rpc::capnp_transport::{
     CapnpClient, RemoteConnectOutcome, ARTIFACT_NOT_FOUND, CONNECTION_CLOSED,
 };
-use distill_rpc::{AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, StreamEvent};
+use distill_rpc::{
+    AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, ImportFailure, StreamEvent,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::admission::{Admission, FetchAdmission};
@@ -39,6 +41,8 @@ const IN_FLIGHT_REQUEST_LIMIT: usize = 256;
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Watched-import failures publish no version; the driver polls them.
+const IMPORT_FAILURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
@@ -78,6 +82,7 @@ pub struct RpcIo {
     pending: Vec<IoEvent>,
     delivered_fetches: Vec<FetchPermit>,
     basis: IoBasis,
+    import_failures: watch::Receiver<Option<Vec<ImportFailure>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -95,6 +100,7 @@ impl RpcIo {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (event_tx, events) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
         let (init_tx, init_rx) = sync_mpsc::sync_channel(1);
+        let (import_failures_tx, import_failures) = watch::channel(None);
         let thread = std::thread::Builder::new()
             .name("distill-rpc-io".into())
             .spawn(move || {
@@ -106,6 +112,7 @@ impl RpcIo {
                     shutdown_rx,
                     event_tx,
                     init_tx,
+                    import_failures_tx,
                 )
             })
             .map_err(|error| RpcIoInitError::Unavailable(error.to_string()))?;
@@ -129,8 +136,19 @@ impl RpcIo {
             pending: Vec::new(),
             delivered_fetches: Vec::new(),
             basis,
+            import_failures,
             thread: Some(thread),
         })
+    }
+
+    /// The daemon's current watched-import failures when they changed since
+    /// the last call; `None` when unchanged or not yet polled. Each names a
+    /// bundle still serving its last good contents.
+    pub fn take_import_failures(&mut self) -> Option<Vec<ImportFailure>> {
+        if !self.import_failures.has_changed().unwrap_or(false) {
+            return None;
+        }
+        self.import_failures.borrow_and_update().clone()
     }
 
     fn send(&mut self, command: Command) {
@@ -294,6 +312,7 @@ fn run_thread(
     shutdown: watch::Receiver<bool>,
     events: mpsc::Sender<Completion>,
     init: sync_mpsc::SyncSender<Result<IoBasis, RpcIoInitError>>,
+    import_failures: watch::Sender<Option<Vec<ImportFailure>>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -369,6 +388,8 @@ fn run_thread(
             )),
             fetch_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             spool_directory: config.spool_directory,
+            import_failures,
+            next_import_failure_poll: tokio::time::Instant::now(),
         }
         .run()
         .await;
@@ -391,6 +412,8 @@ struct Driver {
     request_slots: std::sync::Arc<tokio::sync::Semaphore>,
     fetch_slot: std::sync::Arc<tokio::sync::Semaphore>,
     spool_directory: Option<PathBuf>,
+    import_failures: watch::Sender<Option<Vec<ImportFailure>>>,
+    next_import_failure_poll: tokio::time::Instant,
 }
 
 struct RebindState {
@@ -421,6 +444,7 @@ impl Driver {
                 break;
             }
             let retry_at = self.rebind.as_ref().map(|rebind| rebind.next_attempt);
+            let poll_at = self.next_import_failure_poll;
             let wake = if let Some(retry_at) = retry_at {
                 tokio::select! {
                     biased;
@@ -433,10 +457,12 @@ impl Driver {
                     biased;
                     _ = self.shutdown.changed() => DriverWake::Shutdown,
                     command = self.commands.recv() => DriverWake::Command(command),
+                    () = tokio::time::sleep_until(poll_at) => DriverWake::PollImportFailures,
                 }
             };
             match wake {
                 DriverWake::Shutdown => break,
+                DriverWake::PollImportFailures => self.poll_import_failures().await,
                 DriverWake::Command(Some(command)) => {
                     if !self.handle(command).await {
                         break;
@@ -479,6 +505,23 @@ impl Driver {
         }
         if let Some(task) = self.delta_task.take() {
             task.abort();
+        }
+    }
+
+    /// Publish the daemon's watched-import failures when they changed. A
+    /// failed poll keeps the last list; reconnection is the command path's
+    /// job.
+    async fn poll_import_failures(&mut self) {
+        self.next_import_failure_poll =
+            tokio::time::Instant::now() + IMPORT_FAILURE_POLL_INTERVAL;
+        if let Ok(RemoteCall::Success(failures)) = self.hub.import_failures().await {
+            self.import_failures.send_if_modified(|current| {
+                if current.as_ref() == Some(&failures) {
+                    return false;
+                }
+                *current = Some(failures);
+                true
+            });
         }
     }
 
@@ -802,6 +845,7 @@ impl Driver {
 enum DriverWake {
     Command(Option<Command>),
     Reconnect,
+    PollImportFailures,
     Shutdown,
 }
 

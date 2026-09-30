@@ -149,6 +149,10 @@ async fn remote_loader_client_preserves_typed_calls() {
                 },
                 wire_bytes
             );
+            assert!(matches!(
+                hub.import_failures().await.unwrap(),
+                RemoteCall::Success(failures) if failures.is_empty()
+            ));
 
             let mut subscription = match hub
                 .subscribe(stamp.version, vec![asset], vec![])

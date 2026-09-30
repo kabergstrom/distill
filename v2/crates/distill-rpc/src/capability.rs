@@ -1458,6 +1458,27 @@ impl Hub {
         })
     }
 
+    /// The current watched-import failures. They are memo state, not input:
+    /// recording or clearing one publishes no version, so clients poll.
+    pub fn import_failures(&self) -> RpcResult<Vec<ImportFailure>> {
+        if let Some(result) = self.live() {
+            return result;
+        }
+        match self.server.inner.reader.watched_import_failure_summaries() {
+            Ok(rows) => RpcResult::Success(
+                rows.into_iter()
+                    .map(|row| ImportFailure {
+                        bundle: row.bundle,
+                        root: row.root,
+                        path: row.path,
+                        message: row.message,
+                    })
+                    .collect(),
+            ),
+            Err(error) => RpcResult::Failure(store_failure(error)),
+        }
+    }
+
     pub fn unsubscribe(&self, assets: Vec<AssetUuid>, paths: Vec<String>) -> RpcResult<()> {
         if let Some(result) = self.live() {
             return result;

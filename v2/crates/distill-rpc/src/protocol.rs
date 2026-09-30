@@ -12,7 +12,20 @@ pub use distill_store::state::{
     SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
 };
 
-pub const PROTOCOL_VERSION: u32 = 9;
+/// 10: `Hub.importFailures`.
+pub const PROTOCOL_VERSION: u32 = 10;
+
+/// A watched import whose latest attempt failed. The bundle keeps serving its
+/// last good contents; the failure clears when a later import succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportFailure {
+    pub bundle: BundleUuid,
+    /// Asset root name.
+    pub root: String,
+    /// The bundle's path within `root`.
+    pub path: String,
+    pub message: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetDefinitionHash(pub [u8; 32]);

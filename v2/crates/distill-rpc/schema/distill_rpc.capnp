@@ -302,6 +302,24 @@ struct UuidListCall {
   }
 }
 
+# A watched import whose latest attempt failed (see Hub.importFailures).
+struct ImportFailure {
+  bundle @0 :Data;
+  root @1 :Text;
+  path @2 :Text;
+  message @3 :Text;
+}
+
+struct ImportFailuresCall {
+  union {
+    success @0 :List(ImportFailure);
+    reconnectRequired @1 :ReconnectRequired;
+    configurationFailed @2 :ConfigurationError;
+    snapshotExpired @3 :Void;
+    error @4 :RpcError;
+  }
+}
+
 struct OptionalData {
   union {
     absent @0 :Void;
@@ -777,6 +795,9 @@ interface Hub {
   unsubscribe @7 (assets :List(Data), paths :List(Text))
               -> (result :VoidCall);
   authoringSnapshot @8 () -> (result :AuthoringSnapshotCall);
+  # Current watched-import failures: memo state, not versioned input, so
+  # clients poll it. Protocol 10.
+  importFailures @9 () -> (result :ImportFailuresCall);
 }
 
 interface Snapshot {

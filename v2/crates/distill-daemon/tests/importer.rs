@@ -132,6 +132,28 @@ fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: Logical
         .unwrap();
 }
 
+/// The watched-import failures a runtime client polls, as (path, message).
+fn import_failures(coordinator: &DaemonCoordinator) -> Vec<(String, String)> {
+    let hub = match coordinator
+        .server()
+        .root()
+        .connect(distill_rpc::ConnectRequest::new("dev", TargetDefinitionHash([4; 32])))
+    {
+        distill_rpc::ConnectOutcome::Connected(connected) => connected.hub,
+        other => panic!("expected connection, got {other:?}"),
+    };
+    match hub.import_failures() {
+        distill_rpc::RpcResult::Success(failures) => failures
+            .into_iter()
+            .map(|failure| {
+                assert_eq!(failure.root, "main");
+                (failure.path, failure.message)
+            })
+            .collect(),
+        other => panic!("expected import failures, got {other:?}"),
+    }
+}
+
 fn object<const N: usize>(fields: [(&str, AuthoredValue); N]) -> AuthoredValue {
     AuthoredValue::Object(
         fields
@@ -315,6 +337,10 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         InputVersion(6),
         "memoizing a failure is not an input event"
     );
+    let failures = import_failures(&coordinator);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "imported.bundle");
+    assert!(failures[0].1.contains("invalid digit"), "{failures:?}");
     let failed_memo = failed.memo_seq;
     assert!(coordinator.authoring_service().watched_imports_needing_reimport()
         .unwrap()
@@ -345,6 +371,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         .is_none());
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(9));
+    assert!(import_failures(&coordinator).is_empty());
     assert_eq!(
         coordinator.store().read().input_version(),
         InputVersion(8)
