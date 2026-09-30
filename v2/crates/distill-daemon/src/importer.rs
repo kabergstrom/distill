@@ -682,6 +682,32 @@ impl AuthoringService {
         }
     }
 
+    /// Run a directory import at `base` without publishing it.
+    pub(crate) fn run_watched_directory_import(
+        &self,
+        base: InputVersion,
+        task: &DirectoryImportTask,
+    ) -> Result<ImportRun, RpcFailure> {
+        let (importer, invocation) = self.directory_import_invocation(base, task)?;
+        self.run_import(base, importer, invocation)
+            .map_err(ImportExecutionError::into_rpc)
+    }
+
+    /// Publish a watched run as the version after `base`, which may be
+    /// later than the run's. `None` when the run failed and the failure
+    /// was memoized instead.
+    pub(crate) fn publish_watched_import(
+        &self,
+        base: InputVersion,
+        run: ImportRun,
+    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
+        match self.publish_import(base, run, ImportExecutionMode::Publish) {
+            Ok(prepared) => Ok(Some(prepared)),
+            Err(error) if error.memoized => Ok(None),
+            Err(error) => Err(error.into_rpc()),
+        }
+    }
+
     fn directory_import_invocation(
         &self,
         base: InputVersion,
@@ -791,6 +817,48 @@ impl AuthoringService {
         base: InputVersion,
         request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
+        let run = self.run_import_request(base, request)?;
+        self.publish_import_run(base, run)
+    }
+
+    /// Run an explicit import at `base` without publishing it. The run
+    /// reads the store and the roots; it may execute off the authority.
+    pub(crate) fn run_import_request(
+        &self,
+        base: InputVersion,
+        request: &ImportRequest,
+    ) -> Result<ImportRun, RpcFailure> {
+        let (importer, invocation) = self.import_invocation(base, request)?;
+        self.run_import(base, importer, invocation)
+            .map_err(ImportExecutionError::into_rpc)
+    }
+
+    /// Run a reimport of `bundle` at `base` without publishing it.
+    pub(crate) fn run_reimport_bundle(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<ImportRun, RpcFailure> {
+        let (importer, invocation) = self.reimport_invocation(base, bundle)?;
+        self.run_import(base, importer, invocation)
+            .map_err(ImportExecutionError::into_rpc)
+    }
+
+    /// Publish a run made at `base`, on the authority, still at `base`.
+    pub(crate) fn publish_import_run(
+        &self,
+        base: InputVersion,
+        run: ImportRun,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        self.publish_import(base, run, ImportExecutionMode::Publish)
+            .map_err(ImportExecutionError::into_rpc)
+    }
+
+    fn import_invocation(
+        &self,
+        base: InputVersion,
+        request: &ImportRequest,
+    ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let importer = self.registered_importer(&request.importer)?;
         let settings_snapshot = snapshot_to_json(&importer.settings_schema).map_err(invalid)?;
         let settings = decode_authoring_payload(
@@ -818,8 +886,7 @@ impl AuthoringService {
         let mut backend =
             RootedImportBackend::open(&self.scanner, &self.store, &capabilities)?;
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
-        self.execute_import(
-            base,
+        Ok((
             importer,
             ImportInvocation {
                 destination,
@@ -830,9 +897,7 @@ impl AuthoringService {
                 origin: None,
                 basis_deps: Vec::new(),
             },
-            ImportExecutionMode::Publish,
-        )
-        .map_err(ImportExecutionError::into_rpc)
+        ))
     }
 
     pub(crate) fn prepare_reimport_bundle(
@@ -889,6 +954,19 @@ impl AuthoringService {
         bundle: BundleUuid,
         mode: ImportExecutionMode,
     ) -> Result<PreparedImportCommit, RpcFailure> {
+        let (importer, invocation) = self.reimport_invocation(base, bundle)?;
+        let prepared = self
+            .execute_import(base, importer, invocation, mode)
+            .map_err(ImportExecutionError::into_rpc)?;
+        debug_assert_eq!(prepared.bundle, bundle);
+        Ok(prepared)
+    }
+
+    fn reimport_invocation(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
         let store = self
             .store
             .lock()
@@ -921,93 +999,7 @@ impl AuthoringService {
         };
         let sources = prior.model.record.sources.clone();
         let watch = prior.model.record.watch;
-        drop(store);
-        let prepared = self
-            .execute_import(
-                base,
-                importer,
-                ImportInvocation {
-                    destination,
-                    prior: Some(prior),
-                    sources,
-                    explicit_settings: None,
-                    watch,
-                    origin: None,
-                    basis_deps: Vec::new(),
-                },
-                mode,
-            )
-            .map_err(ImportExecutionError::into_rpc)?;
-        debug_assert_eq!(prepared.bundle, bundle);
-        Ok(prepared)
-    }
-
-    /// Coordinator-only watched retry. A stable failed attempt that was
-    /// durably memoized is a handled outcome, not a background-loop error.
-    pub(crate) fn prepare_watched_reimport(
-        &self,
-        base: InputVersion,
-        bundle: BundleUuid,
-    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
-        match self.prepare_reimport_for_watcher(base, bundle) {
-            Ok(prepared) => Ok(Some(prepared)),
-            Err(error) if error.memoized => Ok(None),
-            Err(error) => Err(error.into_rpc()),
-        }
-    }
-
-    fn prepare_reimport_for_watcher(
-        &self,
-        base: InputVersion,
-        bundle: BundleUuid,
-    ) -> Result<PreparedImportCommit, ImportExecutionError> {
-        let store = self.store.lock().map_err(|_| {
-            ImportExecutionError::unmemoized(invalid("durable store coordinator mutex is poisoned"))
-        })?;
-        require_base(&store, base).map_err(ImportExecutionError::unmemoized)?;
-        let meta = store
-            .bundle(bundle)
-            .map_err(invalid)
-            .map_err(ImportExecutionError::unmemoized)?
-            .ok_or_else(|| {
-                ImportExecutionError::unmemoized(invalid(format!(
-                    "cannot reimport unknown bundle {bundle}"
-                )))
-            })?;
-        let prior = self
-            .read_prior_import(&store, &meta)
-            .map_err(ImportExecutionError::unmemoized)?;
-        let importer = self
-            .registered_importer(&prior.model.record.importer)
-            .map_err(ImportExecutionError::unmemoized)?;
-        if prior.settings_type_uuid != importer.settings_type_uuid {
-            return Err(ImportExecutionError::unmemoized(invalid(
-                "the recorded settings entry type no longer matches the importer registration",
-            )));
-        }
-        let root = store
-            .root_name(meta.root)
-            .map_err(invalid)
-            .map_err(ImportExecutionError::unmemoized)?
-            .ok_or_else(|| {
-                ImportExecutionError::unmemoized(invalid("bundle root identity is missing"))
-            })?;
-        let target = self
-            .scanner
-            .physical_path(&root, &meta.path)
-            .map_err(invalid)
-            .map_err(ImportExecutionError::unmemoized)?;
-        let destination = ImportDestination {
-            root,
-            path: meta.path.clone(),
-            target,
-            meta: Some(meta),
-        };
-        let sources = prior.model.record.sources.clone();
-        let watch = prior.model.record.watch;
-        drop(store);
-        let prepared = self.execute_import(
-            base,
+        Ok((
             importer,
             ImportInvocation {
                 destination,
@@ -1018,10 +1010,25 @@ impl AuthoringService {
                 origin: None,
                 basis_deps: Vec::new(),
             },
-            ImportExecutionMode::Publish,
-        )?;
-        debug_assert_eq!(prepared.bundle, bundle);
-        Ok(prepared)
+        ))
+    }
+
+    /// Coordinator-only watched retry. A stable failed attempt that was
+    /// durably memoized is a handled outcome, not a background-loop error.
+    pub(crate) fn prepare_watched_reimport(
+        &self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
+        let (importer, invocation) = self.reimport_invocation(base, bundle)?;
+        match self.execute_import(base, importer, invocation, ImportExecutionMode::Publish) {
+            Ok(prepared) => {
+                debug_assert_eq!(prepared.bundle, bundle);
+                Ok(Some(prepared))
+            }
+            Err(error) if error.memoized => Ok(None),
+            Err(error) => Err(error.into_rpc()),
+        }
     }
 
     fn execute_import(
@@ -1031,6 +1038,18 @@ impl AuthoringService {
         invocation: ImportInvocation,
         mode: ImportExecutionMode,
     ) -> Result<PreparedImportCommit, ImportExecutionError> {
+        let run = self.run_import(base, importer, invocation)?;
+        self.publish_import(base, run, mode)
+    }
+
+    /// Run the importer at `base`. This writes nothing, so it may run off
+    /// the authority; [`AuthoringService::publish_import`] publishes it.
+    fn run_import(
+        &self,
+        base: InputVersion,
+        importer: RegisteredImporter,
+        invocation: ImportInvocation,
+    ) -> Result<ImportRun, ImportExecutionError> {
         let ImportInvocation {
             destination,
             prior,
@@ -1074,8 +1093,16 @@ impl AuthoringService {
         };
         let mut read_set = context.into_read_set();
         read_set.extend(basis_deps);
-        let output = match result {
-            Ok(output) => output,
+        let outcome = match result {
+            Ok(_) if read_set.iter().any(dep_has_failure) => {
+                let message = "an importer cannot publish after catching a failed context observation";
+                Err(ImportRunFailure {
+                    terminal: WatchedImportTerminal::Dependency,
+                    message: message.to_owned(),
+                    rpc: invalid(message),
+                })
+            }
+            Ok(output) => Ok(output),
             Err(error) => {
                 let terminal = match &error {
                     AuthoringImporterError::Dependency(dependency)
@@ -1106,48 +1133,89 @@ impl AuthoringService {
                     }
                 };
                 let message = error.message();
+                Err(ImportRunFailure {
+                    terminal,
+                    rpc: invalid(format!("importer {:?} failed: {message}", importer.id)),
+                    message,
+                })
+            }
+        };
+        Ok(ImportRun {
+            base,
+            importer,
+            destination,
+            prior,
+            sources,
+            explicit_settings,
+            watch,
+            origin,
+            read_set,
+            outcome,
+        })
+    }
+
+    /// Publish `run` as the version after `base`, on the authority. A run
+    /// from an earlier base publishes only when its destination and read
+    /// set are unchanged; otherwise it is discarded as stale.
+    fn publish_import(
+        &self,
+        base: InputVersion,
+        run: ImportRun,
+        mode: ImportExecutionMode,
+    ) -> Result<PreparedImportCommit, ImportExecutionError> {
+        let ImportRun {
+            base: run_base,
+            importer,
+            destination,
+            prior,
+            sources,
+            explicit_settings,
+            watch,
+            origin,
+            read_set,
+            outcome,
+        } = run;
+        if run_base != base {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| invalid("durable store coordinator mutex is poisoned"))
+                .map_err(ImportExecutionError::unmemoized)?;
+            require_base(&store, base).map_err(ImportExecutionError::unmemoized)?;
+            if !destination_unchanged(&store, &destination)? {
+                return Err(ImportExecutionError::unmemoized(RpcFailure::StaleInputVersion {
+                    expected: base,
+                    got: run_base,
+                }));
+            }
+        }
+        let output = match outcome {
+            Ok(output) => output,
+            Err(failure) => {
                 let memoized = if mode == ImportExecutionMode::Publish {
                     self.record_failed_attempt(
-                        base,
+                        run_base,
                         destination.meta.as_ref(),
                         watch,
                         &read_set,
-                        terminal,
-                        &message,
+                        failure.terminal,
+                        &failure.message,
                     )
                     .map_err(ImportExecutionError::unmemoized)?
                 } else {
                     false
                 };
                 return Err(ImportExecutionError {
-                    rpc: invalid(format!("importer {:?} failed: {message}", importer.id)),
+                    rpc: failure.rpc,
                     memoized,
                 });
             }
         };
-        if read_set.iter().any(dep_has_failure) {
-            let message = "an importer cannot publish after catching a failed context observation";
-            let memoized = if mode == ImportExecutionMode::Publish {
-                self.record_failed_attempt(
-                    base,
-                    destination.meta.as_ref(),
-                    watch,
-                    &read_set,
-                    WatchedImportTerminal::Dependency,
-                    message,
-                )
-                .map_err(ImportExecutionError::unmemoized)?
-            } else {
-                false
-            };
-            return Err(ImportExecutionError {
-                rpc: invalid(message),
-                memoized,
-            });
-        }
 
+        // New identities are seeded by the run's base, so the fold is the
+        // same wherever the run publishes.
         let seed = import_identity_seed(
-            base,
+            run_base,
             &destination.root,
             &destination.path,
             importer.capability_hash,
@@ -1294,7 +1362,8 @@ impl AuthoringService {
             .store
             .lock()
             .map_err(|_| invalid("durable store coordinator mutex is poisoned"))?;
-        require_base(&store, base)?;
+        // On the authority: nothing publishes between the revalidation above
+        // and this record, whatever version the attempt ran at.
         let memo_seq = store.memo_seq();
         store
             .record_watched_import_failure(&WatchedImportFailure {
@@ -3173,6 +3242,41 @@ struct PriorImport {
     model: ImportedBundle,
     settings_type_uuid: TypeUuid,
     bundle: Bundle,
+}
+
+/// An importer run, not yet published (see [`AuthoringService::run_import`]).
+pub(crate) struct ImportRun {
+    base: InputVersion,
+    importer: RegisteredImporter,
+    destination: ImportDestination,
+    prior: Option<PriorImport>,
+    sources: Vec<RootedPath>,
+    explicit_settings: Option<AuthoredValue>,
+    watch: bool,
+    origin: Option<DirectoryOrigin>,
+    read_set: Vec<FileDep>,
+    outcome: Result<ImportOutput, ImportRunFailure>,
+}
+
+/// An importer failure a watched import memoizes.
+struct ImportRunFailure {
+    terminal: WatchedImportTerminal,
+    message: String,
+    rpc: RpcFailure,
+}
+
+/// Whether the bundle at `destination` is still the one the run read.
+fn destination_unchanged(
+    store: &Store,
+    destination: &ImportDestination,
+) -> Result<bool, ImportExecutionError> {
+    let current = match &destination.meta {
+        Some(meta) => store.bundle(meta.bundle),
+        None => store.bundle_at(&destination.root, &destination.path),
+    }
+    .map_err(invalid)
+    .map_err(ImportExecutionError::unmemoized)?;
+    Ok(current == destination.meta)
 }
 
 struct ImportInvocation {

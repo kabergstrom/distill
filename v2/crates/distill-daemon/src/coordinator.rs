@@ -25,7 +25,7 @@ use distill_rpc::{
     DerivedOutputEntry, DerivedOutputMutation, DriftedInput, LineageManifestClaimant,
     LineageRepairState, PathMutation, PipelineCandidateIdentity, PipelineDiagnostic,
     SchemaTransitionAction, Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison,
-    VersionPoisonV1,
+    PreparedImportCommit, RpcFailure, VersionPoisonV1,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
@@ -60,6 +60,7 @@ use crate::epoch::{
 use crate::lineage_repair::{
     plan_same_dir_temp, unique_sibling, write_planned_temp, LineageRepairBackendInitError,
 };
+use crate::importer::ImportRun;
 use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::operations::{PlannedSchemaTransition, SchemaTransitionJournalBasis};
 use crate::pipeline_map::PipelineProjection;
@@ -1939,13 +1940,10 @@ impl DaemonCoordinator {
     /// Each bundle publishes as its own version so a later conflict cannot
     /// roll back an earlier per-file success.
     pub fn reconcile_watched_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.on_authority(|| {
-            let pending = self
-                .authoring
-                .watched_imports_needing_reimport()
-                .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-            self.reconcile_watched_import_bundles(pending)
-        })
+        let pending = self
+            .on_authority(|| self.authoring.watched_imports_needing_reimport())
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        self.reconcile_watched_import_bundles(pending)
     }
 
     /// Watcher-batch variant that revalidates only read sets capable of
@@ -1955,42 +1953,83 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.on_authority(|| {
-            let pending = if capabilities_changed {
-                self.authoring
-                    .watched_imports_affected_by_capabilities(&work.dirty, &work.renames)
-            } else {
-                self.authoring
-                    .watched_imports_affected_by(&work.dirty, &work.renames)
-            }
+        let pending = self
+            .on_authority(|| {
+                if capabilities_changed {
+                    self.authoring
+                        .watched_imports_affected_by_capabilities(&work.dirty, &work.renames)
+                } else {
+                    self.authoring
+                        .watched_imports_affected_by(&work.dirty, &work.renames)
+                }
+            })
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-            self.reconcile_watched_import_bundles(pending)
-        })
+        self.reconcile_watched_import_bundles(pending)
     }
 
     fn reconcile_watched_import_bundles(
         &self,
         pending: Vec<BundleUuid>,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let mut imported = Vec::with_capacity(pending.len());
-        for bundle in pending {
-            let base = self.server().current_stamp().version;
-            let authoring = Arc::clone(&self.authoring);
-            let publication = self
-                .server()
-                .coordinated_maybe_commit(base, || {
-                    authoring
-                        .prepare_watched_reimport(base, bundle)
-                        .map(|prepared| prepared.map(|prepared| prepared.commit))
-                        .map_err(|error| format!("{error:?}"))
-                })
-                .map_err(CoordinatorError::Coordinated)?;
-            if publication.is_some() {
-                imported.push(bundle);
-            }
-        }
-        Ok(imported)
+        self.reconcile_watched(
+            &pending,
+            |base, bundle| self.authoring.run_reimport_bundle(base, *bundle),
+            |base, bundle| self.authoring.prepare_watched_reimport(base, *bundle),
+        )
     }
+
+    /// Run each watched import in parallel, off the authority, at the
+    /// current version; then publish them in order on the authority, each as
+    /// its own version. A run that an earlier publication made stale reruns
+    /// there, at the version it publishes after.
+    fn reconcile_watched<T: Sync>(
+        &self,
+        items: &[T],
+        run: impl Fn(InputVersion, &T) -> Result<ImportRun, RpcFailure> + Sync,
+        rerun: impl Fn(InputVersion, &T) -> Result<Option<PreparedImportCommit>, RpcFailure> + Sync,
+    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
+        use rayon::prelude::*;
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = self.server().current_stamp().version;
+        let runs = items
+            .par_iter()
+            .map(|item| run(base, item))
+            .collect::<Vec<_>>();
+        self.on_authority(|| {
+            let mut imported = Vec::with_capacity(items.len());
+            for (item, run) in items.iter().zip(runs) {
+                let current = self.server().current_stamp().version;
+                let drifted = current != base;
+                let mut bundle = None;
+                let publication = self
+                    .server()
+                    .coordinated_maybe_commit(current, || {
+                        let prepared = match run {
+                            Ok(run) => match self.authoring.publish_watched_import(current, run) {
+                                Err(_) if drifted => rerun(current, item),
+                                published => published,
+                            },
+                            Err(_) if drifted => rerun(current, item),
+                            Err(error) => Err(error),
+                        }
+                        .map_err(|error| format!("{error:?}"))?;
+                        Ok(prepared.map(|prepared| {
+                            bundle = Some(prepared.bundle);
+                            prepared.commit
+                        }))
+                    })
+                    .map_err(CoordinatorError::Coordinated)?;
+                if publication.is_some() {
+                    imported.push(bundle.expect("a published watched import names its bundle"));
+                }
+            }
+            Ok(imported)
+        })
+    }
+
 
     pub fn pending_file_work(&self) -> Result<PendingFileWork, CoordinatorError> {
         lock_store(&self.store)
@@ -2017,13 +2056,10 @@ impl DaemonCoordinator {
     /// bundle is a separate journaled/versioned fold; orphaned prior outputs
     /// are deliberately retained and therefore never appear as deletion work.
     pub fn reconcile_directory_imports(&self) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.on_authority(|| {
-            let tasks = self
-                .authoring
-                .directory_import_tasks()
-                .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-            self.reconcile_directory_import_tasks(tasks)
-        })
+        let tasks = self
+            .on_authority(|| self.authoring.directory_import_tasks())
+            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
+        self.reconcile_directory_import_tasks(tasks)
     }
 
     pub fn reconcile_directory_imports_affected(
@@ -2031,54 +2067,29 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.on_authority(|| {
-            let tasks = if capabilities_changed {
-                self.authoring
-                    .directory_import_tasks_affected_by_capabilities(&work.dirty, &work.renames)
-            } else {
-                self.authoring
-                    .directory_import_tasks_affected_by(&work.dirty, &work.renames)
-            }
+        let tasks = self
+            .on_authority(|| {
+                if capabilities_changed {
+                    self.authoring
+                        .directory_import_tasks_affected_by_capabilities(&work.dirty, &work.renames)
+                } else {
+                    self.authoring
+                        .directory_import_tasks_affected_by(&work.dirty, &work.renames)
+                }
+            })
             .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-            self.reconcile_directory_import_tasks(tasks)
-        })
+        self.reconcile_directory_import_tasks(tasks)
     }
 
     fn reconcile_directory_import_tasks(
         &self,
         tasks: Vec<crate::importer::DirectoryImportTask>,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let mut imported = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            let base = self.server().current_stamp().version;
-            let authoring = Arc::clone(&self.authoring);
-            let bundle = Arc::new(Mutex::new(None));
-            let captured = Arc::clone(&bundle);
-            let publication = self
-                .server()
-                .coordinated_maybe_commit(base, || {
-                    let prepared = authoring
-                        .prepare_watched_directory_import(base, &task)
-                        .map_err(|error| format!("{error:?}"))?;
-                    let Some(prepared) = prepared else {
-                        return Ok(None);
-                    };
-                    *captured
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared.bundle);
-                    Ok(Some(prepared.commit))
-                })
-                .map_err(CoordinatorError::Coordinated)?;
-            if publication.is_some() {
-                imported.push(
-                    bundle
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .expect("coordinated directory import captured its bundle"),
-                );
-            }
-        }
-        Ok(imported)
+        self.reconcile_watched(
+            &tasks,
+            |base, task| self.authoring.run_watched_directory_import(base, task),
+            |base, task| self.authoring.prepare_watched_directory_import(base, task),
+        )
     }
 }
 

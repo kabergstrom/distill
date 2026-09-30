@@ -626,6 +626,23 @@ impl StoreReader {
             .transpose()
     }
 
+    /// The bundle row at (root name, path), if any.
+    pub fn bundle_at(&self, root_name: &str, path: &str) -> Result<Option<BundleMeta>, StoreError> {
+        let bundle = self
+            .conn
+            .query_row(
+                "SELECT b.bundle_uuid FROM bundles b JOIN roots r USING (root_id)
+                 WHERE r.name = ?1 AND b.path = ?2",
+                rusqlite::params![root_name, path],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match bundle {
+            Some(bundle) => self.bundle(BundleUuid(blob16(bundle))),
+            None => Ok(None),
+        }
+    }
+
     /// One bundle's physical row. Poisoned bundles still *have* a row —
     /// the poison is part of it.
     pub fn bundle(&self, bundle: BundleUuid) -> Result<Option<BundleMeta>, StoreError> {

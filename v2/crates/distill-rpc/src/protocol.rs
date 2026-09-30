@@ -1018,6 +1018,11 @@ impl PreparedOperationCommit {
     }
 }
 
+/// The authority-side step of an import run: publish what ran off the
+/// authority, or fail.
+pub type ImportJob<'a> =
+    Box<dyn FnOnce() -> Result<PreparedImportCommit, RpcFailure> + Send + 'a>;
+
 /// Daemon integration seam for workflows that require importer, filesystem,
 /// migration, or doctor services. Implementations prepare a side-effect-free
 /// commit; publication remains an atomic RPC-server CAS step.
@@ -1050,6 +1055,26 @@ pub trait AuthoringBackend: Send + Sync {
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure>;
+
+    /// Run an import off the authority and return the step that publishes
+    /// it, which the authority runs while still at `base`. The default
+    /// leaves all the work to that step.
+    fn run_import<'a>(
+        &'a self,
+        base: InputVersion,
+        request: ImportRequest,
+    ) -> Result<ImportJob<'a>, RpcFailure> {
+        Ok(Box::new(move || self.prepare_import(base, &request)))
+    }
+
+    /// [`AuthoringBackend::run_import`] for a reimport.
+    fn run_reimport<'a>(
+        &'a self,
+        base: InputVersion,
+        bundle: BundleUuid,
+    ) -> Result<ImportJob<'a>, RpcFailure> {
+        Ok(Box::new(move || self.prepare_reimport(base, bundle)))
+    }
 
     fn prepare_operation(
         &self,

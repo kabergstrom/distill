@@ -1420,8 +1420,15 @@ impl Hub {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
-        self.prepared(base, |backend| {
-            let prepared = backend.prepare_import(base, &request)?;
+        // The importer runs here, off the authority; the authority only
+        // publishes, and only while still at `base`.
+        let backend = self.server.inner.handle.authoring_backend();
+        let job = match backend.run_import(base, request) {
+            Ok(job) => job,
+            Err(error) => return RpcResult::Failure(error),
+        };
+        self.prepared(base, move |_| {
+            let prepared = job()?;
             Ok(Some((prepared.commit, prepared.bundle)))
         })
         .expect("an import always publishes")
@@ -1431,8 +1438,13 @@ impl Hub {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
-        self.prepared(base, |backend| {
-            let prepared = backend.prepare_reimport(base, bundle)?;
+        let backend = self.server.inner.handle.authoring_backend();
+        let job = match backend.run_reimport(base, bundle) {
+            Ok(job) => job,
+            Err(error) => return RpcResult::Failure(error),
+        };
+        self.prepared(base, move |_| {
+            let prepared = job()?;
             if prepared.bundle != bundle {
                 return Err(RpcFailure::InvalidAuthoringRequest {
                     detail: "reimport backend changed the bundle identity".to_owned(),
