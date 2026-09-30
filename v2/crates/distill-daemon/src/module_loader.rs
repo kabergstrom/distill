@@ -1,62 +1,23 @@
 //! Concrete pipeline cdylib loader over the shared New Game Plus host layer.
+//!
+//! The module table, its ABI identity and the export macro are defined in
+//! `distill-pipeline-api` and re-exported here.
 
 use std::collections::BTreeSet;
 
-use distill_asset::{
-    AssetRuntimeDescriptor, CallbackPanic, EncodeContainer, EncodeSink, EpochToken, ErasedValue,
-    ModuleEpochToken, PlaceholderThunk,
+pub use distill_pipeline_api::module::{
+    decode_module_abi_identity, encode_module_abi_identity, host_interface_closure_manifest,
+    host_module_abi_identity, host_rustc_identity, PipelineModuleEntryV2, PipelineModuleTableV2,
+    PipelineProbeFnV2, PipelineRegisterFnV2, PipelineUnloadFnV2, PIPELINE_MODULE_ABI_VERSION_V2,
+    PIPELINE_MODULE_SYMBOL_V2,
 };
-use distill_build::import::ImportOutput;
-use distill_build::outputs::{OutputDecls, OutputError};
-use distill_build::tool::{ToolOutput, ToolRunError};
-use distill_core::canonical::{domain_digest, DSMA};
-use distill_json::AuthoredValue;
-use unicode_normalization::is_nfc;
 
-use crate::callbacks::{
-    CallbackInvokeError, CodegenAsset, CodegenContextError, CodegenDescriptor, DefaultsDescriptor,
-    Diagnostic, Diagnostics, ImporterDescriptor, MigrationFunctionError, PipelineCodegenContext,
-    PipelineProcessContext, ProcessArtifact, ProcessContextError, ProcessOutputs,
-    ProcessorDescriptor, ProcessorError, ProcessorProducts, ToolDescriptor, ToolRegistration,
-    ToolSource, ValidatorDescriptor,
-};
 use crate::epoch::{
-    CandidateRegistrationArena, ErasedRegistrationCapsule, HostCallbackBoundary,
-    LoadedPipelineModule, ModuleAbiIdentity, ModuleCallError, PipelineModuleLoader, Registration,
-    RegistrationSet, RegistrationStatus, StagedModule, TargetDefinition,
+    CandidateRegistrationArena, LoadedPipelineModule, ModuleAbiIdentity, ModuleCallError,
+    PipelineModuleLoader, StagedModule, TargetDefinition,
 };
-use crate::importer::{AuthoringImportContext, AuthoringImporterError};
 
-mod host_interface_closure {
-    include!(concat!(env!("OUT_DIR"), "/host_interface_closure.rs"));
-}
-
-pub const PIPELINE_MODULE_ABI_VERSION_V2: u32 = 2;
-pub const PIPELINE_MODULE_SYMBOL_V2: &[u8] = b"distill_pipeline_module_v2\0";
-const IDENTITY_ENCODING_VERSION: u8 = 1;
 const MAX_PROBE_BYTES: usize = 64 * 1024;
-
-pub type PipelineProbeFnV2 =
-    unsafe extern "C" fn(buffer: *mut u8, capacity: u32, length: *mut u32) -> i32;
-pub type PipelineRegisterFnV2 = unsafe fn(
-    targets: &[TargetDefinition],
-    arena: &mut CandidateRegistrationArena,
-) -> Result<BTreeSet<String>, ModuleCallError>;
-pub type PipelineUnloadFnV2 = unsafe fn() -> Result<(), ModuleCallError>;
-
-/// The audited pipeline module table. The C-ABI prefix is called before Rust
-/// ABI compatibility is established; the lower entries are called only after
-/// the returned identity equals the host's complete expected identity.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PipelineModuleTableV2 {
-    pub abi_version: u32,
-    pub module_abi: PipelineProbeFnV2,
-    pub register: PipelineRegisterFnV2,
-    pub unload: PipelineUnloadFnV2,
-}
-
-pub type PipelineModuleEntryV2 = unsafe extern "C" fn() -> *const PipelineModuleTableV2;
 
 /// Copy a versioned module table without reading beyond the cross-ABI prefix
 /// before that prefix has selected the complete table layout.
@@ -85,108 +46,6 @@ unsafe fn read_pipeline_module_table(
     // SAFETY: a matching prefix selects the complete v2 table contract, and
     // the resident module keeps the pointed-to static alive.
     Ok(unsafe { pointer.read() })
-}
-
-pub fn host_interface_closure_manifest() -> &'static [(&'static str, &'static [u8])] {
-    host_interface_closure::HOST_INTERFACE_CLOSURE
-}
-
-/// Exact `rustc -vV` of the compiler that built this resident host image.
-/// This is intentionally independent of the watched project's DSLI.
-pub fn host_rustc_identity() -> &'static str {
-    host_interface_closure::HOST_RUSTC_IDENTITY
-}
-
-/// The daemon-side ABI identity embedded into the expected candidate. A
-/// pipeline module built against this exact interface crate calls the same
-/// helper when exporting its C-prefix identity bytes.
-pub fn host_module_abi_identity() -> ModuleAbiIdentity {
-    let interface_fingerprint = domain_digest(DSMA, 1, |encoder| {
-        encoder.seq(
-            host_interface_closure::HOST_INTERFACE_CLOSURE,
-            |encoder, row| {
-                encoder.str(row.0);
-                encoder.u64(row.1.len() as u64);
-                encoder.raw(row.1);
-            },
-        );
-        encoder.seq(
-            host_interface_closure::HOST_BUILD_CONFIGURATION,
-            |encoder, row| {
-                encoder.str(row.0);
-                encoder.str(row.1);
-            },
-        );
-    });
-    let measured_interface = domain_digest(DSMA, 2, |encoder| {
-        encode_measurement::<PipelineModuleTableV2>(encoder);
-        encode_measurement::<PipelineProbeFnV2>(encoder);
-        encode_measurement::<PipelineRegisterFnV2>(encoder);
-        encode_measurement::<PipelineUnloadFnV2>(encoder);
-        encode_measurement::<TargetDefinition>(encoder);
-        encode_measurement::<CandidateRegistrationArena>(encoder);
-        encode_measurement::<ErasedRegistrationCapsule>(encoder);
-        encode_measurement::<Registration>(encoder);
-        encode_measurement::<RegistrationSet>(encoder);
-        encode_measurement::<RegistrationStatus>(encoder);
-        encode_measurement::<HostCallbackBoundary>(encoder);
-        encode_measurement::<ModuleCallError>(encoder);
-        encode_measurement::<ModuleAbiIdentity>(encoder);
-        encode_measurement::<ModuleEpochToken>(encoder);
-        encode_measurement::<EpochToken>(encoder);
-        encode_measurement::<ErasedValue>(encoder);
-        encode_measurement::<AssetRuntimeDescriptor>(encoder);
-        encode_measurement::<EncodeContainer>(encoder);
-        encode_measurement::<PlaceholderThunk>(encoder);
-        encode_measurement::<CallbackPanic>(encoder);
-        encode_measurement::<*mut dyn EncodeSink>(encoder);
-        encode_measurement::<*mut dyn AuthoringImportContext>(encoder);
-        encode_measurement::<*mut dyn PipelineProcessContext>(encoder);
-        encode_measurement::<*mut dyn PipelineCodegenContext>(encoder);
-        encode_measurement::<AuthoredValue>(encoder);
-        encode_measurement::<ImporterDescriptor>(encoder);
-        encode_measurement::<ProcessorDescriptor>(encoder);
-        encode_measurement::<CodegenDescriptor>(encoder);
-        encode_measurement::<CodegenAsset>(encoder);
-        encode_measurement::<CodegenContextError>(encoder);
-        encode_measurement::<ValidatorDescriptor>(encoder);
-        encode_measurement::<DefaultsDescriptor>(encoder);
-        encode_measurement::<ToolDescriptor>(encoder);
-        encode_measurement::<ToolRegistration>(encoder);
-        encode_measurement::<ToolSource>(encoder);
-        encode_measurement::<ProcessorProducts>(encoder);
-        encode_measurement::<ProcessArtifact>(encoder);
-        encode_measurement::<ProcessOutputs>(encoder);
-        encode_measurement::<ProcessContextError>(encoder);
-        encode_measurement::<ProcessorError>(encoder);
-        encode_measurement::<MigrationFunctionError>(encoder);
-        encode_measurement::<Diagnostic>(encoder);
-        encode_measurement::<Diagnostics>(encoder);
-        encode_measurement::<CallbackInvokeError<ProcessorError>>(encoder);
-        encode_measurement::<AuthoringImporterError>(encoder);
-        encode_measurement::<ImportOutput>(encoder);
-        encode_measurement::<OutputDecls>(encoder);
-        encode_measurement::<OutputError>(encoder);
-        encode_measurement::<ToolOutput>(encoder);
-        encode_measurement::<ToolRunError>(encoder);
-    });
-    ModuleAbiIdentity {
-        rustc: host_rustc_identity().to_owned(),
-        interface_fingerprint,
-        measured_interface,
-        panic_strategy: if cfg!(panic = "unwind") {
-            "unwind".to_owned()
-        } else {
-            "abort".to_owned()
-        },
-        allocator: "system".to_owned(),
-    }
-}
-
-fn encode_measurement<T>(encoder: &mut distill_core::canonical::CanonicalEncoder) {
-    encoder.str(std::any::type_name::<T>());
-    encoder.u64(std::mem::size_of::<T>() as u64);
-    encoder.u64(std::mem::align_of::<T>() as u64);
 }
 
 #[derive(Debug, Default)]
@@ -265,8 +124,10 @@ impl LoadedPipelineModule for DynamicLoadedPipelineModule {
         arena: &mut CandidateRegistrationArena,
     ) -> Result<BTreeSet<String>, ModuleCallError> {
         // SAFETY: this Rust-ABI entry is reached only after the host compared
-        // the shared source identity and ModuleAbiIdentity exactly.
-        unsafe { (self.table()?.register)(targets, arena) }
+        // the shared source identity and ModuleAbiIdentity exactly. The module
+        // registers through the API arena, which calls back into `arena`
+        // through its `RegistrationHost` implementation.
+        unsafe { (self.table()?.register)(targets, &mut arena.registrar()) }
     }
 
     fn unload(&mut self) -> Result<(), ModuleCallError> {
@@ -283,38 +144,6 @@ impl LoadedPipelineModule for DynamicLoadedPipelineModule {
             image.close();
         }
     }
-}
-
-pub fn encode_module_abi_identity(
-    identity: &ModuleAbiIdentity,
-) -> Result<Vec<u8>, ModuleCallError> {
-    let mut writer = Writer::default();
-    writer.byte(IDENTITY_ENCODING_VERSION);
-    writer.string(&identity.rustc)?;
-    writer.raw(&identity.interface_fingerprint);
-    writer.raw(&identity.measured_interface);
-    writer.string(&identity.panic_strategy)?;
-    writer.string(&identity.allocator)?;
-    Ok(writer.bytes)
-}
-
-pub fn decode_module_abi_identity(bytes: &[u8]) -> Result<ModuleAbiIdentity, ModuleCallError> {
-    let mut reader = Reader::new(bytes);
-    let version = reader.byte()?;
-    if version != IDENTITY_ENCODING_VERSION {
-        return Err(ModuleCallError::new(format!(
-            "unsupported module identity encoding {version}"
-        )));
-    }
-    let module_abi = ModuleAbiIdentity {
-        rustc: reader.string()?,
-        interface_fingerprint: reader.array()?,
-        measured_interface: reader.array()?,
-        panic_strategy: reader.string()?,
-        allocator: reader.string()?,
-    };
-    reader.finish()?;
-    Ok(module_abi)
 }
 
 fn read_probe(probe: PipelineProbeFnV2) -> Result<Vec<u8>, ModuleCallError> {
@@ -356,94 +185,6 @@ fn read_probe(probe: PipelineProbeFnV2) -> Result<Vec<u8>, ModuleCallError> {
     Ok(bytes)
 }
 
-#[derive(Default)]
-struct Writer {
-    bytes: Vec<u8>,
-}
-
-impl Writer {
-    fn byte(&mut self, value: u8) {
-        self.bytes.push(value);
-    }
-
-    fn raw(&mut self, value: &[u8]) {
-        self.bytes.extend_from_slice(value);
-    }
-
-    fn count(&mut self, value: usize) -> Result<(), ModuleCallError> {
-        let value = u32::try_from(value)
-            .map_err(|_| ModuleCallError::new("module ABI count exceeds u32"))?;
-        self.raw(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn string(&mut self, value: &str) -> Result<(), ModuleCallError> {
-        if !is_nfc(value) {
-            return Err(ModuleCallError::new("module ABI string is not NFC"));
-        }
-        self.count(value.len())?;
-        self.raw(value.as_bytes());
-        Ok(())
-    }
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], ModuleCallError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| ModuleCallError::new("module ABI length overflow"))?;
-        let value = self
-            .bytes
-            .get(self.position..end)
-            .ok_or_else(|| ModuleCallError::new("truncated module ABI payload"))?;
-        self.position = end;
-        Ok(value)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], ModuleCallError> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| ModuleCallError::new("truncated module ABI array"))
-    }
-
-    fn byte(&mut self) -> Result<u8, ModuleCallError> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn count(&mut self) -> Result<usize, ModuleCallError> {
-        usize::try_from(u32::from_le_bytes(self.array()?))
-            .map_err(|_| ModuleCallError::new("module ABI count does not fit usize"))
-    }
-
-    fn string(&mut self) -> Result<String, ModuleCallError> {
-        let length = self.count()?;
-        let value = std::str::from_utf8(self.take(length)?)
-            .map_err(|_| ModuleCallError::new("module ABI string is not UTF-8"))?;
-        if !is_nfc(value) {
-            return Err(ModuleCallError::new("module ABI string is not NFC"));
-        }
-        Ok(value.to_owned())
-    }
-
-    fn finish(&self) -> Result<(), ModuleCallError> {
-        if self.position == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(ModuleCallError::new("trailing bytes in module ABI payload"))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,7 +199,7 @@ mod tests {
 
     unsafe fn empty_register(
         _targets: &[TargetDefinition],
-        _arena: &mut CandidateRegistrationArena,
+        _arena: &mut distill_pipeline_api::registration::RegistrationArena<'_>,
     ) -> Result<BTreeSet<String>, ModuleCallError> {
         Ok(BTreeSet::new())
     }

@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use distill_asset::{ModuleEpochPoisonCause, ModuleEpochToken};
 use distill_core::id::TypeUuid;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
+use distill_pipeline_api::registration::{ErasedCallback, RegistrationArena, RegistrationHost};
 use distill_store::pipeline::ValidatedPipelineEpoch;
 pub use distill_store::state::{
     CleanupDisposition as CandidateCleanupDisposition, PipelineFailure, PipelineFailureCode,
@@ -25,23 +26,19 @@ use distill_store::state::{
 use distill_store::StoreError;
 
 use crate::callbacks::{
-    erase_callback, CallbackHandle, CallbackInvokeError, CodegenDescriptor,
-    ContainedCodegenContext, ContainedImportContext, ContainedProcessContext, DefaultsDescriptor,
-    Diagnostics, ImporterDescriptor, InfallibleCallbackError, MigrationFunctionError,
-    PipelineCodegen, PipelineCodegenContext, PipelineDefaults, PipelineImporter, PipelineMigration,
-    PipelineProcessContext, PipelineProcessor, PipelineValidator, ProcessorDescriptor,
-    ProcessorError, ProcessorProducts, ToolDescriptor, ValidatorDescriptor,
+    CallbackHandle, CallbackInvokeError, CodegenDescriptor, ContainedCodegenContext,
+    ContainedImportContext, ContainedProcessContext, Diagnostics, ImporterDescriptor,
+    InfallibleCallbackError, MigrationFunctionError, PipelineCodegenContext,
+    PipelineProcessContext, ProcessorDescriptor, ProcessorError, ProcessorProducts,
+    ToolDescriptor, ValidatorDescriptor,
 };
 use crate::tool_resolver::resolve_tool_epoch;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleAbiIdentity {
-    pub rustc: String,
-    pub interface_fingerprint: [u8; 32],
-    pub measured_interface: [u8; 32],
-    pub panic_strategy: String,
-    pub allocator: String,
-}
+pub use distill_pipeline_api::module::ModuleAbiIdentity;
+pub use distill_pipeline_api::registration::{
+    ModuleCallError, Registration, RegistrationDisposition, RegistrationKind, RegistrationStatus,
+    TargetDefinition,
+};
 
 /// Audited reverse-call surfaces. New host-owned callback tables must add a
 /// named surface here so the cross-boundary inventory stays explicit.
@@ -86,36 +83,9 @@ impl HostCallbackBoundary {
         F: FnOnce() -> HostCallbackStatus<T>,
     {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).unwrap_or_else(|_| {
-            Err(ModuleCallError::host_callback_panic(
-                self.surface,
-                operation,
-            ))
+            Err(host_callback_panic(self.surface, operation))
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetDefinition {
-    pub name: String,
-    pub fingerprint: [u8; 32],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RegistrationKind {
-    Importer,
-    Processor,
-    Codegen,
-    Validator,
-    Migration,
-    Defaults,
-    Tool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Registration {
-    pub kind: RegistrationKind,
-    pub id: String,
-    pub version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -126,9 +96,9 @@ pub struct RegistrationSet {
     pub pipeline_targets: BTreeSet<String>,
 }
 
-/// A generated erased registration capsule. Module-side construction suppresses
-/// automatic drop; ownership transfers to the host callback on entry and the
-/// status thunk is the only operation permitted to destroy `pointer`.
+/// An erased callback owned by a candidate arena. Ownership transfers to the
+/// arena on entry and the status thunk is the only operation permitted to
+/// destroy `pointer`.
 ///
 /// This has deliberately no `Drop` implementation: if its thunk reports an
 /// error or panics, retaining or even dropping the host-side wrapper leaks the
@@ -188,17 +158,12 @@ impl ErasedRegistrationCapsule {
         Self(unsafe { NonNull::new_unchecked(Box::into_raw(node)) })
     }
 
-    fn from_callback<T: Send + Sync + 'static>(
-        callback: T,
-        owner: ModuleEpochToken,
-        handle: CallbackHandle,
-    ) -> Self {
-        let pointer = erase_callback(callback);
-        // SAFETY: `erase_callback` allocates a `ManuallyDrop<T>` whose address
-        // is stable. The matching generic cleanup thunk destroys T under
-        // containment and deallocates only after successful destruction.
-        let capsule =
-            unsafe { Self::from_raw(pointer, owner, crate::callbacks::cleanup_callback::<T>) };
+    fn from_erased(callback: ErasedCallback, owner: ModuleEpochToken) -> Self {
+        let (pointer, cleanup, handle) = callback.into_parts();
+        // SAFETY: the API's generic registration boxed the callback at a
+        // stable address, with the matching cleanup thunk that destroys it
+        // under containment and deallocates only on success.
+        let capsule = unsafe { Self::from_raw(pointer, owner, cleanup) };
         unsafe { (*capsule.0.as_ptr()).callback = handle };
         capsule
     }
@@ -207,27 +172,6 @@ impl ErasedRegistrationCapsule {
 /// Compatibility spelling for callers generated before the capsule handoff
 /// was made explicit. It has the same no-Drop, consumed-on-entry semantics.
 pub type RegistrationResource = ErasedRegistrationCapsule;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistrationDisposition {
-    Consumed,
-}
-
-/// Every object-bearing host callback returns an explicit consumed status on
-/// both success and failure. There is deliberately no returned-to-caller arm.
-#[derive(Debug)]
-#[must_use = "registration ownership was consumed; inspect the nested result"]
-pub struct RegistrationStatus {
-    pub disposition: RegistrationDisposition,
-    pub result: Result<(), ModuleCallError>,
-}
-
-impl RegistrationStatus {
-    pub fn into_result(self) -> Result<(), ModuleCallError> {
-        debug_assert_eq!(self.disposition, RegistrationDisposition::Consumed);
-        self.result
-    }
-}
 
 /// A tracked residency capability for a module-owned value. Registration and
 /// generated value constructors use this instead of manufacturing an
@@ -314,127 +258,10 @@ impl CandidateRegistrationArena {
         }
     }
 
-    pub fn register_importer<T: PipelineImporter>(
-        &mut self,
-        descriptor: ImporterDescriptor,
-        callback: T,
-    ) -> RegistrationStatus {
-        let registration = Registration {
-            kind: RegistrationKind::Importer,
-            id: descriptor.id.clone(),
-            version: descriptor.version,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            callback,
-            self.owner.clone(),
-            CallbackHandle::importer::<T>(descriptor),
-        );
-        self.install(registration, capsule)
-    }
-
-    pub fn register_processor<T: PipelineProcessor>(
-        &mut self,
-        descriptor: ProcessorDescriptor,
-        callback: T,
-    ) -> RegistrationStatus {
-        let registration = Registration {
-            kind: RegistrationKind::Processor,
-            id: descriptor.id.clone(),
-            version: descriptor.version,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            callback,
-            self.owner.clone(),
-            CallbackHandle::processor::<T>(descriptor),
-        );
-        self.install(registration, capsule)
-    }
-
-    pub fn register_codegen<T: PipelineCodegen>(
-        &mut self,
-        descriptor: CodegenDescriptor,
-        callback: T,
-    ) -> RegistrationStatus {
-        let registration = Registration {
-            kind: RegistrationKind::Codegen,
-            id: descriptor.id.clone(),
-            version: descriptor.version,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            callback,
-            self.owner.clone(),
-            CallbackHandle::codegen::<T>(descriptor),
-        );
-        self.install(registration, capsule)
-    }
-
-    pub fn register_validator<T: PipelineValidator>(
-        &mut self,
-        descriptor: ValidatorDescriptor,
-        callback: T,
-    ) -> RegistrationStatus {
-        let registration = Registration {
-            kind: RegistrationKind::Validator,
-            id: descriptor.id.clone(),
-            version: 1,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            callback,
-            self.owner.clone(),
-            CallbackHandle::validator::<T>(descriptor),
-        );
-        self.install(registration, capsule)
-    }
-
-    pub fn register_migration<T: PipelineMigration>(
-        &mut self,
-        key: impl Into<String>,
-        callback: T,
-    ) -> RegistrationStatus {
-        let key = key.into();
-        let registration = Registration {
-            kind: RegistrationKind::Migration,
-            id: key.clone(),
-            version: 1,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            callback,
-            self.owner.clone(),
-            CallbackHandle::migration::<T>(key),
-        );
-        self.install(registration, capsule)
-    }
-
-    pub fn register_defaults<T: PipelineDefaults>(
-        &mut self,
-        descriptor: DefaultsDescriptor,
-        callback: T,
-    ) -> RegistrationStatus {
-        let registration = Registration {
-            kind: RegistrationKind::Defaults,
-            id: descriptor.type_uuid.to_string(),
-            version: 1,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            callback,
-            self.owner.clone(),
-            CallbackHandle::defaults::<T>(descriptor),
-        );
-        self.install(registration, capsule)
-    }
-
-    pub fn register_tool(&mut self, descriptor: ToolDescriptor) -> RegistrationStatus {
-        let registration = Registration {
-            kind: RegistrationKind::Tool,
-            id: descriptor.id.clone(),
-            version: 1,
-        };
-        let capsule = ErasedRegistrationCapsule::from_callback(
-            descriptor.clone(),
-            self.owner.clone(),
-            CallbackHandle::Tool(descriptor),
-        );
-        self.install(registration, capsule)
+    /// The module-facing view of this arena, as passed to a module's
+    /// `register`.
+    pub fn registrar(&mut self) -> RegistrationArena<'_> {
+        RegistrationArena::new(self)
     }
 
     fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
@@ -706,6 +533,34 @@ impl CandidateRegistrationArena {
     }
 }
 
+/// A module registers through the API arena, which erases each callback on
+/// the module side and hands it here. The callback is wrapped in a capsule
+/// owned by this arena's own epoch and installed like any other capsule, so
+/// it is consumed on entry; a host panic is contained and rejects the
+/// candidate.
+impl RegistrationHost for CandidateRegistrationArena {
+    fn install_callback(
+        &mut self,
+        registration: Registration,
+        callback: ErasedCallback,
+    ) -> RegistrationStatus {
+        let boundary = HostCallbackBoundary::new(HostCallbackSurface::Registry);
+        let result = boundary.call("install", || {
+            let capsule = ErasedRegistrationCapsule::from_erased(callback, self.owner.clone());
+            self.install(registration, capsule).into_result()
+        });
+        if let Err(error) = &result {
+            if self.rejected.is_none() {
+                self.rejected = Some(error.clone());
+            }
+        }
+        RegistrationStatus {
+            disposition: RegistrationDisposition::Consumed,
+            result,
+        }
+    }
+}
+
 /// Allocation-free callback-local ingress owner. It intentionally has no
 /// Drop implementation: a panic before the pure pointer link leaks the node
 /// and forces the candidate boundary to retain the library rather than calling
@@ -737,43 +592,18 @@ pub struct StagedModule {
     pub content_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleCallError {
-    detail: String,
+fn boundary_panic(operation: &str) -> ModuleCallError {
+    ModuleCallError::new(format!(
+        "{operation} panicked at the module boundary; exported thunks must return status"
+    ))
 }
 
-impl ModuleCallError {
-    pub fn new(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-        }
-    }
-
-    pub fn detail(&self) -> &str {
-        &self.detail
-    }
-
-    fn boundary_panic(operation: &str) -> Self {
-        Self::new(format!(
-            "{operation} panicked at the module boundary; exported thunks must return status"
-        ))
-    }
-
-    fn host_callback_panic(surface: HostCallbackSurface, operation: &str) -> Self {
-        Self::new(format!(
-            "{} host callback `{operation}` panicked; host-owned thunk returned error status",
-            surface.as_str()
-        ))
-    }
+fn host_callback_panic(surface: HostCallbackSurface, operation: &str) -> ModuleCallError {
+    ModuleCallError::new(format!(
+        "{} host callback `{operation}` panicked; host-owned thunk returned error status",
+        surface.as_str()
+    ))
 }
-
-impl std::fmt::Display for ModuleCallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
-    }
-}
-
-impl std::error::Error for ModuleCallError {}
 
 /// Audited table after its repr(C) ABI prefix has been located. All three probe
 /// calls must be C-ABI in a concrete loader; `register` is reached only after
@@ -2120,7 +1950,7 @@ fn boundary_call<T>(
     call: impl FnOnce() -> Result<T, ModuleCallError>,
 ) -> Result<T, ModuleCallError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
-        .map_err(|_| ModuleCallError::boundary_panic(operation))?
+        .map_err(|_| boundary_panic(operation))?
 }
 
 fn pipeline_failure(
@@ -2216,7 +2046,7 @@ fn discard_candidate(
             module,
             arena,
             CandidateCleanupDisposition::DlcloseFailed,
-            ModuleCallError::boundary_panic("candidate dlclose").to_string(),
+            boundary_panic("candidate dlclose").to_string(),
         );
     }
     CandidateCleanup {
@@ -2265,7 +2095,7 @@ fn unload_epoch(epoch: &mut PipelineEpoch) -> Result<(), EpochCleanupError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.dlclose())).map_err(|_| {
         EpochCleanupError {
             disposition: CandidateCleanupDisposition::DlcloseFailed,
-            detail: ModuleCallError::boundary_panic("dlclose").to_string(),
+            detail: boundary_panic("dlclose").to_string(),
         }
     })?;
     epoch.module.take();
@@ -2365,6 +2195,7 @@ pub(crate) fn processor_test_epoch_with<
     let token = ModuleEpochToken::new(9002);
     let mut arena = CandidateRegistrationArena::new(token.clone());
     arena
+        .registrar()
         .register_processor(descriptor, processor)
         .into_result()
         .expect("test processor registration is valid");
@@ -2468,8 +2299,8 @@ mod lifecycle_tests {
 mod callback_tests {
     use super::*;
     use crate::callbacks::{
-        CodegenAsset, CodegenContextError, CodegenDescriptor, DiagnosticSeverity,
-        MigrationFunctionError, PipelineCodegen, PipelineCodegenContext, PipelineDefaults,
+        CodegenAsset, CodegenContextError, CodegenDescriptor, DefaultsDescriptor,
+        DiagnosticSeverity, MigrationFunctionError, PipelineCodegen, PipelineCodegenContext, PipelineDefaults,
         PipelineImporter, PipelineProcessContext, PipelineProcessor, PipelineValidator,
         ProcessorProduct, ProcessorProducts, ToolRegistration, ToolSource,
     };
@@ -2623,6 +2454,7 @@ mod callback_tests {
     fn import_host_callback_panic_is_typed_without_poisoning_the_epoch() {
         let mut epoch = callback_test_epoch(|arena| {
             arena
+                .registrar()
                 .register_importer(
                     ImporterDescriptor {
                         id: "reads".into(),
@@ -2794,6 +2626,7 @@ mod callback_tests {
     fn codegen_host_callback_panic_is_typed_without_poisoning_the_epoch() {
         let mut epoch = callback_test_epoch(|arena| {
             arena
+                .registrar()
                 .register_codegen(
                     CodegenDescriptor {
                         id: "reads".into(),
@@ -2846,6 +2679,7 @@ mod callback_tests {
             root: SchemaNode::Unit,
         };
         arena
+            .registrar()
             .register_importer(
                 ImporterDescriptor {
                     id: "source".into(),
@@ -2859,6 +2693,7 @@ mod callback_tests {
             .into_result()
             .unwrap();
         arena
+            .registrar()
             .register_processor(
                 ProcessorDescriptor {
                     id: "cook".into(),
@@ -2872,6 +2707,7 @@ mod callback_tests {
             .into_result()
             .unwrap();
         arena
+            .registrar()
             .register_validator(
                 ValidatorDescriptor {
                     id: "lint".into(),
@@ -2882,12 +2718,14 @@ mod callback_tests {
             .into_result()
             .unwrap();
         arena
+            .registrar()
             .register_migration("upgrade", |value| -> Result<_, MigrationFunctionError> {
                 Ok(value)
             })
             .into_result()
             .unwrap();
         arena
+            .registrar()
             .register_defaults(
                 DefaultsDescriptor {
                     type_uuid: TypeUuid([2; 16]),
@@ -2897,6 +2735,7 @@ mod callback_tests {
             .into_result()
             .unwrap();
         arena
+            .registrar()
             .register_tool(ToolDescriptor {
                 id: "compiler".into(),
                 registration: ToolRegistration {
@@ -2912,6 +2751,7 @@ mod callback_tests {
             .into_result()
             .unwrap();
         arena
+            .registrar()
             .register_codegen(
                 CodegenDescriptor {
                     id: "rust_bindings".into(),
@@ -3021,10 +2861,12 @@ mod callback_tests {
             outputs: OutputDecls::new(TypeUuid([6; 16]), vec![]).unwrap(),
         };
         arena
+            .registrar()
             .register_processor(descriptor("first"), Process)
             .into_result()
             .unwrap();
         let error = arena
+            .registrar()
             .register_processor(descriptor("second"), Process)
             .into_result()
             .unwrap_err();

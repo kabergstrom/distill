@@ -20,6 +20,7 @@ distill-build = { path = "../distill-build" }
 distill-core = { path = "../distill-core" }
 distill-json = { path = "../distill-json" }
 distill-migrate = { path = "../distill-migrate" }
+distill-pipeline-api = { path = "../distill-pipeline-api" }
 distill-pack = { path = "../distill-pack" }
 distill-rpc = { path = "../distill-rpc" }
 distill-schema = { path = "../distill-schema" }

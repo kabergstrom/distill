@@ -10,6 +10,7 @@ use distill_store::pipeline::RegisteredTool;
 use distill_store::state::InputVersion;
 use distill_store::{Store, StoreError};
 
+use distill_pipeline_api::callbacks::PipelineProcessContext;
 pub use distill_pipeline_api::tool::{ToolOutput, ToolRunError};
 
 use crate::query::normalize_identifier;
@@ -201,6 +202,20 @@ impl<'a, S: ToolEpochSnapshot + ?Sized> ProcessContext<'a, S> {
         self.trace.clear();
         self.stopped = true;
         self.discarded = true;
+    }
+}
+
+/// A processor sees the tool runner through the pipeline API's context
+/// trait; its other reads are provided by the daemon's build context.
+impl<S: ToolEpochSnapshot + ?Sized> PipelineProcessContext for ProcessContext<'_, S> {
+    fn run_tool(
+        &mut self,
+        id: &str,
+        args: &[String],
+        stdin: &[u8],
+    ) -> Result<ToolOutput, ToolRunError> {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        ProcessContext::run_tool(self, id, &args, stdin)
     }
 }
 

@@ -5220,6 +5220,7 @@ mod tests {
             PrimaryCountingProcessor(Arc::clone(&calls)),
             move |arena| {
                 arena
+                    .registrar()
                     .register_migration(
                         "upgrade",
                         move |mut value: AuthoredValue| -> Result<
@@ -5381,6 +5382,7 @@ mod tests {
             },
             move |arena| {
                 arena
+                    .registrar()
                     .register_validator(
                         ValidatorDescriptor {
                             id: "validate-import".to_owned(),

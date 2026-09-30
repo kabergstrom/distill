@@ -1,17 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use distill_asset::AssetType;
-use distill_build::import::ImportOutput;
-use distill_build::outputs::OutputDecls;
-use distill_build::pipeline::TargetSelector;
 use distill_core::id::TypeUuid;
-use distill_daemon::callbacks::{
+use distill_json::AuthoredValue;
+use distill_pipeline_api::callbacks::{
     ImporterDescriptor, PipelineProcessContext, PipelineProcessor, ProcessorDescriptor,
     ProcessorError, ProcessorProduct, ProcessorProducts,
 };
-use distill_daemon::epoch::{CandidateRegistrationArena, ModuleCallError, TargetDefinition};
-use distill_daemon::importer::{AuthoringImportContext, AuthoringImporter, AuthoringImporterError};
-use distill_json::AuthoredValue;
+use distill_pipeline_api::import::ImportOutput;
+use distill_pipeline_api::importer::{
+    AuthoringImportContext, AuthoringImporter, AuthoringImporterError,
+};
+use distill_pipeline_api::outputs::OutputDecls;
+use distill_pipeline_api::registration::{ModuleCallError, RegistrationArena, TargetDefinition};
+use distill_pipeline_api::target::TargetSelector;
 use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind, SchemaNode};
 
 pub const SETTINGS_TYPE: TypeUuid = TypeUuid([0x90; 16]);
@@ -339,7 +341,7 @@ impl PipelineProcessor for FixtureCook {
 
 fn register(
     targets: &[TargetDefinition],
-    arena: &mut CandidateRegistrationArena,
+    arena: &mut RegistrationArena,
 ) -> Result<BTreeSet<String>, ModuleCallError> {
     arena
         .register_importer(
@@ -396,4 +398,4 @@ fn unload() -> Result<(), ModuleCallError> {
     Ok(())
 }
 
-distill_daemon::export_pipeline_module_v2!(register = register, unload = unload);
+distill_pipeline_api::export_pipeline_module_v2!(register = register, unload = unload);

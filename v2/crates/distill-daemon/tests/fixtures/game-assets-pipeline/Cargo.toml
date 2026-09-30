@@ -10,10 +10,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 distill-asset = { path = "../../../../distill-asset" }
-distill-build = { path = "../../../../distill-build" }
 distill-core = { path = "../../../../distill-core" }
-distill-daemon = { path = "../../.." }
 distill-json = { path = "../../../../distill-json" }
+distill-pipeline-api = { path = "../../../../distill-pipeline-api" }
 distill-schema = { path = "../../../../distill-schema" }
 newgameplus-api-macros = { path = "../../../../../../../newgameplus/newgameplus-api-macros" }
 newgameplus-assets = { path = "../../../../../../../newgameplus/newgameplus-assets" }

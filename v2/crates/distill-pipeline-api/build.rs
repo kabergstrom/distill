@@ -10,20 +10,14 @@ fn main() {
     let projects = v2.parent().unwrap().parent().unwrap();
     let newgameplus = projects.join("newgameplus");
 
+    // The interface closure: this crate and the crates it depends on. Nothing
+    // else a module links, and no host crate, affects the identity.
     let mut files = Vec::new();
-    collect_file(&v2.join("Cargo.toml"), "v2/Cargo.toml", &mut files);
-    collect_file(&v2.join("Cargo.lock"), "v2/Cargo.lock", &mut files);
     for crate_name in [
-        "distill-asset",
-        "distill-bundle",
-        "distill-build",
         "distill-core",
-        "distill-daemon",
         "distill-json",
         "distill-migrate",
-        "distill-schema",
-        "distill-store",
-        "distill-wire",
+        "distill-pipeline-api",
     ] {
         let root = v2.join("crates").join(crate_name);
         collect_file(
@@ -38,11 +32,16 @@ fn main() {
         );
         collect_tree(&v2.join("crates"), &root.join("src"), &mut files).unwrap();
     }
-    for crate_name in ["ngp-schema", "ngp-module-host", "source-walk"] {
+    for crate_name in ["ngp-schema", "ngp-source-hash"] {
         let root = newgameplus.join(crate_name);
         collect_file(
             &root.join("Cargo.toml"),
             &format!("{crate_name}/Cargo.toml"),
+            &mut files,
+        );
+        collect_file(
+            &root.join("build.rs"),
+            &format!("{crate_name}/build.rs"),
             &mut files,
         );
         collect_tree(&newgameplus, &root.join("src"), &mut files).unwrap();
