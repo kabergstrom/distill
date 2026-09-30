@@ -449,10 +449,16 @@ fn resolved_hash(
         ConnectOutcome::Connected(connected) => connected.hub,
         other => panic!("resolve connection failed: {other:?}"),
     };
-    let snapshot = hub.snapshot().success().unwrap();
-    match snapshot.resolve(asset).success().unwrap().value {
-        ResolveResult::Built { content_hash } => content_hash,
-        other => panic!("asset did not build: {other:?}"),
+    // A snapshot races background publications (watched reimports), so a
+    // build against a superseded version drifts; retry on a fresh snapshot.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = hub.snapshot().success().unwrap();
+        match snapshot.resolve(asset).success().unwrap().value {
+            ResolveResult::Built { content_hash } => return content_hash,
+            ResolveResult::Drifted { .. } if Instant::now() < deadline => continue,
+            other => panic!("asset did not build: {other:?}"),
+        }
     }
 }
 

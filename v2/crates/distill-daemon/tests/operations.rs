@@ -224,6 +224,25 @@ fn complete(
     }
 }
 
+/// Complete a deferred operation as the durable step of its coordinated
+/// publication (the server's completion path); returns its terminal error.
+fn complete_and_publish(
+    coordinator: &DaemonCoordinator,
+    publication: PreparedOperationPublication,
+    base: InputVersion,
+) -> Option<String> {
+    let mut terminal_error = None;
+    coordinator
+        .server()
+        .coordinated_commit(base, || {
+            let completed = complete(publication, base);
+            terminal_error = completed.terminal_error;
+            Ok(completed.commit)
+        })
+        .unwrap();
+    terminal_error
+}
+
 #[test]
 fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
     let temp = tempfile::tempdir().unwrap();
@@ -288,12 +307,10 @@ fn rename_with_fixups_is_deferred_journaled_and_rescanned_as_one_version() {
 
     assert!(assets.join("old.bundle").exists());
     assert!(!assets.join("renamed.bundle").exists());
-    let completed = complete(prepared.publication, base);
-    assert_eq!(completed.terminal_error, None);
-    coordinator
-        .server()
-        .coordinated_commit(base, || Ok(completed.commit))
-        .unwrap();
+    assert_eq!(
+        complete_and_publish(&coordinator, prepared.publication, base),
+        None
+    );
 
     assert!(!assets.join("old.bundle").exists());
     assert!(assets.join("renamed.bundle").exists());
@@ -439,12 +456,10 @@ fn disk_migration_uses_the_shared_loader_and_prefers_a_custom_edge() {
             &LongRunningOp::DiskMigration(request.encode().unwrap()),
         )
         .unwrap();
-    let completed = complete(prepared.publication, base);
-    assert_eq!(completed.terminal_error, None);
-    coordinator
-        .server()
-        .coordinated_commit(base, || Ok(completed.commit))
-        .unwrap();
+    assert_eq!(
+        complete_and_publish(&coordinator, prepared.publication, base),
+        None
+    );
 
     let migrated =
         distill_bundle::parse_bundle(&std::fs::read(assets.join("value.bundle")).unwrap()).unwrap();
@@ -603,9 +618,8 @@ fn disk_migration_temp_failure_does_not_block_later_bundles() {
     // independent second group must still publish and commit.
     let failing_backup = temp.path().join("first-backup");
     std::fs::rename(&failing_dir, &failing_backup).unwrap();
-    let completed = complete(prepared.publication, base);
-    let terminal_error = completed
-        .terminal_error
+    let terminal_error = complete_and_publish(&coordinator, prepared.publication, base);
+    let terminal_error = terminal_error
         .as_deref()
         .expect("the failed bundle is reported");
     assert!(terminal_error.contains("failing.bundle"));
@@ -614,10 +628,6 @@ fn disk_migration_temp_failure_does_not_block_later_bundles() {
         "unexpected terminal error: {terminal_error}"
     );
     assert!(!terminal_error.contains(&migrating_bundle.to_string()));
-    coordinator
-        .server()
-        .coordinated_commit(base, || Ok(completed.commit))
-        .unwrap();
 
     assert_eq!(
         std::fs::read(failing_backup.join("failing.bundle")).unwrap(),

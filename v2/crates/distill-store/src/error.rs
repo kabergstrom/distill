@@ -29,6 +29,9 @@ pub enum StoreError {
     /// carrying an identity-validation failure, and every
     /// namespace-facing operation fails with this same error.
     Poisoned { error: String },
+    /// A served-state publication failed validation inside its
+    /// transaction, which rolled back.
+    Rejected { detail: String },
     /// Persisted DSVP bytes were malformed or non-canonical.
     InvalidVersionPoison(crate::state::VersionPoisonError),
     /// Persisted DSPP fields were unknown, noncanonical, or inconsistent.
@@ -244,6 +247,7 @@ impl fmt::Display for StoreError {
                  daemon state is disposable — recreate it"
             ),
             StoreError::Poisoned { error } => write!(f, "version poison: {error}"),
+            StoreError::Rejected { detail } => write!(f, "publication rejected: {detail}"),
             StoreError::InvalidVersionPoison(error) => error.fmt(f),
             StoreError::InvalidPipelinePoison(error) => error.fmt(f),
             StoreError::InvalidBootstrapSpec(error) => {

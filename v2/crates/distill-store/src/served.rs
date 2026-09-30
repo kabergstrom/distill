@@ -405,6 +405,16 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
+    /// Every logical path that names `asset`.
+    pub fn served_paths_of(&self, asset: AssetUuid) -> Result<BTreeSet<String>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT path FROM path_index WHERE asset_uuid = ?1")?;
+        let rows = statement.query_map([asset.0.as_slice()], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<BTreeSet<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Served assets whose tag index is poisoned (pending or failed), with
     /// the owning bundle.
     pub fn tag_poisoned_assets(&self) -> Result<Vec<(AssetUuid, BundleUuid)>, StoreError> {
@@ -868,11 +878,11 @@ pub trait ServedWrite {
         Ok(())
     }
 
-    /// Remove one served asset row, its tags, and its tag index. Path rows
-    /// are separate served state and stay.
+    /// Remove one served asset row and its tags. Its tag-index poison and
+    /// path rows are separate served state and stay.
     fn remove_served_asset(&mut self, asset: AssetUuid) -> Result<(), StoreError> {
         let conn = self.served_conn();
-        for table in ["asset_tags", "asset_tag_index", "assets"] {
+        for table in ["asset_tags", "assets"] {
             conn.execute(
                 &format!("DELETE FROM {table} WHERE asset_uuid = ?1"),
                 [asset.0.as_slice()],

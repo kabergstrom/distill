@@ -9,7 +9,8 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::io::{AsyncReadExt, BufReader, BufWriter};
@@ -77,6 +78,8 @@ impl From<capnp::Error> for TransportError {
 
 /// A listener whose address passed the loopback-only configuration staging
 /// gate before any socket was opened.
+const LEASE_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct StagedListener {
     listener: TcpListener,
     root: Root,
@@ -129,11 +132,7 @@ impl StagedListener {
     /// Production accept loop. Each connection remains on the same local IO
     /// thread while independent `RpcSystem`s make progress concurrently.
     pub async fn serve(&self) -> Result<(), TransportError> {
-        loop {
-            // Dropping a Tokio JoinHandle detaches the task; the connection's
-            // own RpcSystem continues until disconnect.
-            drop(self.accept_one().await?);
-        }
+        self.serve_until(std::future::pending()).await
     }
 
     /// Production accept loop with supervisor-owned shutdown. Existing
@@ -144,9 +143,16 @@ impl StagedListener {
         F: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
+        // Capability leases expire lazily on use; the sweep releases the
+        // CAS pins of abandoned ones.
+        let mut sweep = tokio::time::interval(LEASE_SWEEP_PERIOD);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                // Dropping a Tokio JoinHandle detaches the task; the
+                // connection's own RpcSystem continues until disconnect.
                 result = self.accept_one() => drop(result?),
+                _ = sweep.tick() => self.root.server().sweep_expired(),
                 () = &mut shutdown => return Ok(()),
             }
         }
@@ -938,12 +944,26 @@ impl schema::snapshot::Server for SnapshotService {
             // chain. Keep that work off the single-threaded capnp-rpc driver;
             // the daemon build scheduler provides the actual admission bound
             // while this future yields so unrelated connections keep moving.
-            let snapshot = self.snapshot.clone();
-            let outcome = tokio::task::spawn_blocking(move || snapshot.resolve(uuid))
-                .await
-                .map_err(|error| {
-                    capnp::Error::failed(format!("snapshot resolve worker failed: {error}"))
-                })?;
+            let outcome = loop {
+                match self
+                    .snapshot
+                    .resolve_prepare(uuid, crate::BuildWorkClass::Interactive)
+                {
+                    crate::ResolveStep::Done(outcome) => break outcome,
+                    crate::ResolveStep::Build(build) => {
+                        let finished = tokio::task::spawn_blocking(move || build.run())
+                            .await
+                            .map_err(|error| {
+                                capnp::Error::failed(format!(
+                                    "snapshot resolve worker failed: {error}"
+                                ))
+                            })?;
+                        if let Some(outcome) = self.snapshot.resolve_finish(uuid, finished) {
+                            break outcome;
+                        }
+                    }
+                }
+            };
             write_resolve_result(results.get().init_result(), outcome);
             Ok(())
         }
@@ -1325,11 +1345,11 @@ impl schema::metadata_authoring_snapshot::Server for MetadataAuthoringSnapshotSe
 }
 
 struct ChunkStreamService {
-    stream: Mutex<ChunkStream>,
+    stream: RefCell<ChunkStream>,
 }
 
 struct ProgressStreamService {
-    stream: Mutex<ProgressStream>,
+    stream: RefCell<ProgressStream>,
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -1342,8 +1362,7 @@ impl schema::progress_stream::Server for ProgressStreamService {
         async move {
             let progress = self
                 .stream
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
+                .borrow_mut()
                 .next();
             let mut output = results.get();
             match progress {
@@ -1365,8 +1384,7 @@ impl schema::progress_stream::Server for ProgressStreamService {
         async move {
             let cancelled = self
                 .stream
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
+                .borrow_mut()
                 .cancel();
             results.get().set_cancelled(cancelled);
             Ok(())
@@ -1384,8 +1402,7 @@ impl schema::chunk_stream::Server for ChunkStreamService {
         async move {
             let chunk = self
                 .stream
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
+                .borrow_mut()
                 .next_chunk();
             let mut output = results.get();
             match chunk {
@@ -2126,7 +2143,7 @@ pub fn decode_authoring_inspection(
             .collect::<Result<Vec<_>, _>>()?,
     };
     let logical_schema: std::sync::Arc<[u8]> = value.get_logical_schema()?.to_vec().into();
-    crate::server::decode_authoring_payload(schema_hash, &logical_schema, &authored_value)
+    crate::validate::decode_authoring_payload(schema_hash, &logical_schema, &authored_value)
         .map(drop)
         .map_err(|error| {
             capnp::Error::failed(format!("invalid authoring inspection: {error:?}"))
@@ -3365,7 +3382,7 @@ fn write_progress_result(
         RpcResult::Success(stream) => {
             let client: schema::progress_stream::Client =
                 capnp_rpc::new_client(ProgressStreamService {
-                    stream: Mutex::new(stream),
+                    stream: RefCell::new(stream),
                 });
             result.set_success(client);
         }
@@ -3397,7 +3414,7 @@ fn write_metadata_progress_result(
         MetadataCall::Success(stream) => {
             let client: schema::progress_stream::Client =
                 capnp_rpc::new_client(ProgressStreamService {
-                    stream: Mutex::new(stream),
+                    stream: RefCell::new(stream),
                 });
             result.set_success(client);
         }
@@ -3550,7 +3567,7 @@ fn write_fetch_result(
                 }
             }
             let client: schema::chunk_stream::Client = capnp_rpc::new_client(ChunkStreamService {
-                stream: Mutex::new(terminal.value),
+                stream: RefCell::new(terminal.value),
             });
             output.set_chunks(client);
         }
@@ -3581,7 +3598,7 @@ fn write_metadata_fetch_result(
     match outcome {
         MetadataCall::Success(stream) => {
             let client: schema::chunk_stream::Client = capnp_rpc::new_client(ChunkStreamService {
-                stream: Mutex::new(stream),
+                stream: RefCell::new(stream),
             });
             let mut result = result;
             result.set_success(client);

@@ -23,7 +23,7 @@ use distill_rpc::{
     AuthoringValue, Commit, ConfigurationPoison, ConfigurationStatus, CoordinatedCommitError,
     DerivedOutputEntry, DerivedOutputMutation, DriftedInput, LineageManifestClaimant,
     LineageRepairState, PathMutation, PipelineCandidateIdentity, PipelineDiagnostic,
-    SchemaTransitionAction, Server, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison,
+    SchemaTransitionAction, Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison,
     VersionPoisonV1,
 };
 use distill_schema::ProjectSchemaAuthority;
@@ -99,7 +99,7 @@ pub struct DaemonCoordinator {
     scan_initialized: AtomicBool,
     scan_healthy: AtomicBool,
     scan_rejection: Mutex<Option<PendingScanRejection>>,
-    server: Server,
+    server: Arc<ServerHandle>,
     lineage_destination: RwLock<LineageDestination>,
     authoring: Arc<AuthoringService>,
     pipeline: Mutex<CoordinatedPipelineRuntime>,
@@ -200,15 +200,24 @@ impl DaemonCoordinator {
             lineage_destination.clone(),
             Arc::clone(&scan_snapshot),
         )?);
-        let (instance, version) = {
-            let store = lock_store(&store);
-            (store.instance_id(), store.input_version())
-        };
-        let server = Server::new_at_version_with_authoring_backend(
-            instance,
-            version,
-            targets,
+        let target_set = distill_rpc::target_map(targets)?;
+        {
+            let mut store = lock_store(&store);
+            let version = store.input_version();
+            store.served_transaction(|transaction| {
+                use distill_store::served::ServedWrite;
+                transaction.init_change_log_oldest(version)?;
+                distill_rpc::publish_target_set(transaction, &target_set)?;
+                Ok(())
+            })?;
+        }
+        let server = ServerHandle::open(
+            store_config.clone(),
             backend.clone(),
+            Arc::new(DaemonStore {
+                store: Arc::clone(&store),
+                publication: Mutex::new(()),
+            }),
         )?;
         let pipeline = CoordinatedPipelineRuntime {
             host,
@@ -247,7 +256,12 @@ impl DaemonCoordinator {
         })
     }
 
-    pub fn server(&self) -> &Server {
+    /// This thread's RPC front end.
+    pub fn server(&self) -> Server {
+        Server::attach(&self.server)
+    }
+
+    pub fn server_handle(&self) -> &Arc<ServerHandle> {
         &self.server
     }
 
@@ -255,9 +269,9 @@ impl DaemonCoordinator {
     /// authority after it has been placed in its final `Arc`.
     pub fn attach_build_backend(self: &Arc<Self>) {
         let backend = Arc::new(crate::build::CoordinatorBuildBackend::new(self));
-        self.server.install_build_backend(backend.clone());
-        self.server.install_artifact_lease_backend(backend.clone());
-        self.server.install_artifact_payload_backend(backend);
+        let server = self.server();
+        server.install_build_backend(backend.clone());
+        server.install_artifact_lease_backend(backend);
         self.authoring.attach_tag_index_coordinator(self);
     }
 
@@ -305,7 +319,7 @@ impl DaemonCoordinator {
             Err(_) => return Ok(None),
         };
         let diagnostic = observed.1.clone();
-        self.server
+        self.server()
             .coordinated_runtime_pipeline_poison(diagnostic, || {
                 let mut store = lock_store(&self.store);
                 match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
@@ -471,7 +485,7 @@ impl DaemonCoordinator {
         let pending = lock_store(&self.store)
             .stage_pending_restart(changes)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server.restart_required(pending.keys.clone());
+        self.server().restart_required(pending.keys.clone());
         Ok(pending)
     }
 
@@ -479,7 +493,7 @@ impl DaemonCoordinator {
         lock_store(&self.store)
             .clear_pending_restart()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        self.server.restart_required(Vec::new());
+        self.server().restart_required(Vec::new());
         Ok(())
     }
 
@@ -728,7 +742,7 @@ impl DaemonCoordinator {
         let captured = Arc::clone(&filesystem);
         let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let base = self.server.current_stamp().version;
+        let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let fallback_bundles = match lock_store(&store).all_asset_bundles() {
             Ok(bundles) => bundles,
@@ -744,7 +758,7 @@ impl DaemonCoordinator {
         let cleanup_failure = Arc::new(Mutex::new(None));
         let captured_cleanup_failure = Arc::clone(&cleanup_failure);
         let result = self
-            .server
+            .server()
             .coordinated_replace_target_set(base, targets, || {
                 let mut commit = publish_scan(
                     &store,
@@ -912,7 +926,7 @@ impl DaemonCoordinator {
         source: &std::path::Path,
         mut requirements: CandidateRequirements,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let base = self.server.current_stamp().version;
+        let base = self.server().current_stamp().version;
         let mut runtime = lock_pipeline(&self.pipeline);
         let prepared = {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
@@ -984,7 +998,7 @@ impl DaemonCoordinator {
         let mut prepared = Some(prepared);
         let cleanup_failure = Arc::new(Mutex::new(None));
         let captured_cleanup_failure = Arc::clone(&cleanup_failure);
-        let result = self.server.coordinated_commit(base, || {
+        let result = self.server().coordinated_commit(base, || {
             let mut durable = lock_store(&store);
             if durable.input_version() != base {
                 return Err(format!(
@@ -1301,10 +1315,10 @@ impl DaemonCoordinator {
         let healed_configuration = heal_configuration
             .then(|| self.configuration_without_source_poison())
             .transpose()?;
-        let base = self.server.current_stamp().version;
+        let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let diagnostic = poison.clone();
-        let result = self.server.coordinated_commit(base, || {
+        let result = self.server().coordinated_commit(base, || {
             let mut store = lock_store(&store);
             if store.input_version() != base {
                 return Err(format!(
@@ -1387,7 +1401,7 @@ impl DaemonCoordinator {
                     // Never take the publication lock under the scan
                     // snapshot (see `Server::publication_lock`).
                     drop(baseline);
-                    Ok(self.server.current_stamp())
+                    Ok(self.server().current_stamp())
                 } else {
                     drop(baseline);
                     self.publish_scan(scan)
@@ -1503,7 +1517,8 @@ impl DaemonCoordinator {
         }
         // Publication lock before the scan snapshot: authoring imports take
         // the snapshot inside the publication lock (`Server::publication_lock`).
-        let mut publication = self.server.publication_lock();
+        let server = self.server();
+        let mut publication = server.publication_lock();
         let mut baseline = lock_scan_snapshot(&self.scan_snapshot);
         let delta = match self.scanner.scan_incremental_delta(&baseline, &scan_paths) {
             Ok(None) => return Ok(publication.current_stamp()),
@@ -1671,7 +1686,7 @@ impl DaemonCoordinator {
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         }
         candidate.renames.extend_from_slice(renames);
-        let base = self.server.current_stamp().version;
+        let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let projection = self.authoring.pipeline_projection();
         let published_projection =
@@ -1691,7 +1706,7 @@ impl DaemonCoordinator {
             .all_asset_bundles()
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         let stamp = self
-            .server
+            .server()
             .coordinated_commit(base, || {
                 let mut commit =
                     publish_scan(&store, base, candidate, false, None, &projection, tag_epoch)
@@ -1805,10 +1820,10 @@ impl DaemonCoordinator {
                 None,
             )
         };
-        let base = self.server.current_stamp().version;
+        let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
         let stamp = self
-            .server
+            .server()
             .coordinated_commit(base, || {
                 let mut store = lock_store(&store);
                 if store.input_version() != base {
@@ -1890,10 +1905,10 @@ impl DaemonCoordinator {
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let mut imported = Vec::with_capacity(pending.len());
         for bundle in pending {
-            let base = self.server.current_stamp().version;
+            let base = self.server().current_stamp().version;
             let authoring = Arc::clone(&self.authoring);
             let publication = self
-                .server
+                .server()
                 .coordinated_maybe_commit(base, || {
                     authoring
                         .prepare_watched_reimport(base, bundle)
@@ -1960,12 +1975,12 @@ impl DaemonCoordinator {
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
         let mut imported = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let base = self.server.current_stamp().version;
+            let base = self.server().current_stamp().version;
             let authoring = Arc::clone(&self.authoring);
             let bundle = Arc::new(Mutex::new(None));
             let captured = Arc::clone(&bundle);
             let publication = self
-                .server
+                .server()
                 .coordinated_maybe_commit(base, || {
                     let prepared = authoring
                         .prepare_watched_directory_import(base, &task)
@@ -4863,6 +4878,27 @@ fn invalid_manifest<T>(detail: &str) -> Result<T, CoordinatorError> {
 
 fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The daemon side of the RPC server's store: publications are serialized
+/// by `publication`, writes go through the shared store mutex.
+struct DaemonStore {
+    store: Arc<Mutex<Store>>,
+    publication: Mutex<()>,
+}
+
+impl distill_rpc::ExternalStore for DaemonStore {
+    fn lock_publication(&self) -> Box<dyn distill_rpc::PublicationGuard + '_> {
+        Box::new(
+            self.publication
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn with_store(&self, job: &mut dyn FnMut(&mut Store)) {
+        job(&mut lock_store(&self.store));
+    }
 }
 
 fn lock_watcher(watcher: &Mutex<WatcherQueue>) -> MutexGuard<'_, WatcherQueue> {

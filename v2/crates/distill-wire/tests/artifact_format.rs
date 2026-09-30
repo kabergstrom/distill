@@ -4,7 +4,8 @@
 use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, LayoutHash, LogicalHash, TypeUuid};
 use distill_wire::artifact::{
-    canonical_blob_order, content_hash, parse_artifact, parse_artifact_parts, write_artifact,
+    assemble_artifact, canonical_blob_order, content_hash, parse_artifact, parse_artifact_parts,
+    split_artifact, write_artifact,
     ArtifactError, ArtifactHeader, ARTIFACT_FORMAT_VERSION, ARTIFACT_MAGIC,
 };
 
@@ -126,6 +127,23 @@ fn split_transport_reconstructs_metadata_and_complete_content_identity() {
     assert_eq!(split.fixed, complete.fixed);
     assert_eq!(split.variable, complete.variable);
     assert_eq!(split.content_hash, content_hash(&bytes));
+}
+
+#[test]
+fn split_and_assemble_are_inverse() {
+    let a: &[u8] = &[0xA; 5];
+    let b: &[u8] = &[0xB; 17];
+    let c: &[u8] = &[];
+    let bytes = write_simple(
+        &[AssetUuid([9; 16])],
+        &[1, 2, 3, 4],
+        &[5, 6],
+        &[(vec![field("a")], a), (vec![field("b")], b), (vec![field("c")], c)],
+    );
+    let (structural, blobs) = split_artifact(&bytes).unwrap();
+    assert_eq!(blobs.len(), 3);
+    assert_eq!(parse_artifact_parts(structural, &blobs).unwrap().content_hash, content_hash(&bytes));
+    assert_eq!(assemble_artifact(structural, &blobs), bytes);
 }
 
 #[test]

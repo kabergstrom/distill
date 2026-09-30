@@ -523,6 +523,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Rejoin a structural prefix and its blobs (in blob-table order) into the
+/// complete artifact file: each blob at the next 16-aligned offset from the
+/// blob-section base, gaps zero. The inverse of [`split_artifact`]; callers
+/// validate the parts with [`parse_artifact_parts`] first.
+pub fn assemble_artifact(structural: &[u8], blobs: &[&[u8]]) -> Vec<u8> {
+    let total = blobs
+        .iter()
+        .fold(structural.len(), |len, blob| len + 15 + blob.len());
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(structural);
+    let base = out.len();
+    for blob in blobs {
+        let offset = (out.len() - base).next_multiple_of(16);
+        out.resize(base + offset, 0);
+        out.extend_from_slice(blob);
+    }
+    out
+}
+
+/// Split a complete artifact file into its structural prefix and its blobs
+/// in blob-table order, validating it with [`parse_artifact`].
+pub fn split_artifact(bytes: &[u8]) -> Result<(&[u8], Vec<&[u8]>), ArtifactError> {
+    let view = parse_artifact(bytes)?;
+    let structural_len = bytes.len() - view.blob_section.len();
+    let blobs = (0..view.blob_table.len() as u32)
+        .map(|index| view.blob(index).ok_or(ArtifactError::Overflow))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((&bytes[..structural_len], blobs))
+}
+
 /// Parse and strictly validate an artifact (§12): exact total size, zero
 /// padding, canonical `load_deps`, canonical blob-table offsets.
 pub fn parse_artifact(bytes: &[u8]) -> Result<ArtifactView<'_>, ArtifactError> {

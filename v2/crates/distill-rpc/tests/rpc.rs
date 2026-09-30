@@ -353,6 +353,7 @@ fn snapshot_leases_expire_by_deadline_and_new_connections_mint_fresh_leases() {
             "snapshot CAS lease was not released at its deadline"
         );
         std::thread::sleep(Duration::from_millis(5));
+        server.sweep_expired();
     }
 
     assert_eq!(
@@ -417,6 +418,8 @@ fn snapshot_and_connection_bounds_expire_the_oldest_capabilities() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn connection_cap_terminates_an_already_waiting_delta_stream() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
     let server = server_with(&[]);
     server
         .install_lease_policy(LeasePolicy {
@@ -436,7 +439,7 @@ async fn connection_cap_terminates_an_already_waiting_delta_stream() {
     ));
 
     let stream = install.deltas.clone();
-    let pending = tokio::spawn(async move { stream.next_async().await });
+    let pending = tokio::task::spawn_local(async move { stream.next_async().await });
     tokio::task::yield_now().await;
     let second_hub = connect(&server, &[]);
 
@@ -452,6 +455,8 @@ async fn connection_cap_terminates_an_already_waiting_delta_stream() {
         RpcResult::Failure(RpcFailure::LeaseExpired)
     ));
     assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
+        })
+        .await;
 }
 
 #[test]

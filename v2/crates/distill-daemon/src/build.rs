@@ -42,7 +42,7 @@ use distill_migrate::{
 };
 use distill_rpc::{
     decode_asset_reference_query, decode_authoring_payload, ArtifactLeaseBackend, ArtifactPayload,
-    ArtifactPayloadBackend, AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication,
+    AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication,
     BuildBackend, BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree,
     BuildWorkClass, Commit, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure,
     RuntimeTypePolicy, RuntimeTypePolicyRequest, ServedLoadEdge, TagPoisonMutation,
@@ -375,90 +375,6 @@ impl ArtifactLeaseBackend for CoordinatorBuildBackend {
             return;
         };
         let _ = store.unpin_holder(PinKind::PackSession, &format!("rpc-pack-session-{holder}"));
-    }
-}
-
-impl ArtifactPayloadBackend for CoordinatorBuildBackend {
-    fn store_artifact(&self, hash: ContentHash, _payload: &ArtifactPayload) -> Result<(), String> {
-        let coordinator = self
-            .coordinator
-            .upgrade()
-            .ok_or_else(|| "build coordinator stopped".to_owned())?;
-        coordinator
-            .store()
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?
-            .cas_read(&hash.0)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
-    fn load_artifact(&self, hash: ContentHash) -> Result<Option<ArtifactPayload>, String> {
-        let coordinator = self
-            .coordinator
-            .upgrade()
-            .ok_or_else(|| "build coordinator stopped".to_owned())?;
-        let bytes = match coordinator
-            .store()
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?
-            .cas_read(&hash.0)
-        {
-            Ok(bytes) => bytes,
-            Err(StoreError::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        };
-        let view = parse_artifact(&bytes).map_err(|error| error.to_string())?;
-        let structural_len = bytes
-            .len()
-            .checked_sub(view.blob_section.len())
-            .ok_or_else(|| "artifact structural length underflow".to_owned())?;
-        let blobs = (0..view.blob_table.len())
-            .map(|index| {
-                view.blob(index as u32)
-                    .map(|blob| Arc::<[u8]>::from(blob.to_vec()))
-                    .ok_or_else(|| "artifact blob table is invalid".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(ArtifactPayload {
-            structural: Arc::from(bytes[..structural_len].to_vec()),
-            blobs,
-            load_edges: Vec::new(),
-        }))
-    }
-
-    fn store_wire_tree(&self, hash: LayoutHash, bytes: &[u8]) -> Result<(), String> {
-        let coordinator = self
-            .coordinator
-            .upgrade()
-            .ok_or_else(|| "build coordinator stopped".to_owned())?;
-        let stored = coordinator
-            .store()
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?
-            .wire_tree_read(hash)
-            .map_err(|error| error.to_string())?;
-        if stored != bytes {
-            return Err("CAS wire tree bytes disagree with publication".to_owned());
-        }
-        Ok(())
-    }
-
-    fn load_wire_tree(&self, hash: LayoutHash) -> Result<Option<Arc<[u8]>>, String> {
-        let coordinator = self
-            .coordinator
-            .upgrade()
-            .ok_or_else(|| "build coordinator stopped".to_owned())?;
-        match coordinator
-            .store()
-            .lock()
-            .map_err(|_| "durable store mutex is poisoned".to_owned())?
-            .wire_tree_read(hash)
-        {
-            Ok(bytes) => Ok(Some(Arc::from(bytes))),
-            Err(StoreError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
     }
 }
 
@@ -2095,7 +2011,7 @@ fn preload_persisted_reads(
     asset: AssetUuid,
 ) -> Result<(), BuildError> {
     let traces = {
-        let mut store = lock_build_store(context)?;
+        let store = lock_build_store(context)?;
         persisted_candidate_traces(&store, key_kind, static_key, asset)
             .map_err(BuildError::infrastructure)?
     };
@@ -5497,27 +5413,40 @@ mod tests {
             RuntimeTypePolicy { build_only: false }
         );
         for artifact in &first.artifacts {
-            payload_backend
-                .store_artifact(artifact.content_hash, &artifact.payload)
+            coordinator
+                .server()
+                .install_artifact(artifact.content_hash, artifact.payload.clone())
                 .unwrap();
-            let loaded = payload_backend
-                .load_artifact(artifact.content_hash)
-                .unwrap()
-                .expect("committed artifact remains CAS-readable");
-            assert_eq!(loaded.structural, artifact.payload.structural);
-            assert_eq!(loaded.blobs, artifact.payload.blobs);
-            assert!(loaded.load_edges.is_empty());
+            let blobs = artifact
+                .payload
+                .blobs
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&[u8]>>();
+            assert_eq!(
+                coordinator
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .cas_read(&artifact.content_hash.0)
+                    .unwrap(),
+                distill_wire::artifact::assemble_artifact(&artifact.payload.structural, &blobs),
+                "committed artifact remains CAS-readable"
+            );
         }
         for wire_tree in &first.wire_trees {
-            payload_backend
-                .store_wire_tree(wire_tree.layout_hash, &wire_tree.bytes)
+            coordinator
+                .server()
+                .install_wire_tree(wire_tree.layout_hash, wire_tree.bytes.clone())
                 .unwrap();
             assert_eq!(
-                payload_backend
-                    .load_wire_tree(wire_tree.layout_hash)
+                coordinator
+                    .store()
+                    .lock()
                     .unwrap()
-                    .as_deref(),
-                Some(wire_tree.bytes.as_ref()),
+                    .wire_tree_read(wire_tree.layout_hash)
+                    .unwrap(),
+                wire_tree.bytes.to_vec(),
             );
         }
         let first_memo = coordinator.store().lock().unwrap().memo_seq();

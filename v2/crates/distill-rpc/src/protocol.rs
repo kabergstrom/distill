@@ -1202,16 +1202,6 @@ pub trait ArtifactLeaseBackend: Send + Sync {
     }
 }
 
-/// Payload storage seam. Production reads immutable artifact and DSWL bytes
-/// from the daemon CAS; the RPC server retains only authenticated identities
-/// and typed edge metadata needed to authorize a fetch.
-pub trait ArtifactPayloadBackend: Send + Sync {
-    fn store_artifact(&self, hash: ContentHash, payload: &ArtifactPayload) -> Result<(), String>;
-    fn load_artifact(&self, hash: ContentHash) -> Result<Option<ArtifactPayload>, String>;
-    fn store_wire_tree(&self, hash: LayoutHash, bytes: &[u8]) -> Result<(), String>;
-    fn load_wire_tree(&self, hash: LayoutHash) -> Result<Option<Arc<[u8]>>, String>;
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetReferenceQuery {
     Uuid(AssetUuid),
@@ -1310,7 +1300,7 @@ impl ChunkStream {
     }
 }
 
-pub(crate) trait ProgressCompletion: Send + Sync {
+pub(crate) trait ProgressCompletion {
     fn complete(&self) -> Result<(), String>;
     fn cancel(&self) -> bool;
 }
@@ -1319,7 +1309,7 @@ pub struct ProgressStream {
     pub(crate) events: std::collections::VecDeque<AuthoringProgressEvent>,
     pub(crate) next_sequence: u64,
     pub(crate) terminal_seen: bool,
-    pub(crate) completion: Arc<dyn ProgressCompletion>,
+    pub(crate) completion: std::rc::Rc<dyn ProgressCompletion>,
 }
 
 impl std::fmt::Debug for ProgressStream {

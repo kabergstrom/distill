@@ -11,17 +11,28 @@ pub mod distill_rpc_capnp {
 }
 pub mod capnp_loader;
 pub mod capnp_transport;
+mod apply;
+mod capability;
+mod lineage;
 mod persist;
 mod protocol;
 mod server;
+mod validate;
 mod target;
 
 pub use bind::{validate_bind_address, BindStageError};
 pub use protocol::*;
+pub use apply::{
+    apply_commit, apply_commit_served, publish_protocol_epoch, publish_restart_required, publish_runtime_pipeline_poison,
+    publish_target, publish_target_set, ApplyError, ApplyMode, RETAINED_HISTORY_VERSIONS,
+};
+pub use capability::{
+    AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, LineageRepair, MetadataAuthoringSnapshot,
+    MetadataHub, MetadataSnapshot, PackSession, PendingBuild, ResolveStep, Snapshot,
+};
 pub use server::{
-    decode_asset_reference_query, decode_authoring_payload, AuthoringSnapshot,
-    CoordinatedCommitError, DeltaStream, Hub, LeasePolicy, LineageRepair,
-    MetadataAuthoringSnapshot, MetadataHub, MetadataSnapshot, PackSession, Root, Server, Snapshot,
+    target_map, CoordinatedCommitError, ExternalStore, PublicationGuard, LeasePolicy, PublicationLock, Root, Server, ServerHandle,
     MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
+pub use validate::{decode_asset_reference_query, decode_authoring_payload};
 pub use target::{TargetDefinition, TargetSetError};

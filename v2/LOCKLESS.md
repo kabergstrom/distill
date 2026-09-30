@@ -342,6 +342,45 @@ baseline failures) and the deferred-ngp hot-reload scenario still working
 A grep for `Mutex|RwLock|Condvar` over `distill-{store,rpc,daemon}/src`
 should reach zero by the end of phase 6.
 
+### 6.1 Progress
+
+- **Phases 1–2:** done (commits up to `738b556`).
+- **Phase 3:** done.
+  - **Server layout.**
+    - `ServerHandle` (`Arc`, Send + Sync) holds config, instance, the
+      published-version `watch`, the backends and the writer.
+    - `Server` is a per-thread `Rc` front end, found through a thread-local
+      registry via `Server::attach`.
+    - A snapshot is an `Rc<SnapshotTxn>` over a pooled `StoreReader`.
+    - Connections, leases and cached build results live on the front end.
+    - Lease expiry is lazy, plus `Server::sweep_expired`, which the capnp
+      transport calls every second. The expiry thread is gone.
+  - **Writers.**
+    - Embedded mode owns its `Store` on a writer thread (`Writer::Embedded`)
+      and takes jobs over a channel.
+    - The daemon passes its store through `ExternalStore`, which also
+      provides the publication guard.
+    - distill-rpc and distill-store hold no `Mutex`, `RwLock` or `Condvar`;
+      the transport's stream services use `RefCell`.
+  - **Resolve split.**
+    - `Snapshot::resolve_prepare` returns `Done` or a Send `PendingBuild`.
+    - The transport runs `PendingBuild::run` in `spawn_blocking`, then calls
+      `resolve_finish`.
+  - **Artifacts.**
+    - Artifacts are CAS blobs from `assemble_artifact`, with their load edges
+      in `artifact_load_edges`.
+    - A read checks those edges against the parsed dependencies.
+    - `ArtifactPayloadBackend` is deleted.
+  - **Known gap until phase 4.** The daemon commits its namespace in its own
+    input transaction, and the RPC `Delta` for that commit is applied in a
+    follow-up served transaction (`apply_commit_served`) under the
+    publication mutex.
+    - Readers can see the new version before its served rows.
+    - A snapshot is no longer serialized behind an in-flight publication, so
+      a resolve against a just-superseded version returns `Drifted`, and the
+      client must take a fresh snapshot.
+    - `game_assets_e2e::resolved_hash` retries for this reason.
+
 ## 7. Test baseline
 
 Recorded at the start of phase 0; see `git log` for updates.
@@ -351,3 +390,6 @@ Phase 0 (after the tracing and scanner fixes): `cargo test --workspace` →
 `distill-build --test tool::tool_output_is_drained_while_large_stdin_is_written`
 (EPIPE while writing the tool's stdin). It already failed before phase 0 and
 is unrelated to this work.
+
+End of phase 3: `cargo test --workspace --no-fail-fast` → only the same
+`tool_output_is_drained_while_large_stdin_is_written` failure.
