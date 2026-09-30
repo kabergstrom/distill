@@ -1134,6 +1134,17 @@ impl AuthoringService {
                 } else {
                     false
                 };
+                if memoized {
+                    // Handled (memoized) failures never reach the loop's
+                    // error path; without this the author sees nothing and
+                    // the last good bundle silently stays served.
+                    tracing::warn!(
+                        root = %destination.root,
+                        path = %destination.path,
+                        error = %failure.message,
+                        "watched import failed; the previous bundle stays served"
+                    );
+                }
                 return Err(ImportExecutionError {
                     rpc: failure.rpc,
                     memoized,

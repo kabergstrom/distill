@@ -862,6 +862,12 @@ impl DaemonCoordinator {
         failure: PipelineFailure,
         heal_configuration: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
+        tracing::warn!(
+            code = ?failure.code,
+            origin = ?failure.origin,
+            message = %failure.message,
+            "pipeline candidate rejected; importers from it are unavailable"
+        );
         let healed_configuration = heal_configuration
             .then(|| self.configuration_without_source_error());
         let base = self.server().current_stamp().version;
