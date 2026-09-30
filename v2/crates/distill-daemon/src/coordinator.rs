@@ -52,7 +52,7 @@ use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError, StoreR
 
 use crate::store_cell::AuthorityStore;
 use crate::authority::{Authority, AuthoritySender};
-use crate::authoring::{AuthoringFilesystemCandidate, AuthoringService, AuthoringServiceInitError};
+use crate::authoring::{AuthoringService, AuthoringServiceInitError};
 use crate::callbacks::EpochAuthoringImporter;
 use crate::epoch::{
     stored_pipeline_epoch, CandidateRequirements, ModuleHost, PipelineEpoch, PipelineSnapshot,

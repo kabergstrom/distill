@@ -1369,37 +1369,23 @@ impl AuthoringService {
 
     fn registered_importer(&self, id: &str) -> Result<RegisteredImporter, RpcFailure> {
         let id = normalize_identifier(id).map_err(invalid)?;
-        if let Some(importer) = self
-            .pipeline_importers
-            .read()
-            .map_err(|_| invalid("pipeline importer registry lock is poisoned"))?
+        let importers = self.importers();
+        importers
+            .pipeline
             .get(&id)
-            .cloned()
-        {
-            return Ok(importer);
-        }
-        self.builtin_importers
-            .read()
-            .map_err(|_| invalid("built-in importer registry lock is poisoned"))?
-            .get(&id)
+            .or_else(|| importers.builtin.get(&id))
             .cloned()
             .ok_or_else(|| invalid(format!("importer {id:?} is not registered")))
     }
 
     fn importer_capabilities(&self) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
-        let mut capabilities = self
-            .builtin_importers
-            .read()
-            .map_err(|_| invalid("built-in importer registry lock is poisoned"))?
+        let importers = self.importers();
+        let mut capabilities = importers
+            .builtin
             .iter()
             .map(|(id, importer)| (id.clone(), importer.capability_hash))
             .collect::<BTreeMap<_, _>>();
-        for (id, importer) in self
-            .pipeline_importers
-            .read()
-            .map_err(|_| invalid("pipeline importer registry lock is poisoned"))?
-            .iter()
-        {
+        for (id, importer) in importers.pipeline.iter() {
             if capabilities
                 .insert(id.clone(), importer.capability_hash)
                 .is_some()

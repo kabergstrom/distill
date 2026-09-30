@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use distill_bundle::{AssetEntry, Bundle, EntryLineageV1, BUNDLE_FORMAT_VERSION};
 use distill_core::bootstrap::is_bootstrap_control_type;
@@ -43,26 +45,35 @@ use crate::scanner::{AssetRoot, DaemonOwnedDirectoryKind, RootedScanner, ScanErr
 pub struct AuthoringService {
     pub(crate) store: Arc<AuthorityStore>,
     pub(crate) scanner: RootedScanner,
-    roots: RwLock<Vec<AssetRoot>>,
-    quarantine: RwLock<QuarantineDriver>,
-    lineage_destination: RwLock<LineageDestination>,
-    lineage: RwLock<LineageRepairBackend>,
-    pub(crate) builtin_importers: RwLock<RegisteredImporters>,
-    pub(crate) pipeline_importers: RwLock<RegisteredImporters>,
-    pipeline_projection: RwLock<PipelineProjection>,
+    /// The asset roots and what hangs off them, replaced together when the
+    /// configuration changes.
+    filesystem: ArcSwap<AuthoringFilesystem>,
+    importers: ArcSwap<Importers>,
+    pipeline_projection: ArcSwap<PipelineProjection>,
     /// Whether the store's import index was built since it was last
     /// invalidated (see `importer`).
     pub(crate) import_index_ready: AtomicBool,
-    tag_index_coordinator: RwLock<Weak<crate::coordinator::DaemonCoordinator>>,
-    startup_recovery_diagnostic: Mutex<Option<String>>,
+    tag_index_coordinator: OnceLock<Weak<crate::coordinator::DaemonCoordinator>>,
+    startup_recovery_diagnostic: ArcSwapOption<String>,
 }
 
-pub(crate) struct AuthoringFilesystemCandidate {
+struct AuthoringFilesystem {
     roots: Vec<AssetRoot>,
-    scanner: RootedScanner,
     quarantine: QuarantineDriver,
     lineage_destination: LineageDestination,
     lineage: LineageRepairBackend,
+}
+
+/// Registered importers: the daemon's own, and the loaded pipeline's.
+#[derive(Default, Clone)]
+pub(crate) struct Importers {
+    pub(crate) builtin: RegisteredImporters,
+    pub(crate) pipeline: RegisteredImporters,
+}
+
+pub(crate) struct AuthoringFilesystemCandidate {
+    scanner: RootedScanner,
+    filesystem: AuthoringFilesystem,
 }
 
 impl AuthoringFilesystemCandidate {
@@ -71,7 +82,7 @@ impl AuthoringFilesystemCandidate {
     }
 
     pub(crate) fn lineage_destination(&self) -> &LineageDestination {
-        &self.lineage_destination
+        &self.filesystem.lineage_destination
     }
 }
 
@@ -106,57 +117,53 @@ impl AuthoringService {
         Ok(Self {
             store,
             scanner,
-            roots: RwLock::new(roots),
-            quarantine: RwLock::new(quarantine),
-            lineage_destination: RwLock::new(lineage_destination),
-            lineage: RwLock::new(lineage),
-            builtin_importers: RwLock::new(BTreeMap::new()),
-            pipeline_importers: RwLock::new(BTreeMap::new()),
-            pipeline_projection: RwLock::new(PipelineProjection::default()),
+            filesystem: ArcSwap::from_pointee(AuthoringFilesystem {
+                roots,
+                quarantine,
+                lineage_destination,
+                lineage,
+            }),
+            importers: ArcSwap::from_pointee(Importers::default()),
+            pipeline_projection: ArcSwap::from_pointee(PipelineProjection::default()),
             import_index_ready: AtomicBool::new(false),
-            tag_index_coordinator: RwLock::new(Weak::new()),
-            startup_recovery_diagnostic: Mutex::new(startup_recovery_diagnostic),
+            tag_index_coordinator: OnceLock::new(),
+            startup_recovery_diagnostic: ArcSwapOption::new(
+                startup_recovery_diagnostic.map(Arc::new),
+            ),
         })
     }
 
     pub(crate) fn take_startup_recovery_diagnostic(&self) -> Option<String> {
         self.startup_recovery_diagnostic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .swap(None)
+            .map(|diagnostic| (*diagnostic).clone())
     }
 
     pub(crate) fn attach_tag_index_coordinator(
         &self,
         coordinator: &Arc<crate::coordinator::DaemonCoordinator>,
     ) {
-        *self
+        if self
             .tag_index_coordinator
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(coordinator);
+            .set(Arc::downgrade(coordinator))
+            .is_err()
+        {
+            panic!("the tag index coordinator is attached once");
+        }
     }
 
     pub(crate) fn tag_index_coordinator(
         &self,
     ) -> Option<Arc<crate::coordinator::DaemonCoordinator>> {
-        self.tag_index_coordinator
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .upgrade()
+        self.tag_index_coordinator.get().and_then(Weak::upgrade)
     }
 
     pub(crate) fn pipeline_projection(&self) -> PipelineProjection {
-        self.pipeline_projection
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        (**self.pipeline_projection.load()).clone()
     }
 
     pub(crate) fn install_pipeline_projection(&self, projection: PipelineProjection) {
-        *self
-            .pipeline_projection
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = projection;
+        self.pipeline_projection.store(Arc::new(projection));
     }
 
     pub(crate) fn prepare_filesystem_candidate(
@@ -182,53 +189,35 @@ impl AuthoringService {
         }
         let lineage = LineageRepairBackend::new(Arc::clone(&self.store), roots.clone())?;
         Ok(AuthoringFilesystemCandidate {
-            roots,
             scanner,
-            quarantine,
-            lineage_destination,
-            lineage,
+            filesystem: AuthoringFilesystem {
+                roots,
+                quarantine,
+                lineage_destination,
+                lineage,
+            },
         })
     }
 
     pub(crate) fn install_filesystem_candidate(&self, candidate: AuthoringFilesystemCandidate) {
         self.scanner.replace_from(&candidate.scanner);
-        *self
-            .roots
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.roots;
-        *self
-            .quarantine
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.quarantine;
-        *self
-            .lineage_destination
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.lineage_destination;
-        *self
-            .lineage
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.lineage;
+        self.filesystem.store(Arc::new(candidate.filesystem));
     }
 
     pub(crate) fn roots_snapshot(&self) -> Vec<AssetRoot> {
-        self.roots
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.filesystem.load().roots.clone()
     }
 
     pub(crate) fn quarantine_snapshot(&self) -> QuarantineDriver {
-        self.quarantine
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.filesystem.load().quarantine.clone()
     }
 
     pub(crate) fn lineage_destination_snapshot(&self) -> LineageDestination {
-        self.lineage_destination
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.filesystem.load().lineage_destination.clone()
+    }
+
+    pub(crate) fn importers(&self) -> Arc<Importers> {
+        self.importers.load_full()
     }
 
     pub fn register_importer(
@@ -236,21 +225,23 @@ impl AuthoringService {
         importer: Arc<dyn crate::importer::AuthoringImporter>,
     ) -> Result<(), RpcFailure> {
         let registered = RegisteredImporter::validate(importer)?;
-        let mut importers = self
-            .builtin_importers
-            .write()
-            .map_err(|_| invalid("importer registry lock is poisoned"))?;
-        let pipeline = self
-            .pipeline_importers
-            .read()
-            .map_err(|_| invalid("pipeline importer registry lock is poisoned"))?;
-        if importers.contains_key(&registered.id) || pipeline.contains_key(&registered.id) {
+        let mut duplicate = false;
+        self.importers.rcu(|current| {
+            duplicate = current.builtin.contains_key(&registered.id)
+                || current.pipeline.contains_key(&registered.id);
+            let mut next = Importers::clone(current);
+            if !duplicate {
+                next.builtin
+                    .insert(registered.id.clone(), registered.clone());
+            }
+            next
+        });
+        if duplicate {
             return Err(invalid(format!(
                 "importer {:?} is already registered",
                 registered.id
             )));
         }
-        importers.insert(registered.id.clone(), registered);
         Ok(())
     }
 
@@ -274,25 +265,29 @@ impl AuthoringService {
                 return Err(invalid("pipeline epoch contains a duplicate importer id"));
             }
         }
-        let builtins = self
-            .builtin_importers
-            .read()
-            .map_err(|_| invalid("built-in importer registry lock is poisoned"))?;
+        let builtins = &self.importers.load().builtin;
         if let Some(id) = next.keys().find(|id| builtins.contains_key(*id)) {
             return Err(invalid(format!(
                 "pipeline importer {id:?} conflicts with a built-in importer"
             )));
         }
-        drop(builtins);
         Ok(next)
     }
 
+    /// Install the pipeline's importers. A built-in registered since they
+    /// were prepared keeps its id: the pipeline's importer of that id is
+    /// left out.
     pub(crate) fn install_pipeline_importers(&self, next: RegisteredImporters) {
-        *self
-            .pipeline_importers
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        self.importers.rcu(|current| {
+            let mut pipeline = next.clone();
+            pipeline.retain(|id, _| !current.builtin.contains_key(id));
+            Importers {
+                builtin: current.builtin.clone(),
+                pipeline,
+            }
+        });
     }
+
 
     fn prepare_direct_write(
         &self,
@@ -675,9 +670,9 @@ impl AuthoringBackend for AuthoringService {
         basis: &LineageRepairInspection,
         canonical_manifest_bundle: &[u8],
     ) -> Result<Commit, LineageRepairBackendError> {
-        self.lineage
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.filesystem
+            .load()
+            .lineage
             .prepare_create_missing_lineage(basis, canonical_manifest_bundle)
     }
 
@@ -686,9 +681,9 @@ impl AuthoringBackend for AuthoringService {
         basis: &LineageRepairInspection,
         survivor: &LineageManifestClaimant,
     ) -> Result<Commit, LineageRepairBackendError> {
-        self.lineage
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.filesystem
+            .load()
+            .lineage
             .prepare_resolve_duplicate_lineage(basis, survivor)
     }
 }

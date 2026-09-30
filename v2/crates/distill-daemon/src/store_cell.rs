@@ -29,6 +29,7 @@ thread_local! {
 }
 
 /// Whether this thread holds a store guard.
+#[cfg(test)]
 pub(crate) fn guard_held() -> bool {
     OPEN_GUARDS.get() != 0
 }
