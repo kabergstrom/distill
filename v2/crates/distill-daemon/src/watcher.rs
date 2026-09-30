@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -19,7 +18,6 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use crate::scanner::RootedScanner;
 
 const DEFAULT_CAPACITY: usize = 65_536;
-const ROOT_RECONFIGURE_POLL: Duration = Duration::from_millis(40);
 const INCOMPLETE_RENAME_BATCH_LIMIT: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +309,11 @@ enum WatcherCommand {
         paths: BTreeSet<PathBuf>,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    ReplaceAssetRoots {
+        assets: BTreeSet<PathBuf>,
+        quarantine: BTreeSet<PathBuf>,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     Stop,
 }
 
@@ -328,6 +331,24 @@ impl WatcherControl {
         self.commands
             .send(WatcherCommand::ReplaceControlPaths {
                 paths: paths.into_iter().collect(),
+                reply,
+            })
+            .map_err(|_| "native watcher control thread stopped".to_owned())?;
+        result
+            .recv()
+            .map_err(|_| "native watcher control reply was dropped".to_owned())?
+    }
+
+    /// Cover `scanner`'s current roots. When they changed, the watcher
+    /// requests one catch-up scan: the candidate scan that installed them
+    /// ran before this coverage.
+    pub(crate) fn replace_roots(&self, scanner: &RootedScanner) -> Result<(), String> {
+        let (assets, quarantine) = scanner.watch_coverage();
+        let (reply, result) = mpsc::sync_channel(1);
+        self.commands
+            .send(WatcherCommand::ReplaceAssetRoots {
+                assets: assets.into_iter().collect(),
+                quarantine: quarantine.into_iter().collect(),
                 reply,
             })
             .map_err(|_| "native watcher control thread stopped".to_owned())?;
@@ -396,7 +417,6 @@ impl WatcherThread {
             // filtering below keeps sibling events out of the work queue.
             watcher.watch(root, RecursiveMode::Recursive)?;
         }
-        let mut revision = scanner.revision();
         let control = WatcherControl { commands };
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -406,7 +426,7 @@ impl WatcherThread {
             .spawn(move || {
                 let mut watcher = watcher;
                 while !thread_stop.load(Ordering::Acquire) {
-                    match command_rx.recv_timeout(ROOT_RECONFIGURE_POLL) {
+                    match command_rx.recv() {
                         Ok(WatcherCommand::Stop) => break,
                         Ok(WatcherCommand::Native(Ok(event))) => {
                             if let Some(event) = admit_native(&coverage, event) {
@@ -437,34 +457,42 @@ impl WatcherThread {
                             });
                             let _ = reply.send(result);
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Ok(WatcherCommand::ReplaceAssetRoots {
+                            assets,
+                            quarantine,
+                            reply,
+                        }) => {
+                            if assets == watched_assets
+                                && quarantine == coverage.quarantine_prefixes
+                            {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            if let Err(error) = replace_watched_directories(
+                                &mut watcher,
+                                &watched_assets,
+                                &watched_controls,
+                                &assets,
+                                &watched_controls,
+                            ) {
+                                let message = format!(
+                                    "native watcher cannot cover configured asset roots: {error}"
+                                );
+                                sink(WatcherEvent::Failed(message.clone()));
+                                let _ = reply.send(Err(message));
+                                break;
+                            }
+                            watched_assets = assets.clone();
+                            coverage.asset_roots = assets;
+                            coverage.quarantine_prefixes = quarantine;
+                            // The candidate scan preceded watcher
+                            // reconfiguration. Force one armed catch-up scan
+                            // to cover that bounded gap.
+                            sink(WatcherEvent::Rescan);
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(mpsc::RecvError) => break,
                     }
-                    let next_revision = scanner.revision();
-                    if next_revision == revision {
-                        continue;
-                    }
-                    let (next_assets, next_quarantine) = scanner.watch_coverage();
-                    let next_assets = next_assets.into_iter().collect::<BTreeSet<_>>();
-                    if let Err(error) = replace_watched_directories(
-                        &mut watcher,
-                        &watched_assets,
-                        &watched_controls,
-                        &next_assets,
-                        &watched_controls,
-                    ) {
-                        sink(WatcherEvent::Failed(format!(
-                            "native watcher cannot cover configured asset roots: {error}"
-                        )));
-                        break;
-                    }
-                    watched_assets = next_assets.clone();
-                    coverage.asset_roots = next_assets;
-                    coverage.quarantine_prefixes = next_quarantine.into_iter().collect();
-                    revision = next_revision;
-                    // The candidate scan preceded watcher reconfiguration.
-                    // Force one armed catch-up scan to cover that bounded gap.
-                    sink(WatcherEvent::Rescan);
                 }
             })
             .map_err(WatcherStartError::Thread)?;
@@ -477,6 +505,11 @@ impl WatcherThread {
 
     pub(crate) fn control(&self) -> WatcherControl {
         self.control.clone()
+    }
+
+    /// See [`WatcherControl::replace_roots`].
+    pub fn replace_roots(&self, scanner: &RootedScanner) -> Result<(), String> {
+        self.control.replace_roots(scanner)
     }
 }
 

@@ -11,7 +11,6 @@ use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use distill_core::bootstrap::SCHEMA_LINEAGE_MANIFEST_TYPE_UUID;
@@ -198,7 +197,6 @@ struct CanonicalRoot {
 pub struct RootedScanner {
     roots: Arc<RwLock<BTreeMap<String, CanonicalRoot>>>,
     daemon_owned: Arc<RwLock<BTreeMap<PathBuf, DaemonOwnedDirectory>>>,
-    revision: Arc<AtomicU64>,
 }
 
 /// A directory whose contents are produced or retained by the daemon and can
@@ -941,7 +939,6 @@ impl RootedScanner {
         let scanner = Self {
             roots: Arc::new(RwLock::new(canonicalize_roots(roots.clone())?)),
             daemon_owned,
-            revision: Arc::new(AtomicU64::new(0)),
         };
         for root in roots {
             if root.quarantine_dir.is_dir() {
@@ -961,7 +958,6 @@ impl RootedScanner {
         Ok(Self {
             roots: Arc::new(RwLock::new(canonicalize_roots(roots)?)),
             daemon_owned: Arc::clone(&self.daemon_owned),
-            revision: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1034,21 +1030,7 @@ impl RootedScanner {
             .roots
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let watcher_roots_changed = roots.len() != replacement.len()
-            || roots.iter().any(|(name, current)| {
-                replacement.get(name).is_none_or(|next| {
-                    current.configured != next.configured
-                        || current.canonical_path != next.canonical_path
-                })
-            });
         *roots = replacement;
-        if watcher_roots_changed {
-            self.revision.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
     }
 
     pub(crate) fn has_same_roots(&self, other: &Self) -> bool {

@@ -311,6 +311,9 @@ impl ProcessDriver {
             &self.watcher_control,
             ControlInvalidation::all(),
         )?;
+        self.watcher_control
+            .replace_roots(&self.coordinator.scanner())
+            .map_err(CoordinatorError::InvalidManifest)?;
         let started = Instant::now();
         self.coordinator.reconcile_startup(&mut self.queue)?;
         tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
@@ -365,6 +368,13 @@ impl ProcessDriver {
             Some(invalidation) => {
                 self.config_watch
                     .reconcile(coordinator, &self.watcher_control, invalidation)
+                    .and_then(|capabilities_changed| {
+                        // A configuration may have replaced the roots.
+                        self.watcher_control
+                            .replace_roots(&coordinator.scanner())
+                            .map_err(CoordinatorError::InvalidManifest)?;
+                        Ok(capabilities_changed)
+                    })
             }
             None => Ok(false),
         }

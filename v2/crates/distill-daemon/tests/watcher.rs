@@ -204,7 +204,7 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
     )])
     .unwrap();
     let queue = Arc::new(Mutex::new(WatcherQueue::new()));
-    let _watcher = WatcherThread::start(scanner.clone(), [], sink(&queue)).unwrap();
+    let watcher = WatcherThread::start(scanner.clone(), [], sink(&queue)).unwrap();
 
     scanner
         .replace_roots([AssetRoot::new(
@@ -213,6 +213,7 @@ fn root_replacement_requests_one_catch_up_scan_then_watches_new_root() {
             second.join(".distill-displaced"),
         )])
         .unwrap();
+    watcher.replace_roots(&scanner).unwrap();
     assert_eq!(wait_for_action(&queue), WatcherAction::FullRescan);
 
     let path = second.join("later.txt");
