@@ -107,7 +107,7 @@ fn durable_bucket_revalidates_newest_first_and_hydrates_the_selected_extent() {
     );
 
     let missing = Snapshot::default();
-    let hit = lookup_persisted_candidate(&mut store, KeyKind::Processor, &key, asset, &missing)
+    let hit = lookup_persisted_candidate(&store, KeyKind::Processor, &key, asset, &missing)
         .unwrap()
         .unwrap();
     let PersistedOutcome::Success { outputs, .. } = hit.outcome else {
@@ -118,7 +118,7 @@ fn durable_bucket_revalidates_newest_first_and_hydrates_the_selected_extent() {
     let present = Snapshot {
         paths: BTreeMap::from([("asset.bundle".into(), Observed::Ok(Some(resolved)))]),
     };
-    let hit = lookup_persisted_candidate(&mut store, KeyKind::Processor, &key, asset, &present)
+    let hit = lookup_persisted_candidate(&store, KeyKind::Processor, &key, asset, &present)
         .unwrap()
         .unwrap();
     let PersistedOutcome::Success { outputs, .. } = hit.outcome else {

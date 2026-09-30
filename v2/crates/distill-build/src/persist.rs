@@ -3,7 +3,7 @@
 use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_store::cas::record::{FailureCause, FailureFingerprint, KeyKind, ResultOutcome};
 use distill_store::state::MemoSeq;
-use distill_store::{Store, StoreError};
+use distill_store::{StoreError, StoreReader};
 
 use crate::trace::{
     decode_trace_payload_bytes, revalidate, trace_digest, TraceDecodeError, TraceOp, TraceSource,
@@ -95,7 +95,7 @@ impl From<TraceDecodeError> for PersistedCacheError {
 /// Payload extents are authenticated and hydrated before the hit is returned;
 /// a corrupt candidate is an error rather than a silent cache miss.
 pub fn lookup_persisted_candidate(
-    store: &mut Store,
+    store: &StoreReader,
     key_kind: KeyKind,
     static_key: &[u8; 32],
     expected_asset: AssetUuid,
@@ -174,7 +174,7 @@ pub fn lookup_persisted_candidate(
 /// content dependencies named by `TraceOp::Read` before revalidation; the
 /// ordinary lookup remains the single hit-selection path.
 pub fn persisted_candidate_traces(
-    store: &mut Store,
+    store: &StoreReader,
     key_kind: KeyKind,
     static_key: &[u8; 32],
     expected_asset: AssetUuid,

@@ -513,11 +513,34 @@ impl Store {
         })
     }
 
-    /// The candidate bucket for a static-input key, most recently
-    /// committed first (§13). Touches each candidate's `last_used` for
-    /// the LRU policy.
-    pub fn lookup_candidates(
+    /// Record that a memo hit was served, for the LRU eviction policy.
+    /// Lookups are pure reads; whoever selected the hit reports it here.
+    pub fn touch_candidate(
         &mut self,
+        key_kind: KeyKind,
+        static_key: &[u8; 32],
+        trace_digest: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        self.read.conn.execute(
+            "UPDATE result_candidates SET last_used = ?4
+             WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
+            rusqlite::params![
+                key_kind as i64,
+                static_key.as_slice(),
+                trace_digest.as_slice(),
+                now_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+impl StoreReader {
+    /// The candidate bucket for a static-input key, most recently
+    /// committed first (§13). A pure read: the caller reports the hit it
+    /// serves through [`Store::touch_candidate`].
+    pub fn lookup_candidates(
+        &self,
         key_kind: KeyKind,
         static_key: &[u8; 32],
     ) -> Result<Vec<Candidate>, StoreError> {
@@ -532,22 +555,11 @@ impl Store {
             )?;
             mapped.collect::<Result<_, _>>()?
         };
-        let now = now_millis();
         let mut out = Vec::with_capacity(rows.len());
         for (trace_digest, memo_seq, segment, offset, len) in rows {
             let bytes = self.read_extent(segment as u64, offset as u64, len as u64)?;
             let decoded: DecodedRecord = decode_record(&bytes, segment as u64, offset as u64)?;
             let payload = ResultPayload::decode(&decoded.record.payload)?;
-            self.conn.execute(
-                "UPDATE result_candidates SET last_used = ?4
-                 WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-                rusqlite::params![
-                    key_kind as i64,
-                    static_key.as_slice(),
-                    trace_digest.as_slice(),
-                    now,
-                ],
-            )?;
             let mut digest = [0u8; 32];
             digest.copy_from_slice(&trace_digest);
             out.push(Candidate {
@@ -561,9 +573,6 @@ impl Store {
         }
         Ok(out)
     }
-}
-
-impl StoreReader {
 
     pub(crate) fn segment_path(&self, segment_id: u64) -> PathBuf {
         // `cas_segments` names every segment that can hold an indexed

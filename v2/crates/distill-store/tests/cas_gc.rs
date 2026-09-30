@@ -258,8 +258,12 @@ fn the_cache_limit_sweep_evicts_lru_first_and_skips_pinned() {
     let (out2, _, _) = commit_with_aux(&mut store, 2, &[2u8; 1200], b"b");
     let (out3, _, _) = commit_with_aux(&mut store, 3, &[3u8; 1200], b"c");
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let _ = store
+    let hit = store
         .lookup_candidates(KeyKind::Processor, &[1u8; 32])
+        .unwrap()
+        .remove(0);
+    store
+        .touch_candidate(KeyKind::Processor, &[1u8; 32], &hit.trace_digest)
         .unwrap(); // touch #1
     store.pin(PinKind::Manifest, "current", &[out3]).unwrap();
 

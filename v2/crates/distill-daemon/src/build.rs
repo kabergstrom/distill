@@ -2017,14 +2017,20 @@ fn hydrate_processor_stage(
         None
     } else {
         let mut store = lock_build_store(context)?;
-        lookup_persisted_candidate(
-            &mut store,
+        let hit = lookup_persisted_candidate(
+            &store,
             KeyKind::Processor,
             &key,
             loaded.entry.uuid,
             &trace_source,
         )
-        .map_err(BuildError::infrastructure)?
+        .map_err(BuildError::infrastructure)?;
+        if let Some(hit) = &hit {
+            store
+                .touch_candidate(KeyKind::Processor, &key, &hit.trace_digest)
+                .map_err(BuildError::infrastructure)?;
+        }
+        hit
     };
     let Some(hit) = hit else {
         return Ok(None);
@@ -2096,7 +2102,7 @@ fn preload_persisted_reads(
 ) -> Result<(), BuildError> {
     let traces = {
         let mut store = lock_build_store(context)?;
-        persisted_candidate_traces(&mut store, key_kind, static_key, asset)
+        persisted_candidate_traces(&store, key_kind, static_key, asset)
             .map_err(BuildError::infrastructure)?
     };
     // Candidates are newest-first. Materialize only until one complete trace
@@ -3471,14 +3477,20 @@ fn encode_or_hydrate(
         None
     } else {
         let mut store = lock_build_store(context)?;
-        lookup_persisted_candidate(
-            &mut store,
+        let hit = lookup_persisted_candidate(
+            &store,
             KeyKind::BuildImport,
             &key,
             loaded.entry.uuid,
             &trace_source,
         )
-        .map_err(BuildError::infrastructure)?
+        .map_err(BuildError::infrastructure)?;
+        if let Some(hit) = &hit {
+            store
+                .touch_candidate(KeyKind::BuildImport, &key, &hit.trace_digest)
+                .map_err(BuildError::infrastructure)?;
+        }
+        hit
     };
     if let Some(hit) = hit {
         return match hit.outcome {
