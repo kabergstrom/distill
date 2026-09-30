@@ -7,9 +7,9 @@ use std::sync::Arc;
 use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::target_set::CanonicalTargetSet;
 use distill_store::state::{
-    CleanupDisposition, ConfigurationEpoch, ConfigurationPoison, ConfigurationState, DscpV1,
-    InputVersion, MemoSeq, OperationKind, PipelineEpoch, PipelinePoison, PipelinePoisonCode,
-    PipelinePoisonOrigin, PipelineState, Registration, RegistrationKind, SnapshotStamp,
+    CleanupDisposition, ConfigurationEpoch, ConfigurationError, ConfigurationState, DscpV1,
+    InputVersion, MemoSeq, OperationKind, PipelineEpoch, PipelineFailure, PipelineFailureCode,
+    PipelineFailureOrigin, PipelineState, Registration, RegistrationKind, SnapshotStamp,
     StoreInstanceId,
 };
 
@@ -26,10 +26,10 @@ fn epoch() -> Arc<PipelineEpoch> {
     })
 }
 
-fn poison() -> PipelinePoison {
-    PipelinePoison::new(
-        PipelinePoisonCode::CandidateRegistration,
-        PipelinePoisonOrigin::CandidateOpen,
+fn failure() -> PipelineFailure {
+    PipelineFailure::new(
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
         CleanupDisposition::CleanedAndClosed,
         "duplicate processor id `tex-compress`",
     )
@@ -40,8 +40,8 @@ fn configuration() -> Arc<ConfigurationEpoch> {
     Arc::new(ConfigurationEpoch { generation: 7 })
 }
 
-fn configuration_poison() -> ConfigurationPoison {
-    ConfigurationPoison::from_reason(
+fn configuration_error() -> ConfigurationError {
+    ConfigurationError::from_reason(
         &DscpV1::NonLoopbackAddress {
             address: "10.0.0.5:9999".to_owned(),
         },
@@ -107,12 +107,12 @@ fn ready_state_yields_its_epoch() {
 }
 
 #[test]
-fn poisoned_state_epoch_is_the_named_error() {
-    let state = PipelineState::Poisoned {
-        error: poison(),
+fn failed_state_epoch_is_the_named_error() {
+    let state = PipelineState::Failed {
+        error: failure(),
         last_good: None,
     };
-    let err = state.epoch().expect_err("poisoned version has no epoch");
+    let err = state.epoch().expect_err("failed version has no epoch");
     assert!(err.to_string().contains("tex-compress"));
 }
 
@@ -120,8 +120,8 @@ fn poisoned_state_epoch_is_the_named_error() {
 fn last_good_is_residency_bookkeeping_never_served() {
     // §13: "the prior epoch is never silently retained as the new
     // version's code" — even with last_good resident, epoch() fails.
-    let state = PipelineState::Poisoned {
-        error: poison(),
+    let state = PipelineState::Failed {
+        error: failure(),
         last_good: Some(epoch()),
     };
     assert!(state.epoch().is_err());
@@ -130,11 +130,11 @@ fn last_good_is_residency_bookkeeping_never_served() {
 }
 
 #[test]
-fn pure_metadata_reads_remain_valid_under_poison() {
+fn pure_metadata_reads_remain_valid_under_failure() {
     // §13: "pure-metadata reads — the path index, input versions, CAS
     // reads, lease pinning — remain valid under poison".
-    let state = PipelineState::Poisoned {
-        error: poison(),
+    let state = PipelineState::Failed {
+        error: failure(),
         last_good: None,
     };
     for op in [
@@ -146,19 +146,19 @@ fn pure_metadata_reads_remain_valid_under_poison() {
         assert!(!op.requires_epoch(), "{op:?} is pure metadata");
         let got = state
             .check(op)
-            .unwrap_or_else(|_| panic!("{op:?} must survive poison"));
+            .unwrap_or_else(|_| panic!("{op:?} must survive a pipeline failure"));
         assert!(got.is_none(), "pure metadata ops consume no epoch");
     }
 }
 
 #[test]
-fn pipeline_dependent_ops_fail_deterministically_under_poison() {
+fn pipeline_dependent_ops_fail_deterministically_on_failure() {
     // §13: "anything needing the pipeline map, registry, defaults, or
     // migration fns (load_current, terminal-type queries, the
     // derived-output namespace, builds) fails deterministically with a
     // stable Failed naming the registration error".
-    let state = PipelineState::Poisoned {
-        error: poison(),
+    let state = PipelineState::Failed {
+        error: failure(),
         last_good: None,
     };
     for op in [
@@ -168,7 +168,7 @@ fn pipeline_dependent_ops_fail_deterministically_under_poison() {
         OperationKind::Build,
     ] {
         assert!(op.requires_epoch(), "{op:?} needs the pipeline");
-        let err = state.check(op).expect_err("must fail under poison");
+        let err = state.check(op).expect_err("must fail under a pipeline failure");
         assert!(
             err.to_string().contains("tex-compress"),
             "the error names the failure"
@@ -191,9 +191,9 @@ fn ready_state_supplies_the_epoch_to_pipeline_ops() {
 // ---- ConfigurationState (R22/H4) ----
 
 #[test]
-fn configuration_poison_never_serves_last_good_as_current() {
-    let state = ConfigurationState::Poisoned {
-        reason: configuration_poison(),
+fn configuration_error_never_serves_last_good_as_current() {
+    let state = ConfigurationState::Failed {
+        reason: configuration_error(),
         last_good: Some(configuration()),
     };
     assert!(state.epoch().is_err());
@@ -212,9 +212,9 @@ fn configuration_poison_never_serves_last_good_as_current() {
 }
 
 #[test]
-fn configuration_poison_keeps_only_explicitly_pure_operations_available() {
-    let state = ConfigurationState::Poisoned {
-        reason: configuration_poison(),
+fn configuration_error_keeps_only_explicitly_pure_operations_available() {
+    let state = ConfigurationState::Failed {
+        reason: configuration_error(),
         last_good: Some(configuration()),
     };
     for op in [

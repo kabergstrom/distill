@@ -11,7 +11,7 @@ use distill_store::cas::record::{
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::state::{
-    ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+    ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
@@ -25,9 +25,9 @@ fn store() -> (tempfile::TempDir, Store) {
 
 const PARENT: AssetUuid = AssetUuid([7u8; 16]);
 
-fn version_poison(message: &str) -> VersionPoison {
-    VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+fn namespace_error(message: &str) -> NamespaceError {
+    NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: ReadableBundleSource {
                 root_name: "main".into(),
                 normalized_path: "broken.bundle".into(),
@@ -471,7 +471,7 @@ fn resolve_child_ignores_namespace_errors_elsewhere() {
     let (_d, mut store) = store();
     let child = declare_child(&mut store, PARENT, "normals");
     store
-        .input_transaction(|txn| txn.set_namespace_errors([version_poison("collision")]))
+        .input_transaction(|txn| txn.set_namespace_errors([namespace_error("collision")]))
         .unwrap();
     assert_eq!(
         store.resolve_child(child).unwrap(),

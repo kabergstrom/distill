@@ -9,7 +9,7 @@
 
 use crate::db::{InputTxn, StoreReader};
 use crate::error::StoreError;
-use crate::state::{ErrorScope, VersionPoison};
+use crate::state::{ErrorScope, NamespaceError};
 
 /// The scan's namespace errors.
 const NAMESPACE: i64 = 1;
@@ -19,10 +19,10 @@ impl InputTxn<'_> {
     /// (duplicate records collapse).
     pub fn set_namespace_errors(
         &mut self,
-        errors: impl IntoIterator<Item = VersionPoison>,
-    ) -> Result<Vec<VersionPoison>, StoreError> {
+        errors: impl IntoIterator<Item = NamespaceError>,
+    ) -> Result<Vec<NamespaceError>, StoreError> {
         let errors =
-            VersionPoison::canonical_set(errors).map_err(StoreError::InvalidVersionPoison)?;
+            NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)?;
         self.txn
             .execute("DELETE FROM errors WHERE family = ?1", [NAMESPACE])?;
         for error in &errors {
@@ -38,7 +38,7 @@ impl InputTxn<'_> {
                     error.code as u16,
                     error
                         .persisted_bytes()
-                        .map_err(StoreError::InvalidVersionPoison)?,
+                        .map_err(StoreError::InvalidNamespaceError)?,
                     error.message,
                 ],
             )?;
@@ -49,7 +49,7 @@ impl InputTxn<'_> {
 
 impl StoreReader {
     /// Every namespace error, in canonical order.
-    pub fn namespace_errors(&self) -> Result<Vec<VersionPoison>, StoreError> {
+    pub fn namespace_errors(&self) -> Result<Vec<NamespaceError>, StoreError> {
         self.decode_errors(
             "SELECT record FROM errors WHERE family = ?1",
             rusqlite::params![NAMESPACE],
@@ -60,7 +60,7 @@ impl StoreReader {
     pub fn namespace_errors_about(
         &self,
         scope: &ErrorScope,
-    ) -> Result<Vec<VersionPoison>, StoreError> {
+    ) -> Result<Vec<NamespaceError>, StoreError> {
         self.decode_errors(
             "SELECT record FROM errors WHERE family = ?1 AND scope_kind = ?2 AND scope_id = ?3",
             rusqlite::params![NAMESPACE, scope.kind(), scope.id()],
@@ -71,14 +71,15 @@ impl StoreReader {
         &self,
         sql: &str,
         params: impl rusqlite::Params,
-    ) -> Result<Vec<VersionPoison>, StoreError> {
+    ) -> Result<Vec<NamespaceError>, StoreError> {
         let records = self.query_rows(sql, params, |row| row.get::<_, Vec<u8>>(0))?;
         let errors = records
             .iter()
             .map(|bytes| {
-                VersionPoison::from_persisted_bytes(bytes).map_err(StoreError::InvalidVersionPoison)
+                NamespaceError::from_persisted_bytes(bytes)
+                    .map_err(StoreError::InvalidNamespaceError)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        VersionPoison::canonical_set(errors).map_err(StoreError::InvalidVersionPoison)
+        NamespaceError::canonical_set(errors).map_err(StoreError::InvalidNamespaceError)
     }
 }

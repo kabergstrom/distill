@@ -32,7 +32,7 @@ use distill_store::{Store, StoreConfig, StoreError, StoreReader};
 
 use crate::apply::{
     apply_commit, apply_commit_served, configuration_status, publish_protocol_epoch, publish_restart_required,
-    publish_runtime_pipeline_poison, publish_target, publish_target_set, read_lineage_repair,
+    publish_runtime_pipeline_failure, publish_target, publish_target_set, read_lineage_repair,
     read_served_pipeline, ApplyError, ApplyMode,
 };
 use crate::persist::{delta_state, reconnect_reason};
@@ -564,7 +564,7 @@ impl ServerHandle {
 
 /// [`ServedWrite`] made object safe by delegation.
 trait ServedWriteObj {
-    fn runtime_poison(&mut self, poison: PipelinePoison) -> Result<bool, StoreError>;
+    fn runtime_failure(&mut self, failure: PipelineFailure) -> Result<bool, StoreError>;
     fn restart(&mut self, keys: &[String]) -> Result<bool, StoreError>;
     fn target(
         &mut self,
@@ -576,8 +576,8 @@ trait ServedWriteObj {
 }
 
 impl<W: ServedWrite> ServedWriteObj for W {
-    fn runtime_poison(&mut self, poison: PipelinePoison) -> Result<bool, StoreError> {
-        publish_runtime_pipeline_poison(self, poison)
+    fn runtime_failure(&mut self, failure: PipelineFailure) -> Result<bool, StoreError> {
+        publish_runtime_pipeline_failure(self, failure)
     }
 
     fn restart(&mut self, keys: &[String]) -> Result<bool, StoreError> {
@@ -858,9 +858,9 @@ impl Server {
     /// the daemon still executes each request through the ordinary build core.
     pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
         let txn = self.inner.current_snapshot().map_err(store_failure)?;
-        if let ConfigurationStatus::Poisoned(poison) = &txn.configuration {
+        if let ConfigurationStatus::Failed(error) = &txn.configuration {
             return Err(RpcFailure::InvalidQuery {
-                detail: format!("cannot verify poisoned configuration: {poison:?}"),
+                detail: format!("cannot verify failed configuration: {error:?}"),
             });
         }
         if let Some(error) = pipeline_failure(&self.inner.effective_pipeline(&txn)) {
@@ -900,26 +900,26 @@ impl Server {
 
     /// Publish a runtime failure of the current pipeline epoch. Every
     /// snapshot that pinned the epoch sees it and every connection must
-    /// reconnect. `persist` records the daemon's own durable poison first.
-    pub fn coordinated_runtime_pipeline_poison(
+    /// reconnect. `persist` records the daemon's own durable failure first.
+    pub fn coordinated_runtime_pipeline_failure(
         &self,
-        poison: PipelinePoison,
+        failure: PipelineFailure,
         persist: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         self.assert_authority();
-        self.runtime_pipeline_poison_locked(poison, persist)
+        self.runtime_pipeline_failure_locked(failure, persist)
     }
 
-    fn runtime_pipeline_poison_locked(
+    fn runtime_pipeline_failure_locked(
         &self,
-        poison: PipelinePoison,
+        failure: PipelineFailure,
         persist: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        poison
+        failure
             .validate()
-            .map_err(|error| format!("invalid runtime pipeline poison: {error:?}"))?;
-        if poison.origin != PipelinePoisonOrigin::PublishedRuntime {
-            return Err("runtime poison publication requires PublishedRuntime origin".to_owned());
+            .map_err(|error| format!("invalid runtime pipeline failure: {error:?}"))?;
+        if failure.origin != PipelineFailureOrigin::PublishedRuntime {
+            return Err("runtime failure publication requires PublishedRuntime origin".to_owned());
         }
         let (_, current) = self
             .inner
@@ -927,7 +927,7 @@ impl Server {
             .map_err(|error| error.to_string())?;
         match &current {
             PipelineDiagnostic::Ready => {}
-            PipelineDiagnostic::Poisoned(existing) if existing == &poison => return Ok(()),
+            PipelineDiagnostic::Failed(existing) if existing == &failure => return Ok(()),
             other => {
                 return Err(format!(
                     "current RPC pipeline is not the observed ready epoch: {other:?}"
@@ -937,7 +937,7 @@ impl Server {
         persist()?;
         self.inner
             .handle
-            .write_served(false, move |txn| txn.runtime_poison(poison));
+            .write_served(false, move |txn| txn.runtime_failure(failure));
         Ok(())
     }
 
@@ -1368,8 +1368,8 @@ pub(crate) fn entry_role(authoring_only: bool) -> AuthoringEntryRole {
 pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFailure> {
     match diagnostic.clone() {
         PipelineDiagnostic::Ready => None,
-        PipelineDiagnostic::Poisoned(poison) => Some(RpcFailure::PipelineUnavailable(Box::new(
-            PipelineUnavailableDiagnostic::PipelinePoison(poison),
+        PipelineDiagnostic::Failed(failure) => Some(RpcFailure::PipelineUnavailable(Box::new(
+            PipelineUnavailableDiagnostic::PipelineFailure(failure),
         ))),
         PipelineDiagnostic::SchemaAcceptanceRequired(required) => {
             Some(RpcFailure::PipelineUnavailable(Box::new(
@@ -1757,7 +1757,7 @@ impl Inner {
     }
 
     /// A snapshot's pipeline: the current diagnostic while the epoch it
-    /// pinned is still installed (a runtime poison reaches it), else its own.
+    /// pinned is still installed (a runtime failure reaches it), else its own.
     pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> PipelineDiagnostic {
         match self.current_pipeline() {
             Ok((installed_at, current)) if installed_at == txn.pipeline_installed_at => current,
@@ -2044,13 +2044,13 @@ impl Inner {
 
 impl Root {
     /// Narrow, unbound recovery bootstrap. It is minted only while the
-    /// authoritative configuration poison is exactly missing/duplicate
+    /// authoritative configuration error is exactly missing/duplicate
     /// lineage and exposes no metadata or target capability.
     pub fn lineage_repair(&self, protocol: u32) -> LineageRepairConnectOutcome {
         self.server().lineage_repair(protocol)
     }
 
-    /// Target- and compiled-registry-free bootstrap for poison-safe metadata,
+    /// Target- and compiled-registry-free bootstrap for failure-safe metadata,
     /// diagnostics, authored-value inspection, and immutable CAS reads.
     pub fn metadata(&self, protocol: u32) -> MetadataConnectOutcome {
         self.server().metadata(protocol)
@@ -2092,8 +2092,8 @@ impl Server {
                 // server publication, never authority to repair.
                 crate::lineage::LineageInspectionFailure::Invalid(_error) => {
                     LineageRepairConnectOutcome::Unavailable(match &txn.configuration {
-                        ConfigurationStatus::Poisoned(poison) => {
-                            LineageRepairUnavailable::OtherConfigurationPoison(poison.clone())
+                        ConfigurationStatus::Failed(error) => {
+                            LineageRepairUnavailable::OtherConfigurationError(error.clone())
                         }
                         ConfigurationStatus::Ready => LineageRepairUnavailable::ConfigurationReady,
                     })
@@ -2168,14 +2168,14 @@ impl Server {
                 got: request.target_definition_hash,
             });
         }
-        if let ConfigurationStatus::Poisoned(poison) = configuration_status(&configuration) {
-            return ConnectOutcome::ConfigurationPoisoned(poison);
+        if let ConfigurationStatus::Failed(error) = configuration_status(&configuration) {
+            return ConnectOutcome::ConfigurationFailed(error);
         }
         match read_served_pipeline(pipeline).map(|(_, pipeline)| pipeline) {
             Ok(PipelineDiagnostic::Ready) => {}
-            Ok(PipelineDiagnostic::Poisoned(poison)) => {
+            Ok(PipelineDiagnostic::Failed(failure)) => {
                 return ConnectOutcome::PipelineUnavailable(
-                    PipelineUnavailableDiagnostic::PipelinePoison(poison),
+                    PipelineUnavailableDiagnostic::PipelineFailure(failure),
                 );
             }
             Ok(PipelineDiagnostic::SchemaAcceptanceRequired(required)) => {

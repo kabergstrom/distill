@@ -149,7 +149,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
             .read()
             .pipeline_state()
             .unwrap(),
-        Some(PipelineState::Poisoned { .. })
+        Some(PipelineState::Failed { .. })
     ));
 
     std::fs::write(temp.path().join("assets/source.txt"), b"source").unwrap();
@@ -165,7 +165,7 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
             .read()
             .pipeline_state()
             .unwrap(),
-        Some(PipelineState::Poisoned { .. })
+        Some(PipelineState::Failed { .. })
     ));
     assert!(process.last_background_error().is_none());
     assert!(
@@ -376,17 +376,17 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
                     .read()
                     .configuration_state()
                     .unwrap(),
-                ConfigurationState::Poisoned { reason, .. }
+                ConfigurationState::Failed { reason, .. }
                     if matches!(reason.detail.as_ref(), DscpV1::MalformedConfiguration { .. })
             )
         },
         "malformed configuration was not published",
     );
-    let poisoned = process.coordinator().server().current_stamp().version;
+    let failed = process.coordinator().server().current_stamp().version;
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(
         process.coordinator().server().current_stamp().version,
-        poisoned
+        failed
     );
 
     std::fs::write(&path, config_source(&temp)).unwrap();
@@ -402,19 +402,19 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
                 .read()
                 .configuration_state()
                 .unwrap();
-            version > poisoned
+            version > failed
                 && matches!(
                     state,
-                    ConfigurationState::Poisoned { reason, .. }
+                    ConfigurationState::Failed { reason, .. }
                         if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
                 )
         },
-        "valid configuration did not clear its malformed-source poison",
+        "valid configuration did not clear its malformed-source error",
     );
 }
 
 #[test]
-fn valid_configuration_with_malformed_schema_retains_lineage_configuration_poison() {
+fn valid_configuration_with_malformed_schema_retains_lineage_configuration_error() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     let config_path = temp.path().join("distill.toml");
@@ -428,7 +428,7 @@ fn valid_configuration_with_malformed_schema_retains_lineage_configuration_poiso
                     .read()
                     .configuration_state()
                     .unwrap(),
-                ConfigurationState::Poisoned { reason, .. }
+                ConfigurationState::Failed { reason, .. }
                     if matches!(reason.detail.as_ref(), DscpV1::MalformedConfiguration { .. })
             )
         },
@@ -443,15 +443,15 @@ fn valid_configuration_with_malformed_schema_retains_lineage_configuration_poiso
             let store = store.read();
             matches!(
                 store.configuration_state().unwrap(),
-                ConfigurationState::Poisoned { reason, .. }
+                ConfigurationState::Failed { reason, .. }
                     if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
             ) && matches!(
                 store.pipeline_state().unwrap(),
-                Some(PipelineState::Poisoned { error, .. })
+                Some(PipelineState::Failed { error, .. })
                     if error.message.contains("schema authority")
             )
         },
-        "valid configuration erased independent lineage configuration poison",
+        "valid configuration erased independent lineage configuration error",
     );
     assert!(
         process.last_background_error().is_none(),
@@ -478,7 +478,7 @@ fn simultaneous_configuration_defects_choose_canonical_authority() {
                     .read()
                     .configuration_state()
                     .unwrap(),
-                ConfigurationState::Poisoned { reason, .. }
+                ConfigurationState::Failed { reason, .. }
                     if matches!(
                         reason.detail.as_ref(),
                         DscpV1::EmptyTargetApis { target } if target == "dev"
@@ -491,7 +491,7 @@ fn simultaneous_configuration_defects_choose_canonical_authority() {
 }
 
 #[test]
-fn schema_bound_target_mismatches_publish_configuration_poison() {
+fn schema_bound_target_mismatches_publish_configuration_error() {
     let temp = tempfile::tempdir().unwrap();
     let config = config(&temp);
     write_empty_lineage_manifest(&temp);
@@ -508,7 +508,7 @@ fn schema_bound_target_mismatches_publish_configuration_poison() {
                     .read()
                     .configuration_state()
                     .unwrap(),
-                ConfigurationState::Poisoned { reason, .. }
+                ConfigurationState::Failed { reason, .. }
                     if matches!(
                         reason.detail.as_ref(),
                         DscpV1::UnsupportedTargetIdentity { target, .. } if target == "dev"
@@ -759,7 +759,7 @@ fn config_retargets_native_schema_watch_without_polling_the_old_path() {
 }
 
 #[test]
-fn malformed_schema_is_a_stable_pipeline_poison_and_a_valid_edit_retries() {
+fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     let before = process.coordinator().server().current_stamp().version;
@@ -774,28 +774,28 @@ fn malformed_schema_is_a_stable_pipeline_poison_and_a_valid_edit_retries() {
                     .read()
                     .pipeline_state()
                     .unwrap(),
-                Some(PipelineState::Poisoned { error, .. })
+                Some(PipelineState::Failed { error, .. })
                     if error.message.contains("schema authority")
             )
         },
-        "malformed schema was not published as pipeline poison",
+        "malformed schema was not published as a pipeline failure",
     );
-    let poisoned = process.coordinator().server().current_stamp().version;
-    assert_eq!(poisoned.0, before.0 + 1);
+    let failed = process.coordinator().server().current_stamp().version;
+    assert_eq!(failed.0, before.0 + 1);
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(
         process.coordinator().server().current_stamp().version,
-        poisoned
+        failed
     );
 
     write_schema(&temp, "healed");
     wait_until(
-        || process.coordinator().server().current_stamp().version > poisoned,
+        || process.coordinator().server().current_stamp().version > failed,
         "valid schema edit did not retry the atomic candidate",
     );
     assert_eq!(
         process.coordinator().server().current_stamp().version.0,
-        poisoned.0 + 1
+        failed.0 + 1
     );
     assert!(process.last_background_error().is_none());
 }

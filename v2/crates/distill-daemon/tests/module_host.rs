@@ -9,8 +9,8 @@ use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_daemon::epoch::{
     CandidateCleanupDisposition, CandidateRegistrationArena, CandidateRequirements, EpochWorkError,
     HostCallbackBoundary, HostCallbackSurface, LoadedPipelineModule, ModuleAbiIdentity,
-    ModuleCallError, ModuleEpochPin, ModuleHost, PipelineModuleLoader, PipelinePoisonCode,
-    PipelinePoisonOrigin, Registration, RegistrationDisposition, RegistrationKind,
+    ModuleCallError, ModuleEpochPin, ModuleHost, PipelineModuleLoader, PipelineFailureCode,
+    PipelineFailureOrigin, Registration, RegistrationDisposition, RegistrationKind,
     RegistrationResource, RegistrationSet, StagedModule, TargetDefinition, UnloadOutcome,
 };
 
@@ -257,21 +257,21 @@ fn write_module(path: &Path, byte: u8) {
     std::fs::write(path, [byte; 32]).unwrap();
 }
 
-fn assert_poison_fields(
-    poison: &distill_daemon::epoch::PipelinePoison,
-    code: PipelinePoisonCode,
-    origin: PipelinePoisonOrigin,
+fn assert_failure_fields(
+    failure: &distill_daemon::epoch::PipelineFailure,
+    code: PipelineFailureCode,
+    origin: PipelineFailureOrigin,
     cleanup: CandidateCleanupDisposition,
 ) {
-    assert_eq!(poison.code, code);
-    assert_eq!(poison.origin, origin);
-    assert_eq!(poison.cleanup, cleanup);
-    poison.validate().unwrap();
-    assert_ne!(poison.identity, [0; 32]);
+    assert_eq!(failure.code, code);
+    assert_eq!(failure.origin, origin);
+    assert_eq!(failure.cleanup, cleanup);
+    failure.validate().unwrap();
+    assert_ne!(failure.identity, [0; 32]);
 }
 
 #[test]
-fn candidate_open_failure_publishes_poison_and_next_good_candidate_heals() {
+fn candidate_open_failure_publishes_a_failure_and_next_good_candidate_heals() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 1);
@@ -281,13 +281,13 @@ fn candidate_open_failure_publishes_poison_and_next_good_candidate_heals() {
         module: None,
         open_error: Some("loader rejected image"),
     };
-    let poison = host
+    let failure = host
         .publish_candidate(&source, requirements(1), &mut failed)
         .unwrap_err();
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateOpen,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateOpen,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::None,
     );
     assert!(host.snapshot().epoch().is_err());
@@ -397,19 +397,19 @@ fn nfc_equivalent_target_names_are_rejected_before_open_or_register() {
     ];
     let mut host = module_host(temp.path().join("state")).unwrap();
 
-    let poison = host
+    let failure = host
         .publish_candidate(&source, candidate, &mut loader)
         .unwrap_err();
 
     assert!(
-        poison.message.contains("DuplicateTarget"),
+        failure.message.contains("DuplicateTarget"),
         "{}",
-        poison.message
+        failure.message
     );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateValidation,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateValidation,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::None,
     );
     assert_eq!(calls.lock().unwrap().register, 0);
@@ -417,21 +417,21 @@ fn nfc_equivalent_target_names_are_rejected_before_open_or_register() {
 }
 
 #[test]
-fn boundary_panic_is_converted_to_candidate_poison_instead_of_unwinding() {
+fn boundary_panic_is_converted_to_candidate_failure_instead_of_unwinding() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 9);
     let mut host = module_host(temp.path().join("state")).unwrap();
-    let poison = host
+    let failure = host
         .publish_candidate(&source, requirements(9), &mut PanickingLoader)
         .unwrap_err();
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateOpen,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateOpen,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::None,
     );
-    assert!(poison.message.contains("must return status"));
+    assert!(failure.message.contains("must return status"));
 }
 
 fn duplicate_registration_module(
@@ -477,18 +477,18 @@ fn partial_duplicate_registration_cleans_the_complete_arena_in_reverse_order() {
     };
     let mut host = module_host(temp.path().join("state")).unwrap();
 
-    let poison = host
+    let failure = host
         .publish_candidate(&source, requirements(10), &mut loader)
         .unwrap_err();
 
     assert_eq!(
-        poison.cleanup,
+        failure.cleanup,
         CandidateCleanupDisposition::CleanedAndClosed
     );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateRegistration,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::CleanedAndClosed,
     );
     let calls = calls.lock().unwrap();
@@ -511,21 +511,21 @@ fn host_latch_rejects_candidate_when_module_ignores_duplicate_status() {
     };
     let mut host = module_host(temp.path().join("state")).unwrap();
 
-    let poison = host
+    let failure = host
         .publish_candidate(&source, requirements(21), &mut loader)
         .unwrap_err();
 
-    assert!(poison
+    assert!(failure
         .message
         .contains("host latched rejected registration"));
     assert_eq!(
-        poison.cleanup,
+        failure.cleanup,
         CandidateCleanupDisposition::CleanedAndClosed
     );
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateRegistration,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::CleanedAndClosed,
     );
     let calls = calls.lock().unwrap();
@@ -550,31 +550,31 @@ fn rejected_or_panicking_registration_keeps_every_capsule_arena_owned() {
         };
         let mut host = module_host(temp.path().join("state")).unwrap();
 
-        let poison = host
+        let failure = host
             .publish_candidate(&source, requirements(18), &mut loader)
             .unwrap_err();
 
         if panics_after_transfer {
             assert!(
-                poison.message.contains("register panicked"),
+                failure.message.contains("register panicked"),
                 "{}",
-                poison.message
+                failure.message
             );
         } else {
             assert!(
-                poison.message.contains("different module epoch"),
+                failure.message.contains("different module epoch"),
                 "{}",
-                poison.message
+                failure.message
             );
         }
         assert_eq!(
-            poison.cleanup,
+            failure.cleanup,
             CandidateCleanupDisposition::CleanedAndClosed
         );
-        assert_poison_fields(
-            &poison,
-            PipelinePoisonCode::CandidateRegistration,
-            PipelinePoisonOrigin::CandidateOpen,
+        assert_failure_fields(
+            &failure,
+            PipelineFailureCode::CandidateRegistration,
+            PipelineFailureOrigin::CandidateOpen,
             CandidateCleanupDisposition::CleanedAndClosed,
         );
         let calls = calls.lock().unwrap();
@@ -601,18 +601,18 @@ fn cleanup_error_or_panic_leaks_candidate_without_unload_or_dlclose() {
         };
         let mut host = module_host(temp.path().join("state")).unwrap();
 
-        let poison = host
+        let failure = host
             .publish_candidate(&source, requirements(11), &mut loader)
             .unwrap_err();
 
         assert_eq!(
-            poison.cleanup,
+            failure.cleanup,
             CandidateCleanupDisposition::RegistrationCleanupFailed
         );
-        assert_poison_fields(
-            &poison,
-            PipelinePoisonCode::CandidateCleanup,
-            PipelinePoisonOrigin::CandidateOpen,
+        assert_failure_fields(
+            &failure,
+            PipelineFailureCode::CandidateCleanup,
+            PipelineFailureOrigin::CandidateOpen,
             CandidateCleanupDisposition::RegistrationCleanupFailed,
         );
         let calls = calls.lock().unwrap();
@@ -639,18 +639,18 @@ fn unload_error_or_panic_leaks_candidate_without_dlclose() {
         };
         let mut host = module_host(temp.path().join("state")).unwrap();
 
-        let poison = host
+        let failure = host
             .publish_candidate(&source, requirements(12), &mut loader)
             .unwrap_err();
 
         assert_eq!(
-            poison.cleanup,
+            failure.cleanup,
             CandidateCleanupDisposition::ModuleUnloadFailed
         );
-        assert_poison_fields(
-            &poison,
-            PipelinePoisonCode::CandidateCleanup,
-            PipelinePoisonOrigin::CandidateOpen,
+        assert_failure_fields(
+            &failure,
+            PipelineFailureCode::CandidateCleanup,
+            PipelineFailureOrigin::CandidateOpen,
             CandidateCleanupDisposition::ModuleUnloadFailed,
         );
         let calls = calls.lock().unwrap();
@@ -675,15 +675,15 @@ fn leaked_unpublished_token_pin_leaks_candidate_after_unload() {
     };
     let mut host = module_host(temp.path().join("state")).unwrap();
 
-    let poison = host
+    let failure = host
         .publish_candidate(&source, requirements(13), &mut loader)
         .unwrap_err();
 
-    assert_eq!(poison.cleanup, CandidateCleanupDisposition::TokenPinned);
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateCleanup,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_eq!(failure.cleanup, CandidateCleanupDisposition::TokenPinned);
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateCleanup,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::TokenPinned,
     );
     let calls = calls.lock().unwrap();
@@ -709,15 +709,15 @@ fn token_poisoned_during_registration_never_publishes_or_dlcloses() {
     };
     let mut host = module_host(temp.path().join("state")).unwrap();
 
-    let poison = host
+    let failure = host
         .publish_candidate(&source, requirements(14), &mut loader)
         .unwrap_err();
 
-    assert_eq!(poison.cleanup, CandidateCleanupDisposition::TokenPoisoned);
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateCleanup,
-        PipelinePoisonOrigin::CandidateOpen,
+    assert_eq!(failure.cleanup, CandidateCleanupDisposition::TokenPoisoned);
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateCleanup,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::TokenPoisoned,
     );
     assert!(host.snapshot().epoch().is_err());
@@ -728,7 +728,7 @@ fn token_poisoned_during_registration_never_publishes_or_dlcloses() {
 }
 
 #[test]
-fn runtime_poison_fences_every_pin_and_permanently_forbids_dlclose() {
+fn runtime_failure_fences_every_pin_and_permanently_forbids_dlclose() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 2);
@@ -747,11 +747,11 @@ fn runtime_poison_fences_every_pin_and_permanently_forbids_dlclose() {
     let module_value = ErasedValue::new_in(PanickingAssetDrop, epoch.module_token().clone());
     assert!(module_value.destroy().is_err());
     epoch.report_runtime_panic("module asset drop panicked");
-    let runtime_poison = old_snapshot.epoch().unwrap_err();
-    assert_poison_fields(
-        &runtime_poison,
-        PipelinePoisonCode::PublishedCallbackPanic,
-        PipelinePoisonOrigin::PublishedRuntime,
+    let runtime_failure = old_snapshot.epoch().unwrap_err();
+    assert_failure_fields(
+        &runtime_failure,
+        PipelineFailureCode::PublishedCallbackPanic,
+        PipelineFailureOrigin::PublishedRuntime,
         CandidateCleanupDisposition::PublishedEpochLeaked,
     );
     assert!(epoch.try_start_job().is_err());
@@ -776,7 +776,7 @@ fn runtime_poison_fences_every_pin_and_permanently_forbids_dlclose() {
 }
 
 #[test]
-fn token_panic_cause_maps_to_panic_poison_without_a_second_report() {
+fn token_panic_cause_maps_to_panic_failure_without_a_second_report() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 31);
@@ -793,17 +793,17 @@ fn token_panic_cause_maps_to_panic_poison_without_a_second_report() {
         .module_token()
         .poison_with(ModuleEpochPoisonCause::CallbackPanic);
 
-    let poison = host.snapshot().epoch().unwrap_err();
-    assert_eq!(poison.code, PipelinePoisonCode::PublishedCallbackPanic);
+    let failure = host.snapshot().epoch().unwrap_err();
+    assert_eq!(failure.code, PipelineFailureCode::PublishedCallbackPanic);
     assert!(matches!(
         epoch.try_start_job(),
-        Err(EpochWorkError::Poisoned(ref poison))
-            if poison.code == PipelinePoisonCode::PublishedCallbackPanic
+        Err(EpochWorkError::Failed(ref failure))
+            if failure.code == PipelineFailureCode::PublishedCallbackPanic
     ));
 }
 
 #[test]
-fn ordinary_retirement_is_stale_work_not_candidate_poison() {
+fn ordinary_retirement_is_stale_work_not_candidate_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 32);
@@ -845,10 +845,10 @@ fn runtime_rejection_and_retirement_cleanup_emit_exact_dspp_records() {
         .unwrap();
     rejecting_epoch.report_runtime_failure("callback returned rejected status");
     let rejected = rejecting_host.snapshot().epoch().unwrap_err();
-    assert_poison_fields(
+    assert_failure_fields(
         &rejected,
-        PipelinePoisonCode::PublishedCallbackRejected,
-        PipelinePoisonOrigin::PublishedRuntime,
+        PipelineFailureCode::PublishedCallbackRejected,
+        PipelineFailureOrigin::PublishedRuntime,
         CandidateCleanupDisposition::PublishedEpochLeaked,
     );
 
@@ -879,11 +879,11 @@ fn runtime_rejection_and_retirement_cleanup_emit_exact_dspp_records() {
     assert!(cleanup_host
         .reap_retired()
         .contains(&UnloadOutcome::LeakedPoisoned(retiring_id)));
-    let cleanup = cleanup_host.retired_poison(retiring_id).unwrap();
-    assert_poison_fields(
+    let cleanup = cleanup_host.retired_failure(retiring_id).unwrap();
+    assert_failure_fields(
         &cleanup,
-        PipelinePoisonCode::PublishedCleanup,
-        PipelinePoisonOrigin::PublishedRuntime,
+        PipelineFailureCode::PublishedCleanup,
+        PipelineFailureOrigin::PublishedRuntime,
         CandidateCleanupDisposition::PublishedEpochLeaked,
     );
 }
@@ -932,7 +932,7 @@ fn publish_with_module(
     candidate: CandidateRequirements,
     module: FakeModule,
     calls: Arc<Mutex<Calls>>,
-) -> distill_daemon::epoch::PipelinePoison {
+) -> distill_daemon::epoch::PipelineFailure {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pipeline.dylib");
     write_module(&source, 7);
@@ -941,11 +941,11 @@ fn publish_with_module(
         open_error: None,
     };
     let mut host = module_host(temp.path().join("state")).unwrap();
-    let poison = host
+    let failure = host
         .publish_candidate(&source, candidate, &mut loader)
         .unwrap_err();
     assert_eq!(calls.lock().unwrap().register, 0);
-    poison
+    failure
 }
 
 #[test]
@@ -959,18 +959,18 @@ fn missing_or_wrong_module_source_identity_is_rejected_before_abi_and_register()
         } else {
             module.source_identity.source_hash = "ffffffffffffffff".to_owned();
         }
-        let poison = publish_with_module(candidate, module, calls);
-        assert_poison_fields(
-            &poison,
-            PipelinePoisonCode::CandidateAttestation,
-            PipelinePoisonOrigin::CandidateOpen,
+        let failure = publish_with_module(candidate, module, calls);
+        assert_failure_fields(
+            &failure,
+            PipelineFailureCode::CandidateAttestation,
+            PipelineFailureOrigin::CandidateOpen,
             CandidateCleanupDisposition::CleanedAndClosed,
         );
         assert!(
-            poison.message.contains("absent from the watched schema")
-                || poison.message.contains("source hash mismatch"),
+            failure.message.contains("absent from the watched schema")
+                || failure.message.contains("source hash mismatch"),
             "{}",
-            poison.message
+            failure.message
         );
     }
 }
@@ -981,14 +981,14 @@ fn wrong_module_abi_is_rejected_before_register() {
     let candidate = requirements(7);
     let mut module = fake_module(7, calls.clone());
     module.module_abi = module_abi(8);
-    let poison = publish_with_module(candidate, module, calls);
-    assert_poison_fields(
-        &poison,
-        PipelinePoisonCode::CandidateAttestation,
-        PipelinePoisonOrigin::CandidateOpen,
+    let failure = publish_with_module(candidate, module, calls);
+    assert_failure_fields(
+        &failure,
+        PipelineFailureCode::CandidateAttestation,
+        PipelineFailureOrigin::CandidateOpen,
         CandidateCleanupDisposition::CleanedAndClosed,
     );
-    assert!(poison
+    assert!(failure
         .message
         .contains("host-interface ABI identity mismatch"));
 }

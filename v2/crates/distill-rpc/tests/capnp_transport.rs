@@ -410,8 +410,8 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
             "{name} reconnect ordinal"
         );
         assert!(
-            body.contains("configurationPoisoned @2"),
-            "{name} poison ordinal"
+            body.contains("configurationFailed @2"),
+            "{name} configuration ordinal"
         );
         assert!(body.contains("leaseFailure @3"), "{name} lease ordinal");
         assert!(body.contains("error @4"), "{name} error ordinal");
@@ -428,7 +428,7 @@ fn schema_uses_typed_five_arm_results_for_every_hub_and_snapshot_method() {
     for arm in [
         "success @0 :AuthoringInspection",
         "reconnectRequired @1 :ReconnectRequired",
-        "configurationPoisoned @2 :ConfigurationPoison",
+        "configurationFailed @2 :ConfigurationError",
         "leaseFailure @3 :LeaseFailure",
         "error @4 :RpcError",
         "missing @5 :Void",
@@ -755,18 +755,18 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                 _ => panic!("expected refreshed version"),
             }
 
-            let poison = ConfigurationPoison::from_reason(
+            let error = ConfigurationError::from_reason(
                 &DscpV1::MalformedConfiguration { file_hash: [7; 32] },
                 "invalid staged configuration",
             );
-            let poisoned_stamp = server
+            let failed_stamp = server
                 .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Poisoned(poison)),
+                    configuration: Some(ConfigurationStatus::Failed(error)),
                     ..Commit::default()
                 })
                 .unwrap();
-            let poisoned_refresh = refreshed.refresh_request().send().promise.await.unwrap();
-            let poisoned = match poisoned_refresh
+            let failed_refresh = refreshed.refresh_request().send().promise.await.unwrap();
+            let failed = match failed_refresh
                 .get()
                 .unwrap()
                 .get_result()
@@ -775,11 +775,11 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                 .unwrap()
             {
                 schema::authoring_snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
-                _ => panic!("pure authoring metadata refresh must survive configuration poison"),
+                _ => panic!("pure authoring metadata refresh must survive a configuration error"),
             };
-            let poisoned_version = poisoned.version_request().send().promise.await.unwrap();
+            let failed_version = failed.version_request().send().promise.await.unwrap();
             assert!(matches!(
-                poisoned_version
+                failed_version
                     .get()
                     .unwrap()
                     .get_result()
@@ -787,11 +787,11 @@ async fn authoring_snapshot_round_trips_over_real_tcp_with_exact_stamp_and_role_
                     .which()
                     .unwrap(),
                 schema::u_int64_call::Which::Success(version)
-                    if version == poisoned_stamp.version.0
+                    if version == failed_stamp.version.0
             ));
 
             server.replace_target(target_with_definition(8)).unwrap();
-            let fenced = poisoned.version_request().send().promise.await.unwrap();
+            let fenced = failed.version_request().send().promise.await.unwrap();
             assert!(matches!(
                 fenced.get().unwrap().get_result().unwrap().which().unwrap(),
                 schema::u_int64_call::Which::ReconnectRequired(_)
@@ -836,16 +836,16 @@ async fn listener_staging_binds_ipv4_and_ipv6_loopback() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
+async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_failed() {
     LocalSet::new()
         .run_until(async {
             let server = server();
-            let poison = ConfigurationPoison::from_reason(
+            let error = ConfigurationError::from_reason(
                 &DscpV1::MalformedConfiguration { file_hash: [6; 32] },
                 "invalid staged configuration",
             );
-            let version_poison = VersionPoison::new(
-                VersionPoisonV1::UnreadableScanSubtree {
+            let namespace_error = NamespaceError::new(
+                NamespaceErrorV1::UnreadableScanSubtree {
                     subject: ScanSubject::Subtree {
                         root_name: "assets".to_owned(),
                         raw_relative_path: PlatformPathBytes::Unix(b"unreadable".to_vec()),
@@ -857,8 +857,8 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
             .unwrap();
             let stamp = server
                 .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Poisoned(poison.clone())),
-                    namespace_errors: Some(vec![version_poison.clone()]),
+                    configuration: Some(ConfigurationStatus::Failed(error.clone())),
+                    namespace_errors: Some(vec![namespace_error.clone()]),
                     ..Commit::default()
                 })
                 .unwrap();
@@ -894,7 +894,7 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
                 .unwrap()
             {
                 schema::metadata_snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
-                _ => panic!("expected metadata snapshot under poison"),
+                _ => panic!("expected metadata snapshot under a configuration error"),
             };
             let version = snapshot.version_request().send().promise.await.unwrap();
             assert!(matches!(
@@ -911,21 +911,21 @@ async fn unbound_metadata_bootstrap_round_trips_over_tcp_while_poisoned() {
                 .unwrap()
             {
                 schema::metadata_diagnostics_call::Which::Success(value) => value.unwrap(),
-                _ => panic!("expected typed poison diagnostics"),
+                _ => panic!("expected typed error diagnostics"),
             };
             match diagnostics.get_configuration().unwrap().which().unwrap() {
-                schema::configuration_diagnostic::Which::Poisoned(value) => {
+                schema::configuration_diagnostic::Which::Failed(value) => {
                     let value = value.unwrap();
-                    assert_eq!(value.get_code(), poison.code as u16);
-                    assert_eq!(value.get_reason_hash().unwrap(), poison.reason_hash);
+                    assert_eq!(value.get_code(), error.code as u16);
+                    assert_eq!(value.get_reason_hash().unwrap(), error.reason_hash);
                 }
-                _ => panic!("expected poisoned diagnostics"),
+                _ => panic!("expected failed diagnostics"),
             }
             let errors = diagnostics.get_namespace_errors().unwrap();
             assert_eq!(errors.len(), 1);
             assert_eq!(
-                distill_rpc::capnp_transport::decode_version_poison(errors.get(0)).unwrap(),
-                version_poison
+                distill_rpc::capnp_transport::decode_namespace_error(errors.get(0)).unwrap(),
+                namespace_error
             );
             let mut query = snapshot.query_request();
             {
@@ -976,7 +976,7 @@ async fn lineage_repair_bootstrap_and_exact_inspection_round_trip_over_tcp() {
     LocalSet::new()
         .run_until(async {
             let server = server();
-            let poison = ConfigurationPoison::from_reason(
+            let error = ConfigurationError::from_reason(
                 &DscpV1::MissingLineageManifest,
                 "lineage manifest is missing",
             );
@@ -984,7 +984,7 @@ async fn lineage_repair_bootstrap_and_exact_inspection_round_trip_over_tcp() {
             let configured_path = format!("control/{}.bundle", "a".repeat(300));
             let stamp = server
                 .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Poisoned(poison)),
+                    configuration: Some(ConfigurationStatus::Failed(error)),
                     lineage_repair: Some(Some(LineageRepairState::Missing {
                         configured_root: "assets".to_owned(),
                         configured_path: configured_path.clone(),
@@ -1224,41 +1224,41 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 schema::stream_event::Which::Delta(_)
             ));
 
-            // Configuration poison remains a typed result union over the
+            // A configuration error remains a typed result union over the
             // generated transport; refresh itself remains safe.
-            let poison = ConfigurationPoison::from_reason(
+            let error = ConfigurationError::from_reason(
                 &DscpV1::MalformedConfiguration { file_hash: [8; 32] },
                 "invalid staged configuration",
             );
             server
                 .commit(Commit {
-                    configuration: Some(ConfigurationStatus::Poisoned(poison.clone())),
+                    configuration: Some(ConfigurationStatus::Failed(error.clone())),
                     ..Commit::default()
                 })
                 .unwrap();
             let refresh_response = snapshot.refresh_request().send().promise.await.unwrap();
             let refresh_result = refresh_response.get().unwrap().get_result().unwrap();
-            let poisoned_snapshot = match refresh_result.which().unwrap() {
+            let failed_snapshot = match refresh_result.which().unwrap() {
                 schema::snapshot_call::Which::Success(snapshot) => snapshot.unwrap(),
-                _ => panic!("refresh must remain valid under configuration poison"),
+                _ => panic!("refresh must remain valid under a configuration error"),
             };
-            let mut poisoned_resolve = poisoned_snapshot.resolve_request();
-            poisoned_resolve.get().set_uuid(&uuid.0);
-            let poisoned_response = poisoned_resolve.send().promise.await.unwrap();
-            let poisoned_result = poisoned_response.get().unwrap().get_result().unwrap();
-            match poisoned_result.which().unwrap() {
-                schema::resolve_call::Which::ConfigurationPoisoned(value) => {
+            let mut failed_resolve = failed_snapshot.resolve_request();
+            failed_resolve.get().set_uuid(&uuid.0);
+            let failed_response = failed_resolve.send().promise.await.unwrap();
+            let failed_result = failed_response.get().unwrap().get_result().unwrap();
+            match failed_result.which().unwrap() {
+                schema::resolve_call::Which::ConfigurationFailed(value) => {
                     let value = value.unwrap();
-                    assert_eq!(value.get_code(), poison.code as u16);
-                    assert_eq!(value.get_reason_hash().unwrap(), &poison.reason_hash);
+                    assert_eq!(value.get_code(), error.code as u16);
+                    assert_eq!(value.get_reason_hash().unwrap(), &error.reason_hash);
                 }
-                _ => panic!("resolve must return typed configuration poison"),
+                _ => panic!("resolve must return a typed configuration error"),
             }
 
             // The stream notification is advisory; stale capabilities are
             // independently fenced by the generated server adapter.
             server.replace_target(target_with_definition(8)).unwrap();
-            let mut fenced_resolve = poisoned_snapshot.resolve_request();
+            let mut fenced_resolve = failed_snapshot.resolve_request();
             fenced_resolve.get().set_uuid(&uuid.0);
             let fenced_response = fenced_resolve.send().promise.await.unwrap();
             let fenced_result = fenced_response.get().unwrap().get_result().unwrap();
@@ -1271,7 +1271,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                 }
                 _ => panic!("stale capability must be generation-fenced"),
             }
-            let version = poisoned_snapshot
+            let version = failed_snapshot
                 .version_request()
                 .send()
                 .promise
@@ -1287,7 +1287,7 @@ async fn generated_rpc_system_round_trips_connect_snapshot_resolve_fetch_and_del
                     .unwrap(),
                 schema::u_int64_call::Which::ReconnectRequired(_)
             ));
-            let configuration = poisoned_snapshot
+            let configuration = failed_snapshot
                 .configuration_request()
                 .send()
                 .promise
@@ -1916,10 +1916,10 @@ async fn hub_authoring_operation_and_wire_tree_methods_are_live_and_generation_f
 }
 
 #[test]
-fn pipeline_poison_capnp_decode_rejects_unknown_width_and_matrix_failures() {
-    fn initialize(mut root: schema::pipeline_poison::Builder<'_>, identity: &[u8]) {
-        root.set_code(schema::PipelinePoisonCode::CandidateOpen);
-        root.set_origin(schema::PipelinePoisonOrigin::CandidateOpen);
+fn pipeline_failure_capnp_decode_rejects_unknown_width_and_matrix_failures() {
+    fn initialize(mut root: schema::pipeline_failure::Builder<'_>, identity: &[u8]) {
+        root.set_code(schema::PipelineFailureCode::CandidateOpen);
+        root.set_origin(schema::PipelineFailureOrigin::CandidateOpen);
         root.set_cleanup(schema::CleanupDisposition::None);
         root.set_identity(identity);
         root.set_message("diagnostic only");
@@ -1927,17 +1927,17 @@ fn pipeline_poison_capnp_decode_rejects_unknown_width_and_matrix_failures() {
 
     let mut unknown = capnp::message::Builder::new_default();
     {
-        let mut root = unknown.init_root::<schema::pipeline_poison::Builder<'_>>();
+        let mut root = unknown.init_root::<schema::pipeline_failure::Builder<'_>>();
         initialize(root.reborrow(), &[0; 32]);
         use capnp::introspect::{Introspect, TypeVariant};
-        let TypeVariant::Enum(raw_schema) = schema::PipelinePoisonCode::introspect().which() else {
-            panic!("pipeline poison code must introspect as an enum")
+        let TypeVariant::Enum(raw_schema) = schema::PipelineFailureCode::introspect().which() else {
+            panic!("pipeline failure code must introspect as an enum")
         };
         let enum_schema: capnp::schema::EnumSchema = raw_schema.into();
         let capnp::dynamic_value::Builder::Struct(mut dynamic) =
             capnp::dynamic_value::Builder::from(root.reborrow())
         else {
-            panic!("pipeline poison must introspect as a struct")
+            panic!("pipeline failure must introspect as a struct")
         };
         dynamic
             .set_named(
@@ -1946,52 +1946,52 @@ fn pipeline_poison_capnp_decode_rejects_unknown_width_and_matrix_failures() {
             )
             .unwrap();
     }
-    assert!(distill_rpc::capnp_transport::decode_pipeline_poison(
+    assert!(distill_rpc::capnp_transport::decode_pipeline_failure(
         unknown
-            .get_root_as_reader::<schema::pipeline_poison::Reader<'_>>()
+            .get_root_as_reader::<schema::pipeline_failure::Reader<'_>>()
             .unwrap()
     )
     .is_err());
 
     let mut wrong_width = capnp::message::Builder::new_default();
     initialize(
-        wrong_width.init_root::<schema::pipeline_poison::Builder<'_>>(),
+        wrong_width.init_root::<schema::pipeline_failure::Builder<'_>>(),
         &[0; 31],
     );
-    assert!(distill_rpc::capnp_transport::decode_pipeline_poison(
+    assert!(distill_rpc::capnp_transport::decode_pipeline_failure(
         wrong_width
-            .get_root_as_reader::<schema::pipeline_poison::Reader<'_>>()
+            .get_root_as_reader::<schema::pipeline_failure::Reader<'_>>()
             .unwrap()
     )
     .is_err());
 
     let mut wrong_matrix = capnp::message::Builder::new_default();
     {
-        let mut root = wrong_matrix.init_root::<schema::pipeline_poison::Builder<'_>>();
-        root.set_code(schema::PipelinePoisonCode::CandidateCleanup);
-        root.set_origin(schema::PipelinePoisonOrigin::CandidateOpen);
+        let mut root = wrong_matrix.init_root::<schema::pipeline_failure::Builder<'_>>();
+        root.set_code(schema::PipelineFailureCode::CandidateCleanup);
+        root.set_origin(schema::PipelineFailureOrigin::CandidateOpen);
         root.set_cleanup(schema::CleanupDisposition::None);
         root.set_identity(&[0; 32]);
         root.set_message("diagnostic only");
     }
-    assert!(distill_rpc::capnp_transport::decode_pipeline_poison(
+    assert!(distill_rpc::capnp_transport::decode_pipeline_failure(
         wrong_matrix
-            .get_root_as_reader::<schema::pipeline_poison::Reader<'_>>()
+            .get_root_as_reader::<schema::pipeline_failure::Reader<'_>>()
             .unwrap()
     )
     .is_err());
 }
 
 #[test]
-fn configuration_poison_wire_authenticates_dscp_version_detail_code_and_digest() {
+fn configuration_error_wire_authenticates_dscp_version_detail_code_and_digest() {
     let detail = DscpV1::NonLoopbackAddress {
         address: "192.0.2.1:4000".to_owned(),
     };
-    let poison = ConfigurationPoison::from_reason(&detail, "loopback required");
+    let error = ConfigurationError::from_reason(&detail, "loopback required");
     let encode = |version: u16, code: u16, bytes: Vec<u8>, digest: [u8; 32]| {
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut root = message.init_root::<schema::configuration_poison::Builder<'_>>();
+            let mut root = message.init_root::<schema::configuration_error::Builder<'_>>();
             root.set_code(code);
             root.set_reason_hash(&digest);
             root.set_message("loopback required");
@@ -2003,47 +2003,47 @@ fn configuration_poison_wire_authenticates_dscp_version_detail_code_and_digest()
 
     let valid = encode(
         1,
-        poison.code as u16,
-        poison.detail.canonical_detail_bytes(),
-        poison.reason_hash,
+        error.code as u16,
+        error.detail.canonical_detail_bytes(),
+        error.reason_hash,
     );
     assert_eq!(
-        distill_rpc::capnp_transport::decode_configuration_poison(
+        distill_rpc::capnp_transport::decode_configuration_error(
             valid
-                .get_root_as_reader::<schema::configuration_poison::Reader<'_>>()
+                .get_root_as_reader::<schema::configuration_error::Reader<'_>>()
                 .unwrap(),
         )
         .unwrap(),
-        poison
+        error
     );
     for invalid in [
         encode(
             2,
-            poison.code as u16,
-            poison.detail.canonical_detail_bytes(),
-            poison.reason_hash,
+            error.code as u16,
+            error.detail.canonical_detail_bytes(),
+            error.reason_hash,
         ),
         encode(
             1,
-            ConfigurationPoisonCode::DuplicateRootName as u16,
-            poison.detail.canonical_detail_bytes(),
-            poison.reason_hash,
+            ConfigurationErrorCode::DuplicateRootName as u16,
+            error.detail.canonical_detail_bytes(),
+            error.reason_hash,
         ),
         {
-            let mut bytes = poison.detail.canonical_detail_bytes();
+            let mut bytes = error.detail.canonical_detail_bytes();
             bytes.push(0);
-            encode(1, poison.code as u16, bytes, poison.reason_hash)
+            encode(1, error.code as u16, bytes, error.reason_hash)
         },
         encode(
             1,
-            poison.code as u16,
-            poison.detail.canonical_detail_bytes(),
+            error.code as u16,
+            error.detail.canonical_detail_bytes(),
             [9; 32],
         ),
     ] {
-        assert!(distill_rpc::capnp_transport::decode_configuration_poison(
+        assert!(distill_rpc::capnp_transport::decode_configuration_error(
             invalid
-                .get_root_as_reader::<schema::configuration_poison::Reader<'_>>()
+                .get_root_as_reader::<schema::configuration_error::Reader<'_>>()
                 .unwrap(),
         )
         .is_err());
@@ -2188,11 +2188,11 @@ fn rpc_basis_decoder_authenticates_the_adopted_snapshot_stamp() {
 }
 
 #[test]
-fn version_poison_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() {
+fn namespace_error_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() {
     let mut short_claimant_uuid = capnp::message::Builder::new_default();
     {
-        let mut root = short_claimant_uuid.init_root::<schema::version_poison::Builder<'_>>();
-        root.set_code(VersionPoisonCode::DuplicateAssetUuid as u16);
+        let mut root = short_claimant_uuid.init_root::<schema::namespace_error::Builder<'_>>();
+        root.set_code(NamespaceErrorCode::DuplicateAssetUuid as u16);
         root.set_identity(&[0; 32]);
         root.set_message("diagnostic only");
         let mut detail = root.init_detail().init_duplicate_asset_uuid();
@@ -2205,17 +2205,17 @@ fn version_poison_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() {
         second.reborrow().init_parent().set_bytes(&[3; 16]);
         second.set_output_key("b");
     }
-    assert!(distill_rpc::capnp_transport::decode_version_poison(
+    assert!(distill_rpc::capnp_transport::decode_namespace_error(
         short_claimant_uuid
-            .get_root_as_reader::<schema::version_poison::Reader<'_>>()
+            .get_root_as_reader::<schema::namespace_error::Reader<'_>>()
             .unwrap()
     )
     .is_err());
 
     let mut insufficient_claimants = capnp::message::Builder::new_default();
     {
-        let mut root = insufficient_claimants.init_root::<schema::version_poison::Builder<'_>>();
-        root.set_code(VersionPoisonCode::DuplicateAssetUuid as u16);
+        let mut root = insufficient_claimants.init_root::<schema::namespace_error::Builder<'_>>();
+        root.set_code(NamespaceErrorCode::DuplicateAssetUuid as u16);
         root.set_identity(&[0; 32]);
         root.set_message("diagnostic only");
         let mut detail = root.init_detail().init_duplicate_asset_uuid();
@@ -2224,17 +2224,17 @@ fn version_poison_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() {
         claimant.reborrow().init_parent().set_bytes(&[2; 16]);
         claimant.set_output_key("a");
     }
-    assert!(distill_rpc::capnp_transport::decode_version_poison(
+    assert!(distill_rpc::capnp_transport::decode_namespace_error(
         insufficient_claimants
-            .get_root_as_reader::<schema::version_poison::Reader<'_>>()
+            .get_root_as_reader::<schema::namespace_error::Reader<'_>>()
             .unwrap()
     )
     .is_err());
 
     let mut odd_windows_path = capnp::message::Builder::new_default();
     {
-        let mut root = odd_windows_path.init_root::<schema::version_poison::Builder<'_>>();
-        root.set_code(VersionPoisonCode::SameRootNormalizedPathCollision as u16);
+        let mut root = odd_windows_path.init_root::<schema::namespace_error::Builder<'_>>();
+        root.set_code(NamespaceErrorCode::SameRootNormalizedPathCollision as u16);
         root.set_identity(&[0; 32]);
         root.set_message("diagnostic only");
         let mut detail = root
@@ -2256,9 +2256,9 @@ fn version_poison_capnp_decode_rejects_noncanonical_claimants_and_path_bytes() {
             .set_unix_bytes(b"same/path");
         second.set_file_hash(&[2; 32]);
     }
-    assert!(distill_rpc::capnp_transport::decode_version_poison(
+    assert!(distill_rpc::capnp_transport::decode_namespace_error(
         odd_windows_path
-            .get_root_as_reader::<schema::version_poison::Reader<'_>>()
+            .get_root_as_reader::<schema::namespace_error::Reader<'_>>()
             .unwrap()
     )
     .is_err());

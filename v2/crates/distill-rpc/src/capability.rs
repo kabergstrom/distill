@@ -518,7 +518,7 @@ fn inspect_authoring(
 #[derive(Debug)]
 enum AuthoringGate {
     Reconnect(ReconnectReason),
-    ConfigurationPoisoned(ConfigurationPoison),
+    ConfigurationFailed(ConfigurationError),
     Failure(RpcFailure),
 }
 
@@ -526,7 +526,7 @@ impl AuthoringGate {
     fn into_result<T>(self) -> RpcResult<T> {
         match self {
             Self::Reconnect(reason) => RpcResult::ReconnectRequired { reason },
-            Self::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
+            Self::ConfigurationFailed(error) => RpcResult::ConfigurationFailed(error),
             Self::Failure(error) => RpcResult::Failure(error),
         }
     }
@@ -554,8 +554,8 @@ fn authoring_gate(
         Ok(txn) => txn,
         Err(error) => return Some(AuthoringGate::Failure(store_failure(error))),
     };
-    if let ConfigurationStatus::Poisoned(poison) = &txn.configuration {
-        return Some(AuthoringGate::ConfigurationPoisoned(poison.clone()));
+    if let ConfigurationStatus::Failed(error) = &txn.configuration {
+        return Some(AuthoringGate::ConfigurationFailed(error.clone()));
     }
     if let Some(error) = pipeline_failure(&server.inner.effective_pipeline(&txn)) {
         return Some(AuthoringGate::Failure(error));
@@ -2148,8 +2148,8 @@ impl Snapshot {
         if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
             return done(RpcResult::Failure(error));
         }
-        if let ConfigurationStatus::Poisoned(poison) = &txn.configuration {
-            return done(RpcResult::ConfigurationPoisoned(poison.clone()));
+        if let ConfigurationStatus::Failed(error) = &txn.configuration {
+            return done(RpcResult::ConfigurationFailed(error.clone()));
         }
         let snapshot = txn.snapshot();
         let derived = snapshot.served_derived_output(uuid)?;
@@ -2365,7 +2365,7 @@ impl<T> RpcResult<T> {
         match self {
             Self::Success(_) => unreachable!("only failures are retyped"),
             Self::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
-            Self::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
+            Self::ConfigurationFailed(error) => RpcResult::ConfigurationFailed(error),
             Self::Failure(error) => RpcResult::Failure(error),
         }
     }

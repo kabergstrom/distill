@@ -262,7 +262,7 @@ impl ScannedFile {
 
 /// A `.bundle` candidate remains in the report even when its envelope is
 /// malformed. The coordinator, not traversal, decides whether the current
-/// bytes yield a complete namespace skeleton or version-global poison.
+/// bytes yield a complete namespace skeleton or a namespace error.
 #[derive(Debug, Clone)]
 pub struct ScannedBundle {
     pub root_name: String,

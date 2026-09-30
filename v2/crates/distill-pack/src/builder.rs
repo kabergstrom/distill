@@ -11,7 +11,7 @@ use distill_build::trace::PackDefinitionControlValue;
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_json::AuthoredValue;
 use distill_rpc::{
-    ArtifactChunkKind, AuthoringValue, ConfigurationPoison, Hub, PackSession, PathResolveResult,
+    ArtifactChunkKind, AuthoringValue, ConfigurationError, Hub, PackSession, PathResolveResult,
     ReconnectReason, ResolveResult, RpcFailure, RpcResult, Snapshot, TagSelector,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
@@ -55,7 +55,7 @@ pub enum PackBuildError {
         index: usize,
     },
     ReconnectRequired(ReconnectReason),
-    ConfigurationPoisoned(Box<ConfigurationPoison>),
+    ConfigurationFailed(Box<ConfigurationError>),
     Rpc(Box<RpcFailure>),
     BasisMismatch,
     Resolve {
@@ -602,8 +602,8 @@ fn rpc_success<T>(result: RpcResult<T>) -> Result<T, PackBuildError> {
     match result {
         RpcResult::Success(value) => Ok(value),
         RpcResult::ReconnectRequired { reason } => Err(PackBuildError::ReconnectRequired(reason)),
-        RpcResult::ConfigurationPoisoned(poison) => {
-            Err(PackBuildError::ConfigurationPoisoned(Box::new(poison)))
+        RpcResult::ConfigurationFailed(error) => {
+            Err(PackBuildError::ConfigurationFailed(Box::new(error)))
         }
         RpcResult::Failure(error) => Err(PackBuildError::Rpc(Box::new(error))),
     }

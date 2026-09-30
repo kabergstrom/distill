@@ -1,7 +1,7 @@
 //! §13's consistency contract, cross-cutting: the two sequencing
 //! domains stay independent, multi-table input transactions are
 //! all-or-nothing, WAL readers only ever observe complete input
-//! versions, and the poison classifications compose.
+//! versions, and the error classifications compose.
 
 use distill_core::bootstrap::bootstrap_control_logical_registry_v1;
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
@@ -16,8 +16,8 @@ use distill_store::pipeline::{
 };
 use distill_store::pipeline::{ResolvedToolPackageFile, ResolvedToolSourceV2, ToolRegistrationV2};
 use distill_store::state::{
-    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
-    PipelineState, ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+    CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
+    PipelineState, ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 
@@ -42,9 +42,9 @@ fn validated_epoch(
     ValidatedPipelineEpoch::validate(epoch).unwrap()
 }
 
-fn version_poison(message: &str) -> VersionPoison {
-    VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+fn namespace_error(message: &str) -> NamespaceError {
+    NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: ReadableBundleSource {
                 root_name: "main".into(),
                 normalized_path: "broken.bundle".into(),
@@ -57,10 +57,10 @@ fn version_poison(message: &str) -> VersionPoison {
     .unwrap()
 }
 
-fn pipeline_poison(message: &str) -> PipelinePoison {
-    PipelinePoison::new(
-        PipelinePoisonCode::CandidateRegistration,
-        PipelinePoisonOrigin::CandidateOpen,
+fn pipeline_failure(message: &str) -> PipelineFailure {
+    PipelineFailure::new(
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
         CleanupDisposition::CleanedAndClosed,
         message,
     )
@@ -279,8 +279,8 @@ fn wal_readers_only_observe_complete_input_versions() {
 }
 
 #[test]
-fn pure_metadata_reads_survive_a_pipeline_poison() {
-    // §13: the pipeline poison gates pipeline-dependent operations;
+fn pure_metadata_reads_survive_a_pipeline_failure() {
+    // §13: the pipeline failure gates pipeline-dependent operations;
     // path-index and CAS reads remain valid.
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
@@ -290,12 +290,14 @@ fn pure_metadata_reads_survive_a_pipeline_poison() {
         .input_transaction(|txn| {
             let root = txn.intern_root("main")?;
             txn.set_path_entry("a.bundle", root, AssetUuid([2u8; 16]))?;
-            txn.publish_pipeline_poison(&pipeline_poison("candidate rejected: duplicate type uuid"))
+            txn.publish_pipeline_failure(&pipeline_failure(
+                "candidate rejected: duplicate type uuid",
+            ))
         })
         .unwrap();
 
     let state = store.pipeline_state().unwrap().expect("published");
-    assert!(matches!(state, PipelineState::Poisoned { .. }));
+    assert!(matches!(state, PipelineState::Failed { .. }));
     assert!(state.epoch().is_err());
 
     // CAS reads and path resolution still answer.
@@ -322,7 +324,7 @@ fn namespace_errors_do_not_gate_the_namespace_or_the_pipeline() {
                 ),
             )?;
             txn.publish_pipeline_epoch(&validated_epoch([1u8; 32], None))?;
-            txn.set_namespace_errors([version_poison("identity collision")])?;
+            txn.set_namespace_errors([namespace_error("identity collision")])?;
             Ok(())
         })
         .unwrap();

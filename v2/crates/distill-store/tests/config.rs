@@ -1,5 +1,5 @@
 //! §18 configuration state: scheduler bounds/live resize, declared change
-//! classes, pending-restart generations, and configuration poison.
+//! classes, pending-restart generations, and configuration errors.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -140,11 +140,11 @@ fn invalid_restart_value_is_rejected_before_pending_state_exists() {
 }
 
 #[test]
-fn invalid_configuration_candidate_publishes_typed_snapshot_poison() {
+fn invalid_configuration_candidate_publishes_typed_snapshot_error() {
     let (_dir, mut store) = open();
     store
         .input_transaction(|txn| {
-            txn.publish_configuration_poison(
+            txn.publish_configuration_error(
                 &DscpV1::NonLoopbackAddress {
                     address: "10.0.0.5:9999".to_owned(),
                 },
@@ -153,7 +153,7 @@ fn invalid_configuration_candidate_publishes_typed_snapshot_poison() {
         })
         .unwrap();
     let state = store.configuration_state().unwrap();
-    assert!(matches!(state, ConfigurationState::Poisoned { .. }));
+    assert!(matches!(state, ConfigurationState::Failed { .. }));
     let err = state.check(OperationKind::TargetBoundRpc).unwrap_err();
     assert!(err.message.contains("non-loopback"));
     assert!(state.check(OperationKind::SnapshotRead).is_ok());

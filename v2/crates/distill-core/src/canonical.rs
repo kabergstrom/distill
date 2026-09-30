@@ -26,11 +26,11 @@ pub const DSTR: [u8; 4] = *b"DSTR";
 pub const DSSL: [u8; 4] = *b"DSSL";
 /// Typed local deterministic-failure detail (§5, §9).
 pub const DSLF: [u8; 4] = *b"DSLF";
-/// Typed configuration-poison reason facts (§5, §13, §17).
+/// Typed configuration-error reason facts (§5, §13, §17).
 pub const DSCP: [u8; 4] = *b"DSCP";
-/// Typed version-global poison identity (§7, §13, §17).
+/// Typed namespace-error identity (§7, §13, §17).
 pub const DSVP: [u8; 4] = *b"DSVP";
-/// Typed pipeline-poison identity (§3, §13, §17).
+/// Typed pipeline-failure identity (§3, §13, §17).
 pub const DSPP: [u8; 4] = *b"DSPP";
 /// Complete hermetic tool-execution capsule identity (§9, §13).
 pub const DSCT: [u8; 4] = *b"DSCT";

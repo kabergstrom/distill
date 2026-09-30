@@ -12,7 +12,7 @@ struct RpcBasisValue {
   stamp @0 :SnapshotStamp;
 }
 
-struct ConfigurationPoison {
+struct ConfigurationError {
   code @0 :UInt16;
   reasonHash @1 :Data;
   message @2 :Text;
@@ -62,7 +62,7 @@ struct ConnectCall {
   union {
     success @0 :ConnectSuccess;
     targetFailure @1 :TargetFailure;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     protocolFailure @3 :ProtocolFailure;
     error @4 :RpcError;
     pipelineUnavailable @5 :PipelineUnavailableDiagnostic;
@@ -71,7 +71,7 @@ struct ConnectCall {
 
 struct PipelineUnavailableDiagnostic {
   union {
-    pipelinePoison @0 :PipelinePoison;
+    pipelineFailure @0 :PipelineFailure;
     schemaAcceptanceRequired @1 :SchemaAcceptanceRequired;
     retiredTypeReferenced @2 :RetiredTypeReferenced;
   }
@@ -202,7 +202,7 @@ struct SnapshotCall {
   union {
     success @0 :Snapshot;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -212,7 +212,7 @@ struct AuthoringSnapshotCall {
   union {
     success @0 :AuthoringSnapshot;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -222,7 +222,7 @@ struct SubscribeCall {
   union {
     success @0 :Subscription;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -232,7 +232,7 @@ struct VoidCall {
   union {
     success @0 :Void;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -242,7 +242,7 @@ struct UInt64Call {
   union {
     success @0 :UInt64;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -256,7 +256,7 @@ struct UuidCall {
   union {
     success @0 :Uuid;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -285,7 +285,7 @@ struct ProgressCall {
   union {
     success @0 :ProgressStream;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -295,7 +295,7 @@ struct DataCall {
   union {
     success @0 :Data;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -305,7 +305,7 @@ struct UuidListCall {
   union {
     success @0 :List(Uuid);
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -375,14 +375,14 @@ struct PureMetadataQuery {
   hasRole @9 :Bool;
 }
 
-struct VersionPoisonSource {
+struct BundleSource {
   rootName @0 :Text;
   normalizedPath @1 :Text;
   fileHash @2 :Data;
 }
 
 struct AuthoredAssetClaimant {
-  source @0 :VersionPoisonSource;
+  source @0 :BundleSource;
   bundle @1 :Uuid;
   localId @2 :Text;
 }
@@ -399,14 +399,14 @@ struct AssetClaimant {
   }
 }
 
-struct DuplicateAssetPoison {
+struct DuplicateAssetError {
   asset @0 :Uuid;
   claimants @1 :List(AssetClaimant);
 }
 
-struct DuplicateBundlePoison {
+struct DuplicateBundleError {
   bundle @0 :Uuid;
-  sources @1 :List(VersionPoisonSource);
+  sources @1 :List(BundleSource);
 }
 
 struct PlatformPathBytes {
@@ -421,24 +421,24 @@ struct PhysicalPathClaim {
   fileHash @1 :Data;
 }
 
-struct SameRootNormalizedPathPoison {
+struct SameRootNormalizedPathError {
   rootName @0 :Text;
   normalizedPath @1 :Text;
   claims @2 :List(PhysicalPathClaim);
 }
 
-struct IncompleteSkeletonPoison {
-  source @0 :VersionPoisonSource;
+struct IncompleteSkeletonError {
+  source @0 :BundleSource;
   failureCode @1 :UInt16;
 }
 
-struct UnreadableGlobalPathPoison {
+struct UnreadableGlobalPathError {
   rootName @0 :Text;
   normalizedPath @1 :Text;
   failureCode @2 :UInt16;
 }
 
-struct InvalidPhysicalPathPoison {
+struct InvalidPhysicalPathError {
   rootName @0 :Text;
   rawRelativePath @1 :PlatformPathBytes;
   failureCode @2 :UInt16;
@@ -468,38 +468,38 @@ enum ScanFailureCodeValue {
   ioDataLoss @4;
 }
 
-struct UnreadableScanSubtreePoison {
+struct UnreadableScanSubtreeError {
   subject @0 :ScanSubject;
   failure @1 :ScanFailureCodeValue;
 }
 
-struct VersionPoisonDetail {
+struct NamespaceErrorDetail {
   union {
-    duplicateAssetUuid @0 :DuplicateAssetPoison;
-    duplicateBundleUuid @1 :DuplicateBundlePoison;
-    sameRootNormalizedPathCollision @2 :SameRootNormalizedPathPoison;
-    incompleteSkeleton @3 :IncompleteSkeletonPoison;
-    unreadableGlobalBundlePath @4 :UnreadableGlobalPathPoison;
-    invalidPhysicalPath @5 :InvalidPhysicalPathPoison;
-    unreadableScanSubtree @6 :UnreadableScanSubtreePoison;
+    duplicateAssetUuid @0 :DuplicateAssetError;
+    duplicateBundleUuid @1 :DuplicateBundleError;
+    sameRootNormalizedPathCollision @2 :SameRootNormalizedPathError;
+    incompleteSkeleton @3 :IncompleteSkeletonError;
+    unreadableGlobalBundlePath @4 :UnreadableGlobalPathError;
+    invalidPhysicalPath @5 :InvalidPhysicalPathError;
+    unreadableScanSubtree @6 :UnreadableScanSubtreeError;
   }
 }
 
-struct VersionPoison {
+struct NamespaceError {
   code @0 :UInt16;
   identity @1 :Data;
-  detail @2 :VersionPoisonDetail;
+  detail @2 :NamespaceErrorDetail;
   message @3 :Text;
 }
 
 struct ConfigurationDiagnostic {
   union {
     ready @0 :Void;
-    poisoned @1 :ConfigurationPoison;
+    failed @1 :ConfigurationError;
   }
 }
 
-enum PipelinePoisonCode {
+enum PipelineFailureCode {
   candidateOpen @0;
   candidateAttestation @1;
   candidateRegistration @2;
@@ -510,7 +510,7 @@ enum PipelinePoisonCode {
   publishedCleanup @7;
 }
 
-enum PipelinePoisonOrigin {
+enum PipelineFailureOrigin {
   candidateOpen @0;
   publishedRuntime @1;
 }
@@ -526,9 +526,9 @@ enum CleanupDisposition {
   publishedEpochLeaked @7;
 }
 
-struct PipelinePoison {
-  code @0 :PipelinePoisonCode;
-  origin @1 :PipelinePoisonOrigin;
+struct PipelineFailure {
+  code @0 :PipelineFailureCode;
+  origin @1 :PipelineFailureOrigin;
   cleanup @2 :CleanupDisposition;
   identity @3 :Data;
   message @4 :Text;
@@ -584,7 +584,7 @@ struct RetiredTypeReferenced {
 struct PipelineDiagnostic {
   union {
     ready @0 :Void;
-    poisoned @1 :PipelinePoison;
+    failed @1 :PipelineFailure;
     schemaAcceptanceRequired @2 :SchemaAcceptanceRequired;
     retiredTypeReferenced @3 :RetiredTypeReferenced;
   }
@@ -594,7 +594,7 @@ struct MetadataDiagnostics {
   stamp @0 :SnapshotStampValue;
   configuration @1 :ConfigurationDiagnostic;
   pipeline @2 :PipelineDiagnostic;
-  namespaceErrors @3 :List(VersionPoison);
+  namespaceErrors @3 :List(NamespaceError);
 }
 
 struct AuthoringValue {
@@ -667,7 +667,7 @@ struct AuthoringInspectCall {
   union {
     success @0 :AuthoringInspection;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
     missing @5 :Void;
@@ -697,7 +697,7 @@ struct EntryMetaCall {
   union {
     success @0 :EntryMeta;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -727,7 +727,7 @@ struct ResolveCall {
   union {
     success @0 :TerminalResolve;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -753,7 +753,7 @@ struct PathResolveCall {
   union {
     success @0 :TerminalPathResolve;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -783,7 +783,7 @@ struct ChunkStreamCall {
   union {
     success @0 :TerminalFetch;
     reconnectRequired @1 :ReconnectRequired;
-    configurationPoisoned @2 :ConfigurationPoison;
+    configurationFailed @2 :ConfigurationError;
     leaseFailure @3 :LeaseFailure;
     error @4 :RpcError;
   }
@@ -846,7 +846,7 @@ struct LineageRepairInspection {
 struct LineageRepairUnavailable {
   union {
     configurationReady @0 :Void;
-    otherConfigurationPoison @1 :ConfigurationPoison;
+    otherConfigurationError @1 :ConfigurationError;
   }
 }
 

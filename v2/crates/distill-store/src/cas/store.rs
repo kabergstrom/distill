@@ -638,7 +638,7 @@ impl StoreReader {
 
     /// Read an artifact (or wire tree) by hash: extent lookup, read,
     /// verify against the requested hash — corruption is caught, never
-    /// returned. Valid under version and pipeline poison (§13's
+    /// returned. Valid under namespace errors and pipeline failures (§13's
     /// pure-metadata classification).
     pub fn cas_read(&self, hash: &[u8; 32]) -> Result<Vec<u8>, StoreError> {
         let (segment, offset, len) = self

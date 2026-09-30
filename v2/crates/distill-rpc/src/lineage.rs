@@ -20,7 +20,7 @@ pub(crate) fn lineage_inspection(
         ConfigurationStatus::Ready => Err(LineageInspectionFailure::Unavailable(
             LineageRepairUnavailable::ConfigurationReady,
         )),
-        ConfigurationStatus::Poisoned(poison) => match poison.detail.as_ref() {
+        ConfigurationStatus::Failed(error) => match error.detail.as_ref() {
             DscpV1::MissingLineageManifest => match repair {
                 Some(state @ LineageRepairState::Missing { .. }) => Ok(LineageRepairInspection {
                     instance,
@@ -50,7 +50,7 @@ pub(crate) fn lineage_inspection(
                 )),
             },
             _ => Err(LineageInspectionFailure::Unavailable(
-                LineageRepairUnavailable::OtherConfigurationPoison(poison.clone()),
+                LineageRepairUnavailable::OtherConfigurationError(error.clone()),
             )),
         },
     }

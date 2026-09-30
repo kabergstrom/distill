@@ -29,9 +29,9 @@ pub enum StoreError {
     /// transaction, which rolled back.
     Rejected { detail: String },
     /// Persisted DSVP bytes were malformed or non-canonical.
-    InvalidVersionPoison(crate::state::VersionPoisonError),
+    InvalidNamespaceError(crate::state::NamespaceErrorDecodeError),
     /// Persisted DSPP fields were unknown, noncanonical, or inconsistent.
-    InvalidPipelinePoison(crate::state::PipelinePoisonError),
+    InvalidPipelineFailure(crate::state::PipelineFailureDecodeError),
     /// The checked-in DSB format authority could not be parsed. A binary
     /// built in this state cannot advertise bundle format v1 or reach Ready.
     InvalidBootstrapSpec(distill_core::bootstrap::BootstrapSpecError),
@@ -44,7 +44,7 @@ pub enum StoreError {
         expected: distill_core::id::LogicalHash,
         observed: Option<distill_core::id::LogicalHash>,
     },
-    /// A published-runtime poison attempted to fence a different or already
+    /// A published-runtime failure attempted to fence a different or already
     /// unavailable epoch. The first durable transition remains authority.
     StalePublishedPipeline {
         expected: [u8; 32],
@@ -243,8 +243,8 @@ impl fmt::Display for StoreError {
                  daemon state is disposable — recreate it"
             ),
             StoreError::Rejected { detail } => write!(f, "publication rejected: {detail}"),
-            StoreError::InvalidVersionPoison(error) => error.fmt(f),
-            StoreError::InvalidPipelinePoison(error) => error.fmt(f),
+            StoreError::InvalidNamespaceError(error) => error.fmt(f),
+            StoreError::InvalidPipelineFailure(error) => error.fmt(f),
             StoreError::InvalidBootstrapSpec(error) => {
                 write!(f, "bundle-format bootstrap authority is invalid: {error}")
             }
@@ -265,7 +265,7 @@ impl fmt::Display for StoreError {
                 already_unavailable,
             } => write!(
                 f,
-                "published pipeline changed before runtime poison: expected {}, actual {}, already unavailable={already_unavailable}",
+                "published pipeline changed before runtime failure: expected {}, actual {}, already unavailable={already_unavailable}",
                 hex(expected),
                 actual.map_or_else(|| "none".to_owned(), |hash| hex(&hash)),
             ),
@@ -480,8 +480,8 @@ impl std::error::Error for StoreError {
             StoreError::Io { source, .. } => Some(source),
             StoreError::InvalidTargetSet(error) => Some(error),
             StoreError::InvalidToolIdentity(error) => Some(error),
-            StoreError::InvalidPipelinePoison(error) => Some(error),
-            StoreError::InvalidVersionPoison(error) => Some(error),
+            StoreError::InvalidPipelineFailure(error) => Some(error),
+            StoreError::InvalidNamespaceError(error) => Some(error),
             _ => None,
         }
     }

@@ -322,8 +322,8 @@ fn run_thread(
             Ok(hub) => hub,
             Err(outcome) => {
                 let error = match *outcome {
-                    RemoteConnectOutcome::ConfigurationPoisoned(poison) => {
-                        format!("daemon configuration poisoned: {}", poison.message)
+                    RemoteConnectOutcome::ConfigurationFailed(error) => {
+                        format!("daemon configuration failed: {}", error.message)
                     }
                     other => format!("RPC connection rejected: {other:?}"),
                 };
@@ -1271,8 +1271,8 @@ fn connection_event<T: std::fmt::Debug>(call: RemoteCall<T>) -> IoEvent {
 
 fn remote_message<T: std::fmt::Debug>(call: RemoteCall<T>) -> String {
     match call {
-        RemoteCall::ConfigurationPoisoned(poison) => {
-            format!("daemon configuration poisoned: {}", poison.message)
+        RemoteCall::ConfigurationFailed(error) => {
+            format!("daemon configuration failed: {}", error.message)
         }
         RemoteCall::LeaseFailure(error) | RemoteCall::Error(error) => error.message,
         other => format!("unexpected RPC result: {other:?}"),

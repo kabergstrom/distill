@@ -22,7 +22,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{
     AssetDeltaState, AssetEvent, AssetQuery, AssetUuid, AuthoringEntryRole, AuthoringInspectResult,
     AuthoringInspection, AuthoringSnapshot, BundleFileHash, BundleUuid, ChunkStream,
-    ConfigurationPoison, ConfigurationStatus, ConnectError, ConnectOutcome, ConnectRequest,
+    ConfigurationError, ConfigurationStatus, ConnectError, ConnectOutcome, ConnectRequest,
     ContentHash, Delta, DeltaStream, DriftedInput, Hub, InputVersion, LayoutHash,
     LineageManifestClaimant, LineageRepair, LineageRepairConnectOutcome, LineageRepairDestination,
     LineageRepairInspectOutcome, LineageRepairInspection, LineageRepairInvalid,
@@ -33,7 +33,7 @@ use crate::{
     OccupiedLineageDestinationKind, PathResolveFailure, PathResolveResult, ProgressStream,
     PureMetadataEntry, PureMetadataQuery, ReconnectReason, ResolveResult, Root, RpcBasis,
     RpcFailure, RpcResult, Snapshot, SnapshotStamp, StoreInstanceId, TagSelector,
-    TargetDefinitionHash, TypeUuid, VersionPoison, VersionPoisonV1,
+    TargetDefinitionHash, TypeUuid, NamespaceError, NamespaceErrorV1,
 };
 
 pub use crate::distill_rpc_capnp as schema;
@@ -233,7 +233,7 @@ pub enum RemoteConnectOutcome {
         hub: schema::hub::Client,
         instance: StoreInstanceId,
     },
-    ConfigurationPoisoned(ConfigurationPoison),
+    ConfigurationFailed(ConfigurationError),
     PipelineUnavailable(crate::PipelineUnavailableDiagnostic),
     TargetFailure(ConnectError),
     ProtocolFailure {
@@ -271,9 +271,9 @@ impl fmt::Debug for RemoteConnectOutcome {
                 .debug_struct("Connected")
                 .field("instance", instance)
                 .finish_non_exhaustive(),
-            Self::ConfigurationPoisoned(poison) => f
-                .debug_tuple("ConfigurationPoisoned")
-                .field(poison)
+            Self::ConfigurationFailed(error) => f
+                .debug_tuple("ConfigurationFailed")
+                .field(error)
                 .finish(),
             Self::PipelineUnavailable(diagnostic) => f
                 .debug_tuple("PipelineUnavailable")
@@ -346,8 +346,8 @@ impl schema::root::Server for RootService {
                     output.set_hub(hub);
                     output.set_instance(&connected.instance.0);
                 }
-                ConnectOutcome::ConfigurationPoisoned(poison) => {
-                    write_poison(result.init_configuration_poisoned(), &poison);
+                ConnectOutcome::ConfigurationFailed(error) => {
+                    write_configuration_error(result.init_configuration_failed(), &error);
                 }
                 ConnectOutcome::PipelineUnavailable(diagnostic) => {
                     write_pipeline_unavailable(result.init_pipeline_unavailable(), &diagnostic)?;
@@ -2032,8 +2032,8 @@ fn decode_connect_response(
                 instance: StoreInstanceId(instance),
             })
         }
-        Which::ConfigurationPoisoned(poison) => Ok(RemoteConnectOutcome::ConfigurationPoisoned(
-            decode_configuration_poison(poison?)?,
+        Which::ConfigurationFailed(error) => Ok(RemoteConnectOutcome::ConfigurationFailed(
+            decode_configuration_error(error?)?,
         )),
         Which::PipelineUnavailable(diagnostic) => {
             let diagnostic = diagnostic?;
@@ -2041,9 +2041,9 @@ fn decode_connect_response(
                 .which()
                 .map_err(|error| capnp::Error::failed(error.to_string()))?
             {
-                schema::pipeline_unavailable_diagnostic::Which::PipelinePoison(poison) => {
-                    crate::PipelineUnavailableDiagnostic::PipelinePoison(decode_pipeline_poison(
-                        poison?,
+                schema::pipeline_unavailable_diagnostic::Which::PipelineFailure(failure) => {
+                    crate::PipelineUnavailableDiagnostic::PipelineFailure(decode_pipeline_failure(
+                        failure?,
                     )?)
                 }
                 schema::pipeline_unavailable_diagnostic::Which::SchemaAcceptanceRequired(
@@ -2218,45 +2218,45 @@ pub fn decode_authoring_inspection(
     })
 }
 
-pub fn decode_configuration_poison(
-    poison: schema::configuration_poison::Reader<'_>,
-) -> Result<ConfigurationPoison, capnp::Error> {
-    if poison.get_detail_version() != 1 {
+pub fn decode_configuration_error(
+    reader: schema::configuration_error::Reader<'_>,
+) -> Result<ConfigurationError, capnp::Error> {
+    if reader.get_detail_version() != 1 {
         return Err(capnp::Error::failed(format!(
-            "unsupported configuration poison detail version {}",
-            poison.get_detail_version()
+            "unsupported configuration error detail version {}",
+            reader.get_detail_version()
         )));
     }
-    let code = crate::ConfigurationPoisonCode::try_from(poison.get_code())
+    let code = crate::ConfigurationErrorCode::try_from(reader.get_code())
         .map_err(|error| capnp::Error::failed(error.to_string()))?;
-    let detail = crate::DscpV1::from_canonical_detail_bytes(code, poison.get_detail_bytes()?)
+    let detail = crate::DscpV1::from_canonical_detail_bytes(code, reader.get_detail_bytes()?)
         .map_err(|error| capnp::Error::failed(format!("invalid DSCP v1 detail: {error}")))?;
-    let value = ConfigurationPoison {
+    let value = ConfigurationError {
         code,
-        reason_hash: decode_hash(poison.get_reason_hash()?, "reasonHash")
+        reason_hash: decode_hash(reader.get_reason_hash()?, "reasonHash")
             .map_err(|error| capnp::Error::failed(error.message))?,
         detail: Box::new(detail),
-        message: decode_text(poison.get_message()?, "poison.message")
+        message: decode_text(reader.get_message()?, "configurationError.message")
             .map_err(|error| capnp::Error::failed(error.message))?,
     };
     value
         .validate()
-        .map_err(|error| capnp::Error::failed(format!("invalid configuration poison: {error}")))?;
+        .map_err(|error| capnp::Error::failed(format!("invalid configuration error: {error}")))?;
     Ok(value)
 }
 
-pub fn decode_version_poison(
-    poison: schema::version_poison::Reader<'_>,
-) -> Result<VersionPoison, capnp::Error> {
-    let detail = poison.get_detail()?;
+pub fn decode_namespace_error(
+    reader: schema::namespace_error::Reader<'_>,
+) -> Result<NamespaceError, capnp::Error> {
+    let detail = reader.get_detail()?;
     let detail = match detail
         .which()
         .map_err(|error| capnp::Error::failed(error.to_string()))?
     {
-        schema::version_poison_detail::Which::DuplicateAssetUuid(value) => {
+        schema::namespace_error_detail::Which::DuplicateAssetUuid(value) => {
             let value = value?;
             let asset = AssetUuid(
-                decode_uuid(value.get_asset()?.get_bytes()?, "versionPoison.asset")
+                decode_uuid(value.get_asset()?.get_bytes()?, "namespaceError.asset")
                     .map_err(|error| capnp::Error::failed(error.message))?,
             );
             let claimants = value
@@ -2271,17 +2271,17 @@ pub fn decode_version_poison(
                             schema::asset_claimant::Which::Authored(authored) => {
                                 let authored = authored?;
                                 crate::AssetClaimant::Authored {
-                                    source: read_version_poison_source(authored.get_source()?)?,
+                                    source: read_bundle_source(authored.get_source()?)?,
                                     bundle: crate::BundleUuid(
                                         decode_uuid(
                                             authored.get_bundle()?.get_bytes()?,
-                                            "versionPoison.claimant.bundle",
+                                            "namespaceError.claimant.bundle",
                                         )
                                         .map_err(|error| capnp::Error::failed(error.message))?,
                                     ),
                                     local_id: decode_text(
                                         authored.get_local_id()?,
-                                        "versionPoison.claimant.localId",
+                                        "namespaceError.claimant.localId",
                                     )
                                     .map_err(|error| capnp::Error::failed(error.message))?,
                                 }
@@ -2292,13 +2292,13 @@ pub fn decode_version_poison(
                                     parent: AssetUuid(
                                         decode_uuid(
                                             derived.get_parent()?.get_bytes()?,
-                                            "versionPoison.claimant.parent",
+                                            "namespaceError.claimant.parent",
                                         )
                                         .map_err(|error| capnp::Error::failed(error.message))?,
                                     ),
                                     output_key: decode_text(
                                         derived.get_output_key()?,
-                                        "versionPoison.claimant.outputKey",
+                                        "namespaceError.claimant.outputKey",
                                     )
                                     .map_err(|error| capnp::Error::failed(error.message))?,
                                 }
@@ -2307,23 +2307,23 @@ pub fn decode_version_poison(
                     )
                 })
                 .collect::<Result<Vec<_>, capnp::Error>>()?;
-            VersionPoisonV1::DuplicateAssetUuid { asset, claimants }
+            NamespaceErrorV1::DuplicateAssetUuid { asset, claimants }
         }
-        schema::version_poison_detail::Which::DuplicateBundleUuid(value) => {
+        schema::namespace_error_detail::Which::DuplicateBundleUuid(value) => {
             let value = value?;
-            VersionPoisonV1::DuplicateBundleUuid {
+            NamespaceErrorV1::DuplicateBundleUuid {
                 bundle: crate::BundleUuid(
-                    decode_uuid(value.get_bundle()?.get_bytes()?, "versionPoison.bundle")
+                    decode_uuid(value.get_bundle()?.get_bytes()?, "namespaceError.bundle")
                         .map_err(|error| capnp::Error::failed(error.message))?,
                 ),
                 sources: value
                     .get_sources()?
                     .iter()
-                    .map(read_version_poison_source)
+                    .map(read_bundle_source)
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
-        schema::version_poison_detail::Which::SameRootNormalizedPathCollision(value) => {
+        schema::namespace_error_detail::Which::SameRootNormalizedPathCollision(value) => {
             let value = value?;
             let claims = value
                 .get_claims()?
@@ -2341,7 +2341,7 @@ pub fn decode_version_poison(
                             let bytes = bytes?;
                             if bytes.len() % 2 != 0 {
                                 return Err(capnp::Error::failed(
-                                    "version poison Windows path has odd byte length".to_owned(),
+                                    "namespace error Windows path has odd byte length".to_owned(),
                                 ));
                             }
                             crate::PlatformPathBytes::Windows(
@@ -2355,27 +2355,27 @@ pub fn decode_version_poison(
                     Ok(crate::PhysicalPathClaim {
                         raw_relative_path,
                         file_hash: distill_core::id::BundleFileHash(
-                            decode_hash(claim.get_file_hash()?, "versionPoison.claim.fileHash")
+                            decode_hash(claim.get_file_hash()?, "namespaceError.claim.fileHash")
                                 .map_err(|error| capnp::Error::failed(error.message))?,
                         ),
                     })
                 })
                 .collect::<Result<Vec<_>, capnp::Error>>()?;
-            VersionPoisonV1::SameRootNormalizedPathCollision {
-                root_name: decode_text(value.get_root_name()?, "versionPoison.rootName")
+            NamespaceErrorV1::SameRootNormalizedPathCollision {
+                root_name: decode_text(value.get_root_name()?, "namespaceError.rootName")
                     .map_err(|error| capnp::Error::failed(error.message))?,
                 normalized_path: decode_text(
                     value.get_normalized_path()?,
-                    "versionPoison.normalizedPath",
+                    "namespaceError.normalizedPath",
                 )
                 .map_err(|error| capnp::Error::failed(error.message))?,
                 claims,
             }
         }
-        schema::version_poison_detail::Which::IncompleteSkeleton(value) => {
+        schema::namespace_error_detail::Which::IncompleteSkeleton(value) => {
             let value = value?;
-            VersionPoisonV1::IncompleteSkeleton {
-                source: read_version_poison_source(value.get_source()?)?,
+            NamespaceErrorV1::IncompleteSkeleton {
+                source: read_bundle_source(value.get_source()?)?,
                 failure: match value.get_failure_code() {
                     1 => crate::SkeletonFailureCode::EnvelopeMalformed,
                     2 => crate::SkeletonFailureCode::MissingFormatVersion,
@@ -2391,14 +2391,14 @@ pub fn decode_version_poison(
                 },
             }
         }
-        schema::version_poison_detail::Which::UnreadableGlobalBundlePath(value) => {
+        schema::namespace_error_detail::Which::UnreadableGlobalBundlePath(value) => {
             let value = value?;
-            VersionPoisonV1::UnreadableGlobalBundlePath {
-                root_name: decode_text(value.get_root_name()?, "versionPoison.rootName")
+            NamespaceErrorV1::UnreadableGlobalBundlePath {
+                root_name: decode_text(value.get_root_name()?, "namespaceError.rootName")
                     .map_err(|error| capnp::Error::failed(error.message))?,
                 normalized_path: decode_text(
                     value.get_normalized_path()?,
-                    "versionPoison.normalizedPath",
+                    "namespaceError.normalizedPath",
                 )
                 .map_err(|error| capnp::Error::failed(error.message))?,
                 failure: match value.get_failure_code() {
@@ -2414,7 +2414,7 @@ pub fn decode_version_poison(
                 },
             }
         }
-        schema::version_poison_detail::Which::InvalidPhysicalPath(value) => {
+        schema::namespace_error_detail::Which::InvalidPhysicalPath(value) => {
             let value = value?;
             let path = value.get_raw_relative_path()?;
             let raw_relative_path = match path
@@ -2428,7 +2428,7 @@ pub fn decode_version_poison(
                     let bytes = bytes?;
                     if bytes.len() % 2 != 0 {
                         return Err(capnp::Error::failed(
-                            "version poison Windows path has odd byte length".to_owned(),
+                            "namespace error Windows path has odd byte length".to_owned(),
                         ));
                     }
                     crate::PlatformPathBytes::Windows(
@@ -2439,8 +2439,8 @@ pub fn decode_version_poison(
                     )
                 }
             };
-            VersionPoisonV1::InvalidPhysicalPath {
-                root_name: decode_text(value.get_root_name()?, "versionPoison.rootName")
+            NamespaceErrorV1::InvalidPhysicalPath {
+                root_name: decode_text(value.get_root_name()?, "namespaceError.rootName")
                     .map_err(|error| capnp::Error::failed(error.message))?,
                 raw_relative_path,
                 failure: match value.get_failure_code() {
@@ -2459,7 +2459,7 @@ pub fn decode_version_poison(
                 },
             }
         }
-        schema::version_poison_detail::Which::UnreadableScanSubtree(value) => {
+        schema::namespace_error_detail::Which::UnreadableScanSubtree(value) => {
             let value = value?;
             let subject = match value
                 .get_subject()?
@@ -2467,7 +2467,7 @@ pub fn decode_version_poison(
                 .map_err(|error| capnp::Error::failed(error.to_string()))?
             {
                 schema::scan_subject::Which::Root(root) => crate::ScanSubject::Root {
-                    root_name: decode_text(root?.get_root_name()?, "versionPoison.scan.rootName")
+                    root_name: decode_text(root?.get_root_name()?, "namespaceError.scan.rootName")
                         .map_err(|error| capnp::Error::failed(error.message))?,
                 },
                 schema::scan_subject::Which::Subtree(subtree) => {
@@ -2484,7 +2484,7 @@ pub fn decode_version_poison(
                             let bytes = bytes?;
                             if bytes.len() % 2 != 0 {
                                 return Err(capnp::Error::failed(
-                                    "version poison Windows scan path has odd byte length"
+                                    "namespace error Windows scan path has odd byte length"
                                         .to_owned(),
                                 ));
                             }
@@ -2499,7 +2499,7 @@ pub fn decode_version_poison(
                     crate::ScanSubject::Subtree {
                         root_name: decode_text(
                             subtree.get_root_name()?,
-                            "versionPoison.scan.rootName",
+                            "namespaceError.scan.rootName",
                         )
                         .map_err(|error| capnp::Error::failed(error.message))?,
                         raw_relative_path,
@@ -2522,34 +2522,34 @@ pub fn decode_version_poison(
                 }
                 schema::ScanFailureCodeValue::IoDataLoss => crate::ScanFailureCode::IoDataLoss,
             };
-            VersionPoisonV1::UnreadableScanSubtree { subject, failure }
+            NamespaceErrorV1::UnreadableScanSubtree { subject, failure }
         }
     };
-    let message = decode_text(poison.get_message()?, "versionPoison.message")
+    let message = decode_text(reader.get_message()?, "namespaceError.message")
         .map_err(|error| capnp::Error::failed(error.message))?;
-    let decoded = VersionPoison::new(detail, message)
+    let decoded = NamespaceError::new(detail, message)
         .map_err(|error| capnp::Error::failed(error.to_string()))?;
-    let identity = decode_hash(poison.get_identity()?, "versionPoison.identity")
+    let identity = decode_hash(reader.get_identity()?, "namespaceError.identity")
         .map_err(|error| capnp::Error::failed(error.message))?;
-    if decoded.code as u16 != poison.get_code() || decoded.identity != identity {
+    if decoded.code as u16 != reader.get_code() || decoded.identity != identity {
         return Err(capnp::Error::failed(
-            "version poison code/detail/identity mismatch".to_owned(),
+            "namespace error code/detail/identity mismatch".to_owned(),
         ));
     }
     Ok(decoded)
 }
 
-pub fn decode_pipeline_poison(
-    poison: schema::pipeline_poison::Reader<'_>,
-) -> Result<crate::PipelinePoison, capnp::Error> {
-    let code = poison.get_code()? as u16 + 1;
-    let origin = poison.get_origin()? as u16 + 1;
-    let cleanup = poison.get_cleanup()? as u16;
-    let identity = decode_hash(poison.get_identity()?, "pipelinePoison.identity")
+pub fn decode_pipeline_failure(
+    reader: schema::pipeline_failure::Reader<'_>,
+) -> Result<crate::PipelineFailure, capnp::Error> {
+    let code = reader.get_code()? as u16 + 1;
+    let origin = reader.get_origin()? as u16 + 1;
+    let cleanup = reader.get_cleanup()? as u16;
+    let identity = decode_hash(reader.get_identity()?, "pipelineFailure.identity")
         .map_err(|error| capnp::Error::failed(error.message))?;
-    let message = decode_text(poison.get_message()?, "pipelinePoison.message")
+    let message = decode_text(reader.get_message()?, "pipelineFailure.message")
         .map_err(|error| capnp::Error::failed(error.message))?;
-    crate::PipelinePoison::from_wire(code, origin, cleanup, identity, message)
+    crate::PipelineFailure::from_wire(code, origin, cleanup, identity, message)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
@@ -2750,19 +2750,19 @@ pub fn decode_retired_type_referenced(
     })
 }
 
-fn read_version_poison_source(
-    source: schema::version_poison_source::Reader<'_>,
+fn read_bundle_source(
+    source: schema::bundle_source::Reader<'_>,
 ) -> Result<crate::ReadableBundleSource, capnp::Error> {
     Ok(crate::ReadableBundleSource {
-        root_name: decode_text(source.get_root_name()?, "versionPoison.source.rootName")
+        root_name: decode_text(source.get_root_name()?, "namespaceError.source.rootName")
             .map_err(|error| capnp::Error::failed(error.message))?,
         normalized_path: decode_text(
             source.get_normalized_path()?,
-            "versionPoison.source.normalizedPath",
+            "namespaceError.source.normalizedPath",
         )
         .map_err(|error| capnp::Error::failed(error.message))?,
         file_hash: distill_core::id::BundleFileHash(
-            decode_hash(source.get_file_hash()?, "versionPoison.source.fileHash")
+            decode_hash(source.get_file_hash()?, "namespaceError.source.fileHash")
                 .map_err(|error| capnp::Error::failed(error.message))?,
         ),
     })
@@ -2779,8 +2779,8 @@ fn write_snapshot_result(result: schema::snapshot_call::Builder<'_>, outcome: Rp
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(error) => write_rpc_result_error_snapshot(result, error),
     }
@@ -2800,8 +2800,8 @@ fn write_authoring_snapshot_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
             result.init_lease_failure(),
@@ -2896,15 +2896,15 @@ fn write_metadata_diagnostics_result(
             let mut configuration = output.reborrow().init_configuration();
             match &diagnostics.configuration {
                 ConfigurationStatus::Ready => configuration.set_ready(()),
-                ConfigurationStatus::Poisoned(poison) => {
-                    write_poison(configuration.init_poisoned(), poison)
+                ConfigurationStatus::Failed(error) => {
+                    write_configuration_error(configuration.init_failed(), error)
                 }
             }
             let mut pipeline = output.reborrow().init_pipeline();
             match &diagnostics.pipeline {
                 crate::PipelineDiagnostic::Ready => pipeline.set_ready(()),
-                crate::PipelineDiagnostic::Poisoned(poison) => {
-                    write_pipeline_poison(pipeline.init_poisoned(), poison)?
+                crate::PipelineDiagnostic::Failed(failure) => {
+                    write_pipeline_failure(pipeline.init_failed(), failure)?
                 }
                 crate::PipelineDiagnostic::SchemaAcceptanceRequired(diagnostic) => {
                     write_schema_acceptance_required(
@@ -2921,7 +2921,7 @@ fn write_metadata_diagnostics_result(
             }
             let mut errors = output.init_namespace_errors(diagnostics.namespace_errors.len() as u32);
             for (index, error) in diagnostics.namespace_errors.iter().enumerate() {
-                write_version_poison(errors.reborrow().get(index as u32), error);
+                write_namespace_error(errors.reborrow().get(index as u32), error);
             }
         }
         MetadataCall::ReconnectRequired { reason } => {
@@ -3183,8 +3183,8 @@ fn write_uuid_list_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
             result.init_lease_failure(),
@@ -3205,8 +3205,8 @@ fn write_target_entry_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3234,8 +3234,8 @@ fn write_authoring_inspect_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => write_lease_failure(
             result.init_lease_failure(),
@@ -3306,8 +3306,8 @@ fn write_subscribe_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(error) => write_rpc_result_error_subscribe(result, error),
     }
@@ -3319,8 +3319,8 @@ fn write_void_result(mut result: schema::void_call::Builder<'_>, outcome: RpcRes
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3337,8 +3337,8 @@ fn write_uint64_result(mut result: schema::u_int64_call::Builder<'_>, outcome: R
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3358,8 +3358,8 @@ fn write_bundle_uuid_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
@@ -3385,8 +3385,8 @@ fn write_progress_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
@@ -3435,8 +3435,8 @@ fn write_data_result(mut result: schema::data_call::Builder<'_>, outcome: RpcRes
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "connection lease expired")
@@ -3481,8 +3481,8 @@ fn write_resolve_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3516,8 +3516,8 @@ fn write_path_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3554,8 +3554,8 @@ fn write_fetch_result(
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(result.init_reconnect_required(), reason)
         }
-        RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(result.init_configuration_poisoned(), &poison)
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
         }
         RpcResult::Failure(RpcFailure::LeaseExpired) => {
             write_lease_failure(result.init_lease_failure(), "snapshot lease expired")
@@ -3655,9 +3655,9 @@ fn write_snapshot_configuration_result(
 ) {
     match outcome {
         RpcResult::Success(ConfigurationStatus::Ready) => output.set_success(()),
-        RpcResult::Success(ConfigurationStatus::Poisoned(poison))
-        | RpcResult::ConfigurationPoisoned(poison) => {
-            write_poison(output.init_configuration_poisoned(), &poison)
+        RpcResult::Success(ConfigurationStatus::Failed(error))
+        | RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(output.init_configuration_failed(), &error)
         }
         RpcResult::ReconnectRequired { reason } => {
             write_reconnect(output.init_reconnect_required(), reason)
@@ -3746,8 +3746,8 @@ fn write_lineage_unavailable(
 ) {
     match unavailable {
         LineageRepairUnavailable::ConfigurationReady => output.set_configuration_ready(()),
-        LineageRepairUnavailable::OtherConfigurationPoison(poison) => {
-            write_poison(output.init_other_configuration_poison(), poison)
+        LineageRepairUnavailable::OtherConfigurationError(error) => {
+            write_configuration_error(output.init_other_configuration_error(), error)
         }
     }
 }
@@ -4041,15 +4041,15 @@ fn write_authoring_stamp(
     output.set_input_version(stamp.version.0);
 }
 
-fn write_poison(
-    mut output: schema::configuration_poison::Builder<'_>,
-    poison: &ConfigurationPoison,
+fn write_configuration_error(
+    mut output: schema::configuration_error::Builder<'_>,
+    error: &ConfigurationError,
 ) {
-    output.set_code(poison.code as u16);
-    output.set_reason_hash(&poison.reason_hash);
-    output.set_message(poison.message.as_str());
+    output.set_code(error.code as u16);
+    output.set_reason_hash(&error.reason_hash);
+    output.set_message(error.message.as_str());
     output.set_detail_version(1);
-    output.set_detail_bytes(&poison.detail.canonical_detail_bytes());
+    output.set_detail_bytes(&error.detail.canonical_detail_bytes());
 }
 
 fn write_pipeline_unavailable(
@@ -4057,8 +4057,8 @@ fn write_pipeline_unavailable(
     diagnostic: &crate::PipelineUnavailableDiagnostic,
 ) -> Result<(), capnp::Error> {
     match diagnostic {
-        crate::PipelineUnavailableDiagnostic::PipelinePoison(poison) => {
-            write_pipeline_poison(output.reborrow().init_pipeline_poison(), poison)
+        crate::PipelineUnavailableDiagnostic::PipelineFailure(failure) => {
+            write_pipeline_failure(output.reborrow().init_pipeline_failure(), failure)
         }
         crate::PipelineUnavailableDiagnostic::SchemaAcceptanceRequired(required) => {
             write_schema_acceptance_required(
@@ -4077,40 +4077,44 @@ fn write_pipeline_unavailable(
     }
 }
 
-fn write_pipeline_poison(
-    mut output: schema::pipeline_poison::Builder<'_>,
-    poison: &crate::PipelinePoison,
+fn write_pipeline_failure(
+    mut output: schema::pipeline_failure::Builder<'_>,
+    failure: &crate::PipelineFailure,
 ) -> Result<(), capnp::Error> {
-    poison
+    failure
         .validate()
         .map_err(|error| capnp::Error::failed(format!("invalid DSPP diagnostic: {error}")))?;
-    output.set_code(match poison.code {
-        crate::PipelinePoisonCode::CandidateOpen => schema::PipelinePoisonCode::CandidateOpen,
-        crate::PipelinePoisonCode::CandidateAttestation => {
-            schema::PipelinePoisonCode::CandidateAttestation
+    output.set_code(match failure.code {
+        crate::PipelineFailureCode::CandidateOpen => schema::PipelineFailureCode::CandidateOpen,
+        crate::PipelineFailureCode::CandidateAttestation => {
+            schema::PipelineFailureCode::CandidateAttestation
         }
-        crate::PipelinePoisonCode::CandidateRegistration => {
-            schema::PipelinePoisonCode::CandidateRegistration
+        crate::PipelineFailureCode::CandidateRegistration => {
+            schema::PipelineFailureCode::CandidateRegistration
         }
-        crate::PipelinePoisonCode::CandidateValidation => {
-            schema::PipelinePoisonCode::CandidateValidation
+        crate::PipelineFailureCode::CandidateValidation => {
+            schema::PipelineFailureCode::CandidateValidation
         }
-        crate::PipelinePoisonCode::CandidateCleanup => schema::PipelinePoisonCode::CandidateCleanup,
-        crate::PipelinePoisonCode::PublishedCallbackPanic => {
-            schema::PipelinePoisonCode::PublishedCallbackPanic
+        crate::PipelineFailureCode::CandidateCleanup => {
+            schema::PipelineFailureCode::CandidateCleanup
         }
-        crate::PipelinePoisonCode::PublishedCallbackRejected => {
-            schema::PipelinePoisonCode::PublishedCallbackRejected
+        crate::PipelineFailureCode::PublishedCallbackPanic => {
+            schema::PipelineFailureCode::PublishedCallbackPanic
         }
-        crate::PipelinePoisonCode::PublishedCleanup => schema::PipelinePoisonCode::PublishedCleanup,
-    });
-    output.set_origin(match poison.origin {
-        crate::PipelinePoisonOrigin::CandidateOpen => schema::PipelinePoisonOrigin::CandidateOpen,
-        crate::PipelinePoisonOrigin::PublishedRuntime => {
-            schema::PipelinePoisonOrigin::PublishedRuntime
+        crate::PipelineFailureCode::PublishedCallbackRejected => {
+            schema::PipelineFailureCode::PublishedCallbackRejected
+        }
+        crate::PipelineFailureCode::PublishedCleanup => {
+            schema::PipelineFailureCode::PublishedCleanup
         }
     });
-    output.set_cleanup(match poison.cleanup {
+    output.set_origin(match failure.origin {
+        crate::PipelineFailureOrigin::CandidateOpen => schema::PipelineFailureOrigin::CandidateOpen,
+        crate::PipelineFailureOrigin::PublishedRuntime => {
+            schema::PipelineFailureOrigin::PublishedRuntime
+        }
+    });
+    output.set_cleanup(match failure.cleanup {
         crate::CleanupDisposition::None => schema::CleanupDisposition::None,
         crate::CleanupDisposition::CleanedAndClosed => schema::CleanupDisposition::CleanedAndClosed,
         crate::CleanupDisposition::RegistrationCleanupFailed => {
@@ -4126,19 +4130,19 @@ fn write_pipeline_poison(
             schema::CleanupDisposition::PublishedEpochLeaked
         }
     });
-    output.set_identity(&poison.identity);
-    output.set_message(poison.message.as_str());
+    output.set_identity(&failure.identity);
+    output.set_message(failure.message.as_str());
     Ok(())
 }
 
-fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison: &VersionPoison) {
-    debug_assert!(poison.validate().is_ok());
-    output.set_code(poison.code as u16);
-    output.set_identity(&poison.identity);
-    output.set_message(poison.message.as_str());
+fn write_namespace_error(mut output: schema::namespace_error::Builder<'_>, error: &NamespaceError) {
+    debug_assert!(error.validate().is_ok());
+    output.set_code(error.code as u16);
+    output.set_identity(&error.identity);
+    output.set_message(error.message.as_str());
     let detail = output.init_detail();
-    match &poison.detail {
-        VersionPoisonV1::DuplicateAssetUuid { asset, claimants } => {
+    match &error.detail {
+        NamespaceErrorV1::DuplicateAssetUuid { asset, claimants } => {
             let mut value = detail.init_duplicate_asset_uuid();
             value.reborrow().init_asset().set_bytes(&asset.0);
             let mut rows = value.init_claimants(claimants.len() as u32);
@@ -4151,7 +4155,7 @@ fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison:
                         local_id,
                     } => {
                         let mut authored = row.reborrow().init_authored();
-                        write_version_poison_source(authored.reborrow().init_source(), source);
+                        write_bundle_source(authored.reborrow().init_source(), source);
                         authored.reborrow().init_bundle().set_bytes(&bundle.0);
                         authored.set_local_id(local_id.as_str());
                     }
@@ -4163,12 +4167,12 @@ fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison:
                 }
             }
         }
-        VersionPoisonV1::DuplicateBundleUuid { bundle, sources } => {
+        NamespaceErrorV1::DuplicateBundleUuid { bundle, sources } => {
             let mut value = detail.init_duplicate_bundle_uuid();
             value.reborrow().init_bundle().set_bytes(&bundle.0);
-            write_version_poison_sources(value.init_sources(sources.len() as u32), sources);
+            write_bundle_sources(value.init_sources(sources.len() as u32), sources);
         }
-        VersionPoisonV1::SameRootNormalizedPathCollision {
+        NamespaceErrorV1::SameRootNormalizedPathCollision {
             root_name,
             normalized_path,
             claims,
@@ -4193,12 +4197,12 @@ fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison:
                 }
             }
         }
-        VersionPoisonV1::IncompleteSkeleton { source, failure } => {
+        NamespaceErrorV1::IncompleteSkeleton { source, failure } => {
             let mut value = detail.init_incomplete_skeleton();
-            write_version_poison_source(value.reborrow().init_source(), source);
+            write_bundle_source(value.reborrow().init_source(), source);
             value.set_failure_code(*failure as u16);
         }
-        VersionPoisonV1::UnreadableGlobalBundlePath {
+        NamespaceErrorV1::UnreadableGlobalBundlePath {
             root_name,
             normalized_path,
             failure,
@@ -4208,7 +4212,7 @@ fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison:
             value.set_normalized_path(normalized_path.as_str());
             value.set_failure_code(*failure as u16);
         }
-        VersionPoisonV1::InvalidPhysicalPath {
+        NamespaceErrorV1::InvalidPhysicalPath {
             root_name,
             raw_relative_path,
             failure,
@@ -4228,7 +4232,7 @@ fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison:
             }
             value.set_failure_code(*failure as u16);
         }
-        VersionPoisonV1::UnreadableScanSubtree { subject, failure } => {
+        NamespaceErrorV1::UnreadableScanSubtree { subject, failure } => {
             let mut value = detail.init_unreadable_scan_subtree();
             let subject_output = value.reborrow().init_subject();
             match subject {
@@ -4271,17 +4275,17 @@ fn write_version_poison(mut output: schema::version_poison::Builder<'_>, poison:
     }
 }
 
-fn write_version_poison_sources(
-    mut output: capnp::struct_list::Builder<'_, schema::version_poison_source::Owned>,
+fn write_bundle_sources(
+    mut output: capnp::struct_list::Builder<'_, schema::bundle_source::Owned>,
     sources: &[crate::ReadableBundleSource],
 ) {
     for (index, source) in sources.iter().enumerate() {
-        write_version_poison_source(output.reborrow().get(index as u32), source);
+        write_bundle_source(output.reborrow().get(index as u32), source);
     }
 }
 
-fn write_version_poison_source(
-    mut output: schema::version_poison_source::Builder<'_>,
+fn write_bundle_source(
+    mut output: schema::bundle_source::Builder<'_>,
     source: &crate::ReadableBundleSource,
 ) {
     output.set_root_name(source.root_name.as_str());

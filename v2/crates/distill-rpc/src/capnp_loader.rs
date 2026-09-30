@@ -6,12 +6,12 @@ use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_store::state::{InputVersion, SnapshotStamp, StoreInstanceId};
 
 use crate::capnp_transport::{
-    decode_configuration_poison, decode_rpc_basis, schema,
+    decode_configuration_error, decode_rpc_basis, schema,
     RemoteConnectOutcome,
 };
 use crate::{
     ArtifactChunk, ArtifactChunkKind, AssetDeltaState, AssetEvent, AuthoringEntryRole,
-    ConfigurationPoison, Delta, DriftedInput, PathResolveFailure, PathResolveResult,
+    ConfigurationError, Delta, DriftedInput, PathResolveFailure, PathResolveResult,
     ReconnectReason, ResolveResult, RpcBasis, ServedLoadEdge, StreamEvent, TerminalEvent,
 };
 
@@ -25,7 +25,7 @@ pub struct RemoteError {
 pub enum RemoteCall<T> {
     Success(T),
     ReconnectRequired(ReconnectReason),
-    ConfigurationPoisoned(ConfigurationPoison),
+    ConfigurationFailed(ConfigurationError),
     LeaseFailure(RemoteError),
     Error(RemoteError),
 }
@@ -80,8 +80,8 @@ impl RemoteHub {
             schema::snapshot_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::snapshot_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::snapshot_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::snapshot_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -107,8 +107,8 @@ impl RemoteHub {
             schema::data_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::data_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::data_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::data_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -152,8 +152,8 @@ impl RemoteHub {
             schema::subscribe_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::subscribe_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::subscribe_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::subscribe_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -188,8 +188,8 @@ impl RemoteHub {
             schema::void_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::void_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::void_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::void_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -229,8 +229,8 @@ impl RemoteSnapshot {
             schema::u_int64_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::u_int64_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::u_int64_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::u_int64_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -255,8 +255,8 @@ impl RemoteSnapshot {
             schema::snapshot_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::snapshot_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::snapshot_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::snapshot_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -306,8 +306,8 @@ impl RemoteSnapshot {
             schema::chunk_stream_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::chunk_stream_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::chunk_stream_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::chunk_stream_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -339,8 +339,8 @@ impl RemoteSnapshot {
             schema::resolve_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::resolve_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::resolve_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::resolve_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))
@@ -372,8 +372,8 @@ impl RemoteSnapshot {
             schema::path_resolve_call::Which::ReconnectRequired(value) => Ok(
                 RemoteCall::ReconnectRequired(decode_reconnect(value?.get_reason()?)),
             ),
-            schema::path_resolve_call::Which::ConfigurationPoisoned(value) => Ok(
-                RemoteCall::ConfigurationPoisoned(decode_configuration_poison(value?)?),
+            schema::path_resolve_call::Which::ConfigurationFailed(value) => Ok(
+                RemoteCall::ConfigurationFailed(decode_configuration_error(value?)?),
             ),
             schema::path_resolve_call::Which::LeaseFailure(value) => {
                 Ok(RemoteCall::LeaseFailure(decode_lease(value?)?))

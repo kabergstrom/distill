@@ -294,7 +294,7 @@ fn schema_lineage_records_the_chain_with_generations_and_digests() {
 
 #[test]
 fn pipeline_state_row_shape() {
-    // §13: module content identity plus typed poison/acceptance state.
+    // §13: module content identity plus typed failure/acceptance state.
     let dir = tempfile::tempdir().unwrap();
     let conn = open_conn(&dir);
     assert_eq!(

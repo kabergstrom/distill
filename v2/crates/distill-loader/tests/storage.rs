@@ -97,7 +97,7 @@ fn one_failed_free_poisons_exact_epoch_but_other_frees_continue() {
 }
 
 #[test]
-fn published_runtime_poison_fences_new_work_even_before_drain() {
+fn published_runtime_failure_fences_new_work_even_before_drain() {
     let token = ModuleEpochToken::new(9);
     let epoch = GameModuleEpoch(9);
     let mut epochs = RuntimeEpochs::default();

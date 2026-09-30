@@ -21,7 +21,7 @@ use unicode_normalization::is_nfc;
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::state::{
-    InputVersion, PipelineCandidateIdentity, PipelineEpoch, PipelinePoison, PipelineState,
+    InputVersion, PipelineCandidateIdentity, PipelineEpoch, PipelineFailure, PipelineState,
     Registration, RegistrationKind, RetiredTypeReferenced, SchemaAcceptanceRequired,
     SchemaManifestBasis, SchemaRegistryMismatch,
 };
@@ -789,13 +789,16 @@ impl InputTxn<'_> {
     }
 
     /// A rejected candidate still publishes (§13): the version carries a
-    /// pipeline poison naming the error. The prior epoch's identity
+    /// pipeline failure naming the error. The prior epoch's identity
     /// columns are retained as `last_good` residency bookkeeping — never
     /// served as this version's code.
-    pub fn publish_pipeline_poison(&mut self, poison: &PipelinePoison) -> Result<(), StoreError> {
-        poison
+    pub fn publish_pipeline_failure(
+        &mut self,
+        failure: &PipelineFailure,
+    ) -> Result<(), StoreError> {
+        failure
             .validate()
-            .map_err(StoreError::InvalidPipelinePoison)?;
+            .map_err(StoreError::InvalidPipelineFailure)?;
         self.txn.execute(
             "INSERT INTO pipeline_state(
                  id, dylib_hash, input_version,
@@ -818,11 +821,11 @@ impl InputTxn<'_> {
                retired_type_uuid = NULL",
             rusqlite::params![
                 self.version().0 as i64,
-                poison.code as u16,
-                poison.origin as u16,
-                poison.cleanup as u16,
-                poison.identity.as_slice(),
-                poison.message,
+                failure.code as u16,
+                failure.origin as u16,
+                failure.cleanup as u16,
+                failure.identity.as_slice(),
+                failure.message,
             ],
         )?;
         self.txn
@@ -2159,20 +2162,20 @@ fn coverage_error(
 
 impl Store {
 
-    /// Persist the first poison discovered in an already-published module
+    /// Persist the first failure discovered in an already-published module
     /// epoch without minting a new input version. This is a narrow monotonic
     /// runtime-lifecycle transition, guarded by the exact dylib identity.
-    pub fn poison_published_pipeline_epoch(
+    pub fn fail_published_pipeline_epoch(
         &mut self,
         expected_dylib_hash: [u8; 32],
-        poison: &PipelinePoison,
+        failure: &PipelineFailure,
     ) -> Result<(), StoreError> {
-        poison
+        failure
             .validate()
-            .map_err(StoreError::InvalidPipelinePoison)?;
-        if poison.origin != crate::state::PipelinePoisonOrigin::PublishedRuntime {
-            return Err(StoreError::InvalidPipelinePoison(
-                crate::state::PipelinePoisonError::InvalidMatrix,
+            .map_err(StoreError::InvalidPipelineFailure)?;
+        if failure.origin != crate::state::PipelineFailureOrigin::PublishedRuntime {
+            return Err(StoreError::InvalidPipelineFailure(
+                crate::state::PipelineFailureDecodeError::InvalidMatrix,
             ));
         }
 
@@ -2185,11 +2188,11 @@ impl Store {
             )
             .optional()?;
         let (actual, already_unavailable) = match row {
-            Some((actual, poison_code)) => (
+            Some((actual, failure_code)) => (
                 actual
                     .map(|bytes| exact_blob32(bytes, "published pipeline dylib hash"))
                     .transpose()?,
-                poison_code.is_some(),
+                failure_code.is_some(),
             ),
             None => (None, false),
         };
@@ -2209,11 +2212,11 @@ impl Store {
                  poison_message = ?5
              WHERE id = 0 AND dylib_hash = ?6 AND poison_code IS NULL",
             rusqlite::params![
-                poison.code as u16,
-                poison.origin as u16,
-                poison.cleanup as u16,
-                poison.identity.as_slice(),
-                poison.message,
+                failure.code as u16,
+                failure.origin as u16,
+                failure.cleanup as u16,
+                failure.identity.as_slice(),
+                failure.message,
                 expected_dylib_hash.as_slice(),
             ],
         )?;
@@ -2306,11 +2309,11 @@ impl StoreReader {
             .optional()?;
         let Some((
             dylib,
-            poison_code,
-            poison_origin,
-            poison_cleanup,
-            poison_identity,
-            poison_message,
+            failure_code,
+            failure_origin,
+            failure_cleanup,
+            failure_identity,
+            failure_message,
             candidate_dylib,
             stored_manifest_hash,
             retired_manifest_hash,
@@ -2419,48 +2422,50 @@ impl StoreReader {
                 ));
             }
         };
-        let poison = match (
-            poison_code,
-            poison_origin,
-            poison_cleanup,
-            poison_identity,
-            poison_message,
+        let failure = match (
+            failure_code,
+            failure_origin,
+            failure_cleanup,
+            failure_identity,
+            failure_message,
         ) {
             (None, None, None, None, None) => None,
             (Some(code), Some(origin), Some(cleanup), Some(identity), Some(message)) => Some(
-                PipelinePoison::from_wire(
+                PipelineFailure::from_wire(
                     u16::try_from(code).map_err(|_| {
-                        StoreError::InvalidPipelinePoison(
-                            crate::state::PipelinePoisonError::UnknownCode(code as u16),
+                        StoreError::InvalidPipelineFailure(
+                            crate::state::PipelineFailureDecodeError::UnknownCode(code as u16),
                         )
                     })?,
                     u16::try_from(origin).map_err(|_| {
-                        StoreError::InvalidPipelinePoison(
-                            crate::state::PipelinePoisonError::UnknownOrigin(origin as u16),
+                        StoreError::InvalidPipelineFailure(
+                            crate::state::PipelineFailureDecodeError::UnknownOrigin(origin as u16),
                         )
                     })?,
                     u16::try_from(cleanup).map_err(|_| {
-                        StoreError::InvalidPipelinePoison(
-                            crate::state::PipelinePoisonError::UnknownCleanup(cleanup as u16),
+                        StoreError::InvalidPipelineFailure(
+                            crate::state::PipelineFailureDecodeError::UnknownCleanup(
+                                cleanup as u16,
+                            ),
                         )
                     })?,
-                    exact_blob32(identity, "pipeline-poison identity")?,
+                    exact_blob32(identity, "pipeline-failure identity")?,
                     message,
                 )
-                .map_err(StoreError::InvalidPipelinePoison)?,
+                .map_err(StoreError::InvalidPipelineFailure)?,
             ),
             _ => {
                 return Err(invalid_manifest(
                     None,
-                    "pipeline poison columns are incomplete",
+                    "pipeline failure columns are incomplete",
                 ));
             }
         };
 
-        if poison.is_some() && (has_candidate || retired.is_some()) {
+        if failure.is_some() && (has_candidate || retired.is_some()) {
             return Err(invalid_manifest(
                 None,
-                "pipeline state is both poisoned and schema-acceptance-required",
+                "pipeline state is both failed and schema-acceptance-required",
             ));
         }
         if let Some(error) = retired {
@@ -2501,14 +2506,14 @@ impl StoreReader {
             }));
         }
 
-        Ok(Some(match poison {
+        Ok(Some(match failure {
             None => match epoch {
                 Some(epoch) => PipelineState::Ready(epoch),
                 // A row with no identity and no typed unavailable state
                 // cannot be published through this API.
                 None => return Ok(None),
             },
-            Some(error) => PipelineState::Poisoned {
+            Some(error) => PipelineState::Failed {
                 error,
                 last_good: epoch,
             },

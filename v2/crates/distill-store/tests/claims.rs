@@ -3,7 +3,7 @@
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, TypeUuid};
 use distill_store::claims::{DerivedOutputClaim, SourceClaim, SourceClaims};
-use distill_store::state::{AssetClaimant, ReadableBundleSource, VersionPoisonV1};
+use distill_store::state::{AssetClaimant, ReadableBundleSource, NamespaceErrorV1};
 use distill_store::{Store, StoreConfig, StoreError};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -62,9 +62,9 @@ fn a_shared_bundle_uuid_collides_until_one_claimant_leaves() {
             txn.replace_source_claims(None, &[source("a.bundle", 1, 10), source("b.bundle", 1, 20)])
         })
         .unwrap();
-    let [poison] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
-    let VersionPoisonV1::DuplicateBundleUuid { bundle, sources } = poison.detail else {
-        panic!("expected a bundle collision, got {poison:?}");
+    let [error] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
+    let NamespaceErrorV1::DuplicateBundleUuid { bundle, sources } = error.detail else {
+        panic!("expected a bundle collision, got {error:?}");
     };
     assert_eq!(bundle, BundleUuid([1; 16]));
     assert_eq!(sources.len(), 2);
@@ -122,14 +122,14 @@ fn an_asset_uuid_authored_twice_collides() {
             txn.replace_source_claims(Some(&under("b.bundle")), &[source("b.bundle", 2, 10)])
         })
         .unwrap();
-    let [poison] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
+    let [error] = <[_; 1]>::try_from(store.claims_namespace_errors().unwrap()).unwrap();
     assert!(
         matches!(
-            &poison.detail,
-            VersionPoisonV1::DuplicateAssetUuid { asset, claimants }
+            &error.detail,
+            NamespaceErrorV1::DuplicateAssetUuid { asset, claimants }
                 if *asset == AssetUuid([10; 16]) && claimants.len() == 2
         ),
-        "{poison:?}"
+        "{error:?}"
     );
     // Both sources derive the same child from the same parent: one claimant.
     assert_eq!(store.derived_output_claims(AssetUuid([110; 16])).unwrap().len(), 1);

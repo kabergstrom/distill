@@ -12,10 +12,10 @@ use distill_schema::ngp_schema::{verify_snapshot, PrimitiveKind, SchemaNode};
 use crate::*;
 
 pub(crate) fn validate_commit(commit: &Commit) -> Result<(), AdminError> {
-    if let Some(ConfigurationStatus::Poisoned(poison)) = &commit.configuration {
-        poison
+    if let Some(ConfigurationStatus::Failed(error)) = &commit.configuration {
+        error
             .validate()
-            .map_err(|error| AdminError::InvalidConfigurationPoison { error })?;
+            .map_err(|error| AdminError::InvalidConfigurationError { error })?;
     }
     if let Some(pipeline) = &commit.pipeline {
         validate_pipeline_diagnostic(pipeline)?;
@@ -224,18 +224,18 @@ pub(crate) fn validate_lineage_repair_configuration(
     let matches = match (configuration, repair) {
         (ConfigurationStatus::Ready, None) => true,
         (
-            ConfigurationStatus::Poisoned(ConfigurationPoison { detail, .. }),
+            ConfigurationStatus::Failed(ConfigurationError { detail, .. }),
             Some(LineageRepairState::Missing { .. }),
         ) => matches!(detail.as_ref(), DscpV1::MissingLineageManifest),
         (
-            ConfigurationStatus::Poisoned(ConfigurationPoison { detail, .. }),
+            ConfigurationStatus::Failed(ConfigurationError { detail, .. }),
             Some(LineageRepairState::Duplicate { claimants }),
         ) => matches!(
             detail.as_ref(),
             DscpV1::DuplicateLineageManifest { entries } if entries == claimants
         ),
-        (ConfigurationStatus::Poisoned(poison), None) => !matches!(
-            poison.detail.as_ref(),
+        (ConfigurationStatus::Failed(error), None) => !matches!(
+            error.detail.as_ref(),
             DscpV1::MissingLineageManifest | DscpV1::DuplicateLineageManifest { .. }
         ),
         _ => false,
@@ -257,7 +257,7 @@ pub(crate) fn validate_pipeline_diagnostic(diagnostic: &PipelineDiagnostic) -> R
     };
     match diagnostic {
         PipelineDiagnostic::Ready => Ok(()),
-        PipelineDiagnostic::Poisoned(poison) => poison
+        PipelineDiagnostic::Failed(failure) => failure
             .validate()
             .map_err(|error| invalid(&format!("invalid DSPP record: {error:?}"))),
         PipelineDiagnostic::SchemaAcceptanceRequired(required) => {

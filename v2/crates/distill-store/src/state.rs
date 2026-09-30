@@ -182,7 +182,7 @@ pub struct RetiredTypeReferenced {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-pub enum PipelinePoisonCode {
+pub enum PipelineFailureCode {
     CandidateOpen = 1,
     CandidateAttestation = 2,
     CandidateRegistration = 3,
@@ -195,7 +195,7 @@ pub enum PipelinePoisonCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-pub enum PipelinePoisonOrigin {
+pub enum PipelineFailureOrigin {
     CandidateOpen = 1,
     PublishedRuntime = 2,
 }
@@ -214,16 +214,16 @@ pub enum CleanupDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelinePoison {
-    pub code: PipelinePoisonCode,
-    pub origin: PipelinePoisonOrigin,
+pub struct PipelineFailure {
+    pub code: PipelineFailureCode,
+    pub origin: PipelineFailureOrigin,
     pub cleanup: CleanupDisposition,
     pub identity: [u8; 32],
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PipelinePoisonError {
+pub enum PipelineFailureDecodeError {
     UnknownCode(u16),
     UnknownOrigin(u16),
     UnknownCleanup(u16),
@@ -231,19 +231,19 @@ pub enum PipelinePoisonError {
     IdentityMismatch,
 }
 
-impl PipelinePoison {
+impl PipelineFailure {
     pub fn new(
-        code: PipelinePoisonCode,
-        origin: PipelinePoisonOrigin,
+        code: PipelineFailureCode,
+        origin: PipelineFailureOrigin,
         cleanup: CleanupDisposition,
         message: impl Into<String>,
-    ) -> Result<Self, PipelinePoisonError> {
-        validate_pipeline_poison_matrix(code, origin, cleanup)?;
+    ) -> Result<Self, PipelineFailureDecodeError> {
+        validate_pipeline_failure_matrix(code, origin, cleanup)?;
         Ok(Self {
             code,
             origin,
             cleanup,
-            identity: pipeline_poison_identity(code, origin, cleanup),
+            identity: pipeline_failure_identity(code, origin, cleanup),
             message: message.into(),
         })
     }
@@ -254,31 +254,31 @@ impl PipelinePoison {
         cleanup: u16,
         identity: [u8; 32],
         message: impl Into<String>,
-    ) -> Result<Self, PipelinePoisonError> {
+    ) -> Result<Self, PipelineFailureDecodeError> {
         let value = Self::new(
-            PipelinePoisonCode::try_from(code)?,
-            PipelinePoisonOrigin::try_from(origin)?,
+            PipelineFailureCode::try_from(code)?,
+            PipelineFailureOrigin::try_from(origin)?,
             CleanupDisposition::try_from(cleanup)?,
             message,
         )?;
         if value.identity != identity {
-            return Err(PipelinePoisonError::IdentityMismatch);
+            return Err(PipelineFailureDecodeError::IdentityMismatch);
         }
         Ok(value)
     }
 
-    pub fn validate(&self) -> Result<(), PipelinePoisonError> {
-        validate_pipeline_poison_matrix(self.code, self.origin, self.cleanup)?;
-        if self.identity != pipeline_poison_identity(self.code, self.origin, self.cleanup) {
-            return Err(PipelinePoisonError::IdentityMismatch);
+    pub fn validate(&self) -> Result<(), PipelineFailureDecodeError> {
+        validate_pipeline_failure_matrix(self.code, self.origin, self.cleanup)?;
+        if self.identity != pipeline_failure_identity(self.code, self.origin, self.cleanup) {
+            return Err(PipelineFailureDecodeError::IdentityMismatch);
         }
         Ok(())
     }
 }
 
-fn pipeline_poison_identity(
-    code: PipelinePoisonCode,
-    origin: PipelinePoisonOrigin,
+fn pipeline_failure_identity(
+    code: PipelineFailureCode,
+    origin: PipelineFailureOrigin,
     cleanup: CleanupDisposition,
 ) -> [u8; 32] {
     let mut encoder = CanonicalEncoder::new();
@@ -290,21 +290,21 @@ fn pipeline_poison_identity(
     *blake3::hash(&encoder.into_bytes()).as_bytes()
 }
 
-fn validate_pipeline_poison_matrix(
-    code: PipelinePoisonCode,
-    origin: PipelinePoisonOrigin,
+fn validate_pipeline_failure_matrix(
+    code: PipelineFailureCode,
+    origin: PipelineFailureOrigin,
     cleanup: CleanupDisposition,
-) -> Result<(), PipelinePoisonError> {
+) -> Result<(), PipelineFailureDecodeError> {
     let valid = match origin {
-        PipelinePoisonOrigin::CandidateOpen => match code {
-            PipelinePoisonCode::CandidateOpen
-            | PipelinePoisonCode::CandidateAttestation
-            | PipelinePoisonCode::CandidateRegistration
-            | PipelinePoisonCode::CandidateValidation => matches!(
+        PipelineFailureOrigin::CandidateOpen => match code {
+            PipelineFailureCode::CandidateOpen
+            | PipelineFailureCode::CandidateAttestation
+            | PipelineFailureCode::CandidateRegistration
+            | PipelineFailureCode::CandidateValidation => matches!(
                 cleanup,
                 CleanupDisposition::None | CleanupDisposition::CleanedAndClosed
             ),
-            PipelinePoisonCode::CandidateCleanup => matches!(
+            PipelineFailureCode::CandidateCleanup => matches!(
                 cleanup,
                 CleanupDisposition::RegistrationCleanupFailed
                     | CleanupDisposition::ModuleUnloadFailed
@@ -312,47 +312,47 @@ fn validate_pipeline_poison_matrix(
                     | CleanupDisposition::TokenPinned
                     | CleanupDisposition::DlcloseFailed
             ),
-            PipelinePoisonCode::PublishedCallbackPanic
-            | PipelinePoisonCode::PublishedCallbackRejected
-            | PipelinePoisonCode::PublishedCleanup => false,
+            PipelineFailureCode::PublishedCallbackPanic
+            | PipelineFailureCode::PublishedCallbackRejected
+            | PipelineFailureCode::PublishedCleanup => false,
         },
-        PipelinePoisonOrigin::PublishedRuntime => {
+        PipelineFailureOrigin::PublishedRuntime => {
             matches!(
                 code,
-                PipelinePoisonCode::PublishedCallbackPanic
-                    | PipelinePoisonCode::PublishedCallbackRejected
-                    | PipelinePoisonCode::PublishedCleanup
+                PipelineFailureCode::PublishedCallbackPanic
+                    | PipelineFailureCode::PublishedCallbackRejected
+                    | PipelineFailureCode::PublishedCleanup
             ) && cleanup == CleanupDisposition::PublishedEpochLeaked
         }
     };
     valid
         .then_some(())
-        .ok_or(PipelinePoisonError::InvalidMatrix)
+        .ok_or(PipelineFailureDecodeError::InvalidMatrix)
 }
 
-macro_rules! pipeline_poison_try_from {
+macro_rules! pipeline_failure_try_from {
     ($type:ty, $error:ident, {$($value:literal => $variant:ident),+ $(,)?}) => {
         impl TryFrom<u16> for $type {
-            type Error = PipelinePoisonError;
+            type Error = PipelineFailureDecodeError;
             fn try_from(value: u16) -> Result<Self, Self::Error> {
                 match value {
                     $($value => Ok(Self::$variant),)+
-                    other => Err(PipelinePoisonError::$error(other)),
+                    other => Err(PipelineFailureDecodeError::$error(other)),
                 }
             }
         }
     };
 }
 
-pipeline_poison_try_from!(PipelinePoisonCode, UnknownCode, {
+pipeline_failure_try_from!(PipelineFailureCode, UnknownCode, {
     1 => CandidateOpen, 2 => CandidateAttestation, 3 => CandidateRegistration,
     4 => CandidateValidation, 5 => CandidateCleanup, 6 => PublishedCallbackPanic,
     7 => PublishedCallbackRejected, 8 => PublishedCleanup,
 });
-pipeline_poison_try_from!(PipelinePoisonOrigin, UnknownOrigin, {
+pipeline_failure_try_from!(PipelineFailureOrigin, UnknownOrigin, {
     1 => CandidateOpen, 2 => PublishedRuntime,
 });
-pipeline_poison_try_from!(CleanupDisposition, UnknownCleanup, {
+pipeline_failure_try_from!(CleanupDisposition, UnknownCleanup, {
     0 => None, 1 => CleanedAndClosed, 2 => RegistrationCleanupFailed,
     3 => ModuleUnloadFailed, 4 => TokenPoisoned, 5 => TokenPinned,
     6 => DlcloseFailed, 7 => PublishedEpochLeaked,
@@ -370,7 +370,7 @@ pub struct ConfigurationEpoch {
 /// reject; there is deliberately no extensible `Other` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-pub enum ConfigurationPoisonCode {
+pub enum ConfigurationErrorCode {
     MalformedConfiguration = 1,
     NonLoopbackAddress = 2,
     DuplicateRootName = 3,
@@ -387,8 +387,8 @@ pub enum ConfigurationPoisonCode {
     ConfigurationSourceUnavailable = 14,
 }
 
-impl TryFrom<u16> for ConfigurationPoisonCode {
-    type Error = UnknownConfigurationPoisonCode;
+impl TryFrom<u16> for ConfigurationErrorCode {
+    type Error = UnknownConfigurationErrorCode;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
@@ -406,21 +406,21 @@ impl TryFrom<u16> for ConfigurationPoisonCode {
             12 => Ok(Self::UnsupportedTargetIdentity),
             13 => Ok(Self::DuplicateTargetName),
             14 => Ok(Self::ConfigurationSourceUnavailable),
-            unknown => Err(UnknownConfigurationPoisonCode(unknown)),
+            unknown => Err(UnknownConfigurationErrorCode(unknown)),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnknownConfigurationPoisonCode(pub u16);
+pub struct UnknownConfigurationErrorCode(pub u16);
 
-impl fmt::Display for UnknownConfigurationPoisonCode {
+impl fmt::Display for UnknownConfigurationErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown ConfigurationPoisonCode {}", self.0)
+        write!(f, "unknown ConfigurationErrorCode {}", self.0)
     }
 }
 
-impl std::error::Error for UnknownConfigurationPoisonCode {}
+impl std::error::Error for UnknownConfigurationErrorCode {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DscpError {
@@ -506,7 +506,7 @@ pub struct LineageManifestClaimant {
 }
 
 /// Exact, closed typed facts hashed by DSCP v1. Presentation prose never
-/// enters this value; callers supply it separately when publishing poison.
+/// enters this value; callers supply it separately when publishing an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // DSCP's public variant field types are protocol grammar.
 pub enum DscpV1 {
@@ -560,29 +560,29 @@ pub enum DscpV1 {
 }
 
 impl DscpV1 {
-    pub fn code(&self) -> ConfigurationPoisonCode {
+    pub fn code(&self) -> ConfigurationErrorCode {
         match self {
-            Self::MalformedConfiguration { .. } => ConfigurationPoisonCode::MalformedConfiguration,
-            Self::NonLoopbackAddress { .. } => ConfigurationPoisonCode::NonLoopbackAddress,
-            Self::DuplicateRootName { .. } => ConfigurationPoisonCode::DuplicateRootName,
-            Self::InvalidPath { .. } => ConfigurationPoisonCode::InvalidPath,
-            Self::OwnedPathOverlap { .. } => ConfigurationPoisonCode::OwnedPathOverlap,
-            Self::EmptyTargetApis { .. } => ConfigurationPoisonCode::EmptyTargetApis,
-            Self::InvalidParallelism { .. } => ConfigurationPoisonCode::InvalidParallelism,
+            Self::MalformedConfiguration { .. } => ConfigurationErrorCode::MalformedConfiguration,
+            Self::NonLoopbackAddress { .. } => ConfigurationErrorCode::NonLoopbackAddress,
+            Self::DuplicateRootName { .. } => ConfigurationErrorCode::DuplicateRootName,
+            Self::InvalidPath { .. } => ConfigurationErrorCode::InvalidPath,
+            Self::OwnedPathOverlap { .. } => ConfigurationErrorCode::OwnedPathOverlap,
+            Self::EmptyTargetApis { .. } => ConfigurationErrorCode::EmptyTargetApis,
+            Self::InvalidParallelism { .. } => ConfigurationErrorCode::InvalidParallelism,
             Self::InvalidBatchReservation { .. } => {
-                ConfigurationPoisonCode::InvalidBatchReservation
+                ConfigurationErrorCode::InvalidBatchReservation
             }
-            Self::DirectoryAlias { .. } => ConfigurationPoisonCode::DirectoryAlias,
-            Self::MissingLineageManifest => ConfigurationPoisonCode::MissingLineageManifest,
+            Self::DirectoryAlias { .. } => ConfigurationErrorCode::DirectoryAlias,
+            Self::MissingLineageManifest => ConfigurationErrorCode::MissingLineageManifest,
             Self::DuplicateLineageManifest { .. } => {
-                ConfigurationPoisonCode::DuplicateLineageManifest
+                ConfigurationErrorCode::DuplicateLineageManifest
             }
             Self::UnsupportedTargetIdentity { .. } => {
-                ConfigurationPoisonCode::UnsupportedTargetIdentity
+                ConfigurationErrorCode::UnsupportedTargetIdentity
             }
-            Self::DuplicateTargetName { .. } => ConfigurationPoisonCode::DuplicateTargetName,
+            Self::DuplicateTargetName { .. } => ConfigurationErrorCode::DuplicateTargetName,
             Self::ConfigurationSourceUnavailable { .. } => {
-                ConfigurationPoisonCode::ConfigurationSourceUnavailable
+                ConfigurationErrorCode::ConfigurationSourceUnavailable
             }
         }
     }
@@ -605,7 +605,7 @@ impl DscpV1 {
     }
 
     pub fn from_canonical_detail_bytes(
-        code: ConfigurationPoisonCode,
+        code: ConfigurationErrorCode,
         bytes: &[u8],
     ) -> Result<Self, DscpError> {
         let mut decoder = DscpDecoder { bytes, cursor: 0 };
@@ -843,18 +843,18 @@ impl<'a> DscpDecoder<'a> {
         })
     }
 
-    fn detail(&mut self, code: ConfigurationPoisonCode) -> Result<DscpV1, DscpError> {
+    fn detail(&mut self, code: ConfigurationErrorCode) -> Result<DscpV1, DscpError> {
         Ok(match code {
-            ConfigurationPoisonCode::MalformedConfiguration => DscpV1::MalformedConfiguration {
+            ConfigurationErrorCode::MalformedConfiguration => DscpV1::MalformedConfiguration {
                 file_hash: self.array()?,
             },
-            ConfigurationPoisonCode::NonLoopbackAddress => DscpV1::NonLoopbackAddress {
+            ConfigurationErrorCode::NonLoopbackAddress => DscpV1::NonLoopbackAddress {
                 address: self.string()?,
             },
-            ConfigurationPoisonCode::DuplicateRootName => DscpV1::DuplicateRootName {
+            ConfigurationErrorCode::DuplicateRootName => DscpV1::DuplicateRootName {
                 normalized_name: self.string()?,
             },
-            ConfigurationPoisonCode::InvalidPath => DscpV1::InvalidPath {
+            ConfigurationErrorCode::InvalidPath => DscpV1::InvalidPath {
                 key: match self.u8()? {
                     1 => ConfigurationPathKey::AssetRoot,
                     2 => ConfigurationPathKey::StatePath,
@@ -867,26 +867,26 @@ impl<'a> DscpDecoder<'a> {
                 },
                 normalized_or_raw_path: self.string()?,
             },
-            ConfigurationPoisonCode::OwnedPathOverlap => DscpV1::OwnedPathOverlap {
+            ConfigurationErrorCode::OwnedPathOverlap => DscpV1::OwnedPathOverlap {
                 first: self.owned_path_side()?,
                 second: self.owned_path_side()?,
             },
-            ConfigurationPoisonCode::EmptyTargetApis => DscpV1::EmptyTargetApis {
+            ConfigurationErrorCode::EmptyTargetApis => DscpV1::EmptyTargetApis {
                 target: self.string()?,
             },
-            ConfigurationPoisonCode::InvalidParallelism => {
+            ConfigurationErrorCode::InvalidParallelism => {
                 DscpV1::InvalidParallelism { value: self.u32()? }
             }
-            ConfigurationPoisonCode::InvalidBatchReservation => DscpV1::InvalidBatchReservation {
+            ConfigurationErrorCode::InvalidBatchReservation => DscpV1::InvalidBatchReservation {
                 parallelism: self.u32()?,
                 reservation: self.u32()?,
             },
-            ConfigurationPoisonCode::DirectoryAlias => DscpV1::DirectoryAlias {
+            ConfigurationErrorCode::DirectoryAlias => DscpV1::DirectoryAlias {
                 first: self.directory_alias_side()?,
                 second: self.directory_alias_side()?,
             },
-            ConfigurationPoisonCode::MissingLineageManifest => DscpV1::MissingLineageManifest,
-            ConfigurationPoisonCode::DuplicateLineageManifest => {
+            ConfigurationErrorCode::MissingLineageManifest => DscpV1::MissingLineageManifest,
+            ConfigurationErrorCode::DuplicateLineageManifest => {
                 let count = self.count(76)?;
                 DscpV1::DuplicateLineageManifest {
                     entries: (0..count)
@@ -894,17 +894,17 @@ impl<'a> DscpDecoder<'a> {
                         .collect::<Result<Vec<_>, _>>()?,
                 }
             }
-            ConfigurationPoisonCode::UnsupportedTargetIdentity => {
+            ConfigurationErrorCode::UnsupportedTargetIdentity => {
                 DscpV1::UnsupportedTargetIdentity {
                     target: self.string()?,
                     expected: self.layout_identity()?,
                     observed: self.layout_identity()?,
                 }
             }
-            ConfigurationPoisonCode::DuplicateTargetName => DscpV1::DuplicateTargetName {
+            ConfigurationErrorCode::DuplicateTargetName => DscpV1::DuplicateTargetName {
                 normalized_name: self.string()?,
             },
-            ConfigurationPoisonCode::ConfigurationSourceUnavailable => {
+            ConfigurationErrorCode::ConfigurationSourceUnavailable => {
                 DscpV1::ConfigurationSourceUnavailable {
                     path: self.configuration_source_path()?,
                     failure: match self.u16()? {
@@ -982,17 +982,17 @@ fn validate_dscp_text(detail: &DscpV1) -> Result<(), DscpError> {
     }
 }
 
-/// Stable typed failure carried by a configuration-poisoned input version.
+/// Stable typed failure carried by a configuration-failed input version.
 /// `message` is presentation-only; `reason_hash` is exclusively DSCP v1.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigurationPoison {
-    pub code: ConfigurationPoisonCode,
+pub struct ConfigurationError {
+    pub code: ConfigurationErrorCode,
     pub reason_hash: [u8; 32],
     pub detail: Box<DscpV1>,
     pub message: String,
 }
 
-impl ConfigurationPoison {
+impl ConfigurationError {
     pub fn from_reason(reason: &DscpV1, message: impl Into<String>) -> Self {
         Self {
             code: reason.code(),
@@ -1014,19 +1014,19 @@ impl ConfigurationPoison {
     /// Typed facts order by `(code, canonical detail bytes)`; prose only
     /// chooses a stable representative of an otherwise duplicate fact.
     pub fn select_canonical(
-        poisons: impl IntoIterator<Item = Self>,
+        errors: impl IntoIterator<Item = Self>,
     ) -> Result<Option<Self>, DscpError> {
-        Ok(Self::canonical_set(poisons)?.into_iter().next())
+        Ok(Self::canonical_set(errors)?.into_iter().next())
     }
 
     /// Complete canonically ordered set retained for doctor diagnostics.
-    pub fn canonical_set(poisons: impl IntoIterator<Item = Self>) -> Result<Vec<Self>, DscpError> {
-        let mut keyed = poisons
+    pub fn canonical_set(errors: impl IntoIterator<Item = Self>) -> Result<Vec<Self>, DscpError> {
+        let mut keyed = errors
             .into_iter()
-            .map(|poison| {
-                poison.validate()?;
-                let key = (poison.code as u16, poison.detail.canonical_detail_bytes());
-                Ok((key, poison))
+            .map(|error| {
+                error.validate()?;
+                let key = (error.code as u16, error.detail.canonical_detail_bytes());
+                Ok((key, error))
             })
             .collect::<Result<Vec<_>, DscpError>>()?;
         keyed.sort_by(|(left_key, left), (right_key, right)| {
@@ -1035,41 +1035,41 @@ impl ConfigurationPoison {
                 .then_with(|| left.message.cmp(&right.message))
         });
         keyed.dedup_by(|(left_key, _), (right_key, _)| left_key == right_key);
-        Ok(keyed.into_iter().map(|(_, poison)| poison).collect())
+        Ok(keyed.into_iter().map(|(_, error)| error).collect())
     }
 }
 
-impl fmt::Display for ConfigurationPoison {
+impl fmt::Display for ConfigurationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "configuration poison {:?} ({:02x?}): {}",
+            "configuration error {:?} ({:02x?}): {}",
             self.code, self.reason_hash, self.message
         )
     }
 }
 
-impl std::error::Error for ConfigurationPoison {}
+impl std::error::Error for ConfigurationError {}
 
-impl fmt::Display for PipelinePoison {
+impl fmt::Display for PipelineFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pipeline poison: {}", self.message)
+        write!(f, "pipeline failure: {}", self.message)
     }
 }
 
-impl std::error::Error for PipelinePoison {}
+impl std::error::Error for PipelineFailure {}
 
-impl fmt::Display for PipelinePoisonError {
+impl fmt::Display for PipelineFailureDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid pipeline poison: {self:?}")
+        write!(f, "invalid pipeline failure: {self:?}")
     }
 }
 
-impl std::error::Error for PipelinePoisonError {}
+impl std::error::Error for PipelineFailureDecodeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-pub enum VersionPoisonCode {
+pub enum NamespaceErrorCode {
     DuplicateAssetUuid = 1,
     DuplicateBundleUuid = 2,
     SameRootNormalizedPathCollision = 3,
@@ -1165,7 +1165,7 @@ pub struct PhysicalPathClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionPoisonV1 {
+pub enum NamespaceErrorV1 {
     DuplicateAssetUuid {
         asset: AssetUuid,
         claimants: Vec<AssetClaimant>,
@@ -1199,18 +1199,18 @@ pub enum VersionPoisonV1 {
     },
 }
 
-/// §7/§13's closed version-global poison record. `identity` commits only to
+/// §7/§13's closed namespace error record. `identity` commits only to
 /// the typed facts; `message` is presentation text and cannot affect healing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionPoison {
-    pub code: VersionPoisonCode,
+pub struct NamespaceError {
+    pub code: NamespaceErrorCode,
     pub identity: [u8; 32],
-    pub detail: VersionPoisonV1,
+    pub detail: NamespaceErrorV1,
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionPoisonError {
+pub enum NamespaceErrorDecodeError {
     UnsupportedVersion(u8),
     UnknownCode(u16),
     UnknownFailureCode(u16),
@@ -1229,40 +1229,40 @@ pub enum VersionPoisonError {
     IdentityMismatch,
 }
 
-impl fmt::Display for VersionPoisonError {
+impl fmt::Display for NamespaceErrorDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid version poison: {self:?}")
+        write!(f, "invalid namespace error: {self:?}")
     }
 }
 
-impl std::error::Error for VersionPoisonError {}
+impl std::error::Error for NamespaceErrorDecodeError {}
 
-impl VersionPoisonV1 {
-    pub fn code(&self) -> VersionPoisonCode {
+impl NamespaceErrorV1 {
+    pub fn code(&self) -> NamespaceErrorCode {
         match self {
-            Self::DuplicateAssetUuid { .. } => VersionPoisonCode::DuplicateAssetUuid,
-            Self::DuplicateBundleUuid { .. } => VersionPoisonCode::DuplicateBundleUuid,
+            Self::DuplicateAssetUuid { .. } => NamespaceErrorCode::DuplicateAssetUuid,
+            Self::DuplicateBundleUuid { .. } => NamespaceErrorCode::DuplicateBundleUuid,
             Self::SameRootNormalizedPathCollision { .. } => {
-                VersionPoisonCode::SameRootNormalizedPathCollision
+                NamespaceErrorCode::SameRootNormalizedPathCollision
             }
-            Self::IncompleteSkeleton { .. } => VersionPoisonCode::IncompleteSkeleton,
+            Self::IncompleteSkeleton { .. } => NamespaceErrorCode::IncompleteSkeleton,
             Self::UnreadableGlobalBundlePath { .. } => {
-                VersionPoisonCode::UnreadableGlobalBundlePath
+                NamespaceErrorCode::UnreadableGlobalBundlePath
             }
-            Self::InvalidPhysicalPath { .. } => VersionPoisonCode::InvalidPhysicalPath,
-            Self::UnreadableScanSubtree { .. } => VersionPoisonCode::UnreadableScanSubtree,
+            Self::InvalidPhysicalPath { .. } => NamespaceErrorCode::InvalidPhysicalPath,
+            Self::UnreadableScanSubtree { .. } => NamespaceErrorCode::UnreadableScanSubtree,
         }
     }
 }
 
-impl VersionPoison {
+impl NamespaceError {
     pub fn new(
-        detail: VersionPoisonV1,
+        detail: NamespaceErrorV1,
         message: impl Into<String>,
-    ) -> Result<Self, VersionPoisonError> {
-        validate_version_poison_detail(&detail)?;
+    ) -> Result<Self, NamespaceErrorDecodeError> {
+        validate_namespace_error_detail(&detail)?;
         let code = detail.code();
-        let identity = version_poison_identity(code, &detail);
+        let identity = namespace_error_identity(code, &detail);
         Ok(Self {
             code,
             identity,
@@ -1271,84 +1271,84 @@ impl VersionPoison {
         })
     }
 
-    pub fn validate(&self) -> Result<(), VersionPoisonError> {
+    pub fn validate(&self) -> Result<(), NamespaceErrorDecodeError> {
         if self.code != self.detail.code() {
-            return Err(VersionPoisonError::IdentityMismatch);
+            return Err(NamespaceErrorDecodeError::IdentityMismatch);
         }
-        validate_version_poison_detail(&self.detail)?;
-        if self.identity != version_poison_identity(self.code, &self.detail) {
-            return Err(VersionPoisonError::IdentityMismatch);
+        validate_namespace_error_detail(&self.detail)?;
+        if self.identity != namespace_error_identity(self.code, &self.detail) {
+            return Err(NamespaceErrorDecodeError::IdentityMismatch);
         }
         Ok(())
     }
 
-    pub fn persisted_bytes(&self) -> Result<Vec<u8>, VersionPoisonError> {
+    pub fn persisted_bytes(&self) -> Result<Vec<u8>, NamespaceErrorDecodeError> {
         self.validate()?;
         let mut encoder = CanonicalEncoder::new();
         encoder.raw(&DSVP);
         encoder.u8(1);
         encoder.u16(self.code as u16);
-        encode_version_poison_detail(&mut encoder, &self.detail);
+        encode_namespace_error_detail(&mut encoder, &self.detail);
         encoder.str(&self.message);
         Ok(encoder.into_bytes())
     }
 
-    pub fn from_persisted_bytes(bytes: &[u8]) -> Result<Self, VersionPoisonError> {
-        let mut decoder = VersionPoisonDecoder { bytes, cursor: 0 };
+    pub fn from_persisted_bytes(bytes: &[u8]) -> Result<Self, NamespaceErrorDecodeError> {
+        let mut decoder = NamespaceErrorDecoder { bytes, cursor: 0 };
         if decoder.take(4)? != DSVP {
-            return Err(VersionPoisonError::UnknownCode(0));
+            return Err(NamespaceErrorDecodeError::UnknownCode(0));
         }
         let version = decoder.u8()?;
         if version != 1 {
-            return Err(VersionPoisonError::UnsupportedVersion(version));
+            return Err(NamespaceErrorDecodeError::UnsupportedVersion(version));
         }
         let code_raw = decoder.u16()?;
-        let code = VersionPoisonCode::try_from(code_raw)?;
+        let code = NamespaceErrorCode::try_from(code_raw)?;
         let detail = decoder.detail(code)?;
         let message = decoder.string()?;
         if decoder.cursor != bytes.len() {
-            return Err(VersionPoisonError::TrailingBytes);
+            return Err(NamespaceErrorDecodeError::TrailingBytes);
         }
         Self::new(detail, message)
     }
 
-    /// Selects the one authoritative version poison independently of scan
+    /// Selects the one authoritative namespace error independently of scan
     /// discovery order. Typed identity is ordered by `(code, canonical
     /// detail bytes)`; presentation text only resolves an otherwise identical
     /// typed record so duplicate diagnostics cannot reintroduce ordering.
     pub fn select_canonical(
-        poisons: impl IntoIterator<Item = Self>,
-    ) -> Result<Option<Self>, VersionPoisonError> {
-        Ok(Self::canonical_set(poisons)?.into_iter().next())
+        errors: impl IntoIterator<Item = Self>,
+    ) -> Result<Option<Self>, NamespaceErrorDecodeError> {
+        Ok(Self::canonical_set(errors)?.into_iter().next())
     }
 
     /// Returns the complete doctor-diagnostic set in the same canonical
     /// order used to select publication authority. Duplicate typed details
     /// collapse even when their presentation messages differ.
     pub fn canonical_set(
-        poisons: impl IntoIterator<Item = Self>,
-    ) -> Result<Vec<Self>, VersionPoisonError> {
-        let mut keyed = poisons
+        errors: impl IntoIterator<Item = Self>,
+    ) -> Result<Vec<Self>, NamespaceErrorDecodeError> {
+        let mut keyed = errors
             .into_iter()
-            .map(|poison| {
-                poison.validate()?;
+            .map(|error| {
+                error.validate()?;
                 let mut detail = CanonicalEncoder::new();
-                encode_version_poison_detail(&mut detail, &poison.detail);
-                Ok(((poison.code as u16, detail.into_bytes()), poison))
+                encode_namespace_error_detail(&mut detail, &error.detail);
+                Ok(((error.code as u16, detail.into_bytes()), error))
             })
-            .collect::<Result<Vec<_>, VersionPoisonError>>()?;
+            .collect::<Result<Vec<_>, NamespaceErrorDecodeError>>()?;
         keyed.sort_by(|(left_key, left), (right_key, right)| {
             left_key
                 .cmp(right_key)
                 .then_with(|| left.message.cmp(&right.message))
         });
         keyed.dedup_by(|(left_key, _), (right_key, _)| left_key == right_key);
-        Ok(keyed.into_iter().map(|(_, poison)| poison).collect())
+        Ok(keyed.into_iter().map(|(_, error)| error).collect())
     }
 }
 
-impl TryFrom<u16> for VersionPoisonCode {
-    type Error = VersionPoisonError;
+impl TryFrom<u16> for NamespaceErrorCode {
+    type Error = NamespaceErrorDecodeError;
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::DuplicateAssetUuid),
@@ -1358,67 +1358,67 @@ impl TryFrom<u16> for VersionPoisonCode {
             5 => Ok(Self::UnreadableGlobalBundlePath),
             6 => Ok(Self::InvalidPhysicalPath),
             7 => Ok(Self::UnreadableScanSubtree),
-            other => Err(VersionPoisonError::UnknownCode(other)),
+            other => Err(NamespaceErrorDecodeError::UnknownCode(other)),
         }
     }
 }
 
-pub(crate) struct VersionPoisonDecoder<'a> {
+pub(crate) struct NamespaceErrorDecoder<'a> {
     bytes: &'a [u8],
     cursor: usize,
 }
 
-impl<'a> VersionPoisonDecoder<'a> {
+impl<'a> NamespaceErrorDecoder<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, cursor: 0 }
     }
 
     /// Fails unless every byte was consumed.
-    pub(crate) fn finish(&self) -> Result<(), VersionPoisonError> {
+    pub(crate) fn finish(&self) -> Result<(), NamespaceErrorDecodeError> {
         if self.cursor == self.bytes.len() {
             Ok(())
         } else {
-            Err(VersionPoisonError::TrailingBytes)
+            Err(NamespaceErrorDecodeError::TrailingBytes)
         }
     }
 
-    fn take(&mut self, count: usize) -> Result<&'a [u8], VersionPoisonError> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], NamespaceErrorDecodeError> {
         let end = self
             .cursor
             .checked_add(count)
-            .ok_or(VersionPoisonError::Truncated)?;
+            .ok_or(NamespaceErrorDecodeError::Truncated)?;
         let value = self
             .bytes
             .get(self.cursor..end)
-            .ok_or(VersionPoisonError::Truncated)?;
+            .ok_or(NamespaceErrorDecodeError::Truncated)?;
         self.cursor = end;
         Ok(value)
     }
 
-    pub(crate) fn u8(&mut self) -> Result<u8, VersionPoisonError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, NamespaceErrorDecodeError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, VersionPoisonError> {
+    fn u16(&mut self) -> Result<u16, NamespaceErrorDecodeError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
 
-    fn u32(&mut self) -> Result<u32, VersionPoisonError> {
+    fn u32(&mut self) -> Result<u32, NamespaceErrorDecodeError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], VersionPoisonError> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], NamespaceErrorDecodeError> {
         Ok(self.take(N)?.try_into().unwrap())
     }
 
-    pub(crate) fn string(&mut self) -> Result<String, VersionPoisonError> {
-        let len = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+    pub(crate) fn string(&mut self) -> Result<String, NamespaceErrorDecodeError> {
+        let len = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         std::str::from_utf8(self.take(len)?)
             .map(str::to_owned)
-            .map_err(|_| VersionPoisonError::InvalidUtf8)
+            .map_err(|_| NamespaceErrorDecodeError::InvalidUtf8)
     }
 
-    pub(crate) fn source(&mut self) -> Result<ReadableBundleSource, VersionPoisonError> {
+    pub(crate) fn source(&mut self) -> Result<ReadableBundleSource, NamespaceErrorDecodeError> {
         Ok(ReadableBundleSource {
             root_name: self.string()?,
             normalized_path: self.string()?,
@@ -1426,23 +1426,23 @@ impl<'a> VersionPoisonDecoder<'a> {
         })
     }
 
-    fn sources(&mut self) -> Result<Vec<ReadableBundleSource>, VersionPoisonError> {
-        let count = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+    fn sources(&mut self) -> Result<Vec<ReadableBundleSource>, NamespaceErrorDecodeError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         if count > self.bytes.len().saturating_sub(self.cursor) / 40 {
-            return Err(VersionPoisonError::Truncated);
+            return Err(NamespaceErrorDecodeError::Truncated);
         }
         (0..count).map(|_| self.source()).collect()
     }
 
-    fn claimants(&mut self) -> Result<Vec<AssetClaimant>, VersionPoisonError> {
-        let count = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+    fn claimants(&mut self) -> Result<Vec<AssetClaimant>, NamespaceErrorDecodeError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
-            return Err(VersionPoisonError::Truncated);
+            return Err(NamespaceErrorDecodeError::Truncated);
         }
         (0..count).map(|_| self.claimant()).collect()
     }
 
-    pub(crate) fn claimant(&mut self) -> Result<AssetClaimant, VersionPoisonError> {
+    pub(crate) fn claimant(&mut self) -> Result<AssetClaimant, NamespaceErrorDecodeError> {
         match self.u8()? {
             1 => Ok(AssetClaimant::Authored {
                 source: self.source()?,
@@ -1453,14 +1453,14 @@ impl<'a> VersionPoisonDecoder<'a> {
                 parent: AssetUuid(self.array()?),
                 output_key: self.string()?,
             }),
-            other => Err(VersionPoisonError::UnknownClaimantTag(other)),
+            other => Err(NamespaceErrorDecodeError::UnknownClaimantTag(other)),
         }
     }
 
-    fn path_claims(&mut self) -> Result<Vec<PhysicalPathClaim>, VersionPoisonError> {
-        let count = usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+    fn path_claims(&mut self) -> Result<Vec<PhysicalPathClaim>, NamespaceErrorDecodeError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
         if count > self.bytes.len().saturating_sub(self.cursor) / 6 {
-            return Err(VersionPoisonError::Truncated);
+            return Err(NamespaceErrorDecodeError::Truncated);
         }
         (0..count)
             .map(|_| {
@@ -1472,46 +1472,49 @@ impl<'a> VersionPoisonDecoder<'a> {
             .collect()
     }
 
-    fn platform_path(&mut self) -> Result<PlatformPathBytes, VersionPoisonError> {
+    fn platform_path(&mut self) -> Result<PlatformPathBytes, NamespaceErrorDecodeError> {
         match self.u8()? {
             1 => {
                 let len =
-                    usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+                    usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
                 Ok(PlatformPathBytes::Unix(self.take(len)?.to_vec()))
             }
             2 => {
                 let count =
-                    usize::try_from(self.u32()?).map_err(|_| VersionPoisonError::Truncated)?;
+                    usize::try_from(self.u32()?).map_err(|_| NamespaceErrorDecodeError::Truncated)?;
                 if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
-                    return Err(VersionPoisonError::Truncated);
+                    return Err(NamespaceErrorDecodeError::Truncated);
                 }
                 let units = (0..count)
                     .map(|_| self.u16())
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(PlatformPathBytes::Windows(units))
             }
-            other => Err(VersionPoisonError::UnknownPlatformPathTag(other)),
+            other => Err(NamespaceErrorDecodeError::UnknownPlatformPathTag(other)),
         }
     }
 
-    fn detail(&mut self, code: VersionPoisonCode) -> Result<VersionPoisonV1, VersionPoisonError> {
+    fn detail(
+        &mut self,
+        code: NamespaceErrorCode,
+    ) -> Result<NamespaceErrorV1, NamespaceErrorDecodeError> {
         Ok(match code {
-            VersionPoisonCode::DuplicateAssetUuid => VersionPoisonV1::DuplicateAssetUuid {
+            NamespaceErrorCode::DuplicateAssetUuid => NamespaceErrorV1::DuplicateAssetUuid {
                 asset: AssetUuid(self.array()?),
                 claimants: self.claimants()?,
             },
-            VersionPoisonCode::DuplicateBundleUuid => VersionPoisonV1::DuplicateBundleUuid {
+            NamespaceErrorCode::DuplicateBundleUuid => NamespaceErrorV1::DuplicateBundleUuid {
                 bundle: BundleUuid(self.array()?),
                 sources: self.sources()?,
             },
-            VersionPoisonCode::SameRootNormalizedPathCollision => {
-                VersionPoisonV1::SameRootNormalizedPathCollision {
+            NamespaceErrorCode::SameRootNormalizedPathCollision => {
+                NamespaceErrorV1::SameRootNormalizedPathCollision {
                     root_name: self.string()?,
                     normalized_path: self.string()?,
                     claims: self.path_claims()?,
                 }
             }
-            VersionPoisonCode::IncompleteSkeleton => VersionPoisonV1::IncompleteSkeleton {
+            NamespaceErrorCode::IncompleteSkeleton => NamespaceErrorV1::IncompleteSkeleton {
                 source: self.source()?,
                 failure: match self.u16()? {
                     1 => SkeletonFailureCode::EnvelopeMalformed,
@@ -1520,11 +1523,11 @@ impl<'a> VersionPoisonDecoder<'a> {
                     4 => SkeletonFailureCode::IncompleteAssetIdentity,
                     5 => SkeletonFailureCode::IncompleteTypeIdentity,
                     6 => SkeletonFailureCode::IncompleteTagIdentity,
-                    other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                    other => return Err(NamespaceErrorDecodeError::UnknownFailureCode(other)),
                 },
             },
-            VersionPoisonCode::UnreadableGlobalBundlePath => {
-                VersionPoisonV1::UnreadableGlobalBundlePath {
+            NamespaceErrorCode::UnreadableGlobalBundlePath => {
+                NamespaceErrorV1::UnreadableGlobalBundlePath {
                     root_name: self.string()?,
                     normalized_path: self.string()?,
                     failure: match self.u16()? {
@@ -1532,11 +1535,11 @@ impl<'a> VersionPoisonDecoder<'a> {
                         2 => GlobalBundleReadFailureCode::InvalidFileType,
                         3 => GlobalBundleReadFailureCode::SymlinkIdentityChanged,
                         4 => GlobalBundleReadFailureCode::IoDataLoss,
-                        other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                        other => return Err(NamespaceErrorDecodeError::UnknownFailureCode(other)),
                     },
                 }
             }
-            VersionPoisonCode::InvalidPhysicalPath => VersionPoisonV1::InvalidPhysicalPath {
+            NamespaceErrorCode::InvalidPhysicalPath => NamespaceErrorV1::InvalidPhysicalPath {
                 root_name: self.string()?,
                 raw_relative_path: self.platform_path()?,
                 failure: match self.u16()? {
@@ -1547,10 +1550,10 @@ impl<'a> VersionPoisonDecoder<'a> {
                     5 => PhysicalPathFailureCode::DotComponent,
                     6 => PhysicalPathFailureCode::ParentComponent,
                     7 => PhysicalPathFailureCode::ForbiddenCharacter,
-                    other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                    other => return Err(NamespaceErrorDecodeError::UnknownFailureCode(other)),
                 },
             },
-            VersionPoisonCode::UnreadableScanSubtree => VersionPoisonV1::UnreadableScanSubtree {
+            NamespaceErrorCode::UnreadableScanSubtree => NamespaceErrorV1::UnreadableScanSubtree {
                 subject: match self.u8()? {
                     1 => ScanSubject::Root {
                         root_name: self.string()?,
@@ -1559,7 +1562,7 @@ impl<'a> VersionPoisonDecoder<'a> {
                         root_name: self.string()?,
                         raw_relative_path: self.platform_path()?,
                     },
-                    other => return Err(VersionPoisonError::UnknownScanSubjectTag(other)),
+                    other => return Err(NamespaceErrorDecodeError::UnknownScanSubjectTag(other)),
                 },
                 failure: match self.u16()? {
                     1 => ScanFailureCode::PermissionDenied,
@@ -1567,33 +1570,33 @@ impl<'a> VersionPoisonDecoder<'a> {
                     3 => ScanFailureCode::InvalidFileType,
                     4 => ScanFailureCode::SymlinkIdentityChanged,
                     5 => ScanFailureCode::IoDataLoss,
-                    other => return Err(VersionPoisonError::UnknownFailureCode(other)),
+                    other => return Err(NamespaceErrorDecodeError::UnknownFailureCode(other)),
                 },
             },
         })
     }
 }
 
-fn version_poison_identity(code: VersionPoisonCode, detail: &VersionPoisonV1) -> [u8; 32] {
+fn namespace_error_identity(code: NamespaceErrorCode, detail: &NamespaceErrorV1) -> [u8; 32] {
     let mut encoder = CanonicalEncoder::new();
     encoder.raw(&DSVP);
     encoder.u8(1);
     encoder.u16(code as u16);
-    encode_version_poison_detail(&mut encoder, detail);
+    encode_namespace_error_detail(&mut encoder, detail);
     *blake3::hash(&encoder.into_bytes()).as_bytes()
 }
 
-fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &VersionPoisonV1) {
+fn encode_namespace_error_detail(encoder: &mut CanonicalEncoder, detail: &NamespaceErrorV1) {
     match detail {
-        VersionPoisonV1::DuplicateAssetUuid { asset, claimants } => {
+        NamespaceErrorV1::DuplicateAssetUuid { asset, claimants } => {
             encoder.raw(&asset.0);
             encoder.seq(claimants, encode_asset_claimant);
         }
-        VersionPoisonV1::DuplicateBundleUuid { bundle, sources } => {
+        NamespaceErrorV1::DuplicateBundleUuid { bundle, sources } => {
             encoder.raw(&bundle.0);
             encode_bundle_sources(encoder, sources);
         }
-        VersionPoisonV1::SameRootNormalizedPathCollision {
+        NamespaceErrorV1::SameRootNormalizedPathCollision {
             root_name,
             normalized_path,
             claims,
@@ -1602,11 +1605,11 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
             encoder.str(normalized_path);
             encoder.seq(claims, encode_physical_path_claim);
         }
-        VersionPoisonV1::IncompleteSkeleton { source, failure } => {
+        NamespaceErrorV1::IncompleteSkeleton { source, failure } => {
             encode_bundle_source(encoder, source);
             encoder.u16(*failure as u16);
         }
-        VersionPoisonV1::UnreadableGlobalBundlePath {
+        NamespaceErrorV1::UnreadableGlobalBundlePath {
             root_name,
             normalized_path,
             failure,
@@ -1615,7 +1618,7 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
             encoder.str(normalized_path);
             encoder.u16(*failure as u16);
         }
-        VersionPoisonV1::InvalidPhysicalPath {
+        NamespaceErrorV1::InvalidPhysicalPath {
             root_name,
             raw_relative_path,
             failure,
@@ -1624,7 +1627,7 @@ fn encode_version_poison_detail(encoder: &mut CanonicalEncoder, detail: &Version
             encode_platform_path(encoder, raw_relative_path);
             encoder.u16(*failure as u16);
         }
-        VersionPoisonV1::UnreadableScanSubtree { subject, failure } => {
+        NamespaceErrorV1::UnreadableScanSubtree { subject, failure } => {
             match subject {
                 ScanSubject::Root { root_name } => {
                     encoder.u8(1);
@@ -1696,22 +1699,24 @@ pub(crate) fn encode_bundle_source(encoder: &mut CanonicalEncoder, source: &Read
     encoder.raw(&source.file_hash.0);
 }
 
-fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), VersionPoisonError> {
+fn validate_namespace_error_detail(
+    detail: &NamespaceErrorV1,
+) -> Result<(), NamespaceErrorDecodeError> {
     let validate_source = |source: &ReadableBundleSource| {
         validate_root_and_path(&source.root_name, &source.normalized_path)
     };
     let validate_collision_sources = |sources: &[ReadableBundleSource]| {
         if sources.len() < 2 {
-            return Err(VersionPoisonError::InsufficientSources);
+            return Err(NamespaceErrorDecodeError::InsufficientSources);
         }
         if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(VersionPoisonError::NonCanonicalSources);
+            return Err(NamespaceErrorDecodeError::NonCanonicalSources);
         }
         sources.iter().try_for_each(validate_source)
     };
 
     match detail {
-        VersionPoisonV1::DuplicateAssetUuid { claimants, .. } => {
+        NamespaceErrorV1::DuplicateAssetUuid { claimants, .. } => {
             validate_strict_two(claimants)?;
             for claimant in claimants {
                 match claimant {
@@ -1727,10 +1732,10 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
                 }
             }
         }
-        VersionPoisonV1::DuplicateBundleUuid { sources, .. } => {
+        NamespaceErrorV1::DuplicateBundleUuid { sources, .. } => {
             validate_collision_sources(sources)?;
         }
-        VersionPoisonV1::SameRootNormalizedPathCollision {
+        NamespaceErrorV1::SameRootNormalizedPathCollision {
             root_name,
             normalized_path,
             claims,
@@ -1739,25 +1744,25 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
             validate_strict_two(claims)?;
             claims.iter().try_for_each(validate_physical_path_claim)?;
         }
-        VersionPoisonV1::IncompleteSkeleton { source, .. } => validate_source(source)?,
-        VersionPoisonV1::UnreadableGlobalBundlePath {
+        NamespaceErrorV1::IncompleteSkeleton { source, .. } => validate_source(source)?,
+        NamespaceErrorV1::UnreadableGlobalBundlePath {
             root_name,
             normalized_path,
             ..
         } => {
             validate_root_and_path(root_name, normalized_path)?;
         }
-        VersionPoisonV1::InvalidPhysicalPath {
+        NamespaceErrorV1::InvalidPhysicalPath {
             root_name,
             raw_relative_path,
             failure,
         } => {
             validate_root_name(root_name)?;
             if classify_invalid_physical_path(raw_relative_path) != Some(*failure) {
-                return Err(VersionPoisonError::InvalidRawPath);
+                return Err(NamespaceErrorDecodeError::InvalidRawPath);
             }
         }
-        VersionPoisonV1::UnreadableScanSubtree { subject, .. } => match subject {
+        NamespaceErrorV1::UnreadableScanSubtree { subject, .. } => match subject {
             ScanSubject::Root { root_name } => validate_root_name(root_name)?,
             ScanSubject::Subtree {
                 root_name,
@@ -1765,7 +1770,7 @@ fn validate_version_poison_detail(detail: &VersionPoisonV1) -> Result<(), Versio
             } => {
                 validate_root_name(root_name)?;
                 if classify_invalid_physical_path(raw_relative_path).is_some() {
-                    return Err(VersionPoisonError::InvalidRawPath);
+                    return Err(NamespaceErrorDecodeError::InvalidRawPath);
                 }
             }
         },
@@ -1843,28 +1848,30 @@ fn classify_invalid_physical_path(path: &PlatformPathBytes) -> Option<PhysicalPa
     }
 }
 
-fn validate_strict_two<T: Ord>(values: &[T]) -> Result<(), VersionPoisonError> {
+fn validate_strict_two<T: Ord>(values: &[T]) -> Result<(), NamespaceErrorDecodeError> {
     if values.len() < 2 {
-        return Err(VersionPoisonError::InsufficientSources);
+        return Err(NamespaceErrorDecodeError::InsufficientSources);
     }
     if values.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(VersionPoisonError::NonCanonicalSources);
+        return Err(NamespaceErrorDecodeError::NonCanonicalSources);
     }
     Ok(())
 }
 
-fn validate_identifier(value: &str) -> Result<(), VersionPoisonError> {
+fn validate_identifier(value: &str) -> Result<(), NamespaceErrorDecodeError> {
     use unicode_normalization::UnicodeNormalization;
     if value.is_empty()
         || value.nfc().collect::<String>() != value
         || value.contains(['/', '\\', '\0'])
     {
-        return Err(VersionPoisonError::InvalidClaimant);
+        return Err(NamespaceErrorDecodeError::InvalidClaimant);
     }
     Ok(())
 }
 
-fn validate_physical_path_claim(claim: &PhysicalPathClaim) -> Result<(), VersionPoisonError> {
+fn validate_physical_path_claim(
+    claim: &PhysicalPathClaim,
+) -> Result<(), NamespaceErrorDecodeError> {
     let valid = match &claim.raw_relative_path {
         PlatformPathBytes::Unix(bytes) => {
             !bytes.is_empty()
@@ -1886,31 +1893,31 @@ fn validate_physical_path_claim(claim: &PhysicalPathClaim) -> Result<(), Version
     if valid {
         Ok(())
     } else {
-        Err(VersionPoisonError::InvalidRawPath)
+        Err(NamespaceErrorDecodeError::InvalidRawPath)
     }
 }
 
 fn validate_root_and_path(
     root_name: &str,
     normalized_path: &str,
-) -> Result<(), VersionPoisonError> {
+) -> Result<(), NamespaceErrorDecodeError> {
     validate_root_name(root_name)?;
     validate_normalized_path(normalized_path)
 }
 
-fn validate_root_name(root_name: &str) -> Result<(), VersionPoisonError> {
+fn validate_root_name(root_name: &str) -> Result<(), NamespaceErrorDecodeError> {
     use unicode_normalization::UnicodeNormalization;
 
     if root_name.is_empty()
         || root_name.nfc().collect::<String>() != root_name
         || root_name.contains(['/', '\\', '\0'])
     {
-        return Err(VersionPoisonError::InvalidRootName);
+        return Err(NamespaceErrorDecodeError::InvalidRootName);
     }
     Ok(())
 }
 
-fn validate_normalized_path(normalized_path: &str) -> Result<(), VersionPoisonError> {
+fn validate_normalized_path(normalized_path: &str) -> Result<(), NamespaceErrorDecodeError> {
     use unicode_normalization::UnicodeNormalization;
 
     if normalized_path.is_empty()
@@ -1920,18 +1927,18 @@ fn validate_normalized_path(normalized_path: &str) -> Result<(), VersionPoisonEr
             .split('/')
             .any(|part| part.is_empty() || matches!(part, "." | ".."))
     {
-        return Err(VersionPoisonError::InvalidPath);
+        return Err(NamespaceErrorDecodeError::InvalidPath);
     }
     Ok(())
 }
 
-impl fmt::Display for VersionPoison {
+impl fmt::Display for NamespaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "version poison: {}", self.message)
+        write!(f, "namespace error: {}", self.message)
     }
 }
 
-impl std::error::Error for VersionPoison {}
+impl std::error::Error for NamespaceError {}
 
 /// What an `errors` row is about (LOCKLESS.md §4).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1982,7 +1989,7 @@ fn lossy_path(path: &PlatformPathBytes) -> String {
     }
 }
 
-impl VersionPoison {
+impl NamespaceError {
     /// The one entity this error is about. A collision is about the
     /// colliding UUID; every other namespace error about a file or subtree.
     pub fn scope(&self) -> ErrorScope {
@@ -1991,27 +1998,27 @@ impl VersionPoison {
             path,
         };
         match &self.detail {
-            VersionPoisonV1::DuplicateAssetUuid { asset, .. } => ErrorScope::Asset(*asset),
-            VersionPoisonV1::DuplicateBundleUuid { bundle, .. } => ErrorScope::Bundle(*bundle),
-            VersionPoisonV1::SameRootNormalizedPathCollision {
+            NamespaceErrorV1::DuplicateAssetUuid { asset, .. } => ErrorScope::Asset(*asset),
+            NamespaceErrorV1::DuplicateBundleUuid { bundle, .. } => ErrorScope::Bundle(*bundle),
+            NamespaceErrorV1::SameRootNormalizedPathCollision {
                 root_name,
                 normalized_path,
                 ..
             }
-            | VersionPoisonV1::UnreadableGlobalBundlePath {
+            | NamespaceErrorV1::UnreadableGlobalBundlePath {
                 root_name,
                 normalized_path,
                 ..
             } => file(root_name, normalized_path.clone()),
-            VersionPoisonV1::IncompleteSkeleton { source, .. } => {
+            NamespaceErrorV1::IncompleteSkeleton { source, .. } => {
                 file(&source.root_name, source.normalized_path.clone())
             }
-            VersionPoisonV1::InvalidPhysicalPath {
+            NamespaceErrorV1::InvalidPhysicalPath {
                 root_name,
                 raw_relative_path,
                 ..
             } => file(root_name, lossy_path(raw_relative_path)),
-            VersionPoisonV1::UnreadableScanSubtree { subject, .. } => match subject {
+            NamespaceErrorV1::UnreadableScanSubtree { subject, .. } => match subject {
                 ScanSubject::Root { root_name } => file(root_name, String::new()),
                 ScanSubject::Subtree {
                     root_name,
@@ -2038,18 +2045,18 @@ pub enum PipelineState {
         error: RetiredTypeReferenced,
         last_good: Option<Arc<PipelineEpoch>>,
     },
-    Poisoned {
-        error: PipelinePoison,
+    Failed {
+        error: PipelineFailure,
         last_good: Option<Arc<PipelineEpoch>>,
     },
 }
 
 /// Typed reason a snapshot has no usable pipeline epoch. Schema acceptance
-/// is deliberately not collapsed into generic pipeline poison: authoring can
+/// is deliberately not collapsed into a generic pipeline failure: authoring can
 /// inspect its manifest/candidate basis and issue the explicit bound command.
 #[derive(Debug, Clone, Copy)]
 pub enum PipelineUnavailable<'a> {
-    Poisoned(&'a PipelinePoison),
+    Failed(&'a PipelineFailure),
     SchemaAcceptanceRequired(&'a SchemaAcceptanceRequired),
     RetiredTypeReferenced(&'a RetiredTypeReferenced),
 }
@@ -2057,7 +2064,7 @@ pub enum PipelineUnavailable<'a> {
 impl fmt::Display for PipelineUnavailable<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PipelineUnavailable::Poisoned(error) => error.fmt(f),
+            PipelineUnavailable::Failed(error) => error.fmt(f),
             PipelineUnavailable::SchemaAcceptanceRequired(required) => write!(
                 f,
                 "schema acceptance required for candidate dylib {:02x?} against source manifest {} ({} registry mismatch(es))",
@@ -2077,7 +2084,7 @@ impl fmt::Display for PipelineUnavailable<'_> {
 
 impl PipelineState {
     /// The pipeline state current at a snapshot's version. Fallible,
-    /// because a pipeline-poisoned version has no `PipelineEpoch` to
+    /// because a pipeline-failed version has no `PipelineEpoch` to
     /// return (§3: a failed candidate never becomes one, and the prior
     /// epoch may not stand in).
     pub fn epoch(&self) -> Result<&Arc<PipelineEpoch>, PipelineUnavailable<'_>> {
@@ -2089,14 +2096,14 @@ impl PipelineState {
             PipelineState::RetiredTypeReferenced { error, .. } => {
                 Err(PipelineUnavailable::RetiredTypeReferenced(error))
             }
-            PipelineState::Poisoned { error, .. } => Err(PipelineUnavailable::Poisoned(error)),
+            PipelineState::Failed { error, .. } => Err(PipelineUnavailable::Failed(error)),
         }
     }
 
     /// The §13 operation classification: pure-metadata reads remain valid
-    /// under poison (`Ok(None)` — no epoch consumed); pipeline-dependent
+    /// under failure (`Ok(None)` — no epoch consumed); pipeline-dependent
     /// operations receive the epoch when ready (`Ok(Some(_))`) and fail
-    /// deterministically with its typed poison or schema-acceptance reason
+    /// deterministically with its typed failure or schema-acceptance reason
     /// otherwise.
     pub fn check(
         &self,
@@ -2110,30 +2117,30 @@ impl PipelineState {
 }
 
 /// The configuration state pinned by a snapshot. A rejected candidate
-/// is representable independently from pipeline poison: the prior valid
+/// is representable independently from a pipeline failure: the prior valid
 /// configuration is residency/bookkeeping only and is never served as
-/// the poisoned version's active values.
+/// the failed version's active values.
 #[derive(Debug, Clone)]
 pub enum ConfigurationState {
     Ready(Arc<ConfigurationEpoch>),
-    Poisoned {
-        reason: ConfigurationPoison,
+    Failed {
+        reason: ConfigurationError,
         last_good: Option<Arc<ConfigurationEpoch>>,
     },
 }
 
 impl ConfigurationState {
-    pub fn epoch(&self) -> Result<&Arc<ConfigurationEpoch>, &ConfigurationPoison> {
+    pub fn epoch(&self) -> Result<&Arc<ConfigurationEpoch>, &ConfigurationError> {
         match self {
             ConfigurationState::Ready(epoch) => Ok(epoch),
-            ConfigurationState::Poisoned { reason, .. } => Err(reason),
+            ConfigurationState::Failed { reason, .. } => Err(reason),
         }
     }
 
     pub fn check(
         &self,
         op: OperationKind,
-    ) -> Result<Option<&Arc<ConfigurationEpoch>>, &ConfigurationPoison> {
+    ) -> Result<Option<&Arc<ConfigurationEpoch>>, &ConfigurationError> {
         if !op.requires_configuration() {
             return Ok(None);
         }
@@ -2142,13 +2149,13 @@ impl ConfigurationState {
 }
 
 /// The operations §13's consistency contract classifies against a
-/// poisoned version. Pure-metadata reads never consult the epoch;
+/// failed version. Pure-metadata reads never consult the epoch;
 /// everything needing the pipeline map, registry, defaults, or migration
 /// fns does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
-    /// Creating or reading a metadata snapshot is valid under config
-    /// poison; its state fields carry the poison explicitly.
+    /// Creating or reading a metadata snapshot is valid under a config
+    /// error; its state fields carry the error explicitly.
     SnapshotRead,
     /// Path-index resolution — pure metadata.
     PathIndex,
@@ -2168,16 +2175,16 @@ pub enum OperationKind {
     /// Builds — need everything above.
     Build,
     /// Any authoring write depends on validated roots/output paths and
-    /// is refused while configuration is poisoned.
+    /// is refused while configuration has failed.
     Authoring,
     /// Target-bound RPC methods require a validated target definition
-    /// and expose configuration poison as a stable typed result.
+    /// and expose the configuration error as a stable typed result.
     TargetBoundRpc,
 }
 
 impl OperationKind {
     /// Whether the operation needs the pipeline epoch — the exact §13
-    /// split between "remains valid under poison" and "fails
+    /// split between "remains valid under failure" and "fails
     /// deterministically".
     pub fn requires_epoch(self) -> bool {
         match self {

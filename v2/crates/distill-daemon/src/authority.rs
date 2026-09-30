@@ -89,7 +89,7 @@ impl AuthoritySender {
         let _ = self.inbox.send(Message::Watch(event));
     }
 
-    /// Ask the driver to look at the pipeline (a runtime poison, or a
+    /// Ask the driver to look at the pipeline (a runtime failure, or a
     /// retired epoch that may unload).
     pub(crate) fn poke(&self) {
         let _ = self.inbox.send(Message::Poke);

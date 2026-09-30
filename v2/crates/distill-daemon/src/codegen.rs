@@ -118,7 +118,7 @@ impl CodegenService {
         output.verify()?;
 
         let snapshot = daemon.pipeline_snapshot();
-        let epoch = snapshot.epoch().map_err(|poison| poison.to_string())?;
+        let epoch = snapshot.epoch().map_err(|failure| failure.to_string())?;
         let store_handle = daemon.store();
         let basis = write_store(&store_handle)?.input_version();
         if self.last_attempted == Some(basis) {
@@ -152,7 +152,7 @@ impl CodegenService {
                 if retryable_codegen_callback_failure(&error) {
                     return Err(error.to_string());
                 }
-                let _ = daemon.sync_runtime_pipeline_poison();
+                let _ = daemon.sync_runtime_pipeline_failure();
                 self.last_attempted = Some(basis);
                 return Err(error.to_string());
             }

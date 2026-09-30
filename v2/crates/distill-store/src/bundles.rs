@@ -1,5 +1,5 @@
 //! Asset-namespace metadata (§13): `bundles`, `assets` + search tags,
-//! `path_index`, `deps`, `schemas` — and the two poison shapes.
+//! `path_index`, `deps`, `schemas` — and bundle poison versus namespace errors.
 //!
 //! Bundle-scoped poison (§7, §13): a file that cannot be indexed
 //! publishes a poison row *only when the current malformed bytes
@@ -12,7 +12,7 @@
 //! return a stable `Failed` naming the error, and tag queries whose
 //! selectors match its entries fail naming the poisoned bundle. Anything
 //! less than the complete skeleton takes §7's conservative
-//! **version-global** poison instead — *regardless of what prior
+//! **namespace error** instead — *regardless of what prior
 //! metadata exists*: a prior indexed row identifies what the OLD bytes
 //! claimed, not what the malformed bytes might claim, so a poison is
 //! scoped only by facts validated from the bytes being poisoned.
@@ -103,7 +103,7 @@ pub struct ServedAuthoring {
 /// CURRENT bytes yielded (§7, §13) — the precondition for bundle-scoped
 /// poison. Every field is a fact validated from the bytes being
 /// poisoned; the caller that could not extract all of them publishes
-/// the version-global poison instead.
+/// a namespace error instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceSkeleton {
     pub bundle: BundleUuid,
@@ -432,7 +432,7 @@ impl InputTxn<'_> {
         for entry in &skeleton.entries {
             // Plain INSERT: a skeleton UUID colliding with another
             // bundle's row is a cross-file identity collision — §7 keeps
-            // the version-global poison for those, and the constraint
+            // a namespace error for those, and the constraint
             // failure surfaces rather than silently reassigning the row.
             self.txn.execute(
                 "INSERT INTO assets(
@@ -794,7 +794,7 @@ impl StoreReader {
     }
 
     /// §13 `MetadataSnapshot::entry` semantics: `Ok(None)` is a
-    /// recordable miss; a poisoned version or a poisoned owning bundle is
+    /// recordable miss; a namespace error or a poisoned owning bundle is
     /// `Err`, never last-good metadata.
     pub fn entry(&self, asset: AssetUuid) -> Result<Option<EntryMeta>, StoreError> {
         let row = self
@@ -869,7 +869,7 @@ impl StoreReader {
 
     /// §13 `MetadataSnapshot::resolve_path` semantics: `Ok(None)` is a
     /// recordable miss; a path resolvable in more than one asset root is
-    /// `Err` (§18), never a tiebreak; version poison is `Err`.
+    /// `Err` (§18), never a tiebreak; a namespace error is `Err`.
     pub fn resolve_path(&self, path: &str) -> Result<Option<AssetUuid>, StoreError> {
         // A poisoned bundle's own path fails naming it (§13): the poison
         // row replaced the file's asset rows, and a Missing here would

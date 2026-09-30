@@ -1062,9 +1062,9 @@ fn asset_reference_query_uses_uuid_precedence_and_rejects_noncanonical_selectors
     assert!(decode_asset_reference_query(&selector(None, Some(&"x".repeat(256)))).is_err());
 }
 
-fn test_version_poison() -> VersionPoison {
-    VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+fn test_namespace_error() -> NamespaceError {
+    NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: ReadableBundleSource {
                 root_name: "assets".to_owned(),
                 normalized_path: "broken.asset".to_owned(),
@@ -1081,7 +1081,7 @@ fn test_version_poison() -> VersionPoison {
 fn metadata_namespace_calls_serve_around_a_namespace_error() {
     let server = server_with(&[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
-    let poison = test_version_poison();
+    let error = test_namespace_error();
     server
         .commit(Commit {
             authoring: vec![AuthoringMutation::Set(entry.clone())],
@@ -1107,7 +1107,7 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
                     }],
                 },
             )),
-            namespace_errors: Some(vec![poison.clone()]),
+            namespace_errors: Some(vec![error.clone()]),
             ..Commit::default()
         })
         .unwrap();
@@ -1117,7 +1117,7 @@ fn metadata_namespace_calls_serve_around_a_namespace_error() {
         .connected()
         .unwrap();
     let diagnostics = connected.hub.diagnostics().success().unwrap();
-    assert_eq!(diagnostics.namespace_errors, vec![poison]);
+    assert_eq!(diagnostics.namespace_errors, vec![error]);
     assert!(matches!(
         diagnostics.pipeline,
         PipelineDiagnostic::SchemaAcceptanceRequired(_)
@@ -1274,7 +1274,7 @@ fn target_snapshot_namespace_calls_serve_around_a_namespace_error() {
     let hub = connect(&server, &[(1, false)]);
     server
         .commit(Commit {
-            namespace_errors: Some(vec![test_version_poison()]),
+            namespace_errors: Some(vec![test_namespace_error()]),
             ..Commit::default()
         })
         .unwrap();
@@ -1302,7 +1302,7 @@ fn target_snapshot_namespace_calls_serve_around_a_namespace_error() {
 }
 
 #[test]
-fn unbound_metadata_bootstrap_survives_poison_and_has_no_runtime_surface() {
+fn unbound_metadata_bootstrap_survives_a_configuration_error_and_has_no_runtime_surface() {
     let server = server_with(&[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
     let (hash, payload) = canonical_artifact(
@@ -1316,14 +1316,14 @@ fn unbound_metadata_bootstrap_survives_poison_and_has_no_runtime_surface() {
         Vec::new(),
     );
     server.install_artifact(hash, payload).unwrap();
-    let poison = ConfigurationPoison::from_reason(
+    let error = ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash: [4; 32] },
         "invalid staged configuration",
     );
     let stamp = server
         .commit(Commit {
             authoring: vec![AuthoringMutation::Set(entry.clone())],
-            configuration: Some(ConfigurationStatus::Poisoned(poison.clone())),
+            configuration: Some(ConfigurationStatus::Failed(error.clone())),
             ..Commit::default()
         })
         .unwrap();
@@ -1337,7 +1337,7 @@ fn unbound_metadata_bootstrap_survives_poison_and_has_no_runtime_surface() {
     assert_eq!(snapshot.version(), MetadataCall::Success(stamp.version));
     assert_eq!(
         snapshot.diagnostics().success().unwrap().configuration,
-        ConfigurationStatus::Poisoned(poison.clone())
+        ConfigurationStatus::Failed(error.clone())
     );
     let authoring = connected.hub.authoring_snapshot().success().unwrap();
     assert!(matches!(
@@ -1523,24 +1523,24 @@ fn every_authoring_snapshot_method_is_lease_and_generation_fenced() {
 }
 
 #[test]
-fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_poison() {
+fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_error() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::AuthoringOnly);
-    let poison = ConfigurationPoison::from_reason(
+    let error = ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash: [9; 32] },
         "invalid staged configuration",
     );
-    let poisoned_stamp = server
+    let failed_stamp = server
         .commit(Commit {
             authoring: vec![AuthoringMutation::Set(entry.clone())],
-            configuration: Some(ConfigurationStatus::Poisoned(poison)),
+            configuration: Some(ConfigurationStatus::Failed(error)),
             ..Commit::default()
         })
         .unwrap();
 
     let pinned = authoring_snapshot(&hub);
-    assert_eq!(pinned.stamp(), poisoned_stamp);
+    assert_eq!(pinned.stamp(), failed_stamp);
     assert_eq!(
         pinned.query(AssetQuery {
             uuid: Some(entry.uuid),
@@ -1552,7 +1552,7 @@ fn authoring_inspection_is_a_pinned_pure_metadata_read_under_configuration_poiso
     assert!(matches!(
         pinned.inspect(entry.uuid),
         RpcResult::Success(AuthoringInspectResult::Inspection(value))
-            if value.stamp == poisoned_stamp
+            if value.stamp == failed_stamp
     ));
 }
 
@@ -1848,7 +1848,7 @@ fn deleted_result_preserves_the_deleting_stamp_across_later_commits() {
 }
 
 #[test]
-fn configuration_poison_is_snapshot_pinned_and_typed_without_blocking_safe_reads() {
+fn configuration_error_is_snapshot_pinned_and_typed_without_blocking_safe_reads() {
     let server = server_with(&[(1, false)]);
     let hub = connect(&server, &[(1, false)]);
     let (hash, payload) = canonical_artifact(
@@ -1865,41 +1865,41 @@ fn configuration_poison_is_snapshot_pinned_and_typed_without_blocking_safe_reads
     let reason = DscpV1::NonLoopbackAddress {
         address: "198.51.100.7:7331".to_owned(),
     };
-    let poison = ConfigurationPoison::from_reason(&reason, "daemon.address is not loopback");
+    let error = ConfigurationError::from_reason(&reason, "daemon.address is not loopback");
     server
         .commit(Commit {
-            configuration: Some(ConfigurationStatus::Poisoned(poison.clone())),
+            configuration: Some(ConfigurationStatus::Failed(error.clone())),
             ..Commit::default()
         })
         .unwrap();
-    let poisoned = snapshot(&hub);
+    let failed = snapshot(&hub);
 
     assert_eq!(
-        poisoned.configuration(),
-        RpcResult::Success(ConfigurationStatus::Poisoned(poison.clone()))
+        failed.configuration(),
+        RpcResult::Success(ConfigurationStatus::Failed(error.clone()))
     );
     assert_eq!(
-        poisoned.resolve(asset_id(1)),
-        RpcResult::ConfigurationPoisoned(poison.clone())
+        failed.resolve(asset_id(1)),
+        RpcResult::ConfigurationFailed(error.clone())
     );
     assert!(matches!(
-        poisoned.resolve_path("a.asset"),
+        failed.resolve_path("a.asset"),
         RpcResult::Success(_)
     ));
-    assert!(matches!(hub.fetch(&poisoned, hash), RpcResult::Success(_)));
-    assert!(matches!(poisoned.refresh(), RpcResult::Success(_)));
+    assert!(matches!(hub.fetch(&failed, hash), RpcResult::Success(_)));
+    assert!(matches!(failed.refresh(), RpcResult::Success(_)));
     assert!(matches!(
         hub.subscribe(InputVersion(1), vec![], vec![]),
         RpcResult::Success(_)
     ));
     assert_eq!(
         server.root().connect(request_for(7, 3, &[(1, false)])),
-        ConnectOutcome::ConfigurationPoisoned(poison.clone())
+        ConnectOutcome::ConfigurationFailed(error.clone())
     );
 
-    let same_reason_new_words = ConfigurationPoison::from_reason(&reason, "translated diagnostic");
-    assert_eq!(poison.reason_hash, same_reason_new_words.reason_hash);
-    assert_ne!(poison.message, same_reason_new_words.message);
+    let same_reason_new_words = ConfigurationError::from_reason(&reason, "translated diagnostic");
+    assert_eq!(error.reason_hash, same_reason_new_words.reason_hash);
+    assert_ne!(error.message, same_reason_new_words.message);
 }
 
 #[test]
@@ -1950,7 +1950,7 @@ fn connect_returns_typed_pipeline_unavailable_without_minting_a_hub() {
 }
 
 #[test]
-fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
+fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
     let server = server_with(&[(1, false)]);
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let stamp = server
@@ -1968,9 +1968,9 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
         .unwrap();
     let hub = connect(&server, &[(1, false)]);
     let pinned = snapshot(&hub);
-    let poison = PipelinePoison::new(
-        PipelinePoisonCode::PublishedCallbackPanic,
-        PipelinePoisonOrigin::PublishedRuntime,
+    let failure = PipelineFailure::new(
+        PipelineFailureCode::PublishedCallbackPanic,
+        PipelineFailureOrigin::PublishedRuntime,
         CleanupDisposition::PublishedEpochLeaked,
         "processor callback panicked",
     )
@@ -1978,7 +1978,7 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
     let mut persisted = false;
 
     server
-        .coordinated_runtime_pipeline_poison(poison.clone(), || {
+        .coordinated_runtime_pipeline_failure(failure.clone(), || {
             persisted = true;
             Ok(())
         })
@@ -2007,8 +2007,8 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
     assert_reconnect(hub.write(stamp.version, Vec::new()), reason);
     assert_eq!(
         server.root().connect(request_for(7, 3, &[(1, false)])),
-        ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelinePoison(
-            poison.clone()
+        ConnectOutcome::PipelineUnavailable(PipelineUnavailableDiagnostic::PipelineFailure(
+            failure.clone()
         ))
     );
     assert_eq!(
@@ -2022,7 +2022,7 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
             .success()
             .unwrap()
             .pipeline,
-        PipelineDiagnostic::Poisoned(poison)
+        PipelineDiagnostic::Failed(failure)
     );
 }
 
@@ -2030,17 +2030,17 @@ fn published_runtime_poison_fences_shared_epoch_without_minting_a_version() {
 fn commit_rejects_unauthenticated_dscp_and_noncanonical_typed_pipeline_diagnostics() {
     let server = server_with(&[(1, false)]);
     let before = server.current_stamp();
-    let mut poison = ConfigurationPoison::from_reason(
+    let mut error = ConfigurationError::from_reason(
         &DscpV1::MalformedConfiguration { file_hash: [1; 32] },
         "bad configuration",
     );
-    poison.reason_hash = [2; 32];
+    error.reason_hash = [2; 32];
     assert!(matches!(
         server.commit(Commit {
-            configuration: Some(ConfigurationStatus::Poisoned(poison)),
+            configuration: Some(ConfigurationStatus::Failed(error)),
             ..Commit::default()
         }),
-        Err(AdminError::InvalidConfigurationPoison { .. })
+        Err(AdminError::InvalidConfigurationError { .. })
     ));
 
     let empty_schema = PipelineDiagnostic::SchemaAcceptanceRequired(SchemaAcceptanceRequired {
@@ -3112,15 +3112,15 @@ fn lineage_repair_is_a_narrow_exact_basis_capability_with_typed_cas_outcomes() {
             file_hash: BundleFileHash([2; 32]),
         },
     ];
-    let poison = ConfigurationPoison::from_reason(
+    let error = ConfigurationError::from_reason(
         &DscpV1::DuplicateLineageManifest {
             entries: claimants.clone(),
         },
         "two lineage manifests",
     );
-    let poisoned_stamp = server
+    let failed_stamp = server
         .commit(Commit {
-            configuration: Some(ConfigurationStatus::Poisoned(poison)),
+            configuration: Some(ConfigurationStatus::Failed(error)),
             lineage_repair: Some(Some(LineageRepairState::Duplicate {
                 claimants: claimants.clone(),
             })),
@@ -3136,7 +3136,7 @@ fn lineage_repair_is_a_narrow_exact_basis_capability_with_typed_cas_outcomes() {
         other => panic!("expected exact repair inspection, got {other:?}"),
     };
     assert_eq!(first.instance, StoreInstanceId([9; 16]));
-    assert_eq!(first.stamp, poisoned_stamp);
+    assert_eq!(first.stamp, failed_stamp);
     assert_eq!(
         repair.resolve_duplicate(
             first.clone(),
@@ -3205,7 +3205,7 @@ fn lineage_repair_rejects_backend_publication_outside_the_repair_boundary() {
             file_hash: BundleFileHash([2; 32]),
         },
     ];
-    let poison = ConfigurationPoison::from_reason(
+    let error = ConfigurationError::from_reason(
         &DscpV1::DuplicateLineageManifest {
             entries: claimants.clone(),
         },
@@ -3213,7 +3213,7 @@ fn lineage_repair_rejects_backend_publication_outside_the_repair_boundary() {
     );
     server
         .commit(Commit {
-            configuration: Some(ConfigurationStatus::Poisoned(poison)),
+            configuration: Some(ConfigurationStatus::Failed(error)),
             lineage_repair: Some(Some(LineageRepairState::Duplicate {
                 claimants: claimants.clone(),
             })),

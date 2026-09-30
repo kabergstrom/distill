@@ -214,8 +214,8 @@ fn rpc_value<T>(result: RpcResult<T>, operation: &str) -> Result<T, PackCommandE
         RpcResult::ReconnectRequired { reason } => Err(PackCommandError::Connect(format!(
             "{operation}: reconnect required: {reason:?}"
         ))),
-        RpcResult::ConfigurationPoisoned(poison) => Err(PackCommandError::Connect(format!(
-            "{operation}: configuration poisoned: {poison:?}"
+        RpcResult::ConfigurationFailed(error) => Err(PackCommandError::Connect(format!(
+            "{operation}: configuration failed: {error:?}"
         ))),
         RpcResult::Failure(error) => {
             Err(PackCommandError::Connect(format!("{operation}: {error:?}")))

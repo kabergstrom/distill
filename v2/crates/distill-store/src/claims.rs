@@ -1,7 +1,7 @@
 //! Scan claims: what each scanned `.bundle` source claims — its bundle
 //! UUID, its authored asset UUIDs, the derived outputs its assets project,
 //! its primary path, a lineage manifest, or (for an unreadable skeleton) a
-//! version poison. Rows are keyed by the claiming (root, path), so a scan
+//! namespace error. Rows are keyed by the claiming (root, path), so a scan
 //! replaces exactly the claims of the subtree it observed.
 //!
 //! Two tables follow from the claims in the same transaction:
@@ -18,8 +18,8 @@ use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
     encode_asset_claimant, encode_bundle_source, encode_lineage_manifest_claimant, AssetClaimant,
-    LineageManifestClaimant, ReadableBundleSource, VersionPoison, VersionPoisonDecoder,
-    VersionPoisonError, VersionPoisonV1,
+    LineageManifestClaimant, ReadableBundleSource, NamespaceError, NamespaceErrorDecoder,
+    NamespaceErrorDecodeError, NamespaceErrorV1,
 };
 
 const BUNDLE: i64 = 0;
@@ -57,7 +57,7 @@ pub enum SourceClaim {
     /// A SchemaLineageManifest entry.
     Lineage(LineageManifestClaimant),
     /// The source's skeleton is unreadable.
-    Malformed(VersionPoison),
+    Malformed(NamespaceError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -128,12 +128,12 @@ fn claim_row(claim: &SourceClaim) -> Result<(i64, Vec<u8>, Vec<u8>, Vec<u8>), St
             encoded(&|encoder| encode_lineage_manifest_claimant(encoder, claimant)),
             Vec::new(),
         ),
-        SourceClaim::Malformed(poison) => (
+        SourceClaim::Malformed(error) => (
             MALFORMED,
             Vec::new(),
-            poison
+            error
                 .persisted_bytes()
-                .map_err(StoreError::InvalidVersionPoison)?,
+                .map_err(StoreError::InvalidNamespaceError)?,
             Vec::new(),
         ),
     })
@@ -319,32 +319,32 @@ impl Store {
     }
 }
 
-fn poison_error(error: VersionPoisonError) -> StoreError {
-    StoreError::InvalidVersionPoison(error)
+fn invalid_namespace_error(error: NamespaceErrorDecodeError) -> StoreError {
+    StoreError::InvalidNamespaceError(error)
 }
 
 fn uuid16(bytes: &[u8]) -> Result<[u8; 16], StoreError> {
     bytes
         .try_into()
-        .map_err(|_| poison_error(VersionPoisonError::Truncated))
+        .map_err(|_| invalid_namespace_error(NamespaceErrorDecodeError::Truncated))
 }
 
 fn decode_bundle_source(bytes: &[u8]) -> Result<ReadableBundleSource, StoreError> {
-    let mut decoder = VersionPoisonDecoder::new(bytes);
-    let source = decoder.source().map_err(poison_error)?;
-    decoder.finish().map_err(poison_error)?;
+    let mut decoder = NamespaceErrorDecoder::new(bytes);
+    let source = decoder.source().map_err(invalid_namespace_error)?;
+    decoder.finish().map_err(invalid_namespace_error)?;
     Ok(source)
 }
 
 fn decode_asset_claimant(bytes: &[u8]) -> Result<AssetClaimant, StoreError> {
-    let mut decoder = VersionPoisonDecoder::new(bytes);
-    let claimant = decoder.claimant().map_err(poison_error)?;
-    decoder.finish().map_err(poison_error)?;
+    let mut decoder = NamespaceErrorDecoder::new(bytes);
+    let claimant = decoder.claimant().map_err(invalid_namespace_error)?;
+    decoder.finish().map_err(invalid_namespace_error)?;
     Ok(claimant)
 }
 
 fn decode_lineage_claimant(bytes: &[u8]) -> Result<LineageManifestClaimant, StoreError> {
-    let mut decoder = VersionPoisonDecoder::new(bytes);
+    let mut decoder = NamespaceErrorDecoder::new(bytes);
     let claimant = (|| {
         Ok(LineageManifestClaimant {
             root_name: decoder.string()?,
@@ -355,8 +355,8 @@ fn decode_lineage_claimant(bytes: &[u8]) -> Result<LineageManifestClaimant, Stor
             file_hash: BundleFileHash(decoder.array()?),
         })
     })()
-    .map_err(poison_error)?;
-    decoder.finish().map_err(poison_error)?;
+    .map_err(invalid_namespace_error)?;
+    decoder.finish().map_err(invalid_namespace_error)?;
     Ok(claimant)
 }
 
@@ -364,15 +364,17 @@ impl StoreReader {
     /// The namespace errors of the claims, in canonical order: every
     /// malformed skeleton and every bundle or asset UUID with more than one
     /// claimant.
-    pub fn claims_namespace_errors(&self) -> Result<Vec<VersionPoison>, StoreError> {
-        let mut poisons = self
+    pub fn claims_namespace_errors(&self) -> Result<Vec<NamespaceError>, StoreError> {
+        let mut errors = self
             .query_rows(
                 "SELECT claimant FROM source_claims WHERE kind = 5",
                 [],
                 |row| row.get::<_, Vec<u8>>(0),
             )?
             .iter()
-            .map(|bytes| VersionPoison::from_persisted_bytes(bytes).map_err(poison_error))
+            .map(|bytes| {
+                NamespaceError::from_persisted_bytes(bytes).map_err(invalid_namespace_error)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let collisions = self.query_rows(
             "SELECT grp, subject FROM claim_collisions ORDER BY grp, subject",
@@ -389,15 +391,15 @@ impl StoreReader {
                 [&subject],
                 |row| row.get::<_, Vec<u8>>(0),
             )?;
-            let poison = if group == BUNDLE_GROUP {
+            let namespace_error = if group == BUNDLE_GROUP {
                 let bundle = BundleUuid(uuid16(&subject)?);
                 let mut sources = claimants
                     .iter()
                     .map(|bytes| decode_bundle_source(bytes))
                     .collect::<Result<Vec<_>, _>>()?;
                 sources.sort();
-                VersionPoison::new(
-                    VersionPoisonV1::DuplicateBundleUuid { bundle, sources },
+                NamespaceError::new(
+                    NamespaceErrorV1::DuplicateBundleUuid { bundle, sources },
                     format!("duplicate bundle UUID {bundle}"),
                 )
             } else {
@@ -407,14 +409,14 @@ impl StoreReader {
                     .map(|bytes| decode_asset_claimant(bytes))
                     .collect::<Result<Vec<_>, _>>()?;
                 claimants.sort();
-                VersionPoison::new(
-                    VersionPoisonV1::DuplicateAssetUuid { asset, claimants },
+                NamespaceError::new(
+                    NamespaceErrorV1::DuplicateAssetUuid { asset, claimants },
                     format!("duplicate asset UUID {asset}"),
                 )
             };
-            poisons.push(poison.map_err(poison_error)?);
+            errors.push(namespace_error.map_err(invalid_namespace_error)?);
         }
-        VersionPoison::canonical_set(poisons).map_err(poison_error)
+        NamespaceError::canonical_set(errors).map_err(invalid_namespace_error)
     }
 
     /// The distinct sources claiming `bundle`.
@@ -447,7 +449,7 @@ impl StoreReader {
         for (claimant, detail) in rows {
             let AssetClaimant::Derived { parent, output_key } = decode_asset_claimant(&claimant)?
             else {
-                return Err(poison_error(VersionPoisonError::InvalidClaimant));
+                return Err(invalid_namespace_error(NamespaceErrorDecodeError::InvalidClaimant));
             };
             outputs.insert(DerivedOutputClaim {
                 parent,
@@ -499,7 +501,7 @@ impl StoreReader {
                 }
                 PRIMARY_PATH => {
                     pending.paths.insert(String::from_utf8(subject).map_err(|_| {
-                        poison_error(VersionPoisonError::InvalidUtf8)
+                        invalid_namespace_error(NamespaceErrorDecodeError::InvalidUtf8)
                     })?);
                 }
                 _ => {}

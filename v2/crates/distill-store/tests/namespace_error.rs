@@ -2,8 +2,8 @@ use distill_core::canonical::{CanonicalEncoder, DSVP};
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::state::{
     AssetClaimant, PhysicalPathClaim, PhysicalPathFailureCode, PlatformPathBytes,
-    ReadableBundleSource, ScanFailureCode, ScanSubject, VersionPoison, VersionPoisonCode,
-    VersionPoisonError, VersionPoisonV1,
+    ReadableBundleSource, ScanFailureCode, ScanSubject, NamespaceError, NamespaceErrorCode,
+    NamespaceErrorDecodeError, NamespaceErrorV1,
 };
 
 fn source(root: &str, path: &str, byte: u8) -> ReadableBundleSource {
@@ -15,7 +15,7 @@ fn source(root: &str, path: &str, byte: u8) -> ReadableBundleSource {
 }
 
 #[test]
-fn version_poison_identity_pins_dsvp_v1_and_excludes_message() {
+fn namespace_error_identity_pins_dsvp_v1_and_excludes_message() {
     let claimants = vec![
         AssetClaimant::Authored {
             source: source("main", "a.bundle", 1),
@@ -27,19 +27,19 @@ fn version_poison_identity_pins_dsvp_v1_and_excludes_message() {
             output_key: "extra".into(),
         },
     ];
-    let detail = VersionPoisonV1::DuplicateAssetUuid {
+    let detail = NamespaceErrorV1::DuplicateAssetUuid {
         asset: AssetUuid([3; 16]),
         claimants: claimants.clone(),
     };
-    let first = VersionPoison::new(detail.clone(), "first wording").unwrap();
-    let second = VersionPoison::new(detail, "different wording").unwrap();
-    assert_eq!(first.code, VersionPoisonCode::DuplicateAssetUuid);
+    let first = NamespaceError::new(detail.clone(), "first wording").unwrap();
+    let second = NamespaceError::new(detail, "different wording").unwrap();
+    assert_eq!(first.code, NamespaceErrorCode::DuplicateAssetUuid);
     assert_eq!(first.identity, second.identity);
 
     let mut expected = CanonicalEncoder::new();
     expected.raw(&DSVP);
     expected.u8(1);
-    expected.u16(VersionPoisonCode::DuplicateAssetUuid as u16);
+    expected.u16(NamespaceErrorCode::DuplicateAssetUuid as u16);
     expected.raw(&[3; 16]);
     expected.u32(2);
     expected.u8(1); // AssetClaimant::Authored
@@ -57,12 +57,12 @@ fn version_poison_identity_pins_dsvp_v1_and_excludes_message() {
     );
     let encoded = first.persisted_bytes().unwrap();
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&encoded).unwrap(),
+        NamespaceError::from_persisted_bytes(&encoded).unwrap(),
         first
     );
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&[encoded, vec![0]].concat()).unwrap_err(),
-        VersionPoisonError::TrailingBytes
+        NamespaceError::from_persisted_bytes(&[encoded, vec![0]].concat()).unwrap_err(),
+        NamespaceErrorDecodeError::TrailingBytes
     );
 }
 
@@ -72,24 +72,24 @@ fn collision_sources_are_strictly_sorted_distinct_and_have_two_rows() {
         parent: AssetUuid([5; 16]),
         output_key: "extra".into(),
     };
-    let detail = |claimants| VersionPoisonV1::DuplicateAssetUuid {
+    let detail = |claimants| NamespaceErrorV1::DuplicateAssetUuid {
         asset: AssetUuid([3; 16]),
         claimants,
     };
     assert_eq!(
-        VersionPoison::new(detail(vec![one.clone()]), "bad").unwrap_err(),
-        VersionPoisonError::InsufficientSources
+        NamespaceError::new(detail(vec![one.clone()]), "bad").unwrap_err(),
+        NamespaceErrorDecodeError::InsufficientSources
     );
     assert_eq!(
-        VersionPoison::new(detail(vec![one.clone(), one]), "bad").unwrap_err(),
-        VersionPoisonError::NonCanonicalSources
+        NamespaceError::new(detail(vec![one.clone(), one]), "bad").unwrap_err(),
+        NamespaceErrorDecodeError::NonCanonicalSources
     );
 }
 
 #[test]
 fn same_root_path_collision_retains_lossless_distinct_physical_names() {
-    let poison = VersionPoison::new(
-        VersionPoisonV1::SameRootNormalizedPathCollision {
+    let error = NamespaceError::new(
+        NamespaceErrorV1::SameRootNormalizedPathCollision {
             root_name: "main".into(),
             normalized_path: "café.bundle".into(),
             claims: vec![
@@ -107,18 +107,18 @@ fn same_root_path_collision_retains_lossless_distinct_physical_names() {
     )
     .unwrap();
     assert_eq!(
-        poison.code,
-        VersionPoisonCode::SameRootNormalizedPathCollision
+        error.code,
+        NamespaceErrorCode::SameRootNormalizedPathCollision
     );
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&poison.persisted_bytes().unwrap()).unwrap(),
-        poison
+        NamespaceError::from_persisted_bytes(&error.persisted_bytes().unwrap()).unwrap(),
+        error
     );
 }
 
 #[test]
 fn invalid_physical_path_retains_raw_bytes_and_fixed_failure_code() {
-    assert_eq!(VersionPoisonCode::InvalidPhysicalPath as u16, 6);
+    assert_eq!(NamespaceErrorCode::InvalidPhysicalPath as u16, 6);
     assert_eq!(PhysicalPathFailureCode::InvalidUnixUtf8 as u16, 1);
     assert_eq!(PhysicalPathFailureCode::UnpairedWindowsUtf16 as u16, 2);
     assert_eq!(PhysicalPathFailureCode::Absolute as u16, 3);
@@ -127,8 +127,8 @@ fn invalid_physical_path_retains_raw_bytes_and_fixed_failure_code() {
     assert_eq!(PhysicalPathFailureCode::ParentComponent as u16, 6);
     assert_eq!(PhysicalPathFailureCode::ForbiddenCharacter as u16, 7);
 
-    let poison = VersionPoison::new(
-        VersionPoisonV1::InvalidPhysicalPath {
+    let error = NamespaceError::new(
+        NamespaceErrorV1::InvalidPhysicalPath {
             root_name: "main".into(),
             raw_relative_path: PlatformPathBytes::Unix(vec![b'b', 0xff]),
             failure: PhysicalPathFailureCode::InvalidUnixUtf8,
@@ -136,12 +136,12 @@ fn invalid_physical_path_retains_raw_bytes_and_fixed_failure_code() {
         "invalid physical name",
     )
     .unwrap();
-    assert_eq!(poison.code, VersionPoisonCode::InvalidPhysicalPath);
+    assert_eq!(error.code, NamespaceErrorCode::InvalidPhysicalPath);
 
-    let encoded = poison.persisted_bytes().unwrap();
+    let encoded = error.persisted_bytes().unwrap();
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&encoded).unwrap(),
-        poison
+        NamespaceError::from_persisted_bytes(&encoded).unwrap(),
+        error
     );
 
     let mut expected_identity = CanonicalEncoder::new();
@@ -154,15 +154,15 @@ fn invalid_physical_path_retains_raw_bytes_and_fixed_failure_code() {
     expected_identity.raw(&[b'b', 0xff]);
     expected_identity.u16(1); // InvalidUnixUtf8
     assert_eq!(
-        poison.identity,
+        error.identity,
         *blake3::hash(&expected_identity.into_bytes()).as_bytes()
     );
 }
 
 #[test]
 fn canonical_winner_is_independent_of_discovery_order() {
-    let invalid_path = VersionPoison::new(
-        VersionPoisonV1::InvalidPhysicalPath {
+    let invalid_path = NamespaceError::new(
+        NamespaceErrorV1::InvalidPhysicalPath {
             root_name: "main".into(),
             raw_relative_path: PlatformPathBytes::Windows(vec![0xd800]),
             failure: PhysicalPathFailureCode::UnpairedWindowsUtf16,
@@ -170,8 +170,8 @@ fn canonical_winner_is_independent_of_discovery_order() {
         "invalid path",
     )
     .unwrap();
-    let incomplete = VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+    let incomplete = NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: source("main", "broken.bundle", 7),
             failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
         },
@@ -179,25 +179,25 @@ fn canonical_winner_is_independent_of_discovery_order() {
     )
     .unwrap();
 
-    let forward = VersionPoison::select_canonical(vec![invalid_path.clone(), incomplete.clone()])
+    let forward = NamespaceError::select_canonical(vec![invalid_path.clone(), incomplete.clone()])
         .unwrap()
         .unwrap();
-    let reverse = VersionPoison::select_canonical(vec![incomplete.clone(), invalid_path])
+    let reverse = NamespaceError::select_canonical(vec![incomplete.clone(), invalid_path])
         .unwrap()
         .unwrap();
     assert_eq!(forward, incomplete);
     assert_eq!(reverse, incomplete);
 
-    let lexicographically_later = VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+    let lexicographically_later = NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: source("main", "z.bundle", 1),
             failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
         },
         "z",
     )
     .unwrap();
-    let lexicographically_first = VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+    let lexicographically_first = NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: source("main", "a.bundle", 9),
             failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
         },
@@ -205,7 +205,7 @@ fn canonical_winner_is_independent_of_discovery_order() {
     )
     .unwrap();
     assert_eq!(
-        VersionPoison::select_canonical(vec![
+        NamespaceError::select_canonical(vec![
             lexicographically_later,
             lexicographically_first.clone(),
         ])
@@ -213,16 +213,16 @@ fn canonical_winner_is_independent_of_discovery_order() {
         Some(lexicographically_first)
     );
 
-    let duplicate_a = VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+    let duplicate_a = NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: source("main", "same.bundle", 3),
             failure: distill_store::state::SkeletonFailureCode::EnvelopeMalformed,
         },
         "z diagnostic",
     )
     .unwrap();
-    let duplicate_b = VersionPoison::new(duplicate_a.detail.clone(), "a diagnostic").unwrap();
-    let set = VersionPoison::canonical_set([duplicate_a, duplicate_b]).unwrap();
+    let duplicate_b = NamespaceError::new(duplicate_a.detail.clone(), "a diagnostic").unwrap();
+    let set = NamespaceError::canonical_set([duplicate_a, duplicate_b]).unwrap();
     assert_eq!(set.len(), 1);
     assert_eq!(set[0].message, "a diagnostic");
 }
@@ -232,7 +232,7 @@ fn invalid_physical_path_rejects_unknown_failure_code() {
     let mut encoded = CanonicalEncoder::new();
     encoded.raw(&DSVP);
     encoded.u8(1);
-    encoded.u16(VersionPoisonCode::InvalidPhysicalPath as u16);
+    encoded.u16(NamespaceErrorCode::InvalidPhysicalPath as u16);
     encoded.str("main");
     encoded.u8(1); // Unix
     encoded.u32(1);
@@ -240,8 +240,8 @@ fn invalid_physical_path_rejects_unknown_failure_code() {
     encoded.u16(8); // not a PhysicalPathFailureCode
     encoded.str("diagnostic");
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&encoded.into_bytes()).unwrap_err(),
-        VersionPoisonError::UnknownFailureCode(8)
+        NamespaceError::from_persisted_bytes(&encoded.into_bytes()).unwrap_err(),
+        NamespaceErrorDecodeError::UnknownFailureCode(8)
     );
 }
 
@@ -299,8 +299,8 @@ fn invalid_physical_path_recomputes_lowest_applicable_platform_failure() {
     ];
 
     for (raw_relative_path, failure) in cases {
-        VersionPoison::new(
-            VersionPoisonV1::InvalidPhysicalPath {
+        NamespaceError::new(
+            NamespaceErrorV1::InvalidPhysicalPath {
                 root_name: "main".into(),
                 raw_relative_path: raw_relative_path.clone(),
                 failure,
@@ -315,8 +315,8 @@ fn invalid_physical_path_recomputes_lowest_applicable_platform_failure() {
             PhysicalPathFailureCode::ForbiddenCharacter
         };
         assert_eq!(
-            VersionPoison::new(
-                VersionPoisonV1::InvalidPhysicalPath {
+            NamespaceError::new(
+                NamespaceErrorV1::InvalidPhysicalPath {
                     root_name: "main".into(),
                     raw_relative_path,
                     failure: wrong,
@@ -324,35 +324,35 @@ fn invalid_physical_path_recomputes_lowest_applicable_platform_failure() {
                 "wrong classification",
             )
             .unwrap_err(),
-            VersionPoisonError::InvalidRawPath
+            NamespaceErrorDecodeError::InvalidRawPath
         );
     }
 
     assert_eq!(
-        VersionPoison::new(
-            VersionPoisonV1::InvalidPhysicalPath {
+        NamespaceError::new(
+            NamespaceErrorV1::InvalidPhysicalPath {
                 root_name: "main".into(),
                 raw_relative_path: PlatformPathBytes::Unix(b"valid/path".to_vec()),
                 failure: PhysicalPathFailureCode::ForbiddenCharacter,
             },
-            "valid path cannot be poisoned",
+            "valid path cannot fail",
         )
         .unwrap_err(),
-        VersionPoisonError::InvalidRawPath
+        NamespaceErrorDecodeError::InvalidRawPath
     );
 }
 
 #[test]
 fn unreadable_scan_subtree_pins_closed_subject_and_failure_encodings() {
-    assert_eq!(VersionPoisonCode::UnreadableScanSubtree as u16, 7);
+    assert_eq!(NamespaceErrorCode::UnreadableScanSubtree as u16, 7);
     assert_eq!(ScanFailureCode::PermissionDenied as u16, 1);
     assert_eq!(ScanFailureCode::NotFound as u16, 2);
     assert_eq!(ScanFailureCode::InvalidFileType as u16, 3);
     assert_eq!(ScanFailureCode::SymlinkIdentityChanged as u16, 4);
     assert_eq!(ScanFailureCode::IoDataLoss as u16, 5);
 
-    let root = VersionPoison::new(
-        VersionPoisonV1::UnreadableScanSubtree {
+    let root = NamespaceError::new(
+        NamespaceErrorV1::UnreadableScanSubtree {
             subject: ScanSubject::Root {
                 root_name: "main".into(),
             },
@@ -397,18 +397,18 @@ fn unreadable_scan_subtree_pins_closed_subject_and_failure_encodings() {
     ];
     for subject in subjects {
         for failure in failures {
-            let poison = VersionPoison::new(
-                VersionPoisonV1::UnreadableScanSubtree {
+            let error = NamespaceError::new(
+                NamespaceErrorV1::UnreadableScanSubtree {
                     subject: subject.clone(),
                     failure,
                 },
                 "scan failed",
             )
             .unwrap();
-            assert_eq!(poison.code, VersionPoisonCode::UnreadableScanSubtree);
+            assert_eq!(error.code, NamespaceErrorCode::UnreadableScanSubtree);
             assert_eq!(
-                VersionPoison::from_persisted_bytes(&poison.persisted_bytes().unwrap()).unwrap(),
-                poison
+                NamespaceError::from_persisted_bytes(&error.persisted_bytes().unwrap()).unwrap(),
+                error
             );
         }
     }
@@ -419,24 +419,24 @@ fn unreadable_scan_subtree_rejects_open_tags_and_failure_codes() {
     let mut unknown_subject = CanonicalEncoder::new();
     unknown_subject.raw(&DSVP);
     unknown_subject.u8(1);
-    unknown_subject.u16(VersionPoisonCode::UnreadableScanSubtree as u16);
+    unknown_subject.u16(NamespaceErrorCode::UnreadableScanSubtree as u16);
     unknown_subject.u8(3);
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&unknown_subject.into_bytes()).unwrap_err(),
-        VersionPoisonError::UnknownScanSubjectTag(3)
+        NamespaceError::from_persisted_bytes(&unknown_subject.into_bytes()).unwrap_err(),
+        NamespaceErrorDecodeError::UnknownScanSubjectTag(3)
     );
 
     let mut unknown_failure = CanonicalEncoder::new();
     unknown_failure.raw(&DSVP);
     unknown_failure.u8(1);
-    unknown_failure.u16(VersionPoisonCode::UnreadableScanSubtree as u16);
+    unknown_failure.u16(NamespaceErrorCode::UnreadableScanSubtree as u16);
     unknown_failure.u8(1);
     unknown_failure.str("main");
     unknown_failure.u16(6);
     unknown_failure.str("diagnostic");
     assert_eq!(
-        VersionPoison::from_persisted_bytes(&unknown_failure.into_bytes()).unwrap_err(),
-        VersionPoisonError::UnknownFailureCode(6)
+        NamespaceError::from_persisted_bytes(&unknown_failure.into_bytes()).unwrap_err(),
+        NamespaceErrorDecodeError::UnknownFailureCode(6)
     );
 }
 
@@ -450,8 +450,8 @@ fn unreadable_scan_subtree_accepts_only_valid_relative_raw_paths() {
     ];
     for raw_relative_path in invalid {
         assert_eq!(
-            VersionPoison::new(
-                VersionPoisonV1::UnreadableScanSubtree {
+            NamespaceError::new(
+                NamespaceErrorV1::UnreadableScanSubtree {
                     subject: ScanSubject::Subtree {
                         root_name: "main".into(),
                         raw_relative_path,
@@ -461,16 +461,16 @@ fn unreadable_scan_subtree_accepts_only_valid_relative_raw_paths() {
                 "invalid subject",
             )
             .unwrap_err(),
-            VersionPoisonError::InvalidRawPath
+            NamespaceErrorDecodeError::InvalidRawPath
         );
     }
 }
 
 #[test]
 fn unreadable_scan_subtree_identity_and_dedup_include_exact_subject_and_failure() {
-    let poison = |path: &[u8], failure| {
-        VersionPoison::new(
-            VersionPoisonV1::UnreadableScanSubtree {
+    let error = |path: &[u8], failure| {
+        NamespaceError::new(
+            NamespaceErrorV1::UnreadableScanSubtree {
                 subject: ScanSubject::Subtree {
                     root_name: "main".into(),
                     raw_relative_path: PlatformPathBytes::Unix(path.to_vec()),
@@ -481,14 +481,14 @@ fn unreadable_scan_subtree_identity_and_dedup_include_exact_subject_and_failure(
         )
         .unwrap()
     };
-    let first = poison(b"a", ScanFailureCode::NotFound);
-    let duplicate = VersionPoison::new(first.detail.clone(), "different prose").unwrap();
-    let different_path = poison(b"b", ScanFailureCode::NotFound);
-    let different_failure = poison(b"a", ScanFailureCode::PermissionDenied);
+    let first = error(b"a", ScanFailureCode::NotFound);
+    let duplicate = NamespaceError::new(first.detail.clone(), "different prose").unwrap();
+    let different_path = error(b"b", ScanFailureCode::NotFound);
+    let different_failure = error(b"a", ScanFailureCode::PermissionDenied);
     assert_ne!(first.identity, different_path.identity);
     assert_ne!(first.identity, different_failure.identity);
     let canonical =
-        VersionPoison::canonical_set([different_path, duplicate, different_failure, first])
+        NamespaceError::canonical_set([different_path, duplicate, different_failure, first])
             .unwrap();
     assert_eq!(canonical.len(), 3);
 }

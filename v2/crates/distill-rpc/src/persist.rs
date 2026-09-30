@@ -125,7 +125,7 @@ fn bad_tag(what: &str, tag: u8) -> PersistError {
 }
 
 /// The served pipeline blob: the input version whose publication installed
-/// this diagnostic, then the diagnostic. A runtime poison rewrites the
+/// this diagnostic, then the diagnostic. A runtime failure rewrites the
 /// diagnostic but keeps the installing version, so every snapshot that
 /// pinned the same pipeline sees it.
 pub(crate) fn encode_served_pipeline(installed_at: InputVersion, value: &PipelineDiagnostic) -> Vec<u8> {
@@ -148,13 +148,13 @@ pub(crate) fn decode_served_pipeline(
 fn write_pipeline(out: &mut Writer, value: &PipelineDiagnostic) {
     match value {
         PipelineDiagnostic::Ready => out.u8(0),
-        PipelineDiagnostic::Poisoned(poison) => {
+        PipelineDiagnostic::Failed(failure) => {
             out.u8(1);
-            out.u16(poison.code as u16);
-            out.u16(poison.origin as u16);
-            out.u16(poison.cleanup as u16);
-            out.bytes(&poison.identity);
-            out.text(&poison.message);
+            out.u16(failure.code as u16);
+            out.u16(failure.origin as u16);
+            out.u16(failure.cleanup as u16);
+            out.bytes(&failure.identity);
+            out.text(&failure.message);
         }
         PipelineDiagnostic::SchemaAcceptanceRequired(required) => {
             out.u8(2);
@@ -209,9 +209,9 @@ fn read_pipeline(reader: &mut Reader<'_>) -> Result<PipelineDiagnostic, PersistE
             let cleanup = reader.u16()?;
             let identity = reader.array()?;
             let message = reader.text()?;
-            PipelineDiagnostic::Poisoned(
-                PipelinePoison::from_wire(code, origin, cleanup, identity, message)
-                    .map_err(|error| PersistError(format!("pipeline poison: {error:?}")))?,
+            PipelineDiagnostic::Failed(
+                PipelineFailure::from_wire(code, origin, cleanup, identity, message)
+                    .map_err(|error| PersistError(format!("pipeline failure: {error:?}")))?,
             )
         }
         2 => {
@@ -439,9 +439,9 @@ mod tests {
 
     #[test]
     fn pipeline_and_lineage_values_round_trip() {
-        let poison = PipelinePoison::new(
-            PipelinePoisonCode::CandidateRegistration,
-            PipelinePoisonOrigin::CandidateOpen,
+        let failure = PipelineFailure::new(
+            PipelineFailureCode::CandidateRegistration,
+            PipelineFailureOrigin::CandidateOpen,
             CleanupDisposition::CleanedAndClosed,
             "boom",
         )
@@ -460,7 +460,7 @@ mod tests {
         });
         for value in [
             PipelineDiagnostic::Ready,
-            PipelineDiagnostic::Poisoned(poison),
+            PipelineDiagnostic::Failed(failure),
             retired,
         ] {
             let bytes = encode_served_pipeline(InputVersion(7), &value);

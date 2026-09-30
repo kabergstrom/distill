@@ -199,7 +199,7 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, BundleError> {
 /// malformed portion cannot change bundle/asset identity or entry data. This
 /// deliberately remains stricter than a best-effort parser: if framing,
 /// schema closure, lineage, or any schema-directed value walk fails, callers
-/// must use version-global poison.
+/// must publish a namespace error.
 pub fn extract_namespace_skeleton(bytes: &[u8]) -> Result<BundleNamespaceSkeleton, BundleError> {
     on_reserved_stack(|| {
         let bundle = if bytes.first() == Some(&0x89) {

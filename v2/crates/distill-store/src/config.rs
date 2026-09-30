@@ -18,7 +18,7 @@ use rusqlite::OptionalExtension;
 use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
-    ConfigurationEpoch, ConfigurationPoison, ConfigurationPoisonCode, ConfigurationState, DscpV1,
+    ConfigurationEpoch, ConfigurationError, ConfigurationErrorCode, ConfigurationState, DscpV1,
 };
 
 type PersistedConfigurationRow = (
@@ -311,14 +311,14 @@ pub(crate) fn read_configuration_state(
             (Some(code), Some(detail_version), Some(detail), Some(reason_hash), Some(message)) => {
                 let code = u16::try_from(code)
                     .ok()
-                    .and_then(|code| ConfigurationPoisonCode::try_from(code).ok())
+                    .and_then(|code| ConfigurationErrorCode::try_from(code).ok())
                     .ok_or_else(|| StoreError::InvalidConfiguration {
-                        error: format!("unknown persisted configuration poison code {code}"),
+                        error: format!("unknown persisted configuration error code {code}"),
                     })?;
                 let reason_hash: [u8; 32] = reason_hash.try_into().map_err(|bytes: Vec<u8>| {
                     StoreError::InvalidConfiguration {
                         error: format!(
-                            "persisted configuration poison reason hash has length {}, expected 32",
+                            "persisted configuration error reason hash has length {}, expected 32",
                             bytes.len()
                         ),
                     }
@@ -326,13 +326,13 @@ pub(crate) fn read_configuration_state(
                 let detail_version =
                     u8::try_from(detail_version).map_err(|_| StoreError::InvalidConfiguration {
                         error: format!(
-                            "unknown persisted configuration poison detail version {detail_version}"
+                            "unknown persisted configuration error detail version {detail_version}"
                         ),
                     })?;
                 if detail_version != 1 {
                     return Err(StoreError::InvalidConfiguration {
                         error: format!(
-                            "unknown persisted configuration poison detail version {detail_version}"
+                            "unknown persisted configuration error detail version {detail_version}"
                         ),
                     });
                 }
@@ -342,7 +342,7 @@ pub(crate) fn read_configuration_state(
                             error: error.to_string(),
                         }
                     })?;
-                let reason = ConfigurationPoison {
+                let reason = ConfigurationError {
                     code,
                     reason_hash,
                     detail: Box::new(detail),
@@ -353,14 +353,14 @@ pub(crate) fn read_configuration_state(
                     .map_err(|error| StoreError::InvalidConfiguration {
                         error: error.to_string(),
                     })?;
-                ConfigurationState::Poisoned {
+                ConfigurationState::Failed {
                     reason,
                     last_good: Some(epoch),
                 }
             }
             _ => {
                 return Err(StoreError::InvalidConfiguration {
-                    error: "persisted configuration poison fields are incomplete".to_owned(),
+                    error: "persisted configuration error fields are incomplete".to_owned(),
                 });
             }
         })
@@ -368,7 +368,7 @@ pub(crate) fn read_configuration_state(
 }
 
 impl InputTxn<'_> {
-    /// Publish a validated configuration candidate, healing any prior poison
+    /// Publish a validated configuration candidate, healing any prior error
     /// while retaining the active generation selected by the configuration
     /// coordinator.
     pub fn publish_configuration_ready(&mut self, generation: u64) -> Result<(), StoreError> {
@@ -390,18 +390,18 @@ impl InputTxn<'_> {
         Ok(())
     }
 
-    pub fn publish_configuration_poison(
+    pub fn publish_configuration_error(
         &mut self,
         reason: &DscpV1,
         message: &str,
     ) -> Result<(), StoreError> {
-        let poison = ConfigurationPoison::from_reason(reason, message);
-        poison
+        let error = ConfigurationError::from_reason(reason, message);
+        error
             .validate()
             .map_err(|error| StoreError::InvalidConfiguration {
                 error: error.to_string(),
             })?;
-        let detail = poison.detail.canonical_detail_bytes();
+        let detail = error.detail.canonical_detail_bytes();
         self.txn.execute(
             "INSERT INTO configuration_state(
                  id, active_generation, input_version,
@@ -416,10 +416,10 @@ impl InputTxn<'_> {
                poison_message = excluded.poison_message",
             rusqlite::params![
                 self.version().0 as i64,
-                poison.code as u16,
+                error.code as u16,
                 detail,
-                poison.reason_hash.as_slice(),
-                poison.message,
+                error.reason_hash.as_slice(),
+                error.message,
             ],
         )?;
         Ok(())

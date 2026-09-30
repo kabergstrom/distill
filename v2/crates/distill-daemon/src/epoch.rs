@@ -15,8 +15,8 @@ use distill_core::id::TypeUuid;
 use distill_core::target_set::{CanonicalTargetSet, TargetSetRow};
 use distill_store::pipeline::ValidatedPipelineEpoch;
 pub use distill_store::state::{
-    CleanupDisposition as CandidateCleanupDisposition, PipelinePoison, PipelinePoisonCode,
-    PipelinePoisonOrigin,
+    CleanupDisposition as CandidateCleanupDisposition, PipelineFailure, PipelineFailureCode,
+    PipelineFailureOrigin,
 };
 use distill_store::state::{
     PipelineEpoch as StoredPipelineEpoch, Registration as StoredRegistration,
@@ -813,7 +813,7 @@ pub struct EpochStatus {
     pub unloaded: bool,
 }
 
-/// Called when an epoch may need its host's attention: a runtime poison
+/// Called when an epoch may need its host's attention: a runtime failure
 /// to persist, or a retired epoch that may now unload.
 pub type EpochWake = Arc<dyn Fn() + Send + Sync>;
 
@@ -852,7 +852,7 @@ struct EpochInner {
     draining: AtomicBool,
     unloaded: AtomicBool,
     /// The first runtime failure; it fences the epoch for good.
-    runtime_error: OnceLock<(PipelinePoisonCode, String)>,
+    runtime_error: OnceLock<(PipelineFailureCode, String)>,
     /// Read through `&self` once published; torn down only with the epoch
     /// exclusively held (see `unload_epoch`) or in `Drop`.
     registration_arena: Option<CandidateRegistrationArena>,
@@ -1327,7 +1327,7 @@ impl PipelineEpoch {
     fn callback_job<E>(&self) -> Result<EpochJobGuard, CallbackInvokeError<E>> {
         self.try_start_job().map_err(|error| {
             CallbackInvokeError::Unavailable(match error {
-                EpochWorkError::Poisoned(poison) => poison.message,
+                EpochWorkError::Failed(failure) => failure.message,
                 EpochWorkError::Retired { epoch_id } => {
                     format!("pipeline epoch {epoch_id} is retired")
                 }
@@ -1365,12 +1365,12 @@ impl PipelineEpoch {
     /// and every snapshot that pins this epoch.
     pub fn report_runtime_failure(&self, error: impl Into<String>) {
         self.0
-            .poison(PipelinePoisonCode::PublishedCallbackRejected, error.into());
+            .poison(PipelineFailureCode::PublishedCallbackRejected, error.into());
     }
 
     pub fn report_runtime_panic(&self, error: impl Into<String>) {
         self.0
-            .poison(PipelinePoisonCode::PublishedCallbackPanic, error.into());
+            .poison(PipelineFailureCode::PublishedCallbackPanic, error.into());
     }
 
     pub fn drain_complete(&self) -> bool {
@@ -1403,11 +1403,11 @@ impl EpochInner {
         if let Some(cause) = self.token.poison_cause() {
             let (code, detail) = match cause {
                 ModuleEpochPoisonCause::CallbackPanic => (
-                    PipelinePoisonCode::PublishedCallbackPanic,
+                    PipelineFailureCode::PublishedCallbackPanic,
                     "a module-owned no-unwind thunk contained a callback panic",
                 ),
                 ModuleEpochPoisonCause::CallbackRejected => (
-                    PipelinePoisonCode::PublishedCallbackRejected,
+                    PipelineFailureCode::PublishedCallbackRejected,
                     "a module-owned status thunk returned a rejected status",
                 ),
             };
@@ -1415,9 +1415,9 @@ impl EpochInner {
         }
     }
 
-    fn poison(&self, code: PipelinePoisonCode, detail: String) {
+    fn poison(&self, code: PipelineFailureCode, detail: String) {
         self.token.poison_with(match code {
-            PipelinePoisonCode::PublishedCallbackPanic => ModuleEpochPoisonCause::CallbackPanic,
+            PipelineFailureCode::PublishedCallbackPanic => ModuleEpochPoisonCause::CallbackPanic,
             _ => ModuleEpochPoisonCause::CallbackRejected,
         });
         self.accepting.store(false, Ordering::Release);
@@ -1428,9 +1428,9 @@ impl EpochInner {
 
     fn rejection(&self) -> EpochWorkError {
         match self.runtime_error.get() {
-            Some((code, detail)) => EpochWorkError::Poisoned(pipeline_poison(
+            Some((code, detail)) => EpochWorkError::Failed(pipeline_failure(
                 *code,
-                PipelinePoisonOrigin::PublishedRuntime,
+                PipelineFailureOrigin::PublishedRuntime,
                 CandidateCleanupDisposition::PublishedEpochLeaked,
                 detail.clone(),
             )),
@@ -1463,7 +1463,7 @@ pub struct EpochJobGuard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpochWorkError {
-    Poisoned(PipelinePoison),
+    Failed(PipelineFailure),
     Retired { epoch_id: u64 },
 }
 
@@ -1480,7 +1480,7 @@ impl Drop for EpochJobGuard {
 #[derive(Clone)]
 enum PublishedState {
     Ready(PipelineEpoch),
-    Poisoned(PipelinePoison),
+    Failed(PipelineFailure),
 }
 
 #[derive(Clone)]
@@ -1489,15 +1489,15 @@ pub struct PipelineSnapshot {
 }
 
 impl PipelineSnapshot {
-    pub fn epoch(&self) -> Result<&PipelineEpoch, PipelinePoison> {
+    pub fn epoch(&self) -> Result<&PipelineEpoch, PipelineFailure> {
         match &self.state {
-            PublishedState::Poisoned(error) => Err(error.clone()),
+            PublishedState::Failed(error) => Err(error.clone()),
             PublishedState::Ready(epoch) => {
                 epoch.0.observe_token_poison();
                 if let Some((code, detail)) = epoch.0.runtime_error.get() {
-                    Err(pipeline_poison(
+                    Err(pipeline_failure(
                         *code,
-                        PipelinePoisonOrigin::PublishedRuntime,
+                        PipelineFailureOrigin::PublishedRuntime,
                         CandidateCleanupDisposition::PublishedEpochLeaked,
                         detail.clone(),
                     ))
@@ -1539,7 +1539,7 @@ impl ModuleHost {
     }
 
     /// Call `wake` when one of this host's epochs needs attention
-    /// ([`ModuleHost::reap_retired`], or persisting a runtime poison).
+    /// ([`ModuleHost::reap_retired`], or persisting a runtime failure).
     pub(crate) fn set_wake(&mut self, wake: EpochWake) {
         self.wake = Some(wake);
     }
@@ -1552,9 +1552,9 @@ impl ModuleHost {
 
     pub fn snapshot(&self) -> PipelineSnapshot {
         let state = self.published.clone().unwrap_or_else(|| {
-            PublishedState::Poisoned(pipeline_poison(
-                PipelinePoisonCode::CandidateOpen,
-                PipelinePoisonOrigin::CandidateOpen,
+            PublishedState::Failed(pipeline_failure(
+                PipelineFailureCode::CandidateOpen,
+                PipelineFailureOrigin::CandidateOpen,
                 CandidateCleanupDisposition::None,
                 "no pipeline epoch has been published",
             ))
@@ -1570,15 +1570,15 @@ impl ModuleHost {
         source: &Path,
         mut requirements: CandidateRequirements,
         loader: &mut dyn PipelineModuleLoader,
-    ) -> Result<PipelineEpoch, PipelinePoison> {
+    ) -> Result<PipelineEpoch, PipelineFailure> {
         match self.prepare_candidate(source, &mut requirements, loader) {
             Ok(epoch) => {
                 self.install_ready(epoch.clone());
                 Ok(epoch)
             }
-            Err(poison) => {
-                self.install_poison(poison.clone());
-                Err(poison)
+            Err(failure) => {
+                self.install_failure(failure.clone());
+                Err(failure)
             }
         }
     }
@@ -1595,13 +1595,13 @@ impl ModuleHost {
         source: &Path,
         requirements: &mut CandidateRequirements,
         loader: &mut dyn PipelineModuleLoader,
-    ) -> Result<PipelineEpoch, PipelinePoison> {
+    ) -> Result<PipelineEpoch, PipelineFailure> {
         let id = self.mint_epoch_id();
         let target_set = match validate_requirements(requirements) {
             Ok(target_set) => target_set,
             Err(error) => {
-                return Err(candidate_poison_record(
-                    PipelinePoisonCode::CandidateValidation,
+                return Err(candidate_failure_record(
+                    PipelineFailureCode::CandidateValidation,
                     error,
                     CandidateCleanupDisposition::None,
                 ))
@@ -1610,8 +1610,8 @@ impl ModuleHost {
         let staged = match self.stage_copy(id, source) {
             Ok(staged) => staged,
             Err(error) => {
-                return Err(candidate_poison_record(
-                    PipelinePoisonCode::CandidateOpen,
+                return Err(candidate_failure_record(
+                    PipelineFailureCode::CandidateOpen,
                     error,
                     CandidateCleanupDisposition::None,
                 ))
@@ -1620,8 +1620,8 @@ impl ModuleHost {
         let mut module = match boundary_call("open", || loader.open_staged(&staged)) {
             Ok(module) => module,
             Err(error) => {
-                return Err(candidate_poison_record(
-                    PipelinePoisonCode::CandidateOpen,
+                return Err(candidate_failure_record(
+                    PipelineFailureCode::CandidateOpen,
                     error.to_string(),
                     CandidateCleanupDisposition::None,
                 ))
@@ -1640,7 +1640,7 @@ impl ModuleHost {
             Ok(registration) => registration,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
-                return Err(candidate_poison_with_cleanup(
+                return Err(candidate_failure_with_cleanup(
                     error.code,
                     error.detail,
                     cleanup,
@@ -1649,8 +1649,8 @@ impl ModuleHost {
         };
         if token.is_poisoned() {
             let cleanup = discard_candidate(module, registration_arena);
-            return Err(candidate_poison_with_cleanup(
-                PipelinePoisonCode::CandidateRegistration,
+            return Err(candidate_failure_with_cleanup(
+                PipelineFailureCode::CandidateRegistration,
                 "candidate token was poisoned during registration".to_owned(),
                 cleanup,
             ));
@@ -1660,8 +1660,8 @@ impl ModuleHost {
             validate_registered_schema_types(&registration_arena, &requirements.schema_registry)
         {
             let cleanup = discard_candidate(module, registration_arena);
-            return Err(candidate_poison_with_cleanup(
-                PipelinePoisonCode::CandidateRegistration,
+            return Err(candidate_failure_with_cleanup(
+                PipelineFailureCode::CandidateRegistration,
                 error,
                 cleanup,
             ));
@@ -1671,8 +1671,8 @@ impl ModuleHost {
             Ok(tools) => tools,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
-                return Err(candidate_poison_with_cleanup(
-                    PipelinePoisonCode::CandidateRegistration,
+                return Err(candidate_failure_with_cleanup(
+                    PipelineFailureCode::CandidateRegistration,
                     format!("tool registration resolution failed: {error}"),
                     cleanup,
                 ));
@@ -1694,7 +1694,7 @@ impl ModuleHost {
         Ok(epoch)
     }
 
-    /// Attempt cleanup of every retired image. Runtime poison is checked before
+    /// Attempt cleanup of every retired image. Runtime failure is checked before
     /// active jobs or Arc pins: it is a permanent fence, not a delayed unload.
     pub fn reap_retired(&mut self) -> Vec<UnloadOutcome> {
         let mut outcomes = Vec::with_capacity(self.retired.len());
@@ -1726,7 +1726,7 @@ impl ModuleHost {
                 }
                 Err(error) => {
                     epoch.0.poison(
-                        PipelinePoisonCode::PublishedCleanup,
+                        PipelineFailureCode::PublishedCleanup,
                         format!(
                             "epoch cleanup disposition={}: {}",
                             cleanup_disposition_name(error.disposition),
@@ -1745,12 +1745,12 @@ impl ModuleHost {
         self.retired.len()
     }
 
-    pub fn retired_poison(&self, id: u64) -> Option<PipelinePoison> {
+    pub fn retired_failure(&self, id: u64) -> Option<PipelineFailure> {
         let epoch = self.retired.iter().find(|epoch| epoch.id() == id)?;
         let (code, message) = epoch.0.runtime_error.get()?;
-        Some(pipeline_poison(
+        Some(pipeline_failure(
             *code,
-            PipelinePoisonOrigin::PublishedRuntime,
+            PipelineFailureOrigin::PublishedRuntime,
             CandidateCleanupDisposition::PublishedEpochLeaked,
             message.clone(),
         ))
@@ -1804,9 +1804,9 @@ impl ModuleHost {
         }
     }
 
-    pub(crate) fn install_poison(&mut self, poison: PipelinePoison) {
+    pub(crate) fn install_failure(&mut self, failure: PipelineFailure) {
         self.retire_published_ready();
-        self.published = Some(PublishedState::Poisoned(poison));
+        self.published = Some(PublishedState::Failed(failure));
     }
 
     pub(crate) fn install_ready(&mut self, epoch: PipelineEpoch) {
@@ -1815,7 +1815,7 @@ impl ModuleHost {
         self.published = Some(PublishedState::Ready(epoch));
     }
 
-    pub(crate) fn discard_unpublished(&mut self, mut epoch: PipelineEpoch) -> Option<PipelinePoison> {
+    pub(crate) fn discard_unpublished(&mut self, mut epoch: PipelineEpoch) -> Option<PipelineFailure> {
         epoch.begin_drain();
         match unload_epoch(&mut epoch) {
             Ok(()) => None,
@@ -1825,8 +1825,8 @@ impl ModuleHost {
                 // but report the candidate-cleanup matrix required at the
                 // publication boundary.
                 epoch.0.token.poison();
-                let poison = candidate_poison_record(
-                    PipelinePoisonCode::CandidateCleanup,
+                let failure = candidate_failure_record(
+                    PipelineFailureCode::CandidateCleanup,
                     format!(
                         "unpublished candidate cleanup disposition={}: {}",
                         cleanup_disposition_name(error.disposition),
@@ -1835,7 +1835,7 @@ impl ModuleHost {
                     error.disposition,
                 );
                 self.retired.push(epoch);
-                Some(poison)
+                Some(failure)
             }
         }
     }
@@ -1905,11 +1905,11 @@ fn validate_registered_schema_types(
     Ok(())
 }
 
-fn candidate_poison_with_cleanup(
-    initiating_code: PipelinePoisonCode,
+fn candidate_failure_with_cleanup(
+    initiating_code: PipelineFailureCode,
     detail: String,
     cleanup: CandidateCleanup,
-) -> PipelinePoison {
+) -> PipelineFailure {
     let detail = format!(
         "{detail}; candidate cleanup disposition={}: {}",
         cleanup_disposition_name(cleanup.disposition),
@@ -1918,17 +1918,17 @@ fn candidate_poison_with_cleanup(
     let code = if cleanup.disposition == CandidateCleanupDisposition::CleanedAndClosed {
         initiating_code
     } else {
-        PipelinePoisonCode::CandidateCleanup
+        PipelineFailureCode::CandidateCleanup
     };
-    candidate_poison_record(code, detail, cleanup.disposition)
+    candidate_failure_record(code, detail, cleanup.disposition)
 }
 
-fn candidate_poison_record(
-    code: PipelinePoisonCode,
+fn candidate_failure_record(
+    code: PipelineFailureCode,
     detail: String,
     cleanup: CandidateCleanupDisposition,
-) -> PipelinePoison {
-    pipeline_poison(code, PipelinePoisonOrigin::CandidateOpen, cleanup, detail)
+) -> PipelineFailure {
+    pipeline_failure(code, PipelineFailureOrigin::CandidateOpen, cleanup, detail)
 }
 
 pub(crate) fn stored_pipeline_epoch(
@@ -2064,21 +2064,21 @@ fn validate_open_module(
 }
 
 struct CandidatePhaseError {
-    code: PipelinePoisonCode,
+    code: PipelineFailureCode,
     detail: String,
 }
 
 impl CandidatePhaseError {
     fn attestation(detail: impl Into<String>) -> Self {
         Self {
-            code: PipelinePoisonCode::CandidateAttestation,
+            code: PipelineFailureCode::CandidateAttestation,
             detail: detail.into(),
         }
     }
 
     fn registration(detail: impl Into<String>) -> Self {
         Self {
-            code: PipelinePoisonCode::CandidateRegistration,
+            code: PipelineFailureCode::CandidateRegistration,
             detail: detail.into(),
         }
     }
@@ -2123,13 +2123,13 @@ fn boundary_call<T>(
         .map_err(|_| ModuleCallError::boundary_panic(operation))?
 }
 
-fn pipeline_poison(
-    code: PipelinePoisonCode,
-    origin: PipelinePoisonOrigin,
+fn pipeline_failure(
+    code: PipelineFailureCode,
+    origin: PipelineFailureOrigin,
     cleanup: CandidateCleanupDisposition,
     message: impl Into<String>,
-) -> PipelinePoison {
-    PipelinePoison::new(code, origin, cleanup, message)
+) -> PipelineFailure {
+    PipelineFailure::new(code, origin, cleanup, message)
         .expect("daemon emits only the closed DSPP code/origin/cleanup matrix")
 }
 
@@ -2425,7 +2425,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn unpublished_cleanup_failure_uses_candidate_cleanup_poison_matrix() {
+    fn unpublished_cleanup_failure_uses_candidate_cleanup_failure_matrix() {
         let temp = tempfile::tempdir().unwrap();
         let mut host = ModuleHost::new(temp.path()).unwrap();
         let token = ModuleEpochToken::new(9100);
@@ -2453,11 +2453,11 @@ mod lifecycle_tests {
             Box::new(FailingUnloadModule),
         );
 
-        let poison = host.discard_unpublished(epoch).unwrap();
-        assert_eq!(poison.code, PipelinePoisonCode::CandidateCleanup);
-        assert_eq!(poison.origin, PipelinePoisonOrigin::CandidateOpen);
+        let failure = host.discard_unpublished(epoch).unwrap();
+        assert_eq!(failure.code, PipelineFailureCode::CandidateCleanup);
+        assert_eq!(failure.origin, PipelineFailureOrigin::CandidateOpen);
         assert_eq!(
-            poison.cleanup,
+            failure.cleanup,
             CandidateCleanupDisposition::ModuleUnloadFailed
         );
         assert_eq!(host.retired_count(), 1);

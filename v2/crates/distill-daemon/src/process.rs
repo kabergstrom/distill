@@ -15,8 +15,8 @@ use tokio::sync::watch;
 
 use distill_schema::{ProjectSchemaAuthority, SchemaAuthorityError};
 use distill_store::state::{
-    CleanupDisposition, ConfigurationPoison, PipelinePoison, PipelinePoisonCode,
-    PipelinePoisonOrigin,
+    CleanupDisposition, ConfigurationError, PipelineFailure, PipelineFailureCode,
+    PipelineFailureOrigin,
 };
 
 use crate::authority::Driver;
@@ -32,7 +32,7 @@ use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
 /// How often the process loop takes the watcher queue (the debounce) and
-/// checks for a runtime pipeline poison or a drained retired epoch. The
+/// checks for a runtime pipeline failure or a drained retired epoch. The
 /// last two become authority messages when builds become jobs (phase 6).
 const DEBOUNCE: Duration = Duration::from_millis(40);
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -395,7 +395,7 @@ impl ProcessDriver {
                 .and_then(|_| reconcile_imports(coordinator, true, false)),
             WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
         });
-        let poison_result = coordinator.sync_runtime_pipeline_poison().map(|_| ());
+        let failure_result = coordinator.sync_runtime_pipeline_failure().map(|_| ());
         let retention_result = if Instant::now() >= self.next_retention_sweep {
             self.next_retention_sweep = Instant::now() + RETENTION_SWEEP_INTERVAL;
             coordinator
@@ -404,7 +404,7 @@ impl ProcessDriver {
         } else {
             Ok(())
         };
-        let result = result.and(poison_result).and(retention_result);
+        let result = result.and(failure_result).and(retention_result);
         let _ = coordinator.reap_retired_pipeline_epochs();
         match result {
             Err(error) => {
@@ -708,17 +708,17 @@ impl ConfigWatch {
 
         match &schema.outcome {
             Err(message) if input_changed => {
-                let poison = PipelinePoison::new(
-                    PipelinePoisonCode::CandidateValidation,
-                    PipelinePoisonOrigin::CandidateOpen,
+                let failure = PipelineFailure::new(
+                    PipelineFailureCode::CandidateValidation,
+                    PipelineFailureOrigin::CandidateOpen,
                     CleanupDisposition::None,
                     message.clone(),
                 )
-                .expect("schema candidate poison tuple is valid");
+                .expect("schema candidate failure tuple is valid");
                 if self.rejected {
-                    coordinator.publish_pipeline_rejection_healing_configuration(poison)?;
+                    coordinator.publish_pipeline_rejection_healing_configuration(failure)?;
                 } else {
-                    coordinator.publish_pipeline_rejection(poison)?;
+                    coordinator.publish_pipeline_rejection(failure)?;
                 }
                 if self.rejected {
                     self.staged = candidate;
@@ -742,8 +742,8 @@ impl ConfigWatch {
                             ConfigSourceState::Failure(reason) => reason.reason_hash(),
                         };
                         let selected =
-                            ConfigurationPoison::select_canonical(errors.iter().map(|error| {
-                                ConfigurationPoison::from_reason(
+                            ConfigurationError::select_canonical(errors.iter().map(|error| {
+                                ConfigurationError::from_reason(
                                     &candidate_error_reason(error, file_hash),
                                     error.to_string(),
                                 )
@@ -900,8 +900,8 @@ fn observe_configuration(path: &Path) -> ConfigObservation {
     let hash = *blake3::hash(&bytes).as_bytes();
     let outcome = match std::str::from_utf8(&bytes) {
         Ok(source) => DaemonConfig::parse_staged(path, source).map_err(|errors| {
-            let selected = ConfigurationPoison::select_canonical(errors.iter().map(|error| {
-                ConfigurationPoison::from_reason(
+            let selected = ConfigurationError::select_canonical(errors.iter().map(|error| {
+                ConfigurationError::from_reason(
                     &config_error_reason(error, &bytes),
                     error.to_string(),
                 )
@@ -991,8 +991,8 @@ fn reconcile_imports(
     if reconcile.is_ok() {
         coordinator.acknowledge_file_work(&work)?;
     }
-    let poison = coordinator.sync_runtime_pipeline_poison().map(|_| ());
-    reconcile.and(poison)
+    let failure = coordinator.sync_runtime_pipeline_failure().map(|_| ());
+    reconcile.and(failure)
 }
 
 fn spawn_rpc_loop(

@@ -23,11 +23,11 @@ use distill_core::lineage::AcceptedSchemaEpoch;
 use distill_json::AuthoredValue;
 use distill_rpc::{
     AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole, AuthoringMutation,
-    AuthoringValue, Commit, ConfigurationPoison, ConfigurationStatus, CoordinatedCommitError,
+    AuthoringValue, Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
     DerivedOutputEntry, DerivedOutputMutation, DriftedInput, LineageManifestClaimant,
     LineageRepairState, PathMutation, PipelineCandidateIdentity, PipelineDiagnostic,
-    SchemaTransitionAction, Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, VersionPoison,
-    PreparedImportCommit, RpcFailure, VersionPoisonV1,
+    SchemaTransitionAction, Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, NamespaceError,
+    PreparedImportCommit, RpcFailure, NamespaceErrorV1,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
@@ -45,7 +45,7 @@ use distill_store::pipeline::{
 use distill_store::served::{encode_authored_value, ResolutionRow};
 use distill_store::state::{
     AssetClaimant, CleanupDisposition, ConfigurationState, DirectoryAliasSide, DscpV1,
-    InputVersion, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+    InputVersion, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
     PipelineState as StoredPipelineState, ReadableBundleSource,
     RetiredTypeReferenced as StoredRetiredTypeReferenced, ScanFailureCode, ScanSubject,
     SkeletonFailureCode,
@@ -110,7 +110,7 @@ pub struct DaemonCoordinator {
     pipeline: PipelineState,
     schema_authority: ArcSwapOption<ProjectSchemaAuthority>,
     build_targets: ArcSwap<BTreeMap<String, Target>>,
-    configuration_poison: AuthorityCell<Option<ConfigurationPoison>>,
+    configuration_error: AuthorityCell<Option<ConfigurationError>>,
     operational: ScheduledPool,
     /// Last: stopped (and joined) after everything else is gone.
     authority: Authority,
@@ -132,10 +132,10 @@ enum ConfigurationPipelinePublication {
         epoch: ValidatedPipelineEpoch,
         tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
     },
-    Poison(PipelinePoison),
+    Failed(PipelineFailure),
 }
 
-fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) -> Option<PipelinePoison> {
+fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) -> Option<PipelineFailure> {
     if let Some(pending) = runtime.pending.take() {
         runtime.host.discard_unpublished(pending.loaded)
     } else {
@@ -146,7 +146,7 @@ fn discard_pending(runtime: &mut CoordinatedPipelineRuntime) -> Option<PipelineP
 fn discard_prepared(
     runtime: &mut CoordinatedPipelineRuntime,
     prepared: &mut Option<PipelineEpoch>,
-) -> Option<PipelinePoison> {
+) -> Option<PipelineFailure> {
     if let Some(prepared) = prepared.take() {
         runtime.host.discard_unpublished(prepared)
     } else {
@@ -154,7 +154,7 @@ fn discard_prepared(
     }
 }
 
-fn record_cleanup_failure(slot: &mut Option<PipelinePoison>, failure: Option<PipelinePoison>) {
+fn record_cleanup_failure(slot: &mut Option<PipelineFailure>, failure: Option<PipelineFailure>) {
     if let Some(failure) = failure {
         if slot.is_none() {
             *slot = Some(failure);
@@ -257,7 +257,7 @@ impl DaemonCoordinator {
             pipeline: PipelineState::new(pipeline, authority.sender()),
             schema_authority: ArcSwapOption::empty(),
             build_targets: ArcSwap::from_pointee(BTreeMap::new()),
-            configuration_poison: AuthorityCell::new(None, authority.sender()),
+            configuration_error: AuthorityCell::new(None, authority.sender()),
             operational,
             authority,
         })
@@ -333,13 +333,13 @@ impl DaemonCoordinator {
         PipelineSnapshot::clone(&self.pipeline.published.load())
     }
 
-    /// Persist the first runtime poison latched by a published callback
+    /// Persist the first runtime failure latched by a published callback
     /// without minting a new input version. The in-memory epoch token fences
     /// work immediately; this closes the crash/restart durability side of the
     /// same monotonic transition.
-    pub(crate) fn sync_runtime_pipeline_poison(
+    pub(crate) fn sync_runtime_pipeline_failure(
         &self,
-    ) -> Result<Option<PipelinePoison>, CoordinatorError> {
+    ) -> Result<Option<PipelineFailure>, CoordinatorError> {
         self.on_authority(|| {
             let runtime = lock_pipeline(&self.pipeline);
             let Some(epoch) = runtime.host.published_ready_epoch() else {
@@ -347,16 +347,16 @@ impl DaemonCoordinator {
             };
             let observed = match runtime.host.snapshot().epoch() {
                 Ok(_) => return Ok(None),
-                Err(poison) if poison.origin == PipelinePoisonOrigin::PublishedRuntime => {
-                    (epoch.dylib_hash(), poison)
+                Err(failure) if failure.origin == PipelineFailureOrigin::PublishedRuntime => {
+                    (epoch.dylib_hash(), failure)
                 }
                 Err(_) => return Ok(None),
             };
             let diagnostic = observed.1.clone();
             self.server()
-                .coordinated_runtime_pipeline_poison(diagnostic, || {
+                .coordinated_runtime_pipeline_failure(diagnostic, || {
                     let mut store = self.store.write();
-                    match store.poison_published_pipeline_epoch(observed.0, &observed.1) {
+                    match store.fail_published_pipeline_epoch(observed.0, &observed.1) {
                         Ok(()) => Ok(()),
                         Err(StoreError::StalePublishedPipeline {
                             actual: Some(actual),
@@ -491,9 +491,9 @@ impl DaemonCoordinator {
         })
     }
 
-    fn configuration_poison(&self) -> Option<ConfigurationPoison> {
+    fn configuration_error(&self) -> Option<ConfigurationError> {
         let source = self
-            .configuration_poison
+            .configuration_error
             .borrow_mut()
             .clone();
         let scan = self
@@ -501,23 +501,23 @@ impl DaemonCoordinator {
             .borrow_mut()
             .as_ref()
             .and_then(|pending| pending.rejection.configuration.clone());
-        ConfigurationPoison::select_canonical(source.into_iter().chain(scan))
+        ConfigurationError::select_canonical(source.into_iter().chain(scan))
             .ok()
             .flatten()
     }
 
     /// The namespace errors of the pending scan rejection.
-    fn pending_scan_errors(&self) -> Vec<VersionPoison> {
+    fn pending_scan_errors(&self) -> Vec<NamespaceError> {
         self.scan_rejection
             .borrow_mut()
             .as_ref()
             .map_or_else(Vec::new, |pending| pending.rejection.version.clone())
     }
 
-    fn configuration_without_source_poison(
+    fn configuration_without_source_error(
         &self,
     ) -> Result<(ConfigurationStatus, Option<LineageRepairState>), CoordinatorError> {
-        let scan_poison = self
+        let scan_error = self
             .scan_rejection
             .borrow_mut()
             .as_ref()
@@ -527,7 +527,7 @@ impl DaemonCoordinator {
             &lineage,
             &self.scanner,
             &self.lineage_destination(),
-            scan_poison,
+            scan_error,
         )
         .map(|(configuration, repair, _)| (configuration, repair))
     }
@@ -546,18 +546,18 @@ impl DaemonCoordinator {
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let message: String = message.into();
         self.on_authority(|| {
-            let poison = ConfigurationPoison::from_reason(&reason, message);
+            let error = ConfigurationError::from_reason(&reason, message);
             let previous = {
                 let mut current = self
-                    .configuration_poison
+                    .configuration_error
                     .borrow_mut();
-                current.replace(poison)
+                current.replace(error)
             };
             match self.publish_cached_scan() {
                 Ok(stamp) => Ok(stamp),
                 Err(error) => {
                     *self
-                        .configuration_poison
+                        .configuration_error
                         .borrow_mut() = previous;
                     Err(error)
                 }
@@ -568,14 +568,14 @@ impl DaemonCoordinator {
     pub fn heal_configuration_rejection(&self) -> Result<SnapshotStamp, CoordinatorError> {
         self.on_authority(|| {
             let previous = self
-                .configuration_poison
+                .configuration_error
                 .borrow_mut()
                 .take();
             match self.publish_cached_scan() {
                 Ok(stamp) => Ok(stamp),
                 Err(error) => {
                     *self
-                        .configuration_poison
+                        .configuration_error
                         .borrow_mut() = previous;
                     Err(error)
                 }
@@ -647,17 +647,17 @@ impl DaemonCoordinator {
                     ) {
                         Err(error) => {
                             let cleanup = runtime.host.discard_unpublished(prepared);
-                            let poison = cleanup.unwrap_or_else(|| {
-                                PipelinePoison::new(
-                                    PipelinePoisonCode::CandidateRegistration,
-                                    PipelinePoisonOrigin::CandidateOpen,
+                            let failure = cleanup.unwrap_or_else(|| {
+                                PipelineFailure::new(
+                                    PipelineFailureCode::CandidateRegistration,
+                                    PipelineFailureOrigin::CandidateOpen,
                                     CleanupDisposition::CleanedAndClosed,
                                     format!("invalid target-resolved pipeline map: {error:?}"),
                                 )
                                 .expect("candidate-registration cleanup tuple is valid")
                             });
                             (
-                                ConfigurationPipelinePublication::Poison(poison),
+                                ConfigurationPipelinePublication::Failed(failure),
                                 None,
                                 PipelineProjection::default(),
                             )
@@ -666,9 +666,9 @@ impl DaemonCoordinator {
                             let stored = match stored_pipeline_epoch(&prepared, &requirements) {
                                 Ok(stored) => stored,
                                 Err(error) => {
-                                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                                         drop(runtime);
-                                        return self.publish_pipeline_rejection(poison);
+                                        return self.publish_pipeline_rejection(failure);
                                     }
                                     return Err(CoordinatorError::InvalidManifest(error.to_string()));
                                 }
@@ -676,9 +676,9 @@ impl DaemonCoordinator {
                             if let Err(error) = self.authoring.prepare_pipeline_importers(
                                 EpochAuthoringImporter::metadata_only(prepared.importer_descriptors()),
                             ) {
-                                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                                if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                                     drop(runtime);
-                                    return self.publish_pipeline_rejection(poison);
+                                    return self.publish_pipeline_rejection(failure);
                                 }
                                 return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
                             }
@@ -694,8 +694,8 @@ impl DaemonCoordinator {
                         }
                     }
                 }
-                Err(poison) => (
-                    ConfigurationPipelinePublication::Poison(poison),
+                Err(failure) => (
+                    ConfigurationPipelinePublication::Failed(failure),
                     None,
                     PipelineProjection::default(),
                 ),
@@ -707,9 +707,9 @@ impl DaemonCoordinator {
             ) {
                 Ok(claims) => claims,
                 Err(error) => {
-                    if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
                         drop(runtime);
-                        return self.publish_pipeline_rejection(poison);
+                        return self.publish_pipeline_rejection(failure);
                     }
                     return Err(error);
                 }
@@ -721,9 +721,9 @@ impl DaemonCoordinator {
             let fallback_bundles = match store.read().all_asset_bundles() {
                 Ok(bundles) => bundles,
                 Err(error) => {
-                    if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
                         drop(runtime);
-                        return self.publish_pipeline_rejection(poison);
+                        return self.publish_pipeline_rejection(failure);
                     }
                     return Err(CoordinatorError::InvalidManifest(error.to_string()));
                 }
@@ -762,7 +762,7 @@ impl DaemonCoordinator {
                         .store(Some(Arc::clone(&schema_authority)));
                     self.build_targets.store(Arc::new(build_targets.clone()));
                     authoring.install_pipeline_projection(projection.clone());
-                    self.configuration_poison
+                    self.configuration_error
                         .borrow_mut()
                         .take();
                     match (&pipeline, prepared_epoch.take(), published_pipeline) {
@@ -791,14 +791,14 @@ impl DaemonCoordinator {
                                 &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
-                            let fence = PipelinePoison::new(
-                                PipelinePoisonCode::CandidateValidation,
-                                PipelinePoisonOrigin::CandidateOpen,
+                            let fence = PipelineFailure::new(
+                                PipelineFailureCode::CandidateValidation,
+                                PipelineFailureOrigin::CandidateOpen,
                                 CleanupDisposition::None,
                                 "pipeline candidate requires explicit schema acceptance",
                             )
                             .expect("schema-acceptance fence is valid");
-                            runtime.host.install_poison(fence);
+                            runtime.host.install_failure(fence);
                             runtime.pending = Some(PendingPipelineEpoch {
                                 loaded: prepared,
                                 stored: epoch.clone(),
@@ -808,7 +808,7 @@ impl DaemonCoordinator {
                         (
                             ConfigurationPipelinePublication::Epoch { .. },
                             Some(prepared),
-                            PipelineDiagnostic::Poisoned(error),
+                            PipelineDiagnostic::Failed(error),
                         ) => {
                             record_cleanup_failure(
                                 &mut cleanup_failure,
@@ -818,20 +818,20 @@ impl DaemonCoordinator {
                                 &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
-                            runtime.host.install_poison(error);
+                            runtime.host.install_failure(error);
                             authoring.install_pipeline_importers(BTreeMap::new());
                         }
                         (
-                            ConfigurationPipelinePublication::Poison(poison),
+                            ConfigurationPipelinePublication::Failed(failure),
                             None,
-                            PipelineDiagnostic::Poisoned(_)
+                            PipelineDiagnostic::Failed(_)
                             | PipelineDiagnostic::RetiredTypeReferenced(_),
                         ) => {
                             record_cleanup_failure(
                                 &mut cleanup_failure,
                                 discard_pending(&mut runtime),
                             );
-                            runtime.host.install_poison(poison.clone());
+                            runtime.host.install_failure(failure.clone());
                             authoring.install_pipeline_importers(BTreeMap::new());
                         }
                         _ => unreachable!(
@@ -853,18 +853,18 @@ impl DaemonCoordinator {
                 });
             match result {
                 Ok(stamp) => {
-                    let poison = cleanup_failure.take();
-                    if let Some(poison) = poison {
+                    let failure = cleanup_failure.take();
+                    if let Some(failure) = failure {
                         drop(runtime);
-                        self.publish_pipeline_rejection(poison)
+                        self.publish_pipeline_rejection(failure)
                     } else {
                         Ok(stamp)
                     }
                 }
                 Err(error) => {
-                    if let Some(poison) = discard_prepared(&mut runtime, &mut prepared_epoch) {
+                    if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
                         drop(runtime);
-                        return self.publish_pipeline_rejection(poison);
+                        return self.publish_pipeline_rejection(failure);
                     }
                     Err(CoordinatorError::Coordinated(error))
                 }
@@ -889,18 +889,18 @@ impl DaemonCoordinator {
             };
             let prepared = match prepared {
                 Ok(prepared) => prepared,
-                Err(poison) => {
+                Err(failure) => {
                     drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
+                    return self.publish_pipeline_rejection(failure);
                 }
             };
 
             let stored = match stored_pipeline_epoch(&prepared, &requirements) {
                 Ok(stored) => stored,
                 Err(error) => {
-                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                         drop(runtime);
-                        return self.publish_pipeline_rejection(poison);
+                        return self.publish_pipeline_rejection(failure);
                     }
                     return Err(CoordinatorError::InvalidManifest(error.to_string()));
                 }
@@ -911,9 +911,9 @@ impl DaemonCoordinator {
                         prepared.importer_descriptors(),
                     ))
             {
-                if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                     drop(runtime);
-                    return self.publish_pipeline_rejection(poison);
+                    return self.publish_pipeline_rejection(failure);
                 }
                 return Err(CoordinatorError::InvalidManifest(format!("{error:?}")));
             }
@@ -922,9 +922,9 @@ impl DaemonCoordinator {
             let authority = match self.schema_authority() {
                 Some(authority) => authority,
                 None => {
-                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                         drop(runtime);
-                        return self.publish_pipeline_rejection(poison);
+                        return self.publish_pipeline_rejection(failure);
                     }
                     return Err(CoordinatorError::InvalidManifest(
                         "pipeline publication requires project schema authority".to_owned(),
@@ -935,9 +935,9 @@ impl DaemonCoordinator {
             let asset_bundles = match store.read().all_asset_bundles() {
                 Ok(bundles) => bundles,
                 Err(error) => {
-                    if let Some(poison) = runtime.host.discard_unpublished(prepared) {
+                    if let Some(failure) = runtime.host.discard_unpublished(prepared) {
                         drop(runtime);
-                        return self.publish_pipeline_rejection(poison);
+                        return self.publish_pipeline_rejection(failure);
                     }
                     return Err(CoordinatorError::InvalidManifest(error.to_string()));
                 }
@@ -993,14 +993,14 @@ impl DaemonCoordinator {
                             &mut cleanup_failure,
                             discard_pending(&mut runtime),
                         );
-                        let fence = PipelinePoison::new(
-                            PipelinePoisonCode::CandidateValidation,
-                            PipelinePoisonOrigin::CandidateOpen,
+                        let fence = PipelineFailure::new(
+                            PipelineFailureCode::CandidateValidation,
+                            PipelineFailureOrigin::CandidateOpen,
                             CleanupDisposition::None,
                             "pipeline candidate requires explicit schema acceptance",
                         )
-                        .expect("schema-acceptance fence is a valid candidate poison");
-                        runtime.host.install_poison(fence);
+                        .expect("schema-acceptance fence is a valid candidate failure");
+                        runtime.host.install_failure(fence);
                         runtime.pending = Some(PendingPipelineEpoch {
                             loaded: candidate,
                             stored: stored.clone(),
@@ -1028,19 +1028,19 @@ impl DaemonCoordinator {
             });
             match result {
                 Ok(stamp) => {
-                    let poison = cleanup_failure.take();
-                    if let Some(poison) = poison {
+                    let failure = cleanup_failure.take();
+                    if let Some(failure) = failure {
                         drop(runtime);
-                        self.publish_pipeline_rejection(poison)
+                        self.publish_pipeline_rejection(failure)
                     } else {
                         Ok(stamp)
                     }
                 }
                 Err(error) => {
                     if let Some(candidate) = prepared.take() {
-                        if let Some(poison) = runtime.host.discard_unpublished(candidate) {
+                        if let Some(failure) = runtime.host.discard_unpublished(candidate) {
                             drop(runtime);
-                            return self.publish_pipeline_rejection(poison);
+                            return self.publish_pipeline_rejection(failure);
                         }
                     }
                     Err(CoordinatorError::Coordinated(error))
@@ -1052,22 +1052,22 @@ impl DaemonCoordinator {
     /// Publish a candidate-input failure which occurs before a module can be
     /// opened (for example, malformed watched schema JSON). The last durable
     /// schema/target projection remains intact, while the new input version is
-    /// explicitly pipeline-poisoned and the live module is fenced.
+    /// explicitly pipeline-failed and the live module is fenced.
     pub fn publish_pipeline_rejection(
         &self,
-        poison: PipelinePoison,
+        failure: PipelineFailure,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         self.on_authority(|| {
-            self.publish_pipeline_rejection_inner(poison, false)
+            self.publish_pipeline_rejection_inner(failure, false)
         })
     }
 
     pub(crate) fn publish_pipeline_rejection_healing_configuration(
         &self,
-        poison: PipelinePoison,
+        failure: PipelineFailure,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         self.on_authority(|| {
-            self.publish_pipeline_rejection_inner(poison, true)
+            self.publish_pipeline_rejection_inner(failure, true)
         })
     }
 
@@ -1263,20 +1263,20 @@ impl DaemonCoordinator {
 
     fn publish_pipeline_rejection_inner(
         &self,
-        poison: PipelinePoison,
+        failure: PipelineFailure,
         heal_configuration: bool,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let healed_configuration = heal_configuration
-            .then(|| self.configuration_without_source_poison())
+            .then(|| self.configuration_without_source_error())
             .transpose()?;
         let base = self.server().current_stamp().version;
         let store = Arc::clone(&self.store);
-        let diagnostic = poison.clone();
+        let diagnostic = failure.clone();
         let result = self.server().coordinated_commit(base, || {
             let mut store = store.write();
             if store.input_version() != base {
                 return Err(format!(
-                    "durable pipeline-poison basis is {:?}, expected {base:?}",
+                    "durable pipeline-failure basis is {:?}, expected {base:?}",
                     store.input_version()
                 ));
             }
@@ -1285,13 +1285,13 @@ impl DaemonCoordinator {
                 .map_err(|error| error.to_string())?
             {
                 ConfigurationState::Ready(epoch) => epoch.generation,
-                ConfigurationState::Poisoned { last_good, .. } => {
+                ConfigurationState::Failed { last_good, .. } => {
                     last_good.map_or(0, |epoch| epoch.generation)
                 }
             };
             store
                 .input_transaction(|transaction| {
-                    transaction.publish_pipeline_poison(&diagnostic)?;
+                    transaction.publish_pipeline_failure(&diagnostic)?;
                     match healed_configuration
                         .as_ref()
                         .map(|(configuration, _)| configuration)
@@ -1299,8 +1299,8 @@ impl DaemonCoordinator {
                         Some(ConfigurationStatus::Ready) => {
                             transaction.publish_configuration_ready(generation)?
                         }
-                        Some(ConfigurationStatus::Poisoned(poison)) => transaction
-                            .publish_configuration_poison(&poison.detail, &poison.message)?,
+                        Some(ConfigurationStatus::Failed(error)) => transaction
+                            .publish_configuration_error(&error.detail, &error.message)?,
                         None => {}
                     }
                     Ok(())
@@ -1313,7 +1313,7 @@ impl DaemonCoordinator {
                 lineage_repair: healed_configuration
                     .as_ref()
                     .map(|(_, repair)| repair.clone()),
-                pipeline: Some(PipelineDiagnostic::Poisoned(diagnostic.clone())),
+                pipeline: Some(PipelineDiagnostic::Failed(diagnostic.clone())),
                 pipeline_epoch_changed: true,
                 ..Commit::default()
             })
@@ -1325,10 +1325,10 @@ impl DaemonCoordinator {
                     drop(runtime);
                     return self.publish_pipeline_rejection_inner(cleanup, false);
                 }
-                runtime.host.install_poison(poison);
+                runtime.host.install_failure(failure);
                 self.authoring.install_pipeline_importers(BTreeMap::new());
                 if heal_configuration {
-                    self.configuration_poison
+                    self.configuration_error
                         .borrow_mut()
                         .take();
                 }
@@ -1533,7 +1533,7 @@ impl DaemonCoordinator {
             let inputs = PlanInputs {
                 scanner: &self.scanner,
                 destination: self.lineage_destination(),
-                configuration_poison: self.configuration_poison(),
+                configuration_error: self.configuration_error(),
                 namespace_errors: self.pending_scan_errors(),
                 authority: authority.as_deref(),
                 fresh: fresh_bundles(&delta),
@@ -1621,7 +1621,7 @@ impl DaemonCoordinator {
             &self.scanner,
             &self.lineage_destination(),
             scan,
-            self.configuration_poison(),
+            self.configuration_error(),
             authority.as_deref(),
         )?;
         if !heals_scan_rejection {
@@ -1736,10 +1736,10 @@ impl DaemonCoordinator {
             .chain(rejection.version.iter().cloned())
             .collect::<Vec<_>>();
         let source_configuration = self
-            .configuration_poison
+            .configuration_error
             .borrow_mut()
             .clone();
-        let external_configuration = ConfigurationPoison::select_canonical(
+        let external_configuration = ConfigurationError::select_canonical(
             source_configuration
                 .into_iter()
                 .chain(rejection.configuration.clone()),
@@ -1757,7 +1757,7 @@ impl DaemonCoordinator {
         } else {
             (
                 external_configuration
-                    .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Poisoned),
+                    .map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed),
                 None,
             )
         };
@@ -1778,7 +1778,7 @@ impl DaemonCoordinator {
                     .map_err(|error| error.to_string())?
                 {
                     ConfigurationState::Ready(epoch) => epoch.generation,
-                    ConfigurationState::Poisoned { last_good, .. } => {
+                    ConfigurationState::Failed { last_good, .. } => {
                         last_good.map_or(0, |epoch| epoch.generation)
                     }
                 };
@@ -1789,8 +1789,8 @@ impl DaemonCoordinator {
                             ConfigurationStatus::Ready => {
                                 transaction.publish_configuration_ready(generation)?
                             }
-                            ConfigurationStatus::Poisoned(poison) => transaction
-                                .publish_configuration_poison(&poison.detail, &poison.message)?,
+                            ConfigurationStatus::Failed(error) => transaction
+                                .publish_configuration_error(&error.detail, &error.message)?,
                         }
                         Ok(())
                     })
@@ -1969,8 +1969,8 @@ impl DaemonCoordinator {
 
 #[derive(Clone)]
 struct ScanRejection {
-    version: Vec<VersionPoison>,
-    configuration: Option<ConfigurationPoison>,
+    version: Vec<NamespaceError>,
+    configuration: Option<ConfigurationError>,
 }
 
 #[derive(Clone)]
@@ -1984,9 +1984,9 @@ fn select_scan_rejection(
 ) -> Result<ScanRejection, CoordinatorError> {
     let rejections = rejections.into_iter().collect::<Vec<_>>();
     let version =
-        VersionPoison::canonical_set(rejections.iter().flat_map(|item| item.version.clone()))
+        NamespaceError::canonical_set(rejections.iter().flat_map(|item| item.version.clone()))
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-    let configuration = ConfigurationPoison::select_canonical(
+    let configuration = ConfigurationError::select_canonical(
         rejections.into_iter().filter_map(|item| item.configuration),
     )
     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
@@ -2013,8 +2013,8 @@ fn classify_scan_rejection(
         failure,
     } = error
     {
-        let poison = VersionPoison::new(
-            VersionPoisonV1::InvalidPhysicalPath {
+        let namespace_error = NamespaceError::new(
+            NamespaceErrorV1::InvalidPhysicalPath {
                 root_name: root_name.clone(),
                 raw_relative_path: raw_relative_path.clone(),
                 failure: *failure,
@@ -2023,7 +2023,7 @@ fn classify_scan_rejection(
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         return Ok(ScanRejection {
-            version: vec![poison],
+            version: vec![namespace_error],
             configuration: None,
         });
     }
@@ -2033,8 +2033,8 @@ fn classify_scan_rejection(
         claims,
     } = error
     {
-        let poison = VersionPoison::new(
-            VersionPoisonV1::SameRootNormalizedPathCollision {
+        let namespace_error = NamespaceError::new(
+            NamespaceErrorV1::SameRootNormalizedPathCollision {
                 root_name: root_name.clone(),
                 normalized_path: normalized_path.clone(),
                 claims: claims.clone(),
@@ -2043,7 +2043,7 @@ fn classify_scan_rejection(
         )
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
         return Ok(ScanRejection {
-            version: vec![poison],
+            version: vec![namespace_error],
             configuration: None,
         });
     }
@@ -2064,7 +2064,7 @@ fn classify_scan_rejection(
         };
         return Ok(ScanRejection {
             version: Vec::new(),
-            configuration: Some(ConfigurationPoison::from_reason(&reason, error.to_string())),
+            configuration: Some(ConfigurationError::from_reason(&reason, error.to_string())),
         });
     }
     if let ScanError::DaemonOwnedDirectoryAlias {
@@ -2088,7 +2088,7 @@ fn classify_scan_rejection(
         };
         return Ok(ScanRejection {
             version: Vec::new(),
-            configuration: Some(ConfigurationPoison::from_reason(&reason, error.to_string())),
+            configuration: Some(ConfigurationError::from_reason(&reason, error.to_string())),
         });
     }
     let (path, failure) = match error {
@@ -2128,11 +2128,11 @@ fn classify_scan_rejection(
         .unwrap_or_else(|| ScanSubject::Root {
             root_name: "unconfigured".to_owned(),
         });
-    let detail = VersionPoisonV1::UnreadableScanSubtree { subject, failure };
-    let poison = VersionPoison::new(detail, error.to_string())
+    let detail = NamespaceErrorV1::UnreadableScanSubtree { subject, failure };
+    let namespace_error = NamespaceError::new(detail, error.to_string())
         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
     Ok(ScanRejection {
-        version: vec![poison],
+        version: vec![namespace_error],
         configuration: None,
     })
 }
@@ -2284,18 +2284,18 @@ impl Withheld {
     /// What `errors` withhold. `sources` name the assets of withheld
     /// bundles.
     fn new<'a>(
-        errors: &[VersionPoison],
+        errors: &[NamespaceError],
         sources: impl IntoIterator<Item = &'a ScannedBundle>,
     ) -> Self {
         let mut withheld = Self::default();
         let mut bundle_errors = BTreeMap::new();
         for error in errors {
             match &error.detail {
-                VersionPoisonV1::DuplicateBundleUuid { bundle, .. } => {
+                NamespaceErrorV1::DuplicateBundleUuid { bundle, .. } => {
                     withheld.bundles.insert(*bundle);
                     bundle_errors.insert(*bundle, error.message.clone());
                 }
-                VersionPoisonV1::DuplicateAssetUuid { asset, .. } => {
+                NamespaceErrorV1::DuplicateAssetUuid { asset, .. } => {
                     withheld.assets.insert(*asset, error.message.clone());
                 }
                 _ => {}
@@ -2424,15 +2424,15 @@ fn source_claims(
                     );
                 }
             } else {
-                let poison = VersionPoison::new(
-                    VersionPoisonV1::IncompleteSkeleton {
+                let namespace_error = NamespaceError::new(
+                    NamespaceErrorV1::IncompleteSkeleton {
                         source: readable.clone(),
                         failure: skeleton_failure(error),
                     },
                     error.to_string(),
                 )
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-                claims.push(SourceClaim::Malformed(poison));
+                claims.push(SourceClaim::Malformed(namespace_error));
             }
         }
         Ok(bundle) => {
@@ -2491,9 +2491,9 @@ fn bundle_claims<'a>(
 struct PlanInputs<'a> {
     scanner: &'a RootedScanner,
     destination: LineageDestination,
-    configuration_poison: Option<ConfigurationPoison>,
+    configuration_error: Option<ConfigurationError>,
     /// Namespace errors outside the claims (a pending scan rejection's).
-    namespace_errors: Vec<VersionPoison>,
+    namespace_errors: Vec<NamespaceError>,
     authority: Option<&'a ProjectSchemaAuthority>,
     /// The bundles this scan read, by (root, path); other claimed sources
     /// are parsed from their stored bytes.
@@ -2558,7 +2558,7 @@ fn incremental_plan(
     reader: &StoreReader,
     inputs: &PlanInputs<'_>,
 ) -> Result<IncrementalScanPlan, CoordinatorError> {
-    let namespace_errors = VersionPoison::canonical_set(
+    let namespace_errors = NamespaceError::canonical_set(
         reader
             .claims_namespace_errors()?
             .into_iter()
@@ -2569,7 +2569,7 @@ fn incremental_plan(
         &claimed_lineage(reader, &inputs.fresh)?,
         inputs.scanner,
         &inputs.destination,
-        inputs.configuration_poison.clone(),
+        inputs.configuration_error.clone(),
     )?;
     let pending = reader.pending_claims()?;
     // Every source of each pending bundle: a colliding bundle withholds the
@@ -2645,7 +2645,7 @@ fn incremental_plan(
 }
 
 struct IncrementalScanPlan {
-    namespace_errors: Vec<VersionPoison>,
+    namespace_errors: Vec<NamespaceError>,
     withheld: Withheld,
     configuration: ConfigurationStatus,
     lineage_repair: Option<LineageRepairState>,
@@ -2660,7 +2660,7 @@ fn indexed_lineage_projection(
     lineage: &BTreeMap<LineageManifestClaimant, VerifiedSchemaLineageManifest>,
     scanner: &RootedScanner,
     destination: &LineageDestination,
-    external_poison: Option<ConfigurationPoison>,
+    external_error: Option<ConfigurationError>,
 ) -> Result<
     (
         ConfigurationStatus,
@@ -2672,12 +2672,12 @@ fn indexed_lineage_projection(
     let (lineage_configuration, mut repair, manifest) = match lineage.len() {
         0 => {
             let reason = DscpV1::MissingLineageManifest;
-            let poison = ConfigurationPoison::from_reason(
+            let error = ConfigurationError::from_reason(
                 &reason,
                 "the unique SchemaLineageManifest is missing",
             );
             (
-                ConfigurationStatus::Poisoned(poison),
+                ConfigurationStatus::Failed(error),
                 Some(LineageRepairState::Missing {
                     configured_root: destination.root.clone(),
                     configured_path: destination.path.clone(),
@@ -2700,12 +2700,12 @@ fn indexed_lineage_projection(
             let reason = DscpV1::DuplicateLineageManifest {
                 entries: claimants.clone(),
             };
-            let poison = ConfigurationPoison::from_reason(
+            let error = ConfigurationError::from_reason(
                 &reason,
                 "multiple SchemaLineageManifest entries claim authority",
             );
             (
-                ConfigurationStatus::Poisoned(poison),
+                ConfigurationStatus::Failed(error),
                 Some(LineageRepairState::Duplicate { claimants }),
                 None,
             )
@@ -2713,18 +2713,18 @@ fn indexed_lineage_projection(
     };
     let configuration = match lineage_configuration {
         ConfigurationStatus::Ready => {
-            external_poison.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Poisoned)
+            external_error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
         }
-        ConfigurationStatus::Poisoned(lineage_poison) => {
-            let selected = ConfigurationPoison::select_canonical(
-                external_poison.into_iter().chain([lineage_poison.clone()]),
+        ConfigurationStatus::Failed(lineage_error) => {
+            let selected = ConfigurationError::select_canonical(
+                external_error.into_iter().chain([lineage_error.clone()]),
             )
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
-            .expect("lineage supplied one configuration poison");
-            if selected.reason_hash != lineage_poison.reason_hash {
+            .expect("lineage supplied one configuration error");
+            if selected.reason_hash != lineage_error.reason_hash {
                 repair = None;
             }
-            ConfigurationStatus::Poisoned(selected)
+            ConfigurationStatus::Failed(selected)
         }
     };
     Ok((configuration, repair, manifest))
@@ -2742,7 +2742,7 @@ fn scan_key_matches(prefix: &ScanKey, key: &ScanKey) -> bool {
 struct ScanCandidate {
     scan: ScanSnapshot,
     renames: Vec<LogicalRename>,
-    namespace_errors: Vec<VersionPoison>,
+    namespace_errors: Vec<NamespaceError>,
     bundle_poisons: BTreeMap<BundleUuid, ScopedBundlePoison>,
     configuration: ConfigurationStatus,
     lineage_repair: Option<LineageRepairState>,
@@ -2754,10 +2754,10 @@ impl ScanCandidate {
         scanner: &RootedScanner,
         destination: &LineageDestination,
         scan: ScanSnapshot,
-        external_poison: Option<ConfigurationPoison>,
+        external_error: Option<ConfigurationError>,
         authority: Option<&ProjectSchemaAuthority>,
     ) -> Result<Self, CoordinatorError> {
-        let mut poisons = Vec::new();
+        let mut errors = Vec::new();
         let mut bundle_poisons = BTreeMap::new();
         for bundle in scan.bundle_rows() {
             if let Err(error) = &bundle.parsed {
@@ -2766,12 +2766,12 @@ impl ScanCandidate {
                     continue;
                 }
                 let source = readable_source(bundle);
-                let detail = VersionPoisonV1::IncompleteSkeleton {
+                let detail = NamespaceErrorV1::IncompleteSkeleton {
                     source,
                     failure: skeleton_failure(error),
                 };
-                poisons.push(
-                    VersionPoison::new(detail, error.to_string())
+                errors.push(
+                    NamespaceError::new(detail, error.to_string())
                         .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?,
                 );
             }
@@ -2826,9 +2826,9 @@ impl ScanCandidate {
         for (bundle, mut sources) in bundles {
             if sources.len() > 1 {
                 sources.sort();
-                poisons.push(
-                    VersionPoison::new(
-                        VersionPoisonV1::DuplicateBundleUuid { bundle, sources },
+                errors.push(
+                    NamespaceError::new(
+                        NamespaceErrorV1::DuplicateBundleUuid { bundle, sources },
                         format!("duplicate bundle UUID {bundle}"),
                     )
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?,
@@ -2838,16 +2838,16 @@ impl ScanCandidate {
         for (asset, mut claimants) in assets {
             if claimants.len() > 1 {
                 claimants.sort();
-                poisons.push(
-                    VersionPoison::new(
-                        VersionPoisonV1::DuplicateAssetUuid { asset, claimants },
+                errors.push(
+                    NamespaceError::new(
+                        NamespaceErrorV1::DuplicateAssetUuid { asset, claimants },
                         format!("duplicate asset UUID {asset}"),
                     )
                     .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?,
                 );
             }
         }
-        let namespace_errors = VersionPoison::canonical_set(poisons)
+        let namespace_errors = NamespaceError::canonical_set(errors)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
 
         let mut claimants = lineage_claimants(&parsed);
@@ -2857,7 +2857,7 @@ impl ScanCandidate {
             match claimants.as_slice() {
                 [] => {
                     let reason = DscpV1::MissingLineageManifest;
-                    let poison = distill_rpc::ConfigurationPoison::from_reason(
+                    let error = distill_rpc::ConfigurationError::from_reason(
                         &reason,
                         "the unique SchemaLineageManifest is missing",
                     );
@@ -2867,7 +2867,7 @@ impl ScanCandidate {
                         destination: scanner
                             .inspect_destination(&destination.root, &destination.path)?,
                     };
-                    (ConfigurationStatus::Poisoned(poison), Some(repair), None)
+                    (ConfigurationStatus::Failed(error), Some(repair), None)
                 }
                 [claimant] => {
                     let (source, bundle) = parsed
@@ -2887,12 +2887,12 @@ impl ScanCandidate {
                     let reason = DscpV1::DuplicateLineageManifest {
                         entries: claimants.clone(),
                     };
-                    let poison = distill_rpc::ConfigurationPoison::from_reason(
+                    let error = distill_rpc::ConfigurationError::from_reason(
                         &reason,
                         "multiple SchemaLineageManifest entries claim authority",
                     );
                     (
-                        ConfigurationStatus::Poisoned(poison),
+                        ConfigurationStatus::Failed(error),
                         Some(LineageRepairState::Duplicate { claimants }),
                         None,
                     )
@@ -2901,18 +2901,18 @@ impl ScanCandidate {
 
         let configuration = match lineage_configuration {
             ConfigurationStatus::Ready => {
-                external_poison.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Poisoned)
+                external_error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
             }
-            ConfigurationStatus::Poisoned(lineage_poison) => {
-                let selected = ConfigurationPoison::select_canonical(
-                    external_poison.into_iter().chain([lineage_poison.clone()]),
+            ConfigurationStatus::Failed(lineage_error) => {
+                let selected = ConfigurationError::select_canonical(
+                    external_error.into_iter().chain([lineage_error.clone()]),
                 )
                 .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
-                .expect("lineage supplied one configuration poison");
-                if selected.reason_hash != lineage_poison.reason_hash {
+                .expect("lineage supplied one configuration error");
+                if selected.reason_hash != lineage_error.reason_hash {
                     lineage_repair = None;
                 }
-                ConfigurationStatus::Poisoned(selected)
+                ConfigurationStatus::Failed(selected)
             }
         };
 
@@ -2934,7 +2934,7 @@ fn projected_derived_outputs(
 ) -> Result<
     (
         BTreeMap<AssetUuid, DerivedOutputEntry>,
-        Vec<VersionPoison>,
+        Vec<NamespaceError>,
     ),
     StoreError,
 > {
@@ -2994,14 +2994,14 @@ fn projected_derived_outputs(
         }
     }
 
-    let mut poisons = Vec::new();
+    let mut errors = Vec::new();
     for (asset, mut claimants) in claims {
         claimants.sort();
         claimants.dedup();
         if claimants.len() > 1 {
-            poisons.push(
-                VersionPoison::new(
-                    VersionPoisonV1::DuplicateAssetUuid { asset, claimants },
+            errors.push(
+                NamespaceError::new(
+                    NamespaceErrorV1::DuplicateAssetUuid { asset, claimants },
                     format!("duplicate asset UUID {asset}"),
                 )
                 .map_err(|error| StoreError::InvalidConfiguration {
@@ -3010,7 +3010,7 @@ fn projected_derived_outputs(
             );
         }
     }
-    Ok((outputs, poisons))
+    Ok((outputs, errors))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3180,7 +3180,7 @@ fn publish_scan(
     claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
     let (derived_outputs, derived_errors) = projected_derived_outputs(&candidate, projection)?;
-    candidate.namespace_errors = VersionPoison::canonical_set(
+    candidate.namespace_errors = NamespaceError::canonical_set(
         std::mem::take(&mut candidate.namespace_errors)
             .into_iter()
             .chain(derived_errors),
@@ -3273,7 +3273,7 @@ fn publish_scan(
     let newly_failed = withheld.newly_failed(&store)?;
     let mut generation = match store.configuration_state()? {
         ConfigurationState::Ready(epoch) => epoch.generation,
-        ConfigurationState::Poisoned { last_good, .. } => {
+        ConfigurationState::Failed { last_good, .. } => {
             last_good.map_or(0, |epoch| epoch.generation)
         }
     };
@@ -3395,8 +3395,8 @@ fn publish_scan(
 
         match &candidate.configuration {
             ConfigurationStatus::Ready => transaction.publish_configuration_ready(generation)?,
-            ConfigurationStatus::Poisoned(poison) => {
-                transaction.publish_configuration_poison(&poison.detail, &poison.message)?
+            ConfigurationStatus::Failed(error) => {
+                transaction.publish_configuration_error(&error.detail, &error.message)?
             }
         }
         if let Some(manifest) = &candidate.lineage_manifest {
@@ -3413,9 +3413,9 @@ fn publish_scan(
                     transaction.publish_tool_epoch(tools)?;
                 }
             }
-            Some(ConfigurationPipelinePublication::Poison(poison)) => {
-                next_pipeline = PipelineDiagnostic::Poisoned(poison.clone());
-                transaction.publish_pipeline_poison(poison)?;
+            Some(ConfigurationPipelinePublication::Failed(failure)) => {
+                next_pipeline = PipelineDiagnostic::Failed(failure.clone());
+                transaction.publish_pipeline_failure(failure)?;
             }
             None => {}
         }
@@ -3760,8 +3760,8 @@ fn publish_incremental_scan(
             ConfigurationStatus::Ready => {
                 transaction.publish_configuration_ready(configuration_generation)?;
             }
-            ConfigurationStatus::Poisoned(poison) => {
-                transaction.publish_configuration_poison(&poison.detail, &poison.message)?;
+            ConfigurationStatus::Failed(error) => {
+                transaction.publish_configuration_error(&error.detail, &error.message)?;
             }
         }
         if let Some(transition) = schema_transition {
@@ -3915,7 +3915,7 @@ fn prepare_incremental_publication(
     })?;
     let configuration_generation = match store.configuration_state()? {
         ConfigurationState::Ready(epoch) => epoch.generation,
-        ConfigurationState::Poisoned { last_good, .. } => {
+        ConfigurationState::Failed { last_good, .. } => {
             last_good.map_or(0, |epoch| epoch.generation)
         }
     };
@@ -4258,7 +4258,7 @@ fn pipeline_diagnostic(state: Option<StoredPipelineState>) -> PipelineDiagnostic
                 references: error.references,
             })
         }
-        Some(StoredPipelineState::Poisoned { error, .. }) => PipelineDiagnostic::Poisoned(error),
+        Some(StoredPipelineState::Failed { error, .. }) => PipelineDiagnostic::Failed(error),
     }
 }
 
@@ -4326,7 +4326,7 @@ fn publish_incremental_paths_with_schema_transition(
         let inputs = PlanInputs {
             scanner,
             destination: lineage_destination.clone(),
-            configuration_poison: coordinator.configuration_poison(),
+            configuration_error: coordinator.configuration_error(),
             namespace_errors: Vec::new(),
             authority: authority.as_deref(),
             fresh: fresh_bundles(&delta),

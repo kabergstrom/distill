@@ -5,12 +5,12 @@ pub use distill_core::id::{
     AssetUuid, BundleFileHash, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
 };
 pub use distill_store::state::{
-    AssetClaimant, CleanupDisposition, ConfigurationPoison, ConfigurationPoisonCode, DscpV1,
+    AssetClaimant, CleanupDisposition, ConfigurationError, ConfigurationErrorCode, DscpV1,
     GlobalBundleReadFailureCode, InputVersion, LineageManifestClaimant, PhysicalPathClaim,
-    PhysicalPathFailureCode, PipelineCandidateIdentity, PipelinePoison, PipelinePoisonCode,
-    PipelinePoisonOrigin, PlatformPathBytes, ReadableBundleSource, ScanFailureCode, ScanSubject,
+    PhysicalPathFailureCode, PipelineCandidateIdentity, PipelineFailure, PipelineFailureCode,
+    PipelineFailureOrigin, PlatformPathBytes, ReadableBundleSource, ScanFailureCode, ScanSubject,
     SchemaAcceptanceRequired, SchemaManifestBasis, SchemaRegistryMismatch, SkeletonFailureCode,
-    SnapshotStamp, StoreInstanceId, VersionPoison, VersionPoisonCode, VersionPoisonV1,
+    SnapshotStamp, StoreInstanceId, NamespaceError, NamespaceErrorCode, NamespaceErrorV1,
 };
 pub use distill_store::RetiredTypeReference;
 
@@ -54,14 +54,14 @@ pub enum ConnectError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectOutcome {
     Connected(Connected),
-    ConfigurationPoisoned(ConfigurationPoison),
+    ConfigurationFailed(ConfigurationError),
     PipelineUnavailable(PipelineUnavailableDiagnostic),
     Rejected(ConnectError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineUnavailableDiagnostic {
-    PipelinePoison(PipelinePoison),
+    PipelineFailure(PipelineFailure),
     SchemaAcceptanceRequired(SchemaAcceptanceRequired),
     RetiredTypeReferenced(RetiredTypeReferenced),
 }
@@ -109,7 +109,7 @@ pub struct LineageRepairInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineageRepairUnavailable {
     ConfigurationReady,
-    OtherConfigurationPoison(ConfigurationPoison),
+    OtherConfigurationError(ConfigurationError),
 }
 
 #[derive(Debug, Clone)]
@@ -233,14 +233,14 @@ impl Eq for Connected {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigurationStatus {
     Ready,
-    Poisoned(ConfigurationPoison),
+    Failed(ConfigurationError),
 }
 
-/// Closed, poison-safe pipeline diagnostic using shared typed §13 records.
+/// Closed, failure-safe pipeline diagnostic using shared typed §13 records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineDiagnostic {
     Ready,
-    Poisoned(PipelinePoison),
+    Failed(PipelineFailure),
     SchemaAcceptanceRequired(SchemaAcceptanceRequired),
     RetiredTypeReferenced(RetiredTypeReferenced),
 }
@@ -259,12 +259,12 @@ pub struct MetadataDiagnostics {
     pub configuration: ConfigurationStatus,
     pub pipeline: PipelineDiagnostic,
     /// Every current namespace error (LOCKLESS.md §4), in canonical order.
-    pub namespace_errors: Vec<VersionPoison>,
+    pub namespace_errors: Vec<NamespaceError>,
 }
 
 /// R22/H4 terminology alias. The Cap'n Proto declaration calls the wire
 /// struct `ConfigurationStatus`; both names denote the same snapshot-pinned
-/// Ready/Poisoned state.
+/// Ready/Failed state.
 pub type ConfigurationState = ConfigurationStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,7 +377,7 @@ impl<T> MetadataNamespaceCall<T> {
 pub enum RpcResult<T> {
     Success(T),
     ReconnectRequired { reason: ReconnectReason },
-    ConfigurationPoisoned(ConfigurationPoison),
+    ConfigurationFailed(ConfigurationError),
     Failure(RpcFailure),
 }
 
@@ -393,7 +393,7 @@ impl<T> RpcResult<T> {
         match self {
             Self::Success(value) => RpcResult::Success(map(value)),
             Self::ReconnectRequired { reason } => RpcResult::ReconnectRequired { reason },
-            Self::ConfigurationPoisoned(poison) => RpcResult::ConfigurationPoisoned(poison),
+            Self::ConfigurationFailed(error) => RpcResult::ConfigurationFailed(error),
             Self::Failure(error) => RpcResult::Failure(error),
         }
     }
@@ -1678,13 +1678,13 @@ pub struct Commit {
     pub tag_projection_mutations: Vec<TagProjectionMutation>,
     pub configuration: Option<ConfigurationStatus>,
     pub pipeline: Option<PipelineDiagnostic>,
-    /// The publication installs, retires, or poisons a module epoch even when
+    /// The publication installs, retires, or fails a module epoch even when
     /// the externally visible diagnostic remains `Ready`. Existing target
     /// Hubs must reconnect instead of retaining capabilities across that
     /// boundary.
     pub pipeline_epoch_changed: bool,
     /// `Some` replaces the namespace errors (LOCKLESS.md §4).
-    pub namespace_errors: Option<Vec<VersionPoison>>,
+    pub namespace_errors: Option<Vec<NamespaceError>>,
     /// `Some(None)` clears repair inspection; `Some(Some(_))` publishes the
     /// exact current missing/duplicate lineage basis.
     pub lineage_repair: Option<Option<LineageRepairState>>,
@@ -1722,10 +1722,10 @@ pub enum AdminError {
     InvalidLineageRepairState {
         detail: String,
     },
-    InvalidVersionPoison {
-        error: distill_store::state::VersionPoisonError,
+    InvalidNamespaceError {
+        error: distill_store::state::NamespaceErrorDecodeError,
     },
-    InvalidConfigurationPoison {
+    InvalidConfigurationError {
         error: distill_store::state::DscpError,
     },
     InvalidPipelineDiagnostic {

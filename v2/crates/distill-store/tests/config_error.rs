@@ -1,9 +1,9 @@
-//! DSCP v1 configuration-poison grammar and persistence pinning.
+//! DSCP v1 configuration-error grammar and persistence pinning.
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid};
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{
-    ConfigurationPathKey, ConfigurationPoison, ConfigurationPoisonCode,
+    ConfigurationPathKey, ConfigurationError, ConfigurationErrorCode,
     ConfigurationSourceFailureCode, ConfigurationSourcePath, ConfigurationState,
     DirectoryAliasSide, DscpV1, LineageManifestClaimant, OwnedPathKind, OwnedPathSide,
 };
@@ -37,24 +37,24 @@ fn lineage_claimant(marker: u8, asset: u8) -> LineageManifestClaimant {
 
 #[test]
 fn dscp_v1_discriminants_and_one_complete_preimage_are_byte_pinned() {
-    assert_eq!(ConfigurationPoisonCode::MalformedConfiguration as u16, 1);
-    assert_eq!(ConfigurationPoisonCode::NonLoopbackAddress as u16, 2);
-    assert_eq!(ConfigurationPoisonCode::DuplicateRootName as u16, 3);
-    assert_eq!(ConfigurationPoisonCode::InvalidPath as u16, 4);
-    assert_eq!(ConfigurationPoisonCode::OwnedPathOverlap as u16, 5);
-    assert_eq!(ConfigurationPoisonCode::EmptyTargetApis as u16, 6);
-    assert_eq!(ConfigurationPoisonCode::InvalidParallelism as u16, 7);
-    assert_eq!(ConfigurationPoisonCode::InvalidBatchReservation as u16, 8);
-    assert_eq!(ConfigurationPoisonCode::DirectoryAlias as u16, 9);
-    assert_eq!(ConfigurationPoisonCode::MissingLineageManifest as u16, 10);
-    assert_eq!(ConfigurationPoisonCode::DuplicateLineageManifest as u16, 11);
+    assert_eq!(ConfigurationErrorCode::MalformedConfiguration as u16, 1);
+    assert_eq!(ConfigurationErrorCode::NonLoopbackAddress as u16, 2);
+    assert_eq!(ConfigurationErrorCode::DuplicateRootName as u16, 3);
+    assert_eq!(ConfigurationErrorCode::InvalidPath as u16, 4);
+    assert_eq!(ConfigurationErrorCode::OwnedPathOverlap as u16, 5);
+    assert_eq!(ConfigurationErrorCode::EmptyTargetApis as u16, 6);
+    assert_eq!(ConfigurationErrorCode::InvalidParallelism as u16, 7);
+    assert_eq!(ConfigurationErrorCode::InvalidBatchReservation as u16, 8);
+    assert_eq!(ConfigurationErrorCode::DirectoryAlias as u16, 9);
+    assert_eq!(ConfigurationErrorCode::MissingLineageManifest as u16, 10);
+    assert_eq!(ConfigurationErrorCode::DuplicateLineageManifest as u16, 11);
     assert_eq!(
-        ConfigurationPoisonCode::UnsupportedTargetIdentity as u16,
+        ConfigurationErrorCode::UnsupportedTargetIdentity as u16,
         12
     );
-    assert_eq!(ConfigurationPoisonCode::DuplicateTargetName as u16, 13);
+    assert_eq!(ConfigurationErrorCode::DuplicateTargetName as u16, 13);
     assert_eq!(
-        ConfigurationPoisonCode::ConfigurationSourceUnavailable as u16,
+        ConfigurationErrorCode::ConfigurationSourceUnavailable as u16,
         14
     );
     assert_eq!(ConfigurationPathKey::AssetRoot as u8, 1);
@@ -99,67 +99,67 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
     let cases = [
         (
             DscpV1::MalformedConfiguration { file_hash: [0; 32] },
-            ConfigurationPoisonCode::MalformedConfiguration,
+            ConfigurationErrorCode::MalformedConfiguration,
         ),
         (
             DscpV1::NonLoopbackAddress {
                 address: "10.0.0.5:9999".to_owned(),
             },
-            ConfigurationPoisonCode::NonLoopbackAddress,
+            ConfigurationErrorCode::NonLoopbackAddress,
         ),
         (
             DscpV1::DuplicateRootName {
                 normalized_name: "main".to_owned(),
             },
-            ConfigurationPoisonCode::DuplicateRootName,
+            ConfigurationErrorCode::DuplicateRootName,
         ),
         (
             DscpV1::InvalidPath {
                 key: ConfigurationPathKey::AssetRoot,
                 normalized_or_raw_path: "../assets".to_owned(),
             },
-            ConfigurationPoisonCode::InvalidPath,
+            ConfigurationErrorCode::InvalidPath,
         ),
         (
             DscpV1::OwnedPathOverlap {
                 first: owned.clone(),
                 second: owned,
             },
-            ConfigurationPoisonCode::OwnedPathOverlap,
+            ConfigurationErrorCode::OwnedPathOverlap,
         ),
         (
             DscpV1::EmptyTargetApis {
                 target: "ship".to_owned(),
             },
-            ConfigurationPoisonCode::EmptyTargetApis,
+            ConfigurationErrorCode::EmptyTargetApis,
         ),
         (
             DscpV1::InvalidParallelism { value: 0 },
-            ConfigurationPoisonCode::InvalidParallelism,
+            ConfigurationErrorCode::InvalidParallelism,
         ),
         (
             DscpV1::InvalidBatchReservation {
                 parallelism: 4,
                 reservation: 4,
             },
-            ConfigurationPoisonCode::InvalidBatchReservation,
+            ConfigurationErrorCode::InvalidBatchReservation,
         ),
         (
             DscpV1::DirectoryAlias {
                 first: alias.clone(),
                 second: alias,
             },
-            ConfigurationPoisonCode::DirectoryAlias,
+            ConfigurationErrorCode::DirectoryAlias,
         ),
         (
             DscpV1::MissingLineageManifest,
-            ConfigurationPoisonCode::MissingLineageManifest,
+            ConfigurationErrorCode::MissingLineageManifest,
         ),
         (
             DscpV1::DuplicateLineageManifest {
                 entries: vec![lineage_claimant(1, 9), lineage_claimant(2, 9)],
             },
-            ConfigurationPoisonCode::DuplicateLineageManifest,
+            ConfigurationErrorCode::DuplicateLineageManifest,
         ),
         (
             DscpV1::UnsupportedTargetIdentity {
@@ -167,20 +167,20 @@ fn every_dscp_v1_arm_maps_to_its_fixed_code() {
                 expected: compilation.clone(),
                 observed: compilation,
             },
-            ConfigurationPoisonCode::UnsupportedTargetIdentity,
+            ConfigurationErrorCode::UnsupportedTargetIdentity,
         ),
         (
             DscpV1::DuplicateTargetName {
                 normalized_name: "ship".to_owned(),
             },
-            ConfigurationPoisonCode::DuplicateTargetName,
+            ConfigurationErrorCode::DuplicateTargetName,
         ),
         (
             DscpV1::ConfigurationSourceUnavailable {
                 path: ConfigurationSourcePath::Unix(vec![b'c', 0xff]),
                 failure: ConfigurationSourceFailureCode::Missing,
             },
-            ConfigurationPoisonCode::ConfigurationSourceUnavailable,
+            ConfigurationErrorCode::ConfigurationSourceUnavailable,
         ),
     ];
     for (reason, expected) in cases {
@@ -208,7 +208,7 @@ fn dscp_detail_decoder_rejects_noncanonical_order_and_text() {
     unsorted.extend_from_slice(&canonical[4..4 + row_len]);
     assert!(matches!(
         DscpV1::from_canonical_detail_bytes(
-            ConfigurationPoisonCode::DuplicateLineageManifest,
+            ConfigurationErrorCode::DuplicateLineageManifest,
             &unsorted,
         ),
         Err(distill_store::state::DscpError::NonCanonical)
@@ -219,7 +219,7 @@ fn dscp_detail_decoder_rejects_noncanonical_order_and_text() {
     decomposed.extend_from_slice(b"cafe\xcc\x81");
     assert_eq!(
         DscpV1::from_canonical_detail_bytes(
-            ConfigurationPoisonCode::DuplicateRootName,
+            ConfigurationErrorCode::DuplicateRootName,
             &decomposed,
         )
         .unwrap_err(),
@@ -280,7 +280,7 @@ fn directory_alias_paths_round_trip_losslessly() {
 
     let bytes = detail.canonical_detail_bytes();
     assert_eq!(
-        DscpV1::from_canonical_detail_bytes(ConfigurationPoisonCode::DirectoryAlias, &bytes)
+        DscpV1::from_canonical_detail_bytes(ConfigurationErrorCode::DirectoryAlias, &bytes)
             .unwrap(),
         detail
     );
@@ -307,7 +307,7 @@ fn unavailable_configuration_source_preserves_raw_paths_and_closed_failures() {
         let bytes = detail.canonical_detail_bytes();
         assert_eq!(
             DscpV1::from_canonical_detail_bytes(
-                ConfigurationPoisonCode::ConfigurationSourceUnavailable,
+                ConfigurationErrorCode::ConfigurationSourceUnavailable,
                 &bytes,
             )
             .unwrap(),
@@ -319,27 +319,27 @@ fn unavailable_configuration_source_preserves_raw_paths_and_closed_failures() {
 #[test]
 fn configuration_defects_select_one_authority_and_retain_the_canonical_doctor_set() {
     let later =
-        ConfigurationPoison::from_reason(&DscpV1::InvalidParallelism { value: 0 }, "parallelism");
-    let first = ConfigurationPoison::from_reason(
+        ConfigurationError::from_reason(&DscpV1::InvalidParallelism { value: 0 }, "parallelism");
+    let first = ConfigurationError::from_reason(
         &DscpV1::NonLoopbackAddress {
             address: "192.0.2.1:5000".into(),
         },
         "network",
     );
-    let duplicate = ConfigurationPoison::from_reason(
+    let duplicate = ConfigurationError::from_reason(
         &DscpV1::NonLoopbackAddress {
             address: "192.0.2.1:5000".into(),
         },
         "a network diagnostic",
     );
 
-    let set = ConfigurationPoison::canonical_set([later.clone(), first.clone(), duplicate.clone()])
+    let set = ConfigurationError::canonical_set([later.clone(), first.clone(), duplicate.clone()])
         .unwrap();
     assert_eq!(set.len(), 2);
     assert_eq!(set[0], duplicate);
     assert_eq!(set[1], later);
     assert_eq!(
-        ConfigurationPoison::select_canonical([later, first, duplicate]).unwrap(),
+        ConfigurationError::select_canonical([later, first, duplicate]).unwrap(),
         Some(set[0].clone())
     );
 }
@@ -386,30 +386,30 @@ fn layout_identity_fields_are_part_of_the_typed_reason() {
 }
 
 #[test]
-fn typed_configuration_poison_roundtrips_and_message_is_not_hashed() {
+fn typed_configuration_error_roundtrips_and_message_is_not_hashed() {
     let (_dir, mut store) = open();
     let facts = DscpV1::NonLoopbackAddress {
         address: "10.0.0.5:9999".to_owned(),
     };
     let expected_hash = facts.reason_hash();
     assert_eq!(
-        ConfigurationPoison::from_reason(&facts, "first diagnostic").reason_hash,
-        ConfigurationPoison::from_reason(&facts, "completely different prose").reason_hash,
+        ConfigurationError::from_reason(&facts, "first diagnostic").reason_hash,
+        ConfigurationError::from_reason(&facts, "completely different prose").reason_hash,
     );
     store
         .input_transaction(|txn| {
-            txn.publish_configuration_poison(&facts, "daemon address is not loopback")
+            txn.publish_configuration_error(&facts, "daemon address is not loopback")
         })
         .unwrap();
 
     let state = store.configuration_state().unwrap();
-    let ConfigurationState::Poisoned { reason: poison, .. } = state else {
-        panic!("typed poison must be persisted");
+    let ConfigurationState::Failed { reason: error, .. } = state else {
+        panic!("typed error must be persisted");
     };
-    assert_eq!(poison.code, ConfigurationPoisonCode::NonLoopbackAddress);
-    assert_eq!(poison.reason_hash, expected_hash);
-    assert_eq!(poison.detail.as_ref(), &facts);
-    assert_eq!(poison.message, "daemon address is not loopback");
+    assert_eq!(error.code, ConfigurationErrorCode::NonLoopbackAddress);
+    assert_eq!(error.reason_hash, expected_hash);
+    assert_eq!(error.detail.as_ref(), &facts);
+    assert_eq!(error.message, "daemon address is not loopback");
     assert_eq!(
         facts.reason_hash(),
         DscpV1::NonLoopbackAddress {
@@ -421,11 +421,11 @@ fn typed_configuration_poison_roundtrips_and_message_is_not_hashed() {
 }
 
 #[test]
-fn a_later_valid_generation_heals_all_persisted_poison_fields() {
+fn a_later_valid_generation_heals_all_persisted_error_fields() {
     let (_dir, mut store) = open();
     store
         .input_transaction(|txn| {
-            txn.publish_configuration_poison(
+            txn.publish_configuration_error(
                 &DscpV1::InvalidParallelism { value: 0 },
                 "parallelism must be positive",
             )
@@ -470,7 +470,7 @@ fn unknown_persisted_code_is_rejected_instead_of_becoming_an_other_variant() {
 }
 
 #[test]
-fn noncanonical_persisted_poison_shape_is_rejected() {
+fn noncanonical_persisted_error_shape_is_rejected() {
     let (dir, store) = open();
     let state_path = dir.path().join(".distill");
     drop(store);
@@ -502,14 +502,14 @@ fn noncanonical_persisted_poison_shape_is_rejected() {
 }
 
 #[test]
-fn persisted_configuration_poison_recomputes_detail_authority() {
+fn persisted_configuration_error_recomputes_detail_authority() {
     let cases = ["version", "trailing-detail", "wrong-code", "wrong-digest"];
     for case in cases {
         let (dir, mut store) = open();
         let state_path = dir.path().join(".distill");
         store
             .input_transaction(|txn| {
-                txn.publish_configuration_poison(
+                txn.publish_configuration_error(
                     &DscpV1::NonLoopbackAddress {
                         address: "10.0.0.5:9999".to_owned(),
                     },

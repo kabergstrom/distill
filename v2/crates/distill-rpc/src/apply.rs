@@ -1,7 +1,7 @@
 //! Publishing RPC state into the store (LOCKLESS.md §2.2). A typed
 //! [`Commit`] is applied to the served tables inside the publishing input
 //! transaction, so a version is never visible without its RPC projection.
-//! Fence changes that publish no input version (runtime pipeline poison,
+//! Fence changes that publish no input version (runtime pipeline failure,
 //! restart keys, target replacement) are [`ServedWrite`] helpers too.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,7 +30,7 @@ const EMBEDDED_ROOT: &str = "rpc";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyMode {
     /// The embedded server owns the namespace: authoring entries, paths,
-    /// derived outputs, tags, configuration and version poison are written
+    /// derived outputs, tags, configuration and namespace errors are written
     /// from the commit.
     Full,
     /// The daemon already wrote the namespace in the same transaction; only
@@ -100,8 +100,8 @@ pub(crate) fn configuration_status(
 ) -> ConfigurationStatus {
     match state {
         distill_store::state::ConfigurationState::Ready(_) => ConfigurationStatus::Ready,
-        distill_store::state::ConfigurationState::Poisoned { reason, .. } => {
-            ConfigurationStatus::Poisoned(reason.clone())
+        distill_store::state::ConfigurationState::Failed { reason, .. } => {
+            ConfigurationStatus::Failed(reason.clone())
         }
     }
 }
@@ -133,7 +133,7 @@ fn apply<W: ServedWrite>(
     for error in commit.namespace_errors.iter().flatten() {
         error
             .validate()
-            .map_err(|error| AdminError::InvalidVersionPoison { error })?;
+            .map_err(|error| AdminError::InvalidNamespaceError { error })?;
     }
     let version = txn.change_version();
     let (_, current_pipeline) = read_served_pipeline(txn.txn_served_blob(SERVED_PIPELINE)?)?;
@@ -331,8 +331,8 @@ fn write_namespace(txn: &mut InputTxn<'_>, commit: &Commit) -> Result<(), ApplyE
     }
     match &commit.configuration {
         Some(ConfigurationStatus::Ready) => txn.publish_configuration_ready(0)?,
-        Some(ConfigurationStatus::Poisoned(poison)) => {
-            txn.publish_configuration_poison(&poison.detail, &poison.message)?
+        Some(ConfigurationStatus::Failed(error)) => {
+            txn.publish_configuration_error(&error.detail, &error.message)?
         }
         None => {}
     }
@@ -354,16 +354,16 @@ fn derived_row(entry: &DerivedOutputEntry) -> DerivedOutputRow {
 
 /// Publish a runtime failure of the current pipeline epoch. The diagnostic
 /// keeps its installing version, so every snapshot that pinned this epoch
-/// sees the poison; every connection must reconnect. Returns `false` when
-/// the same poison is already published.
-pub fn publish_runtime_pipeline_poison<W: ServedWrite>(
+/// sees the failure; every connection must reconnect. Returns `false` when
+/// the same failure is already published.
+pub fn publish_runtime_pipeline_failure<W: ServedWrite>(
     txn: &mut W,
-    poison: PipelinePoison,
+    failure: PipelineFailure,
 ) -> Result<bool, StoreError> {
     let (installed_at, current) = read_served_pipeline(txn.txn_served_blob(SERVED_PIPELINE)?)?;
     match &current {
         PipelineDiagnostic::Ready => {}
-        PipelineDiagnostic::Poisoned(existing) if existing == &poison => return Ok(false),
+        PipelineDiagnostic::Failed(existing) if existing == &failure => return Ok(false),
         other => {
             return Err(StoreError::Rejected {
                 detail: format!("current RPC pipeline is not the observed ready epoch: {other:?}"),
@@ -374,7 +374,7 @@ pub fn publish_runtime_pipeline_poison<W: ServedWrite>(
         SERVED_PIPELINE,
         Some(&encode_served_pipeline(
             installed_at,
-            &PipelineDiagnostic::Poisoned(poison),
+            &PipelineDiagnostic::Failed(failure),
         )),
     )?;
     txn.bump_rpc_pipeline_generation()?;

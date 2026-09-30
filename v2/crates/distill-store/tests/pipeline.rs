@@ -1,5 +1,5 @@
 //! §13 pipeline-side metadata: the `pipeline_state` row (dylib hash and
-//! staged-candidate poison), the `tools` ToolEpoch
+//! staged-candidate failure), the `tools` ToolEpoch
 //! table, and the source-controlled schema-lineage projection that gates
 //! automatic migration diffs (§11).
 
@@ -18,7 +18,7 @@ use distill_store::pipeline::{
     ValidatedPipelineEpoch, VerifiedSchemaLineageManifest,
 };
 use distill_store::state::{
-    CleanupDisposition, PipelineEpoch, PipelinePoison, PipelinePoisonCode, PipelinePoisonOrigin,
+    CleanupDisposition, PipelineEpoch, PipelineFailure, PipelineFailureCode, PipelineFailureOrigin,
     PipelineState, PipelineUnavailable, Registration, RegistrationKind,
 };
 use distill_store::{RetiredTypeReference, Store, StoreConfig, StoreError};
@@ -102,7 +102,7 @@ fn project_empty(store: &mut Store) {
 }
 
 #[test]
-fn published_runtime_poison_is_durable_without_a_new_input_version() {
+fn published_runtime_failure_is_durable_without_a_new_input_version() {
     let (_dir, mut store) = store();
     project_empty(&mut store);
     let ready = epoch(41);
@@ -110,26 +110,26 @@ fn published_runtime_poison_is_durable_without_a_new_input_version() {
         .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
         .unwrap();
     let version = store.input_version();
-    let poison = PipelinePoison::new(
-        PipelinePoisonCode::PublishedCallbackPanic,
-        PipelinePoisonOrigin::PublishedRuntime,
+    let failure = PipelineFailure::new(
+        PipelineFailureCode::PublishedCallbackPanic,
+        PipelineFailureOrigin::PublishedRuntime,
         CleanupDisposition::PublishedEpochLeaked,
         "drop thunk panicked",
     )
     .unwrap();
     store
-        .poison_published_pipeline_epoch(ready.dylib_hash, &poison)
+        .fail_published_pipeline_epoch(ready.dylib_hash, &failure)
         .unwrap();
     assert_eq!(store.input_version(), version);
     assert!(matches!(
         store.pipeline_state().unwrap(),
-        Some(PipelineState::Poisoned {
+        Some(PipelineState::Failed {
             error,
             last_good: Some(_),
-        }) if error == poison
+        }) if error == failure
     ));
     assert!(matches!(
-        store.poison_published_pipeline_epoch(ready.dylib_hash, &poison),
+        store.fail_published_pipeline_epoch(ready.dylib_hash, &failure),
         Err(StoreError::StalePublishedPipeline {
             already_unavailable: true,
             ..
@@ -138,22 +138,22 @@ fn published_runtime_poison_is_durable_without_a_new_input_version() {
 }
 
 #[test]
-fn runtime_poison_cas_cannot_fence_another_epoch_or_use_candidate_origin() {
+fn runtime_failure_cas_cannot_fence_another_epoch_or_use_candidate_origin() {
     let (_dir, mut store) = store();
     project_empty(&mut store);
     let ready = epoch(42);
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&ready))
         .unwrap();
-    let runtime = PipelinePoison::new(
-        PipelinePoisonCode::PublishedCallbackRejected,
-        PipelinePoisonOrigin::PublishedRuntime,
+    let runtime = PipelineFailure::new(
+        PipelineFailureCode::PublishedCallbackRejected,
+        PipelineFailureOrigin::PublishedRuntime,
         CleanupDisposition::PublishedEpochLeaked,
         "callback rejected",
     )
     .unwrap();
     assert!(matches!(
-        store.poison_published_pipeline_epoch([0xff; 32], &runtime),
+        store.fail_published_pipeline_epoch([0xff; 32], &runtime),
         Err(StoreError::StalePublishedPipeline { .. })
     ));
     assert!(matches!(
@@ -161,16 +161,16 @@ fn runtime_poison_cas_cannot_fence_another_epoch_or_use_candidate_origin() {
         Some(PipelineState::Ready(_))
     ));
 
-    let candidate = PipelinePoison::new(
-        PipelinePoisonCode::CandidateOpen,
-        PipelinePoisonOrigin::CandidateOpen,
+    let candidate = PipelineFailure::new(
+        PipelineFailureCode::CandidateOpen,
+        PipelineFailureOrigin::CandidateOpen,
         CleanupDisposition::None,
         "open failed",
     )
     .unwrap();
     assert!(matches!(
-        store.poison_published_pipeline_epoch(ready.dylib_hash, &candidate),
-        Err(StoreError::InvalidPipelinePoison(_))
+        store.fail_published_pipeline_epoch(ready.dylib_hash, &candidate),
+        Err(StoreError::InvalidPipelineFailure(_))
     ));
 }
 
@@ -244,10 +244,10 @@ fn h(n: u8) -> LogicalHash {
 
 const T: TypeUuid = TypeUuid([4u8; 16]);
 
-fn candidate_poison(message: &str) -> PipelinePoison {
-    PipelinePoison::new(
-        PipelinePoisonCode::CandidateRegistration,
-        PipelinePoisonOrigin::CandidateOpen,
+fn candidate_failure(message: &str) -> PipelineFailure {
+    PipelineFailure::new(
+        PipelineFailureCode::CandidateRegistration,
+        PipelineFailureOrigin::CandidateOpen,
         CleanupDisposition::CleanedAndClosed,
         message,
     )
@@ -283,8 +283,8 @@ fn publishing_an_epoch_roundtrips_identity_and_registrations() {
 }
 
 #[test]
-fn a_rejected_candidate_still_publishes_as_poison() {
-    // §13: failure publishes the version carrying a pipeline poison —
+fn a_rejected_candidate_still_publishes_as_a_failure() {
+    // §13: failure publishes the version carrying a pipeline failure —
     // the prior epoch is never silently retained as the new version's
     // code, and the version is never dropped.
     let (_d, mut store) = store();
@@ -294,20 +294,20 @@ fn a_rejected_candidate_still_publishes_as_poison() {
         .unwrap();
     store
         .input_transaction(|txn| {
-            txn.publish_pipeline_poison(&candidate_poison("dup processor id `tex`"))
+            txn.publish_pipeline_failure(&candidate_failure("dup processor id `tex`"))
         })
         .unwrap();
 
     let state = store.pipeline_state().unwrap().expect("still published");
     match &state {
-        PipelineState::Poisoned { error, last_good } => {
+        PipelineState::Failed { error, last_good } => {
             assert!(error.message.contains("dup processor id"));
             // last_good is residency bookkeeping only — present, but
             // epoch() still refuses.
             let last: &Arc<PipelineEpoch> = last_good.as_ref().expect("prior epoch recorded");
             assert_eq!(last.dylib_hash, [3u8; 32]);
         }
-        other => panic!("expected Poisoned, got {other:?}"),
+        other => panic!("expected Failed, got {other:?}"),
     }
     assert!(state.epoch().is_err());
 }
@@ -317,24 +317,24 @@ fn poison_with_no_prior_epoch_has_no_last_good() {
     let (_d, mut store) = store();
     store
         .input_transaction(|txn| {
-            txn.publish_pipeline_poison(&candidate_poison("first candidate invalid"))
+            txn.publish_pipeline_failure(&candidate_failure("first candidate invalid"))
         })
         .unwrap();
     match store.pipeline_state().unwrap().expect("published") {
-        PipelineState::Poisoned { last_good, .. } => assert!(last_good.is_none()),
-        other => panic!("expected Poisoned, got {other:?}"),
+        PipelineState::Failed { last_good, .. } => assert!(last_good.is_none()),
+        other => panic!("expected Failed, got {other:?}"),
     }
 }
 
 #[test]
-fn the_next_successful_swap_publishes_over_the_poison() {
+fn the_next_successful_swap_publishes_over_the_failure() {
     let (_d, mut store) = store();
     project_empty(&mut store);
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(3)))
         .unwrap();
     store
-        .input_transaction(|txn| txn.publish_pipeline_poison(&candidate_poison("bad candidate")))
+        .input_transaction(|txn| txn.publish_pipeline_failure(&candidate_failure("bad candidate")))
         .unwrap();
     store
         .input_transaction(|txn| txn.publish_pipeline_epoch(&epoch(7)))

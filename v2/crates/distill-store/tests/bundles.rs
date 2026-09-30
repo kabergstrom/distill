@@ -1,7 +1,7 @@
 //! §13 asset-namespace tables: bundles (physical key + poison rows),
 //! assets + search tags, the path/primary resolution index, dependency
-//! records with selector indexes, the schema cache — and the two poison
-//! shapes: bundle-scoped rows and the version-global poison.
+//! records with selector indexes, the schema cache — and the two error
+//! shapes: bundle-scoped poison rows and namespace errors.
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{
@@ -10,7 +10,7 @@ use distill_store::bundles::{
 };
 use distill_store::files::RootId;
 use distill_store::state::{
-    ErrorScope, ReadableBundleSource, SkeletonFailureCode, VersionPoison, VersionPoisonV1,
+    ErrorScope, ReadableBundleSource, SkeletonFailureCode, NamespaceError, NamespaceErrorV1,
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,9 +21,9 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
-fn version_poison(message: &str) -> VersionPoison {
-    VersionPoison::new(
-        VersionPoisonV1::IncompleteSkeleton {
+fn namespace_error(message: &str) -> NamespaceError {
+    NamespaceError::new(
+        NamespaceErrorV1::IncompleteSkeleton {
             source: ReadableBundleSource {
                 root_name: "main".into(),
                 normalized_path: "broken.bundle".into(),
@@ -627,7 +627,7 @@ fn fixing_the_file_heals_on_the_next_version() {
 fn a_namespace_error_leaves_the_rest_of_the_namespace_readable() {
     let (_d, mut store) = store();
     seed(&mut store);
-    let error = version_poison("broken.bundle has no complete skeleton");
+    let error = namespace_error("broken.bundle has no complete skeleton");
     store
         .input_transaction(|txn| txn.set_namespace_errors([error.clone()]))
         .unwrap();
@@ -656,8 +656,8 @@ fn a_namespace_error_leaves_the_rest_of_the_namespace_readable() {
 fn namespace_errors_persist_the_full_set_in_canonical_order() {
     let (_d, mut store) = store();
     let make = |path: &str, byte: u8| {
-        VersionPoison::new(
-            VersionPoisonV1::IncompleteSkeleton {
+        NamespaceError::new(
+            NamespaceErrorV1::IncompleteSkeleton {
                 source: ReadableBundleSource {
                     root_name: "main".into(),
                     normalized_path: path.into(),

@@ -19,7 +19,7 @@ use distill_schema::ngp_schema::{
     node_hash, snapshot_to_json, LogicalSchema, PrimitiveKind, SchemaNode,
 };
 use distill_store::config::RestartOnlyChange;
-use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
+use distill_store::state::{ConfigurationState, DscpV1, InputVersion, NamespaceErrorV1};
 use distill_store::served::ResolutionRow;
 use distill_store::{Store, StoreConfig, StoreError, StoreReader};
 
@@ -287,7 +287,7 @@ fn assert_only_the_shared_asset_is_withheld(store: &StoreReader) {
     let [error] = <[_; 1]>::try_from(store.namespace_errors().unwrap()).unwrap();
     assert!(matches!(
         error.detail,
-        VersionPoisonV1::DuplicateAssetUuid { asset, .. } if asset == AssetUuid([40; 16])
+        NamespaceErrorV1::DuplicateAssetUuid { asset, .. } if asset == AssetUuid([40; 16])
     ));
     assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
     assert!(store.entry(AssetUuid([34; 16])).unwrap().is_some());
@@ -427,7 +427,7 @@ fn full_scan_publishes_one_store_and_rpc_version_with_missing_lineage_repair_bas
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
     assert!(matches!(
         store.configuration_state().unwrap(),
-        ConfigurationState::Poisoned { reason, .. }
+        ConfigurationState::Failed { reason, .. }
             if matches!(reason.detail.as_ref(), DscpV1::MissingLineageManifest)
     ));
     drop(store);
@@ -581,7 +581,7 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
     let store = coordinator.store();
     assert!(matches!(
         store.read().namespace_errors().unwrap()[0].detail,
-        VersionPoisonV1::UnreadableScanSubtree { .. }
+        NamespaceErrorV1::UnreadableScanSubtree { .. }
     ));
 
     std::fs::remove_file(link).unwrap();
@@ -594,7 +594,7 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
 
 #[cfg(unix)]
 #[test]
-fn incremental_scan_poison_heals_when_observation_returns_to_last_good() {
+fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -639,7 +639,7 @@ fn incremental_scan_poison_heals_when_observation_returns_to_last_good() {
 
 #[cfg(unix)]
 #[test]
-fn unrelated_incremental_observation_does_not_heal_pending_scan_poison() {
+fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -730,7 +730,7 @@ fn configuration_scan_rejection_preserves_existing_namespace_errors() {
 
 #[cfg(unix)]
 #[test]
-fn directory_alias_publishes_configuration_poison_without_aborting_the_version() {
+fn directory_alias_publishes_configuration_error_without_aborting_the_version() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
@@ -746,7 +746,7 @@ fn directory_alias_publishes_configuration_poison_without_aborting_the_version()
     let store = coordinator.store();
     assert!(matches!(
         store.read().configuration_state().unwrap(),
-        ConfigurationState::Poisoned { reason, .. }
+        ConfigurationState::Failed { reason, .. }
             if matches!(reason.detail.as_ref(), DscpV1::DirectoryAlias { .. })
     ));
 }

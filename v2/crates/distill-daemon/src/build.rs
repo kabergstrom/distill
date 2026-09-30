@@ -207,21 +207,21 @@ impl BuildBackend for CoordinatorBuildBackend {
         };
         let scheduled_request = request.clone();
         let job_coordinator = Arc::clone(&coordinator);
-        let (result, poison) = coordinator.run_scheduled(class, move || {
+        let (result, failure) = coordinator.run_scheduled(class, move || {
             let result = build_with_runtime(&job_coordinator, &scheduled_request);
-            let poison = job_coordinator.sync_runtime_pipeline_poison();
-            (result, poison)
+            let failure = job_coordinator.sync_runtime_pipeline_failure();
+            (result, failure)
         });
-        match poison {
-            Ok(Some(poison)) => {
+        match failure {
+            Ok(Some(failure)) => {
                 return Err(RpcFailure::PipelineUnavailable(Box::new(
-                    PipelineUnavailableDiagnostic::PipelinePoison(poison),
+                    PipelineUnavailableDiagnostic::PipelineFailure(failure),
                 )))
             }
             Ok(None) => {}
             Err(error) => {
                 return Err(RpcFailure::AuthoringBackendUnavailable {
-                    operation: format!("persist runtime pipeline poison: {error}"),
+                    operation: format!("persist runtime pipeline failure: {error}"),
                 })
             }
         }
@@ -1019,7 +1019,7 @@ fn build_with_runtime_mode(
     let pipeline = coordinator.pipeline_snapshot();
     let epoch = pipeline
         .epoch()
-        .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+        .map_err(|failure| BuildError::Failed(failure.to_string()))?;
     let dylib_hash = epoch.dylib_hash();
     let registry = PipelineRegistry::new(
         epoch
@@ -1615,7 +1615,7 @@ fn build_asset_inner(
     let validators_registered = context
         .pipeline
         .epoch()
-        .map_err(|poison| BuildError::Failed(poison.to_string()))?
+        .map_err(|failure| BuildError::Failed(failure.to_string()))?
         .validator_descriptors()
         .iter()
         .any(|descriptor| descriptor.asset_type == loaded.entry.type_uuid);
@@ -1789,7 +1789,7 @@ fn run_processor_stage(
     let epoch = context
         .pipeline
         .epoch()
-        .map_err(|poison| BuildError::Failed(poison.to_string()))?
+        .map_err(|failure| BuildError::Failed(failure.to_string()))?
         .clone();
     let verify_fresh = context.verify_fresh;
     let mut process_context = BuildProcessContext::new(
@@ -2625,7 +2625,7 @@ fn capture_trace_source(context: &BuildContext) -> Result<StoreTraceSource, Buil
     let epoch = context
         .pipeline
         .epoch()
-        .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+        .map_err(|failure| BuildError::Failed(failure.to_string()))?;
     let store = lock_build_store(context)?;
     StoreTraceSource::capture(
         &store,
@@ -3131,7 +3131,7 @@ fn load_current_entry(
         let epoch = runtime
             .pipeline
             .epoch()
-            .map_err(|poison| BuildError::Failed(poison.to_string()))?;
+            .map_err(|failure| BuildError::Failed(failure.to_string()))?;
         let defaults = EpochDefaults::new(epoch, entry.type_uuid);
         execute_ops(&plan, &value, &schema.root, &current_schema.root, &defaults)
             .map_err(|error| {
@@ -3348,7 +3348,7 @@ fn execute_custom_migration(
             match runtime
                 .pipeline
                 .epoch()
-                .map_err(|poison| BuildError::Failed(poison.to_string()))?
+                .map_err(|failure| BuildError::Failed(failure.to_string()))?
                 .invoke_migration(key, input)
             {
                 Ok(output) => output,
@@ -3483,7 +3483,7 @@ fn encode_or_hydrate(
         let diagnostics = context
             .pipeline
             .epoch()
-            .map_err(|poison| BuildError::Failed(poison.to_string()))?
+            .map_err(|failure| BuildError::Failed(failure.to_string()))?
             .invoke_validators(loaded.entry.type_uuid, &current_value)
             .map_err(BuildError::failed)?;
         let error_paths = diagnostics
