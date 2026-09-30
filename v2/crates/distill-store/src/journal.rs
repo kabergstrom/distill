@@ -304,7 +304,6 @@ impl Store {
     /// as an abandoned attempt in one durable transaction, including children
     /// such as deletions that do not have a proposal temp.
     pub fn abort_unarmed_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
-        self.assert_no_open_input();
         let transaction = self.read.conn.savepoint()?;
         let state: Option<(i64, i64)> = transaction
             .query_row(
@@ -339,7 +338,6 @@ impl Store {
     /// healed input version; retirement merely proves no filesystem work is
     /// left implicit.
     pub fn retire_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
-        self.assert_no_open_input();
         let transaction = self.read.conn.savepoint()?;
         let state: Option<i64> = transaction
             .query_row(

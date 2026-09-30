@@ -150,6 +150,32 @@ impl Drop for EmbeddedWriter {
     }
 }
 
+/// An input the daemon's coordinated step joins: rolled back unless
+/// finished.
+struct OpenInput<'a> {
+    handle: &'a ServerHandle,
+    open: bool,
+}
+
+impl OpenInput<'_> {
+    fn finish(mut self) -> Result<(), CoordinatedCommitError> {
+        self.open = false;
+        self.handle
+            .writer()
+            .run(|store| store.finish_input(true))
+            .map(|_| ())
+            .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))
+    }
+}
+
+impl Drop for OpenInput<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.handle.writer().run(|store| store.finish_input(false));
+        }
+    }
+}
+
 /// A job for the authority thread.
 pub type AuthorityJob = Box<dyn FnOnce() + Send + 'static>;
 
@@ -488,7 +514,8 @@ impl ServerHandle {
                 })),
             }
         });
-        if result.is_ok() {
+        // Inside an open input, readers are told once it commits.
+        if result.is_ok() && !self.writer().run(|store| store.input_open()) {
             self.notify_published();
         }
         result
@@ -1167,10 +1194,24 @@ impl Server {
                 observed,
             });
         }
-        let Some(commit) = publish().map_err(CoordinatedCommitError::Publication)? else {
-            return Ok(None);
+        let handle = &self.inner.handle;
+        if handle.embedded() {
+            let Some(commit) = publish().map_err(CoordinatedCommitError::Publication)? else {
+                return Ok(None);
+            };
+            return self.publish_locked(base, commit, targets).map(Some);
+        }
+        // The daemon's step, its own writes and the served projection
+        // commit as one input: no reader sees the version before its rows.
+        handle.writer().run(|store| store.arm_input());
+        let open = OpenInput { handle, open: true };
+        let published = match publish().map_err(CoordinatedCommitError::Publication)? {
+            Some(commit) => Some(self.publish_locked(base, commit, targets)?),
+            None => None,
         };
-        self.publish_locked(base, commit, targets).map(Some)
+        open.finish()?;
+        handle.notify_published();
+        Ok(published)
     }
 
     /// Apply `commit` as the version after `base`; the caller is the

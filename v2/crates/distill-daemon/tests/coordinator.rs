@@ -20,7 +20,7 @@ use distill_schema::ngp_schema::{
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::state::{ConfigurationState, DscpV1, InputVersion, VersionPoisonV1};
-use distill_store::{Store, StoreConfig, StoreError};
+use distill_store::{Store, StoreConfig, StoreError, StoreReader};
 
 fn ordinary_bundle() -> (Vec<u8>, BundleUuid, AssetUuid) {
     ordinary_bundle_with(73, 72, 7)
@@ -418,6 +418,38 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     assert_eq!(store.input_version(), InputVersion(3));
     assert!(store.bundle(bundle_uuid).unwrap().is_none());
     assert!(store.entry(asset_uuid).unwrap().is_none());
+}
+
+#[test]
+fn a_coordinated_publication_is_invisible_until_it_commits_whole() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
+    let coordinator = coordinator(&temp);
+    let bundle_path = temp.path().join("assets/ordinary.bundle");
+    std::fs::write(&bundle_path, bytes).unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+
+    let backend = Arc::clone(coordinator.authoring_service());
+    let state = temp.path().join(".distill");
+    let stamp = coordinator
+        .coordinated_commit(InputVersion(1), || {
+            let commit = backend
+                .prepare_write(InputVersion(1), &[AuthoringOp::Remove { uuid: asset_uuid }])
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or_else(|| "production authoring returned no commit".to_owned())?;
+            // The namespace is written, but not yet as a version anyone else
+            // can read: it commits with the served rows.
+            let outside = StoreReader::open(StoreConfig::new(state.clone())).unwrap();
+            assert_eq!(outside.input_version(), InputVersion(1));
+            assert!(outside.entry(asset_uuid).unwrap().is_some());
+            Ok(commit)
+        })
+        .unwrap();
+    assert_eq!(stamp.version, InputVersion(2));
+    let outside = StoreReader::open(StoreConfig::new(state)).unwrap();
+    assert_eq!(outside.input_version(), InputVersion(2));
+    assert!(outside.entry(asset_uuid).unwrap().is_none());
+    assert!(outside.bundle(bundle_uuid).unwrap().is_none());
 }
 
 #[cfg(unix)]

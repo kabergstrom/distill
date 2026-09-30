@@ -517,13 +517,17 @@ impl std::fmt::Debug for StoreReader {
 pub struct Store {
     pub(crate) read: StoreReader,
     pub(crate) cas: crate::cas::store::CasInner,
-    open_input: Option<OpenInput>,
+    input: InputState,
 }
 
-/// An input opened by [`Store::begin_input`].
-#[derive(Debug, Clone, Copy)]
-struct OpenInput {
-    base: InputVersion,
+/// Whether writes join one input ([`Store::arm_input`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputState {
+    Closed,
+    /// The next input transaction begins the input.
+    Armed,
+    /// Writes join the input begun at `base`.
+    Begun { base: InputVersion },
 }
 
 impl std::fmt::Debug for Store {
@@ -624,7 +628,7 @@ impl Store {
                 instance_id,
             },
             cas: Default::default(),
-            open_input: None,
+            input: InputState::Closed,
         };
         store.init_cas()?;
         let recovery = store.recover_cas()?;
@@ -687,15 +691,21 @@ impl Store {
     /// whole transaction rolls back and the version does not advance:
     /// readers only ever observe a complete input version.
     ///
-    /// Inside an open input ([`Store::begin_input`]) this joins it: its
+    /// Inside an armed input ([`Store::arm_input`]) this begins or joins it: its
     /// writes, and the version it names, commit with that input.
     pub fn input_transaction<T, F>(&mut self, f: F) -> Result<(T, InputVersion), StoreError>
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
-        if self.open_input.is_some() {
-            return self.joined_input_transaction(f, true);
+        match self.input {
+            InputState::Begun { .. } => return self.joined_input_transaction(f, true),
+            InputState::Armed => {
+                self.begin_input()?;
+                return self.joined_input_transaction(f, true);
+            }
+            InputState::Closed => {}
         }
+        self.arm_input();
         self.begin_input()?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.joined_input_transaction(f, true)
@@ -740,11 +750,11 @@ impl Store {
         let instance = self.instance_id();
         let config = Arc::clone(&self.config);
         let state_path = config.state_path.clone();
-        let open = self.open_input;
+        let open = self.input;
         let txn = self.read.conn.savepoint()?;
         let base = match open {
-            Some(open) => open.base,
-            None => InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0)),
+            InputState::Begun { base } => base,
+            _ => InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0)),
         };
         let version = InputVersion(base.0 + 1);
         let mut input_txn = InputTxn {
@@ -765,11 +775,17 @@ impl Store {
         Ok((out, version))
     }
 
-    /// Open one input that the writes until [`Store::finish_input`] join:
-    /// input transactions, memo and served writes. Other connections see
-    /// none of it until it commits, as one version.
-    pub fn begin_input(&mut self) -> Result<(), StoreError> {
-        assert!(self.open_input.is_none(), "an input is already open");
+    /// Arm one input: the next input transaction begins it, and the writes
+    /// after that until [`Store::finish_input`] join it (input transactions,
+    /// memo and served writes). Other connections see none of it until it
+    /// commits, as one version. Writes before it begins stand alone.
+    pub fn arm_input(&mut self) {
+        assert_eq!(self.input, InputState::Closed, "an input is already armed");
+        self.input = InputState::Armed;
+    }
+
+    fn begin_input(&mut self) -> Result<(), StoreError> {
+        assert_eq!(self.input, InputState::Armed, "an input begins once armed");
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
         let base = match meta_get_u64(&self.read.conn, "input_version") {
             Ok(version) => InputVersion(version.unwrap_or(0)),
@@ -778,19 +794,23 @@ impl Store {
                 return Err(error);
             }
         };
-        self.open_input = Some(OpenInput { base });
+        self.input = InputState::Begun { base };
         Ok(())
     }
 
-    /// Whether an input is open ([`Store::begin_input`]).
+    /// Whether an input is armed ([`Store::arm_input`]).
     pub fn input_open(&self) -> bool {
-        self.open_input.is_some()
+        self.input != InputState::Closed
     }
 
-    /// Commit (`keep`) or roll back the open input. Returns the version
+    /// Commit (`keep`) or roll back the armed input. Returns the version
     /// the store is at afterwards.
     pub fn finish_input(&mut self, keep: bool) -> Result<InputVersion, StoreError> {
-        let open = self.open_input.take().expect("an input is open");
+        let state = std::mem::replace(&mut self.input, InputState::Closed);
+        let InputState::Begun { base } = state else {
+            assert_eq!(state, InputState::Armed, "an input is armed");
+            return Ok(self.input_version());
+        };
         if keep {
             match self.read.conn.execute_batch("COMMIT") {
                 Ok(()) => return Ok(self.input_version()),
@@ -803,7 +823,7 @@ impl Store {
         }
         self.read.conn.execute_batch("ROLLBACK")?;
         self.resync_cas_segments()?;
-        Ok(open.base)
+        Ok(base)
     }
 
     /// Segments created inside a rolled-back input exist on disk and in the
@@ -824,7 +844,7 @@ impl Store {
     /// ahead of the filesystem changes it records) cannot join an input.
     pub(crate) fn assert_no_open_input(&self) {
         assert!(
-            self.open_input.is_none(),
+            !matches!(self.input, InputState::Begun { .. }),
             "a journal write cannot join an open input"
         );
     }
