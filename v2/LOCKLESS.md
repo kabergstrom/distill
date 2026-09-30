@@ -269,12 +269,22 @@ pipeline, config, or daemon.
    - The `deferred-ngp` harness shrinks to a config file.
 6. **Logging.** `tracing` in daemon, rpc and store; `RUST_LOG` is honored by
    `distilld`. (Started in phase 0.)
-7. **Re-evaluate** journal (3.5k lines), quarantine, lineage_repair and
-   migration_control (about 6k lines).
-   - The write-intent journal stays; it is what makes writes into user
-     asset roots crash-safe. It becomes authority-only.
-   - The rest is judged after phases 1–5, once the single writer removes
-     the concurrency it defends against.
+7. **Journal, quarantine, lineage: decided (phase 10).**
+   - The journal and quarantine are gone. Every write into an asset root
+     or codegen output is `atomic_write`: temp file in the target's
+     directory, fsync, rename over the target, fsync the directory. The
+     target is re-hashed right before the rename (conflict check). A
+     delete is a plain `remove_file`. The file is written first, the
+     store rows follow; a crash between the two is healed by the scanner,
+     which is disk truth.
+   - Migration happens on read only. A bundle write never drops data: the
+     automatic plan from the stored entry's schema to the written one may
+     drop only default-valued fields, and a refused plan needs a
+     registered migration function. `force_lossy` overrides.
+   - Renames are `#[asset(renamed_from = "old")]`. Anything the planner
+     refuses goes to a migration function registered by (type, from, to);
+     without one, that asset's read fails with a per-asset error.
+   - Schema lineage (manifest, seed, repair, `distilld init`) is deleted.
 8. The coordinator's 40 ms sleep-poll and the codegen run on every loop go
    away. Codegen runs when a publication changed an input it read.
 9. Subscriptions come from `change_log` (§1.6).
@@ -337,7 +347,8 @@ baseline failures) and the deferred-ngp hot-reload scenario still working
 8. **`distill-pipeline-api`.** Port the fixture plugin and deferred-ngp's
    `tools/distill/pipeline`.
 9. **Bootstrap CLI and harness removal.**
-10. **Journal, quarantine, and lineage review** (§5.7).
+10. **Journal, quarantine, and lineage** (§5.7): replaced by atomic writes,
+    migrate on read and `renamed_from`.
 
 A grep for `Mutex|RwLock|Condvar` over `distill-{store,rpc,daemon}/src`
 should reach zero by the end of phase 6.
@@ -642,6 +653,62 @@ should reach zero by the end of phase 6.
   - **Deferred:** the imports list is a start-engine.sh file format, not
     daemon config. A daemon-side "importer default settings" import is not
     in the protocol.
+- **Phase 10:** done (commits `a213e28`, `51d1c85`, `d855121`, `d439f55`;
+  newgameplus `7631c8f`, `79d1883`; deferred-ngp `8a16b50`). distill
+  from `503d889`: 92 files, +2004 −22547.
+  - **Lineage, schema transitions, migration controls** (`a213e28`,
+    −15.6k lines): the lineage manifest, seed, repair and `distilld init`
+    are deleted, with `DiskMigration`, schema transitions, MigrationV1
+    controls and doctor schema repair. Build migration: a migration
+    function registered for (type, from, to) wins, else the automatic
+    plan; a refusal is that asset's error. A migrated asset's build key
+    includes the pipeline dylib hash.
+  - **Atomic writes** (`51d1c85`, −6.9k lines): `atomic.rs`
+    (`atomic_write_expecting`, `remove_expecting`, `Expected::{Any,
+    Absent, Hash}`). The journal, quarantine, `PublicationGroupKind`,
+    `.distill-displaced`, `quarantine_dir` and
+    `displaced_retention_days` are gone (SCHEMA_VERSION 34; the four
+    journal tables dropped). Authoring writes the bundle, then commits
+    rows under the store guard; codegen writes changed files, then
+    `commit_codegen_outputs`. Crash-heal tests: a rewritten bundle whose
+    rows never committed is adopted on restart; codegen files written
+    before a crash are adopted by the next publication. `DoctorRequest::
+    Clean` is removed (PROTOCOL_VERSION 7).
+  - **Lossless writes** (`d855121`): `write` carries `forceLossy`
+    (PROTOCOL_VERSION 8). A write replacing an entry stored under another
+    schema is refused with `RpcFailure::LossyWrite { type_uuid, asset,
+    fields, detail }` when a `DropField` hits a non-default value
+    (`distill_migrate::lossy_drops`, paths like `$.items[].gone`), or when
+    the planner refuses and no migration function is registered.
+  - **`renamed_from`** (`d439f55`, newgameplus `7631c8f`): source-walk
+    parses `#[asset(renamed_from = "old")]` into `FieldAttrs`; it is never
+    hashed. `ngp_schema::project_with_renames` keys each rename by the
+    planner's display path; `ProjectTypeAuthority::renamed_from` carries
+    them; `plan_automatic_renamed` matches by name, then by rename.
+  - **Tests:** 1042 passed, 1 failed (the known
+    `tool_output_is_drained_while_large_stdin_is_written`), from 1144/1:
+    lineage, journal and quarantine tests went with their code.
+  - **Headless check:** pipeline build, source-walk, daemon (no `init`),
+    import of tonemap.comp and lighting.comp; the RPC client saw
+    lighting.comp's new content hash ~0.4 s after an edit to
+    `gbuffer_common.glsl`. No `.distill-displaced` anywhere.
+  - **Deviations:**
+    - The attribute is `#[asset(renamed_from)]`, not `#[distill(...)]`:
+      every field attr (`blob`, `skip`, `tag`, `rev`) is on `asset`.
+    - A rename is a `CopyField` or `Widen` from the old name. A rename
+      whose value also changed shape is refused (nested ops read and write
+      one path), so it needs a migration function.
+    - Renames live beside the logical schema (`Renames`), not in
+      `SchemaNode`: a snapshot holds exactly what its hash covers. The
+      write check takes them from the current schema authority when the
+      write is under the current hash.
+    - Codegen crash heal: if inputs changed between the crash and the
+      restart, a file matching neither the recorded nor the proposed
+      hash is reported as edited outside distill.
+    - Configs naming `lineage_manifest` or `displaced_retention_days` are
+      rejected (`deny_unknown_fields`). A store from before SCHEMA_VERSION
+      34 is refused; delete the state directory.
+    - The scan diagnostic tag for quarantine no longer decodes.
 
 ## 7. Test baseline
 
