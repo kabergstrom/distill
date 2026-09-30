@@ -152,7 +152,8 @@ pub(crate) struct CoordinatorBuildBackend {
 
 /// Set in `active_builds` while the CAS cache sweep runs: it starts only
 /// when no build is in flight, and no build starts until it ends, so no
-/// build reads a candidate the sweep evicts.
+/// build reads a candidate the sweep evicts. It is set and cleared inside
+/// one authority job, so a job queued after seeing it runs once it is clear.
 const CAS_MAINTENANCE: usize = 1 << (usize::BITS - 1);
 
 impl CoordinatorBuildBackend {
@@ -163,11 +164,14 @@ impl CoordinatorBuildBackend {
         }
     }
 
-    fn enter_build(&self) {
+    fn enter_build(&self, store: &AuthorityStore) -> Result<(), RpcFailure> {
         let mut current = self.active_builds.load(Ordering::Acquire);
         loop {
             if current & CAS_MAINTENANCE != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // Wait out the sweep's authority job.
+                store.write_with(|_| ()).map_err(|_| RpcFailure::AuthoringBackendUnavailable {
+                    operation: "start build: the authority stopped".to_owned(),
+                })?;
                 current = self.active_builds.load(Ordering::Acquire);
                 continue;
             }
@@ -181,7 +185,7 @@ impl CoordinatorBuildBackend {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => return Ok(()),
                 Err(observed) => current = observed,
             }
         }
@@ -190,13 +194,13 @@ impl CoordinatorBuildBackend {
 
 impl BuildBackend for CoordinatorBuildBackend {
     fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        self.enter_build();
         let coordinator =
             self.coordinator
                 .upgrade()
                 .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
                     operation: "build coordinator stopped".to_owned(),
                 })?;
+        self.enter_build(&coordinator.store())?;
         let class = match request.work_class {
             BuildWorkClass::Interactive => WorkClass::Interactive,
             BuildWorkClass::Batch => WorkClass::Batch,
@@ -323,33 +327,39 @@ impl BuildBackend for CoordinatorBuildBackend {
             .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
                 operation: format!("release completed build pin: {error}"),
             })?;
-        if previous != 1
-            || self
-                .active_builds
-                .compare_exchange(0, CAS_MAINTENANCE, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
+        if previous != 1 {
             return Ok(());
         }
+        let active_builds = &self.active_builds;
         let sweep = coordinator.store().write_with(|store| {
-            let sweep = store.enforce_cache_limit().map_err(|error| {
-                RpcFailure::AuthoringBackendUnavailable {
-                    operation: format!("enforce CAS cache limit: {error}"),
-                }
-            })?;
-            if sweep.evicted != 0 {
-                store
-                    .compact()
-                    .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
-                        operation: format!("compact CAS after eviction: {error}"),
-                    })?;
+            if active_builds
+                .compare_exchange(0, CAS_MAINTENANCE, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(());
             }
-            Ok(())
+            let sweep = sweep_cache(store);
+            active_builds.fetch_and(!CAS_MAINTENANCE, Ordering::Release);
+            sweep
         });
-        self.active_builds
-            .fetch_and(!CAS_MAINTENANCE, Ordering::Release);
         sweep.map_err(stopped)?
     }
+}
+
+fn sweep_cache(store: &mut Store) -> Result<(), RpcFailure> {
+    let sweep = store
+        .enforce_cache_limit()
+        .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
+            operation: format!("enforce CAS cache limit: {error}"),
+        })?;
+    if sweep.evicted != 0 {
+        store
+            .compact()
+            .map_err(|error| RpcFailure::AuthoringBackendUnavailable {
+                operation: format!("compact CAS after eviction: {error}"),
+            })?;
+    }
+    Ok(())
 }
 
 impl ArtifactLeaseBackend for CoordinatorBuildBackend {
