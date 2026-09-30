@@ -332,8 +332,8 @@ fn compaction_reclaims_dead_bytes_and_flips_the_generation() {
     // The generation flip was transactional: a reopen sees agreement and
     // does not rebuild.
     drop(store);
-    let store = Store::open(cfg(&dir)).unwrap();
-    assert!(!store.recovery_report().rebuilt_index);
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    assert!(!recovery.rebuilt_index);
     assert_eq!(store.cas_read(&survivor).unwrap(), b"surviving artifact");
 }
 
@@ -366,8 +366,8 @@ fn compacted_duplicate_payload_precedes_every_surviving_result() {
     lines[0] = format!("generation {}", generation + 1);
     std::fs::write(&current_path, lines.join("\n") + "\n").unwrap();
 
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    assert!(store.recovery_report().rebuilt_index);
+    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    assert!(recovery.rebuilt_index);
     assert_eq!(store.cas_read(&hash).unwrap(), b"shared artifact");
     let candidates = store
         .lookup_candidates(KeyKind::Processor, &[1; 32])

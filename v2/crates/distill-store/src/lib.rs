@@ -21,5 +21,5 @@ pub mod pipeline;
 pub mod state;
 
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
-pub use db::{InputTxn, Store, SCHEMA_VERSION};
+pub use db::{InputTxn, Store, StoreReader, SCHEMA_VERSION};
 pub use error::{RetiredTypeReference, StoreError};

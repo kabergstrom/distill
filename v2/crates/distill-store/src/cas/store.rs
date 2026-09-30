@@ -23,7 +23,7 @@ use crate::cas::record::{
     decode_record, encode_record, AuxRow, DecodedRecord, FailureCause, KeyKind, OutputRow, Record,
     RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN,
 };
-use crate::db::Store;
+use crate::db::{Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::MemoSeq;
 
@@ -164,25 +164,14 @@ pub(crate) fn parse_segment_id(name: &str, kind: SegmentKind) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
+fn io_err(path: &std::path::Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
+    move |source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 impl Store {
-    fn io_err(path: &std::path::Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
-        move |source| StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
-    }
-
-    pub(crate) fn segment_path(&self, segment_id: u64) -> PathBuf {
-        let name = self
-            .cas
-            .segments
-            .iter()
-            .find(|segment| segment.id == segment_id)
-            .map(|segment| segment.name.clone())
-            .unwrap_or_else(|| segment_file_name(segment_id, SegmentKind::Regular));
-        self.cas.dir.join(name)
-    }
-
     /// Roll to a fresh segment when the incoming group would cross the
     /// size cap (§18's `cas.segment_size`, applied to newly rolled
     /// segments only). Protocol: create the file, fsync it and the
@@ -208,8 +197,8 @@ impl Store {
         let id = self.cas.next_segment_id;
         let name = segment_file_name(id, kind);
         let path = self.cas.dir.join(&name);
-        let f = std::fs::File::create(&path).map_err(Self::io_err(&path))?;
-        f.sync_all().map_err(Self::io_err(&path))?;
+        let f = std::fs::File::create(&path).map_err(io_err(&path))?;
+        f.sync_all().map_err(io_err(&path))?;
         manifest::fsync_dir(&self.cas.dir)?;
         let mut segments: Vec<ManifestSegment> = self
             .cas
@@ -263,8 +252,8 @@ impl Store {
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
-                .map_err(Self::io_err(&path))?;
-            f.write_all(bytes).map_err(Self::io_err(&path))?;
+                .map_err(io_err(&path))?;
+            f.write_all(bytes).map_err(io_err(&path))?;
             if sync_order.last().copied() != Some(segment) {
                 sync_order.push(segment);
             }
@@ -283,8 +272,8 @@ impl Store {
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .map_err(Self::io_err(&path))?;
-            f.sync_all().map_err(Self::io_err(&path))?;
+                .map_err(io_err(&path))?;
+            f.sync_all().map_err(io_err(&path))?;
         }
         Ok(locations)
     }
@@ -340,9 +329,9 @@ impl Store {
         let indexed_len = self
             .segment_path(segment)
             .metadata()
-            .map_err(Self::io_err(&self.segment_path(segment)))?
+            .map_err(io_err(&self.segment_path(segment)))?
             .len();
-        let txn = self.conn.transaction()?;
+        let txn = self.read.conn.transaction()?;
         upsert_extent(
             &txn,
             &layout_hash.0,
@@ -444,7 +433,7 @@ impl Store {
             .into_iter()
             .map(|segment| {
                 let path = self.segment_path(segment);
-                let len = path.metadata().map_err(Self::io_err(&path))?.len();
+                let len = path.metadata().map_err(io_err(&path))?.len();
                 Ok((segment, len))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
@@ -522,6 +511,79 @@ impl Store {
             aux: receipt_aux,
             unverified_assertions: unverified,
         })
+    }
+
+    /// The candidate bucket for a static-input key, most recently
+    /// committed first (§13). Touches each candidate's `last_used` for
+    /// the LRU policy.
+    pub fn lookup_candidates(
+        &mut self,
+        key_kind: KeyKind,
+        static_key: &[u8; 32],
+    ) -> Result<Vec<Candidate>, StoreError> {
+        let rows: Vec<(Vec<u8>, i64, i64, i64, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT trace_digest, memo_seq, segment, offset, len FROM result_candidates
+                 WHERE key_kind = ?1 AND static_key = ?2 ORDER BY memo_seq DESC",
+            )?;
+            let mapped = stmt.query_map(
+                rusqlite::params![key_kind as i64, static_key.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+            mapped.collect::<Result<_, _>>()?
+        };
+        let now = now_millis();
+        let mut out = Vec::with_capacity(rows.len());
+        for (trace_digest, memo_seq, segment, offset, len) in rows {
+            let bytes = self.read_extent(segment as u64, offset as u64, len as u64)?;
+            let decoded: DecodedRecord = decode_record(&bytes, segment as u64, offset as u64)?;
+            let payload = ResultPayload::decode(&decoded.record.payload)?;
+            self.conn.execute(
+                "UPDATE result_candidates SET last_used = ?4
+                 WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
+                rusqlite::params![
+                    key_kind as i64,
+                    static_key.as_slice(),
+                    trace_digest.as_slice(),
+                    now,
+                ],
+            )?;
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&trace_digest);
+            out.push(Candidate {
+                trace_digest: digest,
+                memo_seq: MemoSeq(memo_seq as u64),
+                asset_uuid: decoded.record.asset_uuid,
+                payload,
+                segment: segment as u64,
+                offset: offset as u64,
+            });
+        }
+        Ok(out)
+    }
+}
+
+impl StoreReader {
+
+    pub(crate) fn segment_path(&self, segment_id: u64) -> PathBuf {
+        // `cas_segments` names every segment that can hold an indexed
+        // extent; the regular spelling covers a segment rolled but not yet
+        // indexed, which only the writer reads.
+        use rusqlite::OptionalExtension;
+        let name: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT file_name FROM cas_segments WHERE segment_id = ?1",
+                [segment_id as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        self.config
+            .state_path
+            .join("cas")
+            .join(name.unwrap_or_else(|| segment_file_name(segment_id, SegmentKind::Regular)))
     }
 
     pub(crate) fn extent_of(&self, hash: &[u8; 32]) -> Result<Option<(u64, u64, u64)>, StoreError> {
@@ -621,61 +683,12 @@ impl Store {
     ) -> Result<Vec<u8>, StoreError> {
         use std::io::{Read, Seek, SeekFrom};
         let path = self.segment_path(segment);
-        let mut f = std::fs::File::open(&path).map_err(Self::io_err(&path))?;
+        let mut f = std::fs::File::open(&path).map_err(io_err(&path))?;
         f.seek(SeekFrom::Start(offset))
-            .map_err(Self::io_err(&path))?;
+            .map_err(io_err(&path))?;
         let mut buf = vec![0u8; len as usize];
-        f.read_exact(&mut buf).map_err(Self::io_err(&path))?;
+        f.read_exact(&mut buf).map_err(io_err(&path))?;
         Ok(buf)
-    }
-
-    /// The candidate bucket for a static-input key, most recently
-    /// committed first (§13). Touches each candidate's `last_used` for
-    /// the LRU policy.
-    pub fn lookup_candidates(
-        &mut self,
-        key_kind: KeyKind,
-        static_key: &[u8; 32],
-    ) -> Result<Vec<Candidate>, StoreError> {
-        let rows: Vec<(Vec<u8>, i64, i64, i64, i64)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT trace_digest, memo_seq, segment, offset, len FROM result_candidates
-                 WHERE key_kind = ?1 AND static_key = ?2 ORDER BY memo_seq DESC",
-            )?;
-            let mapped = stmt.query_map(
-                rusqlite::params![key_kind as i64, static_key.as_slice()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
-            mapped.collect::<Result<_, _>>()?
-        };
-        let now = now_millis();
-        let mut out = Vec::with_capacity(rows.len());
-        for (trace_digest, memo_seq, segment, offset, len) in rows {
-            let bytes = self.read_extent(segment as u64, offset as u64, len as u64)?;
-            let decoded: DecodedRecord = decode_record(&bytes, segment as u64, offset as u64)?;
-            let payload = ResultPayload::decode(&decoded.record.payload)?;
-            self.conn.execute(
-                "UPDATE result_candidates SET last_used = ?4
-                 WHERE key_kind = ?1 AND static_key = ?2 AND trace_digest = ?3",
-                rusqlite::params![
-                    key_kind as i64,
-                    static_key.as_slice(),
-                    trace_digest.as_slice(),
-                    now,
-                ],
-            )?;
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(&trace_digest);
-            out.push(Candidate {
-                trace_digest: digest,
-                memo_seq: MemoSeq(memo_seq as u64),
-                asset_uuid: decoded.record.asset_uuid,
-                payload,
-                segment: segment as u64,
-                offset: offset as u64,
-            });
-        }
-        Ok(out)
     }
 }
 
@@ -792,6 +805,9 @@ impl crate::db::InputTxn<'_> {
 }
 
 impl Store {
+}
+
+impl StoreReader {
     /// Raw bounded lookup used while preparing an unpublished successor.
     pub fn derived_output_row(
         &self,

@@ -18,7 +18,7 @@ use distill_core::id::ContentHash;
 use rusqlite::OptionalExtension;
 
 use crate::bundles::blob32;
-use crate::db::Store;
+use crate::db::{Store, StoreReader};
 use crate::error::StoreError;
 
 /// Durable lower bound for §14's rename-aside publication protocol.
@@ -244,7 +244,7 @@ impl Store {
                 detail: "a publication group requires at least one child intent".into(),
             });
         }
-        let txn = self.conn.transaction()?;
+        let txn = self.read.conn.transaction()?;
         txn.execute(
             "INSERT INTO publication_groups(kind, basis, state, retired) VALUES (?1, ?2, 0, 0)",
             rusqlite::params![kind as i64, basis],
@@ -282,73 +282,6 @@ impl Store {
         })
     }
 
-    pub fn unfinished_publication_groups(&self) -> Result<Vec<PublicationGroup>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT group_id, kind, basis, state FROM publication_groups
-             WHERE retired = 0 ORDER BY group_id",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut groups = Vec::with_capacity(rows.len());
-        for (group_id, raw_kind, basis, raw_state) in rows {
-            let kind = match raw_kind {
-                1 => PublicationGroupKind::LineageCreate,
-                2 => PublicationGroupKind::LineageDuplicate,
-                3 => PublicationGroupKind::AuthoringWrite,
-                4 => PublicationGroupKind::Import,
-                5 => PublicationGroupKind::DiskMigration,
-                6 => PublicationGroupKind::Codegen,
-                7 => PublicationGroupKind::SchemaRepair,
-                8 => PublicationGroupKind::SchemaTransition,
-                _ => {
-                    return Err(StoreError::BadIntent {
-                        intent_id: group_id,
-                        detail: format!("publication group has unknown kind {raw_kind}"),
-                    })
-                }
-            };
-            let state = match raw_state {
-                0 => PublicationGroupState::Unarmed,
-                1 => PublicationGroupState::Armed,
-                _ => {
-                    return Err(StoreError::BadIntent {
-                        intent_id: group_id,
-                        detail: format!("publication group has unknown state {raw_state}"),
-                    })
-                }
-            };
-            let mut children = self.conn.prepare(
-                "SELECT intent_id FROM publication_group_children
-                 WHERE group_id = ?1 ORDER BY ordinal",
-            )?;
-            let child_intents = children
-                .query_map([group_id], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            if child_intents.is_empty() {
-                return Err(StoreError::BadIntent {
-                    intent_id: group_id,
-                    detail: "publication group has no child intents".into(),
-                });
-            }
-            groups.push(PublicationGroup {
-                group_id,
-                kind,
-                basis,
-                state,
-                child_intents,
-            });
-        }
-        Ok(groups)
-    }
-
     /// Make a complete proposal set executable only after every non-empty
     /// proposal temp has been written and fsynced by the caller.
     pub fn arm_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
@@ -370,7 +303,7 @@ impl Store {
     /// as an abandoned attempt in one durable transaction, including children
     /// such as deletions that do not have a proposal temp.
     pub fn abort_unarmed_publication_group(&mut self, group_id: i64) -> Result<(), StoreError> {
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         let state: Option<(i64, i64)> = transaction
             .query_row(
                 "SELECT state, retired FROM publication_groups WHERE group_id = ?1",
@@ -397,29 +330,6 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
-    }
-
-    pub fn publication_group_child_results(
-        &self,
-        group_id: i64,
-    ) -> Result<Vec<PublicationChildResult>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT w.intent_id, w.target_path, w.terminal_success
-             FROM publication_group_children c
-             JOIN write_intents w ON w.intent_id = c.intent_id
-             WHERE c.group_id = ?1 ORDER BY c.ordinal",
-        )?;
-        let rows = statement
-            .query_map([group_id], |row| {
-                Ok(PublicationChildResult {
-                    intent_id: row.get(0)?,
-                    target_path: row.get(1)?,
-                    terminal_success: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into);
-        rows
     }
 
     /// Retire a parent only after every named child reached a terminal durable
@@ -468,26 +378,6 @@ impl Store {
         Ok(())
     }
 
-    fn ensure_intent_group_armed(&self, intent_id: i64) -> Result<(), StoreError> {
-        let state: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT g.state FROM publication_group_children c
-                 JOIN publication_groups g ON g.group_id = c.group_id
-                 WHERE c.intent_id = ?1 AND g.retired = 0",
-                [intent_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if state != Some(PublicationGroupState::Armed as i64) {
-            return Err(StoreError::BadIntent {
-                intent_id,
-                detail: "publication child has no unfinished armed parent group".into(),
-            });
-        }
-        Ok(())
-    }
-
     /// Execute or resume the supported-Unix rename-aside replacement state machine.
     /// Every move preserves a destination that appeared after the basis CAS;
     /// the exact pre-image and any raced target remain journal-addressable.
@@ -523,30 +413,6 @@ impl Store {
         self.ensure_intent_group_armed(intent_id)?;
         let mut filesystem = self.native_filesystem_for_intent(intent_id, None)?;
         self.reconcile_creation_with(intent_id, &mut filesystem)
-    }
-
-    #[cfg(unix)]
-    fn native_filesystem_for_intent(
-        &self,
-        intent_id: i64,
-        quarantine_dir: Option<&Path>,
-    ) -> Result<NativeRenameAsideFs, StoreError> {
-        let paths: (String, String, String) = self.conn.query_row(
-            "SELECT target_path, temp_path, conflict_path
-             FROM write_intents WHERE intent_id = ?1",
-            [intent_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        NativeRenameAsideFs::for_paths(
-            [
-                PathBuf::from(paths.0),
-                PathBuf::from(paths.1),
-                PathBuf::from(paths.2),
-            ]
-            .iter()
-            .filter(|path| !path.as_os_str().is_empty()),
-            quarantine_dir,
-        )
     }
 
     /// Resume a replacement through caller-supplied filesystem authority.
@@ -1172,50 +1038,6 @@ impl Store {
         })
     }
 
-    fn load_rename_aside_intent(&self, intent_id: i64) -> Result<RenameAsideIntent, StoreError> {
-        let raw = self
-            .conn
-            .query_row(
-                "SELECT target_path, temp_path, conflict_path, pre_image_hash,
-                        proposed_hash, rename_aside_state
-                 FROM write_intents WHERE intent_id = ?1 AND retired = 0",
-                [intent_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((target, temp, conflict, preimage, proposed, state)) = raw else {
-            return Err(StoreError::BadIntent {
-                intent_id,
-                detail: "no unretired intent with this id".to_owned(),
-            });
-        };
-        let expected_preimage = preimage.ok_or_else(|| StoreError::BadIntent {
-            intent_id,
-            detail: "rename-aside replacement requires an expected pre-image".to_owned(),
-        })?;
-        Ok(RenameAsideIntent {
-            target: PathBuf::from(target),
-            temp: PathBuf::from(temp),
-            conflict: PathBuf::from(conflict),
-            expected_preimage: ContentHash(blob32(expected_preimage)),
-            proposed: ContentHash(blob32(proposed)),
-            state: RenameAsideState::from_db(intent_id, state)?,
-        })
-    }
-
-    fn reserved_aside_path(&self, quarantine_dir: &Path, intent_id: i64) -> PathBuf {
-        quarantine_dir.join(format!("intent-{}-{intent_id}", self.instance_id()))
-    }
-
     /// An in-place writer can change the displaced inode after the target was
     /// atomically renamed aside. The changed inode is the newest user object:
     /// restore it no-clobber (after preserving any reappeared target) and
@@ -1308,7 +1130,7 @@ impl Store {
                 });
             }
         };
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         if let Some((path, collision_hash)) = reserved_collision {
             let collision_ordinal: u32 = transaction.query_row(
                 "SELECT COALESCE(MAX(CASE WHEN ordinal >= 2 THEN ordinal END) + 1, 2)
@@ -1386,38 +1208,6 @@ impl Store {
         Ok(())
     }
 
-    fn available_conflict_path<F: JournalFilesystem + ?Sized>(
-        &self,
-        fs: &mut F,
-        intent_id: i64,
-        base: &Path,
-    ) -> Result<PathBuf, StoreError> {
-        for suffix in 0..1024u32 {
-            let candidate = if suffix == 0 {
-                base.to_path_buf()
-            } else {
-                let mut name = base.as_os_str().to_os_string();
-                name.push(format!(".intent-{intent_id}-{suffix}"));
-                PathBuf::from(name)
-            };
-            let journaled: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT 1 FROM displaced WHERE quarantine_path = ?1",
-                    [candidate.to_string_lossy().as_ref()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if journaled.is_none() && fs.read(&candidate)?.is_none() {
-                return Ok(candidate);
-            }
-        }
-        Err(StoreError::BadIntent {
-            intent_id,
-            detail: "could not allocate a unique no-replace conflict path".to_owned(),
-        })
-    }
-
     fn preserve_displacement_path_collision(
         &mut self,
         intent_id: i64,
@@ -1426,7 +1216,7 @@ impl Store {
         replacement: &Path,
         collision_hash: ContentHash,
     ) -> Result<(), StoreError> {
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         let updated = transaction.execute(
             "UPDATE displaced SET quarantine_path = ?4
              WHERE intent_id = ?1 AND ordinal = ?2 AND quarantine_path = ?3",
@@ -1479,7 +1269,7 @@ impl Store {
         actual: ContentHash,
         state: RenameAsideState,
     ) -> Result<(), StoreError> {
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         let updated = transaction.execute(
             "UPDATE displaced SET content_hash = ?3
              WHERE intent_id = ?1 AND ordinal = ?2",
@@ -1525,7 +1315,7 @@ impl Store {
         state: RenameAsideState,
         restored: bool,
     ) -> Result<(), StoreError> {
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         if restored {
             transaction.execute(
                 "UPDATE displaced SET restored = 1
@@ -1552,6 +1342,290 @@ impl Store {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    fn retire_intent_with_outcome(
+        &mut self,
+        intent_id: i64,
+        success: bool,
+    ) -> Result<(), StoreError> {
+        let n = self.conn.execute(
+            "UPDATE write_intents SET terminal_success = ?2, retired = 1
+             WHERE intent_id = ?1 AND retired = 0",
+            rusqlite::params![intent_id, i64::from(success)],
+        )?;
+        if n == 0 {
+            return Err(StoreError::BadIntent {
+                intent_id,
+                detail: "no unretired intent with this id".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Journaled retention expiry. Rows remain as audit history naming
+    /// exactly what destruction removed.
+    pub fn sweep_displaced(&mut self, now_secs: i64) -> Result<usize, StoreError> {
+        let cutoff = now_secs - (self.config.displaced_retention_days as i64) * 86_400;
+        let expired = self
+            .quarantined_entries()?
+            .into_iter()
+            .filter(|e| e.quarantined_at < cutoff)
+            .collect::<Vec<_>>();
+        self.clean_displaced_entries(&expired, now_secs, "retention-expired")
+    }
+
+    /// Explicit `doctor clean`: destroy every retained displacement while
+    /// keeping its row as permanent named audit history.
+    pub fn clean_all_displaced(&mut self, now_secs: i64) -> Result<usize, StoreError> {
+        let entries = self.quarantined_entries()?;
+        self.clean_displaced_entries(&entries, now_secs, "doctor-clean")
+    }
+
+    fn clean_displaced_entries(
+        &mut self,
+        entries: &[DisplacedEntry],
+        now_secs: i64,
+        reason: &str,
+    ) -> Result<usize, StoreError> {
+        let mut touched_dirs = std::collections::BTreeSet::new();
+        for entry in entries {
+            match std::fs::remove_file(&entry.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StoreError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    })
+                }
+            }
+            self.conn.execute(
+                "UPDATE displaced SET cleaned_at = ?2, cleanup_reason = ?3
+                 WHERE displacement_id = ?1",
+                rusqlite::params![entry.displacement_id, now_secs, reason],
+            )?;
+            if let Some(parent) = entry.path.parent() {
+                touched_dirs.insert(parent.to_path_buf());
+            }
+        }
+        for dir in touched_dirs {
+            crate::cas::manifest::fsync_dir(&dir)?;
+        }
+        Ok(entries.len())
+    }
+}
+
+impl StoreReader {
+
+    pub fn unfinished_publication_groups(&self) -> Result<Vec<PublicationGroup>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, kind, basis, state FROM publication_groups
+             WHERE retired = 0 ORDER BY group_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut groups = Vec::with_capacity(rows.len());
+        for (group_id, raw_kind, basis, raw_state) in rows {
+            let kind = match raw_kind {
+                1 => PublicationGroupKind::LineageCreate,
+                2 => PublicationGroupKind::LineageDuplicate,
+                3 => PublicationGroupKind::AuthoringWrite,
+                4 => PublicationGroupKind::Import,
+                5 => PublicationGroupKind::DiskMigration,
+                6 => PublicationGroupKind::Codegen,
+                7 => PublicationGroupKind::SchemaRepair,
+                8 => PublicationGroupKind::SchemaTransition,
+                _ => {
+                    return Err(StoreError::BadIntent {
+                        intent_id: group_id,
+                        detail: format!("publication group has unknown kind {raw_kind}"),
+                    })
+                }
+            };
+            let state = match raw_state {
+                0 => PublicationGroupState::Unarmed,
+                1 => PublicationGroupState::Armed,
+                _ => {
+                    return Err(StoreError::BadIntent {
+                        intent_id: group_id,
+                        detail: format!("publication group has unknown state {raw_state}"),
+                    })
+                }
+            };
+            let mut children = self.conn.prepare(
+                "SELECT intent_id FROM publication_group_children
+                 WHERE group_id = ?1 ORDER BY ordinal",
+            )?;
+            let child_intents = children
+                .query_map([group_id], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if child_intents.is_empty() {
+                return Err(StoreError::BadIntent {
+                    intent_id: group_id,
+                    detail: "publication group has no child intents".into(),
+                });
+            }
+            groups.push(PublicationGroup {
+                group_id,
+                kind,
+                basis,
+                state,
+                child_intents,
+            });
+        }
+        Ok(groups)
+    }
+
+    pub fn publication_group_child_results(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<PublicationChildResult>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT w.intent_id, w.target_path, w.terminal_success
+             FROM publication_group_children c
+             JOIN write_intents w ON w.intent_id = c.intent_id
+             WHERE c.group_id = ?1 ORDER BY c.ordinal",
+        )?;
+        let rows = statement
+            .query_map([group_id], |row| {
+                Ok(PublicationChildResult {
+                    intent_id: row.get(0)?,
+                    target_path: row.get(1)?,
+                    terminal_success: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        rows
+    }
+
+    fn ensure_intent_group_armed(&self, intent_id: i64) -> Result<(), StoreError> {
+        let state: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT g.state FROM publication_group_children c
+                 JOIN publication_groups g ON g.group_id = c.group_id
+                 WHERE c.intent_id = ?1 AND g.retired = 0",
+                [intent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if state != Some(PublicationGroupState::Armed as i64) {
+            return Err(StoreError::BadIntent {
+                intent_id,
+                detail: "publication child has no unfinished armed parent group".into(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn native_filesystem_for_intent(
+        &self,
+        intent_id: i64,
+        quarantine_dir: Option<&Path>,
+    ) -> Result<NativeRenameAsideFs, StoreError> {
+        let paths: (String, String, String) = self.conn.query_row(
+            "SELECT target_path, temp_path, conflict_path
+             FROM write_intents WHERE intent_id = ?1",
+            [intent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        NativeRenameAsideFs::for_paths(
+            [
+                PathBuf::from(paths.0),
+                PathBuf::from(paths.1),
+                PathBuf::from(paths.2),
+            ]
+            .iter()
+            .filter(|path| !path.as_os_str().is_empty()),
+            quarantine_dir,
+        )
+    }
+
+    fn load_rename_aside_intent(&self, intent_id: i64) -> Result<RenameAsideIntent, StoreError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT target_path, temp_path, conflict_path, pre_image_hash,
+                        proposed_hash, rename_aside_state
+                 FROM write_intents WHERE intent_id = ?1 AND retired = 0",
+                [intent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((target, temp, conflict, preimage, proposed, state)) = raw else {
+            return Err(StoreError::BadIntent {
+                intent_id,
+                detail: "no unretired intent with this id".to_owned(),
+            });
+        };
+        let expected_preimage = preimage.ok_or_else(|| StoreError::BadIntent {
+            intent_id,
+            detail: "rename-aside replacement requires an expected pre-image".to_owned(),
+        })?;
+        Ok(RenameAsideIntent {
+            target: PathBuf::from(target),
+            temp: PathBuf::from(temp),
+            conflict: PathBuf::from(conflict),
+            expected_preimage: ContentHash(blob32(expected_preimage)),
+            proposed: ContentHash(blob32(proposed)),
+            state: RenameAsideState::from_db(intent_id, state)?,
+        })
+    }
+
+    fn reserved_aside_path(&self, quarantine_dir: &Path, intent_id: i64) -> PathBuf {
+        quarantine_dir.join(format!("intent-{}-{intent_id}", self.instance_id()))
+    }
+
+    fn available_conflict_path<F: JournalFilesystem + ?Sized>(
+        &self,
+        fs: &mut F,
+        intent_id: i64,
+        base: &Path,
+    ) -> Result<PathBuf, StoreError> {
+        for suffix in 0..1024u32 {
+            let candidate = if suffix == 0 {
+                base.to_path_buf()
+            } else {
+                let mut name = base.as_os_str().to_os_string();
+                name.push(format!(".intent-{intent_id}-{suffix}"));
+                PathBuf::from(name)
+            };
+            let journaled: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM displaced WHERE quarantine_path = ?1",
+                    [candidate.to_string_lossy().as_ref()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if journaled.is_none() && fs.read(&candidate)?.is_none() {
+                return Ok(candidate);
+            }
+        }
+        Err(StoreError::BadIntent {
+            intent_id,
+            detail: "could not allocate a unique no-replace conflict path".to_owned(),
+        })
     }
 
     fn displacement_hash(&self, intent_id: i64, ordinal: u32) -> Result<ContentHash, StoreError> {
@@ -1632,25 +1706,6 @@ impl Store {
                 intent_id,
                 detail: "no unretired intent with this id".into(),
             })
-    }
-
-    fn retire_intent_with_outcome(
-        &mut self,
-        intent_id: i64,
-        success: bool,
-    ) -> Result<(), StoreError> {
-        let n = self.conn.execute(
-            "UPDATE write_intents SET terminal_success = ?2, retired = 1
-             WHERE intent_id = ?1 AND retired = 0",
-            rusqlite::params![intent_id, i64::from(success)],
-        )?;
-        if n == 0 {
-            return Err(StoreError::BadIntent {
-                intent_id,
-                detail: "no unretired intent with this id".to_owned(),
-            });
-        }
-        Ok(())
     }
 
     pub fn unretired_intents(&self) -> Result<Vec<WriteIntent>, StoreError> {
@@ -1839,58 +1894,6 @@ impl Store {
             }
         }
         Ok(diagnostics)
-    }
-
-    /// Journaled retention expiry. Rows remain as audit history naming
-    /// exactly what destruction removed.
-    pub fn sweep_displaced(&mut self, now_secs: i64) -> Result<usize, StoreError> {
-        let cutoff = now_secs - (self.config.displaced_retention_days as i64) * 86_400;
-        let expired = self
-            .quarantined_entries()?
-            .into_iter()
-            .filter(|e| e.quarantined_at < cutoff)
-            .collect::<Vec<_>>();
-        self.clean_displaced_entries(&expired, now_secs, "retention-expired")
-    }
-
-    /// Explicit `doctor clean`: destroy every retained displacement while
-    /// keeping its row as permanent named audit history.
-    pub fn clean_all_displaced(&mut self, now_secs: i64) -> Result<usize, StoreError> {
-        let entries = self.quarantined_entries()?;
-        self.clean_displaced_entries(&entries, now_secs, "doctor-clean")
-    }
-
-    fn clean_displaced_entries(
-        &mut self,
-        entries: &[DisplacedEntry],
-        now_secs: i64,
-        reason: &str,
-    ) -> Result<usize, StoreError> {
-        let mut touched_dirs = std::collections::BTreeSet::new();
-        for entry in entries {
-            match std::fs::remove_file(&entry.path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(StoreError::Io {
-                        path: entry.path.clone(),
-                        source,
-                    })
-                }
-            }
-            self.conn.execute(
-                "UPDATE displaced SET cleaned_at = ?2, cleanup_reason = ?3
-                 WHERE displacement_id = ?1",
-                rusqlite::params![entry.displacement_id, now_secs, reason],
-            )?;
-            if let Some(parent) = entry.path.parent() {
-                touched_dirs.insert(parent.to_path_buf());
-            }
-        }
-        for dir in touched_dirs {
-            crate::cas::manifest::fsync_dir(&dir)?;
-        }
-        Ok(entries.len())
     }
 }
 

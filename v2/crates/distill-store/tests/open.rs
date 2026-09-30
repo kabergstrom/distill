@@ -4,7 +4,7 @@
 //! (daemon state is disposable, §2 — a mismatch is a typed error, never
 //! a silent adopt).
 
-use distill_store::{parse_byte_size, Store, StoreConfig, StoreError};
+use distill_store::{parse_byte_size, Store, StoreConfig, StoreError, StoreReader};
 
 fn cfg(dir: &tempfile::TempDir) -> StoreConfig {
     StoreConfig::new(dir.path().join(".distill"))
@@ -191,4 +191,26 @@ fn byte_sizes_parse_in_section_18_form() {
     assert!(parse_byte_size("").is_err());
     assert!(parse_byte_size("MiB").is_err());
     assert!(parse_byte_size("-1KiB").is_err());
+}
+
+#[test]
+fn a_reader_connection_observes_each_commit_and_cannot_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(cfg(&dir)).unwrap();
+    let reader = store.reader().unwrap();
+    assert_eq!(reader.instance_id(), store.instance_id());
+    assert_eq!(reader.input_version(), store.input_version());
+
+    let (_, version) = store.input_transaction(|_txn| Ok(())).unwrap();
+    assert_eq!(reader.input_version(), version, "no cached counter");
+    assert_eq!(reader.stamp(), store.stamp());
+
+    // The reader is a read-only SQLite connection, not a second writer.
+    assert!(reader.rebuild_indexes().is_err());
+}
+
+#[test]
+fn a_reader_requires_an_existing_store() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(StoreReader::open(cfg(&dir)).is_err());
 }

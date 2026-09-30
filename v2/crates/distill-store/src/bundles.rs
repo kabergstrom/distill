@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use rusqlite::OptionalExtension;
 
-use crate::db::{meta_get_blob, meta_set_blob, InputTxn, Store};
+use crate::db::{meta_get_blob, meta_set_blob, InputTxn, Store, StoreReader};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::files::RootId;
 use crate::state::{InputVersion, VersionPoison};
@@ -471,14 +471,6 @@ impl InputTxn<'_> {
 }
 
 impl Store {
-    fn check_version_poison(&self) -> Result<(), StoreError> {
-        if let Some(poison) = self.version_poison()? {
-            return Err(StoreError::Poisoned {
-                error: poison.message,
-            });
-        }
-        Ok(())
-    }
 
     /// Complete tag extraction after the owning input transaction has made
     /// the candidate namespace readable but before that version is exposed by
@@ -500,7 +492,7 @@ impl Store {
             });
         }
         let mut assets = BTreeSet::new();
-        let txn = self.conn.transaction()?;
+        let txn = self.read.conn.transaction()?;
         for update in updates {
             if !assets.insert(update.asset) {
                 return Err(StoreError::InvalidConfiguration {
@@ -553,6 +545,17 @@ impl Store {
             )?;
         }
         txn.commit()?;
+        Ok(())
+    }
+}
+
+impl StoreReader {
+    fn check_version_poison(&self) -> Result<(), StoreError> {
+        if let Some(poison) = self.version_poison()? {
+            return Err(StoreError::Poisoned {
+                error: poison.message,
+            });
+        }
         Ok(())
     }
 

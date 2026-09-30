@@ -597,8 +597,8 @@ fn a_record_larger_than_the_cap_gets_one_typed_dedicated_oversize_segment() {
     .unwrap();
 
     drop(store);
-    let mut reopened = Store::open(config).unwrap();
-    assert!(reopened.recovery_report().rebuilt_index);
+    let (mut reopened, recovery) = Store::open_with_recovery(config).unwrap();
+    assert!(recovery.rebuilt_index);
     assert_eq!(
         reopened
             .lookup_candidates(KeyKind::Processor, &[0x33; 32])

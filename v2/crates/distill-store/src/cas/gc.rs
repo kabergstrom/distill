@@ -29,7 +29,7 @@ use crate::cas::record::{
     decode_record, KeyKind, RecordKind, ResultOutcome, ResultPayload, RECORD_HEADER_LEN,
 };
 use crate::cas::store::{segment_file_name, CasInner, SegmentInfo};
-use crate::db::{meta_set_u64, Store};
+use crate::db::{meta_set_u64, Store, StoreReader};
 use crate::error::StoreError;
 
 /// What a cache-limit sweep did.
@@ -53,33 +53,6 @@ pub struct CompactionReport {
 }
 
 impl Store {
-    fn referenced_extent_hashes(&self) -> Result<HashSet<[u8; 32]>, StoreError> {
-        let candidates: Vec<(i64, i64, i64)> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT segment, offset, len FROM result_candidates")?;
-            let rows =
-                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        let mut referenced = HashSet::new();
-        for (segment, offset, len) in candidates {
-            referenced.extend(self.result_unit_hashes(
-                segment as u64,
-                offset as u64,
-                len as u64,
-            )?);
-        }
-        let pinned: Vec<Vec<u8>> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT DISTINCT content_hash FROM pins")?;
-            let rows = statement.query_map([], |row| row.get(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        referenced.extend(pinned.into_iter().map(crate::bundles::blob32));
-        Ok(referenced)
-    }
 
     /// Remove payload extents that no committed result or explicit pin owns.
     /// In particular, this retires a wire tree persisted immediately before a
@@ -99,7 +72,7 @@ impl Store {
         if unreferenced.is_empty() {
             return Ok(0);
         }
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         for hash in &unreferenced {
             transaction.execute(
                 "DELETE FROM cas_extents WHERE content_hash = ?1",
@@ -119,7 +92,7 @@ impl Store {
         holder: &str,
         hashes: &[[u8; 32]],
     ) -> Result<(), StoreError> {
-        let txn = self.conn.transaction()?;
+        let txn = self.read.conn.transaction()?;
         for hash in hashes {
             txn.execute(
                 "INSERT OR IGNORE INTO pins(kind, holder, content_hash) VALUES (?1, ?2, ?3)",
@@ -192,7 +165,7 @@ impl Store {
 
         // Delete phase: the pin check runs inside the same transaction
         // that deletes the index rows (§13).
-        let txn = self.conn.transaction()?;
+        let txn = self.read.conn.transaction()?;
         for hash in &unit {
             let pinned: Option<i64> = txn
                 .query_row(
@@ -228,43 +201,6 @@ impl Store {
         }
         txn.commit()?;
         Ok(true)
-    }
-
-    /// The whole pin/evict unit of one result record: every output and
-    /// aux ContentHash plus each output artifact's wire-tree LayoutHash
-    /// (§13). The layout is part of the observable artifact and must live
-    /// for exactly as long as any result that names it.
-    fn result_unit_hashes(
-        &self,
-        segment: u64,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<[u8; 32]>, StoreError> {
-        let bytes = self.read_extent(segment, offset, len)?;
-        let decoded = decode_record(&bytes, segment, offset)?;
-        let payload = ResultPayload::decode(&decoded.record.payload)?;
-        let mut hashes = Vec::new();
-        if let ResultOutcome::Success { outputs, aux } = &payload.outcome {
-            for row in outputs {
-                hashes.push(row.content_hash.0);
-                let artifact = self.cas_read(&row.content_hash.0)?;
-                if artifact.starts_with(&ARTIFACT_MAGIC) {
-                    let view = parse_artifact(&artifact).map_err(|error| {
-                        StoreError::BadResultPayload {
-                            detail: format!(
-                                "output {} is not a valid artifact: {error}",
-                                row.output_key
-                            ),
-                        }
-                    })?;
-                    hashes.push(view.layout_hash.0);
-                }
-            }
-            for row in aux {
-                hashes.push(row.content_hash.0);
-            }
-        }
-        Ok(hashes)
     }
 
     /// The LRU sweep (§18's `cas.cache_limit`, operational-live): evict
@@ -511,7 +447,7 @@ impl Store {
         )?;
 
         // One SQLite transaction flips the index.
-        let txn = self.conn.transaction()?;
+        let txn = self.read.conn.transaction()?;
         txn.execute("DELETE FROM cas_segments", [])?;
         for seg in &new_segments {
             txn.execute(
@@ -585,5 +521,72 @@ impl Store {
             records_copied,
             reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
         })
+    }
+}
+
+impl StoreReader {
+    fn referenced_extent_hashes(&self) -> Result<HashSet<[u8; 32]>, StoreError> {
+        let candidates: Vec<(i64, i64, i64)> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT segment, offset, len FROM result_candidates")?;
+            let rows =
+                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut referenced = HashSet::new();
+        for (segment, offset, len) in candidates {
+            referenced.extend(self.result_unit_hashes(
+                segment as u64,
+                offset as u64,
+                len as u64,
+            )?);
+        }
+        let pinned: Vec<Vec<u8>> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DISTINCT content_hash FROM pins")?;
+            let rows = statement.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        referenced.extend(pinned.into_iter().map(crate::bundles::blob32));
+        Ok(referenced)
+    }
+
+    /// The whole pin/evict unit of one result record: every output and
+    /// aux ContentHash plus each output artifact's wire-tree LayoutHash
+    /// (§13). The layout is part of the observable artifact and must live
+    /// for exactly as long as any result that names it.
+    fn result_unit_hashes(
+        &self,
+        segment: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        let bytes = self.read_extent(segment, offset, len)?;
+        let decoded = decode_record(&bytes, segment, offset)?;
+        let payload = ResultPayload::decode(&decoded.record.payload)?;
+        let mut hashes = Vec::new();
+        if let ResultOutcome::Success { outputs, aux } = &payload.outcome {
+            for row in outputs {
+                hashes.push(row.content_hash.0);
+                let artifact = self.cas_read(&row.content_hash.0)?;
+                if artifact.starts_with(&ARTIFACT_MAGIC) {
+                    let view = parse_artifact(&artifact).map_err(|error| {
+                        StoreError::BadResultPayload {
+                            detail: format!(
+                                "output {} is not a valid artifact: {error}",
+                                row.output_key
+                            ),
+                        }
+                    })?;
+                    hashes.push(view.layout_hash.0);
+                }
+            }
+            for row in aux {
+                hashes.push(row.content_hash.0);
+            }
+        }
+        Ok(hashes)
     }
 }

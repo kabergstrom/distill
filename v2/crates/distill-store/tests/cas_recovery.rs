@@ -57,8 +57,8 @@ fn a_clean_reopen_recovers_nothing() {
     let mut store = Store::open(cfg(&dir)).unwrap();
     commit(&mut store, 1, b"artifact");
     drop(store);
-    let store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report();
+    let (_store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = &recovery;
     assert!(!report.rebuilt_index);
     assert_eq!(report.adopted_results, 0);
     assert_eq!(report.orphaned_payloads, 0);
@@ -90,8 +90,8 @@ fn a_torn_tail_is_truncated_and_the_data_before_it_survives() {
     // The SQLite index still references the (now missing) tail: reopening
     // must reconcile rather than serve dangling extents. The recorded
     // indexed_len exceeds the file: the segment rescans from scratch.
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report().clone();
+    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = recovery.clone();
     assert!(
         !report.truncated_tails.is_empty(),
         "the torn tail was classified: {report:?}"
@@ -112,8 +112,8 @@ fn a_torn_tail_is_truncated_and_the_data_before_it_survives() {
     // The file was physically truncated to a valid boundary: a further
     // reopen is clean.
     drop(store);
-    let store = Store::open(cfg(&dir)).unwrap();
-    assert!(store.recovery_report().truncated_tails.is_empty());
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    assert!(recovery.truncated_tails.is_empty());
     assert_eq!(store.cas_read(&hash1).unwrap(), b"first artifact");
 }
 
@@ -150,8 +150,8 @@ fn payload_records_without_a_result_record_publish_nothing() {
     f.sync_all().unwrap();
     drop(f);
 
-    let store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = &recovery;
     assert_eq!(report.orphaned_payloads, 2, "{report:?}");
     assert_eq!(report.adopted_results, 0);
     // The orphans are not readable — never indexed.
@@ -213,8 +213,8 @@ fn an_unindexed_committed_group_is_adopted_on_reopen() {
     f.sync_all().unwrap();
     drop(f);
 
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report();
+    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = &recovery;
     assert_eq!(report.adopted_results, 1, "{report:?}");
     assert_eq!(report.orphaned_payloads, 0);
     assert_eq!(
@@ -329,8 +329,8 @@ fn generation_mismatch_discards_and_rebuilds_the_index() {
     lines[0] = &bumped;
     std::fs::write(cas_dir.join("CURRENT"), lines.join("\n") + "\n").unwrap();
 
-    let mut store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report();
+    let (mut store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = &recovery;
     assert!(report.rebuilt_index, "{report:?}");
     assert_eq!(report.adopted_results, 2, "both groups rescanned");
     // Everything reads and both buckets resolve after the rebuild.
@@ -354,9 +354,9 @@ fn generation_mismatch_discards_and_rebuilds_the_index() {
     // And the mismatch healed: next open is quiet.
     drop(store);
     assert!(
-        !Store::open(cfg(&dir))
+        !Store::open_with_recovery(cfg(&dir))
             .unwrap()
-            .recovery_report()
+            .1
             .rebuilt_index
     );
 }
@@ -381,8 +381,8 @@ fn duplicate_content_hashes_keep_the_last_and_count_the_rest_garbage() {
     )
     .unwrap();
 
-    let store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = &recovery;
     assert!(report.rebuilt_index);
     assert_eq!(report.duplicate_payloads, 1, "{report:?}");
     assert_eq!(
@@ -406,9 +406,9 @@ fn stray_segment_files_are_removed_current_is_authority() {
     std::fs::write(cas_dir.join("seg-00000000000000ff.dsr"), b"garbage").unwrap();
     std::fs::write(cas_dir.join("CURRENT.tmp"), b"half-written").unwrap();
 
-    let store = Store::open(cfg(&dir)).unwrap();
+    let (_store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
     assert_eq!(
-        store.recovery_report().removed_stray_segments,
+        recovery.removed_stray_segments,
         vec!["seg-00000000000000ff.dsr".to_owned()]
     );
     assert!(!cas_dir.join("seg-00000000000000ff.dsr").exists());
@@ -451,8 +451,8 @@ fn corruption_inside_the_unindexed_tail_truncates_from_the_corrupt_record() {
     f.sync_all().unwrap();
     drop(f);
 
-    let store = Store::open(cfg(&dir)).unwrap();
-    let report = store.recovery_report();
+    let (store, recovery) = Store::open_with_recovery(cfg(&dir)).unwrap();
+    let report = &recovery;
     assert_eq!(report.truncated_tails.len(), 1);
     assert_eq!(
         report.truncated_tails[0].1, valid_len,

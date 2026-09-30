@@ -312,40 +312,61 @@ CREATE TABLE watched_import_failures (
 );
 ";
 
-/// The store: the SQLite metadata layer plus the log-structured CAS,
-/// opened from one `state_path`. One writer, many snapshot readers (§13):
-/// the coordinator owns the `Store`; every write goes through
-/// [`Store::input_transaction`] or the memo-side commit APIs.
-pub struct Store {
+/// A read-only view of the store over one SQLite connection. Every thread
+/// that reads opens its own ([`StoreReader::open`]); the writer's [`Store`]
+/// derefs to the reader over its write connection. Nothing here caches
+/// database content: every accessor reads the committed state visible to
+/// this connection.
+pub struct StoreReader {
     pub(crate) conn: Connection,
-    // (no Debug derive: Connection is not Debug-friendly; see impl below)
     pub(crate) config: StoreConfig,
-    pub(crate) cas: crate::cas::store::CasInner,
     instance_id: StoreInstanceId,
-    input_version: u64,
-    memo_seq: u64,
-    last_recovery: crate::cas::RecoveryReport,
 }
 
-impl std::fmt::Debug for Store {
+impl std::fmt::Debug for StoreReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Store")
+        f.debug_struct("StoreReader")
             .field("state_path", &self.config.state_path)
             .field("instance_id", &self.instance_id)
-            .field("input_version", &self.input_version)
-            .field("memo_seq", &self.memo_seq)
             .finish()
     }
 }
 
+/// The store writer: the SQLite metadata layer plus the log-structured CAS,
+/// opened from one `state_path`. Exactly one writer exists per state
+/// directory; it owns the CAS append state. Reads go through the
+/// [`StoreReader`] it derefs to.
+pub struct Store {
+    pub(crate) read: StoreReader,
+    pub(crate) cas: crate::cas::store::CasInner,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store").field("read", &self.read).finish()
+    }
+}
+
+impl std::ops::Deref for Store {
+    type Target = StoreReader;
+
+    fn deref(&self) -> &StoreReader {
+        &self.read
+    }
+}
+
 impl Store {
-    pub fn state_path(&self) -> &Path {
-        &self.config.state_path
+    /// Open (creating if absent) the daemon state under
+    /// `config.state_path`, run CAS recovery, and return the writer
+    /// together with what recovery found and did (§13's classification).
+    pub fn open(config: StoreConfig) -> Result<Store, StoreError> {
+        Self::open_with_recovery(config).map(|(store, _)| store)
     }
 
-    /// Open (creating if absent) the daemon state under
-    /// `config.state_path`.
-    pub fn open(config: StoreConfig) -> Result<Store, StoreError> {
+    /// [`Store::open`], also returning the recovery report.
+    pub fn open_with_recovery(
+        config: StoreConfig,
+    ) -> Result<(Store, crate::cas::RecoveryReport), StoreError> {
         let state_path = &config.state_path;
         create_dir(state_path)?;
         create_dir(&state_path.join("cas"))?;
@@ -384,8 +405,8 @@ impl Store {
                 id
             }
         };
-        let input_version = meta_get_u64_or_init(&conn, "input_version")?;
-        let memo_seq = meta_get_u64_or_init(&conn, "memo_seq")?;
+        meta_get_u64_or_init(&conn, "input_version")?;
+        meta_get_u64_or_init(&conn, "memo_seq")?;
 
         // Ephemeral state carries no version and rebuilds from scratch
         // (§13): lease, in-flight, and pack-session pins die with the
@@ -412,43 +433,28 @@ impl Store {
         }
 
         let mut store = Store {
-            conn,
-            config,
+            read: StoreReader {
+                conn,
+                config,
+                instance_id,
+            },
             cas: Default::default(),
-            instance_id,
-            input_version,
-            memo_seq,
-            last_recovery: Default::default(),
         };
         store.init_cas()?;
-        store.last_recovery = store.recover_cas()?;
+        let recovery = store.recover_cas()?;
         tracing::info!(
             path = %store.config.state_path.display(),
-            input_version = store.input_version,
-            memo_seq = store.memo_seq,
-            recovery = ?store.last_recovery,
+            input_version = store.input_version().0,
+            memo_seq = store.memo_seq().0,
+            recovery = ?recovery,
             "store opened"
         );
-        Ok(store)
+        Ok((store, recovery))
     }
 
-    /// What startup recovery found and did (§13's classification).
-    pub fn recovery_report(&self) -> &crate::cas::RecoveryReport {
-        &self.last_recovery
-    }
-
-    /// Rebuild every SQLite index from authoritative table rows. This is a
-    /// maintenance action only; callers publish its input-version event in the
-    /// same transaction boundary as their other doctor result state.
-    pub fn rebuild_indexes(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch("REINDEX")?;
-        Ok(())
-    }
-
-    /// Recovery adopted committed groups and advanced the persisted memo
-    /// counter inside its own transactions; sync the cached value.
-    pub(crate) fn set_memo_seq(&mut self, seq: u64) {
-        self.memo_seq = seq;
+    /// Open a reader on the same state directory as this writer.
+    pub fn reader(&self) -> Result<StoreReader, StoreError> {
+        StoreReader::open(self.config.clone())
     }
 
     /// Wipe the daemon state and start over: state is disposable (§2).
@@ -464,27 +470,6 @@ impl Store {
         Store::open(config)
     }
 
-    pub fn instance_id(&self) -> StoreInstanceId {
-        self.instance_id
-    }
-
-    pub fn input_version(&self) -> InputVersion {
-        InputVersion(self.input_version)
-    }
-
-    pub fn memo_seq(&self) -> MemoSeq {
-        MemoSeq(self.memo_seq)
-    }
-
-    /// The instance-qualified current version (§13): what crosses the
-    /// RPC boundary.
-    pub fn stamp(&self) -> SnapshotStamp {
-        SnapshotStamp {
-            instance: self.instance_id,
-            version: self.input_version(),
-        }
-    }
-
     /// Apply one watcher batch or authoring operation as an atomic
     /// transaction advancing the input version (§13). On any error the
     /// whole transaction rolls back and the version does not advance:
@@ -493,20 +478,26 @@ impl Store {
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
-        let base_stamp = self.stamp();
-        let version = InputVersion(self.input_version + 1);
+        let instance = self.instance_id();
         let state_path = self.config.state_path.clone();
-        let txn = self.conn.transaction()?;
+        let txn = self
+            .read
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let base = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
+        let version = InputVersion(base.0 + 1);
         let mut input_txn = InputTxn {
             txn,
-            base_stamp,
+            base_stamp: SnapshotStamp {
+                instance,
+                version: base,
+            },
             version,
             state_path,
         };
         let out = f(&mut input_txn)?;
         meta_set_u64(&input_txn.txn, "input_version", version.0)?;
         input_txn.txn.commit()?;
-        self.input_version = version.0;
         Ok((out, version))
     }
 
@@ -518,14 +509,20 @@ impl Store {
     where
         F: FnOnce(&mut InputTxn<'_>) -> Result<T, StoreError>,
     {
-        let base_stamp = self.stamp();
-        let version = InputVersion(self.input_version + 1);
+        let instance = self.instance_id();
         let state_path = self.config.state_path.clone();
-        let txn = self.conn.transaction()?;
+        let txn = self
+            .read
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let base = InputVersion(meta_get_u64(&txn, "input_version")?.unwrap_or(0));
         let mut input_txn = InputTxn {
             txn,
-            base_stamp,
-            version,
+            base_stamp: SnapshotStamp {
+                instance,
+                version: base,
+            },
+            version: InputVersion(base.0 + 1),
             state_path,
         };
         let out = f(&mut input_txn)?;
@@ -539,13 +536,104 @@ impl Store {
     where
         F: FnOnce(&rusqlite::Transaction<'_>, MemoSeq) -> Result<T, StoreError>,
     {
-        let seq = MemoSeq(self.memo_seq + 1);
-        let txn = self.conn.transaction()?;
+        let txn = self
+            .read
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let seq = MemoSeq(meta_get_u64(&txn, "memo_seq")?.unwrap_or(0) + 1);
         let out = f(&txn, seq)?;
         meta_set_u64(&txn, "memo_seq", seq.0)?;
         txn.commit()?;
-        self.memo_seq = seq.0;
         Ok((out, seq))
+    }
+}
+
+impl StoreReader {
+    /// Open a read-only connection on an existing store. The writer must
+    /// have created the state directory ([`Store::open`]); readers never
+    /// create, migrate, or recover anything.
+    pub fn open(config: StoreConfig) -> Result<StoreReader, StoreError> {
+        let db_path = config.state_path.join("meta.sqlite");
+        let conn = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let found: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if found != SCHEMA_VERSION {
+            return Err(StoreError::SchemaVersionMismatch {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let instance_id = match meta_get_blob(&conn, "instance_id")? {
+            Some(bytes) if bytes.len() == 16 => {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&bytes);
+                StoreInstanceId(id)
+            }
+            _ => {
+                return Err(StoreError::Io {
+                    path: db_path,
+                    source: std::io::Error::other("store has no instance id"),
+                })
+            }
+        };
+        Ok(StoreReader {
+            conn,
+            config,
+            instance_id,
+        })
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.config.state_path
+    }
+
+    /// Rebuild every SQLite index from authoritative table rows. This is a
+    /// maintenance action only; callers publish its input-version event in the
+    /// same transaction boundary as their other doctor result state.
+    pub fn rebuild_indexes(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch("REINDEX")?;
+        Ok(())
+    }
+
+    pub fn instance_id(&self) -> StoreInstanceId {
+        self.instance_id
+    }
+
+    /// The committed input version visible to this connection.
+    ///
+    /// Infallible for now: the phase-3+ rewrites of its callers make it
+    /// return `Result`. A failing single-row read of `store_meta` on an
+    /// open connection means the database is gone or corrupt.
+    pub fn input_version(&self) -> InputVersion {
+        InputVersion(
+            meta_get_u64(&self.conn, "input_version")
+                .expect("store_meta.input_version is readable")
+                .unwrap_or(0),
+        )
+    }
+
+    /// The committed memo sequence visible to this connection. See
+    /// [`StoreReader::input_version`] on infallibility.
+    pub fn memo_seq(&self) -> MemoSeq {
+        MemoSeq(
+            meta_get_u64(&self.conn, "memo_seq")
+                .expect("store_meta.memo_seq is readable")
+                .unwrap_or(0),
+        )
+    }
+
+    /// The instance-qualified current version (§13): what crosses the
+    /// RPC boundary.
+    pub fn stamp(&self) -> SnapshotStamp {
+        SnapshotStamp {
+            instance: self.instance_id,
+            version: self.input_version(),
+        }
     }
 
     /// §14's clean watermark: the newest mtime observed under active
@@ -555,6 +643,7 @@ impl Store {
         meta_get_i64(&self.conn, "clean_watermark")
     }
 }
+
 
 /// One atomic input-version transaction (§13). Every input-versioned
 /// table writes through methods on this; dropping without commit rolls

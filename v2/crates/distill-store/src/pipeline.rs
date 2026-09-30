@@ -18,7 +18,7 @@ use distill_core::tool::{
 use rusqlite::OptionalExtension;
 use unicode_normalization::is_nfc;
 
-use crate::db::{InputTxn, Store};
+use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::{RetiredTypeReference, StoreError};
 use crate::state::{
     InputVersion, PipelineCandidateIdentity, PipelineEpoch, PipelinePoison, PipelineState,
@@ -2158,34 +2158,6 @@ fn coverage_error(
 }
 
 impl Store {
-    /// Retained authority rows currently excluded from the active pipeline
-    /// registry. Coordinators use this to classify waiting scan references
-    /// before opening an input transaction.
-    pub fn retired_type_uuids(&self) -> Result<BTreeSet<TypeUuid>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT type_uuid FROM schema_lineage_current WHERE authority = 1")?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|row| Ok(TypeUuid(exact_blob16(row?, "retired type UUID")?)))
-            .collect();
-        rows
-    }
-
-    /// Exact still-staged candidate identity, including while a
-    /// RetiredTypeReferenced diagnostic is the published unavailable state.
-    pub fn pending_schema_candidate_identity(
-        &self,
-    ) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
-        pending_candidate_identity(&self.conn)
-    }
-
-    /// Exact verified source-manifest basis currently projected into the
-    /// disposable store tables. Schema-transition coordinators use this as a
-    /// read-only stale precondition before touching the authored manifest.
-    pub fn schema_manifest_basis(&self) -> Result<Option<SchemaManifestBasis>, StoreError> {
-        manifest_basis(&self.conn)
-    }
 
     /// Persist the first poison discovered in an already-published module
     /// epoch without minting a new input version. This is a narrow monotonic
@@ -2204,7 +2176,7 @@ impl Store {
             ));
         }
 
-        let transaction = self.conn.transaction()?;
+        let transaction = self.read.conn.transaction()?;
         let row: Option<(Option<Vec<u8>>, Option<i64>)> = transaction
             .query_row(
                 "SELECT dylib_hash, poison_code FROM pipeline_state WHERE id = 0",
@@ -2254,6 +2226,37 @@ impl Store {
         }
         transaction.commit()?;
         Ok(())
+    }
+}
+
+impl StoreReader {
+    /// Retained authority rows currently excluded from the active pipeline
+    /// registry. Coordinators use this to classify waiting scan references
+    /// before opening an input transaction.
+    pub fn retired_type_uuids(&self) -> Result<BTreeSet<TypeUuid>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT type_uuid FROM schema_lineage_current WHERE authority = 1")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| Ok(TypeUuid(exact_blob16(row?, "retired type UUID")?)))
+            .collect();
+        rows
+    }
+
+    /// Exact still-staged candidate identity, including while a
+    /// RetiredTypeReferenced diagnostic is the published unavailable state.
+    pub fn pending_schema_candidate_identity(
+        &self,
+    ) -> Result<Option<PipelineCandidateIdentity>, StoreError> {
+        pending_candidate_identity(&self.conn)
+    }
+
+    /// Exact verified source-manifest basis currently projected into the
+    /// disposable store tables. Schema-transition coordinators use this as a
+    /// read-only stale precondition before touching the authored manifest.
+    pub fn schema_manifest_basis(&self) -> Result<Option<SchemaManifestBasis>, StoreError> {
+        manifest_basis(&self.conn)
     }
 
     /// The published pipeline state, or `None` before any publication.

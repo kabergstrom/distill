@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 
-use crate::db::{InputTxn, Store};
+use crate::db::{InputTxn, Store, StoreReader};
 use crate::error::StoreError;
 use crate::state::{
     ConfigurationEpoch, ConfigurationPoison, ConfigurationPoisonCode, ConfigurationState, DscpV1,
@@ -178,16 +178,13 @@ impl Store {
         candidate: &StoreConfig,
     ) -> Result<(), ConfigValidationError> {
         candidate.validate_scheduler()?;
-        self.config.displaced_retention_days = candidate.displaced_retention_days;
-        self.config.segment_size = candidate.segment_size;
-        self.config.cache_limit = candidate.cache_limit;
-        self.config.parallelism = candidate.parallelism;
-        self.config.batch_reserved_workers = candidate.batch_reserved_workers;
+        let config = &mut self.read.config;
+        config.displaced_retention_days = candidate.displaced_retention_days;
+        config.segment_size = candidate.segment_size;
+        config.cache_limit = candidate.cache_limit;
+        config.parallelism = candidate.parallelism;
+        config.batch_reserved_workers = candidate.batch_reserved_workers;
         Ok(())
-    }
-
-    pub fn operational_config(&self) -> StoreConfig {
-        self.config.clone()
     }
 
     /// Stage and validate restart-only changes without advancing the input
@@ -224,7 +221,7 @@ impl Store {
             )
             .map_err(persistence)? as u64;
         let generation = active.max(prior) + 1;
-        let txn = self.conn.transaction().map_err(persistence)?;
+        let txn = self.read.conn.transaction().map_err(persistence)?;
         txn.execute("DELETE FROM pending_restart", [])
             .map_err(persistence)?;
         for (key, value) in &rows {
@@ -240,6 +237,20 @@ impl Store {
             generation,
             keys: rows.into_iter().map(|(key, _)| key.to_owned()).collect(),
         })
+    }
+
+    /// Clear a staged restart candidate that has been edited back to the
+    /// active startup values. This is not an input event.
+    pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
+        self.conn.execute("DELETE FROM pending_restart", [])?;
+        Ok(())
+    }
+}
+
+impl StoreReader {
+
+    pub fn operational_config(&self) -> StoreConfig {
+        self.config.clone()
     }
 
     pub fn pending_restart(&self) -> Result<Option<PendingRestart>, StoreError> {
@@ -261,13 +272,6 @@ impl Store {
             generation: generation as u64,
             keys,
         }))
-    }
-
-    /// Clear a staged restart candidate that has been edited back to the
-    /// active startup values. This is not an input event.
-    pub fn clear_pending_restart(&mut self) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM pending_restart", [])?;
-        Ok(())
     }
 
     pub fn configuration_state(&self) -> Result<ConfigurationState, StoreError> {

@@ -6,7 +6,7 @@ use distill_core::canonical::CanonicalEncoder;
 use distill_core::id::ContentHash;
 
 use crate::state::InputVersion;
-use crate::{Store, StoreError};
+use crate::{Store, StoreError, StoreReader};
 
 const CODEGEN_BASIS_MAGIC: [u8; 4] = *b"DSCG";
 const CODEGEN_BASIS_VERSION: u8 = 1;
@@ -82,9 +82,6 @@ impl CodegenPublicationBasis {
 }
 
 impl Store {
-    pub fn codegen_outputs(&self) -> Result<BTreeMap<String, ContentHash>, StoreError> {
-        read_outputs(&self.conn)
-    }
 
     /// Replace the complete generated namespace only if the caller names the
     /// exact previously published pre-images. This is memo-side state: source
@@ -125,6 +122,12 @@ impl Store {
             return Ok(());
         }
         self.commit_codegen_outputs(&basis.previous, &basis.proposed)
+    }
+}
+
+impl StoreReader {
+    pub fn codegen_outputs(&self) -> Result<BTreeMap<String, ContentHash>, StoreError> {
+        read_outputs(&self.conn)
     }
 }
 

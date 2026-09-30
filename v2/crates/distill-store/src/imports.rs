@@ -11,7 +11,7 @@ use rusqlite::OptionalExtension;
 use distill_core::id::BundleUuid;
 
 use crate::state::{InputVersion, MemoSeq};
-use crate::{Store, StoreError};
+use crate::{Store, StoreError, StoreReader};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchedImportTerminal {
@@ -88,6 +88,22 @@ impl Store {
         Ok(sequence)
     }
 
+    pub fn clear_watched_import_failure(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
+        if self.watched_import_failure(bundle)?.is_none() {
+            return Ok(false);
+        }
+        let (removed, _) = self.memo_transaction(|transaction, _| {
+            Ok(transaction.execute(
+                "DELETE FROM watched_import_failures WHERE bundle_uuid = ?1",
+                [bundle.0.as_slice()],
+            )? > 0)
+        })?;
+        Ok(removed)
+    }
+}
+
+impl StoreReader {
+
     pub fn watched_import_failure(
         &self,
         bundle: BundleUuid,
@@ -121,18 +137,5 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
-    }
-
-    pub fn clear_watched_import_failure(&mut self, bundle: BundleUuid) -> Result<bool, StoreError> {
-        if self.watched_import_failure(bundle)?.is_none() {
-            return Ok(false);
-        }
-        let (removed, _) = self.memo_transaction(|transaction, _| {
-            Ok(transaction.execute(
-                "DELETE FROM watched_import_failures WHERE bundle_uuid = ?1",
-                [bundle.0.as_slice()],
-            )? > 0)
-        })?;
-        Ok(removed)
     }
 }
