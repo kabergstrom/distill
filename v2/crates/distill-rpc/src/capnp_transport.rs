@@ -38,6 +38,16 @@ use crate::{
 
 pub use crate::distill_rpc_capnp as schema;
 
+/// Wait for `call` on a blocking worker: the single-threaded capnp-rpc
+/// driver never waits on the authority itself.
+async fn run_off_thread<T: Send + 'static>(
+    call: crate::AuthorityCall<T>,
+) -> Result<Result<T, crate::AuthorityStopped>, capnp::Error> {
+    tokio::task::spawn_blocking(move || call.run())
+        .await
+        .map_err(|error| capnp::Error::failed(format!("authority wait failed: {error}")))
+}
+
 const WIRE_INVALID_UUID: u16 = 1001;
 const WIRE_INVALID_HASH: u16 = 1002;
 const WIRE_INVALID_INSTANCE: u16 = 1003;
@@ -445,10 +455,11 @@ impl schema::lineage_repair::Server for LineageRepairService {
                 }
             };
             let bytes: Arc<[u8]> = Arc::from(params.get_canonical_manifest_bundle()?);
-            write_lineage_mutation_result(
-                results.get().init_result(),
-                self.repair.create_missing(basis, bytes),
-            );
+            let outcome = match self.repair.create_missing_call(basis, bytes) {
+                Ok(call) => crate::lineage_call_outcome(run_off_thread(call).await?),
+                Err(outcome) => outcome,
+            };
+            write_lineage_mutation_result(results.get().init_result(), outcome);
             Ok(())
         }
     }
@@ -482,10 +493,11 @@ impl schema::lineage_repair::Server for LineageRepairService {
                     return Ok(());
                 }
             };
-            write_lineage_mutation_result(
-                results.get().init_result(),
-                self.repair.resolve_duplicate(basis, survivor),
-            );
+            let outcome = match self.repair.resolve_duplicate_call(basis, survivor) {
+                Ok(call) => crate::lineage_call_outcome(run_off_thread(call).await?),
+                Err(outcome) => outcome,
+            };
+            write_lineage_mutation_result(results.get().init_result(), outcome);
             Ok(())
         }
     }
@@ -654,11 +666,13 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
+            let result = match self.hub.write_call(InputVersion(params.get_base()), ops) {
+                Ok(call) => crate::write_call_outcome(run_off_thread(call).await?),
+                Err(result) => result,
+            };
             write_uint64_result(
                 results.get().init_result(),
-                self.hub
-                    .write(InputVersion(params.get_base()), ops)
-                    .map_success(|version| version.0),
+                result.map_success(|version| version.0),
             );
             Ok(())
         }
@@ -698,7 +712,10 @@ impl schema::hub::Server for HubService {
                         .map_err(|error| {
                             capnp::Error::failed(format!("import worker failed: {error}"))
                         })?;
-                    self.hub.import_finish(finished)
+                    match self.hub.import_publish_call(finished) {
+                        Ok(call) => crate::import_call_outcome(run_off_thread(call).await?),
+                        Err(result) => result,
+                    }
                 }
                 Err(result) => result,
             };
@@ -737,7 +754,10 @@ impl schema::hub::Server for HubService {
                         .map_err(|error| {
                             capnp::Error::failed(format!("import worker failed: {error}"))
                         })?;
-                    self.hub.import_finish(finished)
+                    match self.hub.import_publish_call(finished) {
+                        Ok(call) => crate::import_call_outcome(run_off_thread(call).await?),
+                        Err(result) => result,
+                    }
                 }
                 Err(result) => result,
             };
@@ -1380,10 +1400,18 @@ impl schema::progress_stream::Server for ProgressStreamService {
         mut results: schema::progress_stream::NextResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            let progress = self
-                .stream
-                .borrow_mut()
-                .next();
+            let step = self.stream.borrow_mut().next_step();
+            let progress = match step {
+                None => None,
+                Some(crate::ProgressStep::Event(event)) => Some(event),
+                Some(crate::ProgressStep::Complete { event, call }) => {
+                    let outcome = match call {
+                        Ok(call) => crate::completion_outcome(run_off_thread(call).await?),
+                        Err(error) => Err(error),
+                    };
+                    Some(self.stream.borrow_mut().finish_completion(event, outcome))
+                }
+            };
             let mut output = results.get();
             match progress {
                 Some(progress) => {

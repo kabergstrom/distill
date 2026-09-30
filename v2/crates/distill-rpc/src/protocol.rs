@@ -1325,8 +1325,31 @@ impl ChunkStream {
 }
 
 pub(crate) trait ProgressCompletion {
-    fn complete(&self) -> Result<(), String>;
+    /// Check the completion here; the returned job publishes it on the
+    /// authority.
+    fn complete_call(&self) -> Result<crate::AuthorityCall<Result<(), String>>, String>;
     fn cancel(&self) -> bool;
+}
+
+/// A step of a [`ProgressStream`].
+pub enum ProgressStep {
+    Event(AuthoringProgressEvent),
+    /// The operation completed; its publication waits on the authority.
+    /// Run `call` (off the RPC thread) and hand its outcome to
+    /// [`ProgressStream::finish_completion`].
+    Complete {
+        event: AuthoringProgressEvent,
+        call: Result<crate::AuthorityCall<Result<(), String>>, String>,
+    },
+}
+
+/// What a completion's job answered, or that the authority stopped.
+pub fn completion_outcome(
+    outcome: Result<Result<(), String>, crate::AuthorityStopped>,
+) -> Result<(), String> {
+    outcome.unwrap_or_else(|crate::AuthorityStopped| {
+        Err("the publishing authority stopped".to_owned())
+    })
 }
 
 pub struct ProgressStream {
@@ -1366,25 +1389,55 @@ impl ProgressStream {
     }
 }
 
-impl Iterator for ProgressStream {
-    type Item = AuthoringProgressEvent;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut event = self.events.pop_front()?;
+impl ProgressStream {
+    /// The next event; a completion comes back as its pending publication.
+    pub fn next_step(&mut self) -> Option<ProgressStep> {
+        let event = self.events.pop_front()?;
         if event.state == AuthoringProgressState::Completed {
-            if let Err(error) = self.completion.complete() {
-                event.state = AuthoringProgressState::Failed;
-                event.payload = Arc::from(error.into_bytes());
-            }
-        } else if matches!(
+            let call = self.completion.complete_call();
+            return Some(ProgressStep::Complete { event, call });
+        }
+        if matches!(
             event.state,
             AuthoringProgressState::Cancelled | AuthoringProgressState::Failed
         ) {
             self.completion.cancel();
         }
+        Some(ProgressStep::Event(self.settle(event)))
+    }
+
+    /// The completion event, once its publication ran.
+    pub fn finish_completion(
+        &mut self,
+        mut event: AuthoringProgressEvent,
+        outcome: Result<(), String>,
+    ) -> AuthoringProgressEvent {
+        if let Err(error) = outcome {
+            event.state = AuthoringProgressState::Failed;
+            event.payload = Arc::from(error.into_bytes());
+        }
+        self.settle(event)
+    }
+
+    fn settle(&mut self, event: AuthoringProgressEvent) -> AuthoringProgressEvent {
         self.next_sequence = event.sequence.saturating_add(1);
         self.terminal_seen = event.state.is_terminal();
-        Some(event)
+        event
+    }
+}
+
+impl Iterator for ProgressStream {
+    type Item = AuthoringProgressEvent;
+
+    /// Runs a completion's publication on this thread.
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_step()? {
+            ProgressStep::Event(event) => Some(event),
+            ProgressStep::Complete { event, call } => {
+                let outcome = call.and_then(|call| completion_outcome(call.run()));
+                Some(self.finish_completion(event, outcome))
+            }
+        }
     }
 }
 

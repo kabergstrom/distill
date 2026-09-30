@@ -29,9 +29,10 @@ pub use apply::{
 pub use capability::{
     AuthoringSnapshot, DeltaStream, FinishedBuild, Hub, LineageRepair, MetadataAuthoringSnapshot,
     MetadataHub, MetadataSnapshot, PackSession, PendingBuild, ResolveStep, Snapshot,
+    import_call_outcome, lineage_call_outcome, write_call_outcome,
 };
 pub use server::{
-    target_map, run_scoped, AuthorityJob, AuthorityStopped, CoordinatedCommitError, ExternalStore, LeasePolicy, Root, Server, ServerHandle,
+    target_map, run_scoped, AuthorityCall, AuthorityJob, AuthorityStopped, CoordinatedCommitError, ExternalStore, LeasePolicy, Root, Server, ServerHandle,
     MAX_SUBSCRIBED_ASSETS, MAX_SUBSCRIBED_PATHS,
 };
 pub use validate::{decode_asset_reference_query, decode_authoring_payload};

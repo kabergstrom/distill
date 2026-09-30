@@ -19,7 +19,7 @@ use distill_store::{StoreError, StoreReader};
 use crate::persist::decode_drifted_input;
 use crate::server::{
     authoring_entry, entry_role, history_deltas, is_embedded, pipeline_failure,
-    publish_backend_commit, store_failure, BuildKey, BuildResolution, ConnectionState,
+    publish_backend_commit, store_failure, AuthorityCall, BuildKey, BuildResolution, ConnectionState,
     MetadataBinding, PackSessionLease, SnapshotTxn, ViewLease, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
@@ -597,15 +597,65 @@ fn validate_progress(events: &[AuthoringProgressEvent]) -> Result<(), String> {
     Ok(())
 }
 
+/// What a job on the authority answered, or that the authority stopped.
+fn authority_outcome<T>(
+    outcome: Result<Option<RpcResult<T>>, AuthorityStopped>,
+) -> Option<RpcResult<T>> {
+    outcome.unwrap_or_else(|AuthorityStopped| {
+        Some(RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
+            operation: "authority".to_owned(),
+        }))
+    })
+}
+
+/// Run a checked lineage repair's job here.
+fn lineage_outcome(
+    call: Result<AuthorityCall<LineageRepairMutationOutcome>, LineageRepairMutationOutcome>,
+) -> LineageRepairMutationOutcome {
+    match call {
+        Ok(call) => lineage_call_outcome(call.run()),
+        Err(outcome) => outcome,
+    }
+}
+
+/// What a lineage repair's job answered, or that the authority stopped.
+/// What a [`Hub::write_call`] answered.
+pub fn write_call_outcome(
+    outcome: Result<Option<RpcResult<InputVersion>>, AuthorityStopped>,
+) -> RpcResult<InputVersion> {
+    authority_outcome(outcome).unwrap_or_else(|| {
+        RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
+            operation: "write".to_owned(),
+        })
+    })
+}
+
+/// What a [`Hub::import_publish_call`] answered.
+pub fn import_call_outcome(
+    outcome: Result<Option<RpcResult<BundleUuid>>, AuthorityStopped>,
+) -> RpcResult<BundleUuid> {
+    authority_outcome(outcome).expect("an import always publishes")
+}
+
+pub fn lineage_call_outcome(
+    outcome: Result<LineageRepairMutationOutcome, AuthorityStopped>,
+) -> LineageRepairMutationOutcome {
+    outcome.unwrap_or_else(|AuthorityStopped| {
+        LineageRepairMutationOutcome::Failure(RpcFailure::AuthoringBackendUnavailable {
+            operation: "lineageRepair".to_owned(),
+        })
+    })
+}
+
 /// Complete a prepared operation on the authority, still at `base`.
 fn complete_on_authority(
     server: &Server,
     base: InputVersion,
     publication: PreparedOperationPublication,
-    what: &str,
-) -> Result<(), String> {
+    what: &'static str,
+) -> AuthorityCall<Result<(), String>> {
     server
-        .authority(|server| {
+        .authority_call(move |server| {
             let current = server.inner.current_stamp().version;
             if current != base {
                 return Err(format!(
@@ -614,7 +664,6 @@ fn complete_on_authority(
             }
             complete_publication(server, base, publication, what)
         })
-        .unwrap_or_else(|AuthorityStopped| Err("the publishing authority stopped".to_owned()))
 }
 
 /// Run a prepared operation's publication against `base`.
@@ -644,7 +693,7 @@ struct ServerOperationCompletion {
 }
 
 impl ProgressCompletion for ServerOperationCompletion {
-    fn complete(&self) -> Result<(), String> {
+    fn complete_call(&self) -> Result<AuthorityCall<Result<(), String>>, String> {
         let publication = self
             .publication
             .borrow_mut()
@@ -655,7 +704,12 @@ impl ProgressCompletion for ServerOperationCompletion {
                 "long-running operation lost its publication basis: {gate:?}"
             ));
         }
-        complete_on_authority(&self.server, self.base, publication, "long-running operation")
+        Ok(complete_on_authority(
+            &self.server,
+            self.base,
+            publication,
+            "long-running operation",
+        ))
     }
 
     fn cancel(&self) -> bool {
@@ -671,7 +725,7 @@ struct MetadataSchemaTransitionCompletion {
 }
 
 impl ProgressCompletion for MetadataSchemaTransitionCompletion {
-    fn complete(&self) -> Result<(), String> {
+    fn complete_call(&self) -> Result<AuthorityCall<Result<(), String>>, String> {
         let publication = self
             .publication
             .borrow_mut()
@@ -682,7 +736,12 @@ impl ProgressCompletion for MetadataSchemaTransitionCompletion {
                 "schema transition lost its metadata binding: {reason:?}"
             ));
         }
-        complete_on_authority(&self.server, self.base, publication, "schema transition")
+        Ok(complete_on_authority(
+            &self.server,
+            self.base,
+            publication,
+            "schema transition",
+        ))
     }
 
     fn cancel(&self) -> bool {
@@ -802,24 +861,32 @@ impl LineageRepair {
         basis: LineageRepairInspection,
         canonical_manifest_bundle: Arc<[u8]>,
     ) -> LineageRepairMutationOutcome {
-        if let Err(outcome) = self.mutation_preflight(&basis) {
-            return outcome;
-        }
+        lineage_outcome(self.create_missing_call(basis, canonical_manifest_bundle))
+    }
+
+    /// Check a `createMissing`; the returned job publishes it on the
+    /// authority, for transports to wait on off the RPC thread.
+    pub fn create_missing_call(
+        &self,
+        basis: LineageRepairInspection,
+        canonical_manifest_bundle: Arc<[u8]>,
+    ) -> Result<AuthorityCall<LineageRepairMutationOutcome>, LineageRepairMutationOutcome> {
+        self.mutation_preflight(&basis)?;
         if !matches!(basis.state, LineageRepairState::Missing { .. }) {
-            return LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
+            return Err(LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
                 code: LineageRepairInvalidCode::WrongBasisState,
                 message: "createMissing requires a Missing inspection".to_owned(),
-            });
+            }));
         }
         if let Err(invalid) =
             crate::lineage::validate_manifest_repair_bundle(&canonical_manifest_bundle)
         {
-            return LineageRepairMutationOutcome::Invalid(invalid);
+            return Err(LineageRepairMutationOutcome::Invalid(invalid));
         }
         let backend = Arc::clone(&self.server.inner.handle.authoring_backend());
-        self.publish_lineage_repair(basis.clone(), || {
+        Ok(self.lineage_repair_call(basis.clone(), move || {
             backend.prepare_create_missing_lineage(&basis, &canonical_manifest_bundle)
-        })
+        }))
     }
 
     pub fn resolve_duplicate(
@@ -827,25 +894,33 @@ impl LineageRepair {
         basis: LineageRepairInspection,
         survivor: LineageManifestClaimant,
     ) -> LineageRepairMutationOutcome {
-        if let Err(outcome) = self.mutation_preflight(&basis) {
-            return outcome;
-        }
+        lineage_outcome(self.resolve_duplicate_call(basis, survivor))
+    }
+
+    /// Check a `resolveDuplicate`; the returned job publishes it on the
+    /// authority, for transports to wait on off the RPC thread.
+    pub fn resolve_duplicate_call(
+        &self,
+        basis: LineageRepairInspection,
+        survivor: LineageManifestClaimant,
+    ) -> Result<AuthorityCall<LineageRepairMutationOutcome>, LineageRepairMutationOutcome> {
+        self.mutation_preflight(&basis)?;
         let LineageRepairState::Duplicate { claimants } = &basis.state else {
-            return LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
+            return Err(LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
                 code: LineageRepairInvalidCode::WrongBasisState,
                 message: "resolveDuplicate requires a Duplicate inspection".to_owned(),
-            });
+            }));
         };
         if claimants.binary_search(&survivor).is_err() {
-            return LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
+            return Err(LineageRepairMutationOutcome::Invalid(LineageRepairInvalid {
                 code: LineageRepairInvalidCode::SurvivorNotClaimant,
                 message: "selected survivor is not an exact current claimant".to_owned(),
-            });
+            }));
         }
         let backend = Arc::clone(&self.server.inner.handle.authoring_backend());
-        self.publish_lineage_repair(basis.clone(), || {
+        Ok(self.lineage_repair_call(basis.clone(), move || {
             backend.prepare_resolve_duplicate_lineage(&basis, &survivor)
-        })
+        }))
     }
 
     fn mutation_preflight(
@@ -855,19 +930,15 @@ impl LineageRepair {
         lineage_preflight(&self.server, &self.binding, basis)
     }
 
-    fn publish_lineage_repair(
+    fn lineage_repair_call(
         &self,
         basis: LineageRepairInspection,
-        prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError> + Send,
-    ) -> LineageRepairMutationOutcome {
-        let binding = &*self.binding;
-        self.server
-            .authority(|server| publish_lineage_repair_locked(server, binding, basis, prepare))
-            .unwrap_or_else(|AuthorityStopped| {
-                LineageRepairMutationOutcome::Failure(RpcFailure::AuthoringBackendUnavailable {
-                    operation: "lineageRepair".to_owned(),
-                })
-            })
+        prepare: impl FnOnce() -> Result<Commit, LineageRepairBackendError> + Send + 'static,
+    ) -> AuthorityCall<LineageRepairMutationOutcome> {
+        let binding = MetadataBinding::clone(&self.binding);
+        self.server.authority_call(move |server| {
+            publish_lineage_repair_locked(server, &binding, basis, prepare)
+        })
     }
 }
 
@@ -1265,66 +1336,100 @@ impl Hub {
 
     /// On the authority, still at `base`: run the backend's `prepare` and
     /// publish its commit. `None` when the backend declined.
-    fn prepared<T: Send>(
+    fn prepared<T: Send + 'static>(
         &self,
         base: InputVersion,
-        prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure> + Send,
+        prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure>
+            + Send
+            + 'static,
     ) -> Option<RpcResult<T>> {
+        authority_outcome(self.prepared_call(base, prepare).run())
+    }
+
+    /// [`Hub::prepared`] as a job for another thread to wait on.
+    fn prepared_call<T: Send + 'static>(
+        &self,
+        base: InputVersion,
+        prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure>
+            + Send
+            + 'static,
+    ) -> AuthorityCall<Option<RpcResult<T>>> {
         let backend = self.server.inner.handle.authoring_backend();
-        self.server
-            .authority(|server| {
-                let current = server.inner.current_stamp().version;
-                if current != base {
-                    return Some(RpcResult::Failure(RpcFailure::StaleInputVersion {
-                        expected: current,
-                        got: base,
-                    }));
-                }
-                match prepare(&*backend) {
-                    Ok(Some((commit, value))) => Some(match publish_backend_commit(server, base, commit) {
-                        Ok(_) => RpcResult::Success(value),
-                        Err(error) => RpcResult::Failure(error),
-                    }),
-                    Ok(None) => None,
-                    Err(error) => Some(RpcResult::Failure(error)),
-                }
-            })
-            .unwrap_or_else(|AuthorityStopped| {
-                Some(RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-                    operation: "authority".to_owned(),
-                }))
-            })
+        self.server.authority_call(move |server| {
+            let current = server.inner.current_stamp().version;
+            if current != base {
+                return Some(RpcResult::Failure(RpcFailure::StaleInputVersion {
+                    expected: current,
+                    got: base,
+                }));
+            }
+            match prepare(&*backend) {
+                Ok(Some((commit, value))) => Some(match publish_backend_commit(server, base, commit) {
+                    Ok(_) => RpcResult::Success(value),
+                    Err(error) => RpcResult::Failure(error),
+                }),
+                Ok(None) => None,
+                Err(error) => Some(RpcResult::Failure(error)),
+            }
+        })
     }
 
     pub fn write(&self, base: InputVersion, ops: Vec<AuthoringOp>) -> RpcResult<InputVersion> {
+        match self.write_call(base, ops) {
+            Ok(call) => write_call_outcome(call.run()),
+            Err(result) => result,
+        }
+    }
+
+    /// Check a write. Against a daemon, the returned job publishes it on
+    /// the authority (`None`: the backend declined); transports wait on it
+    /// off the RPC thread. An embedded server answers here.
+    #[allow(clippy::type_complexity)]
+    pub fn write_call(
+        &self,
+        base: InputVersion,
+        ops: Vec<AuthoringOp>,
+    ) -> Result<AuthorityCall<Option<RpcResult<InputVersion>>>, RpcResult<InputVersion>> {
         if let Some(result) = self.authoring_gate(base) {
-            return result;
+            return Err(result);
         }
         if ops.is_empty() {
-            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
                 detail: "authoring operation batch must not be empty".to_owned(),
-            });
+            }));
         }
         if ops.iter().any(|operation| {
             matches!(operation, AuthoringOp::Set(entry) if entry.local_id.starts_with('$'))
         }) {
-            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
                 detail: "daemon-owned '$settings' and '$record' entries cannot be written directly"
                     .to_owned(),
-            });
+            }));
         }
         let next = InputVersion(base.0 + 1);
-        if let Some(result) = self.prepared(base, |backend| {
+        if is_embedded(&self.server) {
+            return Err(self.embedded_write(base, ops, next));
+        }
+        Ok(self.prepared_call(base, move |backend| {
             Ok(backend
                 .prepare_write(base, &ops)?
                 .map(|commit| (commit, next)))
+        }))
+    }
+
+    fn embedded_write(
+        &self,
+        base: InputVersion,
+        ops: Vec<AuthoringOp>,
+        next: InputVersion,
+    ) -> RpcResult<InputVersion> {
+        let backend_ops = ops.clone();
+        if let Some(result) = self.prepared(base, move |backend| {
+            Ok(backend
+                .prepare_write(base, &backend_ops)?
+                .map(|commit| (commit, next)))
         }) {
             return result;
-        }
-        if !is_embedded(&self.server) {
-            return RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
-                operation: "write".to_owned(),
-            });
         }
         let commit = rpc_try!(self.embedded_write_commit(ops));
         self.publish(base, commit, next)
@@ -1467,6 +1572,18 @@ impl Hub {
     /// Publish a finished import on the authority, only while still at
     /// its base.
     pub fn import_finish(&self, finished: FinishedImport) -> RpcResult<BundleUuid> {
+        match self.import_publish_call(finished) {
+            Ok(call) => import_call_outcome(call.run()),
+            Err(result) => result,
+        }
+    }
+
+    /// [`Hub::import_finish`] as a job for another thread to wait on.
+    #[allow(clippy::type_complexity)]
+    pub fn import_publish_call(
+        &self,
+        finished: FinishedImport,
+    ) -> Result<AuthorityCall<Option<RpcResult<BundleUuid>>>, RpcResult<BundleUuid>> {
         let FinishedImport {
             base,
             reimport,
@@ -1474,9 +1591,9 @@ impl Hub {
         } = finished;
         let job = match job {
             Ok(job) => job,
-            Err(error) => return RpcResult::Failure(error),
+            Err(error) => return Err(RpcResult::Failure(error)),
         };
-        self.prepared(base, move |_| {
+        Ok(self.prepared_call(base, move |_| {
             let prepared = job()?;
             if reimport.is_some_and(|bundle| bundle != prepared.bundle) {
                 return Err(RpcFailure::InvalidAuthoringRequest {
@@ -1484,8 +1601,7 @@ impl Hub {
                 });
             }
             Ok(Some((prepared.commit, prepared.bundle)))
-        })
-        .expect("an import always publishes")
+        }))
     }
 
     pub fn operation(

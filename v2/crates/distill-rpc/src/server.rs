@@ -150,6 +150,20 @@ impl Drop for EmbeddedWriter {
     }
 }
 
+/// Work for the authority, to run on any thread ([`AuthorityCall::run`]).
+pub struct AuthorityCall<T> {
+    handle: Arc<ServerHandle>,
+    step: Box<dyn FnOnce(&Server) -> T + Send>,
+}
+
+impl<T: Send> AuthorityCall<T> {
+    /// Run the step on the authority, blocking until it has run.
+    pub fn run(self) -> Result<T, AuthorityStopped> {
+        let Self { handle, step } = self;
+        handle.on_authority(|| step(&Server::attach(&handle)))
+    }
+}
+
 /// An input the daemon's coordinated step joins: rolled back unless
 /// finished.
 struct OpenInput<'a> {
@@ -1149,14 +1163,16 @@ impl Server {
             .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
-    /// Run `step` on the authority with that thread's front end
-    /// ([`ServerHandle::on_authority`]).
-    pub(crate) fn authority<T: Send>(
+    /// `step` as a job another thread can wait on (the transport waits on
+    /// its blocking pool, never on its own thread).
+    pub(crate) fn authority_call<T: Send + 'static>(
         &self,
-        step: impl FnOnce(&Server) -> T + Send,
-    ) -> Result<T, AuthorityStopped> {
-        let handle = &self.inner.handle;
-        handle.on_authority(|| step(&Server::attach(handle)))
+        step: impl FnOnce(&Server) -> T + Send + 'static,
+    ) -> AuthorityCall<T> {
+        AuthorityCall {
+            handle: Arc::clone(&self.inner.handle),
+            step: Box::new(step),
+        }
     }
 
     /// Coordinated publications are the authority's own steps: the daemon
@@ -2195,6 +2211,7 @@ impl Server {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct MetadataBinding {
     pub(crate) id: u64,
     pub(crate) protocol_epoch: u32,

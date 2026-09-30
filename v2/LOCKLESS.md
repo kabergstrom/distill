@@ -507,10 +507,19 @@ should reach zero by the end of phase 6.
       panic after it. Retire and abort may join.
     - A rollback restores the `cas_segments` rows of segments created
       inside the input; their unindexed bytes are dead space.
-  - **Still open in phase 6:**
-    - RPC authoring calls still block the RPC thread.
-    - The driver's 40 ms tick for runtime poison and epoch reaping.
-    - The maintenance gate's 1 ms back-off.
+  - The driver is event-driven. Watcher events, pokes (an epoch poisoned or
+    drained) and completed jobs that published schedule its next pass;
+    there is no fixed tick.
+  - The build gate waits on the authority: the maintenance bit is set and
+    cleared inside the sweep's authority job, so `enter_build` just queues
+    behind it. There is no back-off sleep.
+  - RPC authoring calls (write, import publish, lineage repair, progress
+    completion) check their gates on the RPC thread. They then hand an
+    `AuthorityCall` to the transport, which waits on it with
+    `spawn_blocking`. The capnp driver never blocks on the authority.
+  - Phase 6 is done: no `Mutex`, `RwLock`, `Condvar` or polling sleep is
+    left in distill-store, distill-rpc or distill-daemon. The dev
+    supervisor's sleeps go away with it in phase 9.
 
 ## 7. Test baseline
 
