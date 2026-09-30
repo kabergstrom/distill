@@ -72,9 +72,7 @@ pub struct CtorTable {
     pub entries: &'static [CtorEntry],
 }
 
-/// A caught callback panic (§3's thunk rule): returned, never unwound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CallbackPanic;
+pub use distill_core::callback::CallbackPanic;
 
 /// `push`'s disposition: `Duplicate` is a *data* verdict (malformed
 /// artifact — a set/map element already present), `Panic` a *callback*
