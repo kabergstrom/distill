@@ -9,10 +9,7 @@ use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
 use distill_build::keys::target_definition_hash;
 use distill_build::query::AssetQuery;
 use distill_build::trace::PackDefinitionControlValue;
-use distill_bundle::{AssetEntry, Bundle, EntryLineageV1};
-use distill_core::bootstrap::{BootstrapControlSpecV1, BootstrapControlSymbol};
-use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
-use distill_core::lineage::{lineage_chain_digest, AcceptedSchemaEpoch, LineageStamp};
+use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_json::AuthoredValue;
@@ -23,7 +20,7 @@ use distill_loader::{
 use distill_pack::builder::{build_publish_and_activate_pack, PackBuildTarget};
 use distill_pack::{PackfileIO, RuntimeTarget as PackRuntimeTarget};
 use distill_rpc::{
-    AuthoringBackend, AuthoringValue, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
+    AuthoringValue, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
     TargetDefinitionHash,
 };
 use distill_schema::ngp_schema::{
@@ -137,10 +134,12 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         serde_json::to_vec(&schema).unwrap(),
     )
     .unwrap();
-    write_lineage_manifest(&assets, &authority);
-    write_schema_seed(&assets, &authority);
     let config = write_config(&temp, &module, authority.identity());
-    let process = DaemonProcess::start(config).unwrap();
+    let report = distill_daemon::bootstrap::init(&config).unwrap();
+    assert_eq!(report.written.len(), 2);
+    let rerun = distill_daemon::bootstrap::init(&config).unwrap();
+    assert!(rerun.written.is_empty(), "init rewrote identical bundles");
+    let process = DaemonProcess::start(config.clone()).unwrap();
     let pipeline_state = process
         .coordinator()
         .store()
@@ -152,7 +151,7 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         "fixture pipeline did not become ready: {pipeline_state:?}"
     );
 
-    let [texture, mesh, shader] = import_assets(&process, &assets);
+    let [texture, mesh, shader] = import_assets(&process, &config, &assets);
 
     let target = process.coordinator().build_target("dev").unwrap();
     let target_hash = target_definition_hash(&target);
@@ -461,35 +460,34 @@ fn resolved_hash(
     }
 }
 
-fn import_assets(process: &DaemonProcess, assets: &Path) -> [AssetUuid; 3] {
-    let coordinator = process.coordinator();
-    let base = coordinator.server().current_stamp().version;
-    let backend = Arc::clone(coordinator.authoring_service());
-    coordinator
-        .coordinated_commit(base, || {
-            let prepared = backend
-                .prepare_import(
-                    base,
-                    &ImportRequest {
-                        importer: "fixture-game-assets".into(),
-                        sources: vec![
-                            "pixel.ppm".into(),
-                            "triangle.obj".into(),
-                            "shaders/basic.comp".into(),
-                        ],
-                        dest: "game-assets.bundle".into(),
-                        settings: AuthoringValue {
-                            canonical_value: Arc::from(&b"{\"value\":0}"[..]),
-                            blobs: Vec::new(),
-                        },
-                        watch: true,
-                        root: "main".into(),
-                    },
-                )
-                .map_err(|error| format!("{error:?}"))?;
-            Ok(prepared.commit)
-        })
-        .unwrap();
+fn import_assets(
+    process: &DaemonProcess,
+    config: &DaemonConfig,
+    assets: &Path,
+) -> [AssetUuid; 3] {
+    // Through the RPC hub, as `distilld import` does.
+    distill_daemon::bootstrap::import(
+        config,
+        process.rpc_address(),
+        None,
+        &ImportRequest {
+            importer: "fixture-game-assets".into(),
+            sources: vec![
+                "pixel.ppm".into(),
+                "triangle.obj".into(),
+                "shaders/basic.comp".into(),
+            ],
+            dest: "game-assets.bundle".into(),
+            settings: AuthoringValue {
+                canonical_value: Arc::from(&b"{\"value\":0}"[..]),
+                blobs: Vec::new(),
+            },
+            watch: true,
+            root: "main".into(),
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
     let bundle =
         distill_bundle::parse_bundle(&std::fs::read(assets.join("game-assets.bundle")).unwrap())
             .unwrap();
@@ -844,142 +842,6 @@ fn host_layout_identity() -> LayoutIdentity {
         rustc: "rustc game-assets-e2e".into(),
         algorithm_version: 1,
     }
-}
-
-fn write_lineage_manifest(assets: &Path, authority: &ProjectSchemaAuthority) {
-    let row = BootstrapControlSpecV1::embedded()
-        .unwrap()
-        .0
-        .into_iter()
-        .find(|row| row.symbol == BootstrapControlSymbol::SchemaLineageManifest)
-        .unwrap();
-    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
-    let types = authority
-        .project_types()
-        .iter()
-        .map(|(type_uuid, project)| {
-            AuthoredValue::Array(vec![
-                bytes(&type_uuid.0),
-                AuthoredValue::Object(BTreeMap::from([
-                    (
-                        "authority".into(),
-                        AuthoredValue::Object(BTreeMap::from([(
-                            "Active".into(),
-                            AuthoredValue::Object(BTreeMap::new()),
-                        )])),
-                    ),
-                    ("current".into(), AuthoredValue::UInt(0)),
-                    (
-                        "epochs".into(),
-                        AuthoredValue::Array(vec![AuthoredValue::Object(BTreeMap::from([
-                            ("digest".into(), bytes(&project.logical_hash.0)),
-                            ("forward_parent".into(), AuthoredValue::Null),
-                        ]))]),
-                    ),
-                ])),
-            ])
-        })
-        .collect();
-    let bundle = Bundle {
-        format_version: 1,
-        uuid: BundleUuid([0xa1; 16]),
-        primary: None,
-        schemas: BTreeMap::from([(row.logical_hash, schema)]),
-        assets: BTreeMap::from([(
-            "manifest".into(),
-            AssetEntry {
-                uuid: AssetUuid([0xa2; 16]),
-                type_uuid: row.type_uuid,
-                schema_hash: row.logical_hash,
-                lineage: EntryLineageV1::Bootstrap {
-                    bundle_format_version: 1,
-                },
-                authoring_only: true,
-                data: AuthoredValue::Object(BTreeMap::from([(
-                    "types".into(),
-                    AuthoredValue::Array(types),
-                )])),
-            },
-        )]),
-    };
-    let path = assets.join("schema/schema-lineage.bundle");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, distill_bundle::write_bundle(&bundle).unwrap()).unwrap();
-}
-
-fn write_schema_seed(assets: &Path, authority: &ProjectSchemaAuthority) {
-    let mut schemas = BTreeMap::new();
-    let mut entries = BTreeMap::new();
-    for (index, (type_uuid, project)) in authority.project_types().iter().enumerate() {
-        schemas.insert(project.logical_hash, project.logical_schema.clone());
-        let epochs = vec![AcceptedSchemaEpoch {
-            digest: project.logical_hash,
-            forward_parent: None,
-        }];
-        entries.insert(
-            format!("schema-{index}"),
-            AssetEntry {
-                uuid: AssetUuid([0xb0 + index as u8; 16]),
-                type_uuid: *type_uuid,
-                schema_hash: project.logical_hash,
-                lineage: EntryLineageV1::Manifest(LineageStamp {
-                    chain: lineage_chain_digest(*type_uuid, &epochs, 0),
-                    epochs,
-                    cursor: 0,
-                }),
-                authoring_only: true,
-                data: schema_seed_value(*type_uuid),
-            },
-        );
-    }
-    let bundle = Bundle {
-        format_version: 1,
-        uuid: BundleUuid([0xaf; 16]),
-        primary: None,
-        schemas,
-        assets: entries,
-    };
-    std::fs::write(
-        assets.join("schema/project-schema-cache.bundle"),
-        distill_bundle::write_bundle(&bundle).unwrap(),
-    )
-    .unwrap();
-}
-
-fn schema_seed_value(type_uuid: TypeUuid) -> AuthoredValue {
-    let fields = if type_uuid == SETTINGS_TYPE {
-        BTreeMap::from([("value".into(), AuthoredValue::UInt(0))])
-    } else if [TEXTURE_SOURCE_TYPE, MESH_SOURCE_TYPE, SHADER_SOURCE_TYPE].contains(&type_uuid) {
-        BTreeMap::from([("value".into(), AuthoredValue::Str(String::new()))])
-    } else if type_uuid == TextureAsset::TYPE_UUID {
-        BTreeMap::from([
-            ("width".into(), AuthoredValue::UInt(0)),
-            ("height".into(), AuthoredValue::UInt(0)),
-            ("format".into(), AuthoredValue::UInt(0)),
-            ("data".into(), AuthoredValue::Array(Vec::new())),
-        ])
-    } else if type_uuid == MeshAsset::TYPE_UUID {
-        BTreeMap::from([
-            ("vertices".into(), AuthoredValue::Array(Vec::new())),
-            ("indices".into(), AuthoredValue::Array(Vec::new())),
-            ("vertex_channels".into(), AuthoredValue::UInt(0)),
-            ("index_stride".into(), AuthoredValue::UInt(0)),
-        ])
-    } else if type_uuid == CookedPipeline::TYPE_UUID {
-        BTreeMap::from([("cooked".into(), AuthoredValue::Blob(Vec::new()))])
-    } else {
-        panic!("missing schema seed for {type_uuid:?}")
-    };
-    AuthoredValue::Object(fields)
-}
-
-fn bytes(bytes: &[u8]) -> AuthoredValue {
-    AuthoredValue::Array(
-        bytes
-            .iter()
-            .map(|byte| AuthoredValue::UInt(u128::from(*byte)))
-            .collect(),
-    )
 }
 
 fn write_config(

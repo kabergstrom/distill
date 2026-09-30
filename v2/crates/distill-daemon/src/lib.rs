@@ -5,6 +5,7 @@
 
 pub mod authoring;
 mod authority;
+pub mod bootstrap;
 mod build;
 pub mod callbacks;
 pub mod codegen;
