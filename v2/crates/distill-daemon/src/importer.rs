@@ -1347,11 +1347,15 @@ impl AuthoringService {
                 commit: distill_rpc::Commit::default(),
             });
         }
-        if destination.meta.is_some() {
-            store
+        if let Some(meta) = &destination.meta {
+            if store
                 .clear_watched_import_failure(bundle)
                 .map_err(invalid)
-                .map_err(ImportExecutionError::unmemoized)?;
+                .map_err(ImportExecutionError::unmemoized)?
+            {
+                self.reindex_watched_bundle(&mut store, meta)
+                    .map_err(ImportExecutionError::unmemoized)?;
+            }
         }
         drop(store);
         let commit = self
@@ -1363,6 +1367,17 @@ impl AuthoringService {
             )
             .map_err(ImportExecutionError::unmemoized)?;
         Ok(PreparedImportCommit { bundle, commit })
+    }
+
+    /// Point `meta`'s import-index row at the basis now in effect: its failure
+    /// memo's attempt basis, or its import record's read set. Incremental
+    /// reconciliation revalidates only the indexed basis; left at the last
+    /// success's, a revert to that source revalidates and the failure never
+    /// clears.
+    fn reindex_watched_bundle(&self, store: &mut Store, meta: &BundleMeta) -> Result<(), RpcFailure> {
+        let row = self.index_import_bundle(store, meta)?;
+        let source = [(row.root_name.clone(), row.path.clone())];
+        store.replace_import_index(Some(&source), &[row]).map_err(invalid)
     }
 
     fn record_failed_attempt(
@@ -1386,11 +1401,10 @@ impl AuthoringService {
         }
         // The memo records the attempt whatever version it ran at; the
         // revalidation above only decides whether it is still wanted.
-        self.store
-            .write()
-            .write_transaction(|store| {
-                let memo_seq = store.memo_seq();
-                store.record_watched_import_failure(&WatchedImportFailure {
+        self.store.write().write_transaction_with(invalid, |store| {
+            let memo_seq = store.memo_seq();
+            store
+                .record_watched_import_failure(&WatchedImportFailure {
                     bundle: destination.bundle,
                     attempted_input_version: base,
                     basis,
@@ -1398,8 +1412,9 @@ impl AuthoringService {
                     message: message.to_owned(),
                     memo_seq,
                 })
-            })
-            .map_err(invalid)?;
+                .map_err(invalid)?;
+            self.reindex_watched_bundle(store, destination)
+        })?;
         Ok(true)
     }
 

@@ -639,3 +639,76 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(8));
 }
+
+/// Reverting a broken source to its last good content retries the import on
+/// the incremental (watcher) path and clears the failure, though the last
+/// success's read set revalidates again.
+#[test]
+fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
+    std::fs::write(assets.join("source.txt"), b"7").unwrap();
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    coordinator.reconcile_full_scan().unwrap();
+    publish_schema_registry(&coordinator, schema_hash);
+    coordinator
+        .authoring_service()
+        .register_importer(Arc::new(ByteImporter { schema }))
+        .unwrap();
+    let backend = Arc::clone(coordinator.authoring_service());
+    let base = coordinator.server().current_stamp().version;
+    coordinator
+        .coordinated_commit(base, || {
+            let prepared = backend
+                .prepare_import(
+                    base,
+                    &ImportRequest {
+                        importer: "byte-importer".into(),
+                        sources: vec!["source.txt".into()],
+                        dest: "imported.bundle".into(),
+                        settings: AuthoringValue {
+                            canonical_value: Arc::from(&b"3"[..]),
+                            blobs: Vec::new(),
+                        },
+                        watch: true,
+                        root: "main".into(),
+                    },
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            Ok(prepared.commit)
+        })
+        .unwrap();
+    // Build the import index as the startup pass does.
+    coordinator.reconcile_watched_imports().unwrap();
+
+    let edit = |content: &[u8]| {
+        std::fs::write(assets.join("source.txt"), content).unwrap();
+        coordinator
+            .reconcile_incremental(&WatcherBatch {
+                paths: vec![assets.join("source.txt")],
+                renames: Vec::new(),
+            })
+            .unwrap();
+        let work = coordinator.pending_file_work().unwrap();
+        coordinator
+            .reconcile_watched_imports_affected(&work, false)
+            .unwrap();
+        coordinator.acknowledge_file_work(&work).unwrap();
+    };
+    edit(b"broken");
+    assert_eq!(import_failures(&coordinator).len(), 1);
+    edit(b"7");
+    assert!(
+        import_failures(&coordinator).is_empty(),
+        "the revert reran the import and cleared its failure"
+    );
+}
