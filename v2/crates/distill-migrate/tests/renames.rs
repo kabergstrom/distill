@@ -114,3 +114,45 @@ fn a_rename_that_also_changes_shape_or_rev_is_refused() {
     let refusal = plan_automatic_renamed(&old, &new, &renames(&[("$.health", "hp")])).unwrap_err();
     assert!(refusal.reasons[0].1.contains("semantic revision"));
 }
+
+/// Sparse values (GAP 19 prefab entries): only present fields migrate;
+/// renames follow their key, drops vanish, additions stay absent.
+#[test]
+fn sparse_values_migrate_only_their_present_fields() {
+    let mode_old = enm(0, &[("A", 0, unit_payload()), ("B", 0, unit_payload())]);
+    let mode_new = enm(0, &[("A", 0, unit_payload()), ("B", 0, unit_payload()), ("C", 0, unit_payload())]);
+    let old = strct(
+        0,
+        &[
+            ("a", 0, p(PK::U32)),
+            ("hp", 0, p(PK::U16)),
+            ("inner", 0, strct(0, &[("gone", 0, p(PK::U32)), ("keep", 0, p(PK::U16)), ("same", 0, p(PK::U8))])),
+            ("mode", 0, mode_old),
+            ("name", 0, SchemaNode::String),
+        ],
+    );
+    let new = strct(
+        0,
+        &[
+            ("a", 0, p(PK::U32)),
+            ("added", 0, opt(p(PK::F32))),
+            ("health", 0, p(PK::U32)),
+            ("inner", 0, strct(0, &[("keep", 0, p(PK::U32)), ("new", 0, p(PK::U8)), ("same", 0, p(PK::U8))])),
+            ("mode", 0, mode_new),
+            ("name", 0, SchemaNode::String),
+        ],
+    );
+    let ops = plan_automatic_renamed(&old, &new, &renames(&[("$.health", "hp")])).unwrap();
+    let input = obj(&[
+        ("hp", ui(7)),
+        ("inner", obj(&[("gone", ui(1)), ("keep", ui(3))])),
+        ("mode", st("B")),
+    ]);
+    let out = distill_migrate::execute_sparse(&ops, &input, &old, &new).unwrap();
+    assert_eq!(
+        out,
+        obj(&[("health", ui(7)), ("inner", obj(&[("keep", ui(3))])), ("mode", st("B"))])
+    );
+    let empty = distill_migrate::execute_sparse(&ops, &obj(&[]), &old, &new).unwrap();
+    assert_eq!(empty, obj(&[]));
+}

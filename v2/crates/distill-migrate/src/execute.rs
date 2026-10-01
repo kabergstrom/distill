@@ -178,8 +178,34 @@ pub fn execute_ops(
     defaults: &dyn DefaultProvider,
 ) -> Result<Exec, MigrationError> {
     let mut defaulted = Vec::new();
-    let value = exec_frame(ops, input, from, to, defaults, &[], &mut defaulted)?;
+    let value = exec_frame(ops, input, from, to, defaults, &[], &mut defaulted, false)?;
     Ok(Exec { value, defaulted })
+}
+
+/// Execute an automatic plan over a SPARSE input: an object holding only
+/// some of `from`'s struct fields, at any depth (absent = the consumer's
+/// default). Ops reading an absent path are skipped, default writes
+/// (`WriteFieldDefault`, `WriteParentDefault`, `WriteNone`) are not
+/// materialized, and the output holds exactly the fields the remaining
+/// ops wrote, so a renamed field follows its key and a dropped one
+/// disappears. A unit variant may be spelled as its bare name. The output
+/// is sparse too and is not checked for conformance.
+pub fn execute_sparse(
+    ops: &[MigrationOp],
+    input: &AuthoredValue,
+    from: &SchemaNode,
+    to: &SchemaNode,
+) -> Result<AuthoredValue, MigrationError> {
+    struct NoDefaults;
+    impl DefaultProvider for NoDefaults {
+        fn field_default(&self, _: &SchemaNode, _: &FieldPath) -> Option<AuthoredValue> {
+            None
+        }
+        fn parent_default(&self, _: &SchemaNode, _: &FieldPath) -> Option<AuthoredValue> {
+            None
+        }
+    }
+    exec_frame(ops, input, from, to, &NoDefaults, &[], &mut Vec::new(), true)
 }
 
 /// Execute one custom edge: Ops plans are validated (EdgeKind::Custom —
@@ -306,6 +332,7 @@ fn insert_write(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_frame(
     ops: &[MigrationOp],
     input: &AuthoredValue,
@@ -314,13 +341,28 @@ fn exec_frame(
     defaults: &dyn DefaultProvider,
     prefix: &[String],
     defaulted: &mut Vec<FieldPath>,
+    sparse: bool,
 ) -> Result<AuthoredValue, MigrationError> {
     let mut writes = Writes::new();
     // MapVariant ops sharing one `at` are one composite writer.
     let mut mv_groups: Vec<(&FieldPath, Vec<&MigrationOp>)> = Vec::new();
+    // Sparse input: an op reading an absent path is skipped, and default
+    // writes are left to the consumer (absent = default).
+    let absent = |p: &FieldPath| sparse && !has_input(input, p);
 
     for op in ops {
         match op {
+            MigrationOp::CopyField { from: f, .. } | MigrationOp::Widen { from: f, .. }
+                if absent(f) => {}
+            MigrationOp::WriteFieldDefault { .. }
+            | MigrationOp::WriteParentDefault { .. }
+            | MigrationOp::WriteNone { .. }
+                if sparse => {}
+            MigrationOp::MapVariant { at, .. }
+            | MigrationOp::MigrateElements { at, .. }
+            | MigrationOp::MigrateMapKeys { at, .. }
+            | MigrationOp::MigrateInline { at, .. }
+                if absent(at) => {}
             MigrationOp::CopyField { from: f, to: t } => {
                 let v = read_input(input, f, prefix)?.clone();
                 insert_write(&mut writes, t, v, prefix)?;
@@ -367,11 +409,11 @@ fn exec_frame(
                 }
             }
             MigrationOp::MigrateElements { at, element } => {
-                let out = exec_elements(element, input, from, to, at, defaults, prefix, defaulted)?;
+                let out = exec_elements(element, input, from, to, at, defaults, prefix, defaulted, sparse)?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
             MigrationOp::MigrateMapKeys { at, key } => {
-                let out = exec_map_keys(key, input, from, to, at, defaults, prefix, defaulted)?;
+                let out = exec_map_keys(key, input, from, to, at, defaults, prefix, defaulted, sparse)?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
             MigrationOp::MigrateInline { at, ops: inner } => {
@@ -387,6 +429,7 @@ fn exec_frame(
                     defaults,
                     &sub_prefix,
                     defaulted,
+                    sparse,
                 )?;
                 insert_write(&mut writes, at, out, prefix)?;
             }
@@ -394,11 +437,18 @@ fn exec_frame(
     }
 
     for (at, group) in mv_groups {
-        let out = exec_map_variants(&group, input, from, to, at, defaults, prefix, defaulted)?;
+        let out = exec_map_variants(&group, input, from, to, at, defaults, prefix, defaulted, sparse)?;
         insert_write(&mut writes, at, out, prefix)?;
     }
 
-    let result = materialize(to, Vec::new(), &mut writes, prefix)?;
+    let result = if sparse {
+        let root = materialize_sparse(to, Vec::new(), &mut writes, true);
+        root.ok_or_else(|| MigrationError::MissingWrite {
+            path: dpath(prefix, &FieldPath::root()),
+        })?
+    } else {
+        materialize(to, Vec::new(), &mut writes, prefix)?
+    };
     if let Some((path, _)) = writes.pop_first() {
         // A write that did not land in the output shape: the plan was not
         // validated (a write below another write, or off-schema).
@@ -408,6 +458,43 @@ fn exec_frame(
         });
     }
     Ok(result)
+}
+
+/// [`materialize`] for sparse output: a struct holds the fields written
+/// beneath it and is omitted when none were (the frame root excepted);
+/// an unwritten leaf is absent.
+fn materialize_sparse(to: &SchemaNode, path: Vec<String>, writes: &mut Writes, root: bool) -> Option<AuthoredValue> {
+    if let Some(v) = writes.remove(&path) {
+        return Some(v);
+    }
+    let SchemaNode::Struct { fields, .. } = to else {
+        return None;
+    };
+    let mut m = std::collections::BTreeMap::new();
+    for (name, _, fnode) in fields {
+        let mut p = path.clone();
+        p.push(name.clone());
+        if let Some(v) = materialize_sparse(fnode, p, writes, false) {
+            m.insert(name.clone(), v);
+        }
+    }
+    (root || !m.is_empty()).then_some(AuthoredValue::Object(m))
+}
+
+/// Whether every segment of `path` is present in `input`. A non-object
+/// on the way counts as present, so the read reports its shape error.
+fn has_input(input: &AuthoredValue, path: &FieldPath) -> bool {
+    let mut v = input;
+    for seg in &path.0 {
+        match v {
+            AuthoredValue::Object(m) => match m.get(seg) {
+                Some(next) => v = next,
+                None => return false,
+            },
+            _ => return true,
+        }
+    }
+    true
 }
 
 fn child_prefix(prefix: &[String], at: &FieldPath, pseudo: Option<String>) -> Vec<String> {
@@ -523,6 +610,7 @@ fn exec_elements(
     defaults: &dyn DefaultProvider,
     prefix: &[String],
     defaulted: &mut Vec<FieldPath>,
+    sparse: bool,
 ) -> Result<AuthoredValue, MigrationError> {
     let fnode = resolve_or_shape(from, at, prefix, "from")?;
     let tnode = resolve_or_shape(to, at, prefix, "to")?;
@@ -540,7 +628,7 @@ fn exec_elements(
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
                 let sub = child_prefix(prefix, at, Some(format!("[{i}]")));
-                out.push(exec_frame(element, item, a, b, defaults, &sub, defaulted)?);
+                out.push(exec_frame(element, item, a, b, defaults, &sub, defaulted, sparse)?);
             }
             Ok(AuthoredValue::Array(out))
         }
@@ -554,7 +642,7 @@ fn exec_elements(
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
                 let sub = child_prefix(prefix, at, Some(format!("[{i}]")));
-                let migrated = exec_frame(element, item, a, b, defaults, &sub, defaulted)?;
+                let migrated = exec_frame(element, item, a, b, defaults, &sub, defaulted, sparse)?;
                 let enc =
                     distill_json::write(&migrated).map_err(|_| MigrationError::Unencodable {
                         path: at_disp.clone(),
@@ -577,7 +665,7 @@ fn exec_elements(
             AuthoredValue::Null => Ok(AuthoredValue::Null),
             inner => {
                 let sub = child_prefix(prefix, at, None);
-                exec_frame(element, inner, a, b, defaults, &sub, defaulted)
+                exec_frame(element, inner, a, b, defaults, &sub, defaulted, sparse)
             }
         },
         (SchemaNode::Map { key: k1, value: v1 }, SchemaNode::Map { value: v2, .. }) => {
@@ -595,7 +683,7 @@ fn exec_elements(
                     let sub = child_prefix(prefix, at, Some(format!("[{k}]")));
                     out.insert(
                         k.clone(),
-                        exec_frame(element, val, v1, v2, defaults, &sub, defaulted)?,
+                        exec_frame(element, val, v1, v2, defaults, &sub, defaulted, sparse)?,
                     );
                 }
                 Ok(AuthoredValue::Object(out))
@@ -621,7 +709,7 @@ fn exec_elements(
                         });
                     }
                     let sub = child_prefix(prefix, at, Some(format!("[{i}]")));
-                    let nv = exec_frame(element, &kv[1], v1, v2, defaults, &sub, defaulted)?;
+                    let nv = exec_frame(element, &kv[1], v1, v2, defaults, &sub, defaulted, sparse)?;
                     out.push(AuthoredValue::Array(vec![kv[0].clone(), nv]));
                 }
                 Ok(AuthoredValue::Array(out))
@@ -644,6 +732,7 @@ fn exec_map_keys(
     defaults: &dyn DefaultProvider,
     prefix: &[String],
     defaulted: &mut Vec<FieldPath>,
+    sparse: bool,
 ) -> Result<AuthoredValue, MigrationError> {
     let fnode = resolve_or_shape(from, at, prefix, "from")?;
     let tnode = resolve_or_shape(to, at, prefix, "to")?;
@@ -696,7 +785,7 @@ fn exec_map_keys(
     let mut migrated: Vec<(AuthoredValue, AuthoredValue)> = Vec::new();
     for (i, (k, val)) in entries.into_iter().enumerate() {
         let sub = child_prefix(prefix, at, Some(format!("[{i}]")));
-        let nk = exec_frame(key_ops, &k, k1, k2, defaults, &sub, defaulted)?;
+        let nk = exec_frame(key_ops, &k, k1, k2, defaults, &sub, defaulted, sparse)?;
         migrated.push((nk, val));
     }
 
@@ -746,6 +835,7 @@ fn exec_map_variants(
     defaults: &dyn DefaultProvider,
     prefix: &[String],
     defaulted: &mut Vec<FieldPath>,
+    sparse: bool,
 ) -> Result<AuthoredValue, MigrationError> {
     let fnode = resolve_or_shape(from, at, prefix, "from")?;
     let tnode = resolve_or_shape(to, at, prefix, "to")?;
@@ -776,6 +866,14 @@ fn exec_map_variants(
     }
 
     let v = read_input(input, at, prefix)?;
+    // Sparse values may spell a unit variant as its bare name.
+    if let (true, AuthoredValue::Str(vname)) = (sparse, v) {
+        let renamed = group.iter().find_map(|op| match op {
+            MigrationOp::MapVariant { from: f, to: t, .. } if f == vname => Some(t),
+            _ => None,
+        });
+        return Ok(AuthoredValue::Str(renamed.unwrap_or(vname).clone()));
+    }
     let AuthoredValue::Object(m) = v else {
         return Err(MigrationError::InputShape {
             path: at_disp,
@@ -821,7 +919,7 @@ fn exec_map_variants(
                     detail: format!("variant {tname:?} not in the to-schema enum"),
                 })?;
             let sub = child_prefix(prefix, at, Some(format!("{{{vname}}}")));
-            let out = exec_frame(pops, payload, fpayload, tpayload, defaults, &sub, defaulted)?;
+            let out = exec_frame(pops, payload, fpayload, tpayload, defaults, &sub, defaulted, sparse)?;
             let mut result = std::collections::BTreeMap::new();
             result.insert(tname.clone(), out);
             Ok(AuthoredValue::Object(result))
