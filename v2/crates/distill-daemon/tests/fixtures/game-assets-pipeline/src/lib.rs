@@ -172,8 +172,8 @@ fn cook_mesh(value: &str) -> Result<AuthoredValue, ProcessorError> {
 }
 
 fn cook_shader(value: &str) -> Result<AuthoredValue, ProcessorError> {
-    let cooked = rafx_shader_processor::compile_vulkan_pipeline(
-        &[rafx_shader_processor::VulkanShaderStageSource {
+    let cooked = rafx_shader_processor::compile_pipeline(
+        &[rafx_shader_processor::ShaderStageSource {
             virtual_path: "assets/basic.comp",
             source: value,
         }],
