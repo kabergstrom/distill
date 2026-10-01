@@ -537,6 +537,11 @@ impl Registry {
     /// consult this table): registers the #[asset]-generated
     /// DefaultTable<T>. An op needing an entry the table lacks fails
     /// hard (§11); defaults are never fabricated.
+    /// Implemented as `RegistrationArena::register_asset_defaults::<T>()`
+    /// (`distill-pipeline-api/src/asset_defaults.rs`): a `PipelineDefaults`
+    /// over T's table. Field defaults come from the entry at the container
+    /// node's `Field` (or `Variant`+`Field`) path, parent defaults from the
+    /// container type's own writer.
     pub fn defaults<T: AssetType>(&mut self, table: &'static DefaultTable<T>)
         -> RegistrationStatus;
     /// Tool registry behind ctx.run_tool (§9). Registration is an input
@@ -563,6 +568,10 @@ pub struct DefaultTable<T: AssetType> {
     /// the node type implements Default — detected by the generated
     /// compile-time autoref-specialization probe, never guessed.
     pub nodes: &'static [(SchemaNodeId, &'static [PathStep], DefaultWriter)],
+    /// One row per assigned SchemaNodeId: the node type's canonical logical
+    /// bytes and its own writer. The migration provider matches a frame's
+    /// to-schema container node against these bytes to find its id.
+    pub types: &'static [DefaultNodeType],
     pub _marker: PhantomData<fn() -> T>,
 }
 

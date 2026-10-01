@@ -232,6 +232,19 @@ impl<'a> RegistrationArena<'a> {
         self.host.install_callback(registration, callback)
     }
 
+    /// Register `T`'s generated `DefaultTable` as its migration defaults, so
+    /// an automatic migration adding a field fills it from `Default`.
+    pub fn register_asset_defaults<T: distill_asset::AssetDefaults>(
+        &mut self,
+    ) -> RegistrationStatus {
+        self.register_defaults(
+            DefaultsDescriptor {
+                type_uuid: T::TYPE_UUID,
+            },
+            crate::asset_defaults::AssetTableDefaults::<T>::new(),
+        )
+    }
+
     pub fn register_tool(&mut self, descriptor: ToolDescriptor) -> RegistrationStatus {
         let registration = Registration {
             kind: RegistrationKind::Tool,

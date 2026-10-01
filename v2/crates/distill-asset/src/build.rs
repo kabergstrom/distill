@@ -164,13 +164,18 @@ impl LogicalBuilder {
     }
 }
 
-pub fn logical_hash<T: AssetReflect>() -> LogicalHash {
+/// Canonical logical schema node bytes of `T`: the body `logical_hash` hashes.
+pub fn logical_bytes<T: AssetReflect>() -> Vec<u8> {
     let mut builder = LogicalBuilder::default();
     T::logical(&mut builder);
+    builder.bytes
+}
+
+pub fn logical_hash<T: AssetReflect>() -> LogicalHash {
     let mut hash = blake3::Hasher::new();
     hash.update(b"DSLH");
     hash.update(&[1]);
-    hash.update(&builder.bytes);
+    hash.update(&logical_bytes::<T>());
     LogicalHash(*hash.finalize().as_bytes())
 }
 

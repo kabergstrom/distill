@@ -11,6 +11,7 @@
 // module and `distilld` in the daemon; a library linking this crate (the
 // engine's loader, through distill-build) keeps its own choice.
 
+pub mod asset_defaults;
 pub mod callbacks;
 pub mod codegen;
 pub mod failure;

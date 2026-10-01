@@ -52,7 +52,7 @@ pub unsafe trait AssetReflect: 'static {
     }
 }
 
-fn collect_child_defaults<P: 'static, T: AssetReflect>(
+fn collect_child_defaults<P: AssetReflect, T: AssetReflect>(
     collector: &mut DefaultCollector,
     path: Vec<PathStep>,
 ) {
@@ -65,7 +65,7 @@ fn collect_child_defaults<P: 'static, T: AssetReflect>(
     T::collect_default_nodes(collector);
 }
 
-fn collect_map_defaults<P: 'static, K: AssetReflect, V: AssetReflect>(
+fn collect_map_defaults<P: AssetReflect, K: AssetReflect, V: AssetReflect>(
     collector: &mut DefaultCollector,
 ) {
     let Some(node) = collector.begin::<P>() else {

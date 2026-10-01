@@ -495,7 +495,7 @@ fn common_impls(
                     <#ident as ::distill_asset::AssetReflect>::collect_default_nodes(&mut collector);
                     ::distill_asset::defaults::make_table::<#ident>(
                         <#ident as ::distill_asset::AssetReflect>::default_writer(),
-                        collector.finish(),
+                        collector,
                     )
                 })
             }
