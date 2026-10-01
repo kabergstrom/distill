@@ -1139,8 +1139,22 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     let temp = tempfile::tempdir().unwrap();
     let process = start_gate_daemon(&temp, &variants.v2);
     assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
+    // Let the watcher publish the import's own bundle write first.
+    std::thread::sleep(Duration::from_millis(300));
     let generation = pipeline_generation(&process);
+    let before = process.coordinator().server().current_stamp().version;
 
+    // The order a rebuild job produces. cargo removes the dylib and links
+    // the new one; a pass in between sees no module and keeps serving.
+    std::fs::remove_file(temp.path().join("pipeline.so")).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pipeline_generation(&process), generation);
+    assert_eq!(process.coordinator().server().current_stamp().version, before);
+    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v2)));
+    assert_eq!(process.last_background_error(), None);
+
+    // The new dylib is adopted against the schema source-walk has not
+    // refreshed yet.
     install_gate_pipeline(&temp, &variants.v3);
     wait_long(
         || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3)),
@@ -1155,8 +1169,9 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     assert_eq!(pipeline_generation(&process), generation + 1);
     let before = process.coordinator().server().current_stamp().version;
 
-    // Source-walk catches up: only the pipeline crate's source hash changes,
-    // to the adopted module's. Exactly one epoch change for the edit.
+    // Then source-walk's fast path refreshes only the pipeline crate's
+    // source hash, to the adopted module's. Exactly one epoch change for
+    // the edit.
     write_gate_schema(&temp, &variants.v3);
     std::thread::sleep(Duration::from_millis(1000));
     assert_eq!(pipeline_generation(&process), generation + 1);
@@ -1176,5 +1191,39 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
         "the next importer version did not reimport the watched import",
     );
     assert_eq!(pipeline_generation(&process), generation + 2);
+    assert_eq!(process.last_background_error(), None);
+}
+
+#[test]
+fn a_schema_refresh_observed_before_its_dylib_gives_one_epoch_change() {
+    let variants = gate_variants();
+    let temp = tempfile::tempdir().unwrap();
+    let process = start_gate_daemon(&temp, &variants.v2);
+    assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
+    std::thread::sleep(Duration::from_millis(300));
+    let generation = pipeline_generation(&process);
+    let before = process.coordinator().server().current_stamp().version;
+
+    // The schema already names v3's source while v2 still serves: v2 would
+    // load against it as it is, so nothing is published.
+    write_gate_schema(&temp, &variants.v3);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pipeline_generation(&process), generation);
+    assert_eq!(process.coordinator().server().current_stamp().version, before);
+    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v2)));
+    assert_eq!(process.last_background_error(), None);
+
+    // The dylib follows and matches the schema: one epoch change.
+    install_gate_pipeline(&temp, &variants.v3);
+    wait_long(
+        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3)),
+        "the dylib matching the refreshed schema was not adopted",
+    );
+    wait_long(
+        || imported_value(&temp).as_deref() == Some("v3:note"),
+        "the new importer version did not reimport the watched import",
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pipeline_generation(&process), generation + 1);
     assert_eq!(process.last_background_error(), None);
 }

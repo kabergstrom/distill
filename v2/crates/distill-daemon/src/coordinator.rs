@@ -320,26 +320,46 @@ impl DaemonCoordinator {
         locked(&self.schema_authority).clone()
     }
 
-    /// Whether publishing `candidate` with the current configuration and
-    /// pipeline module would install what already serves: the Ready epoch's
+    /// Whether a Ready pipeline epoch serves.
+    pub(crate) fn has_ready_pipeline(&self) -> bool {
+        lock_pipeline(&self.pipeline).host.published_ready_epoch().is_some()
+    }
+
+    /// Whether publishing `candidate` with the current configuration and the
+    /// pipeline module whose bytes hash to `dylib_hash` would install what
+    /// already serves: the Ready epoch was staged from those bytes, and its
     /// version key (`ngp_module_host::ModuleReloadIdentity::version_key`,
     /// which uses the module's own source hash, plus the rest of the schema)
     /// is the same against `candidate` as against the installed schema.
     ///
     /// This is source-walk catching up after an `AheadOfWalk` adoption: it
-    /// rewrites only the pipeline crate's source hash. Such a schema is not
-    /// republished, so the epoch, the RPC generation, and the imports stay.
-    pub(crate) fn ready_pipeline_serves_schema(&self, candidate: &ProjectSchemaAuthority) -> bool {
+    /// rewrites only the pipeline crate's source hash. It is also a pipeline
+    /// event for bytes the epoch already serves: the pass that adopted them
+    /// may have observed the file mid-replacement (cargo removes and
+    /// re-links it) and staged it a moment later. Neither is republished, so
+    /// the epoch, the RPC generation, and the imports stay.
+    pub(crate) fn ready_pipeline_serves(
+        &self,
+        candidate: &ProjectSchemaAuthority,
+        dylib_hash: [u8; 32],
+    ) -> bool {
         let Some(installed) = self.schema_authority() else {
+            tracing::debug!("no installed schema to compare with");
             return false;
         };
         let Some(epoch) = lock_pipeline(&self.pipeline).host.published_ready_epoch() else {
+            tracing::debug!("no Ready pipeline epoch");
             return false;
         };
         if epoch.runtime_failure().is_some() {
             return false;
         }
+        if epoch.dylib_hash() != dylib_hash {
+            tracing::debug!("the watched pipeline is not the Ready epoch's");
+            return false;
+        }
         let Some(identity) = epoch.reload_identity() else {
+            tracing::debug!("Ready pipeline epoch has no reload identity");
             return false;
         };
         let key = |authority: &ProjectSchemaAuthority| {
@@ -353,7 +373,16 @@ impl DaemonCoordinator {
                 format!("{rest:?}"),
             )
         };
-        key(&installed) == key(candidate)
+        let (installed, candidate) = (key(&installed), key(candidate));
+        if installed != candidate {
+            tracing::debug!(
+                installed_key = %installed.0,
+                candidate_key = %candidate.0,
+                rest_equal = installed.1 == candidate.1,
+                "schema changes what the Ready pipeline epoch would install"
+            );
+        }
+        installed == candidate
     }
 
     pub fn build_target(&self, name: &str) -> Option<Target> {

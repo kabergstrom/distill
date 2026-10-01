@@ -727,21 +727,47 @@ impl ConfigWatch {
         if !config_changed && !schema_changed && !pipeline_changed && !self.rejected {
             return Ok(false);
         }
-        // A schema write that leaves the Ready pipeline epoch's version key
-        // unchanged (source-walk catching up after an ahead-of-walk
-        // adoption) is observed without republishing: no second epoch, no
-        // loader reconnects, no reimport.
-        if schema_changed && !config_changed && !pipeline_changed && !self.rejected {
-            if let Ok(authority) = &schema.outcome {
-                if coordinator.ready_pipeline_serves_schema(authority) {
-                    tracing::info!(
-                        "schema caught up with the Ready pipeline epoch; nothing to republish"
-                    );
+        tracing::debug!(
+            config_changed,
+            schema_changed,
+            pipeline_changed,
+            rejected = self.rejected,
+            ?invalidation,
+            ?pipeline_state,
+            "configuration inputs observed"
+        );
+        // Schema or pipeline writes that leave the Ready pipeline epoch as it
+        // is (the same module bytes, and a schema with the same version key:
+        // source-walk catching up after an ahead-of-walk adoption, in either
+        // order with the dylib event) are observed without republishing: no
+        // second epoch, no loader reconnects, no reimport.
+        if !config_changed && !self.rejected {
+            if let (Ok(authority), ArtifactSourceState::Bytes(dylib_hash)) =
+                (&schema.outcome, &pipeline_state)
+            {
+                if coordinator.ready_pipeline_serves(authority, *dylib_hash) {
+                    tracing::info!("the Ready pipeline epoch already serves these inputs");
                     self.observed_schema = Some(schema.state.clone());
+                    self.observed_pipeline = Some(pipeline_state.clone());
                     self.cached_schema = Some(schema);
+                    self.cached_pipeline = Some(pipeline_state);
                     return Ok(false);
                 }
             }
+        }
+        // cargo replaces the dylib by removing it and linking the new one;
+        // a pass between the two sees no module. With a Ready epoch to keep
+        // serving, that is not a failure: the observed state stays, so the
+        // module's reappearance (or any other write) retries the candidate.
+        if !config_changed
+            && !self.rejected
+            && pipeline_state == ArtifactSourceState::Missing
+            && coordinator.has_ready_pipeline()
+        {
+            tracing::info!("pipeline module is missing; the Ready epoch serves until it reappears");
+            self.cached_schema = Some(schema);
+            self.cached_pipeline = Some(pipeline_state);
+            return Ok(false);
         }
 
         let input_changed = self.observed.is_none()
