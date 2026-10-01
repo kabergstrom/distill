@@ -443,7 +443,27 @@ impl RemoteSnapshot {
         let mut request = self.client.resolve_path_request();
         request.get().set_path(path);
         let response = request.send().promise.await?;
-        let result = response.get()?.get_result()?;
+        self.path_call(response.get()?.get_result()?)
+    }
+
+    /// The runtime asset whose local id is `name` among those imported at
+    /// `path` (protocol 12).
+    pub async fn resolve_named(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Result<RemoteCall<TerminalEvent<PathResolveResult>>, capnp::Error> {
+        let mut request = self.client.resolve_named_request();
+        request.get().set_path(path);
+        request.get().set_name(name);
+        let response = request.send().promise.await?;
+        self.path_call(response.get()?.get_result()?)
+    }
+
+    fn path_call(
+        &self,
+        result: schema::path_resolve_call::Reader<'_>,
+    ) -> Result<RemoteCall<TerminalEvent<PathResolveResult>>, capnp::Error> {
         match result.which()? {
             schema::path_resolve_call::Which::Success(value) => {
                 let value = value?;

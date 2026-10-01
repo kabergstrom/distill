@@ -1029,6 +1029,38 @@ impl schema::snapshot::Server for SnapshotService {
             Ok(())
         }
     }
+
+    fn resolve_named(
+        self: capnp::capability::Rc<Self>,
+        params: schema::snapshot::ResolveNamedParams,
+        mut results: schema::snapshot::ResolveNamedResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            if let Some(reason) = self.snapshot.generation_reconnect() {
+                write_reconnect(
+                    results.get().init_result().init_reconnect_required(),
+                    reason,
+                );
+                return Ok(());
+            }
+            let params = params.get()?;
+            let (path, name) = (params.get_path()?, params.get_name()?);
+            let decoded = decode_text(path, "path")
+                .and_then(|path| Ok((path, decode_text(name, "name")?)));
+            let (path, name) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_path_result(
+                results.get().init_result(),
+                self.snapshot.resolve_named(&path, &name),
+            );
+            Ok(())
+        }
+    }
 }
 
 struct AuthoringSnapshotService {

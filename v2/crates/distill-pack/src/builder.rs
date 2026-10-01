@@ -671,7 +671,19 @@ async fn build_paths(
         let path = entry.normalized_path;
         match terminal(snapshot, remote(snapshot.resolve_path(&path).await)?)? {
             PathResolveResult::Resolved(primary) if primary == asset => paths.push(PathRow {
+                path: path.clone(),
+                name: None,
+                asset_uuid: asset,
+            }),
+            PathResolveResult::Resolved(_) | PathResolveResult::Missing => {}
+            result => return Err(PackBuildError::Path { path, result }),
+        }
+        // Every packed runtime entry is reachable by its name too.
+        let name = entry.local_id;
+        match terminal(snapshot, remote(snapshot.resolve_named(&path, &name).await)?)? {
+            PathResolveResult::Resolved(named) if named == asset => paths.push(PathRow {
                 path,
+                name: Some(name),
                 asset_uuid: asset,
             }),
             PathResolveResult::Resolved(_) | PathResolveResult::Missing => {}

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{
-    IoBasis, IoEvent, LoaderIO, ManifestHash, ReqId, ResolveResult, RpcIo, RpcIoConfig,
+    AssetPath, IoBasis, IoEvent, LoaderIO, ManifestHash, ReqId, ResolveResult, RpcIo, RpcIoConfig,
     RuntimeTarget,
 };
 use distill_rpc::capnp_transport::StagedListener;
@@ -187,7 +187,7 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
 
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);
-    io.resolve_path(ReqId(3), "assets/a.bundle", &basis);
+    io.resolve_path(ReqId(3), &AssetPath::from("assets/a.bundle"), &basis);
     let events = poll_until(&mut io, 3);
     assert!(events.iter().any(|event| matches!(
         event,

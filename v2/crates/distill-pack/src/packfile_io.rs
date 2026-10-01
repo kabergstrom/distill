@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash};
 use distill_loader::{
-    FetchedArtifact, IoBasis, IoEvent, LoaderIO, ManifestHash, PathResolveResult, ReqId,
+    AssetPath, FetchedArtifact, IoBasis, IoEvent, LoaderIO, ManifestHash, PathResolveResult, ReqId,
     ResolveResult, RuntimeTarget as LoaderRuntimeTarget,
 };
 use distill_wire::artifact::{parse_artifact_parts, ArtifactError};
@@ -484,15 +484,26 @@ impl LoaderIO for PackfileIO {
         }
     }
 
-    fn resolve_path(&mut self, req: ReqId, path: &str, basis: &IoBasis) {
+    fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis) {
         let result = if !self.basis_matches(basis) {
             PathResolveResult::Failed {
                 error: "pack remounted: stale manifest basis".into(),
             }
         } else if let Some(paths) = &self.manifest.paths {
-            match distill_build::query::normalize_path(path) {
-                Ok(path) => paths
-                    .binary_search_by(|row| row.path.as_str().cmp(path.as_str()))
+            let key = distill_build::query::normalize_path(&path.path).and_then(|normalized| {
+                let name = path
+                    .name
+                    .as_deref()
+                    .map(distill_build::query::normalize_identifier)
+                    .transpose()?;
+                Ok((normalized, name))
+            });
+            match key {
+                Ok((normalized, name)) => paths
+                    .binary_search_by(|row| {
+                        (row.path.as_str(), row.name.as_deref())
+                            .cmp(&(normalized.as_str(), name.as_deref()))
+                    })
                     .ok()
                     .map(|index| PathResolveResult::Resolved(paths[index].asset_uuid))
                     .unwrap_or(PathResolveResult::Missing),
@@ -505,7 +516,7 @@ impl LoaderIO for PackfileIO {
         };
         self.events.push_back(IoEvent::PathResolved {
             req,
-            path: path.to_owned(),
+            path: path.clone(),
             result,
             basis: self.basis.clone(),
         });

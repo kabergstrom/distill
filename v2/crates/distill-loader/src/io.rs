@@ -27,6 +27,48 @@ impl RuntimeTarget {
     }
 }
 
+/// A late-bound asset reference: a project path (a bundle path), and
+/// optionally the name of one of the assets imported at it (the local id
+/// its importer gave it). Without a name, the path's primary asset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AssetPath {
+    pub path: String,
+    pub name: Option<String>,
+}
+
+impl AssetPath {
+    /// The primary asset at `path`.
+    pub fn primary(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            name: None,
+        }
+    }
+
+    /// The asset named `name` among those imported at `path`.
+    pub fn named(path: &str, name: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            name: Some(name.to_owned()),
+        }
+    }
+}
+
+impl From<&str> for AssetPath {
+    fn from(path: &str) -> Self {
+        Self::primary(path)
+    }
+}
+
+impl std::fmt::Display for AssetPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "{} [{name}]", self.path),
+            None => f.write_str(&self.path),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriftedInput {
     File(String),
@@ -103,7 +145,7 @@ pub enum IoEvent {
     },
     PathResolved {
         req: ReqId,
-        path: String,
+        path: AssetPath,
         result: PathResolveResult,
         basis: IoBasis,
     },
@@ -149,7 +191,9 @@ pub trait LoaderIO {
     fn begin_sweep(&mut self) -> IoBasis;
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis);
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis);
-    fn resolve_path(&mut self, req: ReqId, path: &str, basis: &IoBasis);
+    /// Resolve `path` to an asset UUID: its path's primary, or the asset of
+    /// that name. Answered by `IoEvent::PathResolved`.
+    fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis);
     fn subscribe(&mut self, uuid: AssetUuid);
     fn unsubscribe(&mut self, uuid: AssetUuid);
     fn subscribe_path(&mut self, path: &str);

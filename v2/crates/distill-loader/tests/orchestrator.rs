@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use distill_asset::{AssetRuntimeDescriptor, AssetType, EncodeSink, ErasedValue, ModuleEpochToken};
 use distill_core::id::{AssetUuid, ContentHash, LayoutHash, TypeUuid};
 use distill_loader::{
-    AdoptionId, AssetStorage, CompletionDisposition, FetchedArtifact, GameModuleEpoch, HandleId,
+    AdoptionId, AssetPath, AssetStorage, CompletionDisposition, FetchedArtifact, GameModuleEpoch, HandleId,
     IoBasis, IoEvent, LoadStatus, Loader, LoaderDiagnostic, LoaderIO, ManifestHash, ManifestState,
     PathResolveResult, PendingState, PendingToken, RegistrationError, ReqId, ResolveResult,
     RuntimeTarget, StorageError, TargetBindingState, UpdateResult,
@@ -116,7 +116,7 @@ enum Command {
     BindTarget,
     Resolve(ReqId, AssetUuid, IoBasis),
     Fetch(ReqId, ContentHash, IoBasis),
-    ResolvePath(ReqId, String, IoBasis),
+    ResolvePath(ReqId, AssetPath, IoBasis),
     Subscribe(AssetUuid),
     SubscribePath(String),
     Unsubscribe(AssetUuid),
@@ -166,12 +166,25 @@ impl MockIo {
             .iter()
             .rev()
             .find_map(|command| match command {
-                Command::ResolvePath(req, candidate, basis) if candidate == path => {
+                Command::ResolvePath(req, candidate, basis)
+                    if *candidate == AssetPath::from(path) =>
+                {
                     Some((*req, basis.clone()))
                 }
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn named_for(&self, path: &str, name: &str) -> Option<(ReqId, IoBasis)> {
+        self.commands.iter().rev().find_map(|command| match command {
+            Command::ResolvePath(req, candidate, basis)
+                if *candidate == AssetPath::named(path, name) =>
+            {
+                Some((*req, basis.clone()))
+            }
+            _ => None,
+        })
     }
 }
 
@@ -199,9 +212,9 @@ impl LoaderIO for MockIo {
             .push(Command::Fetch(req, content_hash, basis.clone()));
     }
 
-    fn resolve_path(&mut self, req: ReqId, path: &str, basis: &IoBasis) {
+    fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis) {
         self.commands
-            .push(Command::ResolvePath(req, path.to_owned(), basis.clone()));
+            .push(Command::ResolvePath(req, path.clone(), basis.clone()));
     }
 
     fn subscribe(&mut self, uuid: AssetUuid) {
@@ -1284,7 +1297,7 @@ fn reconnect_missing_detaches_loaded_indirect_uuid_and_subscription() {
     let (path_req, path_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req: path_req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Resolved(old_uuid),
         basis: path_basis,
     });
@@ -1310,7 +1323,7 @@ fn reconnect_missing_detaches_loaded_indirect_uuid_and_subscription() {
     let (new_path_req, new_path_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req: new_path_req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Missing,
         basis: new_path_basis,
     });
@@ -1349,7 +1362,7 @@ fn path_rebind_unsubscribes_old_uuid_before_subscribing_new_uuid() {
     let (first_req, first_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req: first_req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Resolved(first),
         basis: first_basis,
     });
@@ -1369,7 +1382,7 @@ fn path_rebind_unsubscribes_old_uuid_before_subscribing_new_uuid() {
     let (second_req, second_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req: second_req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Resolved(second),
         basis: second_basis,
     });
@@ -1406,7 +1419,7 @@ fn path_delta_resolves_only_the_rebound_component() {
     let (path_req, path_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req: path_req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Resolved(path_uuid),
         basis: path_basis,
     });
@@ -1453,7 +1466,7 @@ fn path_delta_resolves_only_the_rebound_component() {
     let (rebind_req, rebind_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req: rebind_req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Resolved(path_uuid),
         basis: rebind_basis,
     });
@@ -1656,7 +1669,7 @@ fn shared_subscription_owners_release_only_after_the_last_slot() {
     let (req, request_basis) = loader.io().path_for(path);
     loader.io_mut().push(IoEvent::PathResolved {
         req,
-        path: path.to_owned(),
+        path: path.into(),
         result: PathResolveResult::Resolved(asset),
         basis: request_basis,
     });
@@ -1927,4 +1940,82 @@ fn placeholder_edges_restart_and_resolve_as_one_fresh_basis() {
 
     assert_eq!(storage.updates.len(), 3);
     assert_eq!(storage.commits.len(), 3);
+}
+
+#[test]
+fn named_refs_resolve_by_path_and_name_and_rebind_when_the_path_changes() {
+    let token = ModuleEpochToken::new(47);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 47, &token);
+    let path = "characters/fox.gltf.bundle";
+    let walk = loader.add_ref_named::<A>(path, "Walk").unwrap();
+    let run = loader.add_ref_named::<A>(path, "Run").unwrap();
+    let skeleton = loader.add_ref_indirect::<A>(path).unwrap();
+    assert_eq!(loader.add_ref_named::<A>(path, "Walk").unwrap().id(), walk.id());
+    assert_ne!(walk.id(), run.id());
+    assert_ne!(walk.id(), skeleton.id());
+
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    // Every reference into the path shares one path subscription owner set.
+    assert!(loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::SubscribePath(p) if p == path)));
+    let (walk_req, walk_basis) = loader.io().named_for(path, "Walk").unwrap();
+    let (run_req, run_basis) = loader.io().named_for(path, "Run").unwrap();
+    let (skeleton_req, skeleton_basis) = loader.io().path_for(path);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: walk_req,
+        path: AssetPath::named(path, "Walk"),
+        result: PathResolveResult::Resolved(uuid(48)),
+        basis: walk_basis,
+    });
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: run_req,
+        path: AssetPath::named(path, "Run"),
+        result: PathResolveResult::Missing,
+        basis: run_basis,
+    });
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: skeleton_req,
+        path: path.into(),
+        result: PathResolveResult::Resolved(uuid(47)),
+        basis: skeleton_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    for asset in [uuid(47), uuid(48)] {
+        let (hash, bytes) = artifact::<A>(asset, &[]);
+        resolve(&mut loader, asset, hash);
+        loader.process(&mut storage).unwrap();
+        fetched(&mut loader, hash, bytes);
+        loader.process(&mut storage).unwrap();
+    }
+    assert_eq!(loader.status(&walk), LoadStatus::Loaded);
+    assert_eq!(loader.status(&skeleton), LoadStatus::Loaded);
+    assert_eq!(loader.status(&run), LoadStatus::Unloaded);
+
+    // "Run" is imported later: the daemon announces the path, and the
+    // missing name resolves again.
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: Vec::new(),
+        paths: vec![path.to_owned()],
+    });
+    loader.process(&mut storage).unwrap();
+    let (new_run_req, new_run_basis) = loader.io().named_for(path, "Run").unwrap();
+    assert_ne!(new_run_req, run_req);
+    loader.io_mut().push(IoEvent::PathResolved {
+        req: new_run_req,
+        path: AssetPath::named(path, "Run"),
+        result: PathResolveResult::Resolved(uuid(49)),
+        basis: new_run_basis,
+    });
+    loader.process(&mut storage).unwrap();
+    assert!(loader
+        .io()
+        .commands
+        .iter()
+        .any(|command| matches!(command, Command::Resolve(_, asset, _) if *asset == uuid(49))));
 }

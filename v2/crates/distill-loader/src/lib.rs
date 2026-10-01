@@ -23,7 +23,7 @@ pub use component::{
     MemberFailure,
 };
 pub use io::{
-    AssetDeltaState, DriftedInput, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult,
+    AssetDeltaState, AssetPath, DriftedInput, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult,
     ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
 pub use orchestrator::{

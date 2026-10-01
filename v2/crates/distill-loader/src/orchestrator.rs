@@ -28,7 +28,7 @@ use crate::component::{
     MemberFailure,
 };
 use crate::io::{
-    FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ResolveResult,
+    AssetPath, FetchedArtifact, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ResolveResult,
     RuntimeTarget,
 };
 use crate::runtime::{
@@ -152,7 +152,7 @@ impl<T: AssetType> std::fmt::Debug for Handle<T> {
 enum Binding {
     Direct(AssetUuid),
     Indirect {
-        path: String,
+        path: AssetPath,
         resolved: Option<AssetUuid>,
     },
 }
@@ -351,7 +351,7 @@ struct CandidateRecord {
 struct Sweep {
     basis: IoBasis,
     candidates: BTreeMap<AssetUuid, CandidateRecord>,
-    pending_paths: BTreeSet<String>,
+    pending_paths: BTreeSet<AssetPath>,
     dirty_seeds: BTreeSet<AssetUuid>,
 }
 
@@ -386,12 +386,12 @@ pub struct Loader<I: LoaderIO> {
     placeholders: BTreeMap<TypeUuid, PlaceholderRecord>,
     slots: BTreeMap<HandleId, Slot>,
     direct_slots: BTreeMap<(AssetUuid, TypeUuid), HandleId>,
-    path_slots: BTreeMap<(String, TypeUuid), HandleId>,
+    path_slots: BTreeMap<(AssetPath, TypeUuid), HandleId>,
     asset_subscription_owners: BTreeMap<AssetUuid, usize>,
     path_subscription_owners: BTreeMap<String, usize>,
     manifest: BTreeMap<AssetUuid, ManifestEntry>,
     dirty: BTreeSet<AssetUuid>,
-    dirty_paths: BTreeSet<String>,
+    dirty_paths: BTreeSet<AssetPath>,
     sweep: Option<Sweep>,
     /// Rounds restarted since a sweep last completed.
     sweep_retries: u32,
@@ -561,9 +561,26 @@ impl<I: LoaderIO> Loader<I> {
         })
     }
 
+    /// The primary asset at `path`, late-bound: a later import that moves
+    /// the path's primary rebinds the handle.
     pub fn add_ref_indirect<T: AssetType>(&mut self, path: &str) -> Result<Handle<T>, LoaderError> {
+        self.add_ref_path(AssetPath::primary(path))
+    }
+
+    /// The asset named `name` (its importer's local id) among the assets
+    /// imported at `path`, late-bound like [`Self::add_ref_indirect`]: a
+    /// name that appears later binds then. Its type must be `T`.
+    pub fn add_ref_named<T: AssetType>(
+        &mut self,
+        path: &str,
+        name: &str,
+    ) -> Result<Handle<T>, LoaderError> {
+        self.add_ref_path(AssetPath::named(path, name))
+    }
+
+    fn add_ref_path<T: AssetType>(&mut self, path: AssetPath) -> Result<Handle<T>, LoaderError> {
         self.ensure_descriptor(T::TYPE_UUID)?;
-        let key = (path.to_owned(), T::TYPE_UUID);
+        let key = (path.clone(), T::TYPE_UUID);
         if let Some(&id) = self.path_slots.get(&key) {
             if let Some(lease) = self.slots.get(&id).and_then(|slot| slot.lease.upgrade()) {
                 return Ok(Handle {
@@ -576,12 +593,12 @@ impl<I: LoaderIO> Loader<I> {
         let (id, lease) = self.new_slot(
             Some(T::TYPE_UUID),
             Binding::Indirect {
-                path: path.to_owned(),
+                path: path.clone(),
                 resolved: None,
             },
         )?;
         self.path_slots.insert(key, id);
-        self.dirty_paths.insert(path.to_owned());
+        self.dirty_paths.insert(path);
         Ok(Handle {
             id,
             lease,
@@ -844,7 +861,7 @@ impl<I: LoaderIO> Loader<I> {
     fn detach_indirect_slots(
         &mut self,
         storage: &mut dyn AssetStorage,
-        paths: Option<&BTreeSet<String>>,
+        paths: Option<&BTreeSet<AssetPath>>,
     ) {
         let ids = self
             .slots
@@ -899,7 +916,7 @@ impl<I: LoaderIO> Loader<I> {
                 }
                 if slot.path_subscribed {
                     if let Binding::Indirect { path, .. } = &slot.binding {
-                        self.release_path_subscription(path);
+                        self.release_path_subscription(&path.path);
                     }
                 }
                 if let Some(current) = slot.current {
@@ -1097,7 +1114,8 @@ impl<I: LoaderIO> Loader<I> {
         for slot in self.slots.values_mut() {
             if let Binding::Indirect { path, .. } = &slot.binding {
                 if !slot.path_subscribed {
-                    subscribe_paths.push(path.clone());
+                    // A named asset's path changes when names appear there.
+                    subscribe_paths.push(path.path.clone());
                     slot.path_subscribed = true;
                 }
             }
@@ -1177,7 +1195,19 @@ impl<I: LoaderIO> Loader<I> {
                         }
                     }
                 }
-                let paths = paths.into_iter().collect::<BTreeSet<_>>();
+                // A changed path re-resolves every reference into it: its
+                // primary and the names imported there.
+                let changed = paths.into_iter().collect::<BTreeSet<_>>();
+                let paths = self
+                    .slots
+                    .values()
+                    .filter_map(|slot| match &slot.binding {
+                        Binding::Indirect { path, .. } if changed.contains(&path.path) => {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
                 let old_path_assets = self
                     .slots
                     .values()
@@ -1447,7 +1477,7 @@ impl<I: LoaderIO> Loader<I> {
 
     fn accept_path(
         &mut self,
-        path: &str,
+        path: &AssetPath,
         result: PathResolveResult,
         storage: &mut dyn AssetStorage,
     ) {

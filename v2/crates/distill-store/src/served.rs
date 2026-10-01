@@ -403,6 +403,24 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
+    /// Every runtime asset named `name` (its local id) in a bundle at
+    /// `path`; more than one (bundles of that path under several roots) is
+    /// an ambiguity.
+    pub fn served_named_candidates(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Result<BTreeSet<AssetUuid>, StoreError> {
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT a.asset_uuid {SERVED_ENTRY_FROM}
+               AND b.path = ?1 AND a.local_id = ?2 AND a.authoring_only = 0"
+        ))?;
+        let rows = statement.query_map([path, name], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|row| row.map(|bytes| AssetUuid(blob16(bytes))))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Every logical path that names `asset`.
     pub fn served_paths_of(&self, asset: AssetUuid) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self
@@ -673,6 +691,16 @@ pub trait ServedWrite {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Whether `asset` has a resolution row other than `Deleted`: a runtime
+    /// entry the served namespace already announced.
+    fn txn_has_live_resolution(&self, asset: AssetUuid) -> Result<bool, StoreError> {
+        Ok(self.served_conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM asset_resolutions WHERE asset_uuid = ?1 AND kind != 4)",
+            [asset.0.as_slice()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Replace (`Some`) or remove (`None`) an explicit resolution row.

@@ -95,7 +95,7 @@ pub struct ConnectionEpoch(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RequestOwner {
     Handle(HandleId),
-    Path(String),
+    Path(crate::io::AssetPath),
     Content { asset: AssetUuid, hash: ContentHash },
 }
 

@@ -13,8 +13,9 @@ pub use distill_store::state::{
 };
 
 /// 10: `Hub.importFailures`. 11: snapshot `runtimeTypePolicy`, batch-class
-/// `resolve`, `ASSET_NOT_FOUND` (pack over RPC).
-pub const PROTOCOL_VERSION: u32 = 11;
+/// `resolve`, `ASSET_NOT_FOUND` (pack over RPC). 12: snapshot
+/// `resolveNamed` (an asset by path and local id).
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// A watched import whose latest attempt failed. The bundle keeps serving its
 /// last good contents; the failure clears when a later import succeeds.

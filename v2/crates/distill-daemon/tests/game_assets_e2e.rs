@@ -238,6 +238,44 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
             if members.contains(&texture) || members.contains(&mesh)
     )));
 
+    // Named assets: the bundle holds two meshes, each loaded by its path and
+    // the name its importer gave it; an unknown name resolves to nothing.
+    let primary_named = live_loader
+        .add_ref_named::<MeshAsset>("game-assets.bundle", "mesh")
+        .unwrap();
+    let reversed_named = live_loader
+        .add_ref_named::<MeshAsset>("game-assets.bundle", "mesh_reversed")
+        .unwrap();
+    let unknown_named = live_loader
+        .add_ref_named::<MeshAsset>("game-assets.bundle", "mesh_unknown")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_loader.status(&primary_named) != LoadStatus::Loaded
+        || live_loader.status(&reversed_named) != LoadStatus::Loaded
+    {
+        live_loader.process(&mut live_storage).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "named meshes did not load: diagnostics={:?}",
+            live_loader.take_diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    settle_loader(&mut live_loader, &mut live_storage);
+    assert_eq!(live_loader.status(&unknown_named), LoadStatus::Unloaded);
+    let indices_of = |handle: HandleId| {
+        live_storage
+            .values
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == handle)
+            .max_by_key(|((_, adoption), _)| *adoption)
+            .and_then(|(_, value)| value.downcast_ref::<MeshAsset>())
+            .map(|mesh| mesh.indices.clone())
+            .unwrap_or_else(|| panic!("named mesh {handle:?} has no resident value"))
+    };
+    assert_eq!(indices_of(primary_named.id()), [0, 0, 1, 0, 2, 0]);
+    assert_eq!(indices_of(reversed_named.id()), [0, 0, 2, 0, 1, 0]);
+
     // `distilld pack` runs as a client of this serving daemon, from a
     // PackDefinition authored in the asset root.
     let definition = AssetUuid([0xd1; 16]);

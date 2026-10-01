@@ -53,6 +53,10 @@ pub struct WireTreeRow {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PathRow {
     pub path: String,
+    /// `None`: the path's primary asset. `Some`: the asset of that local id
+    /// imported at `path` (pack version 3). Rows sort by path, then name,
+    /// the primary first.
+    pub name: Option<String>,
     pub asset_uuid: AssetUuid,
 }
 
@@ -113,8 +117,12 @@ pub fn canonicalize(mut manifest: PackManifest) -> Result<PackManifest, Manifest
         for row in paths.iter_mut() {
             row.path = distill_build::query::normalize_path(&row.path)
                 .map_err(|_| ManifestError::BadPath)?;
+            if let Some(name) = &mut row.name {
+                *name = distill_build::query::normalize_identifier(name)
+                    .map_err(|_| ManifestError::BadPath)?;
+            }
         }
-        sort_unique(paths, |v| v.path.clone())?;
+        sort_unique(paths, |v| (v.path.clone(), v.name.clone()))?;
     }
     verify_manifest_closure(&manifest)?;
     Ok(manifest)
@@ -343,6 +351,8 @@ fn encode_paths(rows: &[PathRow]) -> Vec<u8> {
     table_start(&mut out, rows.len());
     for row in rows {
         string(&mut out, &row.path);
+        // A local id is never empty: the empty name is the primary.
+        string(&mut out, row.name.as_deref().unwrap_or(""));
         out.extend_from_slice(&row.asset_uuid.0);
     }
     out
@@ -428,7 +438,7 @@ fn decode_wire_trees(bytes: &[u8]) -> Result<Vec<WireTreeRow>, ManifestError> {
 }
 fn decode_paths(bytes: &[u8]) -> Result<Vec<PathRow>, ManifestError> {
     let mut r = Reader { bytes, pos: 0 };
-    let count = r.bounded_count(20)?;
+    let count = r.bounded_count(24)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let path = r.string()?;
@@ -437,12 +447,24 @@ fn decode_paths(bytes: &[u8]) -> Result<Vec<PathRow>, ManifestError> {
         if normalized != path {
             return Err(ManifestError::BadPath);
         }
+        let name = r.string()?;
+        let name = if name.is_empty() {
+            None
+        } else {
+            let normalized = distill_build::query::normalize_identifier(&name)
+                .map_err(|_| ManifestError::BadPath)?;
+            if normalized != name {
+                return Err(ManifestError::BadPath);
+            }
+            Some(name)
+        };
         rows.push(PathRow {
             path,
+            name,
             asset_uuid: AssetUuid(r.a16()?),
         });
     }
-    finish_table(r, rows, |v| v.path.clone())
+    finish_table(r, rows, |v| (v.path.clone(), v.name.clone()))
 }
 fn finish_table<T, K: Ord>(
     r: Reader<'_>,
@@ -603,6 +625,21 @@ mod tests {
         bytes.extend_from_slice(&1_u32.to_le_bytes());
         bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
         bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&[1; 16]);
+
+        assert!(matches!(decode_paths(&bytes), Err(ManifestError::BadPath)));
+    }
+
+    #[test]
+    fn decoder_rejects_noncanonical_name_bytes() {
+        let path = "textures/a.bundle";
+        let name = "Surve\u{301}y";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
         bytes.extend_from_slice(&[1; 16]);
 
         assert!(matches!(decode_paths(&bytes), Err(ManifestError::BadPath)));

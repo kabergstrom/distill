@@ -148,6 +148,21 @@ fn apply<W: ServedWrite>(
     }
     namespace(txn)?;
 
+    // A runtime entry the namespace has not announced yet can be the target
+    // of a named reference (path and local id) still waiting for it: its
+    // bundle's path changes too. Entries keep their identity per local id,
+    // so a changed bundle with the same names notifies only its assets.
+    let mut named_paths = BTreeSet::new();
+    for mutation in &commit.authoring {
+        if let AuthoringMutation::Set(entry) = mutation {
+            if entry.role == AuthoringEntryRole::Runtime
+                && !txn.txn_has_live_resolution(entry.uuid)?
+            {
+                named_paths.insert(entry.normalized_path.clone());
+            }
+        }
+    }
+
     let mut asset_deltas = Vec::with_capacity(commit.assets.len());
     for mutation in &commit.assets {
         match mutation {
@@ -196,6 +211,7 @@ fn apply<W: ServedWrite>(
         .map(|mutation| match mutation {
             PathMutation::Set { path, .. } | PathMutation::Remove { path } => path.clone(),
         })
+        .chain(named_paths)
         .collect::<BTreeSet<_>>();
     for path in paths {
         txn.append_change(version, &Change::Path { path })?;

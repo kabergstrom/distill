@@ -233,10 +233,14 @@ impl AuthoringImporter for GameAssetsImporter {
         let mesh = parse_triangle(&context.read(&mesh)?)?;
         let shader_bytes = context.read(&shader)?;
         let shader = parse_shader(context, &shader_bytes)?;
+        // A second asset of the mesh type under its own name, as a glTF
+        // importer names each clip it imports beside the skeleton.
+        let mesh_reversed = reverse_winding(&mesh);
         let mut output = ImportOutput::new();
         for (id, type_uuid, value) in [
             ("texture", TEXTURE_SOURCE_TYPE, texture),
             ("mesh", MESH_SOURCE_TYPE, mesh),
+            ("mesh_reversed", MESH_SOURCE_TYPE, mesh_reversed),
             ("shader", SHADER_SOURCE_TYPE, shader),
         ] {
             output
@@ -297,6 +301,22 @@ fn parse_triangle(bytes: &[u8]) -> Result<String, AuthoringImporterError> {
         ));
     }
     Ok(source.to_owned())
+}
+
+/// The OBJ source with each face's winding reversed.
+fn reverse_winding(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| match line.strip_prefix("f ") {
+            Some(face) => {
+                let mut corners = face.split_whitespace().collect::<Vec<_>>();
+                corners[1..].reverse();
+                format!("f {}", corners.join(" "))
+            }
+            None => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_shader(

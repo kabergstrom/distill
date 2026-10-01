@@ -6138,8 +6138,9 @@ pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no 
     /// declared IO boundary. RpcIO reaches the daemon's logical path
     /// index (§13); PackfileIO answers from the pack's path table when
     /// built with include_path_table (§16) and completes with a typed
-    /// Unsupported otherwise.
-    fn resolve_path(&mut self, req: ReqId, path: &str, basis: &IoBasis);
+    /// Unsupported otherwise. An `AssetPath` is a bundle path and an
+    /// optional asset name (a local id): without one, the path's primary.
+    fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis);
     fn subscribe(&mut self, uuid: AssetUuid); // no-op for PackfileIO; RpcIO
                                               // rides Hub.subscribe's cursor
                                               // semantics (§17)
@@ -6161,7 +6162,7 @@ pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no 
 pub enum IoEvent {
     Resolved     { req: ReqId, uuid: AssetUuid, result: ResolveResult,
                    basis: IoBasis },
-    PathResolved { req: ReqId, path: String, result: PathResolveResult,
+    PathResolved { req: ReqId, path: AssetPath, result: PathResolveResult,
                    basis: IoBasis },
     Fetched      { req: ReqId, content_hash: ContentHash, artifact: FetchedArtifact,
                    basis: IoBasis },
@@ -6267,6 +6268,11 @@ impl Loader {
     pub fn add_ref<T: AssetType>(&mut self, uuid: AssetUuid) -> Handle<T>;
     pub fn add_ref_indirect<T: AssetType>(&mut self, path: &str) -> Handle<T>;
                                          // late-bound via LoaderIO::resolve_path
+    /// The asset named `name` among those imported at `path` (its local
+    /// id, §10): one source can yield several assets of one type — a
+    /// glTF's skeleton beside its clips "Walk", "Run" — each addressed
+    /// by (path, type, name). Late-bound like `add_ref_indirect`.
+    pub fn add_ref_named<T: AssetType>(&mut self, path: &str, name: &str) -> Handle<T>;
     /// Placeholder thunk for deletion swaps (Deletion, above). A
     /// generated constructor thunk, never a bare `fn() -> T`: the
     /// module-side `placeholder!` macro (the `migration_fn!` pattern,
@@ -6545,11 +6551,14 @@ Content-addressed, patch-friendly (CASC-inspired):
   index's (offset, len) points at payload bytes, so a blob extent is
   mmap-served without touching framing. The **path table**
   (`include_path_table`, Roots below) is pinned to the byte: rows of
-  `normalized logical path (§10's grammar, length-framed str) → primary
-  AssetUuid (16 bytes)`, one row per bundle path whose primary entry is
-  in the pack's manifest — exactly the daemon's logical path index
-  (§13) projected onto the pack closure at the build snapshot, the same
-  mapping `resolvePath` answers over RPC. Coverage and ambiguity are
+  `normalized logical path (§10's grammar, length-framed str), asset
+  name (length-framed str: empty for the primary, else the entry's
+  local id) → AssetUuid (16 bytes)`, sorted by (path, name): one
+  primary row per bundle path whose primary entry is in the pack's
+  manifest, and one named row per runtime entry in it — exactly the
+  daemon's logical path index (§13) projected onto the pack closure at
+  the build snapshot, the same mappings `resolvePath` and
+  `resolveNamed` answer over RPC. Coverage and ambiguity are
   pinned with it: a path resolving ambiguously at the snapshot fails
   the pack build (§18's error — never a tiebreak row); a path whose
   primary is outside the closure is omitted, so `resolve_path` answers
@@ -6805,6 +6814,7 @@ interface Snapshot {
   resolvePath @5 (path :Text) -> (result :PathResolveCall);
   configuration @6 () -> (result :VoidCall);
   fetch @7 (hash :Data) -> (result :ChunkStreamCall);
+  resolveNamed @9 (path :Text, name :Text) -> (result :PathResolveCall);
 }
 
 interface AuthoringSnapshot {

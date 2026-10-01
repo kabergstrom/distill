@@ -1,7 +1,7 @@
 use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
 use distill_loader::{
-    GameModuleEpoch, IoBasis, IoEvent, LoaderIO, PathResolveResult, ReqId, ResolveResult,
+    AssetPath, GameModuleEpoch, IoBasis, IoEvent, LoaderIO, PathResolveResult, ReqId, ResolveResult,
     RuntimeTarget as LoaderRuntimeTarget,
 };
 use distill_pack::archive::{encode_archive, ArtifactPayload};
@@ -100,10 +100,18 @@ fn fixture(
             bytes: wire_bytes,
         }],
         paths: paths.then(|| {
-            vec![PathRow {
-                path: "assets/a.bundle".into(),
-                asset_uuid,
-            }]
+            vec![
+                PathRow {
+                    path: "assets/a.bundle".into(),
+                    name: None,
+                    asset_uuid,
+                },
+                PathRow {
+                    path: "assets/a.bundle".into(),
+                    name: Some("main".into()),
+                    asset_uuid,
+                },
+            ]
         }),
     };
     (
@@ -159,7 +167,7 @@ fn resolves_fetches_and_paths_under_one_manifest_basis() {
     let basis = io.begin_sweep();
     io.resolve(ReqId(1), asset_uuid, &basis);
     io.fetch(ReqId(2), content_hash, &basis);
-    io.resolve_path(ReqId(3), "assets/a.bundle", &basis);
+    io.resolve_path(ReqId(3), &AssetPath::from("assets/a.bundle"), &basis);
     let events = io.poll();
 
     assert!(matches!(&events[0], IoEvent::Resolved {
@@ -226,7 +234,7 @@ fn absent_path_table_is_loudly_unsupported() {
     let (manifest, archive, runtime, _, _) = fixture(false);
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
-    io.resolve_path(ReqId(1), "assets/a.bundle", &basis);
+    io.resolve_path(ReqId(1), &AssetPath::from("assets/a.bundle"), &basis);
     assert!(matches!(
         io.poll().as_slice(),
         [IoEvent::PathResolved {
@@ -244,7 +252,7 @@ fn path_queries_are_normalized_before_lookup() {
     let manifest = encode_manifest(&decoded).unwrap();
     let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
     let basis = io.begin_sweep();
-    io.resolve_path(ReqId(1), "te\u{301}xtures/a.bundle", &basis);
+    io.resolve_path(ReqId(1), &AssetPath::from("te\u{301}xtures/a.bundle"), &basis);
 
     assert!(matches!(io.poll().as_slice(), [IoEvent::PathResolved {
         result: PathResolveResult::Resolved(got), ..
@@ -326,5 +334,23 @@ fn stale_pack_basis_cannot_read() {
     assert!(matches!(
         io.poll().as_slice(),
         [IoEvent::RequestError { req: ReqId(1), .. }]
+    ));
+}
+
+#[test]
+fn named_paths_resolve_by_path_and_name() {
+    let (manifest, archive, runtime, asset_uuid, _) = fixture(true);
+    let mut io = mount_pack(&manifest, &archive, &runtime).unwrap();
+    let basis = io.begin_sweep();
+    io.resolve_path(ReqId(1), &AssetPath::named("assets/a.bundle", "main"), &basis);
+    io.resolve_path(ReqId(2), &AssetPath::named("assets/a.bundle", "other"), &basis);
+    let events = io.poll();
+
+    assert!(matches!(&events[0], IoEvent::PathResolved {
+        req: ReqId(1), path, result: PathResolveResult::Resolved(got), ..
+    } if *got == asset_uuid && path.name.as_deref() == Some("main")));
+    assert!(matches!(
+        &events[1],
+        IoEvent::PathResolved { req: ReqId(2), result: PathResolveResult::Missing, .. }
     ));
 }

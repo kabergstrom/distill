@@ -430,6 +430,21 @@ fn resolve_path_in(snapshot: &StoreReader, path: &str) -> Result<PathResolveResu
     })
 }
 
+fn resolve_named_in(
+    snapshot: &StoreReader,
+    path: &str,
+    name: &str,
+) -> Result<PathResolveResult, StoreError> {
+    let candidates = snapshot.served_named_candidates(path, name)?;
+    Ok(match candidates.len() {
+        0 => PathResolveResult::Missing,
+        1 => PathResolveResult::Resolved(*candidates.first().expect("one candidate")),
+        _ => PathResolveResult::Failed(PathResolveFailure::Ambiguous {
+            candidates: candidates.into_iter().collect(),
+        }),
+    })
+}
+
 fn inspect_authoring(
     snapshot: &StoreReader,
     stamp: SnapshotStamp,
@@ -2006,6 +2021,33 @@ impl Snapshot {
         RpcResult::Success(TerminalEvent {
             basis: self.basis.clone(),
             value: rpc_try!(resolve_path_in(txn.snapshot(), path)),
+        })
+    }
+
+    /// The runtime asset named `name` (its local id) among those imported
+    /// at `path`. Protocol 12.
+    pub fn resolve_named(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> RpcResult<TerminalEvent<PathResolveResult>> {
+        let txn = match self.preflight() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
+        if !valid_logical_path(path) {
+            return RpcResult::Failure(RpcFailure::InvalidPath {
+                path: path.to_owned(),
+            });
+        }
+        if !valid_identifier(name) {
+            return RpcResult::Failure(RpcFailure::InvalidQuery {
+                detail: "asset name is not a canonical local id".to_owned(),
+            });
+        }
+        RpcResult::Success(TerminalEvent {
+            basis: self.basis.clone(),
+            value: rpc_try!(resolve_named_in(txn.snapshot(), path, name)),
         })
     }
 

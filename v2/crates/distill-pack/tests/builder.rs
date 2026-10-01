@@ -360,7 +360,13 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
         output.manifest.assets[0].load_deps[0].asset_uuid,
         fixture.child
     );
-    assert_eq!(output.manifest.paths.as_ref().unwrap().len(), 2);
+    // Each packed runtime entry: its path (it is the primary) and its name.
+    let paths = output.manifest.paths.as_ref().unwrap();
+    assert_eq!(paths.len(), 4);
+    assert_eq!(
+        paths.iter().filter(|row| row.name.as_deref() == Some("main")).count(),
+        2
+    );
     assert_eq!(
         output.archive_file_hash,
         *blake3::hash(&output.archive_bytes).as_bytes()

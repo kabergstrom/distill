@@ -812,6 +812,9 @@ interface Snapshot {
   configuration @6 () -> (result :VoidCall);
   fetch @7 (hash :Data) -> (result :ChunkStreamCall);
   runtimeTypePolicy @8 (typeUuid :Data) -> (result :RuntimeTypePolicyCall);
+  # The runtime asset whose local id is `name` among the assets imported at
+  # `path` (a bundle path). Protocol 12.
+  resolveNamed @9 (path :Text, name :Text) -> (result :PathResolveCall);
 }
 
 struct RuntimeTypePolicy {

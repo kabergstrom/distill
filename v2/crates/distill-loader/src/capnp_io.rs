@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::admission::{Admission, FetchAdmission};
 use crate::io::{
-    AssetDeltaState, DriftedInput, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ReqId,
+    AssetDeltaState, AssetPath, DriftedInput, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ReqId,
     ResolveResult, RuntimeTarget,
 };
 use crate::rpc_decode::{
@@ -229,7 +229,7 @@ impl LoaderIO for RpcIo {
         });
     }
 
-    fn resolve_path(&mut self, req: ReqId, path: &str, basis: &IoBasis) {
+    fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis) {
         self.send(Command::ResolvePath {
             req,
             path: path.to_owned(),
@@ -304,7 +304,7 @@ enum Command {
     },
     ResolvePath {
         req: ReqId,
-        path: String,
+        path: AssetPath,
         basis: IoBasis,
     },
     SubscribeAsset(AssetUuid),
@@ -912,10 +912,14 @@ async fn resolve_event(
 async fn path_event(
     snapshot: RemoteSnapshot,
     req: ReqId,
-    path: String,
+    path: AssetPath,
     request_basis: IoBasis,
 ) -> IoEvent {
-    match snapshot.resolve_path(&path).await {
+    let call = match &path.name {
+        None => snapshot.resolve_path(&path.path).await,
+        Some(name) => snapshot.resolve_named(&path.path, name).await,
+    };
+    match call {
         Ok(RemoteCall::Success(terminal)) => IoEvent::PathResolved {
             req,
             path,

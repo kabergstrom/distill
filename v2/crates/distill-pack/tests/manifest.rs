@@ -44,10 +44,18 @@ fn sample() -> PackManifest {
             layout_hash: LayoutHash([41; 32]),
             bytes: vec![1, 2, 3],
         }],
-        paths: Some(vec![PathRow {
-            path: "assets/root.bundle".into(),
-            asset_uuid: AssetUuid([1; 16]),
-        }]),
+        paths: Some(vec![
+            PathRow {
+                path: "assets/root.bundle".into(),
+                name: None,
+                asset_uuid: AssetUuid([1; 16]),
+            },
+            PathRow {
+                path: "assets/root.bundle".into(),
+                name: Some("Walk".into()),
+                asset_uuid: AssetUuid([2; 16]),
+            },
+        ]),
     }
 }
 
@@ -77,6 +85,7 @@ fn paths_are_nfc_normalized_before_sorting() {
     let mut manifest = sample();
     manifest.paths = Some(vec![PathRow {
         path: "te\u{301}xtures/a.bundle".into(),
+        name: None,
         asset_uuid: AssetUuid([1; 16]),
     }]);
 
@@ -168,4 +177,51 @@ fn duplicate_dependency_assets_are_rejected_even_with_different_types() {
     });
 
     assert_eq!(canonicalize(manifest), Err(ManifestError::Duplicate));
+}
+
+#[test]
+fn named_path_rows_sort_after_the_primary_and_normalize() {
+    let mut manifest = sample();
+    manifest.paths = Some(vec![
+        PathRow {
+            path: "assets/root.bundle".into(),
+            name: Some("Walk".into()),
+            asset_uuid: AssetUuid([2; 16]),
+        },
+        PathRow {
+            path: "assets/root.bundle".into(),
+            name: Some("Surve\u{301}y".into()),
+            asset_uuid: AssetUuid([2; 16]),
+        },
+        PathRow {
+            path: "assets/root.bundle".into(),
+            name: None,
+            asset_uuid: AssetUuid([1; 16]),
+        },
+    ]);
+
+    let decoded = decode_manifest(&encode_manifest(&manifest).unwrap()).unwrap();
+    let names = decoded
+        .paths
+        .unwrap()
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [None, Some("Surv\u{e9}y".to_owned()), Some("Walk".to_owned())]
+    );
+}
+
+#[test]
+fn a_path_row_may_not_repeat_its_name() {
+    let mut manifest = sample();
+    let row = PathRow {
+        path: "assets/root.bundle".into(),
+        name: Some("Walk".into()),
+        asset_uuid: AssetUuid([2; 16]),
+    };
+    manifest.paths = Some(vec![row.clone(), row]);
+
+    assert_eq!(encode_manifest(&manifest), Err(ManifestError::Duplicate));
 }
