@@ -320,6 +320,42 @@ impl DaemonCoordinator {
         locked(&self.schema_authority).clone()
     }
 
+    /// Whether publishing `candidate` with the current configuration and
+    /// pipeline module would install what already serves: the Ready epoch's
+    /// version key (`ngp_module_host::ModuleReloadIdentity::version_key`,
+    /// which uses the module's own source hash, plus the rest of the schema)
+    /// is the same against `candidate` as against the installed schema.
+    ///
+    /// This is source-walk catching up after an `AheadOfWalk` adoption: it
+    /// rewrites only the pipeline crate's source hash. Such a schema is not
+    /// republished, so the epoch, the RPC generation, and the imports stay.
+    pub(crate) fn ready_pipeline_serves_schema(&self, candidate: &ProjectSchemaAuthority) -> bool {
+        let Some(installed) = self.schema_authority() else {
+            return false;
+        };
+        let Some(epoch) = lock_pipeline(&self.pipeline).host.published_ready_epoch() else {
+            return false;
+        };
+        if epoch.runtime_failure().is_some() {
+            return false;
+        }
+        let Some(identity) = epoch.reload_identity() else {
+            return false;
+        };
+        let key = |authority: &ProjectSchemaAuthority| {
+            let schema = authority.schema();
+            let mut rest = schema.clone();
+            rest.source_hashes.clear();
+            // `Schema` has no `PartialEq`; its derived `Debug` covers every
+            // field, in order.
+            (
+                identity.version_key(&schema.source_hashes, &schema.layout_hashes),
+                format!("{rest:?}"),
+            )
+        };
+        key(&installed) == key(candidate)
+    }
+
     pub fn build_target(&self, name: &str) -> Option<Target> {
         self.build_targets.load()
             .get(name)

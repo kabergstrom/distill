@@ -206,6 +206,11 @@ a connection of its own, and SQLite's write lock orders the writers.
   epoch keeps serving: no input version, no pipeline generation bump, and
   the next schema or module write retries it. Without a Ready epoch, or for
   a crate the schema lacks, it is a `CandidateAttestation` failure.
+  A schema write that leaves the Ready epoch's version key
+  (`ModuleReloadIdentity::version_key`: the module's own source hash, the
+  other crates' source hashes, the layout hashes, plus the rest of the
+  schema) unchanged, as source-walk catching up after an ahead-of-walk
+  adoption does, is observed without republishing.
 - **rebuild** (a serving `distilld`) runs the configuration's `[[rebuild]]`
   jobs: it watches each job's dep-info inputs with its own `notify` watcher
   and runs the job's steps as child processes, one at a time (in a process

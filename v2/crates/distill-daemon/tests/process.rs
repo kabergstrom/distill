@@ -1092,7 +1092,7 @@ fn pipeline_ahead_of_its_schema_keeps_serving_until_the_schema_catches_up() {
     assert_eq!(process.coordinator().server().current_stamp().version, before);
     assert_eq!(pipeline_generation(&process), generation);
     assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v1)));
-    assert!(process.last_background_error().is_none());
+    assert_eq!(process.last_background_error(), None);
     assert_eq!(imported_value(&temp).as_deref(), Some("v1:note"));
 
     // Source-walk catches up: exactly one pipeline epoch change, and the
@@ -1108,7 +1108,7 @@ fn pipeline_ahead_of_its_schema_keeps_serving_until_the_schema_catches_up() {
     );
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(pipeline_generation(&process), generation + 1);
-    assert!(process.last_background_error().is_none());
+    assert_eq!(process.last_background_error(), None);
 }
 
 #[test]
@@ -1130,5 +1130,51 @@ fn pipeline_with_an_unchanged_layout_is_adopted_ahead_of_source_walk() {
         "the new importer version did not reimport the watched import",
     );
     assert_eq!(pipeline_generation(&process), generation + 1);
-    assert!(process.last_background_error().is_none());
+    assert_eq!(process.last_background_error(), None);
+}
+
+#[test]
+fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() {
+    let variants = gate_variants();
+    let temp = tempfile::tempdir().unwrap();
+    let process = start_gate_daemon(&temp, &variants.v2);
+    assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
+    let generation = pipeline_generation(&process);
+
+    install_gate_pipeline(&temp, &variants.v3);
+    wait_long(
+        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3)),
+        "a layout-preserving pipeline was not adopted ahead of source-walk",
+    );
+    wait_long(
+        || imported_value(&temp).as_deref() == Some("v3:note"),
+        "the new importer version did not reimport the watched import",
+    );
+    // Let the watcher publish the reimport's own bundle write first.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(pipeline_generation(&process), generation + 1);
+    let before = process.coordinator().server().current_stamp().version;
+
+    // Source-walk catches up: only the pipeline crate's source hash changes,
+    // to the adopted module's. Exactly one epoch change for the edit.
+    write_gate_schema(&temp, &variants.v3);
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(pipeline_generation(&process), generation + 1);
+    assert_eq!(process.coordinator().server().current_stamp().version, before);
+    assert_eq!(ready_dylib_hash(&process), Some(dylib_hash(&variants.v3)));
+    assert_eq!(process.last_background_error(), None);
+
+    // The observed schema still gates the next build: another code-only
+    // change is adopted ahead of the walk as before.
+    install_gate_pipeline(&temp, &variants.v2);
+    wait_long(
+        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v2)),
+        "the next layout-preserving pipeline was not adopted",
+    );
+    wait_long(
+        || imported_value(&temp).as_deref() == Some("v2:note"),
+        "the next importer version did not reimport the watched import",
+    );
+    assert_eq!(pipeline_generation(&process), generation + 2);
+    assert_eq!(process.last_background_error(), None);
 }

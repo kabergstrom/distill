@@ -645,6 +645,9 @@ struct EpochInner {
     targets: Vec<TargetDefinition>,
     registration: RegistrationSet,
     tools: BTreeMap<String, distill_store::pipeline::ToolRegistrationV2>,
+    /// Source and layout identity the module reported when it was validated;
+    /// set once by `prepare_candidate`.
+    reload_identity: OnceLock<ngp_module_host::ModuleReloadIdentity>,
     /// The first runtime failure; it fences the epoch for good.
     runtime_error: OnceLock<(PipelineFailureCode, String)>,
     /// Read through `&self` once published; torn down only with the epoch
@@ -695,6 +698,7 @@ impl PipelineEpoch {
                 .collect(),
             registration,
             tools,
+            reload_identity: OnceLock::new(),
             runtime_error: OnceLock::new(),
             registration_arena: Some(arena),
             module: Some(module),
@@ -707,6 +711,12 @@ impl PipelineEpoch {
 
     pub fn dylib_hash(&self) -> [u8; 32] {
         self.0.staged.content_hash
+    }
+
+    /// The module's source and layout identity, as validated against the
+    /// schema it was published with (`None` only for test-built epochs).
+    pub fn reload_identity(&self) -> Option<&ngp_module_host::ModuleReloadIdentity> {
+        self.0.reload_identity.get()
     }
 
     pub fn staged_path(&self) -> &Path {
@@ -1405,8 +1415,8 @@ impl ModuleHost {
 
         let validation =
             validate_open_module(module.as_mut(), requirements, &mut registration_arena);
-        let registration = match validation {
-            Ok(registration) => registration,
+        let (registration, reload_identity) = match validation {
+            Ok(validated) => validated,
             Err(error) => {
                 let cleanup = discard_candidate(module, registration_arena);
                 // A module ahead of the schema is the normal window between
@@ -1470,6 +1480,7 @@ impl ModuleHost {
             },
             module,
         );
+        let _ = epoch.0.reload_identity.set(reload_identity);
         Ok(epoch)
     }
 
@@ -1732,7 +1743,7 @@ fn validate_open_module(
     module: &mut dyn LoadedPipelineModule,
     requirements: &CandidateRequirements,
     registration_arena: &mut CandidateRegistrationArena,
-) -> Result<RegistrationSet, CandidatePhaseError> {
+) -> Result<(RegistrationSet, ngp_module_host::ModuleReloadIdentity), CandidatePhaseError> {
     let identity = boundary_call("source_identity", || module.reload_identity())
         .map_err(|error| CandidatePhaseError::attestation(error.to_string()))?;
     let crate_name = &identity.source.crate_name;
@@ -1784,7 +1795,7 @@ fn validate_open_module(
     let registration = registration_arena.registration_set(pipeline_targets);
     validate_registration(&registration, &requirements.targets)
         .map_err(CandidatePhaseError::registration)?;
-    Ok(registration)
+    Ok((registration, identity))
 }
 
 struct CandidatePhaseError {

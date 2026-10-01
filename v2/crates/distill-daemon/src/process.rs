@@ -717,6 +717,22 @@ impl ConfigWatch {
         if !config_changed && !schema_changed && !pipeline_changed && !self.rejected {
             return Ok(false);
         }
+        // A schema write that leaves the Ready pipeline epoch's version key
+        // unchanged (source-walk catching up after an ahead-of-walk
+        // adoption) is observed without republishing: no second epoch, no
+        // loader reconnects, no reimport.
+        if schema_changed && !config_changed && !pipeline_changed && !self.rejected {
+            if let Ok(authority) = &schema.outcome {
+                if coordinator.ready_pipeline_serves_schema(authority) {
+                    tracing::info!(
+                        "schema caught up with the Ready pipeline epoch; nothing to republish"
+                    );
+                    self.observed_schema = Some(schema.state.clone());
+                    self.cached_schema = Some(schema);
+                    return Ok(false);
+                }
+            }
+        }
 
         let input_changed = self.observed.is_none()
             || input_configuration_changed(&self.active, &candidate)
