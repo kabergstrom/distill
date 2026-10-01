@@ -1505,6 +1505,50 @@ fn protocol_epoch_reconnect_fences_old_resolve_and_requires_target_binding() {
 }
 
 #[test]
+fn a_pipeline_epoch_change_is_reported_once_per_rebind() {
+    let token = ModuleEpochToken::new(31);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 31, &token);
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let reconnects = |loader: &mut Loader<MockIo>| {
+        loader
+            .take_diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    LoaderDiagnostic::ReconnectRequired(
+                        distill_loader::ReconnectReason::PipelineEpochChanged
+                    )
+                )
+            })
+            .count()
+    };
+    let _ = loader.take_diagnostics();
+
+    // Every request in flight on the old binding fails with the same reason;
+    // the mock binds the target again after them.
+    for _ in 0..8 {
+        loader.io_mut().push(IoEvent::ReconnectRequired {
+            reason: distill_loader::ReconnectReason::PipelineEpochChanged,
+        });
+    }
+    loader.process(&mut storage).unwrap();
+    assert_eq!(reconnects(&mut loader), 1);
+    // The rebind completes on a later pass.
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.target_binding_state(), TargetBindingState::Bound);
+
+    // The next epoch change, after the rebind, is reported again.
+    loader.io_mut().push(IoEvent::ReconnectRequired {
+        reason: distill_loader::ReconnectReason::PipelineEpochChanged,
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(reconnects(&mut loader), 1);
+}
+
+#[test]
 fn update_callback_failure_poisons_only_the_reported_module_epoch() {
     let token = ModuleEpochToken::new(4);
     let other = ModuleEpochToken::new(5);
