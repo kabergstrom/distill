@@ -384,6 +384,16 @@ impl ProcessLoop {
         let failure_result = coordinator.sync_runtime_pipeline_failure().map(|_| ());
         let result = result.and(failure_result);
         match result {
+            // Another publication (an RPC import, say) moved the input
+            // version between this pass reading its base and committing.
+            // Nothing was published; the retry sees the new base.
+            Err(CoordinatorError::Coordinated(distill_rpc::CoordinatedCommitError::Stale {
+                expected,
+                observed,
+            })) => {
+                tracing::debug!(?expected, ?observed, "reconciliation raced a publication; requeued");
+                self.queue.requeue_action(retry_action);
+            }
             Err(error) => {
                 tracing::warn!(%error, "reconciliation failed; requeued");
                 self.errors.send_replace(Some(error.to_string()));
