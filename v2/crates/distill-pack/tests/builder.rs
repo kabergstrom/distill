@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use distill_build::query::AssetQuery as BuildAssetQuery;
 use distill_build::trace::PackDefinitionControlValue;
@@ -9,7 +10,7 @@ use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
 use distill_pack::builder::{
     build_pack, build_publish_and_activate_pack, decode_pack_definition, PackBuildError,
-    PackBuildTarget,
+    PackBuildOutput, PackBuildTarget,
 };
 use distill_pack::{
     activate, archive_filename, manifest_filename, manifest_hash, publish_archive,
@@ -18,20 +19,22 @@ use distill_pack::{
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
     AuthoringMutation, AuthoringValue, BuildBackend, BuildBackendOutcome, BuildRequest, Commit,
-    ConnectOutcome, ConnectRequest, PathMutation, RpcFailure, RuntimeTypePolicy,
+    ConnectRequest, PathMutation, RpcFailure, RuntimeTypePolicy,
     RuntimeTypePolicyRequest, ServedLoadEdge, Server, StoreInstanceId, StoredResolve,
-    TargetDefinition, TargetDefinitionHash,
+    SnapshotPolicy, TargetDefinition, TargetDefinitionHash,
 };
+use distill_rpc::capnp_loader::{RemoteHub, RemoteSnapshot};
+use distill_rpc::capnp_transport::{CapnpClient, StagedListener};
 use distill_schema::ngp_schema::{node_hash, SchemaNode};
 use distill_wire::artifact::{content_hash, write_artifact, ArtifactHeader};
 use distill_wire::dswl::{dswl_bytes, dswl_hash};
 use distill_wire::wire::WireNode;
+use tokio::task::LocalSet;
 
 const TARGET_HASH: [u8; 32] = [7; 32];
 
 struct Fixture {
-    hub: distill_rpc::Hub,
-    snapshot: distill_rpc::Snapshot,
+    server: Server,
     root: AssetUuid,
     child: AssetUuid,
     target: PackTarget,
@@ -145,18 +148,59 @@ fn fixture_with_policy_and_cycle(build_only: bool, cycle: bool) -> Fixture {
         })
         .unwrap();
 
-    let request = ConnectRequest::new("dev", TargetDefinitionHash(TARGET_HASH));
-    let hub = match server.root().connect(request) {
-        ConnectOutcome::Connected(connected) => connected.hub,
-        other => panic!("connection failed: {other:?}"),
-    };
-    let snapshot = hub.snapshot().success().unwrap();
     Fixture {
-        hub,
-        snapshot,
+        server,
         root,
         child,
         target: PackTarget { name: "dev".into() },
+    }
+}
+
+impl Fixture {
+    /// Serve the fixture over a loopback Cap'n Proto listener and run `body`
+    /// against a snapshot pinned on a remote `dev` hub.
+    fn remote<T>(&self, body: impl AsyncFnOnce(&RemoteSnapshot, &RemoteHub) -> T) -> T {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        LocalSet::new().block_on(&runtime, async {
+            let listener = Rc::new(
+                StagedListener::bind(self.server.root(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
+            let address = listener.local_addr().unwrap();
+            let serving = Rc::clone(&listener);
+            let server_task = tokio::task::spawn_local(async move { serving.serve().await });
+            let client = CapnpClient::connect_local(address).await.unwrap();
+            let request = ConnectRequest::new("dev", TargetDefinitionHash(TARGET_HASH));
+            let hub = RemoteHub::connected(client.connect(&request).await.unwrap()).unwrap();
+            let snapshot = hub.snapshot().await.unwrap().success().unwrap();
+            let result = body(&snapshot, &hub).await;
+            drop(client);
+            server_task.abort();
+            result
+        })
+    }
+
+    fn build(
+        &self,
+        definition: &PackDefinitionControlValue,
+    ) -> Result<PackBuildOutput, PackBuildError> {
+        self.remote(async |snapshot, hub| {
+            build_pack(
+                definition,
+                &PackBuildTarget {
+                    name: "dev".into(),
+                    definition_hash: TARGET_HASH,
+                },
+                "zstd-test",
+                snapshot,
+                hub,
+            )
+            .await
+        })
     }
 }
 
@@ -308,17 +352,7 @@ fn pack_definition_decoder_rejects_noncanonical_or_blob_backed_values() {
 #[test]
 fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
     let fixture = fixture();
-    let output = build_pack(
-        &definition(fixture.root),
-        &PackBuildTarget {
-            name: "dev".into(),
-            definition_hash: TARGET_HASH,
-        },
-        "zstd-test",
-        &fixture.snapshot,
-        &fixture.hub,
-    )
-    .unwrap();
+    let output = fixture.build(&definition(fixture.root)).unwrap();
 
     assert_eq!(output.manifest.assets.len(), 2);
     assert_eq!(output.manifest.assets[0].asset_uuid, fixture.root);
@@ -349,31 +383,28 @@ fn build_pack_pulls_the_typed_closure_and_emits_mountable_files() {
 #[test]
 fn build_publish_and_activate_pack_commits_the_complete_pack() {
     let fixture = fixture();
-    let directory = std::env::temp_dir().join(format!(
-        "distill-pack-build-publish-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&directory).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
 
-    let output = build_publish_and_activate_pack(
-        &directory,
-        &definition(fixture.root),
-        &PackBuildTarget {
-            name: "dev".into(),
-            definition_hash: TARGET_HASH,
-        },
-        "zstd-test",
-        &fixture.snapshot,
-        &fixture.hub,
-    )
-    .unwrap();
+    let output = fixture
+        .remote(async |snapshot, hub| {
+            build_publish_and_activate_pack(
+                directory,
+                &definition(fixture.root),
+                &PackBuildTarget {
+                    name: "dev".into(),
+                    definition_hash: TARGET_HASH,
+                },
+                "zstd-test",
+                snapshot,
+                hub,
+            )
+            .await
+        })
+        .unwrap();
     let manifest_hash = manifest_hash(&output.manifest_bytes);
 
-    assert_eq!(read_current(&directory).unwrap(), manifest_hash);
+    assert_eq!(read_current(directory).unwrap(), manifest_hash);
     assert_eq!(
         fs::read(directory.join(manifest_filename(manifest_hash))).unwrap(),
         output.manifest_bytes
@@ -382,34 +413,23 @@ fn build_publish_and_activate_pack_commits_the_complete_pack() {
         fs::read(directory.join(archive_filename(output.archive_file_hash))).unwrap(),
         output.archive_bytes
     );
-    assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 3);
 
     PackfileIO::mount_current(
-        &directory,
+        directory,
         &RuntimeTarget {
             target: fixture.target.name,
             target_def_hash: TARGET_HASH,
         },
     )
     .unwrap();
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn build_pack_rejects_an_empty_root_selection() {
     let fixture = fixture();
     assert!(matches!(
-        build_pack(
-            &definition(AssetUuid([99; 16])),
-            &PackBuildTarget {
-                name: "dev".into(),
-                definition_hash: TARGET_HASH,
-            },
-            "zstd-test",
-            &fixture.snapshot,
-            &fixture.hub,
-        ),
+        fixture.build(&definition(AssetUuid([99; 16]))),
         Err(PackBuildError::EmptyRoot { index: 0 })
     ));
 }
@@ -420,16 +440,7 @@ fn build_pack_closes_roots_before_rpc_evaluation() {
     let mut definition = definition(fixture.root);
     definition.roots[0].authoring_only = Some(true);
     assert!(matches!(
-        build_pack(
-            &definition,
-            &PackBuildTarget {
-                name: "dev".into(),
-                definition_hash: TARGET_HASH,
-            },
-            "zstd-test",
-            &fixture.snapshot,
-            &fixture.hub,
-        ),
+        fixture.build(&definition),
         Err(PackBuildError::InvalidRoot {
             index: 0,
             error: distill_build::query::IntakeError::AuthoringOnlyRestricted,
@@ -441,16 +452,7 @@ fn build_pack_closes_roots_before_rpc_evaluation() {
 fn build_pack_rejects_build_only_terminal_types_from_the_pinned_policy() {
     let fixture = fixture_with_policy(true);
     assert!(matches!(
-        build_pack(
-            &definition(fixture.root),
-            &PackBuildTarget {
-                name: "dev".into(),
-                definition_hash: TARGET_HASH,
-            },
-            "zstd-test",
-            &fixture.snapshot,
-            &fixture.hub,
-        ),
+        fixture.build(&definition(fixture.root)),
         Err(PackBuildError::BuildOnlyType { type_uuid })
             if type_uuid == TypeUuid([21; 16])
     ));
@@ -460,17 +462,38 @@ fn build_pack_rejects_build_only_terminal_types_from_the_pinned_policy() {
 fn build_pack_rejects_a_strong_reference_cycle_with_the_complete_path() {
     let fixture = fixture_with_policy_and_cycle(false, true);
     assert!(matches!(
-        build_pack(
-            &definition(fixture.root),
-            &PackBuildTarget {
-                name: "dev".into(),
-                definition_hash: TARGET_HASH,
-            },
-            "zstd-test",
-            &fixture.snapshot,
-            &fixture.hub,
-        ),
+        fixture.build(&definition(fixture.root)),
         Err(PackBuildError::LoadCycle { cycle })
             if cycle == vec![fixture.root, fixture.child, fixture.root]
     ));
+}
+
+#[test]
+fn build_pack_answers_an_expired_snapshot_as_a_cache_miss() {
+    let fixture = fixture();
+    fixture
+        .server
+        .install_snapshot_policy(SnapshotPolicy {
+            ttl: Duration::from_millis(50),
+            max_snapshots: 8,
+            max_connections: 8,
+        })
+        .unwrap();
+    let error = fixture
+        .remote(async |snapshot, hub| {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            build_pack(
+                &definition(fixture.root),
+                &PackBuildTarget {
+                    name: "dev".into(),
+                    definition_hash: TARGET_HASH,
+                },
+                "zstd-test",
+                snapshot,
+                hub,
+            )
+            .await
+        })
+        .unwrap_err();
+    assert!(error.is_cache_miss(), "{error:?}");
 }

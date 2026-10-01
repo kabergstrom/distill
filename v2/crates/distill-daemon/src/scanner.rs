@@ -197,7 +197,6 @@ pub struct RootedScanner {
 pub enum DaemonOwnedDirectoryKind {
     State,
     ModuleStaging,
-    PackageOutput,
     CodegenOutput,
 }
 
@@ -206,7 +205,6 @@ impl std::fmt::Display for DaemonOwnedDirectoryKind {
         let name = match self {
             Self::State => "daemon state",
             Self::ModuleStaging => "pipeline module staging",
-            Self::PackageOutput => "package output",
             Self::CodegenOutput => "codegen output",
         };
         formatter.write_str(name)
@@ -708,15 +706,37 @@ impl ScanDelta {
     }
 }
 
-/// A path in the store's encoding: its platform bytes.
+/// A path in the store's encoding: its platform bytes (on Windows, its
+/// UTF-16 code units, little-endian).
+#[cfg(unix)]
 pub(crate) fn encode_path(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
 }
 
+#[cfg(unix)]
 pub(crate) fn decode_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(windows)]
+pub(crate) fn encode_path(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(windows)]
+pub(crate) fn decode_path(bytes: &[u8]) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect();
+    PathBuf::from(OsString::from_wide(&units))
 }
 
 fn encode_raw_path(raw: &PlatformPathBytes) -> Vec<u8> {
@@ -772,7 +792,7 @@ fn encode_diagnostic(diagnostic: &ScanDiagnostic) -> Vec<u8> {
             out.push(match kind {
                 DaemonOwnedDirectoryKind::State => 0,
                 DaemonOwnedDirectoryKind::ModuleStaging => 1,
-                DaemonOwnedDirectoryKind::PackageOutput => 2,
+                // 2 was the in-process pack's package output.
                 DaemonOwnedDirectoryKind::CodegenOutput => 3,
             });
         }
@@ -804,7 +824,6 @@ fn decode_diagnostic(bytes: &[u8]) -> Option<ScanDiagnostic> {
             let kind = match input {
                 [0] => DaemonOwnedDirectoryKind::State,
                 [1] => DaemonOwnedDirectoryKind::ModuleStaging,
-                [2] => DaemonOwnedDirectoryKind::PackageOutput,
                 [3] => DaemonOwnedDirectoryKind::CodegenOutput,
                 _ => return None,
             };
@@ -2118,7 +2137,7 @@ fn open_scanned_child(
         path: canonical_path.clone(),
         source,
     })?;
-    let file = File::open(&path).map_err(|source| ScanError::Io {
+    let file = open_entry(&path).map_err(|source| ScanError::Io {
         path: physical.to_path_buf(),
         source,
     })?;
@@ -2162,6 +2181,24 @@ fn open_scanned_child(
         identity,
         symlink_identity,
     })
+}
+
+/// Open a scanned file or directory for reading.
+#[cfg(not(windows))]
+fn open_entry(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+/// Open a scanned file or directory for reading: a directory opens only
+/// with backup semantics.
+#[cfg(windows)]
+fn open_entry(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 fn record_daemon_owned_diagnostic(
@@ -2305,9 +2342,16 @@ fn canonicalize_roots(
     Ok(roots)
 }
 
+#[cfg(unix)]
 fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
     use std::os::unix::ffi::OsStrExt;
     distill_store::state::PlatformPathBytes::Unix(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn platform_path_bytes(path: &Path) -> distill_store::state::PlatformPathBytes {
+    use std::os::windows::ffi::OsStrExt;
+    distill_store::state::PlatformPathBytes::Windows(path.as_os_str().encode_wide().collect())
 }
 
 fn raw_relative_path(
@@ -2323,11 +2367,22 @@ fn raw_relative_path(
     platform_path_bytes(relative)
 }
 
+/// A raw path of this platform's kind; another platform's is `None`.
+#[cfg(unix)]
 fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     match raw {
         PlatformPathBytes::Unix(bytes) => Some(PathBuf::from(OsString::from_vec(bytes.clone()))),
         PlatformPathBytes::Windows(_) => None,
+    }
+}
+
+#[cfg(windows)]
+fn platform_path(raw: &PlatformPathBytes) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    match raw {
+        PlatformPathBytes::Unix(_) => None,
+        PlatformPathBytes::Windows(units) => Some(PathBuf::from(OsString::from_wide(units))),
     }
 }
 
@@ -2408,16 +2463,38 @@ fn normalize_scanned_component(
     })
 }
 
+#[cfg(unix)]
 fn os_sort_key(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     value.as_bytes().to_vec()
 }
 
+/// UTF-16 code units, big-endian, so the bytes order as the units do.
+#[cfg(windows)]
+fn os_sort_key(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().flat_map(u16::to_be_bytes).collect()
+}
+
+#[cfg(unix)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
     FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+    }
+}
+
+/// Stable std has no file index on Windows (`windows_by_handle`); the
+/// creation time stands in for it. A replacement within the tunneling window
+/// can keep a name's creation time, so the length and modification-time
+/// checks back it up where a read must not straddle a replacement.
+#[cfg(windows)]
+fn file_identity(metadata: &Metadata) -> FileIdentity {
+    use std::os::windows::fs::MetadataExt;
+    FileIdentity {
+        device: 0,
+        inode: metadata.creation_time(),
     }
 }
 

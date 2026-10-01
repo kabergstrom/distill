@@ -1773,12 +1773,6 @@ impl Snapshot {
         self.resolve_with_work_class(uuid, BuildWorkClass::Interactive)
     }
 
-    /// Resolve work initiated by an offline pack/doctor traversal. The result
-    /// is identical to [`Self::resolve`]; only scheduler admission differs.
-    pub fn resolve_batch(&self, uuid: AssetUuid) -> RpcResult<TerminalEvent<ResolveResult>> {
-        self.resolve_with_work_class(uuid, BuildWorkClass::Batch)
-    }
-
     fn resolve_with_work_class(
         &self,
         uuid: AssetUuid,

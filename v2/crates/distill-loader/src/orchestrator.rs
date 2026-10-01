@@ -400,6 +400,10 @@ pub struct Loader<I: LoaderIO> {
     next_handle: u64,
     next_adoption: u64,
     target_binding: TargetBindingState,
+    /// Reason last reported since the target was last bound: the requests
+    /// in flight on the old binding each fail with the same reason, and one
+    /// diagnostic per rebind is enough.
+    reported_reconnect: Option<ReconnectReason>,
     registered_target: Option<RuntimeTarget>,
     draining: BTreeSet<GameModuleEpoch>,
 }
@@ -427,6 +431,7 @@ impl<I: LoaderIO> Loader<I> {
             next_handle: 1,
             next_adoption: 1,
             target_binding: TargetBindingState::Required,
+            reported_reconnect: None,
             registered_target: None,
             draining: BTreeSet::new(),
         }
@@ -1110,8 +1115,11 @@ impl<I: LoaderIO> Loader<I> {
     ) -> Result<(), LoaderError> {
         match event {
             IoEvent::ReconnectRequired { reason } => {
-                self.diagnostics
-                    .push(LoaderDiagnostic::ReconnectRequired(reason));
+                if self.reported_reconnect != Some(reason) {
+                    self.reported_reconnect = Some(reason);
+                    self.diagnostics
+                        .push(LoaderDiagnostic::ReconnectRequired(reason));
+                }
                 for entry in self.manifest.values_mut() {
                     if let ManifestState::Current { content_hash } = entry.state {
                         entry.state = ManifestState::Invalidated { last: content_hash };
@@ -1140,6 +1148,7 @@ impl<I: LoaderIO> Loader<I> {
                     return Ok(());
                 }
                 self.target_binding = TargetBindingState::Bound;
+                self.reported_reconnect = None;
             }
             IoEvent::TargetRejected { message } => {
                 self.diagnostics.push(LoaderDiagnostic::Io(format!(

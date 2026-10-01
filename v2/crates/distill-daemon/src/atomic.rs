@@ -172,6 +172,13 @@ fn write_temp(temp: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
     file.sync_all().map_err(io)
 }
 
+/// Windows has no directory fsync (NTFS journals directory entries).
+#[cfg(windows)]
+fn sync_dir(_path: &Path) -> Result<(), AtomicWriteError> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn sync_dir(path: &Path) -> Result<(), AtomicWriteError> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())

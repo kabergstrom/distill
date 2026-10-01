@@ -21,7 +21,6 @@ use distill_store::state::{
 use crate::codegen::CodegenService;
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
-use crate::scanner::DaemonOwnedDirectoryKind;
 use crate::watcher::{
     WatcherAction, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink, WatcherStartError,
     WatcherThread,
@@ -57,28 +56,6 @@ impl DaemonProcess {
     /// Start from the configured shared schema artifact. Production never
     /// substitutes the bootstrap-only table for `assets.schema_path`.
     pub fn start(config: DaemonConfig) -> Result<Self, DaemonProcessError> {
-        Self::start_internal(config, true, Vec::new())
-    }
-
-    pub(crate) fn start_for_pack(
-        config: DaemonConfig,
-        package_output: &Path,
-    ) -> Result<Self, DaemonProcessError> {
-        Self::start_internal(
-            config,
-            false,
-            vec![(
-                DaemonOwnedDirectoryKind::PackageOutput,
-                package_output.to_path_buf(),
-            )],
-        )
-    }
-
-    fn start_internal(
-        config: DaemonConfig,
-        serve_rpc: bool,
-        daemon_owned: Vec<(DaemonOwnedDirectoryKind, PathBuf)>,
-    ) -> Result<Self, DaemonProcessError> {
         let schema_bytes = std::fs::read(&config.assets.schema_path).map_err(|source| {
             DaemonProcessError::SchemaRead {
                 path: config.assets.schema_path.clone(),
@@ -86,21 +63,12 @@ impl DaemonProcess {
             }
         })?;
         let authority = ProjectSchemaAuthority::from_json(&schema_bytes)?;
-        Self::start_with_authority_internal(config, authority, serve_rpc, daemon_owned)
+        Self::start_with_authority(config, authority)
     }
 
     pub fn start_with_authority(
         config: DaemonConfig,
         authority: ProjectSchemaAuthority,
-    ) -> Result<Self, DaemonProcessError> {
-        Self::start_with_authority_internal(config, authority, true, Vec::new())
-    }
-
-    fn start_with_authority_internal(
-        config: DaemonConfig,
-        authority: ProjectSchemaAuthority,
-        serve_rpc: bool,
-        daemon_owned: Vec<(DaemonOwnedDirectoryKind, PathBuf)>,
     ) -> Result<Self, DaemonProcessError> {
         let targets = config.target_definitions(authority.identity())?;
         let coordinator = Arc::new(DaemonCoordinator::open(
@@ -109,16 +77,9 @@ impl DaemonProcess {
             targets,
             config.pipeline.max_dependency_depth,
         )?);
-        for (kind, path) in daemon_owned {
-            coordinator
-                .scanner()
-                .retain_daemon_owned_directory(kind, path)
-                .map_err(|error| {
-                    DaemonProcessError::CoordinatorInit(CoordinatorInitError::Scan(error))
-                })?;
-        }
         coordinator.attach_build_backend();
-        let config_watch = ConfigWatch::new(config.clone());
+        let mut config_watch = ConfigWatch::new(config.clone());
+        config_watch.rebuilder = Some(crate::rebuild::Rebuilder::start(config.rebuild.clone()));
         let (inbox, messages) = mpsc::channel();
         let sink: WatcherSink = {
             let inbox = inbox.clone();
@@ -166,6 +127,7 @@ impl DaemonProcess {
                 coordinator.server_handle().snapshot_policy().ttl + CAS_DELETE_MARGIN,
             ),
             next_cas_pass: Instant::now() + CAS_PASS_INTERVAL,
+            capabilities_pending: false,
         };
         // Startup runs on the loop thread before the loop: events the
         // watcher sends meanwhile wait in its inbox.
@@ -198,25 +160,23 @@ impl DaemonProcess {
         };
         startup?;
 
-        if serve_rpc {
-            let (address_tx, address_rx) = mpsc::sync_channel(1);
-            let rpc_thread = spawn_rpc_loop(
-                process.coordinator.server().root(),
-                config.daemon.address,
-                Arc::clone(&process.stop),
-                address_tx,
-            );
-            process.rpc_thread = Some(rpc_thread);
-            process.rpc_address = match address_rx.recv() {
-                Ok(Ok(address)) => address,
-                Ok(Err(error)) => return Err(DaemonProcessError::Rpc(error)),
-                Err(error) => {
-                    return Err(DaemonProcessError::Rpc(format!(
-                        "RPC startup channel closed: {error}"
-                    )))
-                }
-            };
-        }
+        let (address_tx, address_rx) = mpsc::sync_channel(1);
+        let rpc_thread = spawn_rpc_loop(
+            process.coordinator.server().root(),
+            config.daemon.address,
+            Arc::clone(&process.stop),
+            address_tx,
+        );
+        process.rpc_thread = Some(rpc_thread);
+        process.rpc_address = match address_rx.recv() {
+            Ok(Ok(address)) => address,
+            Ok(Err(error)) => return Err(DaemonProcessError::Rpc(error)),
+            Err(error) => {
+                return Err(DaemonProcessError::Rpc(format!(
+                    "RPC startup channel closed: {error}"
+                )))
+            }
+        };
         Ok(process)
     }
 
@@ -336,6 +296,11 @@ struct ProcessLoop {
     next_idle_pass: Instant,
     cas_sweeper: SegmentSweeper,
     next_cas_pass: Instant,
+    /// An accepted configuration candidate changed the importer registry or
+    /// its capabilities, and the capability-driven reimport has not yet
+    /// completed. A requeued pass keeps it: the configuration watch reports
+    /// the change only once.
+    capabilities_pending: bool,
 }
 
 impl ProcessLoop {
@@ -402,6 +367,10 @@ impl ProcessLoop {
             }
             None => Ok(false),
         }
+        .map(|changed| {
+            self.capabilities_pending |= changed;
+            self.capabilities_pending
+        })
         .and_then(|capabilities_changed| match action {
             WatcherAction::None => Ok(()),
             WatcherAction::Batch(batch) => coordinator
@@ -415,12 +384,23 @@ impl ProcessLoop {
         let failure_result = coordinator.sync_runtime_pipeline_failure().map(|_| ());
         let result = result.and(failure_result);
         match result {
+            // Another publication (an RPC import, say) moved the input
+            // version between this pass reading its base and committing.
+            // Nothing was published; the retry sees the new base.
+            Err(CoordinatorError::Coordinated(distill_rpc::CoordinatedCommitError::Stale {
+                expected,
+                observed,
+            })) => {
+                tracing::debug!(?expected, ?observed, "reconciliation raced a publication; requeued");
+                self.queue.requeue_action(retry_action);
+            }
             Err(error) => {
                 tracing::warn!(%error, "reconciliation failed; requeued");
                 self.errors.send_replace(Some(error.to_string()));
                 self.queue.requeue_action(retry_action);
             }
             Ok(()) => {
+                self.capabilities_pending = false;
                 if reconciled {
                     tracing::info!(elapsed = ?started.elapsed(), "reconciled");
                 }
@@ -584,6 +564,8 @@ struct ConfigWatch {
     cached_pipeline: Option<ArtifactSourceState>,
     rejected: bool,
     source_rejected: bool,
+    /// Runs the active configuration's `[[rebuild]]` jobs.
+    rebuilder: Option<crate::rebuild::Rebuilder>,
 }
 
 impl ConfigWatch {
@@ -599,6 +581,21 @@ impl ConfigWatch {
             cached_pipeline: None,
             rejected: false,
             source_rejected: false,
+            rebuilder: None,
+        }
+    }
+
+    /// Adopt the `[[rebuild]]` jobs of an accepted configuration. They
+    /// depend on neither the schema nor the pipeline module (they build
+    /// those), so they follow the configuration even while either is
+    /// rejected.
+    fn adopt_rebuild_jobs(&mut self, candidate: &DaemonConfig) {
+        if self.active.rebuild == candidate.rebuild {
+            return;
+        }
+        self.active.rebuild = candidate.rebuild.clone();
+        if let Some(rebuilder) = &self.rebuilder {
+            rebuilder.jobs().replace(candidate.rebuild.clone());
         }
     }
 
@@ -659,6 +656,10 @@ impl ConfigWatch {
                 if self.observed.as_ref() == Some(&observation.state) {
                     return Ok(false);
                 }
+                tracing::warn!(
+                    %message,
+                    "configuration rejected; the active one (and its rebuild jobs) stays"
+                );
                 coordinator.publish_configuration_rejection(reason, message)?;
                 self.rejected = true;
                 self.source_rejected = true;
@@ -697,6 +698,7 @@ impl ConfigWatch {
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
         if invalidation.configuration {
+            self.adopt_rebuild_jobs(&candidate);
             watcher
                 .replace_paths([
                     self.path.clone(),
@@ -723,6 +725,48 @@ impl ConfigWatch {
         let schema_changed = self.observed_schema.as_ref() != Some(&schema.state);
         let pipeline_changed = self.observed_pipeline.as_ref() != Some(&pipeline_state);
         if !config_changed && !schema_changed && !pipeline_changed && !self.rejected {
+            return Ok(false);
+        }
+        tracing::debug!(
+            config_changed,
+            schema_changed,
+            pipeline_changed,
+            rejected = self.rejected,
+            ?invalidation,
+            ?pipeline_state,
+            "configuration inputs observed"
+        );
+        // Schema or pipeline writes that leave the Ready pipeline epoch as it
+        // is (the same module bytes, and a schema with the same version key:
+        // source-walk catching up after an ahead-of-walk adoption, in either
+        // order with the dylib event) are observed without republishing: no
+        // second epoch, no loader reconnects, no reimport.
+        if !config_changed && !self.rejected {
+            if let (Ok(authority), ArtifactSourceState::Bytes(dylib_hash)) =
+                (&schema.outcome, &pipeline_state)
+            {
+                if coordinator.ready_pipeline_serves(authority, *dylib_hash) {
+                    tracing::info!("the Ready pipeline epoch already serves these inputs");
+                    self.observed_schema = Some(schema.state.clone());
+                    self.observed_pipeline = Some(pipeline_state.clone());
+                    self.cached_schema = Some(schema);
+                    self.cached_pipeline = Some(pipeline_state);
+                    return Ok(false);
+                }
+            }
+        }
+        // cargo replaces the dylib by removing it and linking the new one;
+        // a pass between the two sees no module. With a Ready epoch to keep
+        // serving, that is not a failure: the observed state stays, so the
+        // module's reappearance (or any other write) retries the candidate.
+        if !config_changed
+            && !self.rejected
+            && pipeline_state == ArtifactSourceState::Missing
+            && coordinator.has_ready_pipeline()
+        {
+            tracing::info!("pipeline module is missing; the Ready epoch serves until it reappears");
+            self.cached_schema = Some(schema);
+            self.cached_pipeline = Some(pipeline_state);
             return Ok(false);
         }
 
@@ -789,7 +833,7 @@ impl ConfigWatch {
                         return Ok(false);
                     }
                 };
-                coordinator.publish_configuration_candidate(
+                let published = coordinator.publish_configuration_candidate(
                     crate::coordinator::ConfigurationCandidate {
                         roots: candidate.asset_roots(),
                         targets: staged.targets,
@@ -798,7 +842,22 @@ impl ConfigWatch {
                         requirements: staged.requirements,
                         schema_authority: Arc::clone(authority),
                     },
-                )?;
+                );
+                match published {
+                    Err(CoordinatorError::PipelineAwaitingSchema(detail)) => {
+                        // Not a failure: the Ready epoch keeps serving. The
+                        // observed state stays, so the schema write
+                        // source-walk is about to make re-runs this whole
+                        // candidate; the caches hold what was just read.
+                        tracing::warn!(%detail, "pipeline candidate waits for source-walk");
+                        self.cached_schema = Some(schema.clone());
+                        self.cached_pipeline = Some(pipeline_state);
+                        return Ok(false);
+                    }
+                    published => {
+                        published?;
+                    }
+                }
             }
             Ok(_) if self.rejected => {
                 coordinator.heal_configuration_rejection()?;
@@ -988,9 +1047,16 @@ fn apply_live_values(active: &mut DaemonConfig, candidate: &DaemonConfig) {
     active.cas = candidate.cas.clone();
 }
 
+#[cfg(unix)]
 fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
     use std::os::unix::ffi::OsStrExt;
     ConfigurationSourcePath::Unix(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
+    use std::os::windows::ffi::OsStrExt;
+    ConfigurationSourcePath::Windows(path.as_os_str().encode_wide().collect())
 }
 
 fn reconcile_imports(

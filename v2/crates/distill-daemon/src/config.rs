@@ -29,7 +29,8 @@ pub struct DaemonConfig {
     pub codegen: CodegenSection,
     pub pipeline: PipelineSection,
     pub cas: CasSection,
-    /// Rebuild-on-save jobs (`crate::rebuild`); read at startup only.
+    /// Rebuild-on-save jobs (`crate::rebuild`); a serving daemon follows
+    /// them as the configuration changes.
     pub rebuild: Vec<RebuildJob>,
 }
 
@@ -197,6 +198,8 @@ enum RawTargetOs {
     Linux,
     Macos,
     Windows,
+    /// The daemon's own.
+    Host,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -205,6 +208,9 @@ enum RawTargetArch {
     Aarch64,
     #[serde(rename = "x86_64")]
     X86_64,
+    /// The daemon's own.
+    #[serde(rename = "host")]
+    Host,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +275,7 @@ impl DaemonConfig {
         let roots = normalize_paths("asset root", raw.assets.roots, base, true)?;
         let state_path = resolve(base, &raw.daemon.state_path)?;
         let schema_path = resolve(base, &raw.assets.schema_path)?;
-        let pipeline_dylib = resolve(base, &raw.modules.pipeline_dylib)?;
+        let pipeline_dylib = resolve(base, &library_path(&raw.modules.pipeline_dylib))?;
         let rs_mod_path = resolve(base, &raw.codegen.rs_mod_path)?;
 
         for root in roots.values() {
@@ -468,6 +474,7 @@ impl DaemonConfig {
         Ok(CandidateRequirements {
             module_abi: host_module_abi_identity(),
             source_hashes: authority.schema().source_hashes.clone(),
+            layout_hashes: authority.schema().layout_hashes.clone(),
             schema_registry: authority
                 .logical_registry()
                 .map_err(|error| DaemonConfigError::Target(error.to_string()))?,
@@ -508,6 +515,7 @@ impl DaemonConfig {
         let requirements = CandidateRequirements {
             module_abi: host_module_abi_identity(),
             source_hashes: authority.schema().source_hashes.clone(),
+            layout_hashes: authority.schema().layout_hashes.clone(),
             schema_registry,
             targets: targets
                 .iter()
@@ -579,10 +587,11 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
         }
     }
 
+    let pipeline_dylib = library_path(&raw.modules.pipeline_dylib);
     let controlled = [
         ("daemon.state_path", &raw.daemon.state_path),
         ("assets.schema_path", &raw.assets.schema_path),
-        ("modules.pipeline_dylib", &raw.modules.pipeline_dylib),
+        ("modules.pipeline_dylib", &pipeline_dylib),
         ("codegen.rs_mod_path", &raw.codegen.rs_mod_path),
     ]
     .into_iter()
@@ -825,10 +834,12 @@ fn normalize_targets(
                         RawTargetOs::Linux => TargetOs::Linux,
                         RawTargetOs::Macos => TargetOs::MacOs,
                         RawTargetOs::Windows => TargetOs::Windows,
+                        RawTargetOs::Host => host_target_os()?,
                     },
                     arch: match raw.arch {
                         RawTargetArch::Aarch64 => TargetArch::Aarch64,
                         RawTargetArch::X86_64 => TargetArch::X86_64,
+                        RawTargetArch::Host => host_target_arch()?,
                     },
                     apis,
                     optimize: raw.optimize,
@@ -879,6 +890,40 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), DaemonConfigError
         });
     }
     Ok(())
+}
+
+/// `{DLL_PREFIX}` and `{DLL_SUFFIX}` in a module path stand for the host's
+/// shared-library affixes (`lib`, `.so` on Linux; none, `.dll` on Windows),
+/// so one configuration names a cargo cdylib on every host.
+fn library_path(path: &Path) -> PathBuf {
+    match path.to_str() {
+        Some(text) if text.contains('{') => PathBuf::from(
+            text.replace("{DLL_PREFIX}", std::env::consts::DLL_PREFIX)
+                .replace("{DLL_SUFFIX}", std::env::consts::DLL_SUFFIX),
+        ),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The OS a `host` target names: the daemon's.
+fn host_target_os() -> Result<TargetOs, DaemonConfigError> {
+    match std::env::consts::OS {
+        "linux" => Ok(TargetOs::Linux),
+        "macos" => Ok(TargetOs::MacOs),
+        "windows" => Ok(TargetOs::Windows),
+        os => Err(DaemonConfigError::Target(format!("host OS {os} is no target OS"))),
+    }
+}
+
+/// The architecture a `host` target names: the daemon's.
+fn host_target_arch() -> Result<TargetArch, DaemonConfigError> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok(TargetArch::X86_64),
+        "aarch64" => Ok(TargetArch::Aarch64),
+        arch => Err(DaemonConfigError::Target(format!(
+            "host architecture {arch} is no target architecture"
+        ))),
+    }
 }
 
 fn rebuild_jobs(raw: Vec<RawRebuild>, base: &Path) -> Result<Vec<RebuildJob>, DaemonConfigError> {
@@ -1034,5 +1079,47 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn host_targets_and_library_affixes_follow_the_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("assets")).unwrap();
+        let source = r#"
+[daemon]
+address = "127.0.0.1:0"
+state_path = "state"
+[assets]
+roots = { main = "assets" }
+schema_path = "schema.json"
+[modules]
+pipeline_dylib = "target/{DLL_PREFIX}pipeline{DLL_SUFFIX}"
+[targets.dev]
+os = "host"
+arch = "host"
+apis = ["vulkan"]
+[codegen]
+rs_mod_path = "generated"
+auto_codegen = false
+[pipeline]
+parallelism = 2
+batch_reserved_workers = 1
+[cas]
+segment_size = "1MiB"
+cache_limit = "8MiB"
+"#;
+        let config = DaemonConfig::parse(temp.path().join("distill.toml"), source).unwrap();
+        let dylib = config.modules.pipeline_dylib.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            dylib,
+            format!("{}pipeline{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX)
+        );
+        let target = &config.targets["dev"];
+        assert_eq!(target.os, host_target_os().unwrap());
+        assert_eq!(target.arch, host_target_arch().unwrap());
+        assert_eq!(
+            target.os,
+            if cfg!(windows) { TargetOs::Windows } else if cfg!(target_os = "macos") { TargetOs::MacOs } else { TargetOs::Linux }
+        );
     }
 }

@@ -210,9 +210,11 @@ fn ambient_tool_runs_directly_and_trust_controls_memoization() {
 #[test]
 fn tool_output_is_drained_while_large_stdin_is_written() {
     let (directory, mut store) = new_store();
+    // Tools run with a cleared environment (no PATH), so only shell builtins.
     let script = br#"#!/bin/sh
-head -c 262144 /dev/zero
-cat >/dev/null
+i=0
+while [ "$i" -lt 4096 ]; do printf %064d 0; i=$((i + 1)); done
+while IFS= read -r _; do :; done
 "#;
     store
         .input_transaction(|txn| {

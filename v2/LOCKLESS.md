@@ -197,11 +197,30 @@ a connection of its own, and SQLite's write lock orders the writers.
 - **CAS reclamation** deletes a retired segment once no read transaction
   can still see it: the daemon waits the snapshot TTL plus a margin.
 - **Module epochs** unload when the last clone of their token drops.
-- **rebuild** (`distilld` only, when the config has `[[rebuild]]` jobs)
-  watches each job's dep-info inputs with its own `notify` watcher and
-  runs the job's steps as child processes, one at a time. It touches no
-  store state: the daemon adopts the pipeline module and schema the steps
-  write through the ordinary watch.
+- **Pipeline swaps** use New Game Plus's reload gate
+  (`ngp_module_host::SourceGate`). A candidate module whose source hash is
+  the watched schema's loads. One whose source is ahead of the schema but
+  whose layout hash (`__ngp_layout_hash`: the crate with non-const fn items
+  stripped) equals the schema's `layout_hashes` entry loads ahead of
+  source-walk. Any other mismatch leaves the candidate pending while a Ready
+  epoch keeps serving: no input version, no pipeline generation bump, and
+  the next schema or module write retries it. Without a Ready epoch, or for
+  a crate the schema lacks, it is a `CandidateAttestation` failure.
+  A schema write that leaves the Ready epoch's version key
+  (`ModuleReloadIdentity::version_key`: the module's own source hash, the
+  other crates' source hashes, the layout hashes, plus the rest of the
+  schema) unchanged, as source-walk catching up after an ahead-of-walk
+  adoption does, is observed without republishing, as is a pipeline write
+  of the bytes the Ready epoch was staged from. A missing pipeline module
+  (cargo removes the dylib before linking the new one) leaves the Ready
+  epoch serving until it reappears.
+- **rebuild** (a serving `distilld`) runs the configuration's `[[rebuild]]`
+  jobs: it watches each job's dep-info inputs with its own `notify` watcher
+  and runs the job's steps as child processes, one at a time (in a process
+  group on Unix, a kill-on-close job object on Windows). The process loop
+  sends it each accepted configuration's jobs over its channel; it touches
+  no store state: the daemon adopts the pipeline module and schema the
+  steps write through the ordinary watch.
 - The only atomics are ID and temp-name sequences.
 
 ## 4. Error model: per-entity rows instead of poisons
@@ -760,12 +779,17 @@ should reach zero by the end of phase 6.
     - Tag-index refinement, build commits and `DeferredOperation`
       completion run inside the input transaction. The front end's
       build-result cache stays.
-    - `distilld pack` against a running daemon fails with `StateLocked`
-      (the state directory's process lock).
+    - `distilld pack` is an RPC client of the running daemon (fixed
+      `daemon.address`, as `import`); with no daemon it says to start
+      one. It reads the PackDefinition on the metadata hub and builds on
+      the definition's target hub: `resolve` with `batch` set,
+      `runtimeTypePolicy`, `query`, `entry` (PROTOCOL_VERSION 10). The
+      in-process pack path is gone. The daemon does not own the output
+      directory, so it must lie outside every asset root.
     - Snapshots of one version on one front end share a `SnapshotTxn`;
       each capability has its own expiry.
-    - Only the capnp transport arms expiry. In-process callers (pack,
-      tests) release on drop.
+    - Only the capnp transport arms expiry. In-process callers (tests)
+      release on drop.
     - The snapshot policy is per front end: a test installs it on the
       serving thread's front end.
     - Hub connections no longer time out; the connection bound closes

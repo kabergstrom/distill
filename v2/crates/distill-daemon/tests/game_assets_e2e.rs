@@ -7,17 +7,15 @@ use std::time::{Duration, Instant};
 
 use distill_asset::{AssetType, ErasedValue, ModuleEpochToken};
 use distill_build::keys::target_definition_hash;
-use distill_build::query::AssetQuery;
-use distill_build::trace::PackDefinitionControlValue;
-use distill_core::id::{AssetUuid, ContentHash, TypeUuid};
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, TypeUuid};
 use distill_daemon::config::DaemonConfig;
+use distill_daemon::pack_command::{build_configured_pack, PackCommandError};
 use distill_daemon::process::DaemonProcess;
 use distill_json::AuthoredValue;
 use distill_loader::{
     AdoptionId, AssetStorage, GameModuleEpoch, HandleId, LoadStatus, Loader, LoaderDiagnostic,
     PendingState, PendingToken, RpcIo, StorageError, UpdateResult,
 };
-use distill_pack::builder::{build_publish_and_activate_pack, PackBuildTarget};
 use distill_pack::{PackfileIO, RuntimeTarget as PackRuntimeTarget};
 use distill_rpc::{
     AuthoringValue, ConnectOutcome, ConnectRequest, ImportRequest, ResolveResult,
@@ -37,6 +35,9 @@ const MESH_SOURCE_TYPE: TypeUuid = TypeUuid([0x92; 16]);
 const SHADER_SOURCE_TYPE: TypeUuid = TypeUuid([0x93; 16]);
 
 use newgameplus_assets::{CookedPipeline, MeshAsset, TextureAsset};
+
+#[path = "support/pack_definition.rs"]
+mod pack_definition;
 
 #[repr(C)]
 struct FixtureSettings {
@@ -237,41 +238,32 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
             if members.contains(&texture) || members.contains(&mesh)
     )));
 
-    let hub = match process
-        .coordinator()
-        .server()
-        .root()
-        .connect(request.clone())
-    {
-        ConnectOutcome::Connected(connected) => connected.hub,
-        other => panic!("pack connection failed: {other:?}"),
-    };
-    let snapshot = hub.snapshot().success().unwrap();
-    let definition = PackDefinitionControlValue {
-        roots: [texture, mesh, shader]
-            .into_iter()
-            .map(|uuid| AssetQuery {
-                uuid: Some(uuid),
-                ..AssetQuery::default()
-            })
-            .collect(),
-        target: "dev".into(),
-        zstd_level: 1,
-        include_path_table: false,
-    };
-    let pack_dir = tempfile::tempdir().unwrap();
-    let output = build_publish_and_activate_pack(
-        pack_dir.path(),
-        &definition,
-        &PackBuildTarget {
-            name: "dev".into(),
-            definition_hash: target_hash,
-        },
-        "game-assets-smoke",
-        &snapshot,
-        &hub,
+    // `distilld pack` runs as a client of this serving daemon, from a
+    // PackDefinition authored in the asset root.
+    let definition = AssetUuid([0xd1; 16]);
+    std::fs::write(
+        assets.join("game.pack.bundle"),
+        pack_definition::pack_definition_bundle(
+            BundleUuid([0xd0; 16]),
+            definition,
+            "dev",
+            &[texture, mesh, shader],
+            false,
+        ),
     )
     .unwrap();
+    let mut client_config = config.clone();
+    client_config.daemon.address = process.rpc_address();
+    let pack_dir = tempfile::tempdir().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let output = loop {
+        match build_configured_pack(&client_config, definition, pack_dir.path()) {
+            Err(PackCommandError::MissingDefinition(_)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => break result.unwrap(),
+        }
+    };
     assert_eq!(output.manifest.assets.len(), 3);
     assert!(
         output.manifest.paths.is_none(),
@@ -326,9 +318,20 @@ fn assert_loaded_game_assets(
     let texture = value_for(texture_handle)
         .downcast_ref::<TextureAsset>()
         .expect("texture terminal value used the wrong native type");
-    assert_eq!((texture.width, texture.height), (1, 1));
+    // The fixture cooks the pixel into a 2x2 texture with its 1x1 mip.
+    assert_eq!((texture.width, texture.height, texture.depth), (2, 2, 1));
+    assert_eq!((texture.array_layers, texture.mip_count), (1, 2));
+    assert_eq!(texture.dimension, newgameplus_assets::TEXTURE_DIMENSION_2D);
     assert_eq!(texture.format, newgameplus_assets::FORMAT_R8G8B8A8_UNORM);
-    assert_eq!(texture.data.as_bytes(), [255, 0, 0, 255]);
+    assert_eq!(texture.data.as_bytes(), [255, 0, 0, 255].repeat(5));
+    let layout = texture
+        .layout(newgameplus_assets::format::block(texture.format).unwrap())
+        .unwrap();
+    assert_eq!(layout.total_len, texture.data.len() as u64);
+    assert_eq!(
+        (layout.subresources[1].mip, layout.subresources[1].offset),
+        (1, 16)
+    );
 
     let mesh = value_for(mesh_handle)
         .downcast_ref::<MeshAsset>()
@@ -636,6 +639,10 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
             fields: vec![
                 field("width", 3),
                 field("height", 3),
+                field("depth", 3),
+                field("array_layers", 3),
+                field("mip_count", 3),
+                field("dimension", 0),
                 field("format", 0),
                 Field {
                     attrs: FieldAttrs {
@@ -758,6 +765,22 @@ fn fixture_schema(source_identity: (String, String)) -> Schema {
                             TextureAsset,
                             height
                         )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            depth
+                        )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            array_layers
+                        )),
+                        layout_field::<TextureAsset, u32>(std::mem::offset_of!(
+                            TextureAsset,
+                            mip_count
+                        )),
+                        layout_field::<TextureAsset, u8>(std::mem::offset_of!(
+                            TextureAsset,
+                            dimension
+                        )),
                         layout_field::<TextureAsset, u8>(std::mem::offset_of!(
                             TextureAsset,
                             format
@@ -861,19 +884,19 @@ fn write_config(
         r#"
 [daemon]
 address = "127.0.0.1:0"
-state_path = "{}"
+state_path = '{}'
 [assets]
-roots = {{ main = "{}" }}
-schema_path = "{}"
+roots = {{ main = '{}' }}
+schema_path = '{}'
 [modules]
-pipeline_dylib = "{}"
+pipeline_dylib = '{}'
 [targets.dev]
 os = "{}"
 arch = "{}"
 apis = ["vulkan"]
 optimize = false
 [codegen]
-rs_mod_path = "{}"
+rs_mod_path = '{}'
 auto_codegen = false
 [pipeline]
 parallelism = 2

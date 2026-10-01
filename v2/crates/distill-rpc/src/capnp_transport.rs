@@ -53,11 +53,15 @@ const RPC_FAILURE: u16 = 3000;
 pub const ARTIFACT_NOT_FOUND: u16 = 3001;
 /// `RpcError.code` of a call on a connection closed to admit a newer one.
 pub const CONNECTION_CLOSED: u16 = 3002;
+/// `RpcError.code` of an `entry` whose asset has no runtime entry (absent,
+/// authoring-only, or a derived output).
+pub const ASSET_NOT_FOUND: u16 = 3003;
 
 fn failure_code(error: &RpcFailure) -> u16 {
     match error {
         RpcFailure::ArtifactNotFound { .. } => ARTIFACT_NOT_FOUND,
         RpcFailure::ConnectionClosed => CONNECTION_CLOSED,
+        RpcFailure::AssetNotFound { .. } => ASSET_NOT_FOUND,
         _ => RPC_FAILURE,
     }
 }
@@ -867,22 +871,25 @@ impl schema::snapshot::Server for SnapshotService {
                 );
                 return Ok(());
             }
-            let uuid = match decode_uuid(params.get()?.get_uuid()?, "uuid") {
+            let params = params.get()?;
+            let uuid = match decode_uuid(params.get_uuid()?, "uuid") {
                 Ok(uuid) => AssetUuid(uuid),
                 Err(error) => {
                     write_wire_error(results.get().init_result().init_error(), &error);
                     return Ok(());
                 }
             };
+            let work_class = if params.get_batch() {
+                crate::BuildWorkClass::Batch
+            } else {
+                crate::BuildWorkClass::Interactive
+            };
             // Lazy resolution may synchronously execute a complete processor
             // chain. Keep that work off the single-threaded capnp-rpc driver;
             // the daemon build scheduler provides the actual admission bound
             // while this future yields so unrelated connections keep moving.
             let outcome = loop {
-                match self
-                    .snapshot
-                    .resolve_prepare(uuid, crate::BuildWorkClass::Interactive)
-                {
+                match self.snapshot.resolve_prepare(uuid, work_class) {
                     crate::ResolveStep::Done(outcome) => break outcome,
                     crate::ResolveStep::Build(build) => {
                         let finished = tokio::task::spawn_blocking(move || build.run())
@@ -991,6 +998,34 @@ impl schema::snapshot::Server for SnapshotService {
                 }
             };
             write_fetch_result(results.get().init_result(), self.snapshot.fetch(hash));
+            Ok(())
+        }
+    }
+
+    fn runtime_type_policy(
+        self: capnp::capability::Rc<Self>,
+        params: schema::snapshot::RuntimeTypePolicyParams,
+        mut results: schema::snapshot::RuntimeTypePolicyResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
+        async move {
+            if let Some(reason) = self.snapshot.generation_reconnect() {
+                write_reconnect(
+                    results.get().init_result().init_reconnect_required(),
+                    reason,
+                );
+                return Ok(());
+            }
+            let type_uuid = match decode_uuid(params.get()?.get_type_uuid()?, "typeUuid") {
+                Ok(uuid) => TypeUuid(uuid),
+                Err(error) => {
+                    write_wire_error(results.get().init_result().init_error(), &error);
+                    return Ok(());
+                }
+            };
+            write_runtime_type_policy_result(
+                results.get().init_result(),
+                self.snapshot.runtime_type_policy(type_uuid),
+            );
             Ok(())
         }
     }
@@ -3043,6 +3078,25 @@ fn write_resolve_result(
         RpcResult::Failure(RpcFailure::SnapshotExpired) => {
             result.set_snapshot_expired(())
         }
+        RpcResult::Failure(error) => {
+            write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
+        }
+    }
+}
+
+fn write_runtime_type_policy_result(
+    mut result: schema::runtime_type_policy_call::Builder<'_>,
+    outcome: RpcResult<crate::RuntimeTypePolicy>,
+) {
+    match outcome {
+        RpcResult::Success(policy) => result.init_success().set_build_only(policy.build_only),
+        RpcResult::ReconnectRequired { reason } => {
+            write_reconnect(result.init_reconnect_required(), reason)
+        }
+        RpcResult::ConfigurationFailed(error) => {
+            write_configuration_error(result.init_configuration_failed(), &error)
+        }
+        RpcResult::Failure(RpcFailure::SnapshotExpired) => result.set_snapshot_expired(()),
         RpcResult::Failure(error) => {
             write_error(result.init_error(), failure_code(&error), &format!("{error:?}"))
         }

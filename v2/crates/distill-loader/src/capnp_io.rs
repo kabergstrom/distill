@@ -43,12 +43,20 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watched-import failures publish no version; the driver polls them.
 const IMPORT_FAILURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Consecutive failed rebind attempts before the game hears of them. A
+/// pipeline swap briefly fences connections (the daemon answers
+/// `PipelineUnavailable` until the new epoch serves); the backoff rides that
+/// out without a diagnostic.
+const DEFAULT_TARGET_REJECTION_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
     pub fetch_memory_budget: usize,
     pub spool_threshold: usize,
     pub spool_directory: Option<PathBuf>,
+    /// Consecutive failed rebind attempts after which `TargetRejected` is
+    /// reported (once per rebind). Retries continue either way.
+    pub target_rejection_after: u32,
 }
 
 impl Default for RpcIoConfig {
@@ -57,6 +65,7 @@ impl Default for RpcIoConfig {
             fetch_memory_budget: DEFAULT_FETCH_MEMORY_BUDGET,
             spool_threshold: DEFAULT_SPOOL_THRESHOLD,
             spool_directory: None,
+            target_rejection_after: DEFAULT_TARGET_REJECTION_AFTER,
         }
     }
 }
@@ -390,6 +399,7 @@ fn run_thread(
             spool_directory: config.spool_directory,
             import_failures,
             next_import_failure_poll: tokio::time::Instant::now(),
+            target_rejection_after: config.target_rejection_after.max(1),
         }
         .run()
         .await;
@@ -414,13 +424,26 @@ struct Driver {
     spool_directory: Option<PathBuf>,
     import_failures: watch::Sender<Option<Vec<ImportFailure>>>,
     next_import_failure_poll: tokio::time::Instant,
+    target_rejection_after: u32,
 }
 
 struct RebindState {
     target: RuntimeTarget,
     next_attempt: tokio::time::Instant,
     backoff: Duration,
+    failures: u32,
     reported: bool,
+}
+
+impl RebindState {
+    /// Count a failed attempt; true exactly when this failure is the one to
+    /// report (the `report_after`th in a row).
+    fn record_failure(&mut self, report_after: u32) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        let report = !self.reported && self.failures >= report_after;
+        self.reported |= report;
+        report
+    }
 }
 
 struct ReconnectCandidate {
@@ -671,6 +694,7 @@ impl Driver {
             target,
             next_attempt: tokio::time::Instant::now(),
             backoff: RECONNECT_INITIAL_BACKOFF,
+            failures: 0,
             reported: false,
         });
     }
@@ -745,10 +769,11 @@ impl Driver {
     }
 
     async fn defer_reconnect(&mut self, message: String) {
+        let report_after = self.target_rejection_after;
         let report = self
             .rebind
             .as_mut()
-            .is_some_and(|state| !std::mem::replace(&mut state.reported, true));
+            .is_some_and(|state| state.record_failure(report_after));
         if report {
             let _ = send_event(&self.events, IoEvent::TargetRejected { message }).await;
         }
@@ -1437,5 +1462,28 @@ fn drifted_input(input: RpcDriftedInput) -> DriftedInput {
         RpcDriftedInput::Query(query) => DriftedInput::Query(query),
         RpcDriftedInput::Dylib => DriftedInput::Dylib,
         RpcDriftedInput::Tool(tool) => DriftedInput::Tool(tool),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rebind_reports_once_after_consecutive_failures() {
+        let mut state = RebindState {
+            target: RuntimeTarget {
+                epoch: crate::GameModuleEpoch(1),
+                target_definition_hash: [0; 32],
+            },
+            next_attempt: tokio::time::Instant::now(),
+            backoff: RECONNECT_INITIAL_BACKOFF,
+            failures: 0,
+            reported: false,
+        };
+        let reports = (0..6)
+            .map(|_| state.record_failure(DEFAULT_TARGET_REJECTION_AFTER))
+            .collect::<Vec<_>>();
+        assert_eq!(reports, [false, false, true, false, false, false]);
     }
 }

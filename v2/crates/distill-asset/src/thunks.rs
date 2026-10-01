@@ -74,13 +74,11 @@ unsafe fn vec_finish<T>(cur: &mut CtorCursor, dst: *mut u8) -> Result<(), Callba
     })
 }
 
-unsafe fn abort_boxed<T>(mut cur: CtorCursor) -> Result<(), CallbackPanic> {
+unsafe fn abort_boxed<T>(cur: CtorCursor) -> Result<(), CallbackPanic> {
     if cur.state.is_null() {
         return Ok(());
     }
-    let state = cur.state;
-    cur.state = std::ptr::null_mut();
-    drop_boxed_in_place(state.cast::<T>())
+    drop_boxed_in_place(cur.state.cast::<T>())
 }
 
 /// Drop the pointee first, then free its box allocation only on success.

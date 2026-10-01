@@ -53,15 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_daemon(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config = DaemonConfig::load(path)?;
-    let rebuild = config.rebuild.clone();
     let process = DaemonProcess::start(config)?;
     eprintln!("distill daemon listening on {}", process.rpc_address());
-    #[cfg(unix)]
-    let _rebuilder = distill_daemon::rebuild::Rebuilder::start(rebuild)?;
-    #[cfg(not(unix))]
-    if !rebuild.is_empty() {
-        return Err("[[rebuild]] jobs run on Unix hosts only".into());
-    }
     process.wait()
 }
 
@@ -148,7 +141,14 @@ fn pack(args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     };
     let definition: AssetUuid = utf8(definition)?.parse()?;
     let config = DaemonConfig::load(config_path)?;
-    let output = build_configured_pack(config, definition, &PathBuf::from(destination))?;
+    // A client of the running daemon, like import.
+    let output = match build_configured_pack(&config, definition, &PathBuf::from(destination)) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("distilld pack: {error}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
         "activated pack manifest {} with archive {}",
         distill_pack::manifest_filename(distill_pack::manifest_hash(&output.manifest_bytes)),

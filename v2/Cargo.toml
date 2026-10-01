@@ -40,3 +40,10 @@ trybuild = "1"
 zstd = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# distilld as start-engine.sh builds it: optimized, with debug assertions on,
+# because a pipeline module's ABI identity includes its cfg set and pipelines
+# build in the dev profile (a release daemon rejects them).
+[profile.daemon]
+inherits = "release"
+debug-assertions = true

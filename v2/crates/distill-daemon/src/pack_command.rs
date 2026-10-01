@@ -1,8 +1,12 @@
-//! Production one-shot pack construction through the daemon's own schema,
-//! pipeline, lazy-build, snapshot, and CAS authorities.
+//! `distilld pack`: build a pack through a running daemon's RPC.
+//!
+//! The daemon owns the state directory, so the command is a client of it:
+//! it inspects the PackDefinition on the metadata hub, connects to the
+//! definition's target and builds from one pinned snapshot there.
 
 use std::fmt;
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use distill_core::bootstrap::{bootstrap_control_logical_registry_v1, PACK_DEFINITION_TYPE_UUID};
 use distill_core::id::{AssetUuid, LogicalHash, TypeUuid};
@@ -10,21 +14,39 @@ use distill_pack::builder::{
     build_publish_and_activate_pack, decode_pack_definition, encoder_identity, PackBuildError,
     PackBuildOutput, PackBuildTarget,
 };
+use distill_rpc::capnp_loader::{
+    RemoteCall, RemoteHub, RemoteMetadataAuthoringSnapshot, RemoteMetadataHub,
+};
+use distill_rpc::capnp_transport::{CapnpClient, RemoteMetadataOutcome};
 use distill_rpc::{
-    AuthoringEntryRole, AuthoringInspectResult, ConnectOutcome, ConnectRequest, MetadataCall,
-    MetadataConnectOutcome, MetadataNamespaceCall, RpcFailure, RpcResult, SnapshotStamp,
-    TargetDefinitionHash,
-    PROTOCOL_VERSION,
+    AuthoringEntryRole, AuthoringInspectResult, ConnectRequest, SnapshotStamp,
+    TargetDefinitionHash, PROTOCOL_VERSION,
 };
 
+use crate::bootstrap;
 use crate::config::DaemonConfig;
-use crate::process::{DaemonProcess, DaemonProcessError};
 
 const MAX_BASIS_RETRIES: usize = 32;
 
 #[derive(Debug)]
 pub enum PackCommandError {
-    Daemon(DaemonProcessError),
+    /// Nothing answered at the configured daemon address.
+    NoDaemon {
+        address: SocketAddr,
+        error: String,
+    },
+    Config(String),
+    /// The output directory is missing or not a directory.
+    OutputDirectory {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    /// The output directory lies inside an asset root. The running daemon
+    /// does not own it, so it would scan the pack files as assets.
+    OutputInsideAssetRoot {
+        output: PathBuf,
+        root: String,
+    },
     Bootstrap(String),
     Metadata(String),
     MissingDefinition(AssetUuid),
@@ -40,7 +62,6 @@ pub enum PackCommandError {
         expected: LogicalHash,
         observed: LogicalHash,
     },
-    UnknownTarget(String),
     Connect(String),
     UnstableBasis,
     Build(PackBuildError),
@@ -48,17 +69,25 @@ pub enum PackCommandError {
 
 impl fmt::Display for PackCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "pack command failed: {self:?}")
+        match self {
+            Self::NoDaemon { address, error } => {
+                write!(formatter, "no distilld at {address}; start it first ({error})")
+            }
+            Self::OutputInsideAssetRoot { output, root } => write!(
+                formatter,
+                "pack output {} is inside asset root `{root}`; \
+                 use a directory outside every asset root",
+                output.display()
+            ),
+            Self::OutputDirectory { path, error } => {
+                write!(formatter, "pack output {}: {error}", path.display())
+            }
+            other => write!(formatter, "pack command failed: {other:?}"),
+        }
     }
 }
 
 impl std::error::Error for PackCommandError {}
-
-impl From<DaemonProcessError> for PackCommandError {
-    fn from(value: DaemonProcessError) -> Self {
-        Self::Daemon(value)
-    }
-}
 
 impl From<PackBuildError> for PackCommandError {
     fn from(value: PackBuildError) -> Self {
@@ -66,60 +95,115 @@ impl From<PackBuildError> for PackCommandError {
     }
 }
 
+/// Build, publish and activate the pack `definition_asset` describes into
+/// `destination`, through the daemon serving `config`.
 pub fn build_configured_pack(
-    config: DaemonConfig,
+    config: &DaemonConfig,
     definition_asset: AssetUuid,
     destination: &Path,
 ) -> Result<PackBuildOutput, PackCommandError> {
-    let process = DaemonProcess::start_for_pack(config, destination)?;
-    build_pack_from_process(&process, definition_asset, destination)
+    check_output_directory(config, destination)?;
+    let address = config.daemon.address;
+    if address.port() == 0 {
+        return Err(PackCommandError::Config(
+            "daemon.address needs a fixed port for pack to find the daemon".into(),
+        ));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| PackCommandError::Connect(error.to_string()))?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(
+        &runtime,
+        build_pack_at(config, address, definition_asset, destination),
+    )
 }
 
-fn build_pack_from_process(
-    process: &DaemonProcess,
+/// The daemon does not own the output directory, so it must not scan it:
+/// the directory has to exist outside every asset root.
+fn check_output_directory(
+    config: &DaemonConfig,
+    destination: &Path,
+) -> Result<(), PackCommandError> {
+    let output_error = |error| PackCommandError::OutputDirectory {
+        path: destination.to_path_buf(),
+        error,
+    };
+    let output = std::fs::canonicalize(destination).map_err(output_error)?;
+    if !output.is_dir() {
+        return Err(output_error(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "not a directory",
+        )));
+    }
+    for (name, root) in &config.assets.roots {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if output.starts_with(&root) {
+            return Err(PackCommandError::OutputInsideAssetRoot {
+                output,
+                root: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn build_pack_at(
+    config: &DaemonConfig,
+    address: SocketAddr,
     definition_asset: AssetUuid,
     destination: &Path,
 ) -> Result<PackBuildOutput, PackCommandError> {
-    let coordinator = process.coordinator();
-    let root = coordinator.server().root();
-    let metadata_hub = match root.metadata(PROTOCOL_VERSION) {
-        MetadataConnectOutcome::Connected(connected) => connected.hub,
-        outcome => {
-            return Err(PackCommandError::Metadata(format!(
-                "metadata bootstrap rejected: {outcome:?}"
-            )))
-        }
-    };
+    let client = CapnpClient::connect_local(address)
+        .await
+        .map_err(|error| PackCommandError::NoDaemon {
+            address,
+            error: error.to_string(),
+        })?;
+    let metadata = client
+        .metadata(PROTOCOL_VERSION)
+        .await
+        .map_err(|error| PackCommandError::Metadata(error.to_string()))?;
+    let metadata = RemoteMetadataHub::connected(metadata).map_err(|outcome| {
+        PackCommandError::Metadata(match *outcome {
+            RemoteMetadataOutcome::ProtocolFailure {
+                expected,
+                observed,
+                message,
+            } => format!("daemon speaks protocol {expected}, this distilld {observed}: {message}"),
+            RemoteMetadataOutcome::Error { code, message } => format!("{message} ({code})"),
+            RemoteMetadataOutcome::Connected { .. } => unreachable!("connected is Ok"),
+        })
+    })?;
     let expected_schema = bootstrap_control_logical_registry_v1()
         .map_err(|error| PackCommandError::Bootstrap(error.to_string()))?
         .get(&PACK_DEFINITION_TYPE_UUID)
         .copied()
         .ok_or_else(|| PackCommandError::Bootstrap("PackDefinition row is absent".to_owned()))?;
+    let authority = bootstrap::load_authority(config)
+        .map_err(|error| PackCommandError::Config(error.to_string()))?;
 
     for _ in 0..MAX_BASIS_RETRIES {
+        let authoring = remote(metadata.authoring_snapshot().await, "pin authoring snapshot")?;
         let (definition_stamp, definition) =
-            inspect_definition(&metadata_hub, definition_asset, expected_schema)?;
-        let target = coordinator
-            .build_target(&definition.target)
-            .ok_or_else(|| PackCommandError::UnknownTarget(definition.target.clone()))?;
-        let definition_hash = distill_build::keys::target_definition_hash(&target);
-        let hub = match root.connect(ConnectRequest::new(
-            &definition.target,
-            TargetDefinitionHash(definition_hash),
-        )) {
-            ConnectOutcome::Connected(connected) => connected.hub,
-            outcome => {
-                return Err(PackCommandError::Connect(format!(
-                    "target connection rejected: {outcome:?}"
-                )))
-            }
-        };
-        let snapshot = rpc_value(hub.snapshot(), "pin runtime snapshot")?;
-        if snapshot.stamp() != definition_stamp {
+            inspect_definition(&authoring, definition_asset, expected_schema).await?;
+        let definition_hash = bootstrap::target_hash(config, &authority, &definition.target)
+            .map_err(|error| PackCommandError::Config(error.to_string()))?;
+        let outcome = client
+            .connect(&ConnectRequest::new(
+                &definition.target,
+                TargetDefinitionHash(definition_hash),
+            ))
+            .await
+            .map_err(|error| PackCommandError::Connect(error.to_string()))?;
+        let hub = RemoteHub::connected(outcome).map_err(|outcome| {
+            PackCommandError::Connect(format!("target connection rejected: {outcome:?}"))
+        })?;
+        let snapshot = remote(hub.snapshot().await, "pin runtime snapshot")?;
+        if snapshot.basis().snapshot != definition_stamp {
             continue;
         }
-        // An artifact that left the CAS mid-build is a cache miss: build
-        // again at a new snapshot.
         match build_publish_and_activate_pack(
             destination,
             &definition,
@@ -130,23 +214,20 @@ fn build_pack_from_process(
             &encoder_identity(),
             &snapshot,
             &hub,
-        ) {
-            Err(PackBuildError::Rpc(failure))
-                if matches!(
-                    *failure,
-                    RpcFailure::ArtifactNotFound { .. } | RpcFailure::SnapshotExpired
-                ) =>
-            {
-                continue
-            }
+        )
+        .await
+        {
+            // An artifact that left the CAS, or a snapshot that expired,
+            // mid-build is a cache miss: build again at a new snapshot.
+            Err(error) if error.is_cache_miss() => continue,
             result => return result.map_err(Into::into),
         }
     }
     Err(PackCommandError::UnstableBasis)
 }
 
-fn inspect_definition(
-    hub: &distill_rpc::MetadataHub,
+async fn inspect_definition(
+    snapshot: &RemoteMetadataAuthoringSnapshot,
     asset: AssetUuid,
     expected_schema: LogicalHash,
 ) -> Result<
@@ -156,9 +237,7 @@ fn inspect_definition(
     ),
     PackCommandError,
 > {
-    let snapshot = metadata_value(hub.authoring_snapshot(), "pin authoring snapshot")?;
-    let inspection = metadata_namespace_value(snapshot.inspect(asset), "inspect PackDefinition")?;
-    let inspection = match inspection {
+    let inspection = match remote(snapshot.inspect(asset).await, "inspect PackDefinition")? {
         AuthoringInspectResult::Inspection(inspection) => inspection,
         AuthoringInspectResult::Missing => return Err(PackCommandError::MissingDefinition(asset)),
         AuthoringInspectResult::RoleIneligible { observed } => {
@@ -187,50 +266,13 @@ fn inspect_definition(
     Ok((inspection.stamp, definition))
 }
 
-fn metadata_value<T>(result: MetadataCall<T>, operation: &str) -> Result<T, PackCommandError> {
-    match result {
-        MetadataCall::Success(value) => Ok(value),
-        MetadataCall::ReconnectRequired { reason } => Err(PackCommandError::Metadata(format!(
-            "{operation}: reconnect required: {reason:?}"
-        ))),
-        MetadataCall::SnapshotExpired => Err(PackCommandError::Metadata(format!(
-            "{operation}: snapshot expired"
-        ))),
-        MetadataCall::Error(error) => Err(PackCommandError::Metadata(format!(
-            "{operation}: {error:?}"
-        ))),
-    }
-}
-
-fn metadata_namespace_value<T>(
-    result: MetadataNamespaceCall<T>,
+fn remote<T: fmt::Debug, E: fmt::Display>(
+    result: Result<RemoteCall<T>, E>,
     operation: &str,
 ) -> Result<T, PackCommandError> {
     match result {
-        MetadataNamespaceCall::Success(value) => Ok(value),
-        MetadataNamespaceCall::ReconnectRequired { reason } => Err(PackCommandError::Metadata(
-            format!("{operation}: reconnect required: {reason:?}"),
-        )),
-        MetadataNamespaceCall::SnapshotExpired => Err(PackCommandError::Metadata(format!(
-            "{operation}: snapshot expired"
-        ))),
-        MetadataNamespaceCall::Error(error) => Err(PackCommandError::Metadata(format!(
-            "{operation}: {error:?}"
-        ))),
-    }
-}
-
-fn rpc_value<T>(result: RpcResult<T>, operation: &str) -> Result<T, PackCommandError> {
-    match result {
-        RpcResult::Success(value) => Ok(value),
-        RpcResult::ReconnectRequired { reason } => Err(PackCommandError::Connect(format!(
-            "{operation}: reconnect required: {reason:?}"
-        ))),
-        RpcResult::ConfigurationFailed(error) => Err(PackCommandError::Connect(format!(
-            "{operation}: configuration failed: {error:?}"
-        ))),
-        RpcResult::Failure(error) => {
-            Err(PackCommandError::Connect(format!("{operation}: {error:?}")))
-        }
+        Ok(RemoteCall::Success(value)) => Ok(value),
+        Ok(other) => Err(PackCommandError::Connect(format!("{operation}: {other:?}"))),
+        Err(error) => Err(PackCommandError::Connect(format!("{operation}: {error}"))),
     }
 }

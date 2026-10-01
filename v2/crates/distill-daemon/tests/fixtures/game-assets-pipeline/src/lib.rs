@@ -57,6 +57,8 @@ impl Kind {
     }
 }
 
+/// The imported pixel as a 2x2 texture with its 1x1 mip: five texels of
+/// the one colour, mip 0 then mip 1.
 fn cook_texture(value: &str) -> Result<AuthoredValue, ProcessorError> {
     let Some(hex) = value.strip_prefix("1x1:") else {
         return Err(ProcessorError::new(10, "invalid imported PPM value"));
@@ -64,24 +66,30 @@ fn cook_texture(value: &str) -> Result<AuthoredValue, ProcessorError> {
     if hex.len() != 6 {
         return Err(ProcessorError::new(11, "invalid imported PPM pixel"));
     }
-    let mut data = Vec::with_capacity(4);
+    let mut texel = Vec::with_capacity(4);
     for offset in [0, 2, 4] {
-        data.push(
+        texel.push(
             u8::from_str_radix(&hex[offset..offset + 2], 16)
                 .map_err(|error| ProcessorError::new(12, error.to_string()))?,
         );
     }
-    data.push(255);
+    texel.push(255);
+    let uint = |value: u32| AuthoredValue::UInt(u128::from(value));
     Ok(AuthoredValue::Object(BTreeMap::from([
-        ("width".to_owned(), AuthoredValue::UInt(1)),
-        ("height".to_owned(), AuthoredValue::UInt(1)),
+        ("width".to_owned(), uint(2)),
+        ("height".to_owned(), uint(2)),
+        ("depth".to_owned(), uint(1)),
+        ("array_layers".to_owned(), uint(1)),
+        ("mip_count".to_owned(), uint(2)),
+        (
+            "dimension".to_owned(),
+            uint(newgameplus_assets::TEXTURE_DIMENSION_2D.into()),
+        ),
         (
             "format".to_owned(),
-            AuthoredValue::UInt(u128::from(
-                newgameplus_assets::FORMAT_R8G8B8A8_UNORM,
-            )),
+            uint(newgameplus_assets::FORMAT_R8G8B8A8_UNORM.into()),
         ),
-        ("data".to_owned(), AuthoredValue::Blob(data)),
+        ("data".to_owned(), AuthoredValue::Blob(texel.repeat(5))),
     ])))
 }
 
