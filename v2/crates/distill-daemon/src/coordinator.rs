@@ -1540,17 +1540,8 @@ impl DaemonCoordinator {
                         },
                         Err(_) if drifted => rerun(current, item),
                         Err(error) => Err(error),
-                    };
-                    // An importer missing from the current registry fails
-                    // this import alone: the rest of the pass still runs,
-                    // and a registry change (capabilities) retries it.
-                    let prepared = match prepared {
-                        Err(error) if crate::importer::is_unregistered_importer(&error) => {
-                            tracing::warn!(?error, "watched import skipped");
-                            return Ok(None);
-                        }
-                        prepared => prepared.map_err(|error| format!("{error:?}"))?,
-                    };
+                    }
+                    .map_err(|error| format!("{error:?}"))?;
                     Ok(prepared.map(|prepared| {
                         bundle = Some(prepared.bundle);
                         prepared.commit
