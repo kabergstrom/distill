@@ -1,8 +1,23 @@
-//! Snapshot-pinned lazy build execution and durable build-import caching.
+//! Lazy builds: node keys, the node cache, and the build cells requesters
+//! share.
+//!
+//! A build is a pure function of its inputs. Its static inputs are digested
+//! into its key (DSNK for an asset node, DSSI per processor stage, DSBI per
+//! import) and never name an input version; what it observes of the
+//! project (queries, reads, resolves, tools, capabilities) is its trace. A
+//! cached result serves a snapshot exactly when its trace holds there, so
+//! one result serves every snapshot whose answers agree.
+//!
+//! A requester resolves at its own snapshot: it keys the node, looks the
+//! cache up, and on a miss submits the key's build cell
+//! ([`crate::scheduler`]). The cell's worker builds at one consistent read
+//! view opened when it starts, publishes the node in one transaction, and
+//! notifies every waiter; each waiter then checks the trace at its own
+//! snapshot (Built, or Drifted when an observed input differs there).
 
 use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-
+use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use distill_build::artifact_encode::{
@@ -13,8 +28,9 @@ use distill_build::dslf::{
     OutputBindingFailureV1, OutputBindingSlotV1,
 };
 use distill_build::keys::{
-    build_import_digest, static_inputs_canonical_bytes, static_inputs_digest, AppliedMigration,
-    AutomaticMigration, BuildImportInputs, OutputHash, StaticInputs,
+    build_import_digest, node_canonical_bytes, node_digest, static_inputs_canonical_bytes,
+    static_inputs_digest, AppliedMigration, AutomaticMigration, BuildImportInputs, NodeInputs,
+    NodeStage, NodeType, OutputHash, StaticInputs,
 };
 use distill_build::persist::{
     lookup_persisted_candidate, persisted_candidate_traces, PersistedOutcome,
@@ -25,8 +41,9 @@ use distill_build::pipeline::{
 use distill_build::query::{asset_query_result_hash, normalize_path, AssetQuery};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
-    revalidate, trace_payload_bytes, CapabilityKey, ControlQuery, ControlSubject, ControlValueHash,
-    EntryRole, Observed, StableFailureFingerprint, TraceOp, TraceSource,
+    decode_trace_payload_bytes, revalidate, trace_digest, trace_payload_bytes, CapabilityKey,
+    ControlQuery, ControlSubject, ControlValueHash, EntryRole, Observed,
+    StableFailureFingerprint, TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{
@@ -39,21 +56,22 @@ use distill_migrate::{
 };
 use distill_pipeline_api::callbacks::MigrationKey;
 use distill_rpc::{
-    decode_asset_reference_query, decode_authoring_payload, ArtifactPayload,
-    AssetReferenceQuery, AuthoringMutation, BuildArtifactPublication,
-    BuildBackend, BuildBackendOutcome, BuildPublication, BuildRequest, BuildWireTree,
+    decode_asset_reference_query, AssetReferenceQuery, AuthoringMutation, BuildAnswer,
+    BuildBackend, BuildCompletion, BuildRequest, BuildStart, BuildTicket, BuildView,
     BuildWorkClass, Commit, DriftedInput, PipelineUnavailableDiagnostic, RpcFailure,
     RuntimeTypePolicy, RuntimeTypePolicyRequest, ServedLoadEdge, TagPoisonMutation,
     TagProjectionMutation,
 };
 use distill_schema::{ProjectSchemaAuthority, ProjectTypeAuthority};
-use distill_store::bundles::{BundleMeta, EntryMeta, TagIndexUpdate};
+use distill_store::bundles::{EntryMeta, TagIndexUpdate};
 use distill_store::cas::record::{
     FailureCause as StoreFailureCause, FailureFingerprint as StoreFailureFingerprint, KeyKind,
-    LocalFailureClass as StoreLocalFailureClass,
+    LocalFailureClass as StoreLocalFailureClass, ResultOutcome,
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::RegisteredTool;
+use distill_store::state::SnapshotStamp;
+use distill_store::served::StoreSnapshot;
 use distill_store::{Store, StoreError, StoreReader};
 use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERSION};
 use distill_wire::encode::EncodeError;
@@ -65,7 +83,7 @@ use crate::callbacks::{
 use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::scanner::RootedScanner;
-use crate::scheduler::WorkClass;
+use crate::scheduler::{CellOutcome, CellRun, CellWorker, Claim, WorkClass};
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
@@ -138,6 +156,11 @@ impl PublishedTagIndex {
     }
 }
 
+/// The production lazy-build authority. A request resolves at the
+/// requester's snapshot: its DSNK node key is a digest of the node's static
+/// inputs only, the node cache answers when a cached result's trace holds
+/// at that snapshot, and a miss submits the key's build cell, which every
+/// requester of the key shares (`crate::scheduler`).
 pub(crate) struct CoordinatorBuildBackend {
     coordinator: Weak<DaemonCoordinator>,
 }
@@ -150,54 +173,64 @@ impl CoordinatorBuildBackend {
     }
 }
 
+fn coordinator_stopped() -> RpcFailure {
+    RpcFailure::AuthoringBackendUnavailable {
+        operation: "build coordinator stopped".to_owned(),
+    }
+}
+
 impl BuildBackend for CoordinatorBuildBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        let coordinator =
-            self.coordinator
-                .upgrade()
-                .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
-                    operation: "build coordinator stopped".to_owned(),
-                })?;
+    fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        let Some(coordinator) = self.coordinator.upgrade() else {
+            return BuildStart::Answered(Err(coordinator_stopped()));
+        };
+        let env = match NodeEnv::capture(&coordinator, &request.target)
+            .and_then(|env| check_request(&env, request).map(|()| env))
+        {
+            Ok(env) => env,
+            Err(error) => return BuildStart::Answered(error.answer()),
+        };
+        let asset = request.entry.uuid;
+        let mut lookup = NodeLookup::new(&env, view.snapshot, view.latest, view.stamp.version);
+        let key = match lookup.key(asset) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return BuildStart::Answered(Ok(BuildAnswer::Drifted {
+                    input: request.drifted_input.clone(),
+                }))
+            }
+            Err(error) => return BuildStart::Answered(error.answer()),
+        };
+        match lookup.node(asset, 0) {
+            Ok(Some(hit)) => {
+                return BuildStart::Answered(Ok(select_output(
+                    &hit.outputs,
+                    request,
+                )))
+            }
+            Ok(None) => {}
+            Err(error) => return BuildStart::Answered(error.answer()),
+        }
+        drop(lookup);
         let class = match request.work_class {
             BuildWorkClass::Interactive => WorkClass::Interactive,
             BuildWorkClass::Batch => WorkClass::Batch,
         };
-        let scheduled_request = request.clone();
         let job_coordinator = Arc::clone(&coordinator);
-        let (result, failure) = coordinator.run_scheduled(class, move |store| {
-            let result = build_with_runtime(&job_coordinator, store, &scheduled_request);
-            let failure = job_coordinator.sync_runtime_pipeline_failure(store);
-            (result, failure)
+        let target = request.target.clone();
+        let cell_key = key.digest;
+        let ticket = coordinator.request_build(cell_key, class, move |store, worker| {
+            run_cell(&job_coordinator, store, worker, &target, cell_key, asset)
         });
-        match failure {
-            Ok(Some(failure)) => {
-                return Err(RpcFailure::PipelineUnavailable(Box::new(
-                    PipelineUnavailableDiagnostic::PipelineFailure(failure),
-                )))
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(RpcFailure::AuthoringBackendUnavailable {
-                    operation: format!("persist runtime pipeline failure: {error}"),
-                })
-            }
-        }
-        match result {
-            Ok(publication) => Ok(BuildBackendOutcome::Built(publication)),
-            Err(BuildError::Drifted(input)) => Ok(BuildBackendOutcome::Drifted { input }),
-            Err(BuildError::DepthExceeded { limit, chain }) => {
-                Err(RpcFailure::BuildDepthExceeded { limit, chain })
-            }
-            Err(BuildError::Failed(error)) => Ok(BuildBackendOutcome::Failed { error }),
-            Err(BuildError::Deterministic { message, .. }) => {
-                Ok(BuildBackendOutcome::Failed { error: message })
-            }
-            Err(BuildError::Infrastructure(error)) => {
-                Err(RpcFailure::AuthoringBackendUnavailable {
-                    operation: format!("build: {error}"),
-                })
-            }
-        }
+        let request = request.clone();
+        BuildStart::Submitted(BuildTicket::new(async move {
+            let outcome = ticket.await;
+            Box::new(NodeCompletion {
+                outcome,
+                env,
+                request,
+            }) as Box<dyn BuildCompletion>
+        }))
     }
 
     fn runtime_type_policy(
@@ -245,11 +278,559 @@ impl BuildBackend for CoordinatorBuildBackend {
             build_only: project.build_only,
         })
     }
+}
 
-    fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
-        Ok(())
+/// The requested output of a node's outputs: absent, the requester's
+/// derived child no longer exists under these inputs.
+fn select_output(outputs: &BTreeMap<String, ContentHash>, request: &BuildRequest) -> BuildAnswer {
+    match outputs.get(&request.output_key) {
+        Some(content_hash) => BuildAnswer::Built {
+            content_hash: *content_hash,
+        },
+        None => BuildAnswer::Drifted {
+            input: DriftedInput::Asset(request.requested_asset),
+        },
     }
 }
+
+/// What a build cell produces, shared by every requester of its key. Each
+/// requester answers it at its own snapshot ([`NodeCompletion`]).
+pub(crate) enum BuildOutcome {
+    /// The node built, or was found cached, at the worker's view. Its trace
+    /// decides, per requester, whether the outputs serve that requester.
+    Built {
+        trace: Vec<TraceOp>,
+        outputs: BTreeMap<String, ContentHash>,
+    },
+    /// The build failed at the worker's view `at`. A failure keeps no
+    /// complete trace, so it answers only requesters at that same snapshot.
+    Failed { error: String, at: SnapshotStamp },
+    /// The worker's view, or the files on disk, disagree with the key the
+    /// cell was requested under: every requester of the key is behind.
+    Drifted(DriftedInput),
+    Unavailable(RpcFailure),
+}
+
+impl CellOutcome for BuildOutcome {
+    fn lost() -> Self {
+        Self::Unavailable(RpcFailure::AuthoringBackendUnavailable {
+            operation: "build worker stopped before it finished".to_owned(),
+        })
+    }
+}
+
+/// One requester's view of a finished cell.
+struct NodeCompletion {
+    outcome: Arc<BuildOutcome>,
+    env: NodeEnv,
+    request: BuildRequest,
+}
+
+impl BuildCompletion for NodeCompletion {
+    fn answer(self: Box<Self>, view: BuildView<'_>) -> Result<BuildAnswer, RpcFailure> {
+        match &*self.outcome {
+            BuildOutcome::Built { trace, outputs } => {
+                let mut lookup =
+                    NodeLookup::new(&self.env, view.snapshot, view.latest, view.stamp.version);
+                match lookup.first_drift(trace, 0) {
+                    Ok(None) => Ok(select_output(outputs, &self.request)),
+                    Ok(Some(op)) => Ok(BuildAnswer::Drifted {
+                        input: drifted_input(op),
+                    }),
+                    Err(error) => error.answer(),
+                }
+            }
+            BuildOutcome::Failed { error, at } if *at == view.stamp => Ok(BuildAnswer::Failed {
+                error: error.clone(),
+            }),
+            // Built elsewhere, the failure may not hold here: a fresh
+            // snapshot builds again.
+            BuildOutcome::Failed { .. } => Ok(BuildAnswer::Drifted {
+                input: self.request.drifted_input.clone(),
+            }),
+            BuildOutcome::Drifted(input) => Ok(BuildAnswer::Drifted {
+                input: input.clone(),
+            }),
+            BuildOutcome::Unavailable(failure) => Err(failure.clone()),
+        }
+    }
+}
+
+/// The input a requester names when `op` no longer holds at its snapshot.
+fn drifted_input(op: &TraceOp) -> DriftedInput {
+    match op {
+        TraceOp::AuthoringRead { asset, .. }
+        | TraceOp::Read { asset, .. }
+        | TraceOp::RefCheck { asset, .. }
+        | TraceOp::RoleCheck { asset, .. } => DriftedInput::Asset(*asset),
+        TraceOp::Resolve { path, .. } => DriftedInput::File(path.clone()),
+        TraceOp::Query { query, .. } => DriftedInput::Query(format!("{query:?}")),
+        TraceOp::Tool { id, .. } => DriftedInput::Tool(id.clone()),
+        TraceOp::Capability { .. } | TraceOp::Control { .. } | TraceOp::ControlRead { .. } => {
+            DriftedInput::Dylib
+        }
+    }
+}
+
+/// The requester's own consistency checks: the target and chain it names
+/// are the ones this pipeline serves.
+fn check_request(env: &NodeEnv, request: &BuildRequest) -> Result<(), BuildError> {
+    if env.target_definition != request.target_definition.0 {
+        return Err(BuildError::Drifted(request.drifted_input.clone()));
+    }
+    let chain = env
+        .registry
+        .chain(request.entry.type_uuid, &env.target)
+        .map_err(BuildError::failed)?;
+    let expected_requested_type = if request.output_key.is_empty() {
+        chain.terminal
+    } else {
+        chain
+            .extras
+            .get(&request.output_key)
+            .copied()
+            .ok_or(BuildError::Drifted(DriftedInput::Asset(
+                request.requested_asset,
+            )))?
+    };
+    if request.entry.terminal_type != chain.terminal
+        || request.requested_terminal_type != expected_requested_type
+    {
+        return Err(BuildError::Drifted(request.drifted_input.clone()));
+    }
+    let named = if request.output_key.is_empty() {
+        request.entry.uuid
+    } else {
+        AssetUuid::v5(request.entry.uuid, &request.output_key)
+    };
+    if request.requested_asset != named {
+        return Err(BuildError::Drifted(request.drifted_input.clone()));
+    }
+    Ok(())
+}
+
+/// A build cell's job, on a pool worker and the writer it was lent: build
+/// `asset`'s node at a read view opened now, publish it, and report the
+/// outcome every waiter shares.
+fn run_cell(
+    coordinator: &DaemonCoordinator,
+    store: &mut Store,
+    worker: &CellWorker<BuildOutcome>,
+    target: &str,
+    key: [u8; 32],
+    asset: AssetUuid,
+) -> BuildOutcome {
+    let opened = coordinator
+        .open_reader()
+        .and_then(StoreReader::begin_snapshot)
+        .and_then(|view| Ok((view, coordinator.open_reader()?)));
+    let (view, latest) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            return BuildOutcome::Unavailable(RpcFailure::AuthoringBackendUnavailable {
+                operation: format!("open a build view: {error}"),
+            })
+        }
+    };
+    let at = view.stamp();
+    let outcome = match build_cell(coordinator, store, worker, target, key, asset, view, latest) {
+        Ok(node) => BuildOutcome::Built {
+            trace: node.trace,
+            outputs: node.outputs,
+        },
+        Err(error) => error.outcome(at),
+    };
+    match coordinator.sync_runtime_pipeline_failure(store) {
+        Ok(Some(failure)) => BuildOutcome::Unavailable(RpcFailure::PipelineUnavailable(Box::new(
+            PipelineUnavailableDiagnostic::PipelineFailure(failure),
+        ))),
+        Ok(None) => outcome,
+        Err(error) => BuildOutcome::Unavailable(RpcFailure::AuthoringBackendUnavailable {
+            operation: format!("persist runtime pipeline failure: {error}"),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cell(
+    coordinator: &DaemonCoordinator,
+    store: &mut Store,
+    worker: &CellWorker<BuildOutcome>,
+    target: &str,
+    key: [u8; 32],
+    asset: AssetUuid,
+    view: StoreSnapshot,
+    latest: StoreReader,
+) -> Result<NodeResult, BuildError> {
+    let env = NodeEnv::capture(coordinator, target)?;
+    // The requester keyed the cell at its snapshot; this view may be newer.
+    // Inputs that moved since make every requester of the key stale.
+    match node_key(&env, &view, asset)? {
+        Some(observed) if observed.digest == key => {}
+        _ => return Err(BuildError::Drifted(DriftedInput::Asset(asset))),
+    }
+    let at = view.stamp();
+    let mut context = BuildContext::new(
+        env,
+        BuildStores::Worker {
+            view,
+            latest,
+            writer: RefCell::new(store),
+        },
+        coordinator.scanner(),
+        Some(CellScope {
+            worker,
+            root: asset,
+            at,
+        }),
+        false,
+        "tool-runs",
+    )?;
+    build_asset(&mut context, asset)
+}
+
+/// The pipeline one answer or one cell runs under, captured from the
+/// coordinator once and never mixed with another.
+struct NodeEnv {
+    authority: Arc<ProjectSchemaAuthority>,
+    pipeline: PipelineSnapshot,
+    registry: PipelineRegistry,
+    target: Target,
+    target_definition: [u8; 32],
+    dylib_hash: [u8; 32],
+    max_depth: usize,
+}
+
+impl NodeEnv {
+    fn capture(coordinator: &DaemonCoordinator, target: &str) -> Result<Self, BuildError> {
+        let authority = coordinator.schema_authority().ok_or_else(|| {
+            BuildError::Failed("project schema authority is not published".to_owned())
+        })?;
+        let target = coordinator.build_target(target).ok_or_else(|| {
+            BuildError::Failed(format!("build target {target:?} is not published"))
+        })?;
+        Self::new(
+            authority,
+            coordinator.pipeline_snapshot(),
+            target,
+            coordinator.operational_configuration().max_dependency_depth,
+        )
+    }
+
+    fn new(
+        authority: Arc<ProjectSchemaAuthority>,
+        pipeline: PipelineSnapshot,
+        target: Target,
+        max_depth: usize,
+    ) -> Result<Self, BuildError> {
+        let epoch = pipeline
+            .epoch()
+            .map_err(|failure| BuildError::Failed(failure.to_string()))?;
+        let dylib_hash = epoch.dylib_hash();
+        let registry = pipeline_registry(epoch).map_err(BuildError::Failed)?;
+        Ok(Self {
+            target_definition: distill_build::keys::target_definition_hash(&target),
+            authority,
+            registry,
+            target,
+            dylib_hash,
+            max_depth,
+            pipeline,
+        })
+    }
+
+    fn epoch(&self) -> Result<&PipelineEpoch, BuildError> {
+        self.pipeline
+            .epoch()
+            .map_err(|failure| BuildError::Failed(failure.to_string()))
+    }
+}
+
+fn pipeline_registry(epoch: &PipelineEpoch) -> Result<PipelineRegistry, String> {
+    let dylib_hash = epoch.dylib_hash();
+    PipelineRegistry::new(
+        epoch
+            .processor_descriptors()
+            .into_iter()
+            .map(|descriptor| {
+                ProcessorRegistration::new(
+                    &descriptor.id,
+                    descriptor.version,
+                    descriptor.input,
+                    descriptor.selector,
+                    descriptor.outputs,
+                    dylib_hash,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("{error:?}"))?,
+    )
+    .map_err(|error| format!("{error:?}"))
+}
+
+/// A node's DSNK key and the canonical bytes its result record keeps.
+struct NodeKey {
+    digest: [u8; 32],
+    canonical: Vec<u8>,
+}
+
+/// The key of `asset`'s node at `reader`'s state under `env`, or `None`
+/// when `reader` has no such entry. It reads rows only: the bundle is keyed
+/// by its recorded hash, which the build checks the file against.
+fn node_key(
+    env: &NodeEnv,
+    reader: &StoreReader,
+    asset: AssetUuid,
+) -> Result<Option<NodeKey>, BuildError> {
+    let Some(meta) = reader.entry(asset).map_err(BuildError::infrastructure)? else {
+        return Ok(None);
+    };
+    let bundle = reader
+        .bundle(meta.bundle)
+        .map_err(BuildError::infrastructure)?
+        .ok_or_else(|| BuildError::Infrastructure("asset owner bundle is missing".to_owned()))?;
+    let chain = env
+        .registry
+        .chain(meta.type_uuid, &env.target)
+        .map_err(BuildError::failed)?;
+    let validated = env
+        .epoch()?
+        .validator_descriptors()
+        .iter()
+        .any(|descriptor| descriptor.asset_type == meta.type_uuid);
+    let stages = chain
+        .stages
+        .iter()
+        .map(|stage| NodeStage {
+            processor_id: stage.registration.id.clone(),
+            processor_version: stage.registration.version,
+            primary: stage.registration.outputs.primary,
+            extras: stage
+                .registration
+                .outputs
+                .extras
+                .iter()
+                .map(|(key, type_uuid)| (key.clone(), *type_uuid))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let named = std::iter::once(meta.type_uuid)
+        .chain(stages.iter().flat_map(|stage| {
+            std::iter::once(stage.primary).chain(stage.extras.iter().map(|(_, ty)| *ty))
+        }))
+        .chain(std::iter::once(chain.terminal))
+        .chain(chain.extras.values().copied())
+        .collect::<Vec<_>>();
+    let mut types = Vec::with_capacity(named.len());
+    for type_uuid in named {
+        let project = env.authority.project_type(type_uuid).ok_or_else(|| {
+            BuildError::Failed(format!("type {type_uuid} has no project schema authority"))
+        })?;
+        types.push(NodeType {
+            type_uuid,
+            logical: project.logical_hash,
+            layout: project.layout_hash,
+        });
+    }
+    let inputs = NodeInputs {
+        asset,
+        bundle: meta.bundle,
+        local_id: meta.local_id,
+        bundle_hash: bundle.content_hash,
+        authored_type: meta.type_uuid,
+        authored_logical: meta.logical_hash,
+        target_def_hash: env.target_definition,
+        dylib_hash: env.dylib_hash,
+        validated,
+        terminal_type: chain.terminal,
+        extras: chain
+            .extras
+            .iter()
+            .map(|(key, type_uuid)| (key.clone(), *type_uuid))
+            .collect(),
+        stages,
+        types,
+        migration_planner_version: MIGRATION_PLANNER_VERSION,
+        artifact_format_version: ARTIFACT_FORMAT_VERSION,
+    };
+    Ok(Some(NodeKey {
+        digest: node_digest(&inputs),
+        canonical: node_canonical_bytes(&inputs),
+    }))
+}
+
+/// A node result: its outputs by key, and the trace that decides at which
+/// snapshots they serve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeResult {
+    trace: Vec<TraceOp>,
+    outputs: BTreeMap<String, ContentHash>,
+}
+
+/// Read-only node-cache lookups at one snapshot: a requester's before it
+/// submits a build, a waiter's answer to a finished one, and a worker's
+/// before it builds a node. A cached trace's `Read`s are answered by
+/// looking their nodes up in turn, bounded by the dependency depth and
+/// cut at a cycle (a miss).
+struct NodeLookup<'a> {
+    env: &'a NodeEnv,
+    view: &'a StoreReader,
+    latest: &'a StoreReader,
+    tool_version: distill_store::state::InputVersion,
+    base: Option<Rc<StoreTraceSource>>,
+    nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
+    visiting: BTreeSet<AssetUuid>,
+}
+
+impl<'a> NodeLookup<'a> {
+    fn new(
+        env: &'a NodeEnv,
+        view: &'a StoreReader,
+        latest: &'a StoreReader,
+        tool_version: distill_store::state::InputVersion,
+    ) -> Self {
+        Self {
+            env,
+            view,
+            latest,
+            tool_version,
+            base: None,
+            nodes: BTreeMap::new(),
+            visiting: BTreeSet::new(),
+        }
+    }
+
+    fn key(&self, asset: AssetUuid) -> Result<Option<NodeKey>, BuildError> {
+        node_key(self.env, self.view, asset)
+    }
+
+    /// The newest cached result of `asset`'s node whose trace holds here.
+    fn node(&mut self, asset: AssetUuid, depth: usize) -> Result<Option<NodeResult>, BuildError> {
+        if let Some(known) = self.nodes.get(&asset) {
+            return Ok(known.clone());
+        }
+        if depth > self.env.max_depth || !self.visiting.insert(asset) {
+            return Ok(None);
+        }
+        let found = self.lookup(asset, depth);
+        self.visiting.remove(&asset);
+        let found = found?;
+        self.nodes.insert(asset, found.clone());
+        Ok(found)
+    }
+
+    fn lookup(&mut self, asset: AssetUuid, depth: usize) -> Result<Option<NodeResult>, BuildError> {
+        let Some(key) = self.key(asset)? else {
+            return Ok(None);
+        };
+        let candidates = self
+            .latest
+            .lookup_candidates(KeyKind::Node, &key.digest)
+            .map_err(BuildError::infrastructure)?;
+        for candidate in candidates {
+            if candidate.payload.key_kind != KeyKind::Node || candidate.asset_uuid != asset {
+                return Err(BuildError::Infrastructure(
+                    "a node candidate names another key kind or asset".to_owned(),
+                ));
+            }
+            let ResultOutcome::Success { outputs, .. } = &candidate.payload.outcome else {
+                continue;
+            };
+            let trace = decode_trace_payload_bytes(&candidate.payload.trace)
+                .map_err(BuildError::infrastructure)?;
+            if trace_digest(&trace) != candidate.trace_digest {
+                return Err(BuildError::Infrastructure(
+                    "a node candidate's trace does not match its digest".to_owned(),
+                ));
+            }
+            if self.first_drift(&trace, depth)?.is_none() {
+                return Ok(Some(NodeResult {
+                    trace,
+                    outputs: outputs
+                        .iter()
+                        .map(|row| (row.output_key.clone(), row.content_hash))
+                        .collect(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The first operation of `trace` that does not hold here.
+    fn first_drift<'t>(
+        &mut self,
+        trace: &'t [TraceOp],
+        depth: usize,
+    ) -> Result<Option<&'t TraceOp>, BuildError> {
+        for op in trace {
+            if let TraceOp::Read {
+                asset,
+                observed: Observed::Ok(_),
+            } = op
+            {
+                let parent = self
+                    .view
+                    .resolve_child(*asset)
+                    .map_err(BuildError::infrastructure)?
+                    .map_or(*asset, |(parent, _)| parent);
+                self.node(parent, depth + 1)?;
+            }
+        }
+        let source = self.source()?;
+        Ok(trace
+            .iter()
+            .find(|op| !revalidate(std::slice::from_ref(*op), &source)))
+    }
+
+    fn source(&mut self) -> Result<StoreTraceSource, BuildError> {
+        if self.base.is_none() {
+            self.base = Some(Rc::new(StoreTraceSource::capture(
+                self.view,
+                TraceCaptureBasis {
+                    registry: &self.env.registry,
+                    target: &self.env.target,
+                    input_version: self.tool_version,
+                    epoch: self.env.epoch()?,
+                    dylib_hash: self.env.dylib_hash,
+                },
+            )?));
+        }
+        let mut source = StoreTraceSource::clone(self.base.as_ref().expect("captured above"));
+        source.content_hashes = node_content_hashes(
+            self.nodes
+                .iter()
+                .filter_map(|(asset, node)| node.as_ref().map(|node| (*asset, node))),
+        )?;
+        Ok(source)
+    }
+}
+
+/// The content each asset (a node's primary or derived child) has among
+/// `nodes`.
+fn node_content_hashes<'n>(
+    nodes: impl Iterator<Item = (AssetUuid, &'n NodeResult)>,
+) -> Result<BTreeMap<AssetUuid, ContentHash>, BuildError> {
+    let mut content_hashes = BTreeMap::new();
+    for (parent, node) in nodes {
+        for (output_key, hash) in &node.outputs {
+            let asset = if output_key.is_empty() {
+                parent
+            } else {
+                AssetUuid::v5(parent, output_key)
+            };
+            if content_hashes
+                .insert(asset, *hash)
+                .is_some_and(|existing| existing != *hash)
+            {
+                return Err(BuildError::Infrastructure(
+                    "one build context observed two contents for an asset".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(content_hashes)
+}
+
 
 #[derive(Debug, Clone)]
 enum BuildError {
@@ -279,46 +860,48 @@ impl BuildError {
     fn migration(message: impl Into<String>, facts: DslfV1) -> Self {
         Self::deterministic(message, facts)
     }
+
+    /// The outcome a cell reports for this error, built at `at`.
+    fn outcome(self, at: SnapshotStamp) -> BuildOutcome {
+        match self {
+            Self::Drifted(input) => BuildOutcome::Drifted(input),
+            Self::DepthExceeded { limit, chain } => {
+                BuildOutcome::Unavailable(RpcFailure::BuildDepthExceeded { limit, chain })
+            }
+            Self::Failed(error) | Self::Deterministic { message: error, .. } => {
+                BuildOutcome::Failed { error, at }
+            }
+            Self::Infrastructure(error) => {
+                BuildOutcome::Unavailable(RpcFailure::AuthoringBackendUnavailable {
+                    operation: format!("build: {error}"),
+                })
+            }
+        }
+    }
+
+    /// The answer a requester gets for this error, found before any build
+    /// at its own snapshot.
+    fn answer(self) -> Result<BuildAnswer, RpcFailure> {
+        match self {
+            Self::Drifted(input) => Ok(BuildAnswer::Drifted { input }),
+            Self::Failed(error) | Self::Deterministic { message: error, .. } => {
+                Ok(BuildAnswer::Failed { error })
+            }
+            Self::DepthExceeded { limit, chain } => {
+                Err(RpcFailure::BuildDepthExceeded { limit, chain })
+            }
+            Self::Infrastructure(error) => Err(RpcFailure::AuthoringBackendUnavailable {
+                operation: format!("build: {error}"),
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
 struct LoadedAsset {
     meta: EntryMeta,
-    bundle_meta: BundleMeta,
     bundle_bytes: Vec<u8>,
     entry: AssetEntry,
-}
-
-#[derive(Clone)]
-struct NodePublication {
-    primary: BuildOutputRow,
-    outputs: BTreeMap<String, BuildOutputRow>,
-    artifacts: BTreeMap<ContentHash, BuildArtifactPublication>,
-    wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
-}
-
-/// One build, on the writer of whoever runs it: a scheduler job's own, or
-/// the open input that refines the tag index, whose uncommitted rows the
-/// build must see.
-struct BuildContext<'s> {
-    store: RefCell<&'s mut Store>,
-    store_instance: distill_store::state::StoreInstanceId,
-    drifted_input: DriftedInput,
-    scanner: RootedScanner,
-    authority: Arc<ProjectSchemaAuthority>,
-    pipeline: PipelineSnapshot,
-    registry: PipelineRegistry,
-    target: Target,
-    target_definition: [u8; 32],
-    dylib_hash: [u8; 32],
-    basis: distill_store::state::InputVersion,
-    tools: PinnedToolEpoch,
-    execution_root: std::path::PathBuf,
-    max_depth: usize,
-    visiting: BTreeSet<AssetUuid>,
-    callback_chain: Vec<AssetUuid>,
-    memo: BTreeMap<AssetUuid, NodePublication>,
-    verify_fresh: bool,
 }
 
 #[derive(Clone)]
@@ -361,37 +944,196 @@ impl ToolEpochSnapshot for PinnedToolEpoch {
     }
 }
 
-/// Read the build's store, still at the build's basis. A write is never
-/// made while a read is borrowed.
-fn lock_build_store<'c>(context: &'c BuildContext<'_>) -> Result<Ref<'c, Store>, BuildError> {
-    let store = Ref::map(context.store.borrow(), |store| &**store);
-    if store.instance_id() != context.store_instance || store.input_version() != context.basis {
-        return Err(BuildError::Drifted(context.drifted_input.clone()));
+/// Proof that a writer holds an open input. A build that must see the
+/// input's uncommitted rows (tag-index refinement, doctor verification)
+/// runs inline on it, and only with this proof; nothing holding one submits
+/// or waits on a build cell, whose worker would wait on the input's write
+/// lock.
+pub(crate) struct OpenInput<'s>(&'s mut Store);
+
+impl<'s> OpenInput<'s> {
+    pub(crate) fn new(store: &'s mut Store) -> Option<Self> {
+        store.input_open().then_some(Self(store))
     }
-    Ok(store)
 }
 
-/// Run a build's write in one write transaction, still at the build's
-/// basis.
-fn write_build_store<R>(
-    context: &BuildContext,
-    write: impl FnOnce(&mut Store) -> Result<R, StoreError>,
-) -> Result<R, BuildError> {
-    let (instance, basis) = (context.store_instance, context.basis);
-    context
-        .store
-        .borrow_mut()
-        .write_transaction_with(BuildError::infrastructure, |store| {
-            if store.instance_id() != instance || store.input_version() != basis {
-                return Err(BuildError::Drifted(context.drifted_input.clone()));
-            }
-            write(store).map_err(BuildError::infrastructure)
+/// Where a build reads and writes.
+enum BuildStores<'s> {
+    /// A build cell's worker. It reads one consistent view opened when the
+    /// cell started, looks cached results and CAS bytes up at the latest
+    /// committed state, and publishes on the writer it was lent.
+    Worker {
+        view: StoreSnapshot,
+        latest: StoreReader,
+        writer: RefCell<&'s mut Store>,
+    },
+    /// Inline in an open input: reads and writes see its uncommitted rows.
+    Inline(RefCell<&'s mut Store>),
+}
+
+/// A read of a build's store; no write is made while one is held.
+enum StoreRead<'c> {
+    Borrowed(Ref<'c, &'c mut Store>),
+    Reader(&'c StoreReader),
+}
+
+impl std::ops::Deref for StoreRead<'_> {
+    type Target = StoreReader;
+
+    fn deref(&self) -> &StoreReader {
+        match self {
+            Self::Borrowed(store) => store,
+            Self::Reader(reader) => reader,
+        }
+    }
+}
+
+/// The cell a worker's build runs for, and through which its dependencies'
+/// cells are claimed.
+struct CellScope<'w> {
+    worker: &'w CellWorker<BuildOutcome>,
+    /// The node of the job's own cell, which the job finishes.
+    root: AssetUuid,
+    at: SnapshotStamp,
+}
+
+/// A write a node's build makes. They are buffered and published in one
+/// transaction once the node is assembled.
+enum BuildWrite {
+    WireTree(Vec<u8>),
+    Commit(BuildCommit),
+    Artifact {
+        asset: AssetUuid,
+        bytes: Arc<[u8]>,
+        load_edges: Vec<(AssetUuid, TypeUuid)>,
+    },
+}
+
+/// One build: a cell's on its worker, or an inline one in an open input.
+struct BuildContext<'s> {
+    stores: BuildStores<'s>,
+    env: NodeEnv,
+    scanner: RootedScanner,
+    tool_version: distill_store::state::InputVersion,
+    tools: PinnedToolEpoch,
+    execution_root: std::path::PathBuf,
+    visiting: BTreeSet<AssetUuid>,
+    callback_chain: Vec<AssetUuid>,
+    memo: BTreeMap<AssetUuid, NodeResult>,
+    verify_fresh: bool,
+    cells: Option<CellScope<'s>>,
+    /// The view's trace answers, captured once; content hashes come from
+    /// the memo at each use.
+    trace_base: RefCell<Option<Rc<StoreTraceSource>>>,
+    writes: RefCell<Vec<BuildWrite>>,
+    /// Artifact bytes this build produced, readable before (or, verifying,
+    /// without) their publication.
+    artifacts: RefCell<BTreeMap<ContentHash, Arc<[u8]>>>,
+}
+
+impl<'s> BuildContext<'s> {
+    fn new(
+        env: NodeEnv,
+        stores: BuildStores<'s>,
+        scanner: RootedScanner,
+        cells: Option<CellScope<'s>>,
+        verify_fresh: bool,
+        runs: &str,
+    ) -> Result<Self, BuildError> {
+        let (tool_version, tools, execution_root) = {
+            let read = match &stores {
+                BuildStores::Worker { view, .. } => StoreRead::Reader(view),
+                BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
+            };
+            let version = read.input_version();
+            (
+                version,
+                PinnedToolEpoch::capture(&read, version)?,
+                read.state_path().join(runs),
+            )
+        };
+        Ok(Self {
+            stores,
+            env,
+            scanner,
+            tool_version,
+            tools,
+            execution_root,
+            visiting: BTreeSet::new(),
+            callback_chain: Vec::new(),
+            memo: BTreeMap::new(),
+            verify_fresh,
+            cells,
+            trace_base: RefCell::new(None),
+            writes: RefCell::new(Vec::new()),
+            artifacts: RefCell::new(BTreeMap::new()),
         })
+    }
 }
 
-fn ensure_build_basis(context: &BuildContext) -> Result<(), BuildError> {
-    drop(lock_build_store(context)?);
-    Ok(())
+/// Read the build's own view.
+fn lock_build_store<'c>(context: &'c BuildContext<'_>) -> Result<StoreRead<'c>, BuildError> {
+    Ok(match &context.stores {
+        BuildStores::Worker { view, .. } => StoreRead::Reader(view),
+        BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
+    })
+}
+
+/// Read the latest committed state: cached results and CAS bytes.
+fn latest_store<'c>(context: &'c BuildContext<'_>) -> StoreRead<'c> {
+    match &context.stores {
+        BuildStores::Worker { latest, .. } => StoreRead::Reader(latest),
+        BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
+    }
+}
+
+fn record_write(context: &BuildContext, write: BuildWrite) {
+    context.writes.borrow_mut().push(write);
+}
+
+/// Publish the buffered writes in one transaction on the build's writer.
+/// A verifying build publishes nothing.
+fn flush_writes(context: &BuildContext) -> Result<(), BuildError> {
+    let writes = std::mem::take(&mut *context.writes.borrow_mut());
+    if writes.is_empty() || context.verify_fresh {
+        return Ok(());
+    }
+    let publish = |store: &mut Store| {
+        for write in writes {
+            match write {
+                BuildWrite::WireTree(bytes) => {
+                    store.put_wire_tree(&bytes)?;
+                }
+                BuildWrite::Commit(commit) => {
+                    store.commit_build(commit)?;
+                }
+                BuildWrite::Artifact {
+                    asset,
+                    bytes,
+                    load_edges,
+                } => {
+                    store.put_artifact(asset, &bytes, &load_edges)?;
+                }
+            }
+        }
+        Ok(())
+    };
+    match &context.stores {
+        BuildStores::Worker { writer, .. } => writer.borrow_mut().write_transaction(publish),
+        BuildStores::Inline(store) => store.borrow_mut().write_transaction(publish),
+    }
+    .map_err(BuildError::infrastructure)
+}
+
+/// The bytes of an artifact this build produced or found cached.
+fn artifact_bytes(context: &BuildContext, hash: ContentHash) -> Result<Arc<[u8]>, BuildError> {
+    if let Some(bytes) = context.artifacts.borrow().get(&hash) {
+        return Ok(Arc::clone(bytes));
+    }
+    let bytes = latest_store(context)
+        .cas_read(&hash.0)
+        .map_err(BuildError::infrastructure)?;
+    Ok(Arc::from(bytes))
 }
 
 struct BuildProcessContext<'a, 's> {
@@ -608,7 +1350,7 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
 
     fn target(&self) -> Result<&Target, ProcessContextError> {
         self.ensure_active()?;
-        Ok(&self.context.target)
+        Ok(&self.context.env.target)
     }
 
     fn outputs(&self) -> Result<ProcessOutputs, ProcessContextError> {
@@ -667,187 +1409,97 @@ fn build_process_artifact(
     let derived = lock_build_store(context)?
         .resolve_child(asset)
         .map_err(BuildError::failed)?;
-    let (publication, output_key) = match derived {
-        Some((parent, output_key)) => (build_asset(context, parent)?, output_key),
-        None => (build_asset(context, asset)?, String::new()),
-    };
-    let selected = publication.outputs.get(&output_key).ok_or_else(|| {
+    let (parent, output_key) = derived.unwrap_or((asset, String::new()));
+    let node = build_asset(context, parent)?;
+    let content_hash = node.outputs.get(&output_key).copied().ok_or_else(|| {
         BuildError::Failed(format!(
             "built dependency {asset} omitted output {output_key:?}"
         ))
     })?;
-    let artifact = publication
-        .artifacts
-        .get(&selected.content_hash)
-        .ok_or_else(|| {
-            BuildError::Infrastructure("built dependency payload is absent".to_owned())
-        })?;
+    let bytes = artifact_bytes(context, content_hash)?;
+    let (view, structural, blobs) = split_artifact(&bytes)?;
     Ok(ProcessArtifact {
         asset,
-        content_hash: selected.content_hash,
-        encoded_type: selected.encoded_type,
-        terminal_type: selected.terminal_type,
-        structural: Arc::clone(&artifact.payload.structural),
-        blobs: artifact.payload.blobs.clone(),
+        content_hash,
+        encoded_type: view.encoded_type,
+        terminal_type: view.terminal_type,
+        structural,
+        blobs,
     })
 }
 
-fn build_with_runtime(
-    coordinator: &DaemonCoordinator,
-    store: &mut Store,
-    request: &BuildRequest,
-) -> Result<BuildPublication, BuildError> {
-    build_with_runtime_mode(coordinator, store, request, false)
+/// An artifact's parsed header, structural section and blobs.
+fn split_artifact(
+    bytes: &[u8],
+) -> Result<(distill_wire::artifact::ArtifactView<'_>, Arc<[u8]>, Vec<Arc<[u8]>>), BuildError> {
+    let view = parse_artifact(bytes).map_err(BuildError::failed)?;
+    let structural_len = bytes
+        .len()
+        .checked_sub(view.blob_section.len())
+        .ok_or_else(|| BuildError::Failed("artifact structural length underflow".to_owned()))?;
+    let blobs = (0..view.blob_table.len())
+        .map(|index| {
+            view.blob(index as u32)
+                .map(|blob| Arc::<[u8]>::from(blob.to_vec()))
+                .ok_or_else(|| BuildError::Failed("artifact blob table is invalid".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((view, Arc::from(bytes[..structural_len].to_vec()), blobs))
 }
 
-fn build_with_runtime_mode(
+/// Build `request`'s node inline in an open input, at the input's own
+/// rows: a doctor's verification. `verify_fresh` builds without any cache
+/// and publishes nothing.
+fn build_inline(
     coordinator: &DaemonCoordinator,
-    store: &mut Store,
+    input: &mut OpenInput<'_>,
     request: &BuildRequest,
     verify_fresh: bool,
-) -> Result<BuildPublication, BuildError> {
-    let authority = coordinator.schema_authority().ok_or_else(|| {
-        BuildError::Failed("project schema authority is not published".to_owned())
-    })?;
-    let target = coordinator.build_target(&request.target).ok_or_else(|| {
-        BuildError::Failed(format!(
-            "build target {:?} is not published",
-            request.target
-        ))
-    })?;
-    let observed_target =
-        distill_rpc::TargetDefinitionHash(distill_build::keys::target_definition_hash(&target));
-    if observed_target != request.target_definition {
-        return Err(BuildError::Drifted(request.drifted_input.clone()));
-    }
-    let pipeline = coordinator.pipeline_snapshot();
-    let epoch = pipeline
-        .epoch()
-        .map_err(|failure| BuildError::Failed(failure.to_string()))?;
-    let dylib_hash = epoch.dylib_hash();
-    let registry = PipelineRegistry::new(
-        epoch
-            .processor_descriptors()
-            .into_iter()
-            .map(|descriptor| {
-                ProcessorRegistration::new(
-                    &descriptor.id,
-                    descriptor.version,
-                    descriptor.input,
-                    descriptor.selector,
-                    descriptor.outputs,
-                    dylib_hash,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BuildError::failed)?,
-    )
-    .map_err(BuildError::failed)?;
-    let requested_chain = registry
-        .chain(request.entry.type_uuid, &target)
-        .map_err(BuildError::failed)?;
-    let expected_requested_type = if request.output_key.is_empty() {
-        requested_chain.terminal
-    } else {
-        requested_chain
-            .extras
-            .get(&request.output_key)
-            .copied()
-            .ok_or(BuildError::Drifted(DriftedInput::Asset(
-                request.requested_asset,
-            )))?
-    };
-    if request.entry.terminal_type != requested_chain.terminal
-        || request.requested_terminal_type != expected_requested_type
-    {
-        return Err(BuildError::Drifted(request.drifted_input.clone()));
-    }
-    let scanner = coordinator.scanner();
-    let (root, tools, execution_root) = {
-        if store.instance_id() != request.basis.instance
-            || store.input_version() != request.basis.version
-        {
-            return Err(BuildError::Drifted(request.drifted_input.clone()));
-        }
-        let root = load_asset(store, &scanner, request.entry.uuid)?;
-        let tools = PinnedToolEpoch::capture(store, request.basis.version)?;
-        let execution_root = store.state_path().join("tool-runs");
-        (root, tools, execution_root)
-    };
-    verify_request_entry(request, &root, &authority)?;
-
-    let mut context = BuildContext {
-        store: RefCell::new(store),
-        store_instance: request.basis.instance,
-        drifted_input: request.drifted_input.clone(),
-        scanner,
-        authority,
-        pipeline,
-        registry,
-        target,
-        target_definition: request.target_definition.0,
-        dylib_hash,
-        basis: request.basis.version,
-        tools,
-        execution_root,
-        max_depth: coordinator.operational_configuration().max_dependency_depth,
-        visiting: BTreeSet::new(),
-        callback_chain: Vec::new(),
-        memo: BTreeMap::new(),
+) -> Result<NodeResult, BuildError> {
+    let env = NodeEnv::capture(coordinator, &request.target)?;
+    check_request(&env, request)?;
+    let mut context = BuildContext::new(
+        env,
+        BuildStores::Inline(RefCell::new(&mut *input.0)),
+        coordinator.scanner(),
+        None,
         verify_fresh,
-    };
-    let root = build_asset(&mut context, request.entry.uuid)?;
-    ensure_build_basis(&context)?;
-    let selected = root
-        .outputs
-        .get(&request.output_key)
-        .ok_or(BuildError::Drifted(DriftedInput::Asset(
+        "tool-runs",
+    )?;
+    let node = build_asset(&mut context, request.entry.uuid)?;
+    if !node.outputs.contains_key(&request.output_key) {
+        return Err(BuildError::Drifted(DriftedInput::Asset(
             request.requested_asset,
-        )))?;
-    Ok(BuildPublication {
-        root_content_hash: selected.content_hash,
-        artifacts: root.artifacts.into_values().collect(),
-        wire_trees: root.wire_trees.into_values().collect(),
-    })
+        )));
+    }
+    Ok(node)
 }
 
-#[cfg(test)]
-fn build(
-    coordinator: &Arc<DaemonCoordinator>,
-    request: &BuildRequest,
-) -> Result<BuildPublication, BuildError> {
-    let request = request.clone();
-    let job_coordinator = Arc::clone(coordinator);
-    coordinator.run_scheduled(WorkClass::Interactive, move |store| {
-        build_with_runtime(&job_coordinator, store, &request)
-    })
-}
-
-/// Rebuild each request three times, on `store`: doctor verification runs
-/// inside the input it completes in, so its builds see that input and must
-/// not wait on its write lock from another writer.
+/// Rebuild each request three times inside `input`: doctor verification
+/// runs inside the input it completes in, so its builds see that input's
+/// rows, run inline on its writer, and never wait on a build cell.
 pub(crate) fn doctor_verify_builds(
     coordinator: &Arc<DaemonCoordinator>,
-    store: &mut Store,
+    mut input: OpenInput<'_>,
     requests: &[BuildRequest],
 ) -> Result<Vec<String>, String> {
     let mut defects = Vec::new();
     for request in requests {
-        let mut run = |request: &BuildRequest, verify_fresh| {
-            build_with_runtime_mode(coordinator, store, request, verify_fresh)
-        };
-        let published = run(request, false);
-        let first = run(request, true);
-        let second = run(request, true);
+        let mut run =
+            |verify_fresh| build_inline(coordinator, &mut input, request, verify_fresh);
+        let published = run(false);
+        let first = run(true);
+        let second = run(true);
+        let root = |node: &NodeResult| node.outputs.get(&request.output_key).copied();
         match (published, first, second) {
             (Ok(published), Ok(first), Ok(second))
-                if published == first && first == second => {}
-            (Ok(published), Ok(first), Ok(second)) if first == second => defects.push(format!(
-                "asset {} target {:?} fresh rebuild differs from the published artifact set: published root {}, rebuilt root {}",
+                if published.outputs == first.outputs && first.outputs == second.outputs => {}
+            (Ok(published), Ok(first), Ok(second)) if first.outputs == second.outputs => defects.push(format!(
+                "asset {} target {:?} fresh rebuild differs from the published artifact set: published root {:?}, rebuilt root {:?}",
                 request.requested_asset,
                 request.target,
-                published.root_content_hash,
-                first.root_content_hash
+                root(&published),
+                root(&first)
             )),
             (Ok(_), Ok(_), Ok(_)) => defects.push(format!(
                 "asset {} target {:?} produced different fresh rebuild publications",
@@ -870,8 +1522,12 @@ pub(crate) fn doctor_verify_builds(
                 }
             }
             (published, first, second) => defects.push(format!(
-                "asset {} target {:?} changed published/fresh rebuild outcome: {published:?}; {first:?}; {second:?}",
-                request.requested_asset, request.target
+                "asset {} target {:?} changed published/fresh rebuild outcome: {:?}; {:?}; {:?}",
+                request.requested_asset,
+                request.target,
+                published.map(|node| node.outputs),
+                first.map(|node| node.outputs),
+                second.map(|node| node.outputs),
             )),
         }
     }
@@ -881,7 +1537,7 @@ pub(crate) fn doctor_verify_builds(
 /// Finish §10 tag indexing against a namespace that has advanced durably but
 /// is not yet served: the open input applies its RPC delta afterwards.
 pub(crate) fn refine_published_tag_index(
-    store: &mut Store,
+    input: OpenInput<'_>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -890,7 +1546,7 @@ pub(crate) fn refine_published_tag_index(
     fallback_assets: &BTreeMap<AssetUuid, BundleUuid>,
 ) -> PublishedTagIndex {
     try_refine_published_tag_index(
-        store,
+        input.0,
         scanner,
         authority,
         pipeline,
@@ -905,7 +1561,7 @@ pub(crate) fn refine_published_tag_index(
 /// publication. Deleted identities become bounded removals; unrelated tag
 /// rows and cached traces are not enumerated.
 pub(crate) fn refine_published_tag_index_incremental(
-    store: &mut Store,
+    input: OpenInput<'_>,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -919,7 +1575,7 @@ pub(crate) fn refine_published_tag_index_incremental(
         .collect::<BTreeMap<_, _>>();
     let assets = current.keys().copied().collect::<Vec<_>>();
     let mut indexed = try_refine_published_tag_index(
-        store,
+        input.0,
         scanner,
         authority,
         pipeline,
@@ -945,42 +1601,20 @@ fn try_refine_published_tag_index(
     requested_assets: Option<Vec<AssetUuid>>,
 ) -> Result<PublishedTagIndex, String> {
     let tag_epoch = authority.source_hash();
-    let (store_instance, basis, assets, tools, execution_root) = {
-        (
-            store.instance_id(),
-            store.input_version(),
-            match requested_assets {
-                Some(assets) => assets,
-                None => store
-                    .all_asset_ids()
-                    .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
-            },
-            PinnedToolEpoch::capture(store, store.input_version())
-                .map_err(|error| format!("pin tag-index tools: {error:?}"))?,
-            store.state_path().join("tag-index-runs"),
-        )
+    let basis = store.input_version();
+    let assets = match requested_assets {
+        Some(assets) => assets,
+        None => store
+            .all_asset_ids()
+            .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
     };
-    let epoch = pipeline.epoch();
-    let ready = epoch.ok();
-    let target = targets.values().next().cloned();
-    let registry = match (ready, target.as_ref()) {
-        (Some(epoch), Some(_)) => Some(
-            PipelineRegistry::new(
-                epoch
-                    .processor_descriptors()
-                    .into_iter()
-                    .map(|descriptor| {
-                        ProcessorRegistration::new(
-                            &descriptor.id,
-                            descriptor.version,
-                            descriptor.input,
-                            descriptor.selector,
-                            descriptor.outputs,
-                            epoch.dylib_hash(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| format!("tag-index pipeline map: {error:?}"))?,
+    let env = match (pipeline.epoch(), targets.values().next()) {
+        (Ok(_), Some(target)) => Some(
+            NodeEnv::new(
+                Arc::clone(&authority),
+                pipeline.clone(),
+                target.clone(),
+                max_depth,
             )
             .map_err(|error| format!("tag-index pipeline map: {error:?}"))?,
         ),
@@ -990,29 +1624,17 @@ fn try_refine_published_tag_index(
     let mut tags = BTreeMap::new();
     let mut poisons = BTreeMap::new();
     let mut updates = Vec::with_capacity(assets.len());
-    if let (Some(epoch), Some(target), Some(registry)) = (ready, target, registry) {
-        let dylib_hash = epoch.dylib_hash();
-        let target_definition = distill_build::keys::target_definition_hash(&target);
-        let mut context = BuildContext {
-            store: RefCell::new(&mut *store),
-            store_instance,
-            drifted_input: DriftedInput::Dylib,
-            scanner: scanner.clone(),
-            authority: Arc::clone(&authority),
-            pipeline: pipeline.clone(),
-            registry,
-            target,
-            target_definition,
-            dylib_hash,
-            basis,
-            tools,
-            execution_root,
-            max_depth,
-            visiting: BTreeSet::new(),
-            callback_chain: Vec::new(),
-            memo: BTreeMap::new(),
-            verify_fresh: false,
-        };
+    if let Some(env) = env {
+        let dylib_hash = env.dylib_hash;
+        let mut context = BuildContext::new(
+            env,
+            BuildStores::Inline(RefCell::new(&mut *store)),
+            scanner.clone(),
+            None,
+            false,
+            "tag-index-runs",
+        )
+        .map_err(|error| format!("pin tag-index tools: {error:?}"))?;
         for asset in assets {
             let indexed = index_one_tag_entry(&mut context, asset, tag_epoch);
             match indexed {
@@ -1122,7 +1744,7 @@ fn index_one_tag_entry(
     };
     let bundle = loaded.meta.bundle;
     let Some(project) = context
-        .authority
+        .env.authority
         .project_type(loaded.entry.type_uuid)
         .cloned()
     else {
@@ -1150,7 +1772,7 @@ fn index_one_tag_entry(
             )
         })?;
     let extracted = distill_schema::extract_search_tags(
-        context.authority.schema(),
+        context.env.authority.schema(),
         project.schema_type,
         &current,
     )
@@ -1170,74 +1792,74 @@ fn index_one_tag_entry(
         tags: extracted,
         tag_epoch,
         planner_version: migrated.then_some(MIGRATION_PLANNER_VERSION),
-        dylib_hash: migrated.then_some(context.dylib_hash),
+        dylib_hash: migrated.then_some(context.env.dylib_hash),
         trace: trace_payload_bytes(&trace),
         poison: None,
     })
 }
 
-fn verify_request_entry(
-    request: &BuildRequest,
-    loaded: &LoadedAsset,
-    authority: &ProjectSchemaAuthority,
-) -> Result<(), BuildError> {
-    let requested = &request.entry;
-    if request.output_key.is_empty() {
-        if request.requested_asset != requested.uuid {
-            return Err(BuildError::Drifted(request.drifted_input.clone()));
-        }
-    } else if request.requested_asset != AssetUuid::v5(requested.uuid, &request.output_key) {
-        return Err(BuildError::Drifted(request.drifted_input.clone()));
-    }
-    if requested.bundle != loaded.meta.bundle
-        || requested.local_id != loaded.meta.local_id
-        || requested.normalized_path != loaded.bundle_meta.path
-        || requested.type_uuid != loaded.meta.type_uuid
-        || requested.schema_hash != loaded.meta.logical_hash
-    {
-        return Err(BuildError::Drifted(request.drifted_input.clone()));
-    }
-    let decoded = decode_authoring_payload(
-        requested.schema_hash,
-        &requested.logical_schema,
-        &requested.value,
-    )
-    .map_err(BuildError::failed)?;
-    if decoded != loaded.entry.data {
-        return Err(BuildError::Drifted(request.drifted_input.clone()));
-    }
-    authority.project_type(requested.type_uuid).ok_or_else(|| {
-        BuildError::Failed(format!(
-            "type {} has no project schema authority",
-            requested.type_uuid
-        ))
-    })?;
-    Ok(())
+/// One step of a build's walk over its strong-reference closure.
+enum BuildFrame {
+    Enter {
+        asset: AssetUuid,
+        chain: Vec<AssetUuid>,
+    },
+    /// A node whose own outputs are built, assembled once its dependencies
+    /// are; with the cell this worker claimed for it, if any.
+    Assemble(Box<PendingNodePublication>, Option<CellRun<BuildOutcome>>),
 }
 
-fn build_asset(
-    context: &mut BuildContext,
-    asset: AssetUuid,
-) -> Result<NodePublication, BuildError> {
-    enum Frame {
-        Enter {
-            asset: AssetUuid,
-            chain: Vec<AssetUuid>,
-        },
-        Assemble(PendingNodePublication),
-    }
+/// How a node entered the walk.
+enum Entered {
+    Done(NodeResult),
+    Pending(PendingNodePublication, Option<CellRun<BuildOutcome>>),
+}
 
+/// What a worker does about a node it needs and the cache does not hold.
+enum NodeClaim {
+    /// Build it: for the cell this worker now runs (`Some`), or privately.
+    Build(Option<CellRun<BuildOutcome>>),
+    /// Another worker's finished cell serves it at this build's view.
+    Done(NodeResult),
+}
+
+/// Build `asset`'s node and the nodes its outputs strongly reference, or
+/// find them cached. The walk is iterative; its depth is bounded by the
+/// dependency depth and a strong-reference cycle fails it.
+fn build_asset(context: &mut BuildContext, asset: AssetUuid) -> Result<NodeResult, BuildError> {
     let mut chain = context.callback_chain.clone();
     if chain.last().copied() != Some(asset) {
         chain.push(asset);
     }
-    let mut stack = vec![Frame::Enter { asset, chain }];
+    let mut stack = vec![BuildFrame::Enter { asset, chain }];
+    if let Err(error) = drive_build(context, &mut stack) {
+        // Stage results the failed walk cached stay valid; the cells it
+        // claimed report its failure to their waiters.
+        if let Err(flush) = flush_writes(context) {
+            tracing::warn!(?flush, "a failed build could not publish its cached stages");
+        }
+        for frame in stack.drain(..) {
+            if let BuildFrame::Assemble(pending, run) = frame {
+                context.visiting.remove(&pending.asset);
+                if let Some(run) = run {
+                    run.finish(Arc::new(error.clone().outcome(cell_at(context))));
+                }
+            }
+        }
+        return Err(error);
+    }
+    context.memo.get(&asset).cloned().ok_or_else(|| {
+        BuildError::Infrastructure("iterative build lost its root result".to_owned())
+    })
+}
+
+fn drive_build(context: &mut BuildContext, stack: &mut Vec<BuildFrame>) -> Result<(), BuildError> {
     while let Some(frame) = stack.pop() {
         match frame {
-            Frame::Enter { asset, chain } => {
-                if chain.len() > context.max_depth {
+            BuildFrame::Enter { asset, chain } => {
+                if chain.len() > context.env.max_depth {
                     return Err(BuildError::DepthExceeded {
-                        limit: context.max_depth,
+                        limit: context.env.max_depth,
                         chain,
                     });
                 }
@@ -1250,45 +1872,214 @@ fn build_asset(
                     )));
                 }
                 let previous_chain = std::mem::replace(&mut context.callback_chain, chain.clone());
-                let pending = match build_asset_inner(context, asset) {
-                    Ok(pending) => pending,
+                let entered = enter_node(context, asset);
+                context.callback_chain = previous_chain;
+                let (pending, run) = match entered {
+                    Ok(Entered::Done(result)) => {
+                        context.visiting.remove(&asset);
+                        context.memo.insert(asset, result);
+                        continue;
+                    }
+                    Ok(Entered::Pending(pending, run)) => (pending, run),
                     Err(error) => {
-                        context.callback_chain = previous_chain;
                         context.visiting.remove(&asset);
                         return Err(error);
                     }
                 };
-                context.callback_chain = previous_chain;
-                let dependencies = pending_dependency_parents(context, &pending)?;
-                stack.push(Frame::Assemble(pending));
-                for dependency in dependencies.into_iter().rev() {
+                let dependencies = pending_dependency_parents(context, &pending);
+                stack.push(BuildFrame::Assemble(Box::new(pending), run));
+                for dependency in dependencies?.into_iter().rev() {
                     let mut dependency_chain = chain.clone();
                     dependency_chain.push(dependency);
-                    stack.push(Frame::Enter {
+                    stack.push(BuildFrame::Enter {
                         asset: dependency,
                         chain: dependency_chain,
                     });
                 }
             }
-            Frame::Assemble(pending) => {
+            BuildFrame::Assemble(pending, run) => {
                 let asset = pending.asset;
-                let publication = match assemble_pending(context, pending) {
-                    Ok(publication) => publication,
+                let assembled = assemble_pending(context, *pending);
+                context.visiting.remove(&asset);
+                let result = match assembled {
+                    Ok(result) => result,
                     Err(error) => {
-                        context.visiting.remove(&asset);
+                        if let Some(run) = run {
+                            run.finish(Arc::new(error.clone().outcome(cell_at(context))));
+                        }
                         return Err(error);
                     }
                 };
-                context.visiting.remove(&asset);
-                context.memo.insert(asset, publication);
+                if let Some(run) = run {
+                    run.finish(Arc::new(BuildOutcome::Built {
+                        trace: result.trace.clone(),
+                        outputs: result.outputs.clone(),
+                    }));
+                }
+                context.memo.insert(asset, result);
             }
         }
     }
-    context.memo.get(&asset).cloned().ok_or_else(|| {
-        BuildError::Infrastructure("iterative build lost its root result".to_owned())
-    })
+    Ok(())
 }
 
+/// The snapshot a cell's worker builds at. Only a cell's worker claims
+/// cells, so only it finishes one.
+fn cell_at(context: &BuildContext) -> SnapshotStamp {
+    context
+        .cells
+        .as_ref()
+        .map(|scope| scope.at)
+        .expect("only a cell's worker holds a claimed cell")
+}
+
+/// Find `asset`'s node cached, take it from a finished cell, or build its
+/// own outputs.
+fn enter_node(context: &mut BuildContext, asset: AssetUuid) -> Result<Entered, BuildError> {
+    if let Some(found) = cached_node(context, asset)? {
+        return Ok(Entered::Done(found));
+    }
+    let run = match claim_node(context, asset)? {
+        NodeClaim::Done(result) => return Ok(Entered::Done(result)),
+        NodeClaim::Build(run) => run,
+    };
+    match build_asset_inner(context, asset) {
+        Ok(pending) => Ok(Entered::Pending(pending, run)),
+        Err(error) => {
+            if let Some(run) = run {
+                run.finish(Arc::new(error.clone().outcome(cell_at(context))));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// A node-cache lookup at this build's view, answering `Read`s from the
+/// nodes this build already has.
+fn node_lookup<'a>(
+    context: &'a BuildContext,
+    view: &'a StoreReader,
+    latest: &'a StoreReader,
+) -> NodeLookup<'a> {
+    let mut lookup = NodeLookup::new(&context.env, view, latest, context.tool_version);
+    lookup.base = context.trace_base.borrow().clone();
+    lookup.nodes = context
+        .memo
+        .iter()
+        .map(|(asset, node)| {
+            (
+                *asset,
+                Some(NodeResult {
+                    trace: Vec::new(),
+                    outputs: node.outputs.clone(),
+                }),
+            )
+        })
+        .collect();
+    lookup
+}
+
+/// Keep what a lookup found: the nodes it looked up hold at this view.
+fn absorb_lookup(
+    context: &mut BuildContext,
+    base: Option<Rc<StoreTraceSource>>,
+    nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
+) {
+    if context.trace_base.borrow().is_none() {
+        *context.trace_base.borrow_mut() = base;
+    }
+    for (asset, node) in nodes {
+        if let Some(node) = node {
+            context.memo.entry(asset).or_insert(node);
+        }
+    }
+}
+
+/// `asset`'s node from the cache, when a cached result's trace holds at
+/// this build's view. A verifying build finds nothing cached.
+fn cached_node(
+    context: &mut BuildContext,
+    asset: AssetUuid,
+) -> Result<Option<NodeResult>, BuildError> {
+    if context.verify_fresh {
+        return Ok(None);
+    }
+    let depth = context.callback_chain.len();
+    let (found, base, nodes) = {
+        let view = lock_build_store(context)?;
+        let latest = latest_store(context);
+        let mut lookup = node_lookup(context, &view, &latest);
+        let found = lookup.node(asset, depth)?;
+        (found, lookup.base, lookup.nodes)
+    };
+    absorb_lookup(context, base, nodes);
+    Ok(found)
+}
+
+/// Whether a finished cell's `trace` holds at this build's view.
+fn holds_here(context: &mut BuildContext, trace: &[TraceOp]) -> Result<bool, BuildError> {
+    let depth = context.callback_chain.len();
+    let (holds, base, nodes) = {
+        let view = lock_build_store(context)?;
+        let latest = latest_store(context);
+        let mut lookup = node_lookup(context, &view, &latest);
+        let holds = lookup.first_drift(trace, depth)?.is_none();
+        (holds, lookup.base, lookup.nodes)
+    };
+    absorb_lookup(context, base, nodes);
+    Ok(holds)
+}
+
+/// Claim the cell of a node this worker's build needs (§ build cells): run
+/// an absent or queued one inline, wait on one another worker runs unless
+/// that could close a cycle of waiting workers, and otherwise build the
+/// node privately. Inline builds and the job's own root claim nothing.
+fn claim_node(context: &mut BuildContext, asset: AssetUuid) -> Result<NodeClaim, BuildError> {
+    let worker = match &context.cells {
+        Some(scope) if scope.root != asset => scope.worker,
+        _ => return Ok(NodeClaim::Build(None)),
+    };
+    let key = {
+        let view = lock_build_store(context)?;
+        node_key(&context.env, &view, asset)?
+    };
+    let Some(key) = key else {
+        return Ok(NodeClaim::Build(None));
+    };
+    match worker.claim(key.digest) {
+        Claim::Run(run) => {
+            // A worker that finished the cell since this one looked has
+            // published it.
+            if let Some(found) = cached_node(context, asset)? {
+                run.finish(Arc::new(BuildOutcome::Built {
+                    trace: found.trace.clone(),
+                    outputs: found.outputs.clone(),
+                }));
+                return Ok(NodeClaim::Done(found));
+            }
+            Ok(NodeClaim::Build(Some(run)))
+        }
+        Claim::Private => Ok(NodeClaim::Build(None)),
+        Claim::Wait(wait) => {
+            let outcome = wait.wait();
+            if let BuildOutcome::Built { trace, outputs } = &*outcome {
+                if holds_here(context, trace)? {
+                    return Ok(NodeClaim::Done(NodeResult {
+                        trace: trace.clone(),
+                        outputs: outputs.clone(),
+                    }));
+                }
+            }
+            // A result that does not hold at this view, or no result: this
+            // build decides the node for itself.
+            Ok(NodeClaim::Build(None))
+        }
+    }
+}
+
+/// Build one node's own outputs: its import and processor chain, each
+/// stage from its cache when a candidate holds. Its strong dependencies
+/// are entered after it and assembled before it.
 fn build_asset_inner(
     context: &mut BuildContext,
     asset: AssetUuid,
@@ -1303,6 +2094,7 @@ fn build_asset_inner(
         )));
     }
     let project = context
+        .env
         .authority
         .project_type(loaded.entry.type_uuid)
         .cloned()
@@ -1313,23 +2105,26 @@ fn build_asset_inner(
             ))
         })?;
     let validators_registered = context
-        .pipeline
-        .epoch()
-        .map_err(|failure| BuildError::Failed(failure.to_string()))?
+        .env
+        .epoch()?
         .validator_descriptors()
         .iter()
         .any(|descriptor| descriptor.asset_type == loaded.entry.type_uuid);
     let chain = context
+        .env
         .registry
-        .chain(loaded.entry.type_uuid, &context.target)
+        .chain(loaded.entry.type_uuid, &context.env.target)
         .map_err(BuildError::failed)?;
-    validate_runtime_chain(&context.authority, &chain)?;
+    validate_runtime_chain(&context.env.authority, &chain)?;
+    let mut trace = Vec::new();
+    let mut cacheable = !context.verify_fresh;
     let (bytes, references, current_value) = encode_or_hydrate(
         context,
         &loaded,
         &project,
         chain.terminal,
-        validators_registered.then_some(context.dylib_hash),
+        validators_registered.then_some(context.env.dylib_hash),
+        &mut trace,
     )?;
     let imported = EncodedNodeOutput {
         output_key: String::new(),
@@ -1344,9 +2139,18 @@ fn build_asset_inner(
     let outputs = if chain.stages.is_empty() {
         vec![imported]
     } else {
-        process_chain(context, &loaded, &project, &chain, imported, current_value)?
+        process_chain(
+            context,
+            &loaded,
+            &project,
+            &chain,
+            imported,
+            current_value,
+            &mut trace,
+            &mut cacheable,
+        )?
     };
-    prepare_outputs(context, asset, outputs)
+    prepare_outputs(context, asset, outputs, trace, cacheable)
 }
 
 fn validate_runtime_chain(
@@ -1385,10 +2189,12 @@ struct EncodedNodeOutput {
     references: Vec<distill_wire::encode::EncodedReference>,
 }
 
+/// One output's artifact, until its node is published.
 struct PendingArtifact {
-    content_hash: ContentHash,
-    structural: Arc<[u8]>,
-    blobs: Vec<Arc<[u8]>>,
+    asset: AssetUuid,
+    output_key: String,
+    type_uuids: Vec<TypeUuid>,
+    bytes: Arc<[u8]>,
     load_edges: Vec<ServedLoadEdge>,
 }
 
@@ -1396,27 +2202,36 @@ struct PendingArtifact {
 struct BuildOutputRow {
     asset: AssetUuid,
     content_hash: ContentHash,
-    authored_type: TypeUuid,
-    encoded_type: TypeUuid,
-    terminal_type: TypeUuid,
     load_edges: Vec<ServedLoadEdge>,
 }
 
+/// A node whose own outputs are built: published once its dependencies
+/// are assembled.
 struct PendingNodePublication {
     asset: AssetUuid,
     local_assets: BTreeSet<AssetUuid>,
     rows: BTreeMap<String, BuildOutputRow>,
     pending: Vec<PendingArtifact>,
-    wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
+    wire_trees: BTreeMap<LayoutHash, Vec<u8>>,
+    /// The import's and every stage's trace, cached or fresh.
+    trace: Vec<TraceOp>,
+    /// False when a stage ran an uncacheable tool, or the build verifies:
+    /// the node then gets no cache entry.
+    cacheable: bool,
 }
 
-type HydratedProcessorStage = (Vec<EncodedNodeOutput>, BTreeMap<String, Vec<u8>>);
+type HydratedProcessorStage = (
+    Vec<EncodedNodeOutput>,
+    BTreeMap<String, Vec<u8>>,
+    Vec<TraceOp>,
+);
 type EncodedBuildImport = (
     Vec<u8>,
     Vec<distill_wire::encode::EncodedReference>,
     Option<AuthoredValue>,
 );
 
+#[allow(clippy::too_many_arguments)]
 fn process_chain(
     context: &mut BuildContext,
     loaded: &LoadedAsset,
@@ -1424,9 +2239,12 @@ fn process_chain(
     chain: &PipelineChain,
     imported: EncodedNodeOutput,
     current_value: Option<AuthoredValue>,
+    node_trace: &mut Vec<TraceOp>,
+    cacheable: &mut bool,
 ) -> Result<Vec<EncodedNodeOutput>, BuildError> {
     if !context.verify_fresh {
-        if let Some(outputs) = hydrate_complete_chain(context, loaded, chain, &imported)? {
+        if let Some((outputs, traces)) = hydrate_complete_chain(context, loaded, chain, &imported)? {
+            node_trace.extend(traces);
             return Ok(outputs);
         }
     }
@@ -1445,7 +2263,7 @@ fn process_chain(
     for stage in &chain.stages {
         let static_inputs = processor_static_inputs(context, loaded, stage, current_hash)?;
         let cached = hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?;
-        let (next_value, encoded) = run_processor_stage(
+        let (next_value, encoded, trace, stage_cacheable) = run_processor_stage(
             context,
             loaded,
             chain,
@@ -1454,6 +2272,8 @@ fn process_chain(
             current_value,
             cached,
         )?;
+        node_trace.extend(trace);
+        *cacheable &= stage_cacheable;
         let primary = encoded
             .iter()
             .find(|output| output.output_key.is_empty())
@@ -1484,10 +2304,10 @@ fn run_processor_stage(
     static_inputs: &StaticInputs,
     current_value: AuthoredValue,
     cached: Option<HydratedProcessorStage>,
-) -> Result<(AuthoredValue, Vec<EncodedNodeOutput>), BuildError> {
+) -> Result<(AuthoredValue, Vec<EncodedNodeOutput>, Vec<TraceOp>, bool), BuildError> {
     std::fs::create_dir_all(&context.execution_root).map_err(BuildError::infrastructure)?;
     let epoch = context
-        .pipeline
+        .env.pipeline
         .epoch()
         .map_err(|failure| BuildError::Failed(failure.to_string()))?
         .clone();
@@ -1563,7 +2383,7 @@ fn run_processor_stage(
                 return Err(error);
             }
         };
-    if let Some((cached_outputs, cached_debug)) = cached.as_ref() {
+    if let Some((cached_outputs, cached_debug, _)) = cached.as_ref() {
         ensure_cached_stage_matches(cached_outputs, cached_debug, &encoded, &products.debug)?;
     } else if cacheable {
         commit_processor_stage(
@@ -1581,7 +2401,7 @@ fn run_processor_stage(
         .ok_or_else(|| {
             BuildError::Infrastructure("processor result omitted its primary".to_owned())
         })?;
-    Ok((next, encoded))
+    Ok((next, encoded, trace, cacheable))
 }
 
 fn hydrate_complete_chain(
@@ -1589,17 +2409,19 @@ fn hydrate_complete_chain(
     loaded: &LoadedAsset,
     chain: &PipelineChain,
     imported: &EncodedNodeOutput,
-) -> Result<Option<Vec<EncodedNodeOutput>>, BuildError> {
+) -> Result<Option<(Vec<EncodedNodeOutput>, Vec<TraceOp>)>, BuildError> {
     let mut input_hash = ContentHash(*blake3::hash(&imported.bytes).as_bytes());
     let mut extras = BTreeMap::<String, EncodedNodeOutput>::new();
     let mut final_primary = None;
+    let mut traces = Vec::new();
     for stage in &chain.stages {
         let static_inputs = processor_static_inputs(context, loaded, stage, input_hash)?;
-        let Some((outputs, _debug)) =
+        let Some((outputs, _debug, trace)) =
             hydrate_processor_stage(context, loaded, chain, stage, &static_inputs)?
         else {
             return Ok(None);
         };
+        traces.extend(trace);
         let primary = outputs
             .iter()
             .find(|output| output.output_key.is_empty())
@@ -1616,7 +2438,7 @@ fn hydrate_complete_chain(
     }
     let mut outputs = vec![final_primary.expect("nonempty chain has a cached final primary")];
     outputs.extend(extras.into_values());
-    Ok(Some(outputs))
+    Ok(Some((outputs, traces)))
 }
 
 fn processor_static_inputs(
@@ -1636,7 +2458,7 @@ fn processor_static_inputs(
                 .map(|(key, ty)| (key.clone(), *ty)),
         )
     {
-        let authority = context.authority.project_type(type_uuid).ok_or_else(|| {
+        let authority = context.env.authority.project_type(type_uuid).ok_or_else(|| {
             BuildError::Failed(format!(
                 "processor output type {type_uuid} has no schema authority"
             ))
@@ -1651,10 +2473,10 @@ fn processor_static_inputs(
         asset: loaded.entry.uuid,
         stage: stage.index,
         input_hash,
-        target_def_hash: context.target_definition,
+        target_def_hash: context.env.target_definition,
         processor_id: stage.registration.id.clone(),
         processor_version: stage.registration.version,
-        dylib_hash: context.dylib_hash,
+        dylib_hash: context.env.dylib_hash,
         output_hashes,
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
     })
@@ -1673,7 +2495,7 @@ fn hydrate_processor_stage(
     let hit = if context.verify_fresh {
         None
     } else {
-        let store = lock_build_store(context)?;
+        let store = latest_store(context);
         lookup_persisted_candidate(
             &store,
             KeyKind::Processor,
@@ -1709,7 +2531,7 @@ fn hydrate_processor_stage(
                 let (asset, authored_type, encoded_type, terminal_type) =
                     expected_output_identity(loaded, chain, stage, &output.output_key)?;
                 let project = context
-                    .authority
+                    .env.authority
                     .project_type(encoded_type)
                     .cloned()
                     .ok_or_else(|| {
@@ -1740,7 +2562,7 @@ fn hydrate_processor_stage(
                 .into_iter()
                 .map(|row| (row.debug_key, row.bytes))
                 .collect();
-            Ok(Some((hydrated, debug)))
+            Ok(Some((hydrated, debug, hit.trace)))
         }
     }
 }
@@ -1752,7 +2574,7 @@ fn preload_persisted_reads(
     asset: AssetUuid,
 ) -> Result<(), BuildError> {
     let traces = {
-        let store = lock_build_store(context)?;
+        let store = latest_store(context);
         persisted_candidate_traces(&store, key_kind, static_key, asset)
             .map_err(BuildError::infrastructure)?
     };
@@ -1857,7 +2679,7 @@ fn encode_processor_products(
         let (asset, authored_type, encoded_type, terminal_type) =
             expected_output_identity(loaded, chain, stage, &output_key)?;
         let project = context
-            .authority
+            .env.authority
             .project_type(encoded_type)
             .cloned()
             .ok_or_else(|| {
@@ -1956,7 +2778,7 @@ fn commit_processor_stage(
     outputs: &[EncodedNodeOutput],
     debug: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), BuildError> {
-    write_build_store(context, |store| store.commit_build(BuildCommit {
+    record_write(context, BuildWrite::Commit(BuildCommit {
             wire_trees: outputs
                 .iter()
                 .map(|output| output.project.dswl_bytes.clone())
@@ -1984,7 +2806,7 @@ fn commit_processor_stage(
                     })
                     .collect(),
             },
-        }))?;
+        }));
     Ok(())
 }
 
@@ -1996,7 +2818,7 @@ fn commit_processor_failure(
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = build_failure_cause(trace, facts)?;
-    write_build_store(context, |store| store.commit_build(BuildCommit {
+    record_write(context, BuildWrite::Commit(BuildCommit {
             key_kind: KeyKind::Processor,
             static_input_key: static_inputs_digest(static_inputs),
             asset_uuid: loaded.entry.uuid,
@@ -2004,7 +2826,7 @@ fn commit_processor_failure(
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
-        }))?;
+        }));
     Ok(())
 }
 
@@ -2078,6 +2900,8 @@ fn prepare_outputs(
     context: &mut BuildContext,
     asset: AssetUuid,
     outputs: Vec<EncodedNodeOutput>,
+    trace: Vec<TraceOp>,
+    cacheable: bool,
 ) -> Result<PendingNodePublication, BuildError> {
     let local_assets = outputs
         .iter()
@@ -2086,29 +2910,13 @@ fn prepare_outputs(
     let mut rows = BTreeMap::<String, BuildOutputRow>::new();
     let mut pending = Vec::with_capacity(outputs.len());
     let mut wire_trees = BTreeMap::new();
-    for output in &outputs {
-        verify_encoded_output(output)?;
-        write_build_store(context, |store| store.put_wire_tree(&output.project.dswl_bytes))?;
+    for output in outputs {
+        verify_encoded_output(&output)?;
         wire_trees.insert(
             output.project.layout_hash,
-            BuildWireTree {
-                layout_hash: output.project.layout_hash,
-                bytes: Arc::from(output.project.dswl_bytes.clone()),
-            },
+            output.project.dswl_bytes.clone(),
         );
         let view = parse_artifact(&output.bytes).map_err(BuildError::failed)?;
-        let structural_len = output
-            .bytes
-            .len()
-            .checked_sub(view.blob_section.len())
-            .ok_or_else(|| BuildError::Failed("artifact structural length underflow".to_owned()))?;
-        let blobs = (0..view.blob_table.len())
-            .map(|index| {
-                view.blob(index as u32)
-                    .map(|blob| Arc::<[u8]>::from(blob.to_vec()))
-                    .ok_or_else(|| BuildError::Failed("artifact blob table is invalid".to_owned()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let load_edges =
             load_edges_for_output(context, output.asset, &view.load_deps, &output.references)?;
         let content_hash = ContentHash(*blake3::hash(&output.bytes).as_bytes());
@@ -2117,21 +2925,15 @@ fn prepare_outputs(
             BuildOutputRow {
                 asset: output.asset,
                 content_hash,
-                authored_type: output.authored_type,
-                encoded_type: output.encoded_type,
-                terminal_type: output.terminal_type,
-                load_edges,
+                load_edges: load_edges.clone(),
             },
         );
         pending.push(PendingArtifact {
-            content_hash,
-            structural: Arc::from(output.bytes[..structural_len].to_vec()),
-            blobs,
-            load_edges: rows
-                .get(&output.output_key)
-                .expect("row was inserted immediately above")
-                .load_edges
-                .clone(),
+            asset: output.asset,
+            type_uuids: output_type_set(&output),
+            output_key: output.output_key,
+            bytes: Arc::from(output.bytes),
+            load_edges,
         });
     }
 
@@ -2141,6 +2943,8 @@ fn prepare_outputs(
         rows,
         pending,
         wire_trees,
+        trace,
+        cacheable,
     })
 }
 
@@ -2165,86 +2969,116 @@ fn pending_dependency_parents(
     Ok(dependencies.into_iter().collect())
 }
 
+/// Publish a node whose strong dependencies are assembled, in one
+/// transaction on the build's writer: its stages' cache rows, its wire
+/// trees, its artifacts with their load edges, and (when every stage was
+/// cacheable) its node result. A node's trace is its import's and stages'
+/// traces and a `Read` of each strong dependency: a node serves only where
+/// its dependencies build to the same content.
 fn assemble_pending(
-    context: &BuildContext,
+    context: &mut BuildContext,
     pending_node: PendingNodePublication,
-) -> Result<NodePublication, BuildError> {
+) -> Result<NodeResult, BuildError> {
     let PendingNodePublication {
-        asset: _,
+        asset,
         local_assets,
         rows,
         pending,
-        mut wire_trees,
+        wire_trees,
+        mut trace,
+        cacheable,
     } = pending_node;
 
-    let mut artifacts = BTreeMap::new();
+    let mut reads = BTreeMap::new();
     for row in rows.values() {
         for edge in &row.load_edges {
             if local_assets.contains(&edge.asset) {
                 continue;
             }
-            let (dependency, _) = dependency_from_memo(context, edge.asset)?;
-            merge_artifacts(&mut artifacts, dependency.artifacts)?;
-            merge_wire_trees(&mut wire_trees, dependency.wire_trees)?;
+            reads.insert(edge.asset, dependency_hash(context, edge.asset)?);
         }
     }
-    for artifact in pending {
-        artifacts.insert(
-            artifact.content_hash,
-            BuildArtifactPublication {
-                content_hash: artifact.content_hash,
-                payload: ArtifactPayload {
-                    structural: artifact.structural,
-                    blobs: artifact.blobs,
-                    load_edges: artifact.load_edges,
+    trace.extend(reads.into_iter().map(|(asset, hash)| TraceOp::Read {
+        asset,
+        observed: Observed::Ok(hash),
+    }));
+    let outputs = rows
+        .iter()
+        .map(|(output_key, row)| (output_key.clone(), row.content_hash))
+        .collect::<BTreeMap<_, _>>();
+
+    for tree in wire_trees.values() {
+        record_write(context, BuildWrite::WireTree(tree.clone()));
+    }
+    if cacheable {
+        let key = {
+            let view = lock_build_store(context)?;
+            node_key(&context.env, &view, asset)?
+        }
+        .ok_or_else(|| BuildError::Drifted(DriftedInput::Asset(asset)))?;
+        record_write(
+            context,
+            BuildWrite::Commit(BuildCommit {
+                wire_trees: wire_trees.into_values().collect(),
+                key_kind: KeyKind::Node,
+                static_input_key: key.digest,
+                asset_uuid: asset,
+                static_inputs_canonical: key.canonical,
+                trace: trace_payload_bytes(&trace),
+                outcome: CommitOutcome::Success {
+                    payload_kind: PayloadKind::ProcessorOutput,
+                    outputs: pending
+                        .iter()
+                        .map(|artifact| OutputSpec {
+                            output_key: artifact.output_key.clone(),
+                            type_uuids: artifact.type_uuids.clone(),
+                            bytes: artifact.bytes.to_vec(),
+                        })
+                        .collect(),
+                    aux: Vec::new(),
                 },
+            }),
+        );
+    }
+    for artifact in pending {
+        let content_hash = ContentHash(*blake3::hash(&artifact.bytes).as_bytes());
+        context
+            .artifacts
+            .borrow_mut()
+            .insert(content_hash, Arc::clone(&artifact.bytes));
+        record_write(
+            context,
+            BuildWrite::Artifact {
+                asset: artifact.asset,
+                bytes: artifact.bytes,
+                load_edges: artifact
+                    .load_edges
+                    .iter()
+                    .map(|edge| (edge.asset, edge.expected_terminal))
+                    .collect(),
             },
         );
     }
-    let primary = rows
-        .get("")
-        .cloned()
-        .ok_or_else(|| BuildError::Failed("built chain has no primary output".to_owned()))?;
-    Ok(NodePublication {
-        primary,
-        outputs: rows,
-        artifacts,
-        wire_trees,
-    })
+    flush_writes(context)?;
+    Ok(NodeResult { trace, outputs })
 }
 
-fn dependency_from_memo(
-    context: &BuildContext,
-    asset: AssetUuid,
-) -> Result<(NodePublication, BuildOutputRow), BuildError> {
+/// The content a strong dependency, assembled before its dependent, has.
+fn dependency_hash(context: &BuildContext, asset: AssetUuid) -> Result<ContentHash, BuildError> {
     let derived = lock_build_store(context)?
         .resolve_child(asset)
         .map_err(BuildError::failed)?;
-    if let Some((parent, output_key)) = derived {
-        let publication = context.memo.get(&parent).cloned().ok_or_else(|| {
-            BuildError::Infrastructure(format!(
-                "iterative build assembled dependent {asset} before parent {parent}"
-            ))
-        })?;
-        let selected = publication
-            .outputs
-            .get(&output_key)
-            .cloned()
-            .ok_or_else(|| {
-                BuildError::Failed(format!(
-                    "derived child {asset} is absent from parent {parent}'s chain result"
-                ))
-            })?;
-        Ok((publication, selected))
-    } else {
-        let publication = context.memo.get(&asset).cloned().ok_or_else(|| {
-            BuildError::Infrastructure(format!(
-                "iterative build assembled a node before dependency {asset}"
-            ))
-        })?;
-        let selected = publication.primary.clone();
-        Ok((publication, selected))
-    }
+    let (parent, output_key) = derived.unwrap_or((asset, String::new()));
+    let node = context.memo.get(&parent).ok_or_else(|| {
+        BuildError::Infrastructure(format!(
+            "iterative build assembled a node before dependency {asset}"
+        ))
+    })?;
+    node.outputs.get(&output_key).copied().ok_or_else(|| {
+        BuildError::Failed(format!(
+            "derived child {asset} is absent from parent {parent}'s chain result"
+        ))
+    })
 }
 
 fn verify_encoded_output(output: &EncodedNodeOutput) -> Result<(), BuildError> {
@@ -2300,8 +3134,8 @@ fn resolved_terminal_type(
     let store = lock_build_store(context)?;
     if let Some(entry) = store.entry(asset).map_err(BuildError::failed)? {
         return context
-            .registry
-            .chain(entry.type_uuid, &context.target)
+            .env.registry
+            .chain(entry.type_uuid, &context.env.target)
             .map(|chain| chain.terminal)
             .map_err(BuildError::failed);
     }
@@ -2314,8 +3148,8 @@ fn resolved_terminal_type(
         .map_err(BuildError::failed)?
         .ok_or_else(|| BuildError::Failed("derived parent is missing".to_owned()))?;
     context
-        .registry
-        .chain(parent.type_uuid, &context.target)
+        .env.registry
+        .chain(parent.type_uuid, &context.env.target)
         .map_err(BuildError::failed)?
         .extras
         .get(&output_key)
@@ -2323,23 +3157,32 @@ fn resolved_terminal_type(
         .ok_or_else(|| BuildError::Failed("derived output is absent from pipeline map".to_owned()))
 }
 
+/// The trace answers at this build's view: captured once per build (the
+/// view does not move), with the contents of the nodes it has so far.
 fn capture_trace_source(context: &BuildContext) -> Result<StoreTraceSource, BuildError> {
-    let epoch = context
-        .pipeline
-        .epoch()
-        .map_err(|failure| BuildError::Failed(failure.to_string()))?;
-    let store = lock_build_store(context)?;
-    StoreTraceSource::capture(
-        &store,
-        TraceCaptureBasis {
-            registry: &context.registry,
-            target: &context.target,
-            input_version: context.basis,
-            epoch,
-            dylib_hash: context.dylib_hash,
-            memo: &context.memo,
-        },
-    )
+    let base = context.trace_base.borrow().clone();
+    let base = match base {
+        Some(base) => base,
+        None => {
+            let store = lock_build_store(context)?;
+            let base = Rc::new(StoreTraceSource::capture(
+                &store,
+                TraceCaptureBasis {
+                    registry: &context.env.registry,
+                    target: &context.env.target,
+                    input_version: context.tool_version,
+                    epoch: context.env.epoch()?,
+                    dylib_hash: context.env.dylib_hash,
+                },
+            )?);
+            drop(store);
+            *context.trace_base.borrow_mut() = Some(Rc::clone(&base));
+            base
+        }
+    };
+    let mut source = StoreTraceSource::clone(&base);
+    source.content_hashes = node_content_hashes(context.memo.iter().map(|(a, n)| (*a, n)))?;
+    Ok(source)
 }
 
 struct EpochDefaults<'a> {
@@ -2589,7 +3432,7 @@ fn commit_build_import_failure(
     facts: Option<&DslfV1>,
 ) -> Result<(), BuildError> {
     let cause = build_failure_cause(trace, facts)?;
-    write_build_store(context, |store| store.commit_build(BuildCommit {
+    record_write(context, BuildWrite::Commit(BuildCommit {
             key_kind: KeyKind::BuildImport,
             static_input_key: key,
             asset_uuid: loaded.entry.uuid,
@@ -2597,7 +3440,7 @@ fn commit_build_import_failure(
             trace: trace_payload_bytes(trace),
             outcome: CommitOutcome::Failure { cause },
             wire_trees: Vec::new(),
-        }))?;
+        }));
     Ok(())
 }
 
@@ -2610,7 +3453,7 @@ fn load_current_value(
 ) -> Result<AuthoredValue, BuildError> {
     let bundle = distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
     load_current_entry(
-        &context.pipeline,
+        &context.env.pipeline,
         &loaded.entry,
         &bundle,
         &project.logical_schema,
@@ -2824,10 +3667,11 @@ fn encode_or_hydrate(
     project: &ProjectTypeAuthority,
     terminal_type: TypeUuid,
     validator_dylib_hash: Option<[u8; 32]>,
+    trace_out: &mut Vec<TraceOp>,
 ) -> Result<EncodedBuildImport, BuildError> {
     let trace_source = capture_trace_source(context)?;
     let (migrations, automatic_migration) =
-        migration_key_inputs(loaded, project, context.dylib_hash);
+        migration_key_inputs(loaded, project, context.env.dylib_hash);
     let key = build_import_digest(&BuildImportInputs {
         asset: loaded.entry.uuid,
         bundle: loaded.meta.bundle,
@@ -2845,7 +3689,7 @@ fn encode_or_hydrate(
     let hit = if context.verify_fresh {
         None
     } else {
-        let store = lock_build_store(context)?;
+        let store = latest_store(context);
         lookup_persisted_candidate(
             &store,
             KeyKind::BuildImport,
@@ -2861,6 +3705,7 @@ fn encode_or_hydrate(
                 if outputs.len() == 1 && outputs[0].output_key.is_empty() && aux.is_empty() =>
             {
                 let output = outputs.into_iter().next().unwrap();
+                trace_out.extend(hit.trace);
                 validate_cached_output_type_set(
                     &output.type_uuids,
                     loaded.entry.type_uuid,
@@ -2909,7 +3754,7 @@ fn encode_or_hydrate(
 
     if validator_dylib_hash.is_some() {
         let diagnostics = context
-            .pipeline
+            .env.pipeline
             .epoch()
             .map_err(|failure| BuildError::Failed(failure.to_string()))?
             .invoke_validators(loaded.entry.type_uuid, &current_value)
@@ -2927,7 +3772,7 @@ fn encode_or_hydrate(
             };
             let detail = facts.digest().map_err(BuildError::failed)?;
             if !context.verify_fresh {
-                write_build_store(context, |store| store.commit_build(BuildCommit {
+                record_write(context, BuildWrite::Commit(BuildCommit {
                         key_kind: KeyKind::BuildImport,
                         static_input_key: key,
                         asset_uuid: loaded.entry.uuid,
@@ -2940,7 +3785,7 @@ fn encode_or_hydrate(
                             }),
                         },
                         wire_trees: Vec::new(),
-                    }))?;
+                    }));
             }
             return Err(BuildError::Failed(format!(
                 "asset {} failed validation: {diagnostics:?}",
@@ -3005,7 +3850,7 @@ fn encode_or_hydrate(
         terminal_type,
     );
     if !context.verify_fresh {
-        write_build_store(context, |store| store.commit_build(BuildCommit {
+        record_write(context, BuildWrite::Commit(BuildCommit {
                 wire_trees: vec![project.dswl_bytes.clone()],
                 key_kind: KeyKind::BuildImport,
                 static_input_key: key,
@@ -3021,8 +3866,9 @@ fn encode_or_hydrate(
                     }],
                     aux: Vec::new(),
                 },
-            }))?;
+            }));
     }
+    trace_out.extend(trace);
     Ok((bytes, references, Some(current_value)))
 }
 
@@ -3172,7 +4018,6 @@ fn load_asset(
     }
     Ok(LoadedAsset {
         meta,
-        bundle_meta,
         bundle_bytes: canonical,
         entry: entry.clone(),
     })
@@ -3183,42 +4028,6 @@ fn find_bundle_asset(bundle: &Bundle, asset: AssetUuid) -> Option<(&str, &AssetE
         .assets
         .iter()
         .find_map(|(local_id, entry)| (entry.uuid == asset).then_some((local_id.as_str(), entry)))
-}
-
-fn merge_artifacts(
-    target: &mut BTreeMap<ContentHash, BuildArtifactPublication>,
-    source: BTreeMap<ContentHash, BuildArtifactPublication>,
-) -> Result<(), BuildError> {
-    for (hash, artifact) in source {
-        if let Some(existing) = target.get(&hash) {
-            if existing != &artifact {
-                return Err(BuildError::Failed(
-                    "equal content hashes carry different RPC artifact metadata".to_owned(),
-                ));
-            }
-        } else {
-            target.insert(hash, artifact);
-        }
-    }
-    Ok(())
-}
-
-fn merge_wire_trees(
-    target: &mut BTreeMap<LayoutHash, BuildWireTree>,
-    source: BTreeMap<LayoutHash, BuildWireTree>,
-) -> Result<(), BuildError> {
-    for (hash, tree) in source {
-        if let Some(existing) = target.get(&hash) {
-            if existing != &tree {
-                return Err(BuildError::Failed(
-                    "equal layout hashes carry different DSWL bodies".to_owned(),
-                ));
-            }
-        } else {
-            target.insert(hash, tree);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -3257,7 +4066,6 @@ struct TraceCaptureBasis<'a> {
     input_version: distill_store::state::InputVersion,
     epoch: &'a PipelineEpoch,
     dylib_hash: [u8; 32],
-    memo: &'a BTreeMap<AssetUuid, NodePublication>,
 }
 
 impl StoreTraceSource {
@@ -3360,19 +4168,6 @@ impl StoreTraceSource {
             .tool_hashes_at(basis.input_version)
             .map_err(BuildError::infrastructure)?;
         let current_load = CurrentLoadSource::capture(basis.epoch, basis.dylib_hash);
-        let mut content_hashes = BTreeMap::new();
-        for publication in basis.memo.values() {
-            for output in publication.outputs.values() {
-                if content_hashes
-                    .insert(output.asset, output.content_hash)
-                    .is_some_and(|existing| existing != output.content_hash)
-                {
-                    return Err(BuildError::Infrastructure(
-                        "one build context observed two contents for an asset".to_owned(),
-                    ));
-                }
-            }
-        }
         Ok(Self {
             authoring_hashes,
             entries,
@@ -3381,7 +4176,7 @@ impl StoreTraceSource {
             paths,
             tools,
             current_load,
-            content_hashes,
+            content_hashes: BTreeMap::new(),
             tag_poisons,
         })
     }
@@ -3578,7 +4373,8 @@ mod tests {
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_json::AuthoredValue;
     use distill_rpc::{
-        AuthoringEntry, AuthoringEntryRole, AuthoringValue, TargetDefinition,
+        ArtifactPayload, AuthoringEntry, AuthoringEntryRole, AuthoringValue,
+        BuildArtifactPublication, BuildPublication, BuildWireTree, TargetDefinition,
         TargetDefinitionHash,
     };
     use distill_schema::ngp_schema::{
@@ -3896,6 +4692,141 @@ mod tests {
         .unwrap()
     }
 
+    const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async { tokio::time::timeout(WATCHDOG, future).await })
+            .expect("watchdog: the build never finished")
+    }
+
+    /// A requester's snapshot and latest reader.
+    struct Requester {
+        snapshot: StoreSnapshot,
+        latest: StoreReader,
+    }
+
+    impl Requester {
+        fn at_current(coordinator: &DaemonCoordinator) -> Self {
+            Self {
+                snapshot: coordinator.open_reader().unwrap().begin_snapshot().unwrap(),
+                latest: coordinator.open_reader().unwrap(),
+            }
+        }
+
+        fn view(&self) -> BuildView<'_> {
+            BuildView {
+                snapshot: &self.snapshot,
+                stamp: self.snapshot.stamp(),
+                latest: &self.latest,
+            }
+        }
+    }
+
+    /// Answer `request` at `requester`'s snapshot through the production
+    /// backend, waiting for its cell when it submits one.
+    fn resolve(
+        coordinator: &Arc<DaemonCoordinator>,
+        requester: &Requester,
+        request: &BuildRequest,
+    ) -> Result<BuildAnswer, RpcFailure> {
+        match CoordinatorBuildBackend::new(coordinator).start(requester.view(), request) {
+            BuildStart::Answered(answer) => answer,
+            BuildStart::Submitted(ticket) => block_on(ticket).answer(requester.view()),
+        }
+    }
+
+    /// Build `request` at the current snapshot, and read its node's
+    /// published artifacts and wire trees back from the CAS.
+    fn build(
+        coordinator: &Arc<DaemonCoordinator>,
+        request: &BuildRequest,
+    ) -> Result<BuildPublication, BuildError> {
+        let requester = Requester::at_current(coordinator);
+        let root = match resolve(coordinator, &requester, request) {
+            Ok(BuildAnswer::Built { content_hash }) => content_hash,
+            Ok(BuildAnswer::Failed { error }) => return Err(BuildError::Failed(error)),
+            Ok(BuildAnswer::Drifted { input }) => return Err(BuildError::Drifted(input)),
+            Err(failure) => return Err(BuildError::Infrastructure(format!("{failure:?}"))),
+        };
+        let env = NodeEnv::capture(coordinator, &request.target)?;
+        let node = NodeLookup::new(
+            &env,
+            &requester.snapshot,
+            &requester.latest,
+            requester.snapshot.stamp().version,
+        )
+        .node(request.entry.uuid, 0)?
+        .expect("a built node is cached at its requester's snapshot");
+        Ok(published(&requester.latest, root, &node))
+    }
+
+    fn published(latest: &StoreReader, root: ContentHash, node: &NodeResult) -> BuildPublication {
+        let mut artifacts = BTreeMap::new();
+        let mut wire_trees = BTreeMap::new();
+        for hash in node.outputs.values() {
+            let bytes = latest.cas_read(&hash.0).unwrap();
+            let (view, structural, blobs) = split_artifact(&bytes).unwrap();
+            let layout_hash = view.layout_hash;
+            wire_trees.insert(
+                layout_hash,
+                BuildWireTree {
+                    layout_hash,
+                    bytes: Arc::from(latest.wire_tree_read(layout_hash).unwrap()),
+                },
+            );
+            let load_edges = latest
+                .artifact_load_edges(*hash)
+                .unwrap()
+                .into_iter()
+                .map(|(asset, expected_terminal)| ServedLoadEdge {
+                    asset,
+                    expected_terminal,
+                })
+                .collect();
+            artifacts.insert(
+                *hash,
+                BuildArtifactPublication {
+                    content_hash: *hash,
+                    payload: ArtifactPayload {
+                        structural,
+                        blobs,
+                        load_edges,
+                    },
+                },
+            );
+        }
+        BuildPublication {
+            root_content_hash: root,
+            artifacts: artifacts.into_values().collect(),
+            wire_trees: wire_trees.into_values().collect(),
+        }
+    }
+
+    /// Build `request` inline without any cache, as a doctor's verification
+    /// does, and read the outputs it would publish (identical content is
+    /// already in the CAS).
+    fn build_fresh(
+        coordinator: &Arc<DaemonCoordinator>,
+        writer: &mut Store,
+        request: &BuildRequest,
+    ) -> BuildPublication {
+        writer.open_input().unwrap();
+        let node = build_inline(
+            coordinator,
+            &mut OpenInput::new(writer).unwrap(),
+            request,
+            true,
+        )
+        .unwrap();
+        writer.finish_input(false).unwrap();
+        let root = node.outputs[&request.output_key];
+        published(&coordinator.open_reader().unwrap(), root, &node)
+    }
+
     fn rpc_target(hash: TargetDefinitionHash) -> TargetDefinition {
         TargetDefinition::new("dev", hash)
     }
@@ -3943,14 +4874,17 @@ mod tests {
             context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            // The build holds no write transaction while a processor runs:
-            // another writer takes the write lock at once.
-            let unlocked = self
-                .opener
-                .open_writer()
-                .and_then(|mut writer| writer.write_transaction(|_| Ok(())))
-                .is_ok();
-            self.observed_unlocked.store(unlocked, Ordering::SeqCst);
+            // A cell's worker holds no write transaction while a processor
+            // runs: another writer takes the write lock at once. (Probed
+            // until seen once; an inline verification runs inside its input.)
+            if !self.observed_unlocked.load(Ordering::SeqCst) {
+                let unlocked = self
+                    .opener
+                    .open_writer()
+                    .and_then(|mut writer| writer.write_transaction(|_| Ok(())))
+                    .is_ok();
+                self.observed_unlocked.store(unlocked, Ordering::SeqCst);
+            }
             let AuthoredValue::Object(fields) = &input else {
                 panic!("processor input is a struct");
             };
@@ -4084,8 +5018,9 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
+        writer.open_input().unwrap();
         refine_published_tag_index(
-            &mut writer,
+            OpenInput::new(&mut writer).unwrap(),
             coordinator.scanner(),
             Arc::clone(&authority),
             coordinator.pipeline_snapshot(),
@@ -4093,6 +5028,7 @@ mod tests {
             64,
             &BTreeMap::from([(ASSET, BUNDLE)]),
         );
+        writer.finish_input(true).unwrap();
         let indexed = coordinator
             .open_reader()
             .unwrap()
@@ -4102,9 +5038,8 @@ mod tests {
         assert_eq!(indexed.planner_version, Some(MIGRATION_PLANNER_VERSION));
         assert!(indexed.dylib_hash.is_some());
         assert!(indexed.poison.is_none());
-        let mut request = BuildRequest {
+        let request = BuildRequest {
             work_class: BuildWorkClass::Interactive,
-            basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
             target_definition: target_hash,
             requested_asset: ASSET,
@@ -4189,7 +5124,6 @@ mod tests {
                     .unwrap();
             },
         ));
-        request.basis = coordinator.server().current_stamp();
 
         let function = build(&coordinator, &request).unwrap();
         assert_eq!(migration_calls.load(Ordering::SeqCst), 1);
@@ -4323,9 +5257,8 @@ mod tests {
                     .unwrap();
             },
         ));
-        let mut request = BuildRequest {
+        let request = BuildRequest {
             work_class: BuildWorkClass::Interactive,
-            basis: coordinator.server().current_stamp(),
             target: "dev".to_owned(),
             target_definition: target_hash,
             requested_asset: ASSET,
@@ -4359,7 +5292,7 @@ mod tests {
         assert_eq!(
             payload_backend
                 .runtime_type_policy(&RuntimeTypePolicyRequest {
-                    basis: request.basis,
+                    basis: coordinator.server().current_stamp(),
                     target: request.target.clone(),
                     target_definition: request.target_definition,
                     type_uuid: TYPE,
@@ -4489,15 +5422,11 @@ mod tests {
         let noncanonical = [b"\n  ".as_slice(), bundle_bytes.as_slice()].concat();
         std::fs::write(assets.join("byte.bundle"), noncanonical).unwrap();
         coordinator.reconcile_full_scan(&mut writer).unwrap();
-        request.basis = coordinator.server().current_stamp();
         assert_eq!(build(&coordinator, &request).unwrap(), first);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 
-        assert_eq!(
-            build_with_runtime_mode(&coordinator, &mut writer, &request, true).unwrap(),
-            first
-        );
+        assert_eq!(build_fresh(&coordinator, &mut writer, &request), first);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 4);
     }

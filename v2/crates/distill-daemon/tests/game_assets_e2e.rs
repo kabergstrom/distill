@@ -205,12 +205,23 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    // The reimport rewrites the bundle file before the watcher's reconcile
+    // publishes it; a snapshot taken in between resolves the old shader, as
+    // it should.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while resolved_hash(process.coordinator().server().root(), &request, shader)
+        == old_shader_hash
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the reimported shader never resolved to new content"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let new_texture_hash = resolved_hash(process.coordinator().server().root(), &request, texture);
     let new_mesh_hash = resolved_hash(process.coordinator().server().root(), &request, mesh);
-    let new_shader_hash = resolved_hash(process.coordinator().server().root(), &request, shader);
     assert_eq!(old_texture_hash, new_texture_hash);
     assert_eq!(old_mesh_hash, new_mesh_hash);
-    assert_ne!(old_shader_hash, new_shader_hash);
     let deadline = Instant::now() + Duration::from_secs(10);
     while live_storage.commits.len() == baseline_commits {
         live_loader.process(&mut live_storage).unwrap();

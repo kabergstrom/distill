@@ -78,14 +78,32 @@ fn server_with(policies: &[(u8, bool)]) -> Server {
     Server::new(StoreInstanceId([9; 16]), vec![target_with(7, policies)]).unwrap()
 }
 
-#[derive(Default)]
-struct RecordingBuildBackend {
-    requests: Mutex<Vec<BuildRequest>>,
+/// A finished build, answered the same at every snapshot.
+struct Finished(Result<BuildAnswer, RpcFailure>);
+
+impl BuildCompletion for Finished {
+    fn answer(self: Box<Self>, _view: BuildView<'_>) -> Result<BuildAnswer, RpcFailure> {
+        self.0
+    }
 }
 
-impl BuildBackend for RecordingBuildBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        self.requests.lock().unwrap().push(request.clone());
+/// Builds a canonical artifact for each request and publishes it on its
+/// own writer, as the daemon's build workers do, then hands the requester a
+/// ticket for it.
+struct RecordingBuildBackend {
+    server: std::sync::Weak<ServerHandle>,
+    requests: Mutex<Vec<(BuildRequest, SnapshotStamp)>>,
+}
+
+impl RecordingBuildBackend {
+    fn new(server: &Server) -> Self {
+        Self {
+            server: Arc::downgrade(&server.handle()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn publish(&self, request: &BuildRequest) -> Result<BuildAnswer, RpcFailure> {
         let wire_node = distill_wire::wire::WireNode::Unit { offset: 0 };
         let wire_bytes: Arc<[u8]> = Arc::from(distill_wire::dswl::dswl_bytes(&wire_node).unwrap());
         let layout_hash = distill_wire::dswl::dswl_hash(&wire_node).unwrap();
@@ -104,16 +122,36 @@ impl BuildBackend for RecordingBuildBackend {
             Vec::new(),
             Vec::new(),
         );
-        Ok(BuildBackendOutcome::Built(BuildPublication {
-            root_content_hash: content_hash,
-            artifacts: vec![BuildArtifactPublication {
-                content_hash,
-                payload,
-            }],
-            wire_trees: vec![BuildWireTree {
-                layout_hash,
-                bytes: wire_bytes,
-            }],
+        let server = self.server.upgrade().expect("the server outlives its backend");
+        let mut writer = server.opener().open_writer().unwrap();
+        let content_hash = server.install_build_publication(
+            &mut writer,
+            request.requested_asset,
+            BuildPublication {
+                root_content_hash: content_hash,
+                artifacts: vec![BuildArtifactPublication {
+                    content_hash,
+                    payload,
+                }],
+                wire_trees: vec![BuildWireTree {
+                    layout_hash,
+                    bytes: wire_bytes,
+                }],
+            },
+        )?;
+        Ok(BuildAnswer::Built { content_hash })
+    }
+}
+
+impl BuildBackend for RecordingBuildBackend {
+    fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((request.clone(), view.stamp));
+        let answer = self.publish(request);
+        BuildStart::Submitted(BuildTicket::new(async move {
+            Box::new(Finished(answer)) as Box<dyn BuildCompletion>
         }))
     }
 }
@@ -124,27 +162,24 @@ struct DepthLimitedBuildBackend {
 }
 
 struct LifecycleBuildBackend {
+    inner: RecordingBuildBackend,
     events: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl BuildBackend for LifecycleBuildBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        RecordingBuildBackend::default().build(request)
-    }
-
-    fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
-        self.events.lock().unwrap().push("finish");
-        Ok(())
+    fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        self.events.lock().unwrap().push("start");
+        self.inner.start(view, request)
     }
 }
 
 impl BuildBackend for DepthLimitedBuildBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
         *self.calls.lock().unwrap() += 1;
-        Err(RpcFailure::BuildDepthExceeded {
+        BuildStart::Answered(Err(RpcFailure::BuildDepthExceeded {
             limit: 1,
             chain: vec![request.requested_asset, asset_id(99)],
-        })
+        }))
     }
 }
 
@@ -183,6 +218,7 @@ fn snapshot_clones_share_one_read_transaction() {
     let server = server_with(&[(1, false)]);
     let events = Arc::new(Mutex::new(Vec::new()));
     server.install_build_backend(Arc::new(LifecycleBuildBackend {
+        inner: RecordingBuildBackend::new(&server),
         events: Arc::clone(&events),
     }));
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
@@ -206,7 +242,7 @@ fn snapshot_clones_share_one_read_transaction() {
         snapshot.resolve(entry.uuid),
         RpcResult::Success(_)
     ));
-    assert_eq!(&events.lock().unwrap()[..], &["finish"]);
+    assert_eq!(&events.lock().unwrap()[..], &["start"]);
     clone.expire();
     assert_eq!(
         snapshot.version(),
@@ -329,7 +365,7 @@ async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
 #[test]
 fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_outputs() {
     let server = server_with(&[(1, false)]);
-    let backend = Arc::new(RecordingBuildBackend::default());
+    let backend = Arc::new(RecordingBuildBackend::new(&server));
     server.install_build_backend(backend.clone());
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let first_stamp = server
@@ -360,14 +396,15 @@ fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_ou
     );
     assert!(matches!(first.fetch(first_hash), RpcResult::Success(_)));
     // The server keeps no build results: every resolve of a drifted asset
-    // asks the backend, which answers a repeat from its memo by input.
+    // asks the backend, at the requester's own snapshot (the daemon's
+    // backend answers a repeat from its node cache).
     assert_eq!(backend.requests.lock().unwrap().len(), 2);
     assert!(backend
         .requests
         .lock()
         .unwrap()
         .iter()
-        .all(|request| request.basis == first_stamp));
+        .all(|(_, stamp)| *stamp == first_stamp));
 
     let second_stamp = server.commit(Commit::default()).unwrap();
     let second = first.refresh().success().unwrap();
@@ -380,17 +417,17 @@ fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_ou
     );
     let requests = backend.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].basis, second_stamp);
-    assert_eq!(requests[2].target, "dev");
-    assert_eq!(requests[2].target_definition, target_hash(7));
-    assert_eq!(requests[2].requested_asset, entry.uuid);
-    assert!(requests[2].output_key.is_empty());
+    assert_eq!(requests[2].1, second_stamp);
+    assert_eq!(requests[2].0.target, "dev");
+    assert_eq!(requests[2].0.target_definition, target_hash(7));
+    assert_eq!(requests[2].0.requested_asset, entry.uuid);
+    assert!(requests[2].0.output_key.is_empty());
 }
 
 #[test]
 fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() {
     let server = server_with(&[(1, false), (2, false)]);
-    let backend = Arc::new(RecordingBuildBackend::default());
+    let backend = Arc::new(RecordingBuildBackend::new(&server));
     server.install_build_backend(backend.clone());
     let entry = authoring_entry(1, AuthoringEntryRole::Runtime);
     let output_key = "reflection".to_owned();
@@ -425,10 +462,10 @@ fn derived_child_resolution_builds_the_parent_and_selects_the_declared_output() 
     assert!(matches!(snapshot.fetch(hash), RpcResult::Success(_)));
     let requests = backend.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].entry.uuid, entry.uuid);
-    assert_eq!(requests[0].requested_asset, child);
-    assert_eq!(requests[0].output_key, output_key);
-    assert_eq!(requests[0].requested_terminal_type, type_id(2));
+    assert_eq!(requests[0].0.entry.uuid, entry.uuid);
+    assert_eq!(requests[0].0.requested_asset, child);
+    assert_eq!(requests[0].0.output_key, output_key);
+    assert_eq!(requests[0].0.requested_terminal_type, type_id(2));
 }
 
 #[test]

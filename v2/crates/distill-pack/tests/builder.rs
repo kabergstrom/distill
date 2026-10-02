@@ -18,7 +18,7 @@ use distill_pack::{
 };
 use distill_rpc::{
     ArtifactPayload, AssetDeltaState, AssetMutation, AuthoringEntry, AuthoringEntryRole,
-    AuthoringMutation, AuthoringValue, BuildBackend, BuildBackendOutcome, BuildRequest, Commit,
+    AuthoringMutation, AuthoringValue, BuildAnswer, BuildBackend, BuildRequest, BuildStart, BuildView, Commit,
     ConnectRequest, PathMutation, RpcFailure, RuntimeTypePolicy,
     RuntimeTypePolicyRequest, ServedLoadEdge, Server, StoreInstanceId, StoredResolve,
     SnapshotPolicy, TargetDefinition, TargetDefinitionHash,
@@ -45,10 +45,10 @@ struct TypePolicyBackend {
 }
 
 impl BuildBackend for TypePolicyBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        Ok(BuildBackendOutcome::Drifted {
+    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        BuildStart::Answered(Ok(BuildAnswer::Drifted {
             input: request.drifted_input.clone(),
-        })
+        }))
     }
 
     fn runtime_type_policy(

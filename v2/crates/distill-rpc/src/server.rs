@@ -489,10 +489,10 @@ struct UnavailableBuildBackend;
 struct UnavailableAuthoringBackend;
 
 impl BuildBackend for UnavailableBuildBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        Ok(BuildBackendOutcome::Drifted {
+    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        BuildStart::Answered(Ok(BuildAnswer::Drifted {
             input: request.drifted_input.clone(),
-        })
+        }))
     }
 }
 
@@ -715,9 +715,10 @@ impl Server {
         self.inner.current_stamp()
     }
 
-    /// Snapshot-pinned batch requests used by `doctor verify`. This bypasses
-    /// transport capabilities but not configuration or pipeline errors;
-    /// the daemon still executes each request through the ordinary build core.
+    /// Batch requests for every runtime entry of the current snapshot, used
+    /// by `doctor verify`. This bypasses transport capabilities but not
+    /// configuration or pipeline errors; the daemon rebuilds each request
+    /// inline, inside the input the verification runs in.
     pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
         let txn = self.inner.current_snapshot().map_err(store_failure)?;
         if let ConfigurationStatus::Failed(error) = &txn.configuration {
@@ -746,7 +747,6 @@ impl Server {
             for entry in &entries {
                 requests.push(BuildRequest {
                     work_class: BuildWorkClass::Batch,
-                    basis: txn.stamp,
                     target: target.name.clone(),
                     target_definition: TargetDefinitionHash(target.definition_hash),
                     requested_asset: entry.uuid,
@@ -926,8 +926,10 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Publish a build's artifacts and wire trees; return its root hash.
-    pub(crate) fn install_build_publication(
+    /// Publish a build's artifacts and wire trees on `store`, validated as
+    /// an admin install is; return its root hash. For build backends that
+    /// publish outside the daemon (embedded stores, tests).
+    pub fn install_build_publication(
         &self,
         store: &mut Store,
         asset: AssetUuid,
@@ -1162,18 +1164,6 @@ impl Server {
         self.with_writer(|store| self.inner.handle.install_wire_tree(store, hash, bytes))
     }
 
-    pub(crate) fn install_build_publication(
-        &self,
-        asset: AssetUuid,
-        publication: BuildPublication,
-    ) -> Result<ContentHash, RpcFailure> {
-        self.with_writer(|store| {
-            self.inner
-                .handle
-                .install_build_publication(store, asset, publication)
-        })
-    }
-
     /// Embedded: publish an input-version commit.
     pub fn commit(&self, commit: Commit) -> Result<SnapshotStamp, AdminError> {
         assert!(
@@ -1318,13 +1308,6 @@ impl SnapshotTxn {
     pub(crate) fn snapshot(&self) -> &StoreReader {
         &self.snapshot
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum BuildResolution {
-    Built(ContentHash),
-    Failed(String),
-    Drifted(DriftedInput),
 }
 
 /// A held read transaction and its place under `max_snapshots`.

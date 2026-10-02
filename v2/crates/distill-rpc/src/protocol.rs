@@ -785,19 +785,19 @@ pub trait AuthoringBackend: Send + Sync + 'static {
 
 }
 
-/// Snapshot-pinned request issued when runtime resolution reaches a drifted
-/// asset. Implementations must build only from `entry` and inputs resolved at
-/// `basis`; a newer daemon input version is drift, not an implicit rebase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildWorkClass {
     Interactive,
     Batch,
 }
 
+/// What runtime resolution asks of the build backend when it reaches a
+/// drifted asset. A build is a pure function of its inputs, so the request
+/// names no input version: the backend keys the build by its static inputs
+/// and answers it at the requester's [`BuildView`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildRequest {
     pub work_class: BuildWorkClass,
-    pub basis: SnapshotStamp,
     pub target: String,
     pub target_definition: TargetDefinitionHash,
     /// UUID named by the resolver. For a primary this equals `entry.uuid`;
@@ -839,9 +839,9 @@ pub struct BuildArtifactPublication {
     pub payload: ArtifactPayload,
 }
 
-/// Complete content-addressed publication produced by one lazy build. The
-/// root artifact must be present in `artifacts`; dependency artifacts and all
-/// referenced wire trees may be published in the same atomic visibility step.
+/// Artifacts and wire trees a backend outside the daemon publishes for one
+/// build ([`crate::install_build_publication`]). The root artifact must be
+/// present in `artifacts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildPublication {
     pub root_content_hash: ContentHash,
@@ -849,18 +849,87 @@ pub struct BuildPublication {
     pub wire_trees: Vec<BuildWireTree>,
 }
 
+/// What a requester reads while it starts or answers a build: its own
+/// snapshot, whose answers decide whether a result serves it, and the
+/// store's latest committed state, where shared build results and artifacts
+/// land. Both are readers: nothing that answers a resolve writes, and a
+/// thread holding an open input has no view to offer.
+#[derive(Clone, Copy)]
+pub struct BuildView<'a> {
+    pub snapshot: &'a distill_store::StoreReader,
+    pub stamp: SnapshotStamp,
+    pub latest: &'a distill_store::StoreReader,
+}
+
+/// A build's answer for one requester, at that requester's snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuildBackendOutcome {
-    Built(BuildPublication),
+pub enum BuildAnswer {
+    /// The requested artifact is in the CAS.
+    Built { content_hash: ContentHash },
     Failed { error: String },
+    /// An input the build observed differs at the requester's snapshot; a
+    /// fresher snapshot resolves it.
     Drifted { input: DriftedInput },
 }
 
-/// Daemon integration seam for snapshot-pinned, target-specific lazy builds.
-/// The RPC server owns single-flight coordination and artifact publication;
-/// implementations must not call back into the [`crate::Server`].
+/// A finished build, still to be answered at each waiter's own snapshot.
+pub trait BuildCompletion: Send {
+    fn answer(self: Box<Self>, view: BuildView<'_>) -> Result<BuildAnswer, RpcFailure>;
+}
+
+/// One requester's interest in a submitted build. It resolves once the
+/// build finishes; dropping it first withdraws the interest, and a build no
+/// requester wants any more is not started.
+pub struct BuildTicket(
+    std::pin::Pin<Box<dyn std::future::Future<Output = Box<dyn BuildCompletion>> + Send>>,
+);
+
+impl BuildTicket {
+    pub fn new(
+        future: impl std::future::Future<Output = Box<dyn BuildCompletion>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl std::future::Future for BuildTicket {
+    type Output = Box<dyn BuildCompletion>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+impl std::fmt::Debug for BuildTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildTicket").finish_non_exhaustive()
+    }
+}
+
+/// How a backend takes up a request.
+#[derive(Debug)]
+pub enum BuildStart {
+    /// Answered at once, at the requester's snapshot (a cache hit, or a
+    /// failure found before any build).
+    Answered(Result<BuildAnswer, RpcFailure>),
+    /// Submitted: the requester awaits the ticket, then asks the completion
+    /// for its own answer.
+    Submitted(BuildTicket),
+}
+
+/// Daemon integration seam for target-specific lazy builds. The backend
+/// owns the shared build state: it keys a build by its static inputs,
+/// shares one build among every requester of that key, publishes the
+/// result to the CAS and notifies the requesters. The RPC server only reads.
+/// Implementations must not call back into the [`crate::Server`].
 pub trait BuildBackend: Send + Sync {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure>;
+    /// Answer `request` at `view`, or submit its build and hand back a
+    /// ticket. Called on a connection's thread: it reads, never blocks on a
+    /// build.
+    fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart;
 
     fn runtime_type_policy(
         &self,
@@ -869,13 +938,6 @@ pub trait BuildBackend: Send + Sync {
         Err(RpcFailure::AuthoringBackendUnavailable {
             operation: "runtime type-policy lookup".to_owned(),
         })
-    }
-
-    /// Notification that the server has either installed or rejected the
-    /// publication returned by [`Self::build`]. A durable backend uses this
-    /// boundary to run maintenance once the result is served.
-    fn build_finished(&self, _request: &BuildRequest) -> Result<(), RpcFailure> {
-        Ok(())
     }
 }
 

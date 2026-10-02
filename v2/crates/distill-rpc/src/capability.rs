@@ -22,7 +22,7 @@ use distill_store::{Store, StoreError, StoreReader};
 use crate::persist::decode_drifted_input;
 use crate::server::{
     authoring_entry, entry_role, history_deltas, is_embedded, pipeline_failure,
-    publish_backend_commit, store_failure, BuildResolution, ConnectionState,
+    publish_backend_commit, store_failure, ConnectionState,
     MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
@@ -1559,47 +1559,45 @@ pub struct FinishedImport {
 
 // Snapshot
 
-/// A lazy build the server needs before it can answer a resolve. It is
-/// `Send`: transports run it off the RPC thread and hand the result back to
-/// [`Snapshot::resolve_finish`].
+/// A lazy build a resolve waits on: a `Send` future over the backend's
+/// ticket. A transport awaits it on the connection's own task, so the
+/// connection keeps serving its other calls, and hands the result to
+/// [`Snapshot::resolve_finish`]. Dropping it withdraws the resolve's
+/// interest in the build.
 pub struct PendingBuild {
-    request: BuildRequest,
-    backend: Arc<dyn BuildBackend>,
+    asset: AssetUuid,
+    ticket: BuildTicket,
+    started: Instant,
 }
 
 impl fmt::Debug for PendingBuild {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingBuild")
-            .field("asset", &self.request.requested_asset)
+            .field("asset", &self.asset)
             .finish_non_exhaustive()
     }
 }
 
-impl PendingBuild {
-    /// Run the build backend.
-    pub fn run(self) -> FinishedBuild {
-        let started = Instant::now();
-        let outcome = self.backend.build(&self.request);
+impl std::future::Future for PendingBuild {
+    type Output = FinishedBuild;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<FinishedBuild> {
+        let completion = std::task::ready!(std::pin::Pin::new(&mut self.ticket).poll(cx));
         tracing::debug!(
-            asset = %self.request.requested_asset,
-            target = %self.request.target,
-            elapsed = ?started.elapsed(),
-            built = matches!(outcome, Ok(BuildBackendOutcome::Built(_))),
+            asset = %self.asset,
+            elapsed = ?self.started.elapsed(),
             "build finished"
         );
-        FinishedBuild {
-            request: self.request,
-            backend: self.backend,
-            outcome,
-        }
+        std::task::Poll::Ready(FinishedBuild { completion })
     }
 }
 
-/// A [`PendingBuild`]'s result.
+/// A [`PendingBuild`]'s result, still to be answered at the snapshot.
 pub struct FinishedBuild {
-    request: BuildRequest,
-    backend: Arc<dyn BuildBackend>,
-    outcome: Result<BuildBackendOutcome, RpcFailure>,
+    completion: Box<dyn BuildCompletion>,
 }
 
 /// One step of a resolve.
@@ -1747,22 +1745,19 @@ impl Snapshot {
         }
     }
 
+    /// Resolve `uuid`, blocking this thread on a build it needs. Transports
+    /// await [`Self::resolve_prepare`]'s build instead.
     pub fn resolve(&self, uuid: AssetUuid) -> RpcResult<TerminalEvent<ResolveResult>> {
-        self.resolve_with_work_class(uuid, BuildWorkClass::Interactive)
-    }
-
-    fn resolve_with_work_class(
-        &self,
-        uuid: AssetUuid,
-        work_class: BuildWorkClass,
-    ) -> RpcResult<TerminalEvent<ResolveResult>> {
-        match self.resolve_prepare(uuid, work_class) {
+        match self.resolve_prepare(uuid, BuildWorkClass::Interactive) {
             ResolveStep::Done(result) => result,
-            ResolveStep::Build(build) => self.resolve_finish(uuid, build.run()),
+            ResolveStep::Build(build) => {
+                self.resolve_finish(uuid, futures::executor::block_on(build))
+            }
         }
     }
 
-    /// The first half of a resolve: answer it, or name the build it needs.
+    /// The first half of a resolve: answer it, or name the build it waits
+    /// on.
     pub fn resolve_prepare(&self, uuid: AssetUuid, work_class: BuildWorkClass) -> ResolveStep {
         match self.resolve_step(uuid, work_class) {
             Ok(step) => step,
@@ -1813,9 +1808,10 @@ impl Snapshot {
                 Some(ResolutionRow::Deleted(at)) => Some(VersionResolve::Deleted(at)),
             },
         };
-        // A drifted asset is built for this snapshot. The build backend
-        // memoizes by input, so a second resolve of the same snapshot costs
-        // a memo lookup, not a build.
+        // A drifted asset is built on demand. The backend keys the build by
+        // its static inputs: a cached result whose traced inputs hold at
+        // this snapshot answers at once, and requesters of one key share
+        // one build.
         if let (Some(VersionResolve::Drifted(input)), Some(_)) = (&resolution, &meta) {
             let entry = snapshot
                 .served_entry(authoring_uuid)?
@@ -1829,7 +1825,6 @@ impl Snapshot {
             };
             let request = BuildRequest {
                 work_class,
-                basis: self.basis.snapshot,
                 target,
                 target_definition: TargetDefinitionHash(row.definition_hash),
                 requested_asset: uuid,
@@ -1842,10 +1837,23 @@ impl Snapshot {
                 entry,
                 drifted_input: input.clone(),
             };
-            return Ok(ResolveStep::Build(PendingBuild {
-                request,
-                backend: self.server.inner.handle.build_backend(),
-            }));
+            let view = BuildView {
+                snapshot,
+                stamp: self.basis.snapshot,
+                latest: &self.server.inner.reader,
+            };
+            let started = Instant::now();
+            return match self.server.inner.handle.build_backend().start(view, &request) {
+                BuildStart::Answered(answer) => {
+                    drop(txn);
+                    done(self.build_answer(answer))
+                }
+                BuildStart::Submitted(ticket) => Ok(ResolveStep::Build(PendingBuild {
+                    asset: uuid,
+                    ticket,
+                    started,
+                })),
+            };
         }
         let value = match resolution {
             Some(VersionResolve::Built(content_hash)) => {
@@ -1875,35 +1883,41 @@ impl Snapshot {
         }))
     }
 
-    /// The second half of a resolve: publish the build's result and answer
-    /// from it, at this snapshot's basis.
+    /// The second half of a resolve: answer the finished build at this
+    /// snapshot. The build may have run at another snapshot; its traced
+    /// inputs decide whether its result serves this one.
     pub fn resolve_finish(
         &self,
-        uuid: AssetUuid,
+        _uuid: AssetUuid,
         build: FinishedBuild,
     ) -> RpcResult<TerminalEvent<ResolveResult>> {
-        let FinishedBuild {
-            request,
-            backend,
-            outcome,
-        } = build;
-        let mut outcome = outcome.and_then(|outcome| match outcome {
-            BuildBackendOutcome::Built(publication) => self
-                .server
-                .install_build_publication(uuid, publication)
-                .map(BuildResolution::Built),
-            BuildBackendOutcome::Failed { error } => Ok(BuildResolution::Failed(error)),
-            BuildBackendOutcome::Drifted { input } => Ok(BuildResolution::Drifted(input)),
+        let txn = match self.preflight::<TerminalEvent<ResolveResult>>() {
+            Ok(txn) => txn,
+            Err(RpcResult::ReconnectRequired { reason }) => {
+                return RpcResult::ReconnectRequired { reason };
+            }
+            Err(_) => return RpcResult::Failure(RpcFailure::SnapshotExpired),
+        };
+        let answer = build.completion.answer(BuildView {
+            snapshot: txn.snapshot(),
+            stamp: self.basis.snapshot,
+            latest: &self.server.inner.reader,
         });
-        if let Ok(BuildResolution::Built(content_hash)) = &outcome {
-            if let Err(error) =
-                load_artifact(&self.server.inner.reader, *content_hash)
-            {
+        drop(txn);
+        self.build_answer(answer)
+    }
+
+    /// Serve a build answer from this snapshot: a built artifact must be
+    /// readable, and the snapshot still live under a working pipeline.
+    fn build_answer(
+        &self,
+        answer: Result<BuildAnswer, RpcFailure>,
+    ) -> RpcResult<TerminalEvent<ResolveResult>> {
+        let mut outcome = answer;
+        if let Ok(BuildAnswer::Built { content_hash }) = &outcome {
+            if let Err(error) = load_artifact(&self.server.inner.reader, *content_hash) {
                 outcome = Err(error);
             }
-        }
-        if let Err(error) = backend.build_finished(&request) {
-            outcome = Err(error);
         }
         match self.preflight::<()>() {
             Ok(txn) => {
@@ -1918,12 +1932,12 @@ impl Snapshot {
             Err(_) => outcome = Err(RpcFailure::SnapshotExpired),
         }
         match outcome {
-            Ok(resolution) => RpcResult::Success(TerminalEvent {
+            Ok(answer) => RpcResult::Success(TerminalEvent {
                 basis: self.basis.clone(),
-                value: match resolution {
-                    BuildResolution::Built(content_hash) => ResolveResult::Built { content_hash },
-                    BuildResolution::Failed(error) => ResolveResult::Failed { error },
-                    BuildResolution::Drifted(input) => ResolveResult::Drifted {
+                value: match answer {
+                    BuildAnswer::Built { content_hash } => ResolveResult::Built { content_hash },
+                    BuildAnswer::Failed { error } => ResolveResult::Failed { error },
+                    BuildAnswer::Drifted { input } => ResolveResult::Drifted {
                         input,
                         current: self.server.inner.current_stamp(),
                     },

@@ -134,10 +134,10 @@ struct TestBackend {
 }
 
 impl BuildBackend for TestBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
-        Ok(BuildBackendOutcome::Drifted {
+    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
+        BuildStart::Answered(Ok(BuildAnswer::Drifted {
             input: request.drifted_input.clone(),
-        })
+        }))
     }
 
     fn runtime_type_policy(

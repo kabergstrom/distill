@@ -1103,20 +1103,15 @@ impl schema::snapshot::Server for SnapshotService {
             } else {
                 crate::BuildWorkClass::Interactive
             };
-            // Lazy resolution may synchronously execute a complete processor
-            // chain. Run it on a blocking worker so this connection's other
-            // calls (pipelined resolves, fetches, its delta stream) keep
-            // moving; the daemon build scheduler bounds the actual work.
+            // A build runs on the daemon's build workers, never here: this
+            // call awaits its ticket on the connection's LocalSet, so the
+            // connection's other calls (pipelined resolves, fetches, its
+            // delta stream) keep moving. A cancelled call drops the ticket,
+            // which withdraws this requester's interest in the build.
             let outcome = match self.snapshot.resolve_prepare(uuid, work_class) {
                 crate::ResolveStep::Done(outcome) => outcome,
                 crate::ResolveStep::Build(build) => {
-                    let finished = tokio::task::spawn_blocking(move || build.run())
-                        .await
-                        .map_err(|error| {
-                            capnp::Error::failed(format!(
-                                "snapshot resolve worker failed: {error}"
-                            ))
-                        })?;
+                    let finished = build.await;
                     self.snapshot.resolve_finish(uuid, finished)
                 }
             };

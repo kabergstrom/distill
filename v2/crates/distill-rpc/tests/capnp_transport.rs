@@ -323,22 +323,32 @@ impl AuthoringBackend for RecordingAuthoringBackend {
     }
 }
 
+/// A finished build, answered the same at every snapshot.
+struct Finished(Result<BuildAnswer, RpcFailure>);
+
+impl BuildCompletion for Finished {
+    fn answer(self: Box<Self>, _view: BuildView<'_>) -> Result<BuildAnswer, RpcFailure> {
+        self.0
+    }
+}
+
+/// Submits a build that finishes (drifted) once the test releases it.
 struct BlockingBuildBackend {
     started: Arc<AtomicBool>,
     release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl BuildBackend for BlockingBuildBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
         self.started.store(true, Ordering::Release);
-        let (released, wake) = &*self.release;
-        let mut released = released.lock().unwrap();
-        while !*released {
-            released = wake.wait(released).unwrap();
-        }
-        Ok(BuildBackendOutcome::Drifted {
-            input: request.drifted_input.clone(),
-        })
+        let release = Arc::clone(&self.release);
+        let input = request.drifted_input.clone();
+        BuildStart::Submitted(BuildTicket::new(async move {
+            while !*release.0.lock().unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            Box::new(Finished(Ok(BuildAnswer::Drifted { input }))) as Box<dyn BuildCompletion>
+        }))
     }
 }
 
@@ -1956,11 +1966,11 @@ struct PackBackend {
 }
 
 impl BuildBackend for PackBackend {
-    fn build(&self, request: &BuildRequest) -> Result<BuildBackendOutcome, RpcFailure> {
+    fn start(&self, _view: BuildView<'_>, request: &BuildRequest) -> BuildStart {
         self.work_classes.lock().unwrap().push(request.work_class);
-        Ok(BuildBackendOutcome::Drifted {
+        BuildStart::Answered(Ok(BuildAnswer::Drifted {
             input: request.drifted_input.clone(),
-        })
+        }))
     }
 
     fn runtime_type_policy(

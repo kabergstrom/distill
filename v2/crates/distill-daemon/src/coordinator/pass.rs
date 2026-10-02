@@ -763,7 +763,8 @@ impl DaemonCoordinator {
                     let affected = commit_affected_asset_bundles(&commit);
                     if !affected.is_empty() {
                         crate::build::refine_published_tag_index_incremental(
-                            store,
+                            crate::build::OpenInput::new(store)
+                                .expect("tag-index refinement runs inside its input"),
                             tags.scanner.clone(),
                             authority,
                             tags.pipeline.clone(),
@@ -798,7 +799,8 @@ impl DaemonCoordinator {
                 .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority {
                     crate::build::refine_published_tag_index(
-                        store,
+                        crate::build::OpenInput::new(store)
+                            .expect("tag-index refinement runs inside its input"),
                         tags.scanner.clone(),
                         authority,
                         tags.pipeline.clone(),

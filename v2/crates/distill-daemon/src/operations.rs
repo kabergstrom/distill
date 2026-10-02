@@ -316,7 +316,9 @@ impl OperationRuntime {
                     coordinator
                         .as_ref()
                         .expect("verify coordinator was required"),
-                    store,
+                    crate::build::OpenInput::new(store).ok_or_else(|| {
+                        "doctor build verification runs outside its input".to_owned()
+                    })?,
                     requests,
                 )?,
                 Err(defect) => vec![defect.clone()],

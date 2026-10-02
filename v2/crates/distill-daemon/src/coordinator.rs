@@ -9,7 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(test)]
+use std::sync::mpsc;
 
 
 use rayon::ThreadPool;
@@ -94,7 +96,7 @@ pub struct DaemonCoordinator {
     schema_authority: Mutex<Option<Arc<ProjectSchemaAuthority>>>,
     build_targets: Current<BTreeMap<String, Target>>,
     configuration_error: Mutex<Option<ConfigurationError>>,
-    operational: ScheduledPool,
+    operational: ScheduledPool<crate::build::BuildOutcome>,
 }
 
 struct CoordinatedPipelineRuntime {
@@ -437,10 +439,28 @@ impl DaemonCoordinator {
         self.operational.config()
     }
 
+    /// Register interest in the build cell `key` (`crate::scheduler`): the
+    /// cell in flight for it, or a new one running `job`. The ticket
+    /// resolves to the cell's shared outcome; dropping it withdraws the
+    /// interest.
+    pub(crate) fn request_build(
+        &self,
+        key: crate::scheduler::CellKey,
+        class: WorkClass,
+        job: impl FnOnce(
+                &mut Store,
+                &crate::scheduler::CellWorker<crate::build::BuildOutcome>,
+            ) -> crate::build::BuildOutcome
+            + Send
+            + 'static,
+    ) -> crate::scheduler::CellTicket<crate::build::BuildOutcome> {
+        self.operational.request(key, class, job)
+    }
+
     /// Run `run` on a build worker, on the writer the scheduler lends the
-    /// job, and wait for it. The caller must not hold a write transaction
-    /// open: the job's writes would wait on it. Dependency builds run
-    /// inline on the worker, on the same writer.
+    /// job, and wait for it. Test-only: builds are requested through their
+    /// cells ([`Self::request_build`]), never waited on like this.
+    #[cfg(test)]
     pub(crate) fn run_scheduled<R>(
         self: &Arc<Self>,
         class: WorkClass,
@@ -798,7 +818,7 @@ impl DaemonCoordinator {
                     ),
                 }
                 crate::build::refine_published_tag_index(
-                    store,
+                    crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
                     self.scanner.clone(),
                     Arc::clone(&schema_authority),
                     runtime.host.snapshot(),
@@ -940,7 +960,7 @@ impl DaemonCoordinator {
                 ..Commit::default()
             };
             crate::build::refine_published_tag_index(
-                store,
+                crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
                 scanner,
                 Arc::clone(&authority),
                 runtime.host.snapshot(),
@@ -2939,7 +2959,7 @@ pub(crate) fn publish_incremental_paths(
                 let targets = coordinator
                     .build_targets.load();
                 crate::build::refine_published_tag_index_incremental(
-                    store,
+                    crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
                     scanner.clone(),
                     authority,
                     coordinator.pipeline_snapshot(),
