@@ -636,8 +636,7 @@ impl ScanSnapshot {
 
     /// Whether this scan observes what the store's scan tables publish:
     /// `self.same_observation(&ScanSnapshot::load(reader)?)`, or
-    /// [`Self::same_namespace_observation`] without `diagnostics`, failing
-    /// where `load` fails. The tables are streamed in key order and compared
+    /// [`Self::same_namespace_observation`] without `diagnostics`. The tables are streamed in key order and compared
     /// row by row; a bundle file is compared by its stored hash, so no
     /// bundle bytes are read or parsed.
     pub(crate) fn matches_published(
@@ -645,10 +644,6 @@ impl ScanSnapshot {
         reader: &StoreReader,
         diagnostics: bool,
     ) -> Result<bool, StoreError> {
-        if reader.has_directory_alias()? {
-            // `load` rejects the tables; let it say how.
-            return Self::load(reader).map(|_| false);
-        }
         let mut published_diagnostics = BTreeMap::new();
         for row in reader.scan_diagnostics()? {
             let (key, diagnostic) = diagnostic_row(row)?;
@@ -2892,7 +2887,8 @@ mod published_compare_tests {
         assert!(namespace.unwrap_err().contains("malformed scan diagnostic"));
         assert!(all.is_err());
 
-        // Two traversed directories sharing a canonical path.
+        // Two traversed directories sharing a canonical path never reach
+        // the tables: the unique index rejects the write.
         let mut world = new_world();
         let scan = world.scanner.scan().unwrap();
         publish(&mut world.store, &scan, None);
@@ -2900,14 +2896,12 @@ mod published_compare_tests {
         let mut alias = directories[0].clone();
         alias.path = "elsewhere".into();
         directories.push(alias);
-        world
+        assert!(world
             .store
             .input_transaction(|txn| {
                 txn.replace_scan_structure(None, &directories, &scan.encoded_diagnostic_rows())
             })
-            .unwrap();
-        let [namespace, all] = both(&scan, &world.store);
-        assert!(namespace.unwrap_err().contains("inconsistent"));
-        assert!(all.is_err());
+            .is_err());
+        assert_eq!(both(&scan, &world.store), [Ok(true), Ok(true)]);
     }
 }

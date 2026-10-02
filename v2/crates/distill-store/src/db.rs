@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 37;
+pub const SCHEMA_VERSION: u32 = 38;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -71,6 +71,8 @@ CREATE TABLE bundle_files (
     PRIMARY KEY (root_id, path)
 );
 -- Every traversed directory (the root itself at path ''), for alias checks.
+-- Two directories never share a canonical path: the scanner rejects an
+-- alias before publishing, and the unique index enforces it at write.
 CREATE TABLE directories (
     root_id        INTEGER NOT NULL,
     path           TEXT NOT NULL,
@@ -78,7 +80,7 @@ CREATE TABLE directories (
     physical_path  BLOB NOT NULL,
     PRIMARY KEY (root_id, path)
 );
-CREATE INDEX directories_by_canonical ON directories(canonical_path);
+CREATE UNIQUE INDEX directories_by_canonical ON directories(canonical_path);
 -- Non-fatal scan exclusions, keyed by rooted path; `detail` is the
 -- daemon's encoding.
 CREATE TABLE scan_diagnostics (

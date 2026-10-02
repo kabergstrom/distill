@@ -696,8 +696,8 @@ impl StoreReader {
         )
     }
 
-    /// The first traversed directory (by root name, path) whose canonical
-    /// path is `canonical`.
+    /// The traversed directory whose canonical path is `canonical`; the
+    /// unique index admits at most one.
     pub fn directory_by_canonical(
         &self,
         canonical: &[u8],
@@ -707,7 +707,7 @@ impl StoreReader {
             .prepare_cached(
                 "SELECT r.name, t.path, t.canonical_path, t.physical_path
                  FROM directories t JOIN roots r USING (root_id)
-                 WHERE t.canonical_path = ?1 ORDER BY r.name, t.path LIMIT 1",
+                 WHERE t.canonical_path = ?1",
             )?
             .query_row([canonical], observed_directory_row)
             .optional()?)
@@ -1017,14 +1017,4 @@ impl StoreReader {
         Ok(())
     }
 
-    /// Whether two traversed directories share a canonical path: the scan
-    /// tables then hold a directory alias.
-    pub fn has_directory_alias(&self) -> Result<bool, StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM directories
-                           GROUP BY canonical_path HAVING count(*) > 1)",
-            [],
-            |row| row.get(0),
-        )?)
-    }
 }

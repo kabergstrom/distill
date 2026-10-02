@@ -829,6 +829,19 @@ fn subtree_reads_search_one_key_range() {
             "{sql}"
         );
     }
+    // The incremental scan's alias check: one probe of the unique index.
+    let canonical = subtree_plans(&mut store, |store| {
+        assert!(store.directory_by_canonical(b"/c/7").unwrap().is_some());
+    });
+    assert_eq!(canonical.len(), 1);
+    assert_eq!(
+        canonical[0].1,
+        [
+            "SEARCH t USING INDEX directories_by_canonical (canonical_path=?)",
+            "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+        ],
+        "{canonical:#?}"
+    );
 }
 
 /// Reading one subtree of a large root fetches pages for its rows, not the
