@@ -64,8 +64,10 @@ CREATE INDEX files_by_symlink_target ON files(symlink_target)
 CREATE TABLE bundle_files (
     root_id INTEGER NOT NULL,
     path    TEXT NOT NULL,
-    bytes   BLOB NOT NULL,
+    -- Before `bytes`: a row larger than a page keeps its tail on overflow
+    -- pages, so a read of the hash alone never walks the bytes.
     hash    BLOB NOT NULL CHECK (length(hash) = 32),
+    bytes   BLOB NOT NULL,
     PRIMARY KEY (root_id, path)
 );
 -- Every traversed directory (the root itself at path ''), for alias checks.

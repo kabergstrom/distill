@@ -614,3 +614,50 @@ fn the_bundle_asset_walk_sorts_one_bundle_at_a_time() {
     );
 }
 
+/// A bundle file's hash precedes its bytes in its row, so reading every
+/// hash reads the rows' first pages, never the overflow pages that hold
+/// the bytes of a bundle larger than a page. SQLite reads overflow pages
+/// around its page cache, so this counts the bytes the reading thread
+/// read from files.
+#[cfg(target_os = "linux")]
+#[test]
+fn reading_bundle_file_hashes_skips_their_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+    store
+        .input_transaction(|txn| {
+            let root = txn.intern_root("main")?;
+            for index in 0..200u32 {
+                let bytes = vec![index as u8; 16 * 1024];
+                txn.set_bundle_file(root, &bundle_path(index), &bytes)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Bytes this thread has read from files.
+    fn read_bytes() -> u64 {
+        let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+        let line = io.lines().find(|line| line.starts_with("rchar:")).unwrap();
+        line["rchar:".len()..].trim().parse().unwrap()
+    }
+    fn read(read: impl FnOnce()) -> u64 {
+        let before = read_bytes();
+        read();
+        read_bytes() - before
+    }
+    let reader = store.reader().unwrap();
+    let mut hashes = 0;
+    let hash_read = read(|| {
+        reader
+            .for_each_bundle_file_hash(|_, _, _| {
+                hashes += 1;
+                Ok(())
+            })
+            .unwrap();
+    });
+    let bytes_read = read(|| drop(reader.bundle_files().unwrap()));
+    assert_eq!(hashes, 200);
+    println!("hashes: {hash_read} bytes read; bundle bytes: {bytes_read}");
+    assert!(hash_read <= 512 * 1024, "{hash_read} bytes read");
+    assert!(bytes_read >= 20 * hash_read, "{hash_read} against {bytes_read} bytes read");
+}
