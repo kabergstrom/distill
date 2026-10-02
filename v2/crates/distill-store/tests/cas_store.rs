@@ -225,6 +225,47 @@ fn commits_append_to_the_bucket_never_overwrite() {
 }
 
 #[test]
+fn a_commit_naming_payloads_already_in_the_cas_appends_only_its_result() {
+    // A node result names the bytes its last stage committed: the second
+    // commit indexes a new candidate without appending the payloads again.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+    declare_child(&mut store, PARENT, "normals");
+    let segment_bytes = || -> u64 {
+        std::fs::read_dir(dir.path().join(".distill/cas"))
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let before = segment_bytes();
+    store
+        .commit_build(success_commit([1u8; 32], b"trace"))
+        .unwrap();
+    let first = segment_bytes() - before;
+    let before = segment_bytes();
+    let mut node = success_commit([2u8; 32], b"trace");
+    node.key_kind = KeyKind::Node;
+    store.commit_build(node).unwrap();
+    let appended = segment_bytes() - before;
+    let payloads = (b"primary artifact bytes".len()
+        + b"normals artifact bytes".len()
+        + b"debug bytes".len()) as u64;
+    assert!(
+        appended + payloads <= first,
+        "only the result record is appended: {appended} bytes after {first}"
+    );
+    let candidates = store.lookup_candidates(KeyKind::Node, &[2u8; 32]).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].payload.key_kind, KeyKind::Node);
+    let ResultOutcome::Success { outputs, .. } = &candidates[0].payload.outcome else {
+        panic!("node result succeeded");
+    };
+    for output in outputs {
+        assert!(store.cas_read(&output.content_hash.0).is_ok());
+    }
+}
+
+#[test]
 fn cas_read_of_an_unknown_hash_is_not_found() {
     let (_d, store) = store();
     match store.cas_read(&[9u8; 32]) {

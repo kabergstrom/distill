@@ -103,7 +103,8 @@ pub enum CommitOutcome {
 #[derive(Debug, Clone)]
 pub struct BuildCommit {
     pub key_kind: KeyKind,
-    /// The `"DSSI"` StaticInputs digest or `"DSBI"` pre-key digest.
+    /// The `"DSSI"` StaticInputs digest, the `"DSBI"` pre-key digest or the
+    /// `"DSNK"` node key.
     pub static_input_key: [u8; 32],
     /// The parent asset (processor results) or entry (build imports).
     pub asset_uuid: AssetUuid,
@@ -641,11 +642,20 @@ impl Store {
         unit.extend(aux_rows.iter().map(|row| row.content_hash.0));
         unit.extend(layouts.iter().copied());
 
-        // Wire trees already in the CAS are not appended again (a hint the
-        // transaction checks).
+        // Wire trees and payloads already in the CAS are not appended again
+        // (a hint the transaction checks): a node result names the bytes its
+        // last stage already committed.
         let mut skip_trees = Vec::with_capacity(trees.len());
         for (hash, _) in &trees {
             skip_trees.push(extent_exists(&self.conn, &hash.0)?);
+        }
+        let record_hashes: Vec<[u8; 32]> = records
+            .iter()
+            .map(|record| *blake3::hash(&record.payload).as_bytes())
+            .collect();
+        let mut skip_records = Vec::with_capacity(records.len());
+        for hash in &record_hashes {
+            skip_records.push(extent_exists(&self.conn, hash)?);
         }
         loop {
             let mut group: Vec<Record> = trees
@@ -660,7 +670,13 @@ impl Store {
                     payload: preimage.clone(),
                 })
                 .collect();
-            group.extend(records.iter().cloned());
+            group.extend(
+                records
+                    .iter()
+                    .zip(&skip_records)
+                    .filter(|(_, skip)| !**skip)
+                    .map(|(record, _)| record.clone()),
+            );
             group.push(result_record.clone());
             let encoded: Vec<Vec<u8>> = group.iter().map(encode_record).collect();
             let appended = self.append_records(&encoded)?;
@@ -687,6 +703,11 @@ impl Store {
                     if *skipped && !extent_exists(txn, &hash.0)? {
                         // Pruned since the hint: append it after all.
                         return Err(StoreError::NotFound { hash: hash.0 });
+                    }
+                }
+                for (hash, skipped) in record_hashes.iter().zip(&skip_records) {
+                    if *skipped && !extent_exists(txn, hash)? {
+                        return Err(StoreError::NotFound { hash: *hash });
                     }
                 }
                 for hash in &layouts {
@@ -737,9 +758,11 @@ impl Store {
             let memo_seq = match committed {
                 Ok(((), memo_seq)) => memo_seq,
                 Err(StoreError::NotFound { hash })
-                    if trees.iter().any(|(tree, _)| tree.0 == hash) =>
+                    if trees.iter().any(|(tree, _)| tree.0 == hash)
+                        || record_hashes.contains(&hash) =>
                 {
                     skip_trees.iter_mut().for_each(|skip| *skip = false);
+                    skip_records.iter_mut().for_each(|skip| *skip = false);
                     continue;
                 }
                 Err(error) => return Err(error),

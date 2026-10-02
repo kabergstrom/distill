@@ -268,14 +268,18 @@ pub fn decode_record(buf: &[u8], segment: u64, offset: u64) -> Result<DecodedRec
 // Result payload grammar
 // ---------------------------------------------------------------------
 
-/// §13: result records are tagged by key kind — the two lookup keys have
-/// different shapes, and neither is shoehorned into the other's grammar.
+/// §13: result records are tagged by key kind — the lookup keys have
+/// different shapes, and none is shoehorned into another's grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKind {
     /// `"DSSI"` — a processor result keyed by the StaticInputs digest.
     Processor = 0,
     /// `"DSBI"` — a build-import result keyed by the §8 pre-key digest.
     BuildImport = 1,
+    /// `"DSNK"` — one asset node's served outputs (its import, processor
+    /// chain and the strong closure it reads), keyed by the node's static
+    /// inputs.
+    Node = 2,
 }
 
 impl KeyKind {
@@ -283,6 +287,7 @@ impl KeyKind {
         Some(match b {
             0 => KeyKind::Processor,
             1 => KeyKind::BuildImport,
+            2 => KeyKind::Node,
             _ => return None,
         })
     }

@@ -369,6 +369,17 @@ fn duplicate_content_hashes_keep_the_last_and_count_the_rest_garbage() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(cfg(&dir)).unwrap();
     commit(&mut store, 1, b"same bytes");
+    // A commit skips payloads the index already holds; forget the extent so
+    // the second commit appends the same bytes again, as two writers racing
+    // past that hint would.
+    let conn = rusqlite::Connection::open(dir.path().join(".distill/meta.sqlite")).unwrap();
+    for table in ["cas_refs", "cas_extents"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE content_hash = ?1"),
+            [blake3::hash(b"same bytes").as_bytes().as_slice()],
+        )
+        .unwrap();
+    }
     commit(&mut store, 2, b"same bytes"); // same content, different key
     drop(store);
 
