@@ -49,7 +49,7 @@
 
 use std::collections::BTreeSet;
 
-use distill_store::files::ObservedDiagnostic;
+use distill_store::files::{ObservedDiagnostic, ObservedFile};
 
 use super::*;
 use crate::importer::{FileOverlay, ImportRun, PassImport, PassOutput, PassPublication, PlannedImport};
@@ -661,14 +661,27 @@ impl DaemonCoordinator {
     ) -> Result<(PlannedImports, Option<FileOverlay>), CoordinatorError> {
         let publication =
             |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
+        // A complete scan's overlay is the rows it changes, compared with
+        // the committed rows before its input writes them.
+        let mut overlay = match step {
+            ScanStep::Full(step) => Some(FileOverlay::differences(
+                store,
+                step.candidate
+                    .scan
+                    .file_observations()
+                    .map(|((root_name, path), file)| ObservedFile {
+                        root_name: root_name.clone(),
+                        path: path.clone(),
+                        file,
+                    }),
+            )?),
+            _ => None,
+        };
         self.in_plan_input(store, base, step, |store| {
-            let overlay = match step {
-                ScanStep::Incremental(step) => {
-                    Some(FileOverlay::capture(store, Some(step.delta.affected_prefixes()))?)
-                }
-                ScanStep::Full(_) => Some(FileOverlay::capture(store, None)?),
-                _ => None,
-            };
+            if let ScanStep::Incremental(step) = step {
+                overlay = Some(FileOverlay::capture(store, step.delta.affected_prefixes())?);
+            }
+            let overlay = overlay.take();
             let work = match scope.affected.and_then(|affected| affected.work) {
                 Some(work) => work.clone(),
                 None => store.pending_file_work()?,
