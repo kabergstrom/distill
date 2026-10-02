@@ -54,3 +54,4 @@ newgameplus-assets = { path = "../../../../newgameplus/newgameplus-assets" }
 rafx-api = { path = "../../../../rafx/rafx-api", features = ["serde-support"] }
 serde_json = "1"
 tempfile = "3"
+distill-store = { path = "../distill-store", features = ["test-hooks"] }

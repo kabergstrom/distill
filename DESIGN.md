@@ -5529,6 +5529,25 @@ only if its trace holds at the waiting worker's snapshot. Waiting never
 needs a free worker, so a chain of any depth completes with one worker,
 and the visiting set and the §9 depth bound keep every walk finite.
 
+**Revalidation reads only what a trace asks.** A trace is revalidated,
+and a build's own trace questions answered, by indexed point queries in
+the snapshot's read transaction, never by loading the project: an entry,
+its bundle's hash, a derived output, the assets at a path, the tool hash
+at the build's tool version, and for a query the assets of its most
+selective indexed selector (uuid, bundle and local id, bundle path, tag
+value, authored type, path or glob literal prefix, terminal type through
+the authored types that reach it, tag), each then checked against every
+selector as before. Every question costs `O(log n)` plus its answer's
+size, and a five-question trace is a dozen statements at any project
+size. Answers are kept for the rest of the build, whose snapshot does not
+move; a `Read` is answered from the contents of nodes built so far. The
+tool epoch a build runs under is read per tool id when first asked. A
+store failure while answering (a poisoned bundle, a chain error) fails
+only the build that asked a question reaching it. Two shapes still read
+more than their answer: a query with no indexed selector (only a local
+id, only `authoring_only`, or a glob with no literal prefix) reads every
+entry, and a tagged query without one reads every tag-index poison.
+
 **Publication.** A worker publishes each node in one write transaction:
 its stage cache rows, wire trees, artifacts with their load edges, and the
 node's cache row. Only then does it complete the node's cell, so a waiter

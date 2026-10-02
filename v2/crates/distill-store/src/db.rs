@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 35;
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -169,6 +169,8 @@ CREATE TABLE bundles (
     origin_group_root   TEXT,
     origin_group_path   TEXT
 );
+-- Build traces resolve bundle paths and path prefixes (§9).
+CREATE INDEX bundles_by_path ON bundles(path);
 CREATE INDEX bundles_by_origin ON bundles(origin_rules_bundle)
     WHERE origin_rules_bundle IS NOT NULL;
 CREATE TABLE assets (
@@ -187,7 +189,10 @@ CREATE TABLE assets (
     authored_value BLOB,
     terminal_type  BLOB
 );
-CREATE INDEX assets_by_bundle ON assets(bundle_uuid);
+-- An asset by bundle and local id is a reference (§9) a build traces.
+CREATE INDEX assets_by_bundle ON assets(bundle_uuid, local_id);
+-- Build traces query assets by authored and terminal type (§9).
+CREATE INDEX assets_by_type ON assets(type_uuid);
 CREATE TABLE asset_tags (
     asset_uuid BLOB NOT NULL,
     tag        TEXT NOT NULL,
@@ -203,6 +208,10 @@ CREATE TABLE asset_tag_index (
     trace             BLOB NOT NULL,
     poison            TEXT
 );
+-- A tag query fails naming the least poisoned bundle among its
+-- candidates; this lists exactly the poisoned rows.
+CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid)
+    WHERE poison IS NOT NULL;
 CREATE TABLE path_index (
     path       TEXT NOT NULL,
     root_id    INTEGER NOT NULL,
@@ -970,6 +979,27 @@ impl StoreReader {
     pub fn rebuild_indexes(&self) -> Result<(), StoreError> {
         self.conn.execute_batch("REINDEX")?;
         Ok(())
+    }
+
+    /// Test hook: call `hook` with each SQL statement this reader's own
+    /// connection runs, its parameters expanded; `None` stops.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn trace_statements(&mut self, hook: Option<fn(&str)>) {
+        self.conn.trace(hook);
+    }
+
+    /// Test hook: the detail lines of SQLite's `EXPLAIN QUERY PLAN` for
+    /// `sql`, in plan order.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn query_plan_details(&self, sql: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        // Unbound parameters plan as NULLs; the plan does not depend on them.
+        let mut rows = statement.raw_query();
+        let mut details = Vec::new();
+        while let Some(row) = rows.next()? {
+            details.push(row.get::<_, String>(3)?);
+        }
+        Ok(details)
     }
 
     pub fn instance_id(&self) -> StoreInstanceId {

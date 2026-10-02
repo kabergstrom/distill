@@ -42,12 +42,12 @@ use distill_build::query::{asset_query_result_hash, normalize_path, AssetQuery};
 use distill_build::tool::{ProcessContext, ToolEpochSnapshot, ToolRuntimeBinding};
 use distill_build::trace::{
     decode_trace_payload_bytes, revalidate, trace_digest, trace_payload_bytes, CapabilityKey,
-    ControlQuery, ControlSubject, ControlValueHash, EntryRole, Observed,
+    EntryRole, Observed,
     StableFailureFingerprint, TraceOp, TraceSource,
 };
 use distill_bundle::{AssetEntry, Bundle};
 use distill_core::id::{
-    AssetUuid, BundleFileHash, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
+    AssetUuid, BundleUuid, ContentHash, LayoutHash, LogicalHash, TypeUuid,
 };
 use distill_json::AuthoredValue;
 use distill_migrate::{
@@ -84,6 +84,10 @@ use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::scanner::RootedScanner;
 use crate::scheduler::{CellOutcome, CellRun, CellWorker, Claim, WorkClass};
+
+mod trace_source;
+
+use trace_source::{BuiltNodes, StoreTraceSource, TraceAnswers, TraceBasis, TraceQueries};
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
@@ -677,7 +681,7 @@ struct NodeLookup<'a> {
     view: &'a StoreReader,
     latest: &'a StoreReader,
     tool_version: distill_store::state::InputVersion,
-    base: Option<Rc<StoreTraceSource>>,
+    answers: Rc<TraceAnswers>,
     nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
     visiting: BTreeSet<AssetUuid>,
 }
@@ -694,7 +698,7 @@ impl<'a> NodeLookup<'a> {
             view,
             latest,
             tool_version,
-            base: None,
+            answers: Rc::default(),
             nodes: BTreeMap::new(),
             visiting: BTreeSet::new(),
         }
@@ -777,31 +781,31 @@ impl<'a> NodeLookup<'a> {
             }
         }
         let source = self.source()?;
-        Ok(trace
+        let drift = trace
             .iter()
-            .find(|op| !revalidate(std::slice::from_ref(*op), &source)))
+            .find(|op| !revalidate(std::slice::from_ref(*op), &source));
+        source.check()?;
+        Ok(drift)
     }
 
-    fn source(&mut self) -> Result<StoreTraceSource, BuildError> {
-        if self.base.is_none() {
-            self.base = Some(Rc::new(StoreTraceSource::capture(
-                self.view,
-                TraceCaptureBasis {
-                    registry: &self.env.registry,
-                    target: &self.env.target,
-                    input_version: self.tool_version,
-                    epoch: self.env.epoch()?,
-                    dylib_hash: self.env.dylib_hash,
-                },
-            )?));
-        }
-        let mut source = StoreTraceSource::clone(self.base.as_ref().expect("captured above"));
-        source.content_hashes = node_content_hashes(
-            self.nodes
-                .iter()
-                .filter_map(|(asset, node)| node.as_ref().map(|node| (*asset, node))),
-        )?;
-        Ok(source)
+    /// The trace answers at this lookup's snapshot, read as they are asked;
+    /// a `read` sees the nodes looked up so far.
+    fn source(&self) -> Result<StoreTraceSource<'_>, BuildError> {
+        let env = self.env;
+        let current_load = self.answers.current_load(|| {
+            Ok(CurrentLoadSource::capture(env.epoch()?, env.dylib_hash))
+        })?;
+        Ok(StoreTraceSource::new(
+            self.view,
+            TraceBasis {
+                registry: &env.registry,
+                target: &env.target,
+                tool_version: self.tool_version,
+            },
+            &self.answers,
+            current_load,
+            BuiltNodes::Lookup(&self.nodes),
+        ))
     }
 }
 
@@ -904,43 +908,20 @@ struct LoadedAsset {
     entry: AssetEntry,
 }
 
-#[derive(Clone)]
-struct PinnedToolEpoch {
-    tools: BTreeMap<String, RegisteredTool>,
-}
-
-impl PinnedToolEpoch {
-    fn capture(
-        store: &StoreReader,
-        basis: distill_store::state::InputVersion,
-    ) -> Result<Self, BuildError> {
-        let hashes = store
-            .tool_hashes_at(basis)
-            .map_err(BuildError::infrastructure)?;
-        let mut tools = BTreeMap::new();
-        for (key, expected_hash) in hashes {
-            let tool = store
-                .tool_at(&key, basis)
-                .map_err(BuildError::infrastructure)?
-                .ok_or_else(|| {
-                    BuildError::Infrastructure(format!(
-                        "published tool {key:?} disappeared while pinning its epoch"
-                    ))
-                })?;
-            if tool.tool_hash != expected_hash {
-                return Err(BuildError::Infrastructure(format!(
-                    "published tool {key:?} changed while pinning its epoch"
-                )));
-            }
-            tools.insert(key, tool);
-        }
-        Ok(Self { tools })
-    }
-}
-
-impl ToolEpochSnapshot for PinnedToolEpoch {
+/// The ToolEpoch visible at a build's view, read one key at a time as
+/// tools are run (one primary-key read each) and kept for the rest of the
+/// build.
+impl ToolEpochSnapshot for BuildContext<'_> {
     fn tool(&self, id: &str) -> Result<Option<RegisteredTool>, StoreError> {
-        Ok(self.tools.get(id).cloned())
+        if let Some(known) = self.tools.borrow().get(id) {
+            return Ok(known.clone());
+        }
+        let tool = match &self.stores {
+            BuildStores::Worker { view, .. } => view.tool_at(id, self.tool_version),
+            BuildStores::Inline(store) => store.borrow().tool_at(id, self.tool_version),
+        }?;
+        self.tools.borrow_mut().insert(id.to_owned(), tool.clone());
+        Ok(tool)
     }
 }
 
@@ -1015,16 +996,17 @@ struct BuildContext<'s> {
     env: NodeEnv,
     scanner: RootedScanner,
     tool_version: distill_store::state::InputVersion,
-    tools: PinnedToolEpoch,
+    /// The ToolEpoch rows read at the view so far (see its `ToolEpochSnapshot`).
+    tools: RefCell<BTreeMap<String, Option<RegisteredTool>>>,
     execution_root: std::path::PathBuf,
     visiting: BTreeSet<AssetUuid>,
     callback_chain: Vec<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodeResult>,
     verify_fresh: bool,
     cells: Option<CellScope<'s>>,
-    /// The view's trace answers, captured once; content hashes come from
+    /// The trace answers read at the view so far; content hashes come from
     /// the memo at each use.
-    trace_base: RefCell<Option<Rc<StoreTraceSource>>>,
+    trace_answers: Rc<TraceAnswers>,
     writes: RefCell<Vec<BuildWrite>>,
     /// Artifact bytes this build produced, readable before (or, verifying,
     /// without) their publication.
@@ -1040,31 +1022,27 @@ impl<'s> BuildContext<'s> {
         verify_fresh: bool,
         runs: &str,
     ) -> Result<Self, BuildError> {
-        let (tool_version, tools, execution_root) = {
+        let (tool_version, execution_root) = {
             let read = match &stores {
                 BuildStores::Worker { view, .. } => StoreRead::Reader(view),
                 BuildStores::Inline(store) => StoreRead::Borrowed(store.borrow()),
             };
             let version = read.input_version();
-            (
-                version,
-                PinnedToolEpoch::capture(&read, version)?,
-                read.state_path().join(runs),
-            )
+            (version, read.state_path().join(runs))
         };
         Ok(Self {
             stores,
             env,
             scanner,
             tool_version,
-            tools,
+            tools: RefCell::default(),
             execution_root,
             visiting: BTreeSet::new(),
             callback_chain: Vec::new(),
             memo: BTreeMap::new(),
             verify_fresh,
             cells,
-            trace_base: RefCell::new(None),
+            trace_answers: Rc::default(),
             writes: RefCell::new(Vec::new()),
             artifacts: RefCell::new(BTreeMap::new()),
         })
@@ -1196,6 +1174,14 @@ impl<'a, 's> BuildProcessContext<'a, 's> {
         self.abort(error, ProcessContextError::Failed(detail))
     }
 
+    /// Ask trace questions at the build's view; a store failure aborts.
+    fn ask<T>(
+        &mut self,
+        ask: impl FnOnce(&StoreTraceSource<'_>) -> T,
+    ) -> Result<T, ProcessContextError> {
+        ask_trace(self.context, ask).map_err(|error| self.abort_build(error))
+    }
+
     fn finish(self) -> (Vec<TraceOp>, bool, Option<BuildError>) {
         let error = self.fatal.or_else(|| {
             self.discarded.then(|| {
@@ -1213,9 +1199,7 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
         expected_terminal: TypeUuid,
     ) -> Result<ProcessArtifact, ProcessContextError> {
         self.ensure_active()?;
-        let source = capture_trace_source(self.context).map_err(|error| self.abort_build(error))?;
-
-        let role = source.role_check(asset);
+        let role = self.ask(|source| source.role_check(asset))?;
         self.trace.push(TraceOp::RoleCheck {
             asset,
             observed: role.clone(),
@@ -1250,7 +1234,7 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
             Observed::Err(failure) => return Err(self.abort_observed(failure)),
         }
 
-        let terminal = source.ref_check(asset, expected_terminal);
+        let terminal = self.ask(|source| source.ref_check(asset, expected_terminal))?;
         self.trace.push(TraceOp::RefCheck {
             asset,
             expected_terminal,
@@ -1305,8 +1289,7 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
                 return Err(self.abort(BuildError::Failed(detail.to_string()), callback_error));
             }
         };
-        let source = capture_trace_source(self.context).map_err(|error| self.abort_build(error))?;
-        let observed = source.resolve(&path);
+        let observed = self.ask(|source| source.resolve(&path))?;
         self.trace.push(TraceOp::Resolve {
             path: path.clone(),
             observed: observed.clone(),
@@ -1336,15 +1319,20 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
                 return Err(self.abort(BuildError::Failed(detail.to_string()), callback_error));
             }
         };
-        let source = capture_trace_source(self.context).map_err(|error| self.abort_build(error))?;
-        let observed = source.query(&query);
+        let answer = self.ask(|source| match source.query(&query) {
+            Observed::Ok(hash) => Ok((hash, source.query_results(&query))),
+            Observed::Err(failure) => Err(failure),
+        })?;
         self.trace.push(TraceOp::Query {
             query: Box::new(query.clone()),
-            observed: observed.clone(),
+            observed: match &answer {
+                Ok((hash, _)) => Observed::Ok(*hash),
+                Err(failure) => Observed::Err(failure.clone()),
+            },
         });
-        match observed {
-            Observed::Ok(_) => Ok(source.query_results(&query)),
-            Observed::Err(failure) => Err(self.abort_observed(failure)),
+        match answer {
+            Ok((_, results)) => Ok(results),
+            Err(failure) => Err(self.abort_observed(failure)),
         }
     }
 
@@ -1368,7 +1356,7 @@ impl PipelineProcessContext for BuildProcessContext<'_, '_> {
             return Err(distill_build::tool::ToolRunError::AttemptStopped);
         }
         let mut tool = ProcessContext::new(
-            &self.context.tools,
+            &*self.context,
             ToolRuntimeBinding {
                 execution_root: &self.context.execution_root,
             },
@@ -1759,11 +1747,11 @@ fn index_one_tag_entry(
         ));
     };
     let migrated = loaded.entry.schema_hash != project.logical_hash;
-    let source = capture_trace_source(context)
+    let current_load = current_load(context)
         .map_err(|error| (bundle, format!("{error:?}"), Vec::new(), migrated))?;
     let mut trace = Vec::new();
     let current =
-        load_current_value(context, &loaded, &project, &source, &mut trace).map_err(|error| {
+        load_current_value(context, &loaded, &project, current_load, &mut trace).map_err(|error| {
             (
                 bundle,
                 format!("{error:?}"),
@@ -1962,7 +1950,7 @@ fn node_lookup<'a>(
     latest: &'a StoreReader,
 ) -> NodeLookup<'a> {
     let mut lookup = NodeLookup::new(&context.env, view, latest, context.tool_version);
-    lookup.base = context.trace_base.borrow().clone();
+    lookup.answers = Rc::clone(&context.trace_answers);
     lookup.nodes = context
         .memo
         .iter()
@@ -1982,12 +1970,8 @@ fn node_lookup<'a>(
 /// Keep what a lookup found: the nodes it looked up hold at this view.
 fn absorb_lookup(
     context: &mut BuildContext,
-    base: Option<Rc<StoreTraceSource>>,
     nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
 ) {
-    if context.trace_base.borrow().is_none() {
-        *context.trace_base.borrow_mut() = base;
-    }
     for (asset, node) in nodes {
         if let Some(node) = node {
             context.memo.entry(asset).or_insert(node);
@@ -2005,28 +1989,28 @@ fn cached_node(
         return Ok(None);
     }
     let depth = context.callback_chain.len();
-    let (found, base, nodes) = {
+    let (found, nodes) = {
         let view = lock_build_store(context)?;
         let latest = latest_store(context);
         let mut lookup = node_lookup(context, &view, &latest);
         let found = lookup.node(asset, depth)?;
-        (found, lookup.base, lookup.nodes)
+        (found, lookup.nodes)
     };
-    absorb_lookup(context, base, nodes);
+    absorb_lookup(context, nodes);
     Ok(found)
 }
 
 /// Whether a finished cell's `trace` holds at this build's view.
 fn holds_here(context: &mut BuildContext, trace: &[TraceOp]) -> Result<bool, BuildError> {
     let depth = context.callback_chain.len();
-    let (holds, base, nodes) = {
+    let (holds, nodes) = {
         let view = lock_build_store(context)?;
         let latest = latest_store(context);
         let mut lookup = node_lookup(context, &view, &latest);
         let holds = lookup.first_drift(trace, depth)?.is_none();
-        (holds, lookup.base, lookup.nodes)
+        (holds, lookup.nodes)
     };
-    absorb_lookup(context, base, nodes);
+    absorb_lookup(context, nodes);
     Ok(holds)
 }
 
@@ -2252,9 +2236,9 @@ fn process_chain(
     let mut current_value = match current_value {
         Some(value) => value,
         None => {
-            let trace_source = capture_trace_source(context)?;
+            let current_load = current_load(context)?;
             let mut trace = Vec::new();
-            load_current_value(context, loaded, project, &trace_source, &mut trace)?
+            load_current_value(context, loaded, project, current_load, &mut trace)?
         }
     };
     let mut current_hash = ContentHash(*blake3::hash(&imported.bytes).as_bytes());
@@ -2491,18 +2475,13 @@ fn hydrate_processor_stage(
 ) -> Result<Option<HydratedProcessorStage>, BuildError> {
     let key = static_inputs_digest(static_inputs);
     preload_persisted_reads(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
-    let trace_source = capture_trace_source(context)?;
     let hit = if context.verify_fresh {
         None
     } else {
-        let store = latest_store(context);
-        lookup_persisted_candidate(
-            &store,
-            KeyKind::Processor,
-            &key,
-            loaded.entry.uuid,
-            &trace_source,
-        )
+        ask_trace(context, |source| {
+            let store = latest_store(context);
+            lookup_persisted_candidate(&store, KeyKind::Processor, &key, loaded.entry.uuid, source)
+        })?
         .map_err(BuildError::infrastructure)?
     };
     let Some(hit) = hit else {
@@ -2584,8 +2563,7 @@ fn preload_persisted_reads(
     for trace in &traces {
         match preload_trace_reads(context, trace) {
             Ok(()) => {
-                let source = capture_trace_source(context)?;
-                if revalidate(trace, &source) {
+                if ask_trace(context, |source| revalidate(trace, source))? {
                     break;
                 }
             }
@@ -2658,7 +2636,6 @@ fn encode_processor_products(
     products: &crate::callbacks::ProcessorProducts,
     trace: &mut Vec<TraceOp>,
 ) -> Result<Vec<EncodedNodeOutput>, BuildError> {
-    let trace_source = capture_trace_source(context)?;
     let mut values = Vec::with_capacity(products.extras.len() + 1);
     values.push((
         String::new(),
@@ -2688,26 +2665,28 @@ fn encode_processor_products(
                 ))
             })?;
         let source_bundle = loaded.meta.bundle;
-        let mut resolver = |query: &distill_json::AuthoredValue,
-                            expected: TypeUuid,
-                            strong: bool,
-                            _path: &[distill_bundle::PathComponent]| {
-            resolve_reference(&trace_source, source_bundle, query, expected, strong, trace)
-        };
-        let encoded = encode_artifact_value(
-            ArtifactValueSpec {
-                asset_uuid: asset,
-                authored_type,
-                terminal_type,
-                encoded_type,
-                logical_hash: project.logical_hash,
-                layout_hash: project.layout_hash,
-                schema: &project.logical_schema.root,
-                wire: &project.wire,
-                value,
-            },
-            &mut resolver,
-        )
+        let encoded = ask_trace(context, |trace_source| {
+            let mut resolver = |query: &distill_json::AuthoredValue,
+                                expected: TypeUuid,
+                                strong: bool,
+                                _path: &[distill_bundle::PathComponent]| {
+                resolve_reference(trace_source, source_bundle, query, expected, strong, trace)
+            };
+            encode_artifact_value(
+                ArtifactValueSpec {
+                    asset_uuid: asset,
+                    authored_type,
+                    terminal_type,
+                    encoded_type,
+                    logical_hash: project.logical_hash,
+                    layout_hash: project.layout_hash,
+                    schema: &project.logical_schema.root,
+                    wire: &project.wire,
+                    value,
+                },
+                &mut resolver,
+            )
+        })?
         .map_err(|error| {
             let message = error.to_string();
             match artifact_encoding_failure(&error) {
@@ -3157,32 +3136,40 @@ fn resolved_terminal_type(
         .ok_or_else(|| BuildError::Failed("derived output is absent from pipeline map".to_owned()))
 }
 
-/// The trace answers at this build's view: captured once per build (the
-/// view does not move), with the contents of the nodes it has so far.
-fn capture_trace_source(context: &BuildContext) -> Result<StoreTraceSource, BuildError> {
-    let base = context.trace_base.borrow().clone();
-    let base = match base {
-        Some(base) => base,
-        None => {
-            let store = lock_build_store(context)?;
-            let base = Rc::new(StoreTraceSource::capture(
-                &store,
-                TraceCaptureBasis {
-                    registry: &context.env.registry,
-                    target: &context.env.target,
-                    input_version: context.tool_version,
-                    epoch: context.env.epoch()?,
-                    dylib_hash: context.env.dylib_hash,
-                },
-            )?);
-            drop(store);
-            *context.trace_base.borrow_mut() = Some(Rc::clone(&base));
-            base
-        }
-    };
-    let mut source = StoreTraceSource::clone(&base);
-    source.content_hashes = node_content_hashes(context.memo.iter().map(|(a, n)| (*a, n)))?;
-    Ok(source)
+/// Ask trace questions at this build's view. Each is answered by reading
+/// the view when first asked (see `trace_source`), and kept for the rest of the
+/// build, whose view does not move; a `read` sees the contents of the nodes
+/// the build has so far. A store failure met while answering fails the
+/// whole ask.
+fn ask_trace<T>(
+    context: &BuildContext,
+    ask: impl FnOnce(&StoreTraceSource<'_>) -> T,
+) -> Result<T, BuildError> {
+    let store = lock_build_store(context)?;
+    let source = StoreTraceSource::new(
+        &store,
+        TraceBasis {
+            registry: &context.env.registry,
+            target: &context.env.target,
+            tool_version: context.tool_version,
+        },
+        &context.trace_answers,
+        current_load(context)?,
+        BuiltNodes::Memo(&context.memo),
+    );
+    let answer = ask(&source);
+    source.check()?;
+    Ok(answer)
+}
+
+/// The loaded pipeline's capabilities, captured once per build.
+fn current_load<'c>(context: &'c BuildContext) -> Result<&'c CurrentLoadSource, BuildError> {
+    context.trace_answers.current_load(|| {
+        Ok(CurrentLoadSource::capture(
+            context.env.epoch()?,
+            context.env.dylib_hash,
+        ))
+    })
 }
 
 struct EpochDefaults<'a> {
@@ -3425,7 +3412,7 @@ fn artifact_encoding_failure(error: &ArtifactEncodeError) -> Option<ArtifactEnco
 }
 
 fn commit_build_import_failure(
-    context: &mut BuildContext,
+    context: &BuildContext,
     loaded: &LoadedAsset,
     key: [u8; 32],
     trace: &[TraceOp],
@@ -3445,10 +3432,10 @@ fn commit_build_import_failure(
 }
 
 fn load_current_value(
-    context: &mut BuildContext,
+    context: &BuildContext,
     loaded: &LoadedAsset,
     project: &ProjectTypeAuthority,
-    trace_source: &StoreTraceSource,
+    current_load: &CurrentLoadSource,
     trace: &mut Vec<TraceOp>,
 ) -> Result<AuthoredValue, BuildError> {
     let bundle = distill_bundle::parse_bundle(&loaded.bundle_bytes).map_err(BuildError::failed)?;
@@ -3459,7 +3446,7 @@ fn load_current_value(
         &project.logical_schema,
         project.logical_hash,
         &project.renamed_from,
-        &trace_source.current_load,
+        current_load,
         trace,
     )
 }
@@ -3669,7 +3656,7 @@ fn encode_or_hydrate(
     validator_dylib_hash: Option<[u8; 32]>,
     trace_out: &mut Vec<TraceOp>,
 ) -> Result<EncodedBuildImport, BuildError> {
-    let trace_source = capture_trace_source(context)?;
+    let current_load = current_load(context)?;
     let (migrations, automatic_migration) =
         migration_key_inputs(loaded, project, context.env.dylib_hash);
     let key = build_import_digest(&BuildImportInputs {
@@ -3689,14 +3676,16 @@ fn encode_or_hydrate(
     let hit = if context.verify_fresh {
         None
     } else {
-        let store = latest_store(context);
-        lookup_persisted_candidate(
-            &store,
-            KeyKind::BuildImport,
-            &key,
-            loaded.entry.uuid,
-            &trace_source,
-        )
+        ask_trace(context, |source| {
+            let store = latest_store(context);
+            lookup_persisted_candidate(
+                &store,
+                KeyKind::BuildImport,
+                &key,
+                loaded.entry.uuid,
+                source,
+            )
+        })?
         .map_err(BuildError::infrastructure)?
     };
     if let Some(hit) = hit {
@@ -3736,7 +3725,7 @@ fn encode_or_hydrate(
 
     let mut trace = Vec::new();
     let current_value =
-        match load_current_value(context, loaded, project, &trace_source, &mut trace) {
+        match load_current_value(context, loaded, project, current_load, &mut trace) {
             Ok(value) => value,
             Err(error) => {
                 let facts = match &error {
@@ -3795,33 +3784,36 @@ fn encode_or_hydrate(
     }
 
     let source_bundle = loaded.meta.bundle;
-    let mut resolver = |query: &distill_json::AuthoredValue,
-                        expected: TypeUuid,
-                        strong: bool,
-                        _path: &[distill_bundle::PathComponent]| {
-        resolve_reference(
-            &trace_source,
-            source_bundle,
-            query,
-            expected,
-            strong,
-            &mut trace,
+    let encoded = ask_trace(context, |trace_source| {
+        let mut resolver = |query: &distill_json::AuthoredValue,
+                            expected: TypeUuid,
+                            strong: bool,
+                            _path: &[distill_bundle::PathComponent]| {
+            resolve_reference(
+                trace_source,
+                source_bundle,
+                query,
+                expected,
+                strong,
+                &mut trace,
+            )
+        };
+        encode_artifact_value(
+            ArtifactValueSpec {
+                asset_uuid: loaded.entry.uuid,
+                authored_type: loaded.entry.type_uuid,
+                terminal_type,
+                encoded_type: loaded.entry.type_uuid,
+                logical_hash: project.logical_hash,
+                layout_hash: project.layout_hash,
+                schema: &project.logical_schema.root,
+                wire: &project.wire,
+                value: &current_value,
+            },
+            &mut resolver,
         )
-    };
-    let encoded = match encode_artifact_value(
-        ArtifactValueSpec {
-            asset_uuid: loaded.entry.uuid,
-            authored_type: loaded.entry.type_uuid,
-            terminal_type,
-            encoded_type: loaded.entry.type_uuid,
-            logical_hash: project.logical_hash,
-            layout_hash: project.layout_hash,
-            schema: &project.logical_schema.root,
-            wire: &project.wire,
-            value: &current_value,
-        },
-        &mut resolver,
-    ) {
+    })?;
+    let encoded = match encoded {
         Ok(encoded) => encoded,
         Err(error) => {
             let message = error.to_string();
@@ -3873,7 +3865,7 @@ fn encode_or_hydrate(
 }
 
 fn resolve_reference(
-    source: &StoreTraceSource,
+    source: &impl TraceQueries,
     source_bundle: BundleUuid,
     value: &distill_json::AuthoredValue,
     expected: TypeUuid,
@@ -3957,7 +3949,7 @@ fn resolve_reference(
 }
 
 fn resolve_query(
-    source: &StoreTraceSource,
+    source: &impl TraceQueries,
     query: AssetQuery,
     trace: &mut Vec<TraceOp>,
 ) -> Result<Option<AssetUuid>, String> {
@@ -4030,216 +4022,11 @@ fn find_bundle_asset(bundle: &Bundle, asset: AssetUuid) -> Option<(&str, &AssetE
         .find_map(|(local_id, entry)| (entry.uuid == asset).then_some((local_id.as_str(), entry)))
 }
 
-#[derive(Clone)]
-struct TraceEntry {
-    asset: AssetUuid,
-    bundle: BundleUuid,
-    bundle_path: String,
-    local_id: String,
-    authored_type: TypeUuid,
-    terminal_type: TypeUuid,
-    role: EntryRole,
-    tags: BTreeMap<String, Option<String>>,
-}
-
-#[derive(Clone)]
-struct StoreTraceSource {
-    authoring_hashes: BTreeMap<AssetUuid, BundleFileHash>,
-    entries: BTreeMap<AssetUuid, TraceEntry>,
-    terminal_types: BTreeMap<AssetUuid, TypeUuid>,
-    roles: BTreeMap<AssetUuid, EntryRole>,
-    paths: BTreeMap<String, Vec<AssetUuid>>,
-    tools: BTreeMap<String, [u8; 32]>,
-    current_load: CurrentLoadSource,
-    content_hashes: BTreeMap<AssetUuid, ContentHash>,
-    tag_poisons: BTreeMap<AssetUuid, BundleUuid>,
-}
-
+/// The capabilities the loaded pipeline provides (default tables and
+/// migration functions), each answering with the pipeline's dylib hash.
 #[derive(Clone)]
 struct CurrentLoadSource {
     capabilities: Vec<(CapabilityKey, [u8; 32])>,
-}
-
-struct TraceCaptureBasis<'a> {
-    registry: &'a PipelineRegistry,
-    target: &'a Target,
-    input_version: distill_store::state::InputVersion,
-    epoch: &'a PipelineEpoch,
-    dylib_hash: [u8; 32],
-}
-
-impl StoreTraceSource {
-    fn capture(store: &StoreReader, basis: TraceCaptureBasis<'_>) -> Result<Self, BuildError> {
-        let bundle_rows = store.all_bundles().map_err(BuildError::infrastructure)?;
-        let bundles = bundle_rows
-            .iter()
-            .map(|bundle| (bundle.bundle, bundle.path.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let bundle_hashes = bundle_rows
-            .into_iter()
-            .map(|bundle| (bundle.bundle, BundleFileHash(bundle.content_hash.0)))
-            .collect::<BTreeMap<_, _>>();
-        let mut entries = BTreeMap::new();
-        let mut authoring_hashes = BTreeMap::new();
-        let mut tag_poisons = BTreeMap::new();
-        for asset in store.all_asset_ids().map_err(BuildError::infrastructure)? {
-            let Some(entry) = store.entry(asset).map_err(BuildError::failed)? else {
-                continue;
-            };
-            let bundle = entry.bundle;
-            let bundle_hash = bundle_hashes.get(&bundle).copied().ok_or_else(|| {
-                BuildError::Infrastructure("trace entry owner bundle hash is missing".to_owned())
-            })?;
-            let bundle_path = bundles.get(&bundle).cloned().ok_or_else(|| {
-                BuildError::Infrastructure("trace entry owner bundle is missing".to_owned())
-            })?;
-            entries.insert(
-                asset,
-                TraceEntry {
-                    asset,
-                    bundle,
-                    bundle_path,
-                    local_id: entry.local_id,
-                    authored_type: entry.type_uuid,
-                    terminal_type: basis
-                        .registry
-                        .chain(entry.type_uuid, basis.target)
-                        .map_err(BuildError::failed)?
-                        .terminal,
-                    role: if entry.authoring_only {
-                        EntryRole::AuthoringOnly
-                    } else {
-                        EntryRole::Runtime
-                    },
-                    tags: entry.tags,
-                },
-            );
-            authoring_hashes.insert(asset, bundle_hash);
-            if store
-                .tag_index_state(asset)
-                .map_err(BuildError::infrastructure)?
-                .is_some_and(|state| state.poison.is_some())
-            {
-                tag_poisons.insert(asset, bundle);
-            }
-        }
-        let mut paths = BTreeMap::<String, Vec<AssetUuid>>::new();
-        for (path, _, asset) in store
-            .all_path_entries()
-            .map_err(BuildError::infrastructure)?
-        {
-            paths.entry(path).or_default().push(asset);
-        }
-        for assets in paths.values_mut() {
-            assets.sort();
-            assets.dedup();
-        }
-        let mut terminal_types = entries
-            .iter()
-            .map(|(asset, entry)| (*asset, entry.terminal_type))
-            .collect::<BTreeMap<_, _>>();
-        let mut roles = entries
-            .iter()
-            .map(|(asset, entry)| (*asset, entry.role))
-            .collect::<BTreeMap<_, _>>();
-        for (child, parent, output_key) in store
-            .all_derived_outputs()
-            .map_err(BuildError::infrastructure)?
-        {
-            let parent_type = entries.get(&parent).ok_or_else(|| {
-                BuildError::Infrastructure("derived parent is absent from trace index".to_owned())
-            })?;
-            let terminal = basis
-                .registry
-                .chain(parent_type.authored_type, basis.target)
-                .map_err(BuildError::failed)?
-                .extras
-                .get(&output_key)
-                .copied()
-                .ok_or_else(|| {
-                    BuildError::Infrastructure(
-                        "derived output is absent from the pinned pipeline map".to_owned(),
-                    )
-                })?;
-            terminal_types.insert(child, terminal);
-            roles.insert(child, EntryRole::Runtime);
-        }
-        let tools = store
-            .tool_hashes_at(basis.input_version)
-            .map_err(BuildError::infrastructure)?;
-        let current_load = CurrentLoadSource::capture(basis.epoch, basis.dylib_hash);
-        Ok(Self {
-            authoring_hashes,
-            entries,
-            terminal_types,
-            roles,
-            paths,
-            tools,
-            current_load,
-            content_hashes: BTreeMap::new(),
-            tag_poisons,
-        })
-    }
-
-    fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
-        let glob = query
-            .path_glob
-            .as_ref()
-            .and_then(|pattern| globset::Glob::new(pattern).ok())
-            .map(|glob| glob.compile_matcher());
-        self.entries
-            .values()
-            .filter(|entry| entry.role == EntryRole::Runtime)
-            .filter(|entry| query.uuid.is_none_or(|uuid| uuid == entry.asset))
-            .filter(|entry| {
-                query
-                    .bundle_path
-                    .as_ref()
-                    .is_none_or(|path| path == &entry.bundle_path)
-            })
-            .filter(|entry| {
-                query
-                    .local_id
-                    .as_ref()
-                    .is_none_or(|local_id| local_id == &entry.local_id)
-            })
-            .filter(|entry| {
-                query
-                    .bundle_uuid
-                    .is_none_or(|bundle| bundle == entry.bundle)
-            })
-            .filter(|entry| {
-                query
-                    .authored_type
-                    .is_none_or(|authored| authored == entry.authored_type)
-            })
-            .filter(|entry| {
-                query
-                    .terminal_type
-                    .is_none_or(|terminal| terminal == entry.terminal_type)
-            })
-            .filter(|entry| {
-                query.tag.as_ref().is_none_or(|tag| {
-                    entry.tags.get(&tag.tag).is_some_and(|actual| {
-                        tag.value
-                            .as_ref()
-                            .is_none_or(|wanted| actual.as_ref() == Some(wanted))
-                    })
-                })
-            })
-            .filter(|entry| {
-                query
-                    .path_prefix
-                    .as_ref()
-                    .is_none_or(|prefix| entry.bundle_path.starts_with(prefix))
-            })
-            .filter(|entry| {
-                glob.as_ref()
-                    .is_none_or(|glob| glob.is_match(&entry.bundle_path))
-            })
-            .map(|entry| entry.asset)
-            .collect()
-    }
 }
 
 impl CurrentLoadSource {
@@ -4277,93 +4064,14 @@ fn no_trace<T>() -> Observed<T> {
     })
 }
 
-impl TraceSource for StoreTraceSource {
-    fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>> {
-        Observed::Ok(self.authoring_hashes.get(&asset).copied())
-    }
-
-    fn read(&self, asset: AssetUuid) -> Observed<ContentHash> {
-        self.content_hashes.get(&asset).copied().map_or_else(
-            || {
-                Observed::Err(StableFailureFingerprint::MissingRef {
-                    query: Box::new(AssetQuery {
-                        uuid: Some(asset),
-                        ..AssetQuery::default()
-                    }),
-                    expected_terminal: self
-                        .terminal_types
-                        .get(&asset)
-                        .copied()
-                        .unwrap_or(TypeUuid([0; 16])),
-                })
-            },
-            Observed::Ok,
-        )
-    }
-
-    fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>> {
-        match self.paths.get(path).map(Vec::as_slice).unwrap_or_default() {
-            [] => Observed::Ok(None),
-            [asset] => Observed::Ok(Some(*asset)),
-            conflicting => Observed::Err(StableFailureFingerprint::Ambiguous {
-                conflicting: conflicting.to_vec(),
-            }),
-        }
-    }
-
-    fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]> {
-        if query.tag.is_some() {
-            let mut without_tag = query.clone();
-            without_tag.tag = None;
-            let candidates = self.query_results(&without_tag);
-            if let Some(bundle) = candidates
-                .iter()
-                .filter_map(|asset| self.tag_poisons.get(asset))
-                .min()
-            {
-                return Observed::Err(StableFailureFingerprint::Poisoned { bundle: *bundle });
-            }
-        }
-        Observed::Ok(asset_query_result_hash(&self.query_results(query)))
-    }
-
-    fn tool(&self, id: &str) -> Observed<[u8; 32]> {
-        self.tools.get(id).copied().map_or_else(
-            || {
-                Observed::Err(StableFailureFingerprint::MissingCapability {
-                    key: CapabilityKey::Tool(id.to_owned()),
-                })
-            },
-            Observed::Ok,
-        )
-    }
-
-    fn capability(&self, key: &CapabilityKey) -> Observed<[u8; 32]> {
-        self.current_load.capability(key)
-    }
-
-    fn ref_check(&self, asset: AssetUuid, _expected: TypeUuid) -> Observed<Option<TypeUuid>> {
-        Observed::Ok(self.terminal_types.get(&asset).copied())
-    }
-
-    fn role_check(&self, asset: AssetUuid) -> Observed<Option<EntryRole>> {
-        Observed::Ok(self.roles.get(&asset).copied())
-    }
-
-    fn control(&self, _query: &ControlQuery) -> Observed<[u8; 32]> {
-        no_trace()
-    }
-
-    fn control_read(&self, _subject: &ControlSubject) -> Observed<ControlValueHash> {
-        no_trace()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     mod cells;
+    mod eager_trace;
+    mod lazy_trace;
+    use eager_trace::{EagerEntry, EagerTraceSource};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -5435,11 +5143,11 @@ mod tests {
 
     #[test]
     fn reference_trace_invalidates_on_resolution_role_or_terminal_type_drift() {
-        let source = StoreTraceSource {
+        let source = EagerTraceSource {
             authoring_hashes: BTreeMap::new(),
             entries: BTreeMap::from([(
                 ASSET,
-                TraceEntry {
+                EagerEntry {
                     asset: ASSET,
                     bundle: BUNDLE,
                     bundle_path: "target.bundle".to_owned(),
@@ -5494,7 +5202,7 @@ mod tests {
     #[test]
     fn absent_weak_uuid_reference_is_legal_and_trace_invalidates_when_it_appears() {
         let missing = AssetUuid([99; 16]);
-        let mut source = StoreTraceSource {
+        let mut source = EagerTraceSource {
             authoring_hashes: BTreeMap::new(),
             entries: BTreeMap::new(),
             terminal_types: BTreeMap::new(),

@@ -218,6 +218,8 @@ a connection of its own, and SQLite's write lock orders the writers.
   `artifact_load_edges`, and node row in one transaction on its own
   writer, then completes the cell. Each waiter revalidates the node's
   trace at its own snapshot: `Built` where it holds, `Drifted` where not.
+  Traces are revalidated by indexed point queries in the snapshot's read
+  transaction, answers kept per build; nothing loads the whole project.
   Inline builds (doctor verification, tag-index refinement) take an
   `OpenInput` proof: they run only on a writer inside an open input, and
   nothing on the resolve path has one.
@@ -880,6 +882,16 @@ should reach zero by the end of phase 6.
   `KeyKind::Node` with their traces. Tag-index refinement keeps running
   inline, now with an `OpenInput` proof, in a pass's apply input and never
   in its rolled-back plan.
+- **Lazy trace reads.** `StoreTraceSource::capture`, which loaded every
+  entry, bundle, path, derived output, tag poison and tool into maps for
+  each build, is gone, and so is `PinnedToolEpoch`'s copy of the tools
+  table. Each trace question is a point query in the snapshot's read
+  transaction (`distill-store` `trace_reads`), kept in the build's
+  `TraceAnswers`; tools are read per id at the build's tool version. New
+  indexes `bundles_by_path`, `assets_by_type`, the partial
+  `asset_tag_index_poisoned`, and `assets_by_bundle` now on
+  `(bundle_uuid, local_id)` (SCHEMA_VERSION 36). A store failure fails
+  only the questions that reach it, where the capture failed every build.
 
 ## 7. Test baseline
 
@@ -903,3 +915,7 @@ test added), the same single failure.
 
 Build cells, on top of the one-input pass: 1151 passed, no failures (the
 stdin-drain test now passes).
+
+Lazy trace reads: 1157 passed, no failures (6 new: the store's plan and
+prefix-bound tests, and the lazy-against-eager equivalence, revalidation,
+poisoned-bundle and 20 000-asset scale tests).

@@ -78,6 +78,12 @@ impl PipelineRegistry {
         Ok(Self { by_input })
     }
 
+    /// Every type some registration takes as input, in type order: the
+    /// only types whose chains can end anywhere but where they start.
+    pub fn input_types(&self) -> impl Iterator<Item = TypeUuid> + '_ {
+        self.by_input.keys().copied()
+    }
+
     pub fn chain(
         &self,
         authored: TypeUuid,

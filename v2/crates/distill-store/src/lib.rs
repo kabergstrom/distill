@@ -22,6 +22,7 @@ pub mod pipeline;
 pub mod served;
 pub mod opener;
 pub mod state;
+pub mod trace_reads;
 
 pub use current::Current;
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
