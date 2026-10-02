@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use distill_daemon::config::{DaemonConfig, DaemonConfigError};
 use distill_schema::ngp_schema::LayoutIdentity;
 
@@ -68,6 +70,30 @@ fn parses_and_validates_the_complete_configuration_surface() {
     let without_depth = valid_config(&temp).replace("max_dependency_depth = 64\n", "");
     let defaulted = DaemonConfig::parse(temp.path().join("distill.toml"), &without_depth).unwrap();
     assert_eq!(defaulted.pipeline.max_dependency_depth, 32);
+}
+
+#[test]
+fn watch_quiet_defaults_to_250_ms_and_is_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("distill.toml");
+    let defaulted = DaemonConfig::parse(&path, &valid_config(&temp)).unwrap();
+    assert_eq!(defaulted.watch.quiet, Duration::from_millis(250));
+
+    let with = |section: &str| format!("{}\n{section}", valid_config(&temp));
+    let set = DaemonConfig::parse(&path, &with("[watch]\nquiet_ms = 1200\n")).unwrap();
+    assert_eq!(set.watch.quiet, Duration::from_millis(1200));
+    let empty = DaemonConfig::parse(&path, &with("[watch]\n")).unwrap();
+    assert_eq!(empty.watch.quiet, Duration::from_millis(250));
+    assert!(DaemonConfig::parse(&path, &with("[watch]\nquiet_ms = 5000\n")).is_ok());
+
+    for rejected in ["quiet_ms = 0", "quiet_ms = 5001"] {
+        let error = DaemonConfig::parse(&path, &with(&format!("[watch]\n{rejected}\n")))
+            .expect_err(rejected);
+        assert!(matches!(error, DaemonConfigError::Watch(_)), "{rejected}: {error:?}");
+    }
+    let unknown =
+        DaemonConfig::parse(&path, &with("[watch]\nquiet = 10\n")).expect_err("unknown key");
+    assert!(matches!(unknown, DaemonConfigError::Toml(_)), "{unknown:?}");
 }
 
 #[test]

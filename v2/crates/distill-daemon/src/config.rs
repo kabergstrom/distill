@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use distill_build::keys::target_definition_hash;
 use distill_build::pipeline::{GraphicsApi, Target, TargetArch, TargetOs};
@@ -18,6 +19,7 @@ use crate::epoch::{CandidateRequirements, TargetDefinition as PipelineTarget};
 use crate::module_loader::host_module_abi_identity;
 use crate::scanner::AssetRoot;
 use crate::scheduler::{DEFAULT_DEPENDENCY_DEPTH, MAX_DEPENDENCY_DEPTH};
+use crate::settle::{DEFAULT_QUIET, MAX_QUIET};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -29,6 +31,7 @@ pub struct DaemonConfig {
     pub codegen: CodegenSection,
     pub pipeline: PipelineSection,
     pub cas: CasSection,
+    pub watch: WatchSection,
     /// Rebuild-on-save jobs (`crate::rebuild`); a serving daemon follows
     /// them as the configuration changes.
     pub rebuild: Vec<RebuildJob>,
@@ -92,6 +95,22 @@ pub struct CasSection {
     pub cache_limit: u64,
 }
 
+/// `[watch]`: how filesystem changes are waited for (`crate::settle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchSection {
+    /// How long the filesystem must stay quiet before the daemon reconciles
+    /// it (or a rebuild job starts); every change restarts the wait.
+    pub quiet: Duration,
+}
+
+impl Default for WatchSection {
+    fn default() -> Self {
+        Self {
+            quiet: DEFAULT_QUIET,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DaemonConfigError {
     Read {
@@ -130,6 +149,7 @@ pub enum DaemonConfigError {
     },
     Target(String),
     Rebuild(String),
+    Watch(String),
 }
 
 pub(crate) struct StagedExecutionCandidate {
@@ -156,6 +176,8 @@ struct RawConfig {
     codegen: RawCodegen,
     pipeline: RawPipeline,
     cas: RawCas,
+    #[serde(default)]
+    watch: RawWatch,
     #[serde(default)]
     rebuild: Vec<RawRebuild>,
 }
@@ -243,6 +265,38 @@ struct RawRebuild {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawWatch {
+    #[serde(default = "default_quiet_ms")]
+    quiet_ms: u64,
+}
+
+impl Default for RawWatch {
+    fn default() -> Self {
+        Self {
+            quiet_ms: default_quiet_ms(),
+        }
+    }
+}
+
+const fn default_quiet_ms() -> u64 {
+    DEFAULT_QUIET.as_millis() as u64
+}
+
+/// `watch.quiet_ms`, which must be in `1..=MAX_QUIET`.
+fn watch_quiet(raw: &RawWatch) -> Result<Duration, DaemonConfigError> {
+    let max = MAX_QUIET.as_millis() as u64;
+    if (1..=max).contains(&raw.quiet_ms) {
+        Ok(Duration::from_millis(raw.quiet_ms))
+    } else {
+        Err(DaemonConfigError::Watch(format!(
+            "watch.quiet_ms must be in 1..={max}, not {}",
+            raw.quiet_ms
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCas {
     segment_size: String,
     cache_limit: String,
@@ -316,6 +370,7 @@ impl DaemonConfig {
             .map_err(|error| DaemonConfigError::InvalidByteSize(error.to_string()))?;
         let cache_limit = parse_byte_size(&raw.cas.cache_limit)
             .map_err(|error| DaemonConfigError::InvalidByteSize(error.to_string()))?;
+        let quiet = watch_quiet(&raw.watch)?;
         let rebuild = rebuild_jobs(raw.rebuild, base)?;
 
         Ok(Self {
@@ -343,6 +398,7 @@ impl DaemonConfig {
                 segment_size,
                 cache_limit,
             },
+            watch: WatchSection { quiet },
             rebuild,
         })
     }
@@ -673,6 +729,9 @@ fn validate_raw_candidate(raw: &RawConfig, base: &Path) -> Vec<DaemonConfigError
     }
     if let Err(error) = parse_byte_size(&raw.cas.cache_limit) {
         errors.push(DaemonConfigError::InvalidByteSize(error.to_string()));
+    }
+    if let Err(error) = watch_quiet(&raw.watch) {
+        errors.push(error);
     }
     errors
 }
@@ -1064,10 +1123,17 @@ mod tests {
                 segment_size: "1MiB".to_owned(),
                 cache_limit: "8MiB".to_owned(),
             },
+            watch: RawWatch { quiet_ms: 0 },
             rebuild: Vec::new(),
         };
 
         let errors = validate_raw_candidate(&raw, temp.path());
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, DaemonConfigError::Watch(_))),
+            "an out-of-range watch.quiet_ms is retained with the other defects"
+        );
         assert!(errors.iter().any(|error| matches!(
             error,
             DaemonConfigError::Scheduler(ConfigValidationError::ParallelismZero)

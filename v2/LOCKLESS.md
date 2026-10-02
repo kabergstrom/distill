@@ -182,9 +182,10 @@ a connection of its own, and SQLite's write lock orders the writers.
   outside any write reads a snapshot of its own. A writer's CAS segment
   is sealed when its owner closes it.
 - **The process loop** owns the `WatcherQueue`, `ConfigWatch` and codegen.
-  It debounces watcher events against a deadline, publishes scans and
-  imports, and runs startup. Its scan state (the pending rejection and
-  health) sits in a `Mutex` other publications read.
+  It reconciles watcher events once the filesystem has settled (each
+  event restarts a trailing quiet window, `watch.quiet_ms`), publishes
+  scans and imports, and runs startup. Its scan state (the pending
+  rejection and health) sits in a `Mutex` other publications read.
 - **watcher** forwards `notify` events to the loop and holds no queue
   state. It stops on its command channel.
 - **Imports and authoring calls** run on the calling thread: the process
@@ -230,10 +231,12 @@ a connection of its own, and SQLite's write lock orders the writers.
 - **rebuild** (a serving `distilld`) runs the configuration's `[[rebuild]]`
   jobs: it watches each job's dep-info inputs with its own `notify` watcher
   and runs the job's steps as child processes, one at a time (in a process
-  group on Unix, a kill-on-close job object on Windows). The process loop
-  sends it each accepted configuration's jobs over its channel; it touches
-  no store state: the daemon adopts the pipeline module and schema the
-  steps write through the ordinary watch.
+  group on Unix, a kill-on-close job object on Windows), once its inputs
+  have settled (the same `watch.quiet_ms` trailing window as the process
+  loop). The process loop sends it each accepted configuration's jobs and
+  window over its channel; it touches no store state: the daemon adopts
+  the pipeline module and schema the steps write through the ordinary
+  watch.
 - The only atomics are ID and temp-name sequences, and the RPC server's
   admission counters and snapshot policy.
 

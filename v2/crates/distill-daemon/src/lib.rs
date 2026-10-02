@@ -21,5 +21,6 @@ pub mod process;
 pub mod rebuild;
 pub mod scanner;
 pub mod scheduler;
+mod settle;
 mod tool_resolver;
 pub mod watcher;

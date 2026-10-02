@@ -17,7 +17,11 @@
 //! inputs.
 //!
 //! One thread runs the jobs in configuration order, one step at a time. A
-//! change to a running job's inputs ends its round (terminating the step)
+//! queued job starts once the filesystem has settled: each change to an
+//! input restarts a trailing quiet window (`watch.quiet_ms`, shared with
+//! the daemon's reconciliation; `crate::settle`), so a burst of changes (an
+//! editor's save, a git checkout) builds once, from the burst's end state.
+//! A change to a running job's inputs ends its round (terminating the step)
 //! and queues it again. A job whose dep-info is missing runs once at
 //! startup. Steps run in the configuration file's directory with the
 //! daemon's stdout and stderr; a failed step ends its round, and the next
@@ -45,13 +49,12 @@ use std::time::{Duration, Instant};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 pub use crate::config::RebuildJob;
-
-/// Editors save in bursts (write, rename, chmod); a job starts once its
-/// inputs have been quiet this long.
-const SETTLE: Duration = Duration::from_millis(30);
+use crate::settle::QuietWindow;
 
 enum Message {
     Changed(Vec<PathBuf>),
+    /// A new quiet window (`watch.quiet_ms`).
+    Quiet(Duration),
     WatchFailed(String),
     /// A step's process exited (not yet reaped).
     StepExited(u32),
@@ -67,7 +70,8 @@ pub struct Rebuilder {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Replaces a [`Rebuilder`]'s jobs; it may outlive the rebuilder.
+/// Replaces a [`Rebuilder`]'s jobs and settings; it may outlive the
+/// rebuilder.
 #[derive(Clone)]
 pub struct RebuildJobs {
     inbox: mpsc::Sender<Message>,
@@ -78,16 +82,23 @@ impl RebuildJobs {
     pub fn replace(&self, jobs: Vec<RebuildJob>) {
         let _ = self.inbox.send(Message::Jobs(jobs));
     }
+
+    /// Wait `quiet` for the inputs to settle from now on.
+    pub fn set_quiet(&self, quiet: Duration) {
+        let _ = self.inbox.send(Message::Quiet(quiet));
+    }
 }
 
 impl Rebuilder {
-    pub fn start(jobs: Vec<RebuildJob>) -> Self {
+    /// Run `jobs`, each once its inputs have been quiet for `quiet`.
+    pub fn start(jobs: Vec<RebuildJob>, quiet: Duration) -> Self {
         let (inbox, messages) = mpsc::channel();
         let worker = Worker {
             jobs: jobs.into_iter().map(JobState::new).collect(),
             watcher: None,
             watched: BTreeSet::new(),
             queued: BTreeSet::new(),
+            window: QuietWindow::new(quiet, "rebuild"),
             inbox: inbox.clone(),
             messages,
         };
@@ -186,6 +197,9 @@ struct Worker {
     watched: BTreeSet<PathBuf>,
     /// Jobs to run, by index.
     queued: BTreeSet<usize>,
+    /// Changes to the inputs since the last job started: the next waits
+    /// for them to settle.
+    window: QuietWindow,
     inbox: mpsc::Sender<Message>,
     messages: mpsc::Receiver<Message>,
 }
@@ -219,9 +233,15 @@ impl Worker {
                 self.receive(message)?;
                 continue;
             }
-            // Let the burst of events one save makes settle.
-            loop {
-                match self.messages.recv_timeout(SETTLE) {
+            // Wait for the inputs to settle: every change restarts the
+            // window (a job queued with no change, by the configuration,
+            // starts at once).
+            while let Some(closes) = self.window.closes_at() {
+                let wait = closes.saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    break;
+                }
+                match self.messages.recv_timeout(wait) {
                     Ok(message) => self.receive(message)?,
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return Err(Stopped),
@@ -231,6 +251,7 @@ impl Worker {
                 // A replacement dropped the queued jobs.
                 continue;
             };
+            self.window.close();
             self.run_job(index)?;
             self.watch_inputs();
         }
@@ -239,14 +260,34 @@ impl Worker {
     fn receive(&mut self, message: Message) -> Result<(), Stopped> {
         match message {
             Message::Changed(paths) => {
-                for path in paths {
+                for path in &paths {
                     for (index, state) in self.jobs.iter().enumerate() {
-                        if !self.queued.contains(&index) && state.changed(&path) {
+                        if !self.queued.contains(&index) && state.changed(path) {
                             tracing::info!(job = %state.job.name, path = %path.display(), "rebuild queued");
                             self.queued.insert(index);
                         }
                     }
                 }
+                // Once a job waits, every change to an input holds it: the
+                // burst may not be over.
+                if !self.queued.is_empty() {
+                    let inputs: Vec<&Path> = paths
+                        .iter()
+                        .filter(|path| {
+                            self.jobs
+                                .iter()
+                                .any(|state| state.inputs.contains_key(*path))
+                        })
+                        .map(PathBuf::as_path)
+                        .collect();
+                    if !inputs.is_empty() {
+                        self.window.change(Instant::now(), inputs);
+                    }
+                }
+                Ok(())
+            }
+            Message::Quiet(quiet) => {
+                self.window.set_quiet(quiet);
                 Ok(())
             }
             Message::WatchFailed(error) => {
@@ -756,6 +797,18 @@ fn split_rule(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    /// The quiet window the timing of most of these tests assumes.
+    const QUIET: Duration = Duration::from_millis(30);
+
+    /// A script appending `source` to `file`.
+    fn copy(source: &str, file: &str) -> Vec<String> {
+        if cfg!(windows) {
+            shell(&format!("type {source} >> {file}"))
+        } else {
+            shell(&format!("cat {source} >> {file}"))
+        }
+    }
+
     /// A step running `script` in the platform's shell.
     fn shell(script: &str) -> Vec<String> {
         if cfg!(windows) {
@@ -891,7 +944,8 @@ mod tests {
     fn saving_an_input_runs_the_steps() {
         let temp = tempfile::tempdir().unwrap();
         let ran = temp.path().join("ran");
-        let _rebuilder = Rebuilder::start(vec![job(temp.path(), "a", append_line("ran"))]);
+        let _rebuilder =
+            Rebuilder::start(vec![job(temp.path(), "a", append_line("ran"))], QUIET);
         // The watch is installed on the rebuild thread; give it a moment.
         thread::sleep(Duration::from_millis(200));
         assert!(!ran.exists(), "nothing ran before a change");
@@ -902,14 +956,40 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_saves_builds_once_from_its_end_state() {
+        // Saves 20 ms apart, for well over the quiet window: a window fixed
+        // by the first save would start a round part way through.
+        let quiet = Duration::from_millis(300);
+        let temp = tempfile::tempdir().unwrap();
+        let ran = temp.path().join("ran");
+        let _rebuilder =
+            Rebuilder::start(vec![job(temp.path(), "a", copy("a.rs", "ran"))], quiet);
+        thread::sleep(Duration::from_millis(200));
+        for save in 2..=40 {
+            std::fs::write(temp.path().join("a.rs"), format!("{save}\n")).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(wait_for(Duration::from_secs(10), || ran.exists()));
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            std::fs::read_to_string(&ran).unwrap(),
+            "40\n",
+            "one round, after the burst, from its last save"
+        );
+    }
+
+    #[test]
     fn reading_an_input_does_not_hold_off_other_jobs() {
         // Hashing an input opens it; were opens changes, reading b.rs would
         // keep job b hashing it forever and job a would never settle.
         let temp = tempfile::tempdir().unwrap();
-        let _rebuilder = Rebuilder::start(vec![
-            job(temp.path(), "a", append_line("ran-a")),
-            job(temp.path(), "b", append_line("ran-b")),
-        ]);
+        let _rebuilder = Rebuilder::start(
+            vec![
+                job(temp.path(), "a", append_line("ran-a")),
+                job(temp.path(), "b", append_line("ran-b")),
+            ],
+            QUIET,
+        );
         thread::sleep(Duration::from_millis(200));
         std::fs::read(temp.path().join("b.rs")).unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -923,7 +1003,8 @@ mod tests {
     fn a_change_during_a_round_supersedes_it() {
         let temp = tempfile::tempdir().unwrap();
         let ran = temp.path().join("ran");
-        let _rebuilder = Rebuilder::start(vec![job(temp.path(), "a", slow_copy("a.rs", "ran"))]);
+        let _rebuilder =
+            Rebuilder::start(vec![job(temp.path(), "a", slow_copy("a.rs", "ran"))], QUIET);
         thread::sleep(Duration::from_millis(200));
         std::fs::write(temp.path().join("a.rs"), "2").unwrap();
         thread::sleep(Duration::from_millis(400));
@@ -942,7 +1023,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         let a = job(dir, "a", append_line("ran-a"));
-        let rebuilder = Rebuilder::start(vec![a.clone()]);
+        let rebuilder = Rebuilder::start(vec![a.clone()], QUIET);
         thread::sleep(Duration::from_millis(200));
 
         // Unchanged a stays idle; added b runs once.
@@ -975,7 +1056,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         let a = job(dir, "a", slow_copy("a.rs", "ran"));
-        let rebuilder = Rebuilder::start(vec![a]);
+        let rebuilder = Rebuilder::start(vec![a], QUIET);
         thread::sleep(Duration::from_millis(200));
         std::fs::write(dir.join("a.rs"), "2").unwrap();
         thread::sleep(Duration::from_millis(400));

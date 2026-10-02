@@ -91,6 +91,57 @@ fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
     }
 }
 
+/// Long enough after a change for any pass it causes to have run: twice
+/// the default 250 ms quiet window.
+const SETTLED: Duration = Duration::from_millis(500);
+
+#[test]
+fn watcher_changes_wait_for_the_configured_quiet_window() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("assets")).unwrap();
+    let path = temp.path().join("distill.toml");
+    let source = format!("{}[watch]\nquiet_ms = 1000\n", config_source(&temp));
+    std::fs::write(&path, source).unwrap();
+    write_schema(&temp, "initial");
+    let process = DaemonProcess::start(DaemonConfig::load(path).unwrap()).unwrap();
+    // The pass that follows startup.
+    std::thread::sleep(SETTLED);
+    let before = process.coordinator().server().current_stamp().version;
+
+    // Three writes 300 ms apart: each restarts the 1 s window.
+    let asset = temp.path().join("assets/source.txt");
+    let mut last_write = Instant::now();
+    for content in ["one", "two", "three"] {
+        // Taken before the write: its event cannot arrive earlier.
+        last_write = Instant::now();
+        std::fs::write(&asset, content).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            process.coordinator().server().current_stamp().version,
+            before,
+            "nothing reconciles while changes keep arriving"
+        );
+    }
+    wait_until(
+        || process.coordinator().server().current_stamp().version > before,
+        "the burst was not reconciled",
+    );
+    assert!(
+        last_write.elapsed() >= Duration::from_secs(1),
+        "reconciled {:?} after the last write",
+        last_write.elapsed()
+    );
+    assert!(process
+        .coordinator()
+        .open_reader()
+        .unwrap()
+        .all_files()
+        .unwrap()
+        .iter()
+        .any(|(_, path, _)| path == "source.txt"));
+    assert!(process.last_background_error().is_none());
+}
+
 #[test]
 fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     let temp = tempfile::tempdir().unwrap();
@@ -228,7 +279,7 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
         "malformed configuration was not published",
     );
     let failed = process.coordinator().server().current_stamp().version;
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(SETTLED);
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         failed
@@ -462,7 +513,7 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
     );
     let after = process.coordinator().server().current_stamp().version;
     assert_eq!(after.0, before.0 + 1);
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(SETTLED);
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         after
@@ -507,7 +558,7 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
     );
     let after = process.coordinator().server().current_stamp().version;
     assert_eq!(after.0, before.0 + 1);
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(SETTLED);
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         after
@@ -545,7 +596,7 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
             .source_hash(),
         expected_schema_hash
     );
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(SETTLED);
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         after
@@ -573,7 +624,7 @@ fn config_retargets_native_schema_watch_without_polling_the_old_path() {
     let replaced = process.coordinator().server().current_stamp().version;
 
     write_schema_path(&old_schema, "obsolete-path");
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(SETTLED);
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         replaced,
@@ -615,7 +666,7 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
     );
     let failed = process.coordinator().server().current_stamp().version;
     assert_eq!(failed.0, before.0 + 1);
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(SETTLED);
     assert_eq!(
         process.coordinator().server().current_stamp().version,
         failed
@@ -1080,7 +1131,7 @@ fn pipeline_ahead_of_its_schema_keeps_serving_until_the_schema_catches_up() {
     let process = start_gate_daemon(&temp, &variants.v1);
     assert_eq!(imported_value(&temp).as_deref(), Some("v1:note"));
     // Let the watcher publish the import's own bundle write first.
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
     let before = process.coordinator().server().current_stamp().version;
 
@@ -1116,6 +1167,11 @@ fn pipeline_with_an_unchanged_layout_is_adopted_ahead_of_source_walk() {
     let temp = tempfile::tempdir().unwrap();
     let process = start_gate_daemon(&temp, &variants.v2);
     assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
+    // Let the watcher publish the import's own bundle write first: in the
+    // same pass as the module swap, the reimport would rewrite the bundle
+    // that pass's file work observed, and its acknowledgement would fail
+    // (and be retried).
+    std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
 
     // Only fn bodies changed: the schema already describes this build.
@@ -1139,7 +1195,7 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
     let process = start_gate_daemon(&temp, &variants.v2);
     assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
     // Let the watcher publish the import's own bundle write first.
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
     let before = process.coordinator().server().current_stamp().version;
 
@@ -1164,7 +1220,7 @@ fn source_walk_catching_up_after_an_ahead_of_walk_adoption_is_not_republished() 
         "the new importer version did not reimport the watched import",
     );
     // Let the watcher publish the reimport's own bundle write first.
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SETTLED);
     assert_eq!(pipeline_generation(&process), generation + 1);
     let before = process.coordinator().server().current_stamp().version;
 
@@ -1199,7 +1255,7 @@ fn a_schema_refresh_observed_before_its_dylib_gives_one_epoch_change() {
     let temp = tempfile::tempdir().unwrap();
     let process = start_gate_daemon(&temp, &variants.v2);
     assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
     let before = process.coordinator().server().current_stamp().version;
 

@@ -1,7 +1,10 @@
 //! Long-lived daemon process supervisor.
 //!
 //! The process loop runs on a thread of its own, fed by the watcher over a
-//! channel; every reconciliation it starts publishes from that thread.
+//! channel; every reconciliation it starts publishes from that thread. It
+//! reconciles watcher changes once the filesystem has settled: each change
+//! restarts a trailing quiet window (`watch.quiet_ms`, `crate::settle`),
+//! and no pass runs while the window is open (`Schedule`).
 
 use std::io::Read;
 use std::net::SocketAddr;
@@ -21,6 +24,7 @@ use distill_store::state::{
 use crate::codegen::CodegenService;
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
 use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
+use crate::settle::{HeldOpen, QuietWindow};
 use crate::watcher::{
     WatcherAction, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink, WatcherStartError,
     WatcherThread,
@@ -30,9 +34,8 @@ use distill_store::cas::SegmentSweeper;
 use distill_store::{Store, StoreWriter};
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
-/// How long the process loop lets watcher events gather before it
-/// reconciles them (the debounce).
-const DEBOUNCE: Duration = Duration::from_millis(40);
+/// A failed pass, or a failed codegen run, is retried this much later.
+const RETRY_DELAY: Duration = Duration::from_millis(40);
 /// An idle daemon still runs a pass this often.
 const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How often the loop runs its CAS pass (eviction, compaction, dead
@@ -41,6 +44,108 @@ const CAS_PASS_INTERVAL: Duration = Duration::from_secs(10);
 /// How much longer than a snapshot's TTL a dead segment's file stays: no
 /// snapshot that could read it is left by then.
 const CAS_DELETE_MARGIN: Duration = Duration::from_secs(10);
+
+/// When the process loop runs a pass, and when its CAS pass.
+///
+/// Two kinds of deadline combine. Watcher changes hold a trailing quiet
+/// window ([`QuietWindow`], `watch.quiet_ms`): each change pushes it to
+/// that long after itself, so a burst (a git checkout, a branch switch) is
+/// reconciled once, after its last change. Every other reason for a pass (a
+/// failed pass's requeue, a codegen retry, a publication from elsewhere
+/// that needs codegen, the idle pass) asks for one by some time, and the
+/// earliest such request wins.
+///
+/// A pass never starts while the window is open: one asked for during a
+/// burst waits for the burst's end, which then runs one pass for both, so
+/// nothing is reconciled, imported or generated from a filesystem part way
+/// through a change. The one exception is a watcher failure, which stops
+/// the loop at once. The CAS pass reads no source file and keeps its own
+/// timer.
+struct Schedule {
+    window: QuietWindow,
+    /// The earliest time something other than a watcher change asked for a
+    /// pass by; `None` until something asks.
+    due: Option<Instant>,
+    /// The watcher failed: the next pass stops the loop, without waiting.
+    failed: bool,
+    next_idle_pass: Instant,
+    next_cas_pass: Instant,
+}
+
+impl Schedule {
+    fn new(now: Instant, quiet: Duration) -> Self {
+        Self {
+            window: QuietWindow::new(quiet, "reconciliation"),
+            due: None,
+            failed: false,
+            next_idle_pass: now + IDLE_PASS_INTERVAL,
+            next_cas_pass: now + CAS_PASS_INTERVAL,
+        }
+    }
+
+    /// A watcher change to `paths` arrived at `now`. Returns the warning
+    /// (already logged) when the window has been held open too long.
+    fn change<'a>(
+        &mut self,
+        now: Instant,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Option<HeldOpen> {
+        self.window.change(now, paths)
+    }
+
+    /// The watcher failed: pass (and stop) now.
+    fn fail(&mut self, now: Instant) {
+        self.failed = true;
+        self.request(now);
+    }
+
+    /// Run a pass by `at` at the latest, unless watcher changes are still
+    /// arriving then.
+    fn request(&mut self, at: Instant) {
+        self.due = Some(self.due.map_or(at, |due| due.min(at)));
+    }
+
+    /// When the next pass starts: when the watch window closes if watcher
+    /// changes wait, else at the earliest request (the idle pass at the
+    /// latest).
+    fn pass_at(&self) -> Instant {
+        let requested = self
+            .due
+            .map_or(self.next_idle_pass, |due| due.min(self.next_idle_pass));
+        match self.window.closes_at() {
+            Some(closes) if !self.failed => closes,
+            _ => requested,
+        }
+    }
+
+    /// When the loop next has work.
+    fn deadline(&self) -> Instant {
+        self.pass_at().min(self.next_cas_pass)
+    }
+
+    /// Whether the CAS pass is due at `now`; if it is, the next is
+    /// scheduled.
+    fn take_cas_pass(&mut self, now: Instant) -> bool {
+        if now < self.next_cas_pass {
+            return false;
+        }
+        self.next_cas_pass = now + CAS_PASS_INTERVAL;
+        true
+    }
+
+    /// Whether a pass is due at `now`; if it is, it starts: every request
+    /// and the watch window's changes are taken by it.
+    fn take_pass(&mut self, now: Instant) -> bool {
+        if now < self.pass_at() {
+            return false;
+        }
+        self.window.close();
+        self.due = None;
+        self.failed = false;
+        self.next_idle_pass = now + IDLE_PASS_INTERVAL;
+        true
+    }
+}
 
 pub struct DaemonProcess {
     coordinator: Arc<DaemonCoordinator>,
@@ -80,7 +185,10 @@ impl DaemonProcess {
         )?);
         coordinator.attach_build_backend();
         let mut config_watch = ConfigWatch::new(config.clone());
-        config_watch.rebuilder = Some(crate::rebuild::Rebuilder::start(config.rebuild.clone()));
+        config_watch.rebuilder = Some(crate::rebuild::Rebuilder::start(
+            config.rebuild.clone(),
+            config.watch.quiet,
+        ));
         let (inbox, messages) = mpsc::channel();
         let sink: WatcherSink = {
             let inbox = inbox.clone();
@@ -124,13 +232,17 @@ impl DaemonProcess {
             codegen,
             stop: Arc::clone(&stop),
             errors,
-            due: Some(Instant::now()),
+            schedule: {
+                let now = Instant::now();
+                let mut schedule = Schedule::new(now, config.watch.quiet);
+                // The first pass follows startup at once.
+                schedule.request(now);
+                schedule
+            },
             publications: 0,
-            next_idle_pass: Instant::now() + IDLE_PASS_INTERVAL,
             cas_sweeper: SegmentSweeper::new(
                 coordinator.server_handle().snapshot_policy().ttl + CAS_DELETE_MARGIN,
             ),
-            next_cas_pass: Instant::now() + CAS_PASS_INTERVAL,
             capabilities_pending: false,
         };
         // Startup runs on the loop thread before the loop: events the
@@ -296,13 +408,11 @@ struct ProcessLoop {
     codegen: CodegenService,
     stop: Arc<watch::Sender<bool>>,
     errors: watch::Sender<Option<String>>,
-    /// When the next pass is due; `None` until something asks for one.
-    due: Option<Instant>,
+    /// When the next pass and CAS pass run.
+    schedule: Schedule,
     /// The server's publication count the last pass saw.
     publications: u64,
-    next_idle_pass: Instant,
     cas_sweeper: SegmentSweeper,
-    next_cas_pass: Instant,
     /// An accepted configuration candidate changed the importer registry or
     /// its capabilities, and the capability-driven reimport has not yet
     /// completed. A requeued pass keeps it: the configuration watch reports
@@ -417,23 +527,21 @@ impl ProcessLoop {
                 if let Err(error) = self.codegen.run(&self.coordinator, store) {
                     tracing::warn!(%error, "codegen failed");
                     self.errors.send_replace(Some(error));
-                    self.schedule(Instant::now() + DEBOUNCE);
+                    self.schedule.request(Instant::now() + RETRY_DELAY);
                 }
             }
         }
         true
     }
 
-    /// Run a pass by `at` at the latest.
-    fn schedule(&mut self, at: Instant) {
-        self.due = Some(self.due.map_or(at, |due| due.min(at)));
-    }
-
-    /// The loop: fold watcher events into the queue, and reconcile when the
-    /// deadline fires.
+    /// The loop: fold watcher events into the queue, and reconcile once
+    /// they have settled (see [`Schedule`]).
     fn run(mut self, messages: mpsc::Receiver<LoopMessage>) {
         loop {
-            let wait = self.deadline().saturating_duration_since(Instant::now());
+            let wait = self
+                .schedule
+                .deadline()
+                .saturating_duration_since(Instant::now());
             match messages.recv_timeout(wait) {
                 Ok(LoopMessage::Watch(event)) => self.watch(event),
                 Ok(LoopMessage::Published) => self.published(),
@@ -448,40 +556,51 @@ impl ProcessLoop {
     }
 
     fn watch(&mut self, event: WatcherEvent) {
+        let now = Instant::now();
+        // A window held open too long has logged its warning.
+        match &event {
+            WatcherEvent::Native(native) => {
+                self.schedule
+                    .change(now, native.paths.iter().map(PathBuf::as_path));
+            }
+            // An event wholly outside the asset roots and control files (the
+            // daemon's own state writes, under a watched control directory)
+            // invalidates nothing, and is no change to wait for.
+            WatcherEvent::Invalidate(paths) if paths.is_empty() => {}
+            WatcherEvent::Invalidate(paths) => {
+                self.schedule.change(now, paths.iter().map(PathBuf::as_path));
+            }
+            WatcherEvent::Rescan => {
+                self.schedule.change(now, []);
+            }
+            WatcherEvent::Failed(_) => self.schedule.fail(now),
+        }
         self.queue.push(event);
-        // Debounce: a burst of events is reconciled together.
-        self.schedule(Instant::now() + DEBOUNCE);
-    }
-
-    /// When [`ProcessLoop::fire`] is next due.
-    fn deadline(&self) -> Instant {
-        self.due
-            .map_or(self.next_idle_pass, |due| due.min(self.next_idle_pass))
-            .min(self.next_cas_pass)
     }
 
     /// Run the due work. `false` stops the loop.
     fn fire(&mut self) -> bool {
         let now = Instant::now();
-        if now >= self.next_cas_pass {
-            self.next_cas_pass = now + CAS_PASS_INTERVAL;
+        if self.schedule.take_cas_pass(now) {
             if let Err(error) = self
                 .coordinator
                 .maintain_cas(&mut self.store, &mut self.cas_sweeper)
             {
                 tracing::warn!(%error, "CAS maintenance failed");
             }
-            if self.due.is_none_or(|due| due > now) && now < self.next_idle_pass {
-                return true;
-            }
         }
-        self.due = None;
-        self.next_idle_pass = Instant::now() + IDLE_PASS_INTERVAL;
+        if !self.schedule.take_pass(now) {
+            return true;
+        }
         let keep = self.tick();
         self.publications = self.coordinator.server_handle().publication_count();
+        // The pass may have accepted a configuration with another window.
+        self.schedule
+            .window
+            .set_quiet(self.config_watch.active.watch.quiet);
         if self.queue.has_pending() {
             // A failed pass requeued its work.
-            self.schedule(Instant::now() + DEBOUNCE);
+            self.schedule.request(Instant::now() + RETRY_DELAY);
         }
         keep
     }
@@ -490,7 +609,7 @@ impl ProcessLoop {
     /// still needs codegen.
     fn published(&mut self) {
         if self.coordinator.server_handle().publication_count() != self.publications {
-            self.schedule(Instant::now());
+            self.schedule.request(Instant::now());
         }
     }
 }
@@ -598,11 +717,17 @@ impl ConfigWatch {
         }
     }
 
-    /// Adopt the `[[rebuild]]` jobs of an accepted configuration. They
-    /// depend on neither the schema nor the pipeline module (they build
-    /// those), so they follow the configuration even while either is
-    /// rejected.
-    fn adopt_rebuild_jobs(&mut self, candidate: &DaemonConfig) {
+    /// Adopt the `[watch]` settings and `[[rebuild]]` jobs of an accepted
+    /// configuration. They depend on neither the schema nor the pipeline
+    /// module (the jobs build those), so they follow the configuration even
+    /// while either is rejected.
+    fn adopt_watch_and_rebuild(&mut self, candidate: &DaemonConfig) {
+        if self.active.watch != candidate.watch {
+            self.active.watch = candidate.watch.clone();
+            if let Some(rebuilder) = &self.rebuilder {
+                rebuilder.jobs().set_quiet(candidate.watch.quiet);
+            }
+        }
         if self.active.rebuild == candidate.rebuild {
             return;
         }
@@ -715,7 +840,7 @@ impl ConfigWatch {
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
         if invalidation.configuration {
-            self.adopt_rebuild_jobs(&candidate);
+            self.adopt_watch_and_rebuild(&candidate);
             watcher
                 .replace_paths([
                     self.path.clone(),
@@ -1063,6 +1188,7 @@ fn apply_live_values(active: &mut DaemonConfig, candidate: &DaemonConfig) {
     active.targets = candidate.targets.clone();
     active.pipeline = candidate.pipeline.clone();
     active.cas = candidate.cas.clone();
+    active.watch = candidate.watch.clone();
 }
 
 #[cfg(unix)]
@@ -1152,6 +1278,207 @@ fn spawn_rpc_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const QUIET: Duration = Duration::from_millis(250);
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    /// Drive `schedule` as `ProcessLoop::run` does, on a simulated clock: a
+    /// watcher change to `path` at each of `changes` (ms after `start`)
+    /// arrives unless the loop's deadline comes first; at a deadline the due
+    /// work starts, `pass` standing in for each pass. Runs until `end`;
+    /// returns when the passes started, and the held-open warnings.
+    fn drive(
+        schedule: &mut Schedule,
+        start: Instant,
+        changes: &[u64],
+        path: &Path,
+        end: u64,
+        mut pass: impl FnMut(&mut Schedule, Instant),
+    ) -> (Vec<u64>, Vec<HeldOpen>) {
+        let mut changes = changes.iter().copied().peekable();
+        let mut passes = Vec::new();
+        let mut warnings = Vec::new();
+        loop {
+            let deadline = schedule.deadline();
+            match changes.peek() {
+                Some(&at) if start + ms(at) < deadline => {
+                    warnings.extend(schedule.change(start + ms(at), [path]));
+                    changes.next();
+                }
+                _ if deadline > start + ms(end) => break,
+                _ => {
+                    schedule.take_cas_pass(deadline);
+                    if schedule.take_pass(deadline) {
+                        passes.push(deadline.duration_since(start).as_millis() as u64);
+                        pass(schedule, deadline);
+                    }
+                }
+            }
+        }
+        (passes, warnings)
+    }
+
+    fn every(step: u64, from: u64, to: u64) -> Vec<u64> {
+        (from..=to).step_by(step as usize).collect()
+    }
+
+    const ASSET: &str = "/project/assets/a.png";
+
+    #[test]
+    fn a_burst_longer_than_the_window_reconciles_once_after_it_ends() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        // A change every 100 ms for 2 s: eight windows long.
+        let (passes, warnings) = drive(
+            &mut schedule,
+            start,
+            &every(100, 0, 2000),
+            Path::new(ASSET),
+            5000,
+            |_, _| {},
+        );
+        assert_eq!(passes, vec![2250], "one pass, a window after the last change");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn a_single_change_reconciles_after_the_quiet_window() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        let (passes, _) = drive(&mut schedule, start, &[0], Path::new(ASSET), 5000, |_, _| {});
+        assert_eq!(passes, vec![250]);
+    }
+
+    #[test]
+    fn the_configured_quiet_window_is_honoured() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, ms(1000));
+        let (passes, _) = drive(
+            &mut schedule,
+            start,
+            &[0, 900, 3000],
+            Path::new(ASSET),
+            8000,
+            |schedule, _| schedule.window.set_quiet(ms(60)),
+        );
+        // 900 ms apart is one burst under a 1 s window; a pass then adopts
+        // a 60 ms window (as an accepted configuration would).
+        assert_eq!(passes, vec![1900, 3060]);
+    }
+
+    #[test]
+    fn a_failed_pass_retries_but_not_while_changes_arrive() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        let mut failures = 1;
+        let (passes, _) = drive(
+            &mut schedule,
+            start,
+            &[0],
+            Path::new(ASSET),
+            5000,
+            |schedule, now| {
+                if failures > 0 {
+                    failures -= 1;
+                    schedule.request(now + RETRY_DELAY);
+                }
+            },
+        );
+        assert_eq!(passes, vec![250, 290], "the requeued pass retries");
+
+        // The retry is due at 290, but changes resume at 260: it waits for
+        // them to settle.
+        let mut schedule = Schedule::new(start, QUIET);
+        let mut failures = 1;
+        let (passes, _) = drive(
+            &mut schedule,
+            start,
+            &[0, 260, 360, 460],
+            Path::new(ASSET),
+            5000,
+            |schedule, now| {
+                if failures > 0 {
+                    failures -= 1;
+                    schedule.request(now + RETRY_DELAY);
+                }
+            },
+        );
+        assert_eq!(passes, vec![250, 710]);
+    }
+
+    #[test]
+    fn a_requested_pass_waits_for_an_open_window() {
+        // A codegen retry or an outside publication asks for a pass at 150
+        // ms, during a burst: the burst's end runs one pass for both.
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        schedule.request(start + ms(150));
+        let (passes, _) = drive(
+            &mut schedule,
+            start,
+            &every(100, 0, 1000),
+            Path::new(ASSET),
+            5000,
+            |_, _| {},
+        );
+        assert_eq!(passes, vec![1250]);
+
+        // With no change waiting, a request runs when asked.
+        let mut schedule = Schedule::new(start, QUIET);
+        schedule.request(start + ms(150));
+        let (passes, _) = drive(&mut schedule, start, &[], Path::new(ASSET), 5000, |_, _| {});
+        assert_eq!(passes, vec![150]);
+    }
+
+    #[test]
+    fn a_watcher_failure_does_not_wait_for_the_window() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        schedule.change(start, [Path::new(ASSET)]);
+        schedule.fail(start + ms(100));
+        assert_eq!(schedule.deadline(), start + ms(100));
+        assert!(schedule.take_pass(start + ms(100)));
+    }
+
+    #[test]
+    fn a_window_held_open_warns_naming_the_noisy_path_and_still_waits() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        let noisy = Path::new("/project/assets/editor.log");
+        // Rewritten every 100 ms for 7 s.
+        let (passes, warnings) =
+            drive(&mut schedule, start, &every(100, 0, 7000), noisy, 10_000, |_, _| {});
+        assert_eq!(passes, vec![7250], "no cap: the pass waits for the end");
+        assert_eq!(warnings.len(), 1, "once per episode: {warnings:?}");
+        assert_eq!(warnings[0].open_for, ms(5000));
+        assert_eq!(warnings[0].paths, vec![(noisy.to_path_buf(), 51)]);
+    }
+
+    #[test]
+    fn the_cas_pass_runs_during_an_open_window() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start, QUIET);
+        let mut cas_passes = 0;
+        let mut clock = start;
+        // Changes every 100 ms across the 10 s CAS deadline.
+        for at in every(100, 9800, 10_400) {
+            let now = start + ms(at);
+            while schedule.deadline() < now {
+                clock = schedule.deadline();
+                if schedule.take_cas_pass(clock) {
+                    cas_passes += 1;
+                }
+                assert!(!schedule.take_pass(clock), "no pass while changes arrive");
+            }
+            schedule.change(now, [Path::new(ASSET)]);
+        }
+        assert_eq!(cas_passes, 1);
+        assert_eq!(clock, start + CAS_PASS_INTERVAL);
+        assert_eq!(schedule.deadline(), start + ms(10_650));
+    }
 
     #[test]
     fn control_invalidation_rereads_only_the_named_source() {

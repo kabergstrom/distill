@@ -5473,8 +5473,20 @@ One writer, many snapshot readers:
 Modeled on v1's `FileTracker`, whose behavior is carried over:
 
 - **Watcher → incremental batched transactions.** Native OS events retain their
-  affected physical paths and ordered rename pairs, debounce for ~40ms, and
-  publish one transaction after path-local re-observation. Event
+  affected physical paths and ordered rename pairs, wait for the filesystem
+  to settle, and publish one transaction after path-local re-observation.
+  Settling is a **trailing quiet window** (`watch.quiet_ms`, default 250 ms):
+  every event restarts it, so a burst (a git checkout, a branch switch) is
+  reconciled once, after its last event, never from a half-written
+  intermediate state. No pass of the process loop starts while the window
+  is open — a retry of a failed pass, a codegen retry, an outside
+  publication's codegen, or the idle pass waits for it too; only a watcher
+  failure stops the loop at once. There is no cap: a path that never stops
+  changing holds reconciliation off, and once the window has been held open
+  for 5 s the daemon warns (then every 30 s while it stays open), naming the
+  paths that changed most so they can be moved out of the watched roots.
+  `[[rebuild]]` jobs wait for their inputs to settle under the same window.
+  Event
   metadata is never trusted as namespace authority: a file create/write/remove
   re-observes exactly that path, a directory create or rename-to enumerates only
   that subtree (closing the recursive-watch installation race), and a directory
@@ -7043,6 +7055,12 @@ batch_reserved_workers = 1
 [cas]
 segment_size = "256MiB"
 cache_limit = "20GiB"
+
+[watch]
+# Optional. How long the filesystem must be quiet before the daemon
+# reconciles it (§14): every change restarts the wait, so a burst is
+# reconciled once, after it ends. 1..=5000 ms.
+quiet_ms = 250
 ```
 
 Multiple asset roots form one namespace. Paths are root-relative; a relative
@@ -7162,6 +7180,7 @@ ships; an unclassified key is a spec defect:
 | `pipeline.batch_reserved_workers` | operational-live | staging requires `1 <= value <= max(1, parallelism - 1)`; live changes re-clamp at the next scheduling decision while active slots drain (§13) |
 | `cas.segment_size` | operational-live | applies to newly rolled segments only |
 | `cas.cache_limit` | operational-live | eviction policy shifts; the observability rules (§13) are unaffected |
+| `watch.quiet_ms` | operational-live | optional, default 250, must be in `1..=5000`; the next wait for the filesystem to settle (§14) — reconciliation and `[[rebuild]]` jobs — uses the new window |
 | `daemon.displaced_retention_days` | operational-live | applies at the next retention sweep (§14) |
 | `daemon.state_path` | restart-only | daemon state is disposable (§2): relocation is stop, move-or-rebuild, start |
 | `daemon.address` | restart-only | rebinding requires a restart; loopback is validated at staging either way (above) |
