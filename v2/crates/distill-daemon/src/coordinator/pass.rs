@@ -5,7 +5,7 @@
 //! rescan, or a scan rejection), then the imports it makes due, then the
 //! acknowledgement of the watcher work it consumed, and commits all of them
 //! as one input at the base it started from: one new input version, one
-//! publication notification, one change-log version. It runs in three
+//! publication notification, one change-log version. It runs in four
 //! phases:
 //!
 //! 1. **Plan.** An input opened at the base applies the scan step, discovers
@@ -15,12 +15,29 @@
 //! 2. **Run.** The imports run in parallel outside any write, each reading
 //!    the committed `files` rows with the step's uncommitted ones over them
 //!    (`FileOverlay`): what the input will hold when it publishes them.
-//! 3. **Apply.** One coordinated input at the same base applies the scan
-//!    step again, rediscovers the imports, publishes each run whose import is
-//!    still due, acknowledges the work, and merges every step's RPC delta
-//!    into the one commit served for the new version.
+//! 3. **Chain.** Imports that read the outputs of imports the pass runs
+//!    (an imported bundle that is another import's source) run in levels
+//!    after them. For each level, a plan input at the base (rolled back like
+//!    the first) folds the last level's runs to the bundles they will
+//!    publish, discovers the imports due under the outputs that change,
+//!    reading those bytes in place of the files, and plans them; they then
+//!    run against the same outputs over the `FileOverlay`. An import runs
+//!    once, after every import whose output it reads: one planned earlier
+//!    moves to the later level. One that would read its own output again is
+//!    a cycle: it is cut, reported in `failures`, and its next run is the
+//!    next pass's. A chain deeper than `MAX_IMPORT_CHAIN_LEVELS` is
+//!    reported too, and the rest runs in the next pass (`more_work`). A
+//!    level runs only when the committed import index has an import that
+//!    may read one of the outputs.
+//! 4. **Apply.** One coordinated input at the same base applies the scan
+//!    step again, rediscovers the imports level by level (each level under
+//!    the paths the level before published), publishes each run whose
+//!    import is still due, acknowledges the work, and merges every step's
+//!    RPC delta into the one commit served for the new version. Each
+//!    chained run is revalidated against the outputs the input now holds,
+//!    so a run whose upstream published other bytes than planned drifts.
 //!
-//! The write lock is held for the plan and the apply, never across an
+//! The write lock is held for the plans and the apply, never across an
 //! import run. A publication from elsewhere (an RPC write) that lands
 //! between the plan and the apply makes the apply's base check fail
 //! `Stale`: nothing of the pass is published, and the caller retries it from
@@ -28,16 +45,14 @@
 //!
 //! A run whose read set moved before the apply, or an import the apply finds
 //! due that the plan did not, is left for another pass (`more_work`), with
-//! the pass's watcher work kept pending so that pass finds it again. One
-//! import reading another's output in the same pass is such a drift: it
-//! publishes in the next pass's version.
+//! the pass's watcher work kept pending so that pass finds it again.
 
 use std::collections::BTreeSet;
 
 use distill_store::files::ObservedDiagnostic;
 
 use super::*;
-use crate::importer::{FileOverlay, PassImport, PassPublication, PlannedImport};
+use crate::importer::{FileOverlay, ImportRun, PassImport, PassOutput, PassPublication, PlannedImport};
 
 /// What a reconciliation pass did.
 #[derive(Debug, Clone)]
@@ -182,6 +197,19 @@ impl<'a> ImportScope<'a> {
     fn imports(&self) -> bool {
         self.directories || self.watched
     }
+
+    /// The imports that read outputs this scope's imports publish: of the
+    /// same kinds, due under the outputs' paths alone.
+    fn chained(self) -> Self {
+        Self {
+            affected: Some(Affected {
+                work: None,
+                capabilities_changed: false,
+            }),
+            loop_pass: false,
+            ..self
+        }
+    }
 }
 
 impl<'a> Affected<'a> {
@@ -194,6 +222,25 @@ impl<'a> Affected<'a> {
 }
 
 type PlannedImports = Vec<(PassImport, Option<PlannedImport>)>;
+
+/// One level of a pass's imports and their runs (`None`: deferred).
+type Level = Vec<(PassImport, Option<ImportRun>)>;
+
+/// The most levels of chained imports one pass runs after its first.
+const MAX_IMPORT_CHAIN_LEVELS: usize = 8;
+
+/// What planning a pass's import chain decided beyond its levels.
+#[derive(Default)]
+struct Chain {
+    /// Imports that would have read their own output again: they run once
+    /// in this pass and are left due for the next.
+    cut: Vec<PassImport>,
+    /// The cycles and the depth bound met, for [`PassOutcome::failures`].
+    failures: Vec<String>,
+    /// The chain went deeper than [`MAX_IMPORT_CHAIN_LEVELS`]: the rest is
+    /// the next pass's.
+    truncated: bool,
+}
 
 impl DaemonCoordinator {
     /// Reconcile one watcher batch: rescan its paths and run the imports its
@@ -254,8 +301,6 @@ impl DaemonCoordinator {
         step: ScanStep,
         scope: ImportScope<'_>,
     ) -> Result<PassOutcome, CoordinatorError> {
-        use rayon::prelude::*;
-
         // The import index is built in an input; one that rolls back takes
         // the index rows and their built marker with it.
         let (planned, overlay) = if self.needs_plan(store, &step, scope)? {
@@ -263,24 +308,22 @@ impl DaemonCoordinator {
         } else {
             (Vec::new(), None)
         };
-        let mut runs = Vec::with_capacity(planned.len());
-        for (import, run) in planned
-            .into_par_iter()
-            .map(|(import, planned)| {
-                let run = match planned {
-                    Some(planned) => self.authoring.run_pass_import(planned, overlay.as_ref()),
-                    None => Ok(None),
-                };
-                (import, run)
-            })
-            .collect::<Vec<_>>()
-        {
-            let run = run.map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-            runs.push((import, run));
+        let mut levels = vec![self.run_level(planned, overlay.as_ref())?];
+        let mut chain = Chain::default();
+        if scope.imports() {
+            self.plan_chain(
+                store,
+                base,
+                &step,
+                scope,
+                overlay.unwrap_or_else(FileOverlay::empty),
+                &mut levels,
+                &mut chain,
+            )?;
         }
 
-        let mut more_work = false;
-        let mut failures = Vec::new();
+        let mut more_work = chain.truncated;
+        let mut failures = chain.failures;
         let mut imported = Vec::new();
         let published = self.server.coordinated_maybe_commit(store, base, |store| {
             if scope.loop_pass {
@@ -297,34 +340,70 @@ impl DaemonCoordinator {
                 Some(work) => work.clone(),
                 None => store.pending_file_work().map_err(|error| error.to_string())?,
             };
-            for import in self.discover(store, &work, scope)? {
-                let Some(index) = runs.iter().position(|(planned, _)| *planned == import) else {
-                    // Due now, but not when the pass planned.
-                    more_work = true;
-                    continue;
-                };
-                let (_, run) = runs.swap_remove(index);
-                let Some(run) = run else {
-                    // Deferred until its importer is registered.
-                    continue;
-                };
-                match self
-                    .authoring
-                    .publish_pass_import(store, run)
-                    .map_err(|error| format!("{error:?}"))?
-                {
-                    PassPublication::Published(prepared) => {
-                        imported.push(prepared.bundle);
-                        absorb(&mut commit, prepared.commit);
-                    }
-                    PassPublication::Memoized => {}
-                    PassPublication::Drifted => more_work = true,
-                    PassPublication::Failed(error) => {
-                        tracing::warn!(?import, ?error, "import failed with no bundle to hold its failure");
-                        failures.push(format!("{error:?}"));
+            // Each level's imports are those due under the work the level
+            // before published; level 0's, under the pass's own work.
+            let mut level_work = work.clone();
+            let mut level_scope = scope;
+            let mut published_imports = Vec::new();
+            let mut waiting = Vec::new();
+            for level in 0..levels.len() {
+                let mut outputs = Vec::new();
+                for import in self.discover(store, &level_work, level_scope, None)? {
+                    let Some(index) = levels[level]
+                        .iter()
+                        .position(|(planned, _)| *planned == import)
+                    else {
+                        if levels[level + 1..]
+                            .iter()
+                            .any(|later| later.iter().any(|(planned, _)| *planned == import))
+                        {
+                            // It runs after an import it reads.
+                            waiting.push(import);
+                        } else if !(published_imports.contains(&import)
+                            && chain.cut.contains(&import))
+                        {
+                            // Due now, but not when the pass planned (an
+                            // import cut from a cycle stays for the next
+                            // pass, reported once).
+                            more_work = true;
+                        }
+                        continue;
+                    };
+                    let (_, run) = levels[level].swap_remove(index);
+                    let Some(run) = run else {
+                        // Deferred until its importer is registered.
+                        continue;
+                    };
+                    published_imports.push(import.clone());
+                    match self
+                        .authoring
+                        .publish_pass_import(store, run)
+                        .map_err(|error| format!("{error:?}"))?
+                    {
+                        PassPublication::Published(prepared) => {
+                            outputs.push(prepared.bundle);
+                            imported.push(prepared.bundle);
+                            absorb(&mut commit, prepared.commit);
+                        }
+                        PassPublication::Memoized => {}
+                        PassPublication::Drifted => more_work = true,
+                        PassPublication::Failed(error) => {
+                            tracing::warn!(?import, ?error, "import failed with no bundle to hold its failure");
+                            failures.push(format!("{error:?}"));
+                        }
                     }
                 }
+                if level + 1 == levels.len() || outputs.is_empty() {
+                    break;
+                }
+                level_work = published_work(store, &outputs)?;
+                level_scope = scope.chained();
             }
+            // An import that waited for a level that never found it due
+            // still is.
+            more_work |= waiting
+                .iter()
+                .any(|import| !published_imports.contains(import));
             // Work whose imports did not all publish stays pending, so the
             // next pass finds them again.
             if scope.loop_pass && !more_work && !work.is_empty() {
@@ -344,6 +423,219 @@ impl DaemonCoordinator {
             failures,
             imported,
         })
+    }
+
+    /// Run one level's planned imports in parallel, outside any write, under
+    /// `overlay`.
+    fn run_level(
+        &self,
+        planned: PlannedImports,
+        overlay: Option<&FileOverlay>,
+    ) -> Result<Level, CoordinatorError> {
+        use rayon::prelude::*;
+
+        planned
+            .into_par_iter()
+            .map(|(import, planned)| {
+                let run = match planned {
+                    Some(planned) => self.authoring.run_pass_import(planned, overlay),
+                    None => Ok(None),
+                };
+                (import, run)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(import, run)| {
+                run.map(|run| (import, run))
+                    .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))
+            })
+            .collect()
+    }
+
+    /// Plan and run the imports that read the outputs of the pass's last
+    /// level, level by level, each in a plan input at `base` that rolls
+    /// back: an import runs once, after every import of the pass whose
+    /// output it reads, against those outputs (`FileOverlay::with_outputs`).
+    /// Stops when a level changes no output any import reads; an import
+    /// that would read its own output again is a cycle, cut and reported,
+    /// and a chain deeper than [`MAX_IMPORT_CHAIN_LEVELS`] is left for the
+    /// next pass, reported.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_chain(
+        &self,
+        store: &mut Store,
+        base: InputVersion,
+        step: &ScanStep,
+        scope: ImportScope<'_>,
+        scan_overlay: FileOverlay,
+        levels: &mut Vec<Level>,
+        chain: &mut Chain,
+    ) -> Result<(), CoordinatorError> {
+        let publication =
+            |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
+        let rpc = |error: RpcFailure| publication(format!("{error:?}"));
+        // What the input will hold at each output path, once every level
+        // so far publishes.
+        let mut outputs = BTreeMap::<(String, String), PassOutput>::new();
+        // The outputs each import's output derives from in this pass.
+        let mut lineages = BTreeMap::<(String, String), BTreeSet<(String, String)>>::new();
+        loop {
+            let upstream = levels.last().expect("a pass has a first level");
+            let destinations = upstream
+                .iter()
+                .filter_map(|(_, run)| run.as_ref()?.output_destination())
+                .collect::<Vec<_>>();
+            // Most passes chain nothing: the committed index says so without
+            // another plan input. (An import this pass's own scan adds is not
+            // indexed yet: it reads the output in the next pass, through the
+            // output's watcher work.)
+            if destinations.is_empty()
+                || !self
+                    .authoring
+                    .may_read_outputs(&self.open_reader()?, &destinations)
+                    .map_err(rpc)?
+            {
+                return Ok(());
+            }
+            let planned = self.in_plan_input(store, base, step, |store| {
+                // The last level's outputs that change what the input holds.
+                let mut changed = Vec::new();
+                for run in upstream.iter().filter_map(|(_, run)| run.as_ref()) {
+                    let Some(output) = self.authoring.pass_output(store, run).map_err(rpc)? else {
+                        continue;
+                    };
+                    let key = (output.root.clone(), output.path.clone());
+                    let hash = ContentHash(*blake3::hash(&output.bytes).as_bytes());
+                    let held = store
+                        .observed_files_at(&output.path)?
+                        .into_iter()
+                        .find(|row| row.root_name == output.root)
+                        .and_then(|row| row.file.state.content_hash);
+                    if held == Some(hash) {
+                        outputs.remove(&key);
+                    } else {
+                        changed.push(key.clone());
+                        outputs.insert(key, output);
+                    }
+                }
+                if changed.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // The plan input holds the observed rows; only the outputs
+                // are over it.
+                let overlay = FileOverlay::empty().with_outputs(outputs.values());
+                let mut downstream = Vec::<(PassImport, BTreeSet<(String, String)>)>::new();
+                for key in &changed {
+                    let mut lineage = lineages.get(key).cloned().unwrap_or_default();
+                    lineage.insert(key.clone());
+                    let work = published_paths_work(store, std::slice::from_ref(key))
+                        .map_err(publication)?;
+                    for import in self
+                        .discover(store, &work, scope.chained(), Some(&overlay))
+                        .map_err(publication)?
+                    {
+                        let Some(destination) = self
+                            .authoring
+                            .pass_import_destination(store, &import)
+                            .map_err(rpc)?
+                        else {
+                            continue;
+                        };
+                        if lineage.contains(&destination) {
+                            if !chain.cut.contains(&import) {
+                                chain.failures.push(format!(
+                                    "import cycle: {}:{} reads its own output through {}; it reruns in the next pass",
+                                    destination.0,
+                                    destination.1,
+                                    describe_lineage(&lineage),
+                                ));
+                                tracing::warn!(?import, "import chain cycle cut");
+                                chain.cut.push(import);
+                            }
+                            continue;
+                        }
+                        match downstream.iter_mut().find(|(planned, _)| *planned == import) {
+                            Some((_, reads)) => reads.extend(lineage.iter().cloned()),
+                            None => downstream.push((import, lineage.clone())),
+                        }
+                    }
+                }
+                let mut planned = Vec::with_capacity(downstream.len());
+                for (import, lineage) in downstream {
+                    let plan = self.authoring.plan_pass_import(store, &import).map_err(rpc)?;
+                    let destination = self
+                        .authoring
+                        .pass_import_destination(store, &import)
+                        .map_err(rpc)?;
+                    planned.push((import, plan, destination, lineage));
+                }
+                Ok(planned)
+            })?;
+            if planned.is_empty() {
+                return Ok(());
+            }
+            if levels.len() > MAX_IMPORT_CHAIN_LEVELS {
+                let destinations = planned
+                    .iter()
+                    .filter_map(|(_, _, destination, _)| destination.as_ref())
+                    .map(|(root, path)| format!("{root}:{path}"))
+                    .collect::<Vec<_>>();
+                chain.failures.push(format!(
+                    "import chain deeper than {MAX_IMPORT_CHAIN_LEVELS} levels; {} run in the next pass",
+                    destinations.join(", ")
+                ));
+                tracing::warn!(?destinations, "import chain truncated at its depth bound");
+                chain.truncated = true;
+                return Ok(());
+            }
+            // An import planned at an earlier level read an output this
+            // level changes: it runs here instead, once.
+            for level in levels.iter_mut() {
+                level.retain(|(import, _)| !planned.iter().any(|(later, ..)| later == import));
+            }
+            let mut next = Vec::with_capacity(planned.len());
+            for (import, plan, destination, lineage) in planned {
+                if let Some(destination) = destination {
+                    lineages.entry(destination).or_default().extend(lineage);
+                }
+                next.push((import, plan));
+            }
+            let overlay = scan_overlay.with_outputs(outputs.values());
+            levels.push(self.run_level(next, Some(&overlay))?);
+        }
+    }
+
+    /// Run `plan` in an input at `base` with `step` applied, which always
+    /// rolls back.
+    fn in_plan_input<T>(
+        &self,
+        store: &mut Store,
+        base: InputVersion,
+        step: &ScanStep,
+        plan: impl FnOnce(&mut Store) -> Result<T, CoordinatorError>,
+    ) -> Result<T, CoordinatorError> {
+        let publication =
+            |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
+        let observed = store
+            .open_input()
+            .map_err(|error| publication(error.to_string()))?;
+        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if observed != base {
+                return Err(CoordinatorError::Coordinated(CoordinatedCommitError::Stale {
+                    expected: base,
+                    observed,
+                }));
+            }
+            self.apply_scan_step(store, step, false).map_err(publication)?;
+            plan(store)
+        }));
+        let rolled_back = store.finish_input(false);
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        rolled_back.map_err(|error| publication(error.to_string()))?;
+        planned
     }
 
     /// Whether a pass needs its plan phase: a pass with no imports to
@@ -382,17 +674,7 @@ impl DaemonCoordinator {
     ) -> Result<(PlannedImports, Option<FileOverlay>), CoordinatorError> {
         let publication =
             |error: String| CoordinatorError::Coordinated(CoordinatedCommitError::Publication(error));
-        let observed = store
-            .open_input()
-            .map_err(|error| publication(error.to_string()))?;
-        let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if observed != base {
-                return Err(CoordinatorError::Coordinated(CoordinatedCommitError::Stale {
-                    expected: base,
-                    observed,
-                }));
-            }
-            self.apply_scan_step(store, step, false).map_err(publication)?;
+        self.in_plan_input(store, base, step, |store| {
             let overlay = match step {
                 ScanStep::Incremental(step) => {
                     Some(FileOverlay::capture(store, Some(step.delta.affected_prefixes()))?)
@@ -405,7 +687,7 @@ impl DaemonCoordinator {
                 None => store.pending_file_work()?,
             };
             let mut planned = Vec::new();
-            for import in self.discover(store, &work, scope).map_err(publication)? {
+            for import in self.discover(store, &work, scope, None).map_err(publication)? {
                 let plan = self
                     .authoring
                     .plan_pass_import(store, &import)
@@ -413,24 +695,19 @@ impl DaemonCoordinator {
                 planned.push((import, plan));
             }
             Ok((planned, overlay))
-        }));
-        let rolled_back = store.finish_input(false);
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(panic) => std::panic::resume_unwind(panic),
-        };
-        rolled_back.map_err(|error| publication(error.to_string()))?;
-        plan
+        })
     }
 
     /// The imports due under `work`: directory imports first, then watched
     /// reimports. A directory output the rules regenerate is not also
-    /// reimported from its stale record.
+    /// reimported from its stale record. `outputs` holds the import outputs
+    /// the pass will publish before these run, which they read instead.
     fn discover(
         &self,
         store: &mut Store,
         work: &PendingFileWork,
         scope: ImportScope<'_>,
+        outputs: Option<&FileOverlay>,
     ) -> Result<Vec<PassImport>, String> {
         let failure = |error: RpcFailure| format!("{error:?}");
         let mut imports = Vec::new();
@@ -443,7 +720,7 @@ impl DaemonCoordinator {
                     .directory_import_tasks_affected_by_capabilities(store, &work.dirty, &work.renames),
                 Some(_) => self
                     .authoring
-                    .directory_import_tasks_affected_by(store, &work.dirty, &work.renames),
+                    .directory_import_tasks_affected_by(store, &work.dirty, &work.renames, outputs),
             }
             .map_err(failure)?;
             for task in tasks {
@@ -465,7 +742,7 @@ impl DaemonCoordinator {
                     .watched_imports_affected_by_capabilities(store, &work.dirty, &work.renames),
                 Some(_) => self
                     .authoring
-                    .watched_imports_affected_by(store, &work.dirty, &work.renames),
+                    .watched_imports_affected_by(store, &work.dirty, &work.renames, outputs),
             }
             .map_err(failure)?;
             imports.extend(
@@ -859,6 +1136,58 @@ impl DaemonCoordinator {
 /// `commit`: one delta from the base to the state after both. A later
 /// mutation of the same asset, entry, path or output replaces the earlier
 /// one; a later complete replacement replaces everything before it.
+/// The watcher work of the bundles a pass level published, as the input
+/// holds them: what the next level's imports are due under.
+fn published_work(store: &StoreReader, bundles: &[BundleUuid]) -> Result<PendingFileWork, String> {
+    let mut paths = Vec::with_capacity(bundles.len());
+    for bundle in bundles {
+        let meta = store
+            .bundle(*bundle)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("published import bundle {bundle} has no row"))?;
+        let root = store
+            .root_name(meta.root)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("published import bundle {bundle} has no root"))?;
+        paths.push((root, meta.path));
+    }
+    published_paths_work(store, &paths)
+}
+
+/// Watcher work naming each (root, path) as changed.
+fn published_paths_work(
+    store: &StoreReader,
+    paths: &[(String, String)],
+) -> Result<PendingFileWork, String> {
+    let mut dirty = Vec::with_capacity(paths.len());
+    for (root, path) in paths {
+        let root = store
+            .root_id(root)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("import output root {root:?} is not interned"))?;
+        dirty.push(distill_store::files::DirtyEntry {
+            seq: 0,
+            root,
+            path: path.clone(),
+            exists: true,
+            observation: store.input_version(),
+        });
+    }
+    Ok(PendingFileWork {
+        dirty,
+        renames: Vec::new(),
+    })
+}
+
+/// `root:path` of each output in a lineage, in order.
+fn describe_lineage(lineage: &BTreeSet<(String, String)>) -> String {
+    lineage
+        .iter()
+        .map(|(root, path)| format!("{root}:{path}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn absorb(commit: &mut Option<Commit>, later: Commit) {
     match commit {
         Some(commit) => absorb_into(commit, later),

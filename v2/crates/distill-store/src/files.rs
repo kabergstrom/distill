@@ -480,6 +480,15 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
+    /// The id a root name was interned as, if it was.
+    pub fn root_id(&self, name: &str) -> Result<Option<RootId>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT root_id FROM roots WHERE name = ?1", [name], |r| r.get(0))
+            .optional()?
+            .map(RootId))
+    }
+
     /// The name a root id was interned from.
     pub fn root_name(&self, root: RootId) -> Result<Option<String>, StoreError> {
         Ok(self

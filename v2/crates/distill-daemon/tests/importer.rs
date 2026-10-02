@@ -1108,3 +1108,270 @@ fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish
     assert_eq!(failures[0].0, "b.bundle");
     assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "c"]);
 }
+
+/// An importer whose output is one more than the largest value among its
+/// sources that exist: a text source's number, or a bundle source's
+/// `asset` entry, so its sources may be other imports' outputs.
+struct ChainImporter {
+    schema: LogicalSchema,
+}
+
+impl AuthoringImporter for ChainImporter {
+    fn id(&self) -> &str {
+        "chain-importer"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn settings_type_uuid(&self) -> TypeUuid {
+        TYPE_UUID
+    }
+
+    fn settings_schema(&self) -> &LogicalSchema {
+        &self.schema
+    }
+
+    fn default_settings(&self) -> AuthoredValue {
+        AuthoredValue::UInt(0)
+    }
+
+    fn import(
+        &self,
+        context: &mut dyn AuthoringImportContext,
+        _settings: &AuthoredValue,
+    ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
+        let mut value = 0;
+        for source in context.sources().to_vec() {
+            if !context.probe(&source.path)? {
+                continue;
+            }
+            let bytes = context.read(&source.path)?;
+            let source_value = if source.path.ends_with(".bundle") {
+                match distill_bundle::parse_bundle(&bytes)
+                    .map_err(|error| AuthoringImporterError::rejected(5, format!("{error:?}")))?
+                    .assets["asset"]
+                    .data
+                {
+                    AuthoredValue::UInt(value) => value,
+                    ref other => {
+                        return Err(AuthoringImporterError::rejected(6, format!("{other:?}")))
+                    }
+                }
+            } else {
+                std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|text| text.parse::<u128>().ok())
+                    .ok_or_else(|| AuthoringImporterError::rejected(3, "not a number"))?
+            };
+            value = value.max(source_value);
+        }
+        let mut output = distill_build::import::ImportOutput::new();
+        output
+            .entry("asset", TYPE_UUID, AuthoredValue::UInt(value + 1))
+            .map_err(|error| AuthoringImporterError::rejected(4, format!("{error:?}")))?;
+        Ok(output)
+    }
+}
+
+/// Import `dest` from `sources` with [`ChainImporter`], watched, as one
+/// RPC publication, and pass over the watcher work it leaves.
+fn chain_import(coordinator: &DaemonCoordinator, assets: &std::path::Path, dest: &str, sources: &[&str]) {
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version();
+    let backend = Arc::clone(coordinator.authoring_service());
+    coordinator
+        .coordinated_commit(&mut writer, base, |store| {
+            backend
+                .prepare_import(
+                    store,
+                    base,
+                    &ImportRequest {
+                        importer: "chain-importer".into(),
+                        sources: sources.iter().map(|source| (*source).to_owned()).collect(),
+                        dest: dest.into(),
+                        settings: AuthoringValue {
+                            canonical_value: Arc::from(&b"0"[..]),
+                            blobs: Vec::new(),
+                        },
+                        watch: true,
+                        root: "main".into(),
+                    },
+                )
+                .map(|prepared| prepared.commit)
+                .map_err(|error| format!("{error:?}"))
+        })
+        .unwrap();
+    // The watcher's echo of the output: a pass that indexes its import
+    // record and consumes its work.
+    let echo = coordinator
+        .reconcile_batch(&mut writer, &batch(assets, &[dest]), false)
+        .unwrap();
+    assert!(!echo.more_work);
+}
+
+/// `a.src` imported to `a.bundle` by directory rules, and `stems` each
+/// imported, watched, from the bundle of the stem before it: a chain whose
+/// every level reads the output of the one before.
+fn chained_imports(stems: &[&str]) -> (tempfile::TempDir, std::path::PathBuf, DaemonCoordinator) {
+    let (temp, assets, coordinator) = imported_sources(&[("a", "1")], PacedImporter::new);
+    let (_, schema, _) = ordinary_bundle();
+    coordinator
+        .authoring_service()
+        .register_importer(Arc::new(ChainImporter { schema }))
+        .unwrap();
+    let mut previous = "a".to_owned();
+    for stem in stems {
+        chain_import(
+            &coordinator,
+            &assets,
+            &format!("{stem}.bundle"),
+            &[&format!("{previous}.bundle")],
+        );
+        previous = (*stem).to_owned();
+    }
+    (temp, assets, coordinator)
+}
+
+/// An edit at the head of a chain of `levels` imports publishes every level
+/// in the pass's one version, each asset changed once, and leaves nothing
+/// for the next pass.
+fn assert_chain_publishes_in_one_version(stems: &[&str]) {
+    let (_temp, assets, coordinator) = chained_imports(stems);
+    let mut all = vec!["a"];
+    all.extend_from_slice(stems);
+    let reader = coordinator.open_reader().unwrap();
+    let before = generated_values(&reader, &all);
+    assert_eq!(
+        before,
+        (1..=all.len() as u128).map(Some).collect::<Vec<_>>(),
+        "each level is one more than the level it reads"
+    );
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version();
+
+    std::fs::write(assets.join("a.src"), b"5").unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.src"]), false)
+        .unwrap();
+
+    let version = InputVersion(base.0 + 1);
+    assert_eq!(outcome.stamp.version, version);
+    assert_eq!(outcome.imported.len(), all.len());
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    assert!(!outcome.more_work);
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(reader.input_version(), version);
+    assert_eq!(
+        generated_values(&reader, &all),
+        (5..5 + all.len() as u128).map(Some).collect::<Vec<_>>(),
+        "every level of the chain is in the pass's version"
+    );
+    assert_changes_exactly(&changed_assets(&reader, version), &assets, &all);
+
+    // The outputs' own watcher work finds nothing left to import.
+    let outputs = all
+        .iter()
+        .map(|stem| format!("{stem}.bundle"))
+        .collect::<Vec<_>>();
+    let outputs = outputs.iter().map(String::as_str).collect::<Vec<_>>();
+    let echo = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &outputs), false)
+        .unwrap();
+    assert_eq!(echo.stamp.version, version, "nothing drifted to another pass");
+    assert!(echo.imported.is_empty());
+    assert!(!echo.more_work);
+}
+
+#[test]
+fn a_two_level_import_chain_publishes_in_one_version() {
+    assert_chain_publishes_in_one_version(&["b"]);
+}
+
+#[test]
+fn a_three_level_import_chain_publishes_in_one_version() {
+    assert_chain_publishes_in_one_version(&["b", "c"]);
+}
+
+/// A chain deeper than a pass's bound publishes its first levels in one
+/// version, reports the bound, and leaves the rest to the next pass, which
+/// publishes it.
+#[test]
+fn a_chain_deeper_than_the_bound_continues_in_the_next_pass() {
+    let stems = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10"];
+    let (_temp, assets, coordinator) = chained_imports(&stems);
+    let mut all = vec!["a"];
+    all.extend_from_slice(&stems);
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version();
+
+    std::fs::write(assets.join("a.src"), b"20").unwrap();
+    let first = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.src"]), false)
+        .unwrap();
+    assert_eq!(first.stamp.version, InputVersion(base.0 + 1));
+    assert_eq!(first.imported.len(), 9, "the head and eight chained levels");
+    assert!(first.more_work);
+    assert_eq!(first.failures.len(), 1, "{:?}", first.failures);
+    assert!(
+        first.failures[0].contains("deeper than 8 levels") && first.failures[0].contains("l9.bundle"),
+        "{:?}",
+        first.failures
+    );
+    let reader = coordinator.open_reader().unwrap();
+    let mut expected = (20..29).map(Some).collect::<Vec<_>>();
+    expected.extend([Some(10), Some(11)]);
+    assert_eq!(generated_values(&reader, &all), expected);
+
+    let second = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &[]), false)
+        .unwrap();
+    assert_eq!(second.stamp.version, InputVersion(base.0 + 2));
+    assert_eq!(second.imported.len(), 2);
+    assert!(second.failures.is_empty(), "{:?}", second.failures);
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(
+        generated_values(&reader, &all),
+        (20..31).map(Some).collect::<Vec<_>>()
+    );
+}
+
+/// Imports that read each other's outputs (a cycle that never settles) run
+/// once each per pass: the one that would read its own output again is cut
+/// and reported, and the pass still publishes the rest in one version.
+#[test]
+fn an_import_cycle_is_cut_and_reported() {
+    let (_temp, assets, coordinator) = chained_imports(&[]);
+    // x reads a's output and y's; y reads x's.
+    chain_import(&coordinator, &assets, "x.bundle", &["a.bundle", "y.bundle"]);
+    chain_import(&coordinator, &assets, "y.bundle", &["x.bundle"]);
+    let mut writer = coordinator.open_writer().unwrap();
+    // x now reads y: the cycle runs a pass of its own.
+    coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["y.bundle"]), false)
+        .unwrap();
+    let reader = coordinator.open_reader().unwrap();
+    let before = generated_values(&reader, &["a", "x", "y"]);
+    let base = writer.input_version();
+
+    std::fs::write(assets.join("a.src"), b"50").unwrap();
+    let outcome = coordinator
+        .reconcile_batch(&mut writer, &batch(&assets, &["a.src"]), false)
+        .unwrap();
+    let version = InputVersion(base.0 + 1);
+    assert_eq!(outcome.stamp.version, version);
+    assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
+    assert!(
+        outcome.failures[0].contains("import cycle") && outcome.failures[0].contains("x.bundle"),
+        "{:?}",
+        outcome.failures
+    );
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(generated_values(&reader, &["a"]), [Some(50)]);
+    let [_, Some(x), Some(_)] = generated_values(&reader, &["a", "x", "y"])[..] else {
+        panic!("{before:?}");
+    };
+    assert_eq!(x, 51, "x read a's new output");
+    assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "x", "y"]);
+}

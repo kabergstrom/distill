@@ -274,7 +274,7 @@ impl AuthoringService {
         &self,
         store: &mut Store,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(store, None, false)
+        self.watched_imports_needing_reimport_inner(store, None, false, None)
     }
 
     /// Incremental watcher variant: read sets that cannot observe any dirty
@@ -285,8 +285,9 @@ impl AuthoringService {
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
         renames: &[distill_store::files::RenameEvent],
+        overlay: Option<&FileOverlay>,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(store, Some((dirty, renames)), false)
+        self.watched_imports_needing_reimport_inner(store, Some((dirty, renames)), false, overlay)
     }
 
     pub(crate) fn watched_imports_affected_by_capabilities(
@@ -295,7 +296,7 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
         renames: &[distill_store::files::RenameEvent],
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        self.watched_imports_needing_reimport_inner(store, Some((dirty, renames)), true)
+        self.watched_imports_needing_reimport_inner(store, Some((dirty, renames)), true, None)
     }
 
     fn watched_imports_needing_reimport_inner(
@@ -306,6 +307,7 @@ impl AuthoringService {
             &[distill_store::files::RenameEvent],
         )>,
         capabilities_changed: bool,
+        overlay: Option<&FileOverlay>,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let compiled = self.compiled(store)?;
         let capabilities = self.importer_capabilities(&compiled)?;
@@ -335,7 +337,7 @@ impl AuthoringService {
             }) {
                 continue;
             }
-            let mut backend = RootedImportBackend::new(compiled.scanner(), &store, &capabilities);
+            let mut backend = RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
             if !revalidate_read_set(&basis, &mut backend) {
                 pending.push(meta.bundle);
             }
@@ -349,7 +351,7 @@ impl AuthoringService {
         &self,
         store: &mut Store,
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(store, None, false)
+        self.directory_import_tasks_inner(store, None, false, None)
     }
 
     pub(crate) fn directory_import_tasks_affected_by(
@@ -357,8 +359,9 @@ impl AuthoringService {
         store: &mut Store,
         dirty: &[distill_store::files::DirtyEntry],
         renames: &[distill_store::files::RenameEvent],
+        overlay: Option<&FileOverlay>,
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(store, Some((dirty, renames)), false)
+        self.directory_import_tasks_inner(store, Some((dirty, renames)), false, overlay)
     }
 
     pub(crate) fn directory_import_tasks_affected_by_capabilities(
@@ -367,7 +370,7 @@ impl AuthoringService {
         dirty: &[distill_store::files::DirtyEntry],
         renames: &[distill_store::files::RenameEvent],
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        self.directory_import_tasks_inner(store, Some((dirty, renames)), true)
+        self.directory_import_tasks_inner(store, Some((dirty, renames)), true, None)
     }
 
     fn directory_import_tasks_inner(
@@ -378,6 +381,7 @@ impl AuthoringService {
             &[distill_store::files::RenameEvent],
         )>,
         capabilities_changed: bool,
+        overlay: Option<&FileOverlay>,
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
         let compiled = self.compiled(store)?;
         let capabilities = self.importer_capabilities(&compiled)?;
@@ -387,7 +391,7 @@ impl AuthoringService {
             None => Default::default(),
         };
         let entries = self.directory_rule_entries(&store)?;
-        let mut backend = RootedImportBackend::new(compiled.scanner(), &store, &capabilities);
+        let mut backend = RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
         let mut groups = BTreeMap::new();
         let mut touched = BTreeSet::<(BundleUuid, AssetUuid, usize, RootedPath)>::new();
         let mut touched_origins = BTreeSet::<StoredDirectoryOrigin>::new();
@@ -461,7 +465,7 @@ impl AuthoringService {
             let origin = directory_task_origin(&task);
             active_origins.insert(origin.clone());
             touched_origins.insert(origin);
-            if self.directory_task_needs_run(&store, &task, &capabilities)? {
+            if self.directory_task_needs_run(&store, &task, &capabilities, overlay)? {
                 tasks.push(task);
             }
         }
@@ -665,6 +669,72 @@ impl AuthoringService {
         }
     }
 
+    /// Whether an import may read one of `outputs` (root, path) as `store`
+    /// indexes them: a watched import reading the path or listing a query
+    /// it matches, or directory rules whose listing it matches. A cheap
+    /// check on the committed index before a pass plans the imports chained
+    /// to its outputs; an index not built yet may.
+    pub(crate) fn may_read_outputs(
+        &self,
+        store: &StoreReader,
+        outputs: &[(String, String)],
+    ) -> Result<bool, RpcFailure> {
+        if !store.import_index_built().map_err(invalid)? {
+            return Ok(true);
+        }
+        let paths = outputs
+            .iter()
+            .map(|(_, path)| path.as_str())
+            .collect::<Vec<_>>();
+        for indexed in store
+            .watched_imports_reading(paths.iter().copied(), false)
+            .map_err(invalid)?
+        {
+            let reads = decode_attempt_basis(&indexed.basis)?
+                .iter()
+                .any(|dependency| match dependency {
+                    FileDep::Read { path, .. } | FileDep::Probe { path, .. } => {
+                        paths.contains(&path.as_str())
+                    }
+                    FileDep::Listing { query, .. } => {
+                        paths.iter().any(|path| query_matches(query, path))
+                    }
+                    FileDep::Capability { .. } => false,
+                });
+            if reads {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .directory_rule_entries(store)?
+            .iter()
+            .any(|entry| paths.iter().any(|path| query_matches(&entry.rules.listing, path))))
+    }
+
+    /// The (root, path) a pass import writes, as `store` holds it: what the
+    /// imports chained to it read. `None` for a watched bundle that is gone.
+    pub(crate) fn pass_import_destination(
+        &self,
+        store: &StoreReader,
+        import: &PassImport,
+    ) -> Result<Option<(String, String)>, RpcFailure> {
+        match import {
+            PassImport::Directory(task) => Ok(Some((
+                task.destination_root.clone(),
+                task.destination_path.clone(),
+            ))),
+            PassImport::Watched(bundle) => {
+                let Some(meta) = store.bundle(*bundle).map_err(invalid)? else {
+                    return Ok(None);
+                };
+                Ok(store
+                    .root_name(meta.root)
+                    .map_err(invalid)?
+                    .map(|root| (root, meta.path)))
+            }
+        }
+    }
+
     /// The bundle a directory task writes, if it exists yet.
     pub(crate) fn directory_task_destination(
         &self,
@@ -818,6 +888,7 @@ impl AuthoringService {
         store: &StoreReader,
         task: &DirectoryImportTask,
         capabilities: &BTreeMap<String, [u8; 32]>,
+        overlay: Option<&FileOverlay>,
     ) -> Result<bool, RpcFailure> {
         let destination = self.resolve_directory_destination(
             store,
@@ -847,7 +918,7 @@ impl AuthoringService {
             return Ok(true);
         }
         let compiled = self.compiled(store)?;
-        let mut backend = RootedImportBackend::new(compiled.scanner(), store, capabilities);
+        let mut backend = RootedImportBackend::over(compiled.scanner(), store, capabilities, overlay);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
             Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                 return Ok(true);
@@ -1284,36 +1355,6 @@ impl AuthoringService {
             }
         };
 
-        // New identities are seeded by the run's base, so the fold is the
-        // same wherever the run publishes.
-        let seed = import_identity_seed(
-            run_base,
-            &destination.root,
-            &destination.path,
-            importer.capability_hash,
-        );
-        let mut ids = HashIdentitySource::new(seed);
-        let folded = fold_import(
-            prior.as_ref().map(|prior| &prior.model),
-            FoldRequest {
-                output,
-                explicit_settings,
-                default_settings: importer.default_settings.clone(),
-                importer: importer.id.clone(),
-                sources,
-                watch,
-                read_set: read_set.clone(),
-                origin: origin.or_else(|| {
-                    prior
-                        .as_ref()
-                        .and_then(|prior| prior.model.record.origin.clone())
-                }),
-            },
-            &mut ids,
-        )
-        .map_err(|error| invalid(format!("import fold failed: {error:?}")))
-        .map_err(ImportExecutionError::unmemoized)?;
-
         require_base(store, base).map_err(ImportExecutionError::unmemoized)?;
         // The publishing version's compiled state: a run from an earlier
         // base whose capabilities moved fails its revalidation.
@@ -1329,19 +1370,26 @@ impl AuthoringService {
                 "import read-set changed before publication; the result was discarded",
             )));
         }
-        let authority = self
-            .tag_index_coordinator()
-            .and_then(|_| compiled.schema_authority());
-        let bytes = build_import_bundle(
-            store,
-            authority.as_deref(),
-            &importer,
-            &folded,
-            prior.as_ref().map(|prior| &prior.bundle),
-            &mut ids,
-        )
-        .map_err(ImportExecutionError::unmemoized)?;
-        let bundle = folded.bundle_uuid;
+        let (bundle, bytes) = self
+            .folded_bundle(
+                store,
+                &compiled,
+                run_base,
+                &importer,
+                &destination,
+                prior.as_ref(),
+                FoldRequest {
+                    output,
+                    explicit_settings,
+                    default_settings: importer.default_settings.clone(),
+                    importer: importer.id.clone(),
+                    sources,
+                    watch,
+                    read_set,
+                    origin,
+                },
+            )
+            .map_err(ImportExecutionError::unmemoized)?;
         if store
             .bundle(bundle)
             .map_err(invalid)
@@ -1407,6 +1455,83 @@ impl AuthoringService {
             )
             .map_err(ImportExecutionError::unmemoized)?;
         Ok(PreparedImportCommit { bundle, commit })
+    }
+
+    /// The bundle a successful run folds to at `store`: its identity and
+    /// bytes. New identities are seeded by the run's base, so the fold is
+    /// the same wherever the run publishes.
+    #[allow(clippy::too_many_arguments)]
+    fn folded_bundle(
+        &self,
+        store: &StoreReader,
+        compiled: &Compiled,
+        run_base: InputVersion,
+        importer: &RegisteredImporter,
+        destination: &ImportDestination,
+        prior: Option<&PriorImport>,
+        mut request: FoldRequest,
+    ) -> Result<(BundleUuid, Vec<u8>), RpcFailure> {
+        let seed = import_identity_seed(
+            run_base,
+            &destination.root,
+            &destination.path,
+            importer.capability_hash,
+        );
+        let mut ids = HashIdentitySource::new(seed);
+        request.origin = request
+            .origin
+            .or_else(|| prior.and_then(|prior| prior.model.record.origin.clone()));
+        let folded = fold_import(prior.map(|prior| &prior.model), request, &mut ids)
+            .map_err(|error| invalid(format!("import fold failed: {error:?}")))?;
+        let authority = self
+            .tag_index_coordinator()
+            .and_then(|_| compiled.schema_authority());
+        let bytes = build_import_bundle(
+            store,
+            authority.as_deref(),
+            importer,
+            &folded,
+            prior.map(|prior| &prior.bundle),
+            &mut ids,
+        )?;
+        Ok((folded.bundle_uuid, bytes))
+    }
+
+    /// The output a pass's successful run will publish, folded at `store`
+    /// (the pass's input) without writing it: its destination and bytes.
+    /// `None` for a failed run, which publishes no output.
+    pub(crate) fn pass_output(
+        &self,
+        store: &StoreReader,
+        run: &ImportRun,
+    ) -> Result<Option<PassOutput>, RpcFailure> {
+        let Ok(output) = &run.outcome else {
+            return Ok(None);
+        };
+        let compiled = self.compiled(store)?;
+        let (_, bytes) = self.folded_bundle(
+            store,
+            &compiled,
+            run.base,
+            &run.importer,
+            &run.destination,
+            run.prior.as_ref(),
+            FoldRequest {
+                output: output.clone(),
+                explicit_settings: run.explicit_settings.clone(),
+                default_settings: run.importer.default_settings.clone(),
+                importer: run.importer.id.clone(),
+                sources: run.sources.clone(),
+                watch: run.watch,
+                read_set: run.read_set.clone(),
+                origin: run.origin.clone(),
+            },
+        )?;
+        Ok(Some(PassOutput {
+            root: run.destination.root.clone(),
+            path: run.destination.path.clone(),
+            bytes,
+        }))
     }
 
     /// Point `meta`'s import-index row at the basis now in effect: its failure
@@ -1943,16 +2068,22 @@ struct RootedImportBackend<'a> {
 /// caller's, or its own when no store lock may be held across the import,
 /// optionally under a reconciliation pass's uncommitted observation.
 enum ImportRows<'a> {
-    Borrowed(&'a StoreReader),
+    Borrowed(&'a StoreReader, Option<&'a FileOverlay>),
     Owned(StoreReader, Option<&'a FileOverlay>),
 }
 
 impl ImportRows<'_> {
-    fn observed_files_at(&self, path: &str) -> Result<Vec<ObservedFile>, StoreError> {
+    fn parts(&self) -> (&StoreReader, Option<&FileOverlay>) {
         match self {
-            Self::Borrowed(reader) => reader.observed_files_at(path),
-            Self::Owned(reader, None) => reader.observed_files_at(path),
-            Self::Owned(reader, Some(overlay)) => overlay.files_at(reader, path),
+            Self::Borrowed(reader, overlay) => (reader, *overlay),
+            Self::Owned(reader, overlay) => (reader, *overlay),
+        }
+    }
+
+    fn observed_files_at(&self, path: &str) -> Result<Vec<ObservedFile>, StoreError> {
+        match self.parts() {
+            (reader, None) => reader.observed_files_at(path),
+            (reader, Some(overlay)) => overlay.files_at(reader, path),
         }
     }
 
@@ -1961,22 +2092,39 @@ impl ImportRows<'_> {
         &self,
         selection: PathSelection<'_>,
     ) -> Result<Vec<ObservedFile>, StoreError> {
-        match self {
-            Self::Borrowed(reader) => reader.observed_files_in(selection),
-            Self::Owned(reader, None) => reader.observed_files_in(selection),
-            Self::Owned(reader, Some(overlay)) => overlay.files_in(reader, selection),
+        match self.parts() {
+            (reader, None) => reader.observed_files_in(selection),
+            (reader, Some(overlay)) => overlay.files_in(reader, selection),
         }
+    }
+
+    /// The bytes an earlier import of the pass will publish at (root, path).
+    fn output(&self, root: &str, path: &str) -> Option<&[u8]> {
+        self.parts().1.and_then(|overlay| overlay.output(root, path))
     }
 }
 
+/// One import output a reconciliation pass will publish: what the imports
+/// it chains to read in its place.
+pub(crate) struct PassOutput {
+    pub(crate) root: String,
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
 /// The `files` rows a reconciliation pass observed but has not committed:
-/// every row under the scanned prefixes (every row when `under` is `None`).
+/// every row under the scanned prefixes (every row when `under` is `None`),
+/// and the outputs of the imports it runs before others that read them.
 /// A pass runs its imports outside any write against the committed rows
 /// with these over them, which is what its input will hold when it
 /// publishes them.
+#[derive(Clone)]
 pub(crate) struct FileOverlay {
     under: Option<Vec<(String, String)>>,
     rows: Vec<ObservedFile>,
+    /// Earlier imports' outputs by (root, path): each replaces any other
+    /// row at its path, and reads of it see these bytes.
+    outputs: BTreeMap<(String, String), Arc<[u8]>>,
 }
 
 impl FileOverlay {
@@ -2001,20 +2149,62 @@ impl FileOverlay {
         Ok(Self {
             under: under.map(<[_]>::to_vec),
             rows,
+            outputs: BTreeMap::new(),
         })
     }
 
+    /// An overlay of nothing: every committed row reads through.
+    pub(crate) fn empty() -> Self {
+        Self {
+            under: Some(Vec::new()),
+            rows: Vec::new(),
+            outputs: BTreeMap::new(),
+        }
+    }
+
+    /// This overlay with `outputs` over it, each replacing the row at its
+    /// path, a later output replacing an earlier one.
+    pub(crate) fn with_outputs<'o>(&self, outputs: impl IntoIterator<Item = &'o PassOutput>) -> Self {
+        let mut overlay = self.clone();
+        for output in outputs {
+            let key = (output.root.clone(), output.path.clone());
+            overlay
+                .rows
+                .retain(|row| (&row.root_name, &row.path) != (&key.0, &key.1));
+            overlay.rows.push(ObservedFile {
+                root_name: output.root.clone(),
+                path: output.path.clone(),
+                file: distill_store::files::FileState {
+                    mtime: 0,
+                    size: output.bytes.len() as u64,
+                    kind: FileKind::File,
+                    content_hash: Some(ContentHash(*blake3::hash(&output.bytes).as_bytes())),
+                }
+                .into(),
+            });
+            overlay.outputs.insert(key, Arc::from(output.bytes.as_slice()));
+        }
+        overlay
+    }
+
+    fn output(&self, root: &str, path: &str) -> Option<&[u8]> {
+        self.outputs
+            .get(&(root.to_owned(), path.to_owned()))
+            .map(|bytes| &bytes[..])
+    }
+
     fn covers(&self, root: &str, path: &str) -> bool {
-        self.under.as_ref().is_none_or(|under| {
-            under.iter().any(|(prefix_root, prefix)| {
-                prefix_root == root
-                    && (prefix.is_empty()
-                        || path == prefix
-                        || path
-                            .strip_prefix(prefix.as_str())
-                            .is_some_and(|suffix| suffix.starts_with('/')))
+        self.output(root, path).is_some()
+            || self.under.as_ref().is_none_or(|under| {
+                under.iter().any(|(prefix_root, prefix)| {
+                    prefix_root == root
+                        && (prefix.is_empty()
+                            || path == prefix
+                            || path
+                                .strip_prefix(prefix.as_str())
+                                .is_some_and(|suffix| suffix.starts_with('/')))
+                })
             })
-        })
     }
 
     fn files_at(&self, reader: &StoreReader, path: &str) -> Result<Vec<ObservedFile>, StoreError> {
@@ -2063,7 +2253,21 @@ impl<'a> RootedImportBackend<'a> {
     ) -> Self {
         Self {
             scanner,
-            rows: ImportRows::Borrowed(reader),
+            rows: ImportRows::Borrowed(reader, None),
+            capabilities,
+        }
+    }
+
+    /// A backend on `reader`, under `overlay` if given.
+    fn over(
+        scanner: &'a RootedScanner,
+        reader: &'a StoreReader,
+        capabilities: &'a BTreeMap<String, [u8; 32]>,
+        overlay: Option<&'a FileOverlay>,
+    ) -> Self {
+        Self {
+            scanner,
+            rows: ImportRows::Borrowed(reader, overlay),
             capabilities,
         }
     }
@@ -2126,6 +2330,14 @@ impl ImportBackend for RootedImportBackend<'_> {
                 RawFileFailureClass::OtherStable
             });
         };
+        if let Some(bytes) = self.rows.output(&row.root_name, path) {
+            // An earlier import of the pass publishes these bytes here.
+            return Ok((
+                RootedPath::new(&row.root_name, path)
+                    .map_err(|_| RawFileFailureClass::OtherStable)?,
+                bytes.to_vec(),
+            ));
+        }
         let physical = self
             .scanner
             .physical_path(&row.root_name, path)
@@ -3434,6 +3646,16 @@ pub(crate) struct ImportRun {
     origin: Option<DirectoryOrigin>,
     read_set: Vec<FileDep>,
     outcome: Result<ImportOutput, ImportRunFailure>,
+}
+
+impl ImportRun {
+    /// The (root, path) a successful run publishes; `None` for a failed
+    /// run, which publishes no output.
+    pub(crate) fn output_destination(&self) -> Option<(String, String)> {
+        self.outcome
+            .is_ok()
+            .then(|| (self.destination.root.clone(), self.destination.path.clone()))
+    }
 }
 
 /// An importer failure a watched import memoizes.
