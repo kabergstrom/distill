@@ -759,6 +759,13 @@ impl DaemonCoordinator {
         let result = self
             .server
             .coordinated_replace_target_set(store, base, targets, |store| {
+                // The asset rows of the types whose interface this projection
+                // changes are republished; the others keep theirs.
+                let retyped = match self.compiled.at(store) {
+                    Ok(previous) => projection.retyped(previous.projection()),
+                    Err(CompiledLookupError::NotLoaded { .. }) => projection.retyped(self.boot.projection()),
+                    Err(error) => return Err(error.to_string()),
+                };
                 let (version, _) = store
                     .input_transaction(|transaction| {
                         // A valid candidate heals the source's error; a
@@ -779,6 +786,7 @@ impl DaemonCoordinator {
                     true,
                     Some(&pipeline),
                     &projection,
+                    &retyped,
                     tag_epoch,
                     &installed_claims,
                 )
@@ -2128,6 +2136,7 @@ fn publish_scan(
     advance_configuration: bool,
     pipeline: Option<&ConfigurationPipelinePublication>,
     projection: &PipelineProjection,
+    retyped: &BTreeSet<TypeUuid>,
     tag_epoch: [u8; 32],
     claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
@@ -2188,6 +2197,15 @@ fn publish_scan(
     let current_bundle_assets = published_bundle_assets(&published, &candidate.bundle_poisons);
     let asset_changes = AssetGroupChanges::read(store, &current_bundle_assets)?;
     let assets_changed = |bundle: &BundleUuid| asset_changes.changed(bundle, &current_bundle_assets);
+    // So does one holding an asset whose type the projection retyped.
+    let retyped_bundles = published
+        .iter()
+        .filter_map(|source| source.parsed.as_ref().ok())
+        .filter(|bundle| bundle.assets.values().any(|entry| retyped.contains(&entry.type_uuid)))
+        .map(|bundle| bundle.uuid)
+        .collect::<BTreeSet<_>>();
+    let assets_changed =
+        |bundle: &BundleUuid| retyped_bundles.contains(bundle) || assets_changed(bundle);
     let changed_bundles = current_bundle_summaries
         .iter()
         .filter_map(|(bundle, current)| {
@@ -3666,3 +3684,107 @@ mod publish_diff_tests {
     }
 }
 
+
+#[cfg(test)]
+mod projection_tests {
+    //! A publication under a new pipeline projection leaves no asset row
+    //! with the old projection's served interface.
+
+    use super::*;
+    use crate::callbacks::ProcessorDescriptor;
+    use crate::scanner::{AssetRoot, RootedScanner};
+    use distill_build::outputs::OutputDecls;
+    use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
+    use distill_schema::ngp_schema::{node_hash, LayoutIdentity, LogicalSchema, PrimitiveKind, SchemaNode};
+
+    const SOURCE: TypeUuid = TypeUuid([1; 16]);
+    const TERMINAL: TypeUuid = TypeUuid([2; 16]);
+
+    fn projection(terminal: Option<TypeUuid>) -> PipelineProjection {
+        let target = Target::new(
+            TargetOs::Linux,
+            TargetArch::X86_64,
+            BTreeSet::from([GraphicsApi::new("vulkan").unwrap()]),
+            false,
+            true,
+            LayoutIdentity {
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                rustc: "rustc test".into(),
+                algorithm_version: 1,
+            },
+        )
+        .unwrap();
+        let descriptors = terminal
+            .map(|terminal| ProcessorDescriptor {
+                id: "processor".to_owned(),
+                version: 1,
+                input: SOURCE,
+                selector: TargetSelector::new(None, None).unwrap(),
+                outputs: OutputDecls::new(terminal, Vec::new()).unwrap(),
+            })
+            .into_iter()
+            .collect();
+        PipelineProjection::build(
+            descriptors,
+            [9; 32],
+            &BTreeMap::from([("dev".to_owned(), target)]),
+            [SOURCE],
+        )
+        .unwrap()
+    }
+
+    fn publish(
+        store: &mut Store,
+        scanner: &RootedScanner,
+        projection: &PipelineProjection,
+        retyped: &BTreeSet<TypeUuid>,
+    ) {
+        let candidate = ScanCandidate::build(scanner.scan().unwrap(), None).unwrap();
+        let claims = bundle_claims(candidate.scan.bundle_rows(), projection, None).unwrap();
+        let base = store.input_version();
+        publish_scan(store, base, candidate, false, None, projection, retyped, [0; 32], &claims).unwrap();
+    }
+
+    #[test]
+    fn a_projection_change_retypes_unchanged_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let schema = LogicalSchema {
+            root: SchemaNode::Primitive(PrimitiveKind::U8),
+        };
+        let schema_hash = node_hash(&schema.root).unwrap();
+        let asset = AssetUuid([5; 16]);
+        std::fs::write(
+            root.join("a.bundle"),
+            distill_bundle::write_bundle(&Bundle {
+                format_version: 1,
+                uuid: BundleUuid([4; 16]),
+                primary: Some("entry".into()),
+                schemas: BTreeMap::from([(schema_hash, schema)]),
+                assets: BTreeMap::from([(
+                    "entry".into(),
+                    AssetEntry {
+                        uuid: asset,
+                        type_uuid: SOURCE,
+                        schema_hash,
+                        authoring_only: false,
+                        data: AuthoredValue::UInt(7),
+                    },
+                )]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        let terminal = |store: &Store| store.served_entry_meta(asset).unwrap().unwrap().terminal_type;
+
+        let (before, after) = (projection(None), projection(Some(TERMINAL)));
+        publish(&mut store, &scanner, &before, &BTreeSet::new());
+        assert_eq!(terminal(&store), SOURCE);
+        assert_eq!(after.retyped(&before), BTreeSet::from([SOURCE]));
+        publish(&mut store, &scanner, &after, &after.retyped(&before));
+        assert_eq!(terminal(&store), TERMINAL, "the unchanged bundle kept the old terminal type");
+    }
+}

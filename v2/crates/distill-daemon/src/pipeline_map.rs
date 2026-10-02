@@ -72,6 +72,17 @@ impl PipelineProjection {
         Ok(Self { interfaces })
     }
 
+    /// The authored types whose interface differs from `previous`'s: the
+    /// asset rows of these, and only these, change under this projection.
+    pub(crate) fn retyped(&self, previous: &Self) -> BTreeSet<TypeUuid> {
+        self.interfaces
+            .keys()
+            .chain(previous.interfaces.keys())
+            .filter(|authored| self.interface(**authored) != previous.interface(**authored))
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn interface(&self, authored: TypeUuid) -> PipelineInterface {
         self.interfaces
             .get(&authored)

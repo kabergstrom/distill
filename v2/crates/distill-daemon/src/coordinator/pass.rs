@@ -1002,6 +1002,7 @@ impl DaemonCoordinator {
                     false,
                     None,
                     tags.compiled.projection(),
+                    &BTreeSet::new(),
                     tags.tag_epoch,
                     &step.claims,
                 )
