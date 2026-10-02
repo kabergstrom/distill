@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 35;
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -89,8 +89,10 @@ CREATE TABLE source_claims (
 );
 CREATE INDEX source_claims_by_subject ON source_claims(kind, subject);
 -- Per-entity errors (see `errors`): one row per current defect. `family`
--- is the producer that owns the row (1 = scan namespace); `scope_kind` 1
--- file, 2 bundle, 3 asset, 4 target, 5 pipeline, 6 configuration, 7 daemon.
+-- is the producer that owns the row (1 scan namespace, 2 the pending scan
+-- rejection's namespace errors, 3 its configuration error, 4 the
+-- configuration source's error); `scope_kind` 1 file, 2 bundle, 3 asset,
+-- 4 target, 5 pipeline, 6 configuration, 7 daemon.
 CREATE TABLE errors (
     family     INTEGER NOT NULL,
     scope_kind INTEGER NOT NULL CHECK (scope_kind BETWEEN 1 AND 7),
@@ -102,6 +104,11 @@ CREATE TABLE errors (
     PRIMARY KEY (family, identity)
 );
 CREATE INDEX errors_by_scope ON errors(scope_kind, scope_id);
+-- The physical subjects (platform path encoding) whose revalidation heals
+-- the pending scan rejection.
+CREATE TABLE scan_rejection_subjects (
+    path BLOB NOT NULL PRIMARY KEY
+);
 -- Subjects with more than one distinct claimant (group 0 bundles, 1 assets).
 CREATE TABLE claim_collisions (
     grp     INTEGER NOT NULL,
@@ -1014,6 +1021,20 @@ impl StoreReader {
     pub fn clean_watermark(&self) -> Result<Option<i64>, StoreError> {
         meta_get_i64(&self.conn, "clean_watermark")
     }
+
+    /// The input version that last published the daemon's compiled
+    /// configuration state (schema authority, targets, pipeline epoch,
+    /// roots): what in-memory state derived from it is keyed by. `None`
+    /// until a publication records one.
+    pub fn compiled_version(&self) -> Result<Option<InputVersion>, StoreError> {
+        Ok(meta_get_u64(&self.conn, "compiled_version")?.map(InputVersion))
+    }
+
+    /// Whether the complete import index has been built: written in the
+    /// transaction that writes the index rows, so it rolls back with them.
+    pub fn import_index_built(&self) -> Result<bool, StoreError> {
+        Ok(meta_get_u64(&self.conn, "import_index_built")?.is_some_and(|built| built != 0))
+    }
 }
 
 
@@ -1056,6 +1077,12 @@ impl InputTxn<'_> {
     /// Record §14's clean watermark.
     pub fn set_clean_watermark(&mut self, mtime: i64) -> Result<(), StoreError> {
         meta_set_i64(&self.txn, "clean_watermark", mtime)
+    }
+
+    /// Record that this input publishes the daemon's compiled configuration
+    /// state (see [`StoreReader::compiled_version`]).
+    pub fn mark_compiled(&mut self) -> Result<(), StoreError> {
+        meta_set_u64(&self.txn, "compiled_version", self.version.0)
     }
 }
 

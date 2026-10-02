@@ -230,10 +230,15 @@ impl Store {
         self.write_txn(|store| {
             let transaction = store.read.conn.savepoint()?;
             match sources {
-                None => transaction.execute_batch(
-                    "DELETE FROM import_reads; DELETE FROM import_records;
-                     DELETE FROM directory_rule_sources;",
-                )?,
+                None => {
+                    transaction.execute_batch(
+                        "DELETE FROM import_reads; DELETE FROM import_records;
+                         DELETE FROM directory_rule_sources;",
+                    )?;
+                    // The complete index is built: the marker commits or
+                    // rolls back with its rows.
+                    crate::db::meta_set_u64(&transaction, "import_index_built", 1)?;
+                }
                 Some(sources) => {
                     for (root, path) in sources {
                         let params = rusqlite::params![root, path];

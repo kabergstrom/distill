@@ -95,6 +95,7 @@ fn every_section_13_table_exists() {
         "roots",
         "store_meta",
         "errors",
+        "scan_rejection_subjects",
         "codegen_outputs",
         "watched_import_failures",
         "asset_resolutions",
