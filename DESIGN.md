@@ -6924,11 +6924,17 @@ read transaction on a reader of its own; calls on one connection at one
 version share it), its own subscription set, delta queue and change-log
 cursor. None of it is reachable from another thread, so none of it is
 locked. What connections share is the server handle, which is `Send + Sync`
-and holds no per-connection state: the store configuration and identity,
-the backends, the publication `watch` signal, the snapshot policy and two counters, open snapshots and admitted
-connections, all atomics. Writes go through the store,
-whose write lock orders them; the build backend memoizes builds, so the
-RPC layer keeps no build cache of its own. The RPC layer takes no lock of its
+and holds no per-connection state: the store opener (configuration, identity
+and CAS directory; immutable but for the operational configuration, which
+every writer rereads as each transaction begins), the backends, the
+publication `watch` signal, and the snapshot policy and two counters (open
+snapshots and admitted connections), which are atomics. A connection opens a
+store writer of its own on its first write and runs writes, import
+publications and operation completions on its own thread, passing that
+writer explicitly to the daemon backend; the process loop and each build
+job own writers too, and nothing finds a writer through shared or
+thread-local state. SQLite's write lock orders the writers. The build
+backend memoizes builds, so the RPC layer keeps no build cache of its own. The RPC layer takes no lock of its
 own, so it has no lock order: the bounds are claimed by compare-and-swap,
 and the only lock a connection waits on is the store's.
 
