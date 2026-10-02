@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use unicode_normalization::UnicodeNormalization;
 
+use distill_store::bundles::AssetFilter;
 use distill_store::served::{ResolutionRow, ServedEntryMeta, SERVED_RESTART_KEYS};
 use distill_store::{Store, StoreError, StoreReader};
 
@@ -240,7 +241,32 @@ pub(crate) fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> Chu
 // ---------------------------------------------------------------------------
 // Queries
 
-fn query_pure_metadata(entries: &[ServedEntryMeta], query: &PureMetadataQuery) -> Vec<AssetUuid> {
+/// Run a pure metadata query as one indexed SQL query on the snapshot.
+fn query_pure_metadata(
+    snapshot: &StoreReader,
+    query: &PureMetadataQuery,
+) -> Result<Vec<AssetUuid>, StoreError> {
+    let filter = AssetFilter {
+        asset: query.uuid,
+        bundle: query.bundle,
+        authored_type: query.authored_type,
+        path_prefixes: query.normalized_path_prefix.iter().cloned().collect(),
+        authoring_only: query
+            .role
+            .map(|role| role == AuthoringEntryRole::AuthoringOnly),
+        ..AssetFilter::default()
+    };
+    Ok(snapshot
+        .served_assets_matching(&filter)?
+        .into_iter()
+        .map(|matched| matched.asset)
+        .collect())
+}
+
+/// The whole-table scan [`query_pure_metadata`] replaced, kept to pin its
+/// results.
+#[cfg(test)]
+fn query_pure_metadata_scan(entries: &[ServedEntryMeta], query: &PureMetadataQuery) -> Vec<AssetUuid> {
     entries
         .iter()
         .filter(|entry| {
@@ -322,6 +348,35 @@ fn validate_asset_query(query: &AssetQuery, allow_authoring: bool) -> Result<(),
     Ok(())
 }
 
+/// The SQL half of an asset query: every selector but the glob, which
+/// contributes only its literal prefix (the text before its first `*` or
+/// `?`, which every match starts with) and is matched on the rows.
+fn asset_filter(query: &AssetQuery, role: AuthoringEntryRole) -> AssetFilter {
+    let mut path_prefixes = query.path_prefix.iter().cloned().collect::<Vec<_>>();
+    if let Some(glob) = &query.path_glob {
+        let literal = &glob[..glob.find(['*', '?']).unwrap_or(glob.len())];
+        if !literal.is_empty() {
+            path_prefixes.push(literal.to_owned());
+        }
+    }
+    AssetFilter {
+        asset: query.uuid,
+        bundle: query.bundle_uuid,
+        bundle_path: query.bundle_path.clone(),
+        local_id: query.local_id.clone(),
+        authored_type: query.authored_type,
+        terminal_type: query.terminal_type,
+        tag: query
+            .tag
+            .as_ref()
+            .map(|tag| (tag.tag.clone(), tag.value.clone())),
+        path_prefixes,
+        authoring_only: Some(role == AuthoringEntryRole::AuthoringOnly),
+        tag_index_poisoned: false,
+    }
+}
+
+#[cfg(test)]
 fn query_matches(entry: &ServedEntryMeta, query: &AssetQuery, role: AuthoringEntryRole) -> bool {
     query.uuid.is_none_or(|wanted| wanted == entry.asset)
         && query
@@ -360,8 +415,49 @@ fn query_matches(entry: &ServedEntryMeta, query: &AssetQuery, role: AuthoringEnt
 }
 
 /// Run an asset query over a pinned snapshot, failing when a tag query
-/// would consult a poisoned tag index.
+/// would consult a poisoned tag index: the entries the query selects without
+/// its tag whose tag index is poisoned name the failing bundles. Both reads
+/// are indexed SQL queries; only the glob is matched here.
 fn query_assets(
+    snapshot: &StoreReader,
+    query: &AssetQuery,
+    role: AuthoringEntryRole,
+) -> Result<Result<Vec<AssetUuid>, RpcFailure>, StoreError> {
+    let glob_matches = |path: &str| {
+        query
+            .path_glob
+            .as_ref()
+            .is_none_or(|glob| path_glob_matches(glob, path))
+    };
+    if query.tag.is_some() {
+        let poisoned = AssetFilter {
+            tag: None,
+            tag_index_poisoned: true,
+            ..asset_filter(query, role)
+        };
+        let bundles = snapshot
+            .served_assets_matching(&poisoned)?
+            .into_iter()
+            .filter(|matched| glob_matches(&matched.path))
+            .map(|matched| matched.bundle)
+            .collect::<BTreeSet<_>>();
+        if !bundles.is_empty() {
+            return Ok(Err(RpcFailure::TagIndexPoisoned {
+                bundles: bundles.into_iter().collect(),
+            }));
+        }
+    }
+    Ok(Ok(snapshot
+        .served_assets_matching(&asset_filter(query, role))?
+        .into_iter()
+        .filter(|matched| glob_matches(&matched.path))
+        .map(|matched| matched.asset)
+        .collect()))
+}
+
+/// The whole-table scan [`query_assets`] replaced, kept to pin its results.
+#[cfg(test)]
+fn query_assets_scan(
     snapshot: &StoreReader,
     query: &AssetQuery,
     role: AuthoringEntryRole,
@@ -781,8 +877,10 @@ impl MetadataView<'_> {
                 path: query.normalized_path_prefix.clone().unwrap_or_default(),
             });
         }
-        let entries = namespace_try!(txn.snapshot().served_entries());
-        MetadataNamespaceCall::Success(query_pure_metadata(&entries, query))
+        MetadataNamespaceCall::Success(namespace_try!(query_pure_metadata(
+            txn.snapshot(),
+            query
+        )))
     }
 
     fn refresh(&self) -> Result<(MetadataBasis, Rc<SnapshotHold>), MetadataCall<()>> {
@@ -2125,5 +2223,395 @@ impl DeltaStream {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    //! The indexed queries answer exactly what the whole-table scans they
+    //! replaced answered, errors included, and read a small part of a large
+    //! namespace.
+
+    use std::collections::BTreeMap;
+
+    use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+    use distill_store::bundles::{AssetRecord, BundleMeta, ServedAuthoring};
+    use distill_store::{Store, StoreConfig};
+
+    use super::*;
+
+    const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
+    const MESH: TypeUuid = TypeUuid([0x71; 16]);
+    const TEXTURE: TypeUuid = TypeUuid([0x72; 16]);
+    const GPU_MESH: TypeUuid = TypeUuid([0x73; 16]);
+
+    /// Paths that sort between a directory and its children, non-ASCII
+    /// ones, and glob metacharacters spelled literally.
+    const PATHS: [&str; 12] = [
+        "dir",
+        "dir.txt",
+        "dir-old",
+        "dir/child",
+        "dir/child/leaf",
+        "dir0",
+        "dirt/x",
+        "é/ü.bundle",
+        "éa",
+        "a*b",
+        "a?b/c",
+        "z",
+    ];
+
+    fn uuid(kind: u8, index: u32) -> [u8; 16] {
+        let mut bytes = [kind; 16];
+        bytes[12..].copy_from_slice(&index.to_be_bytes());
+        bytes
+    }
+
+    /// Two entries per path (a runtime one and an authoring-only one, with
+    /// varied types and tags), one poisoned bundle, one pending tag index,
+    /// and `filler` more runtime bundles under `bulk/`.
+    fn namespace(filler: u32) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        store
+            .input_transaction(|txn| {
+                let root = txn.intern_root("main")?;
+                txn.put_schema(SCHEMA, "{}")?;
+                let paths = PATHS
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .chain((0..filler).map(|index| format!("bulk/b{index:05}")));
+                for (index, path) in paths.enumerate() {
+                    let index = index as u32;
+                    let bundle = BundleUuid(uuid(0x10, index));
+                    txn.upsert_bundle(&BundleMeta {
+                        bundle,
+                        root,
+                        path: path.clone(),
+                        format_version: 1,
+                        content_hash: ContentHash([index as u8; 32]),
+                        origin: None,
+                    })?;
+                    for (entry, authoring_only) in [(1u8, false), (2, true)] {
+                        let mut tags = BTreeMap::new();
+                        tags.insert(
+                            "kind".to_owned(),
+                            (index % 3 != 0).then(|| ["mesh", "rock"][index as usize % 2].to_owned()),
+                        );
+                        if index % 4 == entry as u32 {
+                            tags.insert("hero".into(), None);
+                        }
+                        txn.upsert_asset(&AssetRecord {
+                            asset: AssetUuid(uuid(0x20 + entry, index)),
+                            bundle,
+                            local_id: if entry == 1 { "main" } else { "settings" }.into(),
+                            type_uuid: if index % 2 == 0 { MESH } else { TEXTURE },
+                            logical_hash: SCHEMA,
+                            authoring_only,
+                            tags,
+                            served: Some(ServedAuthoring {
+                                authored_value: Vec::new(),
+                                terminal_type: if index % 2 == 0 { GPU_MESH } else { TEXTURE },
+                            }),
+                        })?;
+                    }
+                }
+                // `z`'s tag index is pending: its tag queries must fail.
+                let z = PATHS.iter().position(|path| *path == "z").unwrap() as u32;
+                txn.set_tag_index_pending(AssetUuid(uuid(0x21, z)), [7; 32])?;
+                // `dir0` is poisoned: it serves nothing.
+                let dir0 = PATHS.iter().position(|path| *path == "dir0").unwrap() as u32;
+                txn.poison_bundle(
+                    &distill_store::bundles::NamespaceSkeleton {
+                        bundle: BundleUuid(uuid(0x10, dir0)),
+                        root,
+                        path: "dir0".into(),
+                        format_version: 1,
+                        content_hash: ContentHash([0xee; 32]),
+                        entries: Vec::new(),
+                    },
+                    "malformed",
+                )
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    fn selectors() -> Vec<AssetQuery> {
+        let mut queries = Vec::new();
+        let none = AssetQuery {
+            uuid: None,
+            bundle_path: None,
+            local_id: None,
+            bundle_uuid: None,
+            authored_type: None,
+            terminal_type: None,
+            tag: None,
+            path_prefix: None,
+            path_glob: None,
+            authoring_only: None,
+        };
+        for index in [0, 3, 7, 11] {
+            queries.push(AssetQuery {
+                uuid: Some(AssetUuid(uuid(0x21, index))),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                bundle_uuid: Some(BundleUuid(uuid(0x10, index))),
+                local_id: Some("main".into()),
+                ..none.clone()
+            });
+        }
+        for path in PATHS {
+            queries.push(AssetQuery {
+                bundle_path: Some(path.into()),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                bundle_path: Some(path.into()),
+                local_id: Some("settings".into()),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                path_prefix: Some(path.into()),
+                ..none.clone()
+            });
+        }
+        for prefix in ["", "d", "dir/", "é", "a", "bulk/b0001"] {
+            queries.push(AssetQuery {
+                path_prefix: Some(prefix.into()),
+                ..none.clone()
+            });
+        }
+        for glob in [
+            "*", "dir*", "dir/*", "*child*", "d?r*", "é/*", "a*b", "a?b/*", "bulk/b000?", "?",
+            "dir", "*.txt",
+        ] {
+            queries.push(AssetQuery {
+                path_glob: Some(glob.into()),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                path_glob: Some(glob.into()),
+                path_prefix: Some("dir".into()),
+                ..none.clone()
+            });
+        }
+        for type_uuid in [MESH, TEXTURE, GPU_MESH] {
+            queries.push(AssetQuery {
+                authored_type: Some(type_uuid),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                terminal_type: Some(type_uuid),
+                ..none.clone()
+            });
+        }
+        for (tag, value) in [
+            ("kind", None),
+            ("kind", Some("mesh")),
+            ("kind", Some("rock")),
+            ("hero", None),
+            ("hero", Some("x")),
+            ("absent", None),
+        ] {
+            let tag = Some(TagSelector {
+                tag: tag.into(),
+                value: value.map(str::to_owned),
+            });
+            queries.push(AssetQuery {
+                tag: tag.clone(),
+                ..none.clone()
+            });
+            // Narrowed away from `z`'s pending index, and not.
+            queries.push(AssetQuery {
+                tag: tag.clone(),
+                path_prefix: Some("dir".into()),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                tag,
+                path_glob: Some("z*".into()),
+                ..none.clone()
+            });
+        }
+        for authoring_only in [false, true] {
+            queries.push(AssetQuery {
+                authoring_only: Some(authoring_only),
+                ..none.clone()
+            });
+        }
+        queries
+    }
+
+    #[test]
+    fn asset_queries_answer_what_the_scan_answered() {
+        let (_dir, store) = namespace(30);
+        let reader = store.reader().unwrap();
+        let mut nonempty = 0;
+        for query in selectors() {
+            for role in [AuthoringEntryRole::Runtime, AuthoringEntryRole::AuthoringOnly] {
+                let indexed = query_assets(&reader, &query, role).unwrap();
+                let scanned = query_assets_scan(&reader, &query, role).unwrap();
+                assert_eq!(
+                    format!("{indexed:?}"),
+                    format!("{scanned:?}"),
+                    "{query:?} as {role:?}"
+                );
+                nonempty += usize::from(indexed.is_ok_and(|assets| !assets.is_empty()));
+            }
+        }
+        // The selectors exercise matches, not only empty answers.
+        assert!(nonempty > 60, "{nonempty}");
+    }
+
+    #[test]
+    fn pure_metadata_queries_answer_what_the_scan_answered() {
+        let (_dir, store) = namespace(30);
+        let reader = store.reader().unwrap();
+        let entries = reader.served_entries().unwrap();
+        let roles = [None, Some(AuthoringEntryRole::Runtime), Some(AuthoringEntryRole::AuthoringOnly)];
+        let prefixes = [None, Some(""), Some("dir"), Some("dir/"), Some("é"), Some("bulk/b001")];
+        for role in roles {
+            for prefix in prefixes {
+                for (uuid, bundle, authored_type) in [
+                    (None, None, None),
+                    (Some(AssetUuid(uuid(0x22, 3))), None, None),
+                    (None, Some(BundleUuid(uuid(0x10, 4))), None),
+                    (None, None, Some(TEXTURE)),
+                ] {
+                    let query = PureMetadataQuery {
+                        uuid,
+                        bundle,
+                        normalized_path_prefix: prefix.map(str::to_owned),
+                        authored_type,
+                        role,
+                    };
+                    assert_eq!(
+                        query_pure_metadata(&reader, &query).unwrap(),
+                        query_pure_metadata_scan(&entries, &query),
+                        "{query:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The runtime entries build verification reads in one query are the
+    /// per-entry reads it replaced, each failing where that read failed.
+    #[test]
+    fn runtime_entries_are_the_per_entry_reads() {
+        let (_dir, mut store) = namespace(30);
+        // An entry whose schema snapshot is missing fails in its place.
+        let unknown = LogicalHash([0x99; 32]);
+        store
+            .input_transaction(|txn| {
+                txn.upsert_asset(&AssetRecord {
+                    asset: AssetUuid(uuid(0x21, 4)),
+                    bundle: BundleUuid(uuid(0x10, 4)),
+                    local_id: "main".into(),
+                    type_uuid: MESH,
+                    logical_hash: unknown,
+                    authoring_only: false,
+                    tags: BTreeMap::from([("kind".to_owned(), None)]),
+                    served: Some(ServedAuthoring {
+                        authored_value: vec![1, 2, 3],
+                        terminal_type: GPU_MESH,
+                    }),
+                })
+            })
+            .unwrap();
+        let reader = store.reader().unwrap();
+        let per_entry = reader
+            .served_entries()
+            .unwrap()
+            .into_iter()
+            .filter(|meta| !meta.authoring_only)
+            .map(|meta| {
+                reader
+                    .served_entry(meta.asset)
+                    .map(|entry| entry.expect("a served entry reads"))
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Vec<_>>();
+        let batched = reader
+            .served_runtime_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.map_err(|error| error.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(batched, per_entry);
+        assert!(batched.iter().filter(|entry| entry.is_err()).count() == 1);
+        assert!(batched.len() > 30);
+    }
+
+    /// Pages fetched by `read`.
+    fn pages<T>(reader: &StoreReader, read: impl FnOnce() -> T) -> (T, u64) {
+        let before = reader.pages_fetched().unwrap();
+        let value = read();
+        (value, reader.pages_fetched().unwrap() - before)
+    }
+
+    #[test]
+    fn a_narrow_asset_query_reads_little_of_a_large_namespace() {
+        let (_dir, store) = namespace(20_000);
+        let reader = store.reader().unwrap();
+        let narrow = [
+            AssetQuery {
+                bundle_path: Some("bulk/b12345".into()),
+                uuid: None,
+                local_id: None,
+                bundle_uuid: None,
+                authored_type: None,
+                terminal_type: None,
+                tag: None,
+                path_prefix: None,
+                path_glob: None,
+                authoring_only: None,
+            },
+            AssetQuery {
+                bundle_path: None,
+                path_glob: Some("bulk/b1234?".into()),
+                tag: Some(TagSelector {
+                    tag: "hero".into(),
+                    value: None,
+                }),
+                uuid: None,
+                local_id: None,
+                bundle_uuid: None,
+                authored_type: None,
+                terminal_type: None,
+                path_prefix: None,
+                authoring_only: None,
+            },
+        ];
+        for query in narrow {
+            let role = AuthoringEntryRole::Runtime;
+            let (indexed, indexed_pages) = pages(&reader, || query_assets(&reader, &query, role));
+            let (scanned, scanned_pages) =
+                pages(&reader, || query_assets_scan(&reader, &query, role));
+            let indexed = indexed.unwrap().unwrap();
+            assert_eq!(indexed, scanned.unwrap().unwrap());
+            assert!(!indexed.is_empty());
+            println!("{query:?}: {indexed_pages} pages (scan: {scanned_pages})");
+            assert!(indexed_pages <= 128, "{indexed_pages} pages");
+            assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+        }
+        let query = PureMetadataQuery {
+            uuid: None,
+            bundle: None,
+            normalized_path_prefix: Some("bulk/b1234".into()),
+            authored_type: None,
+            role: Some(AuthoringEntryRole::Runtime),
+        };
+        let (indexed, indexed_pages) = pages(&reader, || query_pure_metadata(&reader, &query));
+        let (scanned, scanned_pages) = pages(&reader, || {
+            query_pure_metadata_scan(&reader.served_entries().unwrap(), &query)
+        });
+        assert_eq!(indexed.unwrap(), scanned);
+        println!("pure metadata prefix: {indexed_pages} pages (scan: {scanned_pages})");
+        assert!(indexed_pages <= 64, "{indexed_pages} pages");
+        assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
     }
 }
