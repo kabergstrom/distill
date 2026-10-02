@@ -436,7 +436,10 @@ impl ServerHandle {
             store.served_transaction(|txn| job(txn))
         };
         let value = result.unwrap_or_else(|error| panic!("RPC store write failed: {error}"));
-        self.notify_published();
+        // Inside an open input, readers are told once it commits.
+        if !store.input_open() {
+            self.notify_published();
+        }
         value
     }
 }
@@ -763,7 +766,8 @@ impl ServerHandle {
     /// Publish a runtime failure of the current pipeline epoch. Every
     /// snapshot that pinned the epoch sees it and every connection must
     /// reconnect. `persist` records the daemon's own durable failure first,
-    /// on the same writer.
+    /// on the same writer. Called inside an open input, the failure joins
+    /// that input's version and readers learn of it when the input commits.
     pub fn coordinated_runtime_pipeline_failure(
         &self,
         store: &mut Store,
