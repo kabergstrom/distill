@@ -33,7 +33,7 @@ use distill_store::imports::{
     DirectoryRuleSource, ImportIndexSource, ImportReadKey, WatchedImport, WatchedImportFailure,
     WatchedImportTerminal,
 };
-use distill_store::{Store, StoreOpener, StoreReader};
+use distill_store::{Store, StoreError, StoreOpener, StoreReader};
 use globset::Glob;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
@@ -57,7 +57,7 @@ pub(crate) struct RegisteredImporter {
 
 pub(crate) type RegisteredImporters = BTreeMap<String, RegisteredImporter>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DirectoryImportTask {
     rules_bundle: BundleUuid,
     rule: distill_build::import::ImportRuleId,
@@ -139,7 +139,7 @@ impl AuthoringService {
     /// Index every bundle's import record and directory rules, on `rebuild`
     /// or if this process has not built the index yet.
     fn ensure_import_index(&self, store: &mut Store, rebuild: bool) -> Result<(), RpcFailure> {
-        if !rebuild && self.import_index_built.get().is_some() {
+        if !rebuild && self.import_index_built.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         // The index is read from the bundles in the transaction that
@@ -152,7 +152,8 @@ impl AuthoringService {
             store.replace_import_index(None, &rows).map_err(invalid)
         })?;
         self.directory_rule_entries(store)?;
-        let _ = self.import_index_built.set(());
+        self.import_index_built
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -500,51 +501,15 @@ impl AuthoringService {
         active_origins: &BTreeSet<StoredDirectoryOrigin>,
         capabilities: &BTreeMap<String, [u8; 32]>,
     ) -> Result<(), RpcFailure> {
-        let mut backend =
-            RootedImportBackend::owned(&self.scanner, store.reader().map_err(invalid)?, capabilities);
-        for meta in bundles {
-            let Some(origin) = &meta.origin else {
-                continue;
-            };
-            if active_origins.contains(origin) {
-                continue;
-            }
-            let prior = self.read_prior_import_cached(store, meta)?;
-            let current_basis = prior
-                .model
-                .record
-                .read_set
-                .iter()
-                .map(|dep| observe_file_dep(dep, &mut backend))
-                .collect::<Vec<_>>();
-            let basis = encode_attempt_basis(&current_basis)?;
-            let message = format!(
-                "directory import orphaned: rule {} no longer produces group {}:{}",
-                origin.rule, origin.group_root, origin.group_path
-            );
-            if store
-                .watched_import_failure(meta.bundle)
-                .map_err(invalid)?
-                .is_some_and(|failure| {
-                    failure.terminal == WatchedImportTerminal::DirectoryOrphan
-                        && failure.basis == basis
-                        && failure.message == message
-                })
-            {
-                continue;
-            }
-            store
-                .record_watched_import_failure(&WatchedImportFailure {
-                    bundle: meta.bundle,
-                    attempted_input_version: store.input_version(),
-                    basis,
-                    terminal: WatchedImportTerminal::DirectoryOrphan,
-                    message,
-                    memo_seq: store.memo_seq(),
-                })
-                .map_err(invalid)?;
-        }
-        Ok(())
+        let orphaned = bundles
+            .iter()
+            .filter(|meta| {
+                meta.origin
+                    .as_ref()
+                    .is_some_and(|origin| !active_origins.contains(origin))
+            })
+            .collect::<Vec<_>>();
+        self.record_orphans(store, orphaned, capabilities)
     }
 
     fn record_directory_orphans_affected(
@@ -554,13 +519,8 @@ impl AuthoringService {
         active: &BTreeSet<StoredDirectoryOrigin>,
         capabilities: &BTreeMap<String, [u8; 32]>,
     ) -> Result<(), RpcFailure> {
-        let orphaned = touched.difference(active).cloned().collect::<Vec<_>>();
-        if orphaned.is_empty() {
-            return Ok(());
-        }
-        let mut backend =
-            RootedImportBackend::owned(&self.scanner, store.reader().map_err(invalid)?, capabilities);
-        for origin in orphaned {
+        let mut orphaned = Vec::new();
+        for origin in touched.difference(active) {
             for bundle in store
                 .bundles_owned_by(origin.rules_bundle)
                 .map_err(invalid)?
@@ -568,10 +528,31 @@ impl AuthoringService {
                 let Some(meta) = store.bundle(bundle).map_err(invalid)? else {
                     continue;
                 };
-                if meta.origin.as_ref() != Some(&origin) {
-                    continue;
+                if meta.origin.as_ref() == Some(origin) {
+                    orphaned.push(meta);
                 }
-                let prior = self.read_prior_import_cached(store, &meta)?;
+            }
+        }
+        self.record_orphans(store, orphaned.iter().collect(), capabilities)
+    }
+
+    /// Memoize each orphaned directory output against its read set as the
+    /// store sees it, which inside a reconciliation pass is the pass's own
+    /// uncommitted observation.
+    fn record_orphans(
+        &self,
+        store: &mut Store,
+        orphaned: Vec<&BundleMeta>,
+        capabilities: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<(), RpcFailure> {
+        let mut failures = Vec::new();
+        {
+            let mut backend = RootedImportBackend::new(&self.scanner, store, capabilities);
+            for meta in orphaned {
+                let Some(origin) = &meta.origin else {
+                    continue;
+                };
+                let prior = self.read_prior_import_cached(store, meta)?;
                 let current_basis = prior
                     .model
                     .record
@@ -595,55 +576,100 @@ impl AuthoringService {
                 {
                     continue;
                 }
-                store
-                    .record_watched_import_failure(&WatchedImportFailure {
-                        bundle: meta.bundle,
-                        attempted_input_version: store.input_version(),
-                        basis,
-                        terminal: WatchedImportTerminal::DirectoryOrphan,
-                        message,
-                        memo_seq: store.memo_seq(),
-                    })
-                    .map_err(invalid)?;
+                failures.push((meta.bundle, basis, message));
             }
+        }
+        for (bundle, basis, message) in failures {
+            store
+                .record_watched_import_failure(&WatchedImportFailure {
+                    bundle,
+                    attempted_input_version: store.input_version(),
+                    basis,
+                    terminal: WatchedImportTerminal::DirectoryOrphan,
+                    message,
+                    memo_seq: store.memo_seq(),
+                })
+                .map_err(invalid)?;
         }
         Ok(())
     }
 
-    /// `None` when the failure was memoized or the import is deferred (see
+    /// Plan `import` inside a reconciliation pass's input, at the version
+    /// that input publishes. `None` defers it (see
     /// [`AuthoringService::defer_unavailable`]).
-    pub(crate) fn prepare_watched_directory_import(
+    pub(crate) fn plan_pass_import(
         &self,
         store: &mut Store,
-        base: InputVersion,
-        task: &DirectoryImportTask,
-    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
-        let result = self
-            .directory_import_invocation(store, base, task)
-            .map_err(ImportExecutionError::unmemoized)
-            .and_then(|(importer, invocation)| {
-                self.execute_import(store, base, importer, invocation, ImportExecutionMode::Publish)
-            });
-        match result {
-            Err(error) if error.memoized => Ok(None),
-            result => Ok(self
-                .defer_unavailable(&task.importer, &task.destination_path, result)?),
+        import: &PassImport,
+    ) -> Result<Option<PlannedImport>, RpcFailure> {
+        let base = store.input_version();
+        let planned = match import {
+            PassImport::Directory(task) => {
+                let invocation = self
+                    .directory_import_invocation(store, base, task)
+                    .map_err(ImportExecutionError::unmemoized);
+                self.defer_unavailable(&task.importer, &task.destination_path, invocation)?
+            }
+            PassImport::Watched(bundle) => {
+                let invocation = self
+                    .reimport_invocation(store, base, *bundle)
+                    .map_err(ImportExecutionError::unmemoized);
+                self.defer_reimport(store, *bundle, invocation)?
+            }
+        };
+        Ok(planned.map(|(importer, invocation)| PlannedImport {
+            base,
+            importer,
+            invocation,
+        }))
+    }
+
+    /// Run a planned import outside any write, reading the committed `files`
+    /// rows with the pass's own uncommitted observation over them. `None`
+    /// defers it: its importer went away mid-run.
+    pub(crate) fn run_pass_import(
+        &self,
+        planned: PlannedImport,
+        overlay: Option<&FileOverlay>,
+    ) -> Result<Option<ImportRun>, RpcFailure> {
+        let PlannedImport {
+            base,
+            importer,
+            invocation,
+        } = planned;
+        let id = importer.id.clone();
+        let destination = invocation.destination.path.clone();
+        let result = self.run_import(base, importer, invocation, overlay);
+        self.defer_unavailable(&id, &destination, result)
+    }
+
+    /// Publish a pass's run into the pass's input, at the version that
+    /// input publishes.
+    pub(crate) fn publish_pass_import(
+        &self,
+        store: &mut Store,
+        run: ImportRun,
+    ) -> Result<PassPublication, RpcFailure> {
+        let base = store.input_version();
+        match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
+            Ok(prepared) => Ok(PassPublication::Published(prepared)),
+            Err(error) if error.memoized => Ok(PassPublication::Memoized),
+            Err(error) if error.drifted => Ok(PassPublication::Drifted),
+            Err(error) if error.importer_failed => Ok(PassPublication::Failed(error.rpc)),
+            Err(error) => Err(error.into_rpc()),
         }
     }
 
-    /// Run a directory import at `base` without publishing it. `None` defers
-    /// it (see [`AuthoringService::defer_unavailable`]).
-    pub(crate) fn run_watched_directory_import(
+    /// The bundle a directory task writes, if it exists yet.
+    pub(crate) fn directory_task_destination(
         &self,
-        base: InputVersion,
+        store: &StoreReader,
         task: &DirectoryImportTask,
-    ) -> Result<Option<ImportRun>, RpcFailure> {
-        let result = self
-            .snapshot()
-            .and_then(|snapshot| self.directory_import_invocation(&snapshot, base, task))
-            .map_err(ImportExecutionError::unmemoized)
-            .and_then(|(importer, invocation)| self.run_import(base, importer, invocation));
-        self.defer_unavailable(&task.importer, &task.destination_path, result)
+    ) -> Result<Option<BundleUuid>, RpcFailure> {
+        Ok(store
+            .bundle_at(&task.destination_root, &task.destination_path)
+            .map_err(invalid)?
+            .map(|meta| meta.bundle))
     }
 
     /// Watched reconciliation never fails over an importer that is not
@@ -704,27 +730,6 @@ impl AuthoringService {
         Ok((prior.model.record.importer.clone(), meta.path.clone()))
     }
 
-    /// Coordinator-only watched run of `bundle` at `base`. `None` defers it
-    /// (see [`AuthoringService::defer_unavailable`]).
-    pub(crate) fn run_watched_reimport(
-        &self,
-        base: InputVersion,
-        bundle: BundleUuid,
-    ) -> Result<Option<ImportRun>, RpcFailure> {
-        let result = self
-            .snapshot()
-            .and_then(|snapshot| self.reimport_invocation(&snapshot, base, bundle))
-            .map_err(ImportExecutionError::unmemoized)
-            .and_then(|(importer, invocation)| self.run_import(base, importer, invocation));
-        match result {
-            Ok(run) => Ok(Some(run)),
-            Err(error) => {
-                let snapshot = self.snapshot()?;
-                self.defer_reimport(&snapshot, bundle, Err(error))
-            }
-        }
-    }
-
     fn defer_reimport<T>(
         &self,
         store: &StoreReader,
@@ -737,22 +742,6 @@ impl AuthoringService {
                 Ok((importer, path)) => self.defer_unavailable(&importer, &path, Err(error)),
                 Err(_) => Err(error.into_rpc()),
             },
-        }
-    }
-
-    /// Publish a watched run as the version after `base`, which may be
-    /// later than the run's. `None` when the run failed and the failure
-    /// was memoized instead.
-    pub(crate) fn publish_watched_import(
-        &self,
-        store: &mut Store,
-        base: InputVersion,
-        run: ImportRun,
-    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
-        match self.publish_import(store, base, run, ImportExecutionMode::Publish) {
-            Ok(prepared) => Ok(Some(prepared)),
-            Err(error) if error.memoized => Ok(None),
-            Err(error) => Err(error.into_rpc()),
         }
     }
 
@@ -864,7 +853,7 @@ impl AuthoringService {
     ) -> Result<PreparedImportCommit, RpcFailure> {
         let (importer, invocation) = self.import_invocation(store, base, request)?;
         let run = self
-            .run_import(base, importer, invocation)
+            .run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)?;
         self.publish_import_run(store, base, run)
     }
@@ -880,7 +869,7 @@ impl AuthoringService {
             let snapshot = self.snapshot()?;
             self.import_invocation(&snapshot, base, request)?
         };
-        self.run_import(base, importer, invocation)
+        self.run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)
     }
 
@@ -894,7 +883,7 @@ impl AuthoringService {
             let snapshot = self.snapshot()?;
             self.reimport_invocation(&snapshot, base, bundle)?
         };
-        self.run_import(base, importer, invocation)
+        self.run_import(base, importer, invocation, None)
             .map_err(ImportExecutionError::into_rpc)
     }
 
@@ -935,7 +924,7 @@ impl AuthoringService {
 
         let capabilities = self.importer_capabilities()?;
         let mut backend =
-            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities)?;
+            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities, None)?;
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
         Ok((
             importer,
@@ -1060,30 +1049,6 @@ impl AuthoringService {
         ))
     }
 
-    /// Coordinator-only watched retry. A stable failed attempt that was
-    /// durably memoized is a handled outcome, not a background-loop error.
-    pub(crate) fn prepare_watched_reimport(
-        &self,
-        store: &mut Store,
-        base: InputVersion,
-        bundle: BundleUuid,
-    ) -> Result<Option<PreparedImportCommit>, RpcFailure> {
-        let result = self
-            .reimport_invocation(store, base, bundle)
-            .map_err(ImportExecutionError::unmemoized)
-            .and_then(|(importer, invocation)| {
-                self.execute_import(store, base, importer, invocation, ImportExecutionMode::Publish)
-            });
-        match result {
-            Err(error) if error.memoized => Ok(None),
-            result => {
-                let prepared = self.defer_reimport(store, bundle, result)?;
-                debug_assert!(prepared.as_ref().is_none_or(|prepared| prepared.bundle == bundle));
-                Ok(prepared)
-            }
-        }
-    }
-
     fn execute_import(
         &self,
         store: &mut Store,
@@ -1092,17 +1057,20 @@ impl AuthoringService {
         invocation: ImportInvocation,
         mode: ImportExecutionMode,
     ) -> Result<PreparedImportCommit, ImportExecutionError> {
-        let run = self.run_import(base, importer, invocation)?;
+        let run = self.run_import(base, importer, invocation, None)?;
         self.publish_import(store, base, run, mode)
     }
 
     /// Run the importer at `base`. This writes nothing, so it runs outside any
     /// write transaction; [`AuthoringService::publish_import`] publishes it.
+    /// A reconciliation pass passes its uncommitted `files` observation as
+    /// `overlay`.
     fn run_import(
         &self,
         base: InputVersion,
         importer: RegisteredImporter,
         invocation: ImportInvocation,
+        overlay: Option<&FileOverlay>,
     ) -> Result<ImportRun, ImportExecutionError> {
         let ImportInvocation {
             destination,
@@ -1117,7 +1085,7 @@ impl AuthoringService {
             .importer_capabilities()
             .map_err(ImportExecutionError::unmemoized)?;
         let mut backend =
-            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities)
+            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities, overlay)
                 .map_err(ImportExecutionError::unmemoized)?;
         let mut context = ImportContext::new(&importer.id, sources.clone(), &mut backend)
             .map_err(invalid)
@@ -1236,7 +1204,7 @@ impl AuthoringService {
         if run_base != base {
             require_base(store, base).map_err(ImportExecutionError::unmemoized)?;
             if !destination_unchanged(store, &destination)? {
-                return Err(ImportExecutionError::unmemoized(RpcFailure::StaleInputVersion {
+                return Err(ImportExecutionError::drifted(RpcFailure::StaleInputVersion {
                     expected: base,
                     got: run_base,
                 }));
@@ -1245,7 +1213,7 @@ impl AuthoringService {
         let output = match outcome {
             Ok(output) => output,
             Err(failure) => {
-                let memoized = if mode == ImportExecutionMode::Publish {
+                let memo = if mode == ImportExecutionMode::Publish {
                     self.record_failed_attempt(
                         store,
                         run_base,
@@ -1257,8 +1225,9 @@ impl AuthoringService {
                     )
                     .map_err(ImportExecutionError::unmemoized)?
                 } else {
-                    false
+                    None
                 };
+                let memoized = memo == Some(true);
                 if memoized {
                     // Handled (memoized) failures never reach the loop's
                     // error path; without this the author sees nothing and
@@ -1274,6 +1243,11 @@ impl AuthoringService {
                     rpc: failure.rpc,
                     memoized,
                     importer_unavailable: false,
+                    // The read set moved since the run: the failure is not
+                    // the current sources'.
+                    drifted: memo == Some(false),
+                    // Nothing holds a memo: no watched bundle exists yet.
+                    importer_failed: memo.is_none(),
                 });
             }
         };
@@ -1315,7 +1289,7 @@ impl AuthoringService {
         let mut recheck =
             RootedImportBackend::new(&self.scanner, store, &capabilities);
         if !revalidate_read_set(&read_set, &mut recheck) {
-            return Err(ImportExecutionError::unmemoized(invalid(
+            return Err(ImportExecutionError::drifted(invalid(
                 "import read-set changed before publication; the result was discarded",
             )));
         }
@@ -1410,6 +1384,10 @@ impl AuthoringService {
         store.replace_import_index(Some(&source), &[row]).map_err(invalid)
     }
 
+    /// Memoize a watched run's failure. `Some(true)` once memoized;
+    /// `Some(false)` when its read set moved since the run, so the failure is
+    /// not the current sources'; `None` when no watched bundle exists to
+    /// hold it.
     fn record_failed_attempt(
         &self,
         store: &mut Store,
@@ -1419,16 +1397,17 @@ impl AuthoringService {
         read_set: &[FileDep],
         terminal: WatchedImportTerminal,
         message: &str,
-    ) -> Result<bool, RpcFailure> {
+    ) -> Result<Option<bool>, RpcFailure> {
         let Some(destination) = destination.filter(|_| watch) else {
-            return Ok(false);
+            return Ok(None);
         };
         let basis = encode_attempt_basis(read_set)?;
         let capabilities = self.importer_capabilities()?;
-        let mut backend =
-            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities)?;
+        // Revalidated against the store as this input sees it: a pass's own
+        // uncommitted observation is the current one.
+        let mut backend = RootedImportBackend::new(&self.scanner, store, &capabilities);
         if !revalidate_read_set(read_set, &mut backend) {
-            return Ok(false);
+            return Ok(Some(false));
         }
         // The memo records the attempt whatever version it ran at; the
         // revalidation above only decides whether it is still wanted.
@@ -1446,7 +1425,7 @@ impl AuthoringService {
                 .map_err(invalid)?;
             self.reindex_watched_bundle(store, destination)
         })?;
-        Ok(true)
+        Ok(Some(true))
     }
 
     fn registered_importer(&self, id: &str) -> Result<RegisteredImporter, RpcFailure> {
@@ -1935,20 +1914,103 @@ struct RootedImportBackend<'a> {
 }
 
 /// The store connection an import backend reads `files` through: the
-/// caller's, or its own when no store lock may be held across the import.
+/// caller's, or its own when no store lock may be held across the import,
+/// optionally under a reconciliation pass's uncommitted observation.
 enum ImportRows<'a> {
     Borrowed(&'a StoreReader),
-    Owned(StoreReader),
+    Owned(StoreReader, Option<&'a FileOverlay>),
 }
 
-impl std::ops::Deref for ImportRows<'_> {
-    type Target = StoreReader;
-
-    fn deref(&self) -> &StoreReader {
+impl ImportRows<'_> {
+    fn observed_files_at(&self, path: &str) -> Result<Vec<ObservedFile>, StoreError> {
         match self {
-            Self::Borrowed(reader) => reader,
-            Self::Owned(reader) => reader,
+            Self::Borrowed(reader) => reader.observed_files_at(path),
+            Self::Owned(reader, None) => reader.observed_files_at(path),
+            Self::Owned(reader, Some(overlay)) => overlay.files_at(reader, path),
         }
+    }
+
+    fn observed_files(&self) -> Result<Vec<ObservedFile>, StoreError> {
+        match self {
+            Self::Borrowed(reader) => reader.observed_files(),
+            Self::Owned(reader, None) => reader.observed_files(),
+            Self::Owned(reader, Some(overlay)) => overlay.files(reader),
+        }
+    }
+}
+
+/// The `files` rows a reconciliation pass observed but has not committed:
+/// every row under the scanned prefixes (every row when `under` is `None`).
+/// A pass runs its imports outside any write against the committed rows
+/// with these over them, which is what its input will hold when it
+/// publishes them.
+pub(crate) struct FileOverlay {
+    under: Option<Vec<(String, String)>>,
+    rows: Vec<ObservedFile>,
+}
+
+impl FileOverlay {
+    /// Capture the rows under `under` (all rows when `None`) as `store`'s
+    /// open input holds them.
+    pub(crate) fn capture(
+        store: &StoreReader,
+        under: Option<&[(String, String)]>,
+    ) -> Result<Self, StoreError> {
+        let rows = match under {
+            None => store.observed_files()?,
+            Some(under) => {
+                let mut rows = BTreeMap::new();
+                for (root, prefix) in under {
+                    for row in store.observed_files_under(root, prefix)? {
+                        rows.insert((row.root_name.clone(), row.path.clone()), row);
+                    }
+                }
+                rows.into_values().collect()
+            }
+        };
+        Ok(Self {
+            under: under.map(<[_]>::to_vec),
+            rows,
+        })
+    }
+
+    fn covers(&self, root: &str, path: &str) -> bool {
+        self.under.as_ref().is_none_or(|under| {
+            under.iter().any(|(prefix_root, prefix)| {
+                prefix_root == root
+                    && (prefix.is_empty()
+                        || path == prefix
+                        || path
+                            .strip_prefix(prefix.as_str())
+                            .is_some_and(|suffix| suffix.starts_with('/')))
+            })
+        })
+    }
+
+    fn files_at(&self, reader: &StoreReader, path: &str) -> Result<Vec<ObservedFile>, StoreError> {
+        let mut rows = self.committed(reader.observed_files_at(path)?);
+        rows.extend(self.rows.iter().filter(|row| row.path == path).cloned());
+        rows.sort_by(|left, right| left.root_name.cmp(&right.root_name));
+        Ok(rows)
+    }
+
+    fn files(&self, reader: &StoreReader) -> Result<Vec<ObservedFile>, StoreError> {
+        let mut rows = match self.under {
+            None => Vec::new(),
+            Some(_) => self.committed(reader.observed_files()?),
+        };
+        rows.extend(self.rows.iter().cloned());
+        rows.sort_by(|left, right| {
+            (&left.root_name, &left.path).cmp(&(&right.root_name, &right.path))
+        });
+        Ok(rows)
+    }
+
+    /// The committed rows this overlay does not replace.
+    fn committed(&self, rows: Vec<ObservedFile>) -> Vec<ObservedFile> {
+        rows.into_iter()
+            .filter(|row| !self.covers(&row.root_name, &row.path))
+            .collect()
     }
 }
 
@@ -1965,28 +2027,17 @@ impl<'a> RootedImportBackend<'a> {
         }
     }
 
-    fn owned(
-        scanner: &'a RootedScanner,
-        reader: StoreReader,
-        capabilities: &'a BTreeMap<String, [u8; 32]>,
-    ) -> Self {
-        Self {
-            scanner,
-            rows: ImportRows::Owned(reader),
-            capabilities,
-        }
-    }
-
-    /// A backend on its own store connection.
+    /// A backend on its own store connection, under `overlay` if given.
     fn open(
         scanner: &'a RootedScanner,
         opener: &StoreOpener,
         capabilities: &'a BTreeMap<String, [u8; 32]>,
+        overlay: Option<&'a FileOverlay>,
     ) -> Result<Self, RpcFailure> {
         let reader = opener.open_reader().map_err(invalid)?;
         Ok(Self {
             scanner,
-            rows: ImportRows::Owned(reader),
+            rows: ImportRows::Owned(reader, overlay),
             capabilities,
         })
     }
@@ -3284,6 +3335,34 @@ struct PriorImport {
     bundle: Bundle,
 }
 
+/// One import a reconciliation pass runs: a directory-import output, or a
+/// watched bundle to reimport.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PassImport {
+    Directory(DirectoryImportTask),
+    Watched(BundleUuid),
+}
+
+/// An import a pass planned inside its input, to run outside any write.
+pub(crate) struct PlannedImport {
+    base: InputVersion,
+    importer: RegisteredImporter,
+    invocation: ImportInvocation,
+}
+
+/// What publishing a pass's run did.
+pub(crate) enum PassPublication {
+    Published(PreparedImportCommit),
+    /// The importer failed; the failure is memoized on the bundle, whose
+    /// last good contents stay served.
+    Memoized,
+    /// What the run read changed before it could publish: it was discarded,
+    /// and a later pass reruns it.
+    Drifted,
+    /// The importer failed and no bundle exists yet to hold the memo.
+    Failed(RpcFailure),
+}
+
 /// An importer run, not yet published (see [`AuthoringService::run_import`]).
 pub(crate) struct ImportRun {
     base: InputVersion,
@@ -3340,6 +3419,12 @@ struct ImportExecutionError {
     memoized: bool,
     /// The importer's pipeline epoch went away mid-run.
     importer_unavailable: bool,
+    /// What the run read changed before it could publish: the result is
+    /// discarded, and a later pass reruns it.
+    drifted: bool,
+    /// The importer failed, and no watched bundle exists yet to hold the
+    /// memo.
+    importer_failed: bool,
 }
 
 impl ImportExecutionError {
@@ -3348,6 +3433,15 @@ impl ImportExecutionError {
             rpc,
             memoized: false,
             importer_unavailable: false,
+            drifted: false,
+            importer_failed: false,
+        }
+    }
+
+    fn drifted(rpc: RpcFailure) -> Self {
+        Self {
+            drifted: true,
+            ..Self::unmemoized(rpc)
         }
     }
 

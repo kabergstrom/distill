@@ -40,8 +40,9 @@ pub struct AuthoringService {
     importers: Current<Importers>,
     pipeline_projection: Current<PipelineProjection>,
     /// Set once this process has built the store's import index (see
-    /// `importer`).
-    pub(crate) import_index_built: OnceLock<()>,
+    /// `importer`). A reconciliation pass whose input rolls back restores
+    /// it: the rows it describes rolled back too.
+    pub(crate) import_index_built: std::sync::atomic::AtomicBool,
     tag_index_coordinator: OnceLock<Weak<crate::coordinator::DaemonCoordinator>>,
 }
 
@@ -79,7 +80,7 @@ impl AuthoringService {
             filesystem: Current::new(AuthoringFilesystem { roots }),
             importers: Current::new(Importers::default()),
             pipeline_projection: Current::new(PipelineProjection::default()),
-            import_index_built: OnceLock::new(),
+            import_index_built: std::sync::atomic::AtomicBool::new(false),
             tag_index_coordinator: OnceLock::new(),
         }
     }

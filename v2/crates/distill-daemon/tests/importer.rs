@@ -716,3 +716,395 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
         "the revert reran the import and cleared its failure"
     );
 }
+
+/// [`ByteImporter`] that takes `value` × 10 ms to import. While `gate` holds
+/// its channels, the run of `gated` reports that it started and waits to be
+/// released, once.
+struct PacedImporter {
+    schema: LogicalSchema,
+    gated: u8,
+    gate: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl PacedImporter {
+    fn new(schema: LogicalSchema) -> Self {
+        Self {
+            schema,
+            gated: 0,
+            gate: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Hold the run of `value` until the returned sender releases it; the
+    /// returned receiver reports that it started.
+    fn gated(
+        schema: LogicalSchema,
+        value: u8,
+    ) -> (Self, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        (
+            Self {
+                schema,
+                gated: value,
+                gate: std::sync::Mutex::new(Some((started, released))),
+            },
+            entered,
+            release,
+        )
+    }
+}
+
+impl AuthoringImporter for PacedImporter {
+    fn id(&self) -> &str {
+        "byte-importer"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn settings_type_uuid(&self) -> TypeUuid {
+        TYPE_UUID
+    }
+
+    fn settings_schema(&self) -> &LogicalSchema {
+        &self.schema
+    }
+
+    fn default_settings(&self) -> AuthoredValue {
+        AuthoredValue::UInt(0)
+    }
+
+    fn import(
+        &self,
+        context: &mut dyn AuthoringImportContext,
+        settings: &AuthoredValue,
+    ) -> Result<distill_build::import::ImportOutput, AuthoringImporterError> {
+        let source = context.sources()[0].path.clone();
+        let value = std::str::from_utf8(&context.read(&source)?)
+            .ok()
+            .and_then(|text| text.parse::<u8>().ok());
+        if let Some(value) = value {
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(value) * 10));
+            if value == self.gated {
+                let gate = self.gate.lock().unwrap().take();
+                if let Some((started, release)) = gate {
+                    started.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            }
+        }
+        ByteImporter {
+            schema: self.schema.clone(),
+        }
+        .import(context, settings)
+    }
+}
+
+/// A project with directory rules generating `{stem}.bundle` from each of
+/// `sources` (stem, contents), imported.
+fn imported_sources(
+    sources: &[(&str, &str)],
+    importer: impl FnOnce(LogicalSchema) -> PacedImporter,
+) -> (tempfile::TempDir, std::path::PathBuf, DaemonCoordinator) {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let (ordinary, schema, schema_hash) = ordinary_bundle();
+    std::fs::write(assets.join("ordinary.bundle"), ordinary).unwrap();
+    std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
+    std::fs::write(assets.join("other.txt"), b"7").unwrap();
+    for (stem, contents) in sources {
+        std::fs::write(assets.join(format!("{stem}.src")), contents).unwrap();
+    }
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    publish_schema_registry(&coordinator, schema_hash);
+    coordinator
+        .authoring_service()
+        .register_importer(Arc::new(importer(schema)))
+        .unwrap();
+    assert_eq!(
+        coordinator.reconcile_directory_imports(&mut writer).unwrap().len(),
+        sources.len()
+    );
+    // Earlier passes consumed the setup's watcher work.
+    let work = coordinator.pending_file_work(&mut writer).unwrap();
+    assert!(coordinator.acknowledge_file_work(&mut writer, &work).unwrap());
+    (temp, assets, coordinator)
+}
+
+/// The value each `{stem}.bundle` holds in `store`, `None` while it has none.
+fn generated_values(store: &distill_store::StoreReader, stems: &[&str]) -> Vec<Option<u128>> {
+    stems
+        .iter()
+        .map(|stem| {
+            let bytes = store.bundle_file("main", &format!("{stem}.bundle")).unwrap()?;
+            match distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].data {
+                AuthoredValue::UInt(value) => Some(value),
+                ref other => panic!("unexpected value {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// Every asset of the generated `{stem}.bundle`s, sorted.
+fn generated_assets(assets: &std::path::Path, stems: &[&str]) -> Vec<AssetUuid> {
+    let mut uuids = stems
+        .iter()
+        .flat_map(|stem| {
+            let bytes = std::fs::read(assets.join(format!("{stem}.bundle"))).unwrap();
+            distill_bundle::parse_bundle(&bytes)
+                .unwrap()
+                .assets
+                .into_values()
+                .map(|entry| entry.uuid)
+        })
+        .collect::<Vec<_>>();
+    uuids.sort();
+    uuids
+}
+
+/// `changed` holds each `{stem}.bundle`'s imported asset once, and nothing
+/// outside those bundles.
+fn assert_changes_exactly(changed: &[AssetUuid], assets: &std::path::Path, stems: &[&str]) {
+    let owned = generated_assets(assets, stems);
+    for asset in changed {
+        assert!(owned.contains(asset), "{asset:?} changed outside {stems:?}");
+    }
+    for stem in stems {
+        let bytes = std::fs::read(assets.join(format!("{stem}.bundle"))).unwrap();
+        let asset = distill_bundle::parse_bundle(&bytes).unwrap().assets["asset"].uuid;
+        assert_eq!(
+            changed.iter().filter(|changed| **changed == asset).count(),
+            1,
+            "{stem}'s asset changes once"
+        );
+    }
+}
+
+/// The asset changes the change log holds for `version`.
+fn changed_assets(store: &distill_store::StoreReader, version: InputVersion) -> Vec<AssetUuid> {
+    store
+        .change_log_after(0)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.version == version)
+        .filter_map(|entry| match entry.change {
+            distill_store::served::Change::Asset { asset, .. } => Some(asset),
+            _ => None,
+        })
+        .collect()
+}
+
+fn batch(assets: &std::path::Path, files: &[&str]) -> WatcherBatch {
+    WatcherBatch {
+        paths: files.iter().map(|file| assets.join(file)).collect(),
+        renames: Vec::new(),
+    }
+}
+
+/// A burst touching three generated bundles, whose imports take different
+/// times, publishes as one version: a reader sees every bundle old or every
+/// bundle new, never a mix.
+#[test]
+fn a_burst_across_bundles_publishes_one_version() {
+    let stems = ["a", "b", "c"];
+    let (_temp, assets, coordinator) =
+        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version();
+
+    std::fs::write(assets.join("a.src"), b"9").unwrap();
+    std::fs::write(assets.join("b.src"), b"5").unwrap();
+    std::fs::write(assets.join("c.src"), b"1").unwrap();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (outcome, seen) = std::thread::scope(|scope| {
+        let observer = scope.spawn(|| {
+            let mut seen = Vec::new();
+            loop {
+                let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                let snapshot = coordinator.open_reader().unwrap().begin_snapshot().unwrap();
+                seen.push((snapshot.input_version(), generated_values(&snapshot, &stems)));
+                if finished {
+                    return seen;
+                }
+            }
+        });
+        let outcome = coordinator
+            .reconcile_batch(&mut writer, &batch(&assets, &["a.src", "b.src", "c.src"]), false)
+            .unwrap();
+        done.store(true, std::sync::atomic::Ordering::Release);
+        (outcome, observer.join().unwrap())
+    });
+
+    let version = InputVersion(base.0 + 1);
+    assert_eq!(outcome.stamp.version, version);
+    assert_eq!(outcome.imported.len(), 3);
+    assert!(!outcome.more_work);
+    assert!(outcome.failures.is_empty());
+    let old = vec![Some(1), Some(2), Some(3)];
+    let new = vec![Some(9), Some(5), Some(1)];
+    for (observed, values) in &seen {
+        if *observed == base {
+            assert_eq!(values, &old, "the base holds every old bundle");
+        } else {
+            assert_eq!(*observed, version);
+            assert_eq!(values, &new, "the pass's version holds every new bundle");
+        }
+    }
+    assert_eq!(seen.last().unwrap().0, version);
+
+    let reader = coordinator.open_reader().unwrap();
+    assert_changes_exactly(&changed_assets(&reader, version), &assets, &stems);
+    // The sources' work is acknowledged with the pass; the outputs it wrote
+    // are the next pass's work.
+    let mut pending = reader
+        .pending_file_work()
+        .unwrap()
+        .dirty
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    pending.sort();
+    assert_eq!(pending, ["a.bundle", "b.bundle", "c.bundle"]);
+}
+
+/// An RPC publication that lands while a pass's imports run makes the pass
+/// stale: it publishes nothing, and its retry recomputes everything from the
+/// new base, so both land, once each.
+#[test]
+fn an_rpc_write_during_a_pass_makes_it_stale_and_its_retry_applies_everything_once() {
+    let (_temp, assets, coordinator) =
+        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], |schema| {
+            let (importer, entered, release) = PacedImporter::gated(schema, 4);
+            GATE.with(|gate| *gate.borrow_mut() = Some((entered, release)));
+            importer
+        });
+    let (entered, release) = GATE.with(|gate| gate.borrow_mut().take()).unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version();
+
+    std::fs::write(assets.join("a.src"), b"4").unwrap();
+    std::fs::write(assets.join("b.src"), b"5").unwrap();
+    std::fs::write(assets.join("c.src"), b"6").unwrap();
+    let burst = batch(&assets, &["a.src", "b.src", "c.src"]);
+    let stale = std::thread::scope(|scope| {
+        let pass = scope.spawn(|| {
+            let mut writer = coordinator.open_writer().unwrap();
+            coordinator.reconcile_batch(&mut writer, &burst, false)
+        });
+        entered.recv().unwrap();
+        // The RPC import commits while the pass's import is running.
+        let backend = Arc::clone(coordinator.authoring_service());
+        coordinator
+            .coordinated_commit(&mut writer, base, |store| {
+                backend
+                    .prepare_import(
+                        store,
+                        base,
+                        &ImportRequest {
+                            importer: "byte-importer".into(),
+                            sources: vec!["other.txt".into()],
+                            dest: "explicit.bundle".into(),
+                            settings: AuthoringValue {
+                                canonical_value: Arc::from(&b"3"[..]),
+                                blobs: Vec::new(),
+                            },
+                            watch: true,
+                            root: "main".into(),
+                        },
+                    )
+                    .map(|prepared| prepared.commit)
+                    .map_err(|error| format!("{error:?}"))
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        pass.join().unwrap()
+    });
+    assert!(
+        matches!(
+            stale,
+            Err(distill_daemon::coordinator::CoordinatorError::Coordinated(
+                distill_rpc::CoordinatedCommitError::Stale { .. }
+            ))
+        ),
+        "{stale:?}"
+    );
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(reader.input_version(), InputVersion(base.0 + 1));
+    assert_eq!(
+        generated_values(&reader, &["a", "b", "c"]),
+        [Some(1), Some(2), Some(3)],
+        "the stale pass published nothing"
+    );
+
+    let outcome = coordinator.reconcile_batch(&mut writer, &burst, false).unwrap();
+    let version = InputVersion(base.0 + 2);
+    assert_eq!(outcome.stamp.version, version);
+    assert_eq!(outcome.imported.len(), 3);
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(
+        generated_values(&reader, &["a", "b", "c", "explicit"]),
+        [Some(4), Some(5), Some(6), Some(7)]
+    );
+    // Each publication's assets change once, in its own version.
+    assert_changes_exactly(
+        &changed_assets(&reader, InputVersion(base.0 + 1)),
+        &assets,
+        &["explicit"],
+    );
+    assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "b", "c"]);
+}
+
+thread_local! {
+    static GATE: std::cell::RefCell<
+        Option<(std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// One failing import in a multi-bundle pass: the others publish, the
+/// failing bundle keeps its last good contents and records the failure, and
+/// a new output whose importer fails is reported, all in one version.
+#[test]
+fn an_import_failure_in_a_pass_keeps_its_last_good_bundle_while_the_rest_publish() {
+    let (_temp, assets, coordinator) =
+        imported_sources(&[("a", "1"), ("b", "2"), ("c", "3")], PacedImporter::new);
+    let mut writer = coordinator.open_writer().unwrap();
+    let base = writer.input_version();
+
+    std::fs::write(assets.join("a.src"), b"4").unwrap();
+    std::fs::write(assets.join("b.src"), b"broken").unwrap();
+    std::fs::write(assets.join("c.src"), b"6").unwrap();
+    std::fs::write(assets.join("d.src"), b"new and broken").unwrap();
+    let outcome = coordinator
+        .reconcile_batch(
+            &mut writer,
+            &batch(&assets, &["a.src", "b.src", "c.src", "d.src"]),
+            false,
+        )
+        .unwrap();
+
+    let version = InputVersion(base.0 + 1);
+    assert_eq!(outcome.stamp.version, version);
+    assert_eq!(outcome.imported.len(), 2);
+    assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
+    assert!(!outcome.more_work);
+    let reader = coordinator.open_reader().unwrap();
+    assert_eq!(
+        generated_values(&reader, &["a", "b", "c", "d"]),
+        [Some(4), Some(2), Some(6), None]
+    );
+    let failures = import_failures(&coordinator);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "b.bundle");
+    assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "c"]);
+}

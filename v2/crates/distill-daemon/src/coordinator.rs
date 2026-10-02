@@ -4,7 +4,8 @@
 //! transaction, begun with SQLite's write lock, which rechecks the durable
 //! store basis, applies the complete input, and commits the exact RPC
 //! projection for the same successor version. Publications run on the
-//! calling thread; the process loop runs the scan-driven ones.
+//! calling thread; the process loop runs the scan-driven ones, each pass
+//! of which publishes exactly one input version (see `pass`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use distill_rpc::{
     AuthoringValue, Commit, ConfigurationError, ConfigurationStatus, CoordinatedCommitError,
     DerivedOutputEntry, DerivedOutputMutation, DriftedInput, PathMutation, PipelineDiagnostic,
     Server, ServerHandle, SnapshotStamp, StoredResolve, TargetDefinition, NamespaceError,
-    PreparedImportCommit, RpcFailure, NamespaceErrorV1,
+    RpcFailure, NamespaceErrorV1,
 };
 use distill_schema::ProjectSchemaAuthority;
 use distill_store::bundles::{
@@ -49,7 +50,6 @@ use crate::epoch::{
     stored_pipeline_epoch, CandidateRejection, CandidateRequirements, ModuleHost, PipelineEpoch,
     PipelineSnapshot,
 };
-use crate::importer::ImportRun;
 use crate::module_loader::DynamicPipelineModuleLoader;
 use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{
@@ -58,6 +58,11 @@ use crate::scanner::{
 };
 use crate::scheduler::{ScheduledPool, Scheduler, SchedulerConfig, WorkClass};
 use crate::watcher::{WatcherAction, WatcherBatch, WatcherQueue};
+
+mod pass;
+
+use pass::ImportScope;
+pub use pass::PassOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogicalRename {
@@ -1059,547 +1064,59 @@ impl DaemonCoordinator {
         Ok(())
     }
 
-    /// Reconcile one complete identity-checked namespace scan.
+    /// Reconcile one complete identity-checked namespace scan, as a pass
+    /// with no imports.
     pub fn reconcile_full_scan(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
-        match self.scanner.scan() {
-            Ok(scan)
-                if locked(&self.scan).healthy
-                    && self.scan_initialized.get().is_some() =>
-            {
-                if scan.same_namespace_observation(&ScanSnapshot::load(store)?) {
-                    // Warning-grade exclusions are scanner state, not authored
-                    // input: refresh them without minting an input version.
-                    store.replace_scan_diagnostics(None, &scan.encoded_diagnostic_rows())?;
-                    Ok(self.server.stamp_of(store))
-                } else {
-                    self.publish_scan(store, scan)
-                }
-            }
-            Ok(scan) => self.publish_scan(store, scan),
-            Err(error) => {
-                locked(&self.scan).healthy = false;
-                self.publish_scan_rejection(store, &error, true)
-            }
-        }
-    }
-
-    /// Full startup/recovery scan. Events already queued are replayed
-    /// incrementally after the scan commits; only admitted overflow repeats
-    /// the complete scan. Later events wait in the loop's inbox.
-    pub fn reconcile_startup(
-        &self,
-        store: &mut Store,
-        queue: &mut WatcherQueue,
-    ) -> Result<SnapshotStamp, CoordinatorError> {
-        loop {
-            queue.arm_scan();
-            let scan = self.reconcile_full_scan(store);
-            let action = queue.finish_scan();
-            let stamp = match scan {
-                Ok(stamp) => stamp,
-                Err(error) => {
-                    // Always release scan ownership. Preserve anything that
-                    // arrived while traversal was active so a caller that
-                    // retries can still reconcile the complete event union.
-                    queue.requeue_action(action);
-                    return Err(error);
-                }
-            };
-            match action {
-                WatcherAction::None => return Ok(stamp),
-                WatcherAction::Batch(batch) => return self.reconcile_incremental(store, &batch),
-                WatcherAction::FullRescan => continue,
-                WatcherAction::Failed(message) => {
-                    return Err(CoordinatorError::InvalidManifest(message))
-                }
-            }
-        }
+        let base = self.server.stamp_of(store).version;
+        let step = self.full_step(store)?;
+        self.pass(store, base, step, ImportScope::NONE)
+            .map(|outcome| outcome.stamp)
     }
 
     /// Apply one native watcher batch by reopening only its affected paths or
-    /// directory subtrees and merging those observations into startup state.
+    /// directory subtrees and merging those observations into the published
+    /// state, as a pass with no imports.
     pub fn reconcile_incremental(
         &self,
         store: &mut Store,
         batch: &WatcherBatch,
     ) -> Result<SnapshotStamp, CoordinatorError> {
-        let pending_subjects = locked(&self.scan)
-            .rejection
-            .as_ref()
-            .map(|pending| pending.subjects.clone())
-            .unwrap_or_default();
-        let event_keys = batch
-            .paths
-            .iter()
-            .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
-            .collect::<Vec<_>>();
-        let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
-            prefix.0 == candidate.0
-                && (prefix.1.is_empty()
-                    || candidate.1 == prefix.1
-                    || candidate
-                        .1
-                        .strip_prefix(&prefix.1)
-                        .is_some_and(|suffix| suffix.starts_with('/')))
-        };
-        let heals_pending_rejection = pending_subjects.iter().any(|subject| {
-            let physical_overlap = batch.paths.iter().any(|event| {
-                event == subject || subject.starts_with(event) || event.starts_with(subject)
-            });
-            physical_overlap
-                || self
-                    .scanner
-                    .event_path_key(subject)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|subject_key| {
-                        event_keys.iter().any(|event_key| {
-                            logical_contains(&subject_key, event_key)
-                                || logical_contains(event_key, &subject_key)
-                        })
-                    })
-        });
-        let mut scan_paths = batch.paths.clone();
-        if heals_pending_rejection {
-            // Revalidate the complete rejected subject set, but no unrelated
-            // root or subtree. This lets independently repaired defects heal
-            // across separate native batches without falling back to a full
-            // scan.
-            scan_paths.extend(pending_subjects);
-            scan_paths.sort_unstable();
-            scan_paths.dedup();
-        }
-        let mut renames = Vec::new();
-        for rename in &batch.renames {
-            let from = self.scanner.event_path_key(&rename.from)?;
-            let to = self.scanner.event_path_key(&rename.to)?;
-            if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
-                if from_root == to_root {
-                    renames.push(LogicalRename {
-                        root_name: from_root,
-                        from_path,
-                        to_path,
-                    });
-                }
-            }
-        }
-        let (delta, baseline) = {
-            let stored = StoredBaseline::new(store);
-            let delta = self.scanner.scan_incremental_delta(&stored, &scan_paths);
-            stored.finish()?;
-            match delta {
-                Ok(None) => return Ok(self.server.stamp_of(store)),
-                // The published rows the delta replaces.
-                Ok(Some(delta)) => {
-                    let baseline = ScanSnapshot::load_under(store, delta.affected_prefixes())?;
-                    (delta, baseline)
-                }
-                Err(error) => {
-                    locked(&self.scan).healthy = false;
-                    return self.publish_scan_rejection(store, &error, heals_pending_rejection);
-                }
-            }
-        };
-        let healed_rejection = heals_pending_rejection
-            .then(|| locked(&self.scan).rejection.take())
-            .flatten();
-        if delta.is_same_namespace_observation(&baseline)
-            && renames.is_empty()
-            && locked(&self.scan).healthy
-        {
-            // Diagnostics are replaced with their affected subtree even when
-            // the authored namespace itself did not change.
-            store.replace_scan_diagnostics(
-                Some(delta.affected_prefixes()),
-                &delta.observed().encoded_diagnostic_rows(),
-            )?;
-            return Ok(self.server.stamp_of(store));
-        }
-        let projection = self.authoring.pipeline_projection();
-        let authority = self.schema_authority();
-        let claims = match bundle_claims(
-            delta
-                .observed_bundle_entries()
-                .map(|(_, source)| source.as_ref()),
-            &projection,
-            authority.as_deref(),
-        ) {
-            Ok(claims) => claims,
-            Err(error) => {
-                if let Some(rejection) = healed_rejection {
-                    locked(&self.scan).rejection = Some(rejection);
-                }
-                return Err(error);
-            }
-        };
-        let inputs = PlanInputs {
-            configuration_error: self.configuration_error(),
-            namespace_errors: self.pending_scan_errors(),
-            authority: authority.as_deref(),
-            fresh: fresh_bundles(&delta),
-        };
         let base = self.server.stamp_of(store).version;
-        let tag_epoch = authority
-            .as_ref()
-            .map_or([0; 32], |authority| authority.source_hash());
-        let pipeline = self.pipeline_snapshot();
-        let targets = self
-            .build_targets.load();
-        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let scanner = self.scanner.clone();
-        let result = self.server.coordinated_commit(store, base, |store| {
-            let mut commit = publish_incremental_scan(
-                store,
-                base,
-                &baseline,
-                &delta,
-                &claims,
-                &inputs,
-                &renames,
-                &projection,
-                tag_epoch,
-            )
-            .map_err(|error| error.to_string())?;
-            if let Some(authority) = authority.clone() {
-                let affected = commit_affected_asset_bundles(&commit);
-                if !affected.is_empty() {
-                    crate::build::refine_published_tag_index_incremental(
-                        store,
-                        scanner,
-                        authority,
-                        pipeline,
-                        &targets,
-                        max_dependency_depth,
-                        &affected,
-                    )
-                    .apply_incremental(&mut commit);
-                }
-            }
-            Ok(commit)
-        });
-        match result {
-            Ok(stamp) => {
-                {
-                    let mut scan = locked(&self.scan);
-                    scan.healthy = scan.rejection.is_none();
-                }
-                Ok(stamp)
-            }
-            Err(error) => {
-                if let Some(rejection) = healed_rejection {
-                    locked(&self.scan).rejection = Some(rejection);
-                }
-                Err(CoordinatorError::Coordinated(error))
-            }
-        }
+        let step = self.incremental_step(store, batch)?;
+        self.pass(store, base, step, ImportScope::NONE)
+            .map(|outcome| outcome.stamp)
     }
 
     fn publish_cached_scan(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
+        let base = self.server.stamp_of(store).version;
         let scan = self.published_scan(store)?;
-        self.publish_scan_with_renames(store, scan, &[], false)
+        let step = self.candidate_step(scan, &[], false)?;
+        self.pass(store, base, step, ImportScope::NONE)
+            .map(|outcome| outcome.stamp)
     }
 
-    fn publish_scan(&self, store: &mut Store, scan: ScanSnapshot) -> Result<SnapshotStamp, CoordinatorError> {
-        self.publish_scan_with_renames(store, scan, &[], true)
-    }
-
-    fn publish_scan_with_renames(
-        &self,
-        store: &mut Store,
-        scan: ScanSnapshot,
-        renames: &[LogicalRename],
-        heals_scan_rejection: bool,
-    ) -> Result<SnapshotStamp, CoordinatorError> {
-        let authority = self.schema_authority();
-        let mut candidate = ScanCandidate::build(
-            scan,
-            self.configuration_error(),
-            authority.as_deref(),
-        )?;
-        if !heals_scan_rejection {
-            candidate
-                    .namespace_errors
-                    .extend(self.pending_scan_errors());
-        }
-        candidate.renames.extend_from_slice(renames);
-        let base = self.server.stamp_of(store).version;
-        let projection = self.authoring.pipeline_projection();
-        let claims = bundle_claims(
-            candidate.scan.bundle_rows(),
-            &projection,
-            authority.as_deref(),
-        )?;
-        let tag_epoch = authority
-            .as_ref()
-            .map_or([0; 32], |authority| authority.source_hash());
-        let pipeline = self.pipeline_snapshot();
-        let build_targets = self
-            .build_targets.load();
-        let max_dependency_depth = self.operational_configuration().max_dependency_depth;
-        let scanner = self.scanner.clone();
-        let fallback_bundles = store
-            .all_asset_bundles()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let stamp = self
-            .server
-            .coordinated_commit(store, base, |store| {
-                let mut commit = publish_scan(
-                    store,
-                    base,
-                    candidate,
-                    false,
-                    None,
-                    &projection,
-                    tag_epoch,
-                    &claims,
-                )
-                .map_err(|error| error.to_string())?;
-                if let Some(authority) = authority {
-                    crate::build::refine_published_tag_index(
-                        store,
-                        scanner,
-                        authority,
-                        pipeline,
-                        &build_targets,
-                        max_dependency_depth,
-                        &commit_asset_bundles(&commit, &fallback_bundles),
-                    )
-                    .apply(&mut commit);
-                }
-                Ok(commit)
-            })
-            .map_err(CoordinatorError::Coordinated)?;
-        let _ = self.scan_initialized.set(());
-        if heals_scan_rejection {
-            locked(&self.scan).rejection.take();
-        }
-        {
-            let mut scan = locked(&self.scan);
-            scan.healthy = scan.rejection.is_none();
-        }
-        Ok(stamp)
-    }
-
-    fn publish_scan_rejection(
-        &self,
-        store: &mut Store,
-        error: &ScanError,
-        replaces_pending: bool,
-    ) -> Result<SnapshotStamp, CoordinatorError> {
-        let observed_rejection = classify_scan_rejection(&self.scanner, error)?;
-        let previous_pending = locked(&self.scan).rejection.clone();
-        let rejection = if replaces_pending {
-            observed_rejection
-        } else {
-            select_scan_rejection(
-                previous_pending
-                    .as_ref()
-                    .map(|pending| pending.rejection.clone())
-                    .into_iter()
-                    .chain([observed_rejection]),
-            )?
-        };
-        let mut subjects = self.scanner.rejection_subjects(error);
-        if !replaces_pending {
-            if let Some(previous) = &previous_pending {
-                subjects.extend(previous.subjects.iter().cloned());
-            }
-        }
-        subjects.sort_unstable();
-        subjects.dedup();
-        let pending = PendingScanRejection {
-            rejection: rejection.clone(),
-            subjects,
-        };
-        // The scan could not observe the rejected subjects, so the namespace
-        // keeps what it published; only the errors change.
-        let version = store
-            .claims_namespace_errors()?
-            .into_iter()
-            .chain(rejection.version.iter().cloned())
-            .collect::<Vec<_>>();
-        let source_configuration = locked(&self.configuration_error)
-            .clone();
-        let external_configuration = ConfigurationError::select_canonical(
-            source_configuration
-                .into_iter()
-                .chain(rejection.configuration.clone()),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let configuration =
-            external_configuration.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed);
-        let base = self.server.stamp_of(store).version;
-        let stamp = self
-            .server
-            .coordinated_commit(store, base, |store| {
-                if store.input_version() != base {
-                    return Err(format!(
-                        "durable rejected-scan basis is {:?}, expected {base:?}",
-                        store.input_version()
-                    ));
-                }
-                let generation = match store
-                    .configuration_state()
-                    .map_err(|error| error.to_string())?
-                {
-                    ConfigurationState::Ready(epoch) => epoch.generation,
-                    ConfigurationState::Failed { last_good, .. } => {
-                        last_good.map_or(0, |epoch| epoch.generation)
-                    }
-                };
-                store
-                    .input_transaction(|transaction| {
-                        transaction.set_namespace_errors(version.iter().cloned())?;
-                        match &configuration {
-                            ConfigurationStatus::Ready => {
-                                transaction.publish_configuration_ready(generation)?
-                            }
-                            ConfigurationStatus::Failed(error) => transaction
-                                .publish_configuration_error(&error.detail, &error.message)?,
-                        }
-                        Ok(())
-                    })
-                    .map_err(|error| error.to_string())?;
-                let commit = Commit {
-                    configuration: Some(configuration.clone()),
-                    namespace_errors: Some(version.clone()),
-                    ..Commit::default()
-                };
-                Ok(commit)
-            })
-            .map_err(CoordinatorError::Coordinated)?;
-        locked(&self.scan).rejection = Some(pending);
-        Ok(stamp)
-    }
-
-    /// Rerun watched imports whose complete outcome-bearing basis drifted.
-    /// Each bundle publishes as its own version so a later conflict cannot
-    /// roll back an earlier per-file success.
+    /// Rerun every watched import whose complete outcome-bearing basis
+    /// drifted, as one pass: all of them publish as one version.
     pub fn reconcile_watched_imports(&self, store: &mut Store) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let pending = self
-            .authoring
-            .watched_imports_needing_reimport(store)
-            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_watched_import_bundles(store, pending)
+        self.import_pass(store, ImportScope::watched(None))
     }
 
-    /// Watcher-batch variant that revalidates only read sets capable of
-    /// observing one of the transactionally queued dirty paths.
+    /// Watcher-work variant that revalidates only read sets capable of
+    /// observing one of `work`'s dirty paths.
     pub fn reconcile_watched_imports_affected(
         &self,
         store: &mut Store,
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let pending = if capabilities_changed {
-            self.authoring
-                .watched_imports_affected_by_capabilities(store, &work.dirty, &work.renames)
-        } else {
-            self.authoring.watched_imports_affected_by(store, &work.dirty, &work.renames)
-        }
-        .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_watched_import_bundles(store, pending)
+        self.import_pass(store, ImportScope::watched(Some((work, capabilities_changed))))
     }
 
-    fn reconcile_watched_import_bundles(
-        &self,
-        store: &mut Store,
-        pending: Vec<BundleUuid>,
-    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.reconcile_watched(store, 
-            &pending,
-            |base, bundle| self.authoring.run_watched_reimport(base, *bundle),
-            |store, base, bundle| self.authoring.prepare_watched_reimport(store, base, *bundle),
-        )
-    }
-
-    /// Run each watched import in parallel, outside any write, at the
-    /// current version; then publish them in order, each in its own input as
-    /// its own version. A run that an earlier publication made stale reruns
-    /// there, at the version it publishes after.
-    /// A `None` run is deferred: its importer is unavailable (see
-    /// `AuthoringService::defer_unavailable`).
-    fn reconcile_watched<T: Sync>(
-        &self,
-        store: &mut Store,
-        items: &[T],
-        run: impl Fn(InputVersion, &T) -> Result<Option<ImportRun>, RpcFailure> + Sync,
-        rerun: impl Fn(&mut Store, InputVersion, &T) -> Result<Option<PreparedImportCommit>, RpcFailure>,
-    ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        use rayon::prelude::*;
-
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        let base = self.server.stamp_of(store).version;
-        let runs = items
-            .par_iter()
-            .map(|item| run(base, item))
-            .collect::<Vec<_>>();
-        let mut imported = Vec::with_capacity(items.len());
-        for (item, run) in items.iter().zip(runs) {
-            let current = self.server.stamp_of(store).version;
-            let drifted = current != base;
-            let mut bundle = None;
-            let publication = self
-                .server
-                .coordinated_maybe_commit(store, current, |store| {
-                    let prepared = match run {
-                        Ok(None) => Ok(None),
-                        Ok(Some(run)) => match self.authoring.publish_watched_import(store, current, run) {
-                            Err(_) if drifted => rerun(store, current, item),
-                            published => published,
-                        },
-                        Err(_) if drifted => rerun(store, current, item),
-                        Err(error) => Err(error),
-                    }
-                    .map_err(|error| format!("{error:?}"))?;
-                    Ok(prepared.map(|prepared| {
-                        bundle = Some(prepared.bundle);
-                        prepared.commit
-                    }))
-                })
-                .map_err(CoordinatorError::Coordinated)?;
-            if publication.is_some() {
-                imported.push(bundle.expect("a published watched import names its bundle"));
-            }
-        }
-        Ok(imported)
-    }
-
-
-    pub fn pending_file_work(&self, store: &mut Store) -> Result<PendingFileWork, CoordinatorError> {
-        store
-            .pending_file_work()
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
-    }
-
-    pub fn acknowledge_file_work(
-        &self,
-        store: &mut Store,
-        work: &PendingFileWork,
-    ) -> Result<(), CoordinatorError> {
-        if work.is_empty() {
-            return Ok(());
-        }
-        match store.acknowledge_file_work(work) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(CoordinatorError::InvalidManifest(
-                "watcher work observation changed before acknowledgement".to_owned(),
-            )),
-            Err(error) => Err(CoordinatorError::InvalidManifest(error.to_string())),
-        }
-    }
-
-    /// Discover and apply authored directory-import rules. Every generated
-    /// bundle is a separate versioned fold; orphaned prior outputs
-    /// are deliberately retained and therefore never appear as deletion work.
+    /// Discover and apply authored directory-import rules, as one pass.
+    /// Orphaned prior outputs are deliberately retained and therefore never
+    /// appear as deletion work.
     pub fn reconcile_directory_imports(&self, store: &mut Store) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let tasks = self
-            .authoring
-            .directory_import_tasks(store)
-            .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_directory_import_tasks(store, tasks)
+        self.import_pass(store, ImportScope::directories(None))
     }
 
     pub fn reconcile_directory_imports_affected(
@@ -1608,26 +1125,44 @@ impl DaemonCoordinator {
         work: &PendingFileWork,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        let tasks = if capabilities_changed {
-            self.authoring
-                .directory_import_tasks_affected_by_capabilities(store, &work.dirty, &work.renames)
-        } else {
-            self.authoring.directory_import_tasks_affected_by(store, &work.dirty, &work.renames)
-        }
-        .map_err(|error| CoordinatorError::InvalidManifest(format!("{error:?}")))?;
-        self.reconcile_directory_import_tasks(store, tasks)
+        self.import_pass(store, ImportScope::directories(Some((work, capabilities_changed))))
     }
 
-    fn reconcile_directory_import_tasks(
+    /// An imports-only pass. An importer failure with no bundle to hold its
+    /// memo is this call's error, after the rest of the pass published.
+    fn import_pass(
         &self,
         store: &mut Store,
-        tasks: Vec<crate::importer::DirectoryImportTask>,
+        scope: ImportScope<'_>,
     ) -> Result<Vec<BundleUuid>, CoordinatorError> {
-        self.reconcile_watched(store, 
-            &tasks,
-            |base, task| self.authoring.run_watched_directory_import(base, task),
-            |store, base, task| self.authoring.prepare_watched_directory_import(store, base, task),
-        )
+        let base = self.server.stamp_of(store).version;
+        let outcome = self.pass(store, base, pass::ScanStep::Unchanged, scope)?;
+        if !outcome.failures.is_empty() {
+            return Err(CoordinatorError::InvalidManifest(outcome.failures.join("; ")));
+        }
+        Ok(outcome.imported)
+    }
+
+    pub fn pending_file_work(&self, store: &mut Store) -> Result<PendingFileWork, CoordinatorError> {
+        store
+            .pending_file_work()
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
+    }
+
+    /// Clear the watcher work whose observation still stands. A path whose
+    /// observation moved on has more work queued behind it, not an error: it
+    /// stays pending, and this returns `false`.
+    pub fn acknowledge_file_work(
+        &self,
+        store: &mut Store,
+        work: &PendingFileWork,
+    ) -> Result<bool, CoordinatorError> {
+        if work.is_empty() {
+            return Ok(true);
+        }
+        store
+            .acknowledge_file_work(work)
+            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 }
 
@@ -2285,6 +1820,7 @@ fn scan_key_matches(prefix: &ScanKey, key: &ScanKey) -> bool {
                 .strip_prefix(&prefix.1)
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
+#[derive(Clone)]
 struct ScanCandidate {
     scan: ScanSnapshot,
     renames: Vec<LogicalRename>,
@@ -2688,14 +2224,6 @@ fn publish_scan(
             })?;
     }
 
-    let observation =
-        InputVersion(
-            base.0
-                .checked_add(1)
-                .ok_or_else(|| StoreError::InvalidConfiguration {
-                    error: "input version exhausted".to_owned(),
-                })?,
-        );
     let publishable_changed_bundles = changed_bundles;
     let rpc_publishable_bundles = rpc_changed_bundles;
     let mut commit = rpc_commit(
@@ -2711,6 +2239,9 @@ fn publish_scan(
     )?;
     let mut next_pipeline = pipeline_diagnostic(store.pipeline_state()?);
     store.input_transaction(|transaction| {
+        // Rows are labelled with the version the input publishes, which a
+        // pass's earlier step may already have advanced to.
+        let observation = transaction.version();
         transaction.replace_source_claims(None, claims)?;
         let mut root_ids = BTreeMap::new();
         let mut newest_mtime = 0;
@@ -2930,15 +2461,10 @@ fn publish_incremental_scan(
             ),
         });
     }
-    let observation =
-        InputVersion(
-            base.0
-                .checked_add(1)
-                .ok_or_else(|| StoreError::InvalidConfiguration {
-                    error: "input version exhausted".to_owned(),
-                })?,
-        );
     let (commit, _) = store.input_transaction(|transaction| {
+        // Rows are labelled with the version the input publishes: inside a
+        // pass, an earlier step has already advanced it past `base`.
+        let observation = transaction.version();
         let watermark = transaction.reader().clean_watermark()?.unwrap_or(0);
         let mut root_ids = BTreeMap::new();
         let mut newest_mtime = watermark;

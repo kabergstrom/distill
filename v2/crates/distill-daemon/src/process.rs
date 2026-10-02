@@ -4,7 +4,12 @@
 //! channel; every reconciliation it starts publishes from that thread. It
 //! reconciles watcher changes once the filesystem has settled: each change
 //! restarts a trailing quiet window (`watch.quiet_ms`, `crate::settle`),
-//! and no pass runs while the window is open (`Schedule`).
+//! and no pass runs while the window is open (`Schedule`). Each pass
+//! publishes one input version. A pass that leaves work behind (a drifted
+//! import, a path with newer work) is retried after a delay; a `Stale`
+//! pass, overtaken by an outside write, is retried without an error; and
+//! the background error is replaced by each pass's outcome, so it clears
+//! once a later pass succeeds.
 
 use std::io::Read;
 use std::net::SocketAddr;
@@ -23,10 +28,11 @@ use distill_store::state::{
 
 use crate::codegen::CodegenService;
 use crate::config::{candidate_error_reason, config_error_reason, DaemonConfig, DaemonConfigError};
-use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator};
+use crate::coordinator::{CoordinatorError, CoordinatorInitError, DaemonCoordinator, PassOutcome};
 use crate::settle::{HeldOpen, QuietWindow};
 use crate::watcher::{
-    WatcherAction, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink, WatcherStartError,
+    WatcherAction, WatcherBatch, WatcherControl, WatcherEvent, WatcherQueue, WatcherSink,
+    WatcherStartError,
     WatcherThread,
 };
 use distill_store::config::RestartOnlyChange;
@@ -244,6 +250,7 @@ impl DaemonProcess {
                 coordinator.server_handle().snapshot_policy().ttl + CAS_DELETE_MARGIN,
             ),
             capabilities_pending: false,
+            work_pending: false,
         };
         // Startup runs on the loop thread before the loop: events the
         // watcher sends meanwhile wait in its inbox.
@@ -418,6 +425,9 @@ struct ProcessLoop {
     /// completed. A requeued pass keeps it: the configuration watch reports
     /// the change only once.
     capabilities_pending: bool,
+    /// A pass left watcher work in the store for another pass (see
+    /// `PassOutcome::more_work`).
+    work_pending: bool,
 }
 
 impl ProcessLoop {
@@ -437,17 +447,22 @@ impl ProcessLoop {
             .replace_roots(&self.coordinator.scanner())
             .map_err(CoordinatorError::InvalidManifest)?;
         let started = Instant::now();
-        self.coordinator.reconcile_startup(store, &mut self.queue)?;
-        tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
-        reconcile_imports(&self.coordinator, store, true, false)?;
-        tracing::info!(elapsed = ?started.elapsed(), "startup imports reconciled");
-        if let Err(error) = self.codegen.run(&self.coordinator, store) {
-            self.errors.send_replace(Some(error));
+        // The scan and every import it makes due publish as one version.
+        let outcome = self.coordinator.reconcile_rescan(store, &mut self.queue)?;
+        tracing::info!(elapsed = ?started.elapsed(), "startup reconciled");
+        if outcome.more_work {
+            self.queue.requeue_action(WatcherAction::FullRescan);
         }
+        let mut error = pass_failures(&outcome);
+        if let Err(codegen) = self.codegen.run(&self.coordinator, store) {
+            error = Some(codegen);
+        }
+        self.errors.send_replace(error);
         Ok(())
     }
 
-    /// One pass of the loop: reconcile what the watcher queued.
+    /// One pass of the loop: reconcile what the watcher queued, and what an
+    /// earlier pass left pending, as one input version.
     fn tick(&mut self) -> bool {
         let action = self.queue.take_live_action();
         if let WatcherAction::Failed(message) = &action {
@@ -456,6 +471,17 @@ impl ProcessLoop {
             self.stop.send_replace(true);
             return false;
         }
+        let control_invalidation = match &action {
+            WatcherAction::Batch(batch) => self.config_watch.invalidation_for(batch),
+            WatcherAction::FullRescan => Some(ControlInvalidation::all()),
+            WatcherAction::None | WatcherAction::Failed(_) => None,
+        };
+        // Work an earlier pass left in the store needs a pass of its own
+        // even when the watcher has nothing new.
+        let action = match action {
+            WatcherAction::None if self.work_pending => WatcherAction::Batch(WatcherBatch::default()),
+            action => action,
+        };
         let retry_action = action.clone();
         let started = Instant::now();
         match &action {
@@ -465,12 +491,6 @@ impl ProcessLoop {
             WatcherAction::FullRescan => tracing::info!("reconciling full rescan"),
             WatcherAction::None | WatcherAction::Failed(_) => {}
         }
-        let reconciled = !matches!(action, WatcherAction::None);
-        let control_invalidation = match &action {
-            WatcherAction::Batch(batch) => self.config_watch.invalidation_for(batch),
-            WatcherAction::FullRescan => Some(ControlInvalidation::all()),
-            WatcherAction::None | WatcherAction::Failed(_) => None,
-        };
         let coordinator = &self.coordinator;
         let store = &mut *self.store;
         let result = match control_invalidation {
@@ -492,21 +512,22 @@ impl ProcessLoop {
             self.capabilities_pending
         })
         .and_then(|capabilities_changed| match action {
-            WatcherAction::None => Ok(()),
+            WatcherAction::None => coordinator
+                .sync_runtime_pipeline_failure(store)
+                .map(|_| None),
             WatcherAction::Batch(batch) => coordinator
-                .reconcile_incremental(store, &batch)
-                .and_then(|_| reconcile_imports(coordinator, store, false, capabilities_changed)),
+                .reconcile_batch(store, &batch, capabilities_changed)
+                .map(Some),
             WatcherAction::FullRescan => coordinator
-                .reconcile_startup(store, &mut self.queue)
-                .and_then(|_| reconcile_imports(coordinator, store, true, false)),
+                .reconcile_rescan(store, &mut self.queue)
+                .map(Some),
             WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
         });
-        let failure_result = coordinator.sync_runtime_pipeline_failure(store).map(|_| ());
-        let result = result.and(failure_result);
         match result {
             // Another publication (an RPC import, say) moved the input
             // version between this pass reading its base and committing.
-            // Nothing was published; the retry sees the new base.
+            // Nothing was published; the retry recomputes the whole pass
+            // from the new base.
             Err(CoordinatorError::Coordinated(distill_rpc::CoordinatedCommitError::Stale {
                 expected,
                 observed,
@@ -519,16 +540,39 @@ impl ProcessLoop {
                 self.errors.send_replace(Some(error.to_string()));
                 self.queue.requeue_action(retry_action);
             }
-            Ok(()) => {
-                self.capabilities_pending = false;
-                if reconciled {
-                    tracing::info!(elapsed = ?started.elapsed(), "reconciled");
+            Ok(outcome) => {
+                let more_work = outcome.as_ref().is_some_and(|outcome| outcome.more_work);
+                if let Some(outcome) = &outcome {
+                    tracing::info!(
+                        elapsed = ?started.elapsed(),
+                        version = ?outcome.stamp.version,
+                        more_work,
+                        "reconciled"
+                    );
                 }
-                if let Err(error) = self.codegen.run(&self.coordinator, store) {
-                    tracing::warn!(%error, "codegen failed");
-                    self.errors.send_replace(Some(error));
+                if more_work {
+                    // Imports this pass could not finish rerun in the next
+                    // one, with the same capability change if it had one. A
+                    // full pass reruns whole: its imports were not limited to
+                    // the work.
+                    match retry_action {
+                        WatcherAction::FullRescan => self.queue.requeue_action(retry_action),
+                        _ => self.work_pending = true,
+                    }
+                    self.schedule.request(Instant::now() + RETRY_DELAY);
+                } else {
+                    self.work_pending = false;
+                    self.capabilities_pending = false;
+                }
+                // A pass that succeeded clears the last background error;
+                // what still fails is reported again.
+                let mut error = outcome.as_ref().and_then(pass_failures);
+                if let Err(codegen) = self.codegen.run(&self.coordinator, store) {
+                    tracing::warn!(error = %codegen, "codegen failed");
+                    error = Some(codegen);
                     self.schedule.request(Instant::now() + RETRY_DELAY);
                 }
+                self.errors.send_replace(error);
             }
         }
         true
@@ -1203,30 +1247,9 @@ fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
     ConfigurationSourcePath::Windows(path.as_os_str().encode_wide().collect())
 }
 
-fn reconcile_imports(
-    coordinator: &DaemonCoordinator,
-    store: &mut Store,
-    revalidate_all: bool,
-    capabilities_changed: bool,
-) -> Result<(), CoordinatorError> {
-    let work = coordinator.pending_file_work(store)?;
-    let directories = if revalidate_all {
-        coordinator.reconcile_directory_imports(store)
-    } else {
-        coordinator.reconcile_directory_imports_affected(store, &work, capabilities_changed)
-    };
-    let reconcile = directories.and_then(|_| {
-        if revalidate_all {
-            coordinator.reconcile_watched_imports(store)
-        } else {
-            coordinator.reconcile_watched_imports_affected(store, &work, capabilities_changed)
-        }
-    });
-    if reconcile.is_ok() {
-        coordinator.acknowledge_file_work(store, &work)?;
-    }
-    let failure = coordinator.sync_runtime_pipeline_failure(store).map(|_| ());
-    reconcile.and(failure)
+/// The failures a pass published around, as the loop's background error.
+fn pass_failures(outcome: &PassOutcome) -> Option<String> {
+    (!outcome.failures.is_empty()).then(|| outcome.failures.join("; "))
 }
 
 /// The RPC listener thread. It only accepts: every connection is served on a
