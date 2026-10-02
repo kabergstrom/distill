@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use unicode_normalization::UnicodeNormalization;
 
-use distill_store::bundles::AssetFilter;
+use distill_store::bundles::{AssetAnswer, AssetFilter};
 use distill_store::files::GlobKeys;
 use distill_store::served::{ResolutionRow, ServedEntryMeta, SERVED_RESTART_KEYS};
 use distill_store::{Store, StoreError, StoreReader};
@@ -246,7 +246,7 @@ pub(crate) fn chunk_payload(payload: &ArtifactPayload, chunk_size: usize) -> Chu
 fn query_pure_metadata(
     snapshot: &StoreReader,
     query: &PureMetadataQuery,
-) -> Result<Vec<AssetUuid>, StoreError> {
+) -> Result<Result<Vec<AssetUuid>, RpcFailure>, StoreError> {
     let filter = AssetFilter {
         asset: query.uuid,
         bundle: query.bundle,
@@ -257,11 +257,7 @@ fn query_pure_metadata(
             .map(|role| role == AuthoringEntryRole::AuthoringOnly),
         ..AssetFilter::default()
     };
-    Ok(snapshot
-        .served_assets_matching(&filter)?
-        .into_iter()
-        .map(|matched| matched.asset)
-        .collect())
+    Ok(assets(snapshot.served_assets_matching(&filter, |_| true)?))
 }
 
 /// The whole-table scan [`query_pure_metadata`] replaced, kept to pin its
@@ -413,10 +409,10 @@ fn query_matches(entry: &ServedEntryMeta, query: &AssetQuery, role: AuthoringEnt
         && entry_role(entry.authoring_only) == role
 }
 
-/// Run an asset query over a pinned snapshot, failing when a tag query
-/// would consult a poisoned tag index: the entries the query selects without
-/// its tag whose tag index is poisoned name the failing bundles. Both reads
-/// are indexed SQL queries; only the glob is matched here.
+/// Run an asset query over a pinned snapshot as one asset query
+/// (DESIGN.md §13, asset queries): it fails naming the poisoned bundles it
+/// reaches, through a poisoned bundle's skeleton or a poisoned tag index.
+/// Only the glob is matched here.
 fn query_assets(
     snapshot: &StoreReader,
     query: &AssetQuery,
@@ -428,33 +424,20 @@ fn query_assets(
             .as_ref()
             .is_none_or(|glob| path_glob_matches(glob, path))
     };
-    if query.tag.is_some() {
-        let poisoned = AssetFilter {
-            tag: None,
-            tag_index_poisoned: true,
-            ..asset_filter(query, role)
-        };
-        let bundles = snapshot
-            .served_assets_matching(&poisoned)?
-            .into_iter()
-            .filter(|matched| glob_matches(&matched.path))
-            .map(|matched| matched.bundle)
-            .collect::<BTreeSet<_>>();
-        if !bundles.is_empty() {
-            return Ok(Err(RpcFailure::TagIndexPoisoned {
-                bundles: bundles.into_iter().collect(),
-            }));
-        }
-    }
-    Ok(Ok(snapshot
-        .served_assets_matching(&asset_filter(query, role))?
-        .into_iter()
-        .filter(|matched| glob_matches(&matched.path))
-        .map(|matched| matched.asset)
-        .collect()))
+    Ok(assets(snapshot.served_assets_matching(&asset_filter(query, role), glob_matches)?))
 }
 
-/// The whole-table scan [`query_assets`] replaced, kept to pin its results.
+/// The assets an asset query answered, or the failure naming the poisoned
+/// bundles it reached.
+fn assets(answer: AssetAnswer) -> Result<Vec<AssetUuid>, RpcFailure> {
+    match answer {
+        Ok(matched) => Ok(matched.into_iter().map(|matched| matched.asset).collect()),
+        Err(bundles) => Err(RpcFailure::TagIndexPoisoned { bundles }),
+    }
+}
+
+/// The whole-table scan [`query_assets`] replaced, kept to pin its results
+/// over namespaces whose poisoned bundles have no skeleton entries.
 #[cfg(test)]
 fn query_assets_scan(
     snapshot: &StoreReader,
@@ -876,10 +859,10 @@ impl MetadataView<'_> {
                 path: query.normalized_path_prefix.clone().unwrap_or_default(),
             });
         }
-        MetadataNamespaceCall::Success(namespace_try!(query_pure_metadata(
-            txn.snapshot(),
-            query
-        )))
+        match namespace_try!(query_pure_metadata(txn.snapshot(), query)) {
+            Ok(assets) => MetadataNamespaceCall::Success(assets),
+            Err(failure) => MetadataNamespaceCall::Error(failure),
+        }
     }
 
     fn refresh(&self) -> Result<(MetadataBasis, Rc<SnapshotHold>), MetadataCall<()>> {
@@ -2543,13 +2526,116 @@ mod query_tests {
                         role,
                     };
                     assert_eq!(
-                        query_pure_metadata(&reader, &query).unwrap(),
+                        query_pure_metadata(&reader, &query).unwrap().unwrap(),
                         query_pure_metadata_scan(&entries, &query),
                         "{query:?}"
                     );
                 }
             }
         }
+    }
+
+    /// A query whose selectors match a poisoned bundle's skeleton entry fails
+    /// naming that bundle; one that cannot reach it answers.
+    #[test]
+    fn a_query_reaching_a_poisoned_bundle_fails_naming_it() {
+        let (_dir, mut store) = namespace(0);
+        let dir0 = PATHS.iter().position(|path| *path == "dir0").unwrap() as u32;
+        let bundle = BundleUuid(uuid(0x10, dir0));
+        store
+            .input_transaction(|txn| {
+                let root = txn.intern_root("main")?;
+                txn.poison_bundle(
+                    &distill_store::bundles::NamespaceSkeleton {
+                        bundle,
+                        root,
+                        path: "dir0".into(),
+                        format_version: 1,
+                        content_hash: ContentHash([0xee; 32]),
+                        entries: vec![distill_store::bundles::SkeletonEntry {
+                            asset: AssetUuid(uuid(0x21, dir0)),
+                            local_id: "main".into(),
+                            type_uuid: MESH,
+                            authoring_only: false,
+                            tags: BTreeMap::from([("hero".to_owned(), None)]),
+                        }],
+                    },
+                    "malformed",
+                )
+            })
+            .unwrap();
+        let reader = store.reader().unwrap();
+        let none = AssetQuery {
+            uuid: None,
+            bundle_path: None,
+            local_id: None,
+            bundle_uuid: None,
+            authored_type: None,
+            terminal_type: None,
+            tag: None,
+            path_prefix: None,
+            path_glob: None,
+            authoring_only: None,
+        };
+        let role = AuthoringEntryRole::Runtime;
+        let hero = Some(TagSelector {
+            tag: "hero".into(),
+            value: None,
+        });
+        for reaching in [
+            AssetQuery {
+                path_prefix: Some("dir".into()),
+                ..none.clone()
+            },
+            AssetQuery {
+                tag: hero.clone(),
+                path_prefix: Some("dir".into()),
+                ..none.clone()
+            },
+            AssetQuery {
+                path_glob: Some("dir?".into()),
+                local_id: Some("main".into()),
+                ..none.clone()
+            },
+        ] {
+            assert_eq!(
+                query_assets(&reader, &reaching, role).unwrap(),
+                Err(RpcFailure::TagIndexPoisoned {
+                    bundles: vec![bundle]
+                }),
+                "{reaching:?}"
+            );
+        }
+        for missing in [
+            AssetQuery {
+                tag: hero,
+                path_prefix: Some("dir/".into()),
+                ..none.clone()
+            },
+            AssetQuery {
+                local_id: Some("settings".into()),
+                ..none.clone()
+            },
+            AssetQuery {
+                authored_type: Some(TEXTURE),
+                ..none.clone()
+            },
+        ] {
+            assert!(query_assets(&reader, &missing, role).unwrap().is_ok(), "{missing:?}");
+        }
+        let pure = PureMetadataQuery {
+            uuid: None,
+            bundle: Some(bundle),
+            normalized_path_prefix: None,
+            authored_type: None,
+            role: None,
+        };
+        assert_eq!(
+            query_pure_metadata(&reader, &pure).unwrap(),
+            Err(RpcFailure::TagIndexPoisoned {
+                bundles: vec![bundle]
+            })
+        );
     }
 
     /// The runtime entries build verification reads in one query are the
@@ -2675,7 +2761,7 @@ mod query_tests {
         let (scanned, scanned_pages) = pages(&reader, || {
             query_pure_metadata_scan(&reader.served_entries().unwrap(), &query)
         });
-        assert_eq!(indexed.unwrap(), scanned);
+        assert_eq!(indexed.unwrap().unwrap(), scanned);
         println!("pure metadata prefix: {indexed_pages} pages (scan: {scanned_pages})");
         assert!(indexed_pages <= 64, "{indexed_pages} pages");
         assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");

@@ -5,7 +5,7 @@
 
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, LogicalHash, TypeUuid};
 use distill_store::bundles::{
-    AssetRecord, BundleMeta, DepKind, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
+    AssetFilter,     AssetRecord, BundleMeta, DepKind, DirectoryOrigin, DirectoryRuleId, NamespaceSkeleton,
     SkeletonEntry, TagIndexUpdate,
 };
 use distill_store::files::RootId;
@@ -14,6 +14,24 @@ use distill_store::state::{
 };
 use distill_store::{Store, StoreConfig, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The assets carrying `tag` (with `value`, when given) by one asset query:
+/// runtime entries only unless `authoring`; or the poisoned bundles the
+/// query reached.
+fn tagged(
+    store: &Store,
+    tag: &str,
+    value: Option<&str>,
+    authoring: bool,
+) -> Result<Vec<AssetUuid>, Vec<BundleUuid>> {
+    let filter = AssetFilter {
+        tag: Some((tag.to_owned(), value.map(str::to_owned))),
+        authoring_only: (!authoring).then_some(false),
+        ..AssetFilter::default()
+    };
+    let matched = store.namespace_assets_matching(&filter, |_| true).unwrap()?;
+    Ok(matched.into_iter().map(|matched| matched.asset).collect())
+}
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -223,8 +241,8 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
         .input_transaction(|txn| txn.set_tag_index_pending(AssetUuid([10; 16]), [7; 32]))
         .unwrap();
     assert!(matches!(
-        store.assets_by_tag("anything"),
-        Err(StoreError::TagIndexPoisoned { bundles }) if bundles == [BundleUuid([1; 16])]
+        tagged(&store, "anything", None, false),
+        Err(bundles) if bundles == [BundleUuid([1; 16])]
     ));
 
     store
@@ -242,13 +260,11 @@ fn tag_index_refinement_is_value_aware_and_pending_state_never_underapproximates
         )
         .unwrap();
     assert_eq!(
-        store
-            .assets_by_tag_value("category", Some("enemy"))
+        tagged(&store, "category", Some("enemy"), false)
             .unwrap(),
         [AssetUuid([10; 16])]
     );
-    assert!(store
-        .assets_by_tag_value("category", Some("friend"))
+    assert!(tagged(&store, "category", Some("friend"), false)
         .unwrap()
         .is_empty());
     let state = store.tag_index_state(AssetUuid([10; 16])).unwrap().unwrap();
@@ -275,9 +291,9 @@ fn authoring_only_entries_are_visible_to_tooling_but_ineligible_at_runtime() {
         store.runtime_entry(control.asset).unwrap_err(),
         StoreError::RoleIneligible { asset } if asset == control.asset
     ));
-    assert!(store.assets_by_tag("control").unwrap().is_empty());
+    assert!(tagged(&store, "control", None, false).unwrap().is_empty());
     assert_eq!(
-        store.authoring_assets_by_tag("control").unwrap(),
+        tagged(&store, "control", None, true).unwrap(),
         [control.asset]
     );
 
@@ -306,7 +322,7 @@ fn remove_bundle_cascades_to_assets_and_tags() {
         .unwrap();
     assert!(store.bundle(BundleUuid([1u8; 16])).unwrap().is_none());
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_none());
-    assert!(store.assets_by_tag("hero").unwrap().is_empty());
+    assert!(tagged(&store, "hero", None, false).unwrap().is_empty());
 }
 
 // ---- path resolution (§13 MetadataSnapshot::resolve_path semantics) ----
@@ -480,11 +496,11 @@ fn poisoning_a_bundle_fails_resolves_against_its_uuids() {
     // Queries whose selectors could match the file's entries fail naming
     // the poisoned bundle — the same shape as §10's tag poisoning.
     assert!(matches!(
-        store.assets_by_tag("hero").unwrap_err(),
-        StoreError::BundlePoisoned { .. }
+        tagged(&store, "hero", None, false),
+        Err(_)
     ));
     // A selector that cannot match the poisoned file's entries still works.
-    assert!(store.assets_by_tag("unrelated-tag").unwrap().is_empty());
+    assert!(tagged(&store, "unrelated-tag", None, false).unwrap().is_empty());
 }
 
 #[test]
@@ -520,12 +536,12 @@ fn poison_scope_is_proved_by_the_current_bytes_not_prior_rows() {
     ));
     // A query matching the NEW tag fails naming the poisoned bundle.
     assert!(matches!(
-        store.assets_by_tag("brand-new-tag").unwrap_err(),
-        StoreError::BundlePoisoned { .. }
+        tagged(&store, "brand-new-tag", None, false),
+        Err(_)
     ));
     // A fact only the OLD bytes claimed is gone — replaced, not
     // retained: the selector no longer matches anything.
-    assert!(store.assets_by_tag("texture").unwrap().is_empty());
+    assert!(tagged(&store, "texture", None, false).unwrap().is_empty());
 }
 
 #[test]
@@ -552,8 +568,8 @@ fn bundle_scoped_poison_needs_no_prior_row() {
         StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([77u8; 16])
     ));
     assert!(matches!(
-        store.assets_by_tag("fresh-tag").unwrap_err(),
-        StoreError::BundlePoisoned { .. }
+        tagged(&store, "fresh-tag", None, false),
+        Err(_)
     ));
     // The unrelated seeded bundle still answers.
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
@@ -578,10 +594,10 @@ fn tooling_authoring_query_propagates_matching_bundle_poison() {
         .unwrap();
 
     assert!(matches!(
-        store.authoring_assets_by_tag("control").unwrap_err(),
-        StoreError::BundlePoisoned { bundle, .. } if bundle == BundleUuid([77u8; 16])
+        tagged(&store, "control", None, true),
+        Err(bundles) if bundles == [BundleUuid([77u8; 16])]
     ));
-    assert!(store.assets_by_tag("control").unwrap().is_empty());
+    assert!(tagged(&store, "control", None, false).unwrap().is_empty());
 }
 
 #[test]
@@ -612,13 +628,13 @@ fn fixing_the_file_heals_on_the_next_version() {
         .unwrap();
     assert!(store.entry(AssetUuid([10u8; 16])).unwrap().is_some());
     assert_eq!(
-        store.assets_by_tag("hero").unwrap(),
+        tagged(&store, "hero", None, false).unwrap(),
         [AssetUuid([10u8; 16])]
     );
     // The skeleton-only entry died with the poison: healing republishes
     // wholesale, and stale skeleton facts never outlive it.
     assert!(store.entry(AssetUuid([33u8; 16])).unwrap().is_none());
-    assert!(store.assets_by_tag("stray").unwrap().is_empty());
+    assert!(tagged(&store, "stray", None, false).unwrap().is_empty());
 }
 
 // ---- per-entity namespace errors (LOCKLESS.md §4) ----

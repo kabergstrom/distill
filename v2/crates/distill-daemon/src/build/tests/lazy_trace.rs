@@ -351,7 +351,6 @@ fn lazy<'a>(
     registry: &'a PipelineRegistry,
     target: &'a Target,
     tools_at: InputVersion,
-    answers: &'a TraceAnswers,
     current_load: &'a CurrentLoadSource,
     memo: &'a BTreeMap<AssetUuid, NodeResult>,
 ) -> StoreTraceSource<'a> {
@@ -362,7 +361,6 @@ fn lazy<'a>(
             target,
             tool_version: tools_at,
         },
-        answers,
         current_load,
         BuiltNodes::Memo(memo),
     )
@@ -600,8 +598,10 @@ fn assert_same_answers(
             TraceOp::RoleCheck { asset, observed } => &lazy.role_check(*asset) == observed,
             TraceOp::Resolve { path, observed } => &lazy.resolve(path) == observed,
             TraceOp::Query { query, observed } => {
+                // A failed query has no results.
                 &lazy.query(query) == observed
-                    && lazy.query_results(query) == eager.query_results(query)
+                    && (matches!(observed, Observed::Err(_))
+                        || lazy.query_results(query) == eager.query_results(query))
             }
             TraceOp::Tool { id, observed } => &lazy.tool(id) == observed,
             TraceOp::Capability { key, observed } => &lazy.capability(key) == observed,
@@ -614,11 +614,6 @@ fn assert_same_answers(
     }
     lazy.check().unwrap();
     errors
-}
-
-/// Trace answers kept for one snapshot.
-fn answers() -> TraceAnswers {
-    TraceAnswers::default()
 }
 
 #[test]
@@ -643,13 +638,8 @@ fn store_source_answers_every_question_as_the_eager_capture_did() {
         for tools_at in tool_versions {
             let eager = eager(view, &registry, &target, tools_at, &memo);
             let ops = questions(&eager, &queries);
-            // Fresh answers, and then the same answers again from the
-            // per-snapshot memo.
-            let kept = answers();
-            for _ in 0..2 {
-                let lazy = lazy(view, &registry, &target, tools_at, &kept, &load, &memo);
-                assert_eq!(assert_same_answers(&ops, &eager, &lazy), 0);
-            }
+            let lazy = lazy(view, &registry, &target, tools_at, &load, &memo);
+            assert_eq!(assert_same_answers(&ops, &eager, &lazy), 0);
             checked += ops.len();
             if std::ptr::eq(view, &before) && tools_at == before.stamp().version {
                 recorded = ops;
@@ -761,8 +751,7 @@ fn store_source_revalidates_every_trace_as_the_eager_capture_did() {
     for (view, tools_at, all_hold) in [(&before, tools_before, true), (&after, tools_after, false)]
     {
         let eager = eager(view, &registry, &target, tools_at, &memo);
-        let kept = answers();
-        let lazy = lazy(view, &registry, &target, tools_at, &kept, &load, &memo);
+        let lazy = lazy(view, &registry, &target, tools_at, &load, &memo);
         let mut drifted = 0;
         for trace in &traces {
             let verdict = revalidate(trace, &eager);
@@ -820,8 +809,7 @@ fn a_poisoned_bundle_fails_only_the_questions_that_reach_it() {
     )
     .is_err());
 
-    let kept = answers();
-    let source = lazy(&view, &registry, &target, tools_at, &kept, &load, &memo);
+    let source = lazy(&view, &registry, &target, tools_at, &load, &memo);
     assert_eq!(
         source.authoring_read(asset(1)),
         Observed::Ok(Some(BundleFileHash([1; 32])))
@@ -841,10 +829,32 @@ fn a_poisoned_bundle_fails_only_the_questions_that_reach_it() {
         matches!(&failure, Err(BuildError::Failed(message)) if message.contains("BundlePoisoned")),
         "{failure:?}"
     );
-    source.query(&AssetQuery {
-        local_id: Some("one".to_owned()),
-        ..AssetQuery::default()
-    });
+    // A query whose selectors match the poisoned skeleton fails naming the
+    // bundle, as an answer a trace records; one that cannot reach it
+    // answers.
+    assert_eq!(
+        source.query(&AssetQuery {
+            local_id: Some("one".to_owned()),
+            ..AssetQuery::default()
+        }),
+        Observed::Err(StableFailureFingerprint::Poisoned { bundle: bundle(7) })
+    );
+    assert_eq!(
+        source.query(&AssetQuery {
+            local_id: Some("one".to_owned()),
+            authored_type: Some(TA),
+            ..AssetQuery::default()
+        }),
+        Observed::Ok(asset_query_result_hash(&[asset(1), asset(6)]))
+    );
+    source.check().unwrap();
+    // A reference resolved through such a query fails the build.
+    assert!(source
+        .query_results(&AssetQuery {
+            terminal_type: Some(TB),
+            ..AssetQuery::default()
+        })
+        .is_empty());
     assert!(source.check().is_err());
 }
 
@@ -923,8 +933,7 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
     let trace = {
         let view = project.snapshot();
         let tools_at = view.stamp().version;
-        let kept = answers();
-        let source = lazy(&view, &registry, &target, tools_at, &kept, &load, &memo);
+        let source = lazy(&view, &registry, &target, tools_at, &load, &memo);
         let named = match source.resolve(&path) {
             Observed::Ok(Some(named)) => named,
             other => panic!("{other:?}"),
@@ -994,8 +1003,7 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
     let view = reader.begin_snapshot().unwrap();
     let tools_at = view.stamp().version;
     take_statements();
-    let kept = answers();
-    let source = lazy(&view, &registry, &target, tools_at, &kept, &load, &memo);
+    let source = lazy(&view, &registry, &target, tools_at, &load, &memo);
     let started = std::time::Instant::now();
     assert!(revalidate(&trace, &source));
     let lazy_time = started.elapsed();

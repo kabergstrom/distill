@@ -4948,6 +4948,39 @@ principle). Fixing the file heals
 on the next version; cross-file identity collisions keep §7's
 version-global poison.
 
+#### Asset queries
+
+Every asset query — a build trace's `TraceOp::Query`, a codegen's query, the
+RPC's `query_assets` and pure-metadata query — is one `AssetFilter` answered
+by `StoreReader::namespace_assets_matching` (or `served_assets_matching` over
+the served rows). Each caller only translates its query: a build's
+target-dependent `terminal_type` becomes the set of authored types whose
+chains end there on its target (plus the types whose chains fail, so an
+asset of one fails the build rather than vanishing); a glob contributes its
+keys (literal prefix and literal final segment, one shared cutter,
+`files::GlobKeys`) and is matched on the streamed rows. The filter is driven
+by its most selective indexed selector and runs as at most two statements
+whatever the namespace size — a filter with no indexed selector is one
+streamed statement over every row, never a read per row.
+
+One poison semantics holds for every caller. A query answers the
+non-poisoned rows of its role that match every selector, glob included. It
+**fails, naming the poisoned bundles** (sorted, deduplicated):
+
+- when a poisoned bundle's skeleton row (§7, above) matches every selector
+  the skeleton carries — tag included; a skeleton has no served terminal
+  type, so a served `terminal_type` selector never reaches one; or
+- for a tag query, when a non-poisoned row matching every selector but the
+  tag has a poisoned tag index (§10).
+
+A query that cannot reach a poison answers normally: one malformed file
+fails only the questions whose selectors could match its entries. The trace
+records the failure as `Observed::Err(Poisoned { bundle })` naming the least
+bundle (it revalidates like any answer); codegen fails the run with the
+bundles named; the RPC answers `TagIndexPoisoned { bundles }` for either
+kind of poison. A reference resolved through a query that reaches a poison
+fails the build.
+
 ### Log-structured CAS (artifact store)
 
 Append-only segment files of framed records, pinned:

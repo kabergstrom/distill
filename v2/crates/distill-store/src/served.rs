@@ -244,7 +244,7 @@ macro_rules! served_entry_where {
        AND a.logical_hash IS NOT NULL AND b.poison IS NULL"
     };
 }
-const SERVED_ENTRY_WHERE: &str = served_entry_where!();
+pub(crate) const SERVED_ENTRY_WHERE: &str = served_entry_where!();
 const SERVED_ENTRY_FROM: &str = concat!(
     "FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE ",
     served_entry_where!()
@@ -295,23 +295,16 @@ impl StoreReader {
         Ok(entries)
     }
 
-    /// The served authoring entries `filter` selects, with bundle and logical
-    /// path, by asset UUID: one SQL query over the namespace indexes.
+    /// The served authoring entries `filter` selects and whose bundle's path
+    /// `glob` matches, with bundle and logical path, by asset UUID; or the
+    /// poisoned bundles whose rows the query could select (see
+    /// [`StoreReader::namespace_assets_matching`]).
     pub fn served_assets_matching(
         &self,
         filter: &crate::bundles::AssetFilter,
-    ) -> Result<Vec<crate::bundles::MatchedAsset>, StoreError> {
-        let mut params = Vec::new();
-        let conditions = filter.sql_conditions(&mut params);
-        self.query_rows(
-            &format!(
-                "SELECT a.asset_uuid, a.bundle_uuid, b.path FROM {} WHERE {SERVED_ENTRY_WHERE}{conditions}
-                 ORDER BY a.asset_uuid",
-                filter.sql_from()
-            ),
-            rusqlite::params_from_iter(params),
-            crate::bundles::matched_asset_row,
-        )
+        glob: impl Fn(&str) -> bool,
+    ) -> Result<crate::bundles::AssetAnswer, StoreError> {
+        self.assets_matching(filter, SERVED_ENTRY_WHERE, glob)
     }
 
     /// Every served runtime (not authoring-only) entry with its schema and

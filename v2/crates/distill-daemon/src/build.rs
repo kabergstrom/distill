@@ -17,7 +17,6 @@
 
 use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use distill_build::artifact_encode::{
@@ -88,7 +87,8 @@ use crate::scheduler::{CellOutcome, CellRun, CellWorker, Claim, WorkClass};
 
 mod trace_source;
 
-use trace_source::{BuiltNodes, StoreTraceSource, TraceAnswers, TraceBasis, TraceQueries};
+use trace_source::{BuiltNodes, StoreTraceSource, TraceBasis, TraceQueries};
+pub(crate) use trace_source::runtime_asset_filter;
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
@@ -520,6 +520,8 @@ struct NodeEnv {
     target_definition: [u8; 32],
     dylib_hash: [u8; 32],
     max_depth: usize,
+    /// The loaded pipeline's capabilities, derived from its epoch.
+    current_load: CurrentLoadSource,
 }
 
 impl NodeEnv {
@@ -558,6 +560,7 @@ impl NodeEnv {
             authority,
             registry,
             target,
+            current_load: CurrentLoadSource::capture(epoch, dylib_hash),
             dylib_hash,
             max_depth,
             pipeline,
@@ -703,7 +706,6 @@ struct NodeLookup<'a> {
     view: &'a StoreReader,
     latest: &'a StoreReader,
     tool_version: distill_store::state::InputVersion,
-    answers: Rc<TraceAnswers>,
     nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
     visiting: BTreeSet<AssetUuid>,
 }
@@ -720,7 +722,6 @@ impl<'a> NodeLookup<'a> {
             view,
             latest,
             tool_version,
-            answers: Rc::default(),
             nodes: BTreeMap::new(),
             visiting: BTreeSet::new(),
         }
@@ -814,9 +815,6 @@ impl<'a> NodeLookup<'a> {
     /// a `read` sees the nodes looked up so far.
     fn source(&self) -> Result<StoreTraceSource<'_>, BuildError> {
         let env = self.env;
-        let current_load = self.answers.current_load(|| {
-            Ok(CurrentLoadSource::capture(env.epoch()?, env.dylib_hash))
-        })?;
         Ok(StoreTraceSource::new(
             self.view,
             TraceBasis {
@@ -824,8 +822,7 @@ impl<'a> NodeLookup<'a> {
                 target: &env.target,
                 tool_version: self.tool_version,
             },
-            &self.answers,
-            current_load,
+            &env.current_load,
             BuiltNodes::Lookup(&self.nodes),
         ))
     }
@@ -1030,9 +1027,6 @@ struct BuildContext<'s> {
     memo: BTreeMap<AssetUuid, NodeResult>,
     verify_fresh: bool,
     cells: Option<CellScope<'s>>,
-    /// The trace answers read at the view so far; content hashes come from
-    /// the memo at each use.
-    trace_answers: Rc<TraceAnswers>,
     writes: RefCell<Vec<BuildWrite>>,
     /// Artifact bytes this build produced, readable before (or, verifying,
     /// without) their publication.
@@ -1068,7 +1062,6 @@ impl<'s> BuildContext<'s> {
             memo: BTreeMap::new(),
             verify_fresh,
             cells,
-            trace_answers: Rc::default(),
             writes: RefCell::new(Vec::new()),
             artifacts: RefCell::new(BTreeMap::new()),
         })
@@ -1791,8 +1784,7 @@ fn index_one_tag_entry(
         ));
     };
     let migrated = loaded.entry.schema_hash != project.logical_hash;
-    let current_load = current_load(context)
-        .map_err(|error| (bundle, format!("{error:?}"), Vec::new(), migrated))?;
+    let current_load = &context.env.current_load;
     let mut trace = Vec::new();
     let current =
         load_current_value(context, &loaded, &project, current_load, &mut trace).map_err(|error| {
@@ -1994,7 +1986,6 @@ fn node_lookup<'a>(
     latest: &'a StoreReader,
 ) -> NodeLookup<'a> {
     let mut lookup = NodeLookup::new(&context.env, view, latest, context.tool_version);
-    lookup.answers = Rc::clone(&context.trace_answers);
     lookup.nodes = context
         .memo
         .iter()
@@ -2280,7 +2271,7 @@ fn process_chain(
     let mut current_value = match current_value {
         Some(value) => value,
         None => {
-            let current_load = current_load(context)?;
+            let current_load = &context.env.current_load;
             let mut trace = Vec::new();
             load_current_value(context, loaded, project, current_load, &mut trace)?
         }
@@ -3197,23 +3188,12 @@ fn ask_trace<T>(
             target: &context.env.target,
             tool_version: context.tool_version,
         },
-        &context.trace_answers,
-        current_load(context)?,
+        &context.env.current_load,
         BuiltNodes::Memo(&context.memo),
     );
     let answer = ask(&source);
     source.check()?;
     Ok(answer)
-}
-
-/// The loaded pipeline's capabilities, captured once per build.
-fn current_load<'c>(context: &'c BuildContext) -> Result<&'c CurrentLoadSource, BuildError> {
-    context.trace_answers.current_load(|| {
-        Ok(CurrentLoadSource::capture(
-            context.env.epoch()?,
-            context.env.dylib_hash,
-        ))
-    })
 }
 
 struct EpochDefaults<'a> {
@@ -3700,7 +3680,7 @@ fn encode_or_hydrate(
     validator_dylib_hash: Option<[u8; 32]>,
     trace_out: &mut Vec<TraceOp>,
 ) -> Result<EncodedBuildImport, BuildError> {
-    let current_load = current_load(context)?;
+    let current_load = &context.env.current_load;
     let (migrations, automatic_migration) =
         migration_key_inputs(loaded, project, context.env.dylib_hash);
     let key = build_import_digest(&BuildImportInputs {

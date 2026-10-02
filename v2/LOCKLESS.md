@@ -887,13 +887,31 @@ should reach zero by the end of phase 6.
   entry, bundle, path, derived output, tag poison and tool into maps for
   each build, is gone, and so is `PinnedToolEpoch`'s copy of the tools
   table. Each trace question is a point query in the snapshot's read
-  transaction (`distill-store` `trace_reads`), kept in the build's
-  `TraceAnswers`; tools are read per id at the build's tool version. New
+  transaction (`distill-store` `trace_reads`); tools are read per id at
+  the build's tool version. New
   indexes `bundles_by_path`, `assets_by_type`, the partial
   `asset_tag_index_poisoned`, and `assets_by_bundle` keyed by bundle and
   local id (SCHEMA_VERSION 36 on that branch; the merged schema is 37,
   below). A store failure fails
   only the questions that reach it, where the capture failed every build.
+- **One asset query.** The four asset-query implementations (the trace
+  source's candidate reads, `AssetFilter`, codegen's checks, the RPC's
+  two-pass query) are one `AssetFilter` query, at most two statements
+  (DESIGN.md §13, asset queries): the trace no longer reads each
+  candidate's entry (N+1), an unindexable filter is one streamed
+  statement, and the driver is the filter's most selective index. Bundle
+  and tag-index poisons fail the same way everywhere: a query fails naming
+  the poisoned bundles it reaches, and only then. Codegen's global
+  `check_entries`/`check_tag_selector` (any poisoned bundle failed every
+  codegen query) and the RPC's silent exclusion of skeleton rows are
+  gone; a trace query reaching a poisoned bundle is
+  `Observed::Err(Poisoned)`, where it failed the build. The per-build
+  `TraceAnswers` memo is gone: each question reads again (a primary-key
+  read or one asset query); `CurrentLoadSource`, derived from the
+  pipeline epoch, is captured once with `NodeEnv`. A trace entry is one
+  `assets`/`bundles` join without tags. One glob key cutter
+  (`files::GlobKeys`) serves traces, codegen, the RPC and import
+  enumeration.
 - **Compiled state by store version.** SQLite is the only source of truth
   for what the daemon compiled; memory holds derivations of it, each keyed
   by the version it derives from.
