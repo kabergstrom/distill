@@ -70,6 +70,8 @@ pub enum ConnectOutcome {
     ConfigurationFailed(ConfigurationError),
     PipelineUnavailable(PipelineUnavailableDiagnostic),
     Rejected(ConnectError),
+    /// Past `max_connections`: the request was valid; retry later.
+    Refused(RpcFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,13 +83,15 @@ pub enum PipelineUnavailableDiagnostic {
 pub enum MetadataConnectOutcome {
     Connected(MetadataConnected),
     ProtocolMismatch { expected: u32, observed: u32 },
+    /// Past `max_connections`; retry later.
+    Refused(RpcFailure),
 }
 
 impl MetadataConnectOutcome {
     pub fn connected(self) -> Option<MetadataConnected> {
         match self {
             Self::Connected(connected) => Some(connected),
-            Self::ProtocolMismatch { .. } => None,
+            Self::ProtocolMismatch { .. } | Self::Refused(_) => None,
         }
     }
 }

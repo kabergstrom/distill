@@ -1,9 +1,11 @@
-//! Client capabilities over one front end ([`Server`]): target-bound hubs
-//! and snapshots, metadata bootstraps, delta streams and progress
-//! completions. Every call reads the store through the capability's own
-//! read transaction (snapshots) or the front end's current-state reader
-//! (fences, CAS). A snapshot holds nothing else: an artifact removed from
-//! the CAS after it resolved is a cache miss for the client to retry.
+//! Client capabilities over one connection's front end ([`Server`]):
+//! target-bound hubs and snapshots, metadata bootstraps, delta streams and
+//! progress completions. The capabilities of one connection share its front
+//! end and nothing else. Every call reads the store through the
+//! capability's own read transaction (snapshots) or the connection's
+//! current-state reader (fences, CAS, the change log). A snapshot holds
+//! nothing else: an artifact removed from the CAS after it resolved is a
+//! cache miss for the client to retry.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,7 +22,7 @@ use distill_store::{StoreError, StoreReader};
 use crate::persist::decode_drifted_input;
 use crate::server::{
     authoring_entry, entry_role, history_deltas, is_embedded, pipeline_failure,
-    publish_backend_commit, store_failure, BuildKey, BuildResolution, ConnectionState,
+    publish_backend_commit, store_failure, BuildResolution, ConnectionState,
     MetadataBinding, SnapshotHold, SnapshotTxn, DEFAULT_CHUNK_SIZE,
 };
 use crate::validate::{
@@ -498,9 +500,6 @@ fn authoring_gate(
     connection: &ConnectionState,
     base: InputVersion,
 ) -> Option<AuthoringGate> {
-    if !connection.alive() {
-        return Some(AuthoringGate::Failure(RpcFailure::ConnectionClosed));
-    }
     if let Some(reason) = server.inner.generation_fence(connection) {
         return Some(AuthoringGate::Reconnect(reason));
     }
@@ -675,7 +674,12 @@ impl MetadataHub {
             .current_snapshot()
             .map_err(|error| MetadataCall::Error(store_failure(error)))?;
         let basis = metadata_basis(&self.binding, txn.stamp);
-        Ok((basis, self.server.inner.register_snapshot(txn)))
+        let hold = self
+            .server
+            .inner
+            .register_snapshot(txn)
+            .map_err(MetadataCall::Error)?;
+        Ok((basis, hold))
     }
 
     pub fn snapshot(&self) -> MetadataCall<MetadataSnapshot> {
@@ -800,7 +804,12 @@ impl MetadataView<'_> {
             .current_snapshot()
             .map_err(|error| MetadataCall::Error(store_failure(error)))?;
         let basis = metadata_basis(self.binding, txn.stamp);
-        Ok((basis, self.server.inner.register_snapshot(txn)))
+        let hold = self
+            .server
+            .inner
+            .register_snapshot(txn)
+            .map_err(MetadataCall::Error)?;
+        Ok((basis, hold))
     }
 }
 
@@ -963,11 +972,8 @@ impl Hub {
     }
 
     fn live<T>(&self) -> Option<RpcResult<T>> {
-        self.server.inner.pump();
+        self.server.inner.pump(&self.connection);
         let connection = self.connection.borrow();
-        if !connection.alive() {
-            return Some(RpcResult::Failure(RpcFailure::ConnectionClosed));
-        }
         self.server
             .inner
             .generation_fence(&connection)
@@ -979,7 +985,7 @@ impl Hub {
             return result;
         }
         let txn = rpc_try!(self.server.inner.current_snapshot());
-        RpcResult::Success(snapshot_from(&self.server, &self.connection, txn))
+        snapshot_from(&self.server, &self.connection, txn)
     }
 
     /// Pin a tooling-only view. It shares the same immutable store stamp and
@@ -990,11 +996,11 @@ impl Hub {
             return result;
         }
         let txn = rpc_try!(self.server.inner.current_snapshot());
-        RpcResult::Success(authoring_snapshot_from(&self.server, &self.connection, txn))
+        authoring_snapshot_from(&self.server, &self.connection, txn)
     }
 
     fn authoring_gate<T>(&self, base: InputVersion) -> Option<RpcResult<T>> {
-        self.server.inner.pump();
+        self.server.inner.pump(&self.connection);
         authoring_gate(&self.server, &self.connection.borrow(), base)
             .map(AuthoringGate::into_result)
     }
@@ -1390,7 +1396,7 @@ impl Hub {
         }
         // Deliver everything up to the read version to the existing
         // subscriptions; the history below covers the new ones.
-        inner.pump_until(Some(head));
+        inner.pump_until(&self.connection, Some(head));
 
         let mut connection = self.connection.borrow_mut();
         let requested_assets: BTreeSet<_> = assets.into_iter().collect();
@@ -1516,14 +1522,18 @@ fn snapshot_from(
     server: &Server,
     connection: &Rc<RefCell<ConnectionState>>,
     txn: Rc<SnapshotTxn>,
-) -> Snapshot {
-    Snapshot {
-        server: server.clone(),
-        connection: connection.clone(),
-        basis: RpcBasis {
-            snapshot: txn.stamp,
-        },
-        hold: server.inner.register_snapshot(txn),
+) -> RpcResult<Snapshot> {
+    let basis = RpcBasis {
+        snapshot: txn.stamp,
+    };
+    match server.inner.register_snapshot(txn) {
+        Ok(hold) => RpcResult::Success(Snapshot {
+            server: server.clone(),
+            connection: connection.clone(),
+            basis,
+            hold,
+        }),
+        Err(failure) => RpcResult::Failure(failure),
     }
 }
 
@@ -1531,14 +1541,18 @@ fn authoring_snapshot_from(
     server: &Server,
     connection: &Rc<RefCell<ConnectionState>>,
     txn: Rc<SnapshotTxn>,
-) -> AuthoringSnapshot {
-    AuthoringSnapshot {
-        server: server.clone(),
-        connection: connection.clone(),
-        basis: RpcBasis {
-            snapshot: txn.stamp,
-        },
-        hold: server.inner.register_snapshot(txn),
+) -> RpcResult<AuthoringSnapshot> {
+    let basis = RpcBasis {
+        snapshot: txn.stamp,
+    };
+    match server.inner.register_snapshot(txn) {
+        Ok(hold) => RpcResult::Success(AuthoringSnapshot {
+            server: server.clone(),
+            connection: connection.clone(),
+            basis,
+            hold,
+        }),
+        Err(failure) => RpcResult::Failure(failure),
     }
 }
 
@@ -1660,9 +1674,6 @@ impl Snapshot {
         if let Some(reason) = self.server.inner.generation_fence(&connection) {
             return Err(RpcResult::ReconnectRequired { reason });
         }
-        if !connection.alive() {
-            return Err(RpcResult::Failure(RpcFailure::ConnectionClosed));
-        }
         self.hold
             .txn()
             .ok_or(RpcResult::Failure(RpcFailure::SnapshotExpired))
@@ -1698,9 +1709,6 @@ impl Snapshot {
     pub fn refresh(&self) -> RpcResult<Snapshot> {
         {
             let connection = self.connection.borrow();
-            if !connection.alive() {
-                return RpcResult::Failure(RpcFailure::ConnectionClosed);
-            }
             if let Some(reason) = self.server.inner.generation_fence(&connection) {
                 return RpcResult::ReconnectRequired { reason };
             }
@@ -1709,7 +1717,7 @@ impl Snapshot {
             return RpcResult::Failure(RpcFailure::SnapshotExpired);
         }
         let txn = rpc_try!(self.server.inner.current_snapshot());
-        RpcResult::Success(snapshot_from(&self.server, &self.connection, txn))
+        snapshot_from(&self.server, &self.connection, txn)
     }
 
     pub fn query(&self, query: AssetQuery) -> RpcResult<Vec<AssetUuid>> {
@@ -1793,15 +1801,9 @@ impl Snapshot {
         uuid: AssetUuid,
         work_class: BuildWorkClass,
     ) -> RpcResult<TerminalEvent<ResolveResult>> {
-        loop {
-            match self.resolve_prepare(uuid, work_class) {
-                ResolveStep::Done(result) => return result,
-                ResolveStep::Build(build) => {
-                    if let Some(result) = self.resolve_finish(uuid, build.run()) {
-                        return result;
-                    }
-                }
-            }
+        match self.resolve_prepare(uuid, work_class) {
+            ResolveStep::Done(result) => result,
+            ResolveStep::Build(build) => self.resolve_finish(uuid, build.run()),
         }
     }
 
@@ -1842,69 +1844,54 @@ impl Snapshot {
             }));
         }
         let target = self.connection.borrow().target.clone();
-        let key = BuildKey {
-            basis: self.basis.snapshot,
-            target: target.clone(),
-            asset: uuid,
+        let resolution = match &derived {
+            Some(output) => Some(VersionResolve::Drifted(DriftedInput::Asset(output.parent))),
+            None => match snapshot.asset_resolution(uuid)? {
+                None | Some(ResolutionRow::Missing) => None,
+                Some(ResolutionRow::Built(hash)) => Some(VersionResolve::Built(hash)),
+                Some(ResolutionRow::Drifted(bytes)) => Some(VersionResolve::Drifted(
+                    decode_drifted_input(&bytes).map_err(|error| StoreError::Rejected {
+                        detail: format!("corrupt drift input: {error}"),
+                    })?,
+                )),
+                Some(ResolutionRow::Failed(error)) => Some(VersionResolve::Failed(error)),
+                Some(ResolutionRow::Deleted(at)) => Some(VersionResolve::Deleted(at)),
+            },
         };
-        let built = self.server.inner.build_results.borrow().get(&key).cloned();
-        let resolution = match built {
-            Some(BuildResolution::Built(hash)) => Some(VersionResolve::Built(hash)),
-            Some(BuildResolution::Failed(error)) => Some(VersionResolve::Failed(error)),
-            Some(BuildResolution::Drifted(input)) => Some(VersionResolve::Drifted(input)),
-            None => {
-                let resolution = match &derived {
-                    Some(output) => Some(VersionResolve::Drifted(DriftedInput::Asset(
-                        output.parent,
-                    ))),
-                    None => match snapshot.asset_resolution(uuid)? {
-                        None | Some(ResolutionRow::Missing) => None,
-                        Some(ResolutionRow::Built(hash)) => Some(VersionResolve::Built(hash)),
-                        Some(ResolutionRow::Drifted(bytes)) => {
-                            Some(VersionResolve::Drifted(decode_drifted_input(&bytes).map_err(
-                                |error| StoreError::Rejected {
-                                    detail: format!("corrupt drift input: {error}"),
-                                },
-                            )?))
-                        }
-                        Some(ResolutionRow::Failed(error)) => Some(VersionResolve::Failed(error)),
-                        Some(ResolutionRow::Deleted(at)) => Some(VersionResolve::Deleted(at)),
-                    },
-                };
-                if let (Some(VersionResolve::Drifted(input)), Some(_)) = (&resolution, &meta) {
-                    let entry = snapshot
-                        .served_entry(authoring_uuid)?
-                        .map(authoring_entry)
-                        .transpose()?
-                        .expect("a served entry's metadata implies the entry");
-                    let Some(row) = self.server.inner.reader.rpc_target(&target)? else {
-                        return done(RpcResult::ReconnectRequired {
-                            reason: ReconnectReason::TargetDefinitionChanged,
-                        });
-                    };
-                    let request = BuildRequest {
-                        work_class,
-                        basis: self.basis.snapshot,
-                        target,
-                        target_definition: TargetDefinitionHash(row.definition_hash),
-                        requested_asset: uuid,
-                        output_key: derived
-                            .as_ref()
-                            .map_or_else(String::new, |output| output.output_key.clone()),
-                        requested_terminal_type: derived
-                            .as_ref()
-                            .map_or(entry.terminal_type, |output| output.terminal_type),
-                        entry,
-                        drifted_input: input.clone(),
-                    };
-                    return Ok(ResolveStep::Build(PendingBuild {
-                        request,
-                        backend: self.server.inner.handle.build_backend(),
-                    }));
-                }
-                resolution
-            }
-        };
+        // A drifted asset is built for this snapshot. The build backend
+        // memoizes by input, so a second resolve of the same snapshot costs
+        // a memo lookup, not a build.
+        if let (Some(VersionResolve::Drifted(input)), Some(_)) = (&resolution, &meta) {
+            let entry = snapshot
+                .served_entry(authoring_uuid)?
+                .map(authoring_entry)
+                .transpose()?
+                .expect("a served entry's metadata implies the entry");
+            let Some(row) = self.server.inner.reader.rpc_target(&target)? else {
+                return done(RpcResult::ReconnectRequired {
+                    reason: ReconnectReason::TargetDefinitionChanged,
+                });
+            };
+            let request = BuildRequest {
+                work_class,
+                basis: self.basis.snapshot,
+                target,
+                target_definition: TargetDefinitionHash(row.definition_hash),
+                requested_asset: uuid,
+                output_key: derived
+                    .as_ref()
+                    .map_or_else(String::new, |output| output.output_key.clone()),
+                requested_terminal_type: derived
+                    .as_ref()
+                    .map_or(entry.terminal_type, |output| output.terminal_type),
+                entry,
+                drifted_input: input.clone(),
+            };
+            return Ok(ResolveStep::Build(PendingBuild {
+                request,
+                backend: self.server.inner.handle.build_backend(),
+            }));
+        }
         let value = match resolution {
             Some(VersionResolve::Built(content_hash)) => {
                 if let Err(error) =
@@ -1933,13 +1920,13 @@ impl Snapshot {
         }))
     }
 
-    /// The second half of a resolve: publish the build's result. `None`
-    /// means the caller prepares again (the result is cached for it).
+    /// The second half of a resolve: publish the build's result and answer
+    /// from it, at this snapshot's basis.
     pub fn resolve_finish(
         &self,
         uuid: AssetUuid,
         build: FinishedBuild,
-    ) -> Option<RpcResult<TerminalEvent<ResolveResult>>> {
+    ) -> RpcResult<TerminalEvent<ResolveResult>> {
         let FinishedBuild {
             request,
             backend,
@@ -1971,40 +1958,23 @@ impl Snapshot {
                 }
             }
             Err(RpcResult::ReconnectRequired { reason }) => {
-                return Some(RpcResult::ReconnectRequired { reason });
+                return RpcResult::ReconnectRequired { reason };
             }
             Err(_) => outcome = Err(RpcFailure::SnapshotExpired),
         }
         match outcome {
-            Ok(resolution) => {
-                let key = BuildKey {
-                    basis: self.basis.snapshot,
-                    target: request.target,
-                    asset: uuid,
-                };
-                if key.basis == self.server.inner.current_stamp() {
-                    self.server.inner.cache_build(key, resolution);
-                    None
-                } else {
-                    // The snapshot is no longer current: answer from the
-                    // outcome directly rather than loop on an uncacheable
-                    // build.
-                    Some(RpcResult::Success(TerminalEvent {
-                        basis: self.basis.clone(),
-                        value: match resolution {
-                            BuildResolution::Built(content_hash) => {
-                                ResolveResult::Built { content_hash }
-                            }
-                            BuildResolution::Failed(error) => ResolveResult::Failed { error },
-                            BuildResolution::Drifted(input) => ResolveResult::Drifted {
-                                input,
-                                current: self.server.inner.current_stamp(),
-                            },
-                        },
-                    }))
-                }
-            }
-            Err(error) => Some(RpcResult::Failure(error)),
+            Ok(resolution) => RpcResult::Success(TerminalEvent {
+                basis: self.basis.clone(),
+                value: match resolution {
+                    BuildResolution::Built(content_hash) => ResolveResult::Built { content_hash },
+                    BuildResolution::Failed(error) => ResolveResult::Failed { error },
+                    BuildResolution::Drifted(input) => ResolveResult::Drifted {
+                        input,
+                        current: self.server.inner.current_stamp(),
+                    },
+                },
+            }),
+            Err(error) => RpcResult::Failure(error),
         }
     }
 
@@ -2082,9 +2052,6 @@ impl AuthoringSnapshot {
         if let Some(reason) = self.server.inner.generation_fence(&connection) {
             return Err(RpcResult::ReconnectRequired { reason });
         }
-        if !connection.alive() {
-            return Err(RpcResult::Failure(RpcFailure::ConnectionClosed));
-        }
         self.hold
             .txn()
             .ok_or(RpcResult::Failure(RpcFailure::SnapshotExpired))
@@ -2144,9 +2111,6 @@ impl AuthoringSnapshot {
     pub fn refresh(&self) -> RpcResult<AuthoringSnapshot> {
         {
             let connection = self.connection.borrow();
-            if !connection.alive() {
-                return RpcResult::Failure(RpcFailure::ConnectionClosed);
-            }
             if let Some(reason) = self.server.inner.generation_fence(&connection) {
                 return RpcResult::ReconnectRequired { reason };
             }
@@ -2155,7 +2119,7 @@ impl AuthoringSnapshot {
             return RpcResult::Failure(RpcFailure::SnapshotExpired);
         }
         let txn = rpc_try!(self.server.inner.current_snapshot());
-        RpcResult::Success(authoring_snapshot_from(&self.server, &self.connection, txn))
+        authoring_snapshot_from(&self.server, &self.connection, txn)
     }
 }
 
@@ -2164,28 +2128,20 @@ impl AuthoringSnapshot {
 
 impl DeltaStream {
     pub fn next(&self) -> Option<StreamEvent> {
-        self.server.inner.pump();
-        let mut connection = self.connection.borrow_mut();
-        if !connection.alive() {
-            connection.expire();
-            return None;
-        }
-        connection.queue.pop_front()
+        self.server.inner.pump(&self.connection);
+        self.connection.borrow_mut().queue.pop_front()
     }
 
-    /// Wait for the next stream event without blocking the single-threaded
-    /// Cap'n Proto `RpcSystem`. The publication watch is subscribed before
-    /// the pump, so a publication between the two still wakes the wait.
+    /// Wait for the next stream event without blocking the connection's
+    /// thread. The publication watch is subscribed before the pump, so a
+    /// publication between the two still wakes the wait; the wait itself
+    /// costs the publisher nothing but the signal.
     pub async fn next_async(&self) -> Option<StreamEvent> {
         loop {
             let mut published = self.server.inner.subscribe_published();
-            self.server.inner.pump();
+            self.server.inner.pump(&self.connection);
             let notify = {
                 let mut connection = self.connection.borrow_mut();
-                if !connection.alive() {
-                    connection.expire();
-                    return None;
-                }
                 if let Some(event) = connection.queue.pop_front() {
                     return Some(event);
                 }

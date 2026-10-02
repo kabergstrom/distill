@@ -215,7 +215,7 @@ fn snapshot_clones_share_one_read_transaction() {
 }
 
 #[test]
-fn snapshot_and_connection_bounds_release_the_oldest_capabilities() {
+fn snapshot_and_connection_bounds_hold_across_connections() {
     let server = server_with(&[]);
     server
         .install_snapshot_policy(SnapshotPolicy {
@@ -224,6 +224,7 @@ fn snapshot_and_connection_bounds_release_the_oldest_capabilities() {
             max_connections: 2,
         })
         .unwrap();
+    // Past the bound a connection releases its own oldest snapshot.
     let first_hub = connect(&server, &[]);
     let first_snapshot = snapshot(&first_hub);
     let second_snapshot = snapshot(&first_hub);
@@ -235,68 +236,98 @@ fn snapshot_and_connection_bounds_release_the_oldest_capabilities() {
         second_snapshot.version(),
         RpcResult::Success(InputVersion(0))
     );
+    assert_eq!(server.open_snapshots(), 1);
 
+    // It never reaches into another connection's: one holding none is
+    // refused until a snapshot is released.
     let second_hub = connect(&server, &[]);
-    assert!(matches!(first_hub.snapshot(), RpcResult::Success(_)));
-    server
-        .install_snapshot_policy(SnapshotPolicy {
-            ttl: Duration::from_secs(60),
-            max_snapshots: 1,
-            max_connections: 1,
-        })
-        .unwrap();
     assert!(matches!(
-        first_hub.snapshot(),
-        RpcResult::Failure(RpcFailure::ConnectionClosed)
+        second_hub.snapshot(),
+        RpcResult::Failure(RpcFailure::ResourceLimit { limit: 1, .. })
     ));
+    assert_eq!(
+        second_snapshot.version(),
+        RpcResult::Success(InputVersion(0))
+    );
+    second_snapshot.expire();
     assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
+
+    // A connection past the bound is refused; the open ones are untouched.
+    assert!(matches!(
+        server.root().connect(request_for(7, 1, &[])),
+        ConnectOutcome::Refused(RpcFailure::ResourceLimit { limit: 2, .. })
+    ));
+    assert!(matches!(
+        server.root().metadata(PROTOCOL_VERSION),
+        MetadataConnectOutcome::Refused(RpcFailure::ResourceLimit { limit: 2, .. })
+    ));
+    assert!(matches!(first_hub.snapshot(), RpcResult::Success(_)));
+    drop((first_hub, first_snapshot, second_snapshot));
+    assert!(matches!(
+        server.root().connect(request_for(7, 1, &[])),
+        ConnectOutcome::Connected(_)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn connection_cap_terminates_an_already_waiting_delta_stream() {
+async fn a_refused_connection_leaves_a_waiting_delta_stream_alone() {
     tokio::task::LocalSet::new()
         .run_until(async {
-    let server = server_with(&[]);
-    server
-        .install_snapshot_policy(SnapshotPolicy {
-            ttl: Duration::from_secs(60),
-            max_snapshots: 8,
-            max_connections: 1,
-        })
-        .unwrap();
-    let first_hub = connect(&server, &[]);
-    let install = first_hub
-        .subscribe(InputVersion(0), Vec::new(), Vec::new())
-        .success()
-        .unwrap();
-    assert!(matches!(
-        install.deltas.next(),
-        Some(StreamEvent::InitialDelta { .. })
-    ));
+            let server = server_with(&[]);
+            server
+                .install_snapshot_policy(SnapshotPolicy {
+                    ttl: Duration::from_secs(60),
+                    max_snapshots: 8,
+                    max_connections: 1,
+                })
+                .unwrap();
+            let asset = AssetUuid([5; 16]);
+            let first_hub = connect(&server, &[]);
+            let install = first_hub
+                .subscribe(InputVersion(0), vec![asset], Vec::new())
+                .success()
+                .unwrap();
+            assert!(matches!(
+                install.deltas.next(),
+                Some(StreamEvent::InitialDelta { .. })
+            ));
 
-    let stream = install.deltas.clone();
-    let pending = tokio::task::spawn_local(async move { stream.next_async().await });
-    tokio::task::yield_now().await;
-    let second_hub = connect(&server, &[]);
+            let stream = install.deltas.clone();
+            let pending = tokio::task::spawn_local(async move { stream.next_async().await });
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                server.root().connect(request_for(7, 1, &[])),
+                ConnectOutcome::Refused(_)
+            ));
+            server
+                .commit(Commit {
+                    assets: vec![set_asset(
+                        asset,
+                        StoredResolve::Failed {
+                            error: "changed".into(),
+                        },
+                        AssetDeltaState::Changed,
+                    )],
+                    ..Commit::default()
+                })
+                .unwrap();
 
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .expect("evicted delta stream remained blocked")
-            .unwrap(),
-        None
-    );
-    assert!(matches!(
-        first_hub.snapshot(),
-        RpcResult::Failure(RpcFailure::ConnectionClosed)
-    ));
-    assert!(matches!(second_hub.snapshot(), RpcResult::Success(_)));
+            let event = tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("the waiting delta stream missed the publication")
+                .unwrap();
+            assert!(matches!(
+                event,
+                Some(StreamEvent::Delta(Delta { ref assets, .. }))
+                    if assets == &vec![(asset, AssetDeltaState::Changed)]
+            ));
+            assert!(matches!(first_hub.snapshot(), RpcResult::Success(_)));
         })
         .await;
 }
 
 #[test]
-fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outputs() {
+fn drifted_resolve_builds_per_resolve_at_the_snapshot_and_publishes_canonical_outputs() {
     let server = server_with(&[(1, false)]);
     let backend = Arc::new(RecordingBuildBackend::default());
     server.install_build_backend(backend.clone());
@@ -328,8 +359,15 @@ fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outpu
         }
     );
     assert!(matches!(first.fetch(first_hash), RpcResult::Success(_)));
-    assert_eq!(backend.requests.lock().unwrap().len(), 1);
-    assert_eq!(backend.requests.lock().unwrap()[0].basis, first_stamp);
+    // The server keeps no build results: every resolve of a drifted asset
+    // asks the backend, which answers a repeat from its memo by input.
+    assert_eq!(backend.requests.lock().unwrap().len(), 2);
+    assert!(backend
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.basis == first_stamp));
 
     let second_stamp = server.commit(Commit::default()).unwrap();
     let second = first.refresh().success().unwrap();
@@ -341,12 +379,12 @@ fn drifted_resolve_builds_once_per_snapshot_target_and_publishes_canonical_outpu
         }
     );
     let requests = backend.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].basis, second_stamp);
-    assert_eq!(requests[1].target, "dev");
-    assert_eq!(requests[1].target_definition, target_hash(7));
-    assert_eq!(requests[1].requested_asset, entry.uuid);
-    assert!(requests[1].output_key.is_empty());
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].basis, second_stamp);
+    assert_eq!(requests[2].target, "dev");
+    assert_eq!(requests[2].target_definition, target_hash(7));
+    assert_eq!(requests[2].requested_asset, entry.uuid);
+    assert!(requests[2].output_key.is_empty());
 }
 
 #[test]

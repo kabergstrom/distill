@@ -385,8 +385,6 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
     } = fixture();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = server.handle();
-    let evicting = request.clone();
     let (stalled_ready_tx, stalled_ready_rx) = std::sync::mpsc::sync_channel(1);
     let (release_stall_tx, release_stall_rx) = std::sync::mpsc::channel();
     let root = server.root();
@@ -396,14 +394,6 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&runtime, async move {
-            // One connection at a time: a new one closes the oldest.
-            let front = Server::attach(&handle);
-            front
-                .install_snapshot_policy(SnapshotPolicy {
-                    max_connections: 1,
-                    ..SnapshotPolicy::default()
-                })
-                .unwrap();
             let listener = StagedListener::bind(root.clone(), "127.0.0.1:0")
                 .await
                 .unwrap();
@@ -412,8 +402,11 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
             let first = listener.accept_one().await.unwrap();
             let second = listener.accept_one().await.unwrap();
             drop(listener);
+            // The daemon closes the connections: their threads drop the
+            // RPC systems and the sockets with them.
             close_rx.await.unwrap();
-            let _closing = front.root().connect(evicting);
+            first.close();
+            second.close();
 
             let failed_listener = tokio::net::TcpListener::bind(address).await.unwrap();
             stalled_ready_tx.send(()).unwrap();

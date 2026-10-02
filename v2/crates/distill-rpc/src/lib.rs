@@ -1,8 +1,9 @@
 //! DESIGN.md §17's Cap'n Proto RPC contract.
 //!
 //! The crate keeps its typed state machine transport-neutral, generates the
-//! official Rust bindings from `schema/distill_rpc.capnp`, and adapts them to a
-//! concrete single-threaded `capnp-rpc` system in [`capnp_transport`].
+//! official Rust bindings from `schema/distill_rpc.capnp`, and adapts them to
+//! `capnp-rpc` in [`capnp_transport`], which serves every connection on a
+//! thread of its own.
 
 mod bind;
 #[doc(hidden)]

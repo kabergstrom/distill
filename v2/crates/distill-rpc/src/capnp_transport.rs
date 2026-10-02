@@ -2,19 +2,39 @@
 //!
 //! Protocol state remains in the transport-neutral [`crate::Server`]. This
 //! module validates wire widths, translates typed result unions, and drives
-//! capnp-rpc on a Tokio [`tokio::task::LocalSet`]. `RpcSystem` is deliberately
-//! `!Send`; callers must run listener and client tasks on that one IO thread.
+//! capnp-rpc.
+//!
+//! Server side: one [`StagedListener`] accepts connections, and each one is
+//! served on a thread of its own, with its own current-thread Tokio runtime
+//! and [`tokio::task::LocalSet`] running that connection's `RpcSystem`.
+//! `RpcSystem` and every capability are `!Send` and stay on that thread,
+//! with the connection's front end (store reader, snapshots, subscription
+//! queue): nothing a connection does, a slow SQLite read included, waits on
+//! another connection. The listener itself needs no `LocalSet`. Threads are
+//! bounded by `max_connections` (one past it is closed unserved), exit when
+//! their connection closes, and are told to close by
+//! [`StagedListener::shutdown`]. Closing shuts the socket down and lets
+//! capnp-rpc run its disconnect, which releases every capability the
+//! connection's pending calls hold; dropping a live `RpcSystem` would leak
+//! them. A panic ends only its own thread.
+//!
+//! Client side: [`CapnpClient`] runs its `RpcSystem` as a task on the
+//! caller's `LocalSet`; callers drive it on that one thread.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::cell::RefCell;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::io::{AsyncReadExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use unicode_normalization::UnicodeNormalization;
@@ -35,7 +55,8 @@ use crate::{
 pub use crate::distill_rpc_capnp as schema;
 
 /// Run `call` on a blocking worker: a publication may wait on SQLite's
-/// write lock, and the single-threaded capnp-rpc driver never does.
+/// write lock, and the connection's `RpcSystem` keeps serving its other
+/// calls meanwhile.
 async fn run_blocking<T: Send + 'static>(call: crate::WriteCall<T>) -> Result<T, capnp::Error> {
     tokio::task::spawn_blocking(move || call.run())
         .await
@@ -56,6 +77,9 @@ pub const CONNECTION_CLOSED: u16 = 3002;
 /// `RpcError.code` of an `entry` whose asset has no runtime entry (absent,
 /// authoring-only, or a derived output).
 pub const ASSET_NOT_FOUND: u16 = 3003;
+/// `RpcError.code` of a `Root.connect` or `Root.metadata` refused because
+/// `max_connections` connections are open: retry later.
+pub const CONNECTION_LIMIT: u16 = 3004;
 
 fn failure_code(error: &RpcFailure) -> u16 {
     match error {
@@ -71,6 +95,8 @@ pub enum TransportError {
     BindValidation(crate::BindStageError),
     Io(io::Error),
     Capnp(capnp::Error),
+    /// The listener is serving `limit` connections, or shutting down.
+    Refused { limit: usize },
 }
 
 impl fmt::Display for TransportError {
@@ -79,6 +105,9 @@ impl fmt::Display for TransportError {
             Self::BindValidation(error) => write!(f, "RPC bind validation failed: {error}"),
             Self::Io(error) => write!(f, "RPC I/O failed: {error}"),
             Self::Capnp(error) => write!(f, "Cap'n Proto RPC failed: {error}"),
+            Self::Refused { limit } => {
+                write!(f, "RPC connection refused: {limit} connections are open or the listener is stopping")
+            }
         }
     }
 }
@@ -97,12 +126,77 @@ impl From<capnp::Error> for TransportError {
     }
 }
 
-/// A listener whose address passed the loopback-only configuration staging
-/// gate before any socket was opened.
+/// How long [`StagedListener::serve_until`] waits, after its shutdown
+/// signal, for connection threads to exit before it leaves the rest
+/// running.
+pub const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
+/// How long a connection being closed may take to run capnp-rpc's
+/// disconnect once its socket is shut down.
+const CONNECTION_DISCONNECT_GRACE: Duration = Duration::from_millis(250);
+
+/// A listener whose address passed the loopback-only configuration staging
+/// gate before any socket was opened. Every connection it accepts is served
+/// on a thread of its own.
 pub struct StagedListener {
     listener: TcpListener,
     root: Root,
+    connections: Arc<ConnectionThreads>,
+}
+
+/// The connection threads of one listener.
+struct ConnectionThreads {
+    /// How many are running. Admission increments it under
+    /// `max_connections`; each thread decrements it as it exits.
+    live: watch::Sender<usize>,
+    /// Set once, by shutdown: every thread closes its connection and exits.
+    stop: watch::Sender<bool>,
+}
+
+/// One running connection thread's place among its listener's.
+struct LiveThread(Arc<ConnectionThreads>);
+
+impl Drop for LiveThread {
+    fn drop(&mut self) {
+        self.0.live.send_modify(|live| *live -= 1);
+    }
+}
+
+/// A connection thread panicked; the daemon and every other connection
+/// carry on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionPanicked(pub String);
+
+type ConnectionOutcome = Result<Result<(), capnp::Error>, ConnectionPanicked>;
+
+/// A connection served on its own thread. Await it for the connection's
+/// outcome, reported once the thread has released everything the
+/// connection held; dropping it detaches the thread.
+pub struct ConnectionHandle {
+    done: oneshot::Receiver<ConnectionOutcome>,
+    close: Arc<Notify>,
+}
+
+impl ConnectionHandle {
+    /// Close the connection: its thread drops the RPC system, closing the
+    /// socket, and exits.
+    pub fn close(&self) {
+        self.close.notify_one();
+    }
+}
+
+impl Future for ConnectionHandle {
+    type Output = ConnectionOutcome;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.done).poll(cx).map(|done| {
+            done.unwrap_or_else(|_| {
+                Err(ConnectionPanicked(
+                    "the connection thread exited without an outcome".to_owned(),
+                ))
+            })
+        })
+    }
 }
 
 impl StagedListener {
@@ -110,18 +204,37 @@ impl StagedListener {
         let address =
             crate::validate_bind_address(address).map_err(TransportError::BindValidation)?;
         let listener = TcpListener::bind(address).await?;
-        Ok(Self { listener, root })
+        Ok(Self {
+            listener,
+            root,
+            connections: Arc::new(ConnectionThreads {
+                live: watch::Sender::new(0),
+                stop: watch::Sender::new(false),
+            }),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    /// Accept one connection and spawn its `RpcSystem` on the current
-    /// [`tokio::task::LocalSet`]. The returned handle exposes connection-level
-    /// protocol failure to supervisors that want to observe it.
-    pub async fn accept_one(&self) -> Result<JoinHandle<Result<(), capnp::Error>>, TransportError> {
+    /// How many connection threads are running.
+    pub fn connections(&self) -> usize {
+        *self.connections.live.borrow()
+    }
+
+    /// Accept one connection and serve it on a thread of its own.
+    pub async fn accept_one(&self) -> Result<ConnectionHandle, TransportError> {
         let (stream, peer) = self.listener.accept().await?;
+        self.start(stream, peer)
+    }
+
+    /// Serve an accepted connection on a new thread with its own
+    /// current-thread runtime and `LocalSet`: its `RpcSystem` and every
+    /// capability it hands out live and die there. Past `max_connections`
+    /// running threads, or after shutdown, the connection is closed
+    /// unserved.
+    fn start(&self, stream: TcpStream, peer: SocketAddr) -> Result<ConnectionHandle, TransportError> {
         if !peer.ip().is_loopback() {
             return Err(TransportError::BindValidation(
                 crate::BindStageError::NonLoopbackAddress {
@@ -129,49 +242,161 @@ impl StagedListener {
                 },
             ));
         }
+        let limit = self.root.handle.snapshot_policy().max_connections;
+        let stopped = *self.connections.stop.borrow();
+        let admitted = !stopped
+            && self.connections.live.send_if_modified(|live| {
+                let admit = *live < limit;
+                *live += usize::from(admit);
+                admit
+            });
+        if !admitted {
+            return Err(TransportError::Refused { limit });
+        }
+        let live = LiveThread(Arc::clone(&self.connections));
         stream.set_nodelay(true)?;
-        let root_client: schema::root::Client = capnp_rpc::new_client(RootService {
-            root: self.root.clone(),
-        });
-        Ok(tokio::task::spawn_local(run_rpc_system(
-            stream,
-            Some(root_client.client),
-        )))
+        let stream = stream.into_std()?;
+        let (done_tx, done) = oneshot::channel();
+        let close = Arc::new(Notify::new());
+        let thread_close = Arc::clone(&close);
+        let stop = self.connections.stop.subscribe();
+        let root = self.root.clone();
+        std::thread::Builder::new()
+            .name(format!("distill-rpc {peer}"))
+            .spawn(move || {
+                let outcome = serve_connection_thread(stream, root, stop, thread_close);
+                if let Err(ConnectionPanicked(message)) = &outcome {
+                    tracing::error!(%peer, %message, "RPC connection thread panicked");
+                }
+                drop(live);
+                let _ = done_tx.send(outcome);
+            })?;
+        Ok(ConnectionHandle { done, close })
     }
 
     /// Accept and drive one connection to completion.
     pub async fn serve_one(&self) -> Result<(), TransportError> {
         match self.accept_one().await?.await {
             Ok(result) => result.map_err(TransportError::Capnp),
-            Err(error) => Err(TransportError::Capnp(capnp::Error::failed(format!(
-                "RPC connection task failed: {error}"
-            )))),
+            Err(ConnectionPanicked(message)) => Err(TransportError::Capnp(capnp::Error::failed(
+                format!("RPC connection thread panicked: {message}"),
+            ))),
         }
     }
 
-    /// Production accept loop. Each connection remains on the same local IO
-    /// thread while independent `RpcSystem`s make progress concurrently.
+    /// Production accept loop: every connection on a thread of its own.
     pub async fn serve(&self) -> Result<(), TransportError> {
         self.serve_until(std::future::pending()).await
     }
 
-    /// Production accept loop with supervisor-owned shutdown. Existing
-    /// connection tasks are detached and finish independently; shutdown stops
-    /// admitting new unauthenticated loopback peers immediately.
+    /// Production accept loop with supervisor-owned shutdown. A connection
+    /// that cannot be served (refused past `max_connections`, or failing to
+    /// start) is logged and closed; only a failing listener ends the loop.
+    /// On shutdown the listener stops accepting and closes every
+    /// connection, waiting at most [`CONNECTION_SHUTDOWN_GRACE`] for their
+    /// threads.
     pub async fn serve_until<F>(&self, shutdown: F) -> Result<(), TransportError>
     where
         F: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
-        loop {
+        let result = loop {
             tokio::select! {
-                // Dropping a Tokio JoinHandle detaches the task; the
-                // connection's own RpcSystem continues until disconnect.
-                result = self.accept_one() => drop(result?),
-                () = &mut shutdown => return Ok(()),
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, peer)) => match self.start(stream, peer) {
+                        // The thread runs detached; shutdown reaches it.
+                        Ok(connection) => drop(connection),
+                        Err(error) => tracing::warn!(%peer, %error, "RPC connection not served"),
+                    },
+                    Err(error) => break Err(TransportError::Io(error)),
+                },
+                () = &mut shutdown => break Ok(()),
             }
-        }
+        };
+        self.shutdown(CONNECTION_SHUTDOWN_GRACE).await;
+        result
     }
+
+    /// Close every connection this listener serves and refuse new ones,
+    /// then wait up to `grace` for their threads to exit. A thread blocked
+    /// in a synchronous call exits when the call returns; returns how many
+    /// were still running.
+    pub async fn shutdown(&self, grace: Duration) -> usize {
+        self.connections.stop.send_replace(true);
+        let mut live = self.connections.live.subscribe();
+        let _ = tokio::time::timeout(grace, live.wait_for(|live| *live == 0)).await;
+        let remaining = *live.borrow();
+        if remaining > 0 {
+            tracing::warn!(remaining, "RPC connection threads still running after shutdown");
+        }
+        remaining
+    }
+}
+
+/// The body of one connection thread: serve the connection until it
+/// closes, the listener shuts down, or its handle closes it. Everything
+/// the connection held is released before this returns; blocking workers
+/// still running (a lazy build) finish on their own.
+fn serve_connection_thread(
+    stream: std::net::TcpStream,
+    root: Root,
+    mut stop: watch::Receiver<bool>,
+    close: Arc<Notify>,
+) -> ConnectionOutcome {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return Ok(Err(capnp::Error::failed(format!(
+                "cannot start the connection runtime: {error}"
+            ))))
+        }
+    };
+    let local = tokio::task::LocalSet::new();
+    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        local.block_on(&runtime, async move {
+            let socket = stream
+                .try_clone()
+                .map_err(|error| capnp::Error::failed(format!("connection socket: {error}")))?;
+            let stream = TcpStream::from_std(stream)
+                .map_err(|error| capnp::Error::failed(format!("connection socket: {error}")))?;
+            let root_client: schema::root::Client = capnp_rpc::new_client(RootService { root });
+            let stopped = async {
+                // A dropped listener stops nothing: its threads keep serving.
+                if stop.wait_for(|stopped| *stopped).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let rpc = run_rpc_system(stream, Some(root_client.client));
+            tokio::pin!(rpc);
+            tokio::select! {
+                result = &mut rpc => return result,
+                () = stopped => {}
+                () = close.notified() => {}
+            }
+            // Close by ending the stream, not by dropping the RPC system:
+            // a dropped system leaks the capabilities its pending calls
+            // hold (and with them this connection's reader and admission),
+            // while end-of-stream runs capnp-rpc's disconnect, which
+            // releases them.
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            let _ = tokio::time::timeout(CONNECTION_DISCONNECT_GRACE, rpc).await;
+            Ok(())
+        })
+    }));
+    drop(local);
+    runtime.shutdown_background();
+    served.map_err(|payload| {
+        ConnectionPanicked(
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned()),
+        )
+    })
 }
 
 /// Remote bootstrap client plus the local task driving its single-threaded
@@ -360,6 +585,9 @@ impl schema::root::Server for RootService {
                 ConnectOutcome::Rejected(error) => {
                     write_connect_error(result, &error);
                 }
+                ConnectOutcome::Refused(failure) => {
+                    write_error(result.init_error(), CONNECTION_LIMIT, &format!("{failure:?}"));
+                }
             }
             Ok(())
         }
@@ -387,6 +615,9 @@ impl schema::root::Server for RootService {
                     failure.set_expected(expected);
                     failure.set_observed(observed);
                     failure.set_message("metadata bootstrap protocol mismatch");
+                }
+                MetadataConnectOutcome::Refused(failure) => {
+                    write_error(result.init_error(), CONNECTION_LIMIT, &format!("{failure:?}"));
                 }
             }
             Ok(())
@@ -885,24 +1116,20 @@ impl schema::snapshot::Server for SnapshotService {
                 crate::BuildWorkClass::Interactive
             };
             // Lazy resolution may synchronously execute a complete processor
-            // chain. Keep that work off the single-threaded capnp-rpc driver;
-            // the daemon build scheduler provides the actual admission bound
-            // while this future yields so unrelated connections keep moving.
-            let outcome = loop {
-                match self.snapshot.resolve_prepare(uuid, work_class) {
-                    crate::ResolveStep::Done(outcome) => break outcome,
-                    crate::ResolveStep::Build(build) => {
-                        let finished = tokio::task::spawn_blocking(move || build.run())
-                            .await
-                            .map_err(|error| {
-                                capnp::Error::failed(format!(
-                                    "snapshot resolve worker failed: {error}"
-                                ))
-                            })?;
-                        if let Some(outcome) = self.snapshot.resolve_finish(uuid, finished) {
-                            break outcome;
-                        }
-                    }
+            // chain. Run it on a blocking worker so this connection's other
+            // calls (pipelined resolves, fetches, its delta stream) keep
+            // moving; the daemon build scheduler bounds the actual work.
+            let outcome = match self.snapshot.resolve_prepare(uuid, work_class) {
+                crate::ResolveStep::Done(outcome) => outcome,
+                crate::ResolveStep::Build(build) => {
+                    let finished = tokio::task::spawn_blocking(move || build.run())
+                        .await
+                        .map_err(|error| {
+                            capnp::Error::failed(format!(
+                                "snapshot resolve worker failed: {error}"
+                            ))
+                        })?;
+                    self.snapshot.resolve_finish(uuid, finished)
                 }
             };
             write_resolve_result(results.get().init_result(), outcome);

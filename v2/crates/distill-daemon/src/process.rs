@@ -1084,6 +1084,9 @@ fn reconcile_imports(
     reconcile.and(failure)
 }
 
+/// The RPC listener thread. It only accepts: every connection is served on a
+/// thread of its own (`distill_rpc::capnp_transport`), and on `stop` the
+/// listener closes them and waits a bounded grace for their threads.
 fn spawn_rpc_loop(
     root: distill_rpc::Root,
     address: SocketAddr,

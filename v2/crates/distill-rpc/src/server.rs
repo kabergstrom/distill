@@ -1,24 +1,34 @@
 //! The RPC server over the store's current-state tables (LOCKLESS.md §3).
 //!
 //! A [`ServerHandle`] is the shared, `Send + Sync` identity of one served
-//! store: its configuration, publication signal, and backends. Every thread
-//! that serves clients has its own cheap front end ([`Server`]) holding a
-//! store reader, its connections, snapshots, and subscription queues. A
-//! snapshot is an open read transaction; subscriptions follow the store's
-//! change log. Every thread writes through its own writer of the store
-//! ([`SharedStore`]); SQLite's write lock orders them.
+//! store: its configuration, snapshot policy, publication signal, backends,
+//! and two admission counters. It is the only state connections share, and
+//! none of it is per-connection: the counters and the policy are atomics,
+//! and every thread writes through its own writer of the store
+//! ([`SharedStore`]), whose write lock orders them.
+//!
+//! Every client connection ([`Root::connect`], [`Root::metadata`]) owns a
+//! private front end ([`Server`]): its own store reader, its own snapshots
+//! (open read transactions), and for a target connection its subscription
+//! queue and change-log cursor. Nothing of it is reachable from another
+//! connection, so a connection lives on one thread and needs no locks; the
+//! Cap'n Proto transport gives each one a thread of its own. A connection
+//! learns of publications from the handle's watch signal and reads the
+//! change log itself, from its own cursor. Admin work (commits, installs)
+//! goes through a per-thread front end ([`Server::attach`]) that holds no
+//! connection state.
 //!
 //! Embedded servers (tests, tools) own a private store in a temporary
 //! directory. Daemon servers share the daemon's store: the daemon's
 //! durable step and the served projection of each [`Commit`] commit as one
 //! input ([`crate::apply_commit`]), and then the handle is signalled.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -44,18 +54,61 @@ const MAX_PENDING_STREAM_EVENTS: usize = 1024;
 pub const DEFAULT_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_SNAPSHOTS: usize = 1024;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
-const MAX_IDLE_READERS: usize = 4;
 pub const MAX_SUBSCRIBED_ASSETS: usize = 4096;
 pub const MAX_SUBSCRIBED_PATHS: usize = 4096;
 
-/// Bounds on one front end's capabilities. A snapshot served over the wire
+/// Bounds on the capabilities clients hold. A snapshot served over the wire
 /// expires `ttl` after it opens, whatever its use; clients open another.
-/// Past either count the oldest snapshot or connection is released.
+///
+/// `max_snapshots` bounds the snapshots open across all connections. A
+/// connection opening one past it releases its own oldest snapshot, and is
+/// refused ([`RpcFailure::ResourceLimit`]) when it holds none: a connection
+/// never reaches into another's. `max_connections` bounds the connections
+/// served at once; one past it is refused. Hubs and metadata hubs count
+/// against it, and so, separately, do a listener's transport connections
+/// (`capnp_transport`). A policy applies to what opens after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotPolicy {
     pub ttl: Duration,
     pub max_snapshots: usize,
     pub max_connections: usize,
+}
+
+/// A [`SnapshotPolicy`] readable from any thread without a lock. Each bound
+/// is its own atomic: a reader racing a replacement may combine old and new
+/// bounds, each of them valid, and the next capability opened sees the new
+/// policy whole.
+struct PolicyCell {
+    ttl_nanos: AtomicU64,
+    max_snapshots: AtomicUsize,
+    max_connections: AtomicUsize,
+}
+
+impl PolicyCell {
+    fn new(policy: SnapshotPolicy) -> Self {
+        let cell = Self {
+            ttl_nanos: AtomicU64::new(0),
+            max_snapshots: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(0),
+        };
+        cell.set(policy);
+        cell
+    }
+
+    fn get(&self) -> SnapshotPolicy {
+        SnapshotPolicy {
+            ttl: Duration::from_nanos(self.ttl_nanos.load(Ordering::Acquire)),
+            max_snapshots: self.max_snapshots.load(Ordering::Acquire),
+            max_connections: self.max_connections.load(Ordering::Acquire),
+        }
+    }
+
+    fn set(&self, policy: SnapshotPolicy) {
+        let ttl = u64::try_from(policy.ttl.as_nanos()).unwrap_or(u64::MAX);
+        self.ttl_nanos.store(ttl, Ordering::Release);
+        self.max_snapshots.store(policy.max_snapshots, Ordering::Release);
+        self.max_connections.store(policy.max_connections, Ordering::Release);
+    }
 }
 
 impl Default for SnapshotPolicy {
@@ -160,8 +213,14 @@ pub struct ServerHandle {
     authoring_backend: Arc<dyn AuthoringBackend>,
     build_backend: OnceLock<Arc<dyn BuildBackend>>,
     on_publish: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// What each front end starts with.
-    policy: SnapshotPolicy,
+    /// The bounds connections read when they open a capability.
+    policy: PolicyCell,
+    /// Snapshot capabilities holding a read transaction, over every
+    /// connection ([`SnapshotPolicy::max_snapshots`]).
+    open_snapshots: AtomicUsize,
+    /// Admitted hubs and metadata hubs ([`SnapshotPolicy::max_connections`]).
+    open_connections: AtomicUsize,
+    next_connection_id: AtomicU64,
     /// Every thread writes through its own writer of this store.
     store: Option<Arc<SharedStore>>,
     embedded_dir: Option<PathBuf>,
@@ -201,7 +260,10 @@ impl ServerHandle {
             authoring_backend,
             build_backend: OnceLock::new(),
             on_publish: OnceLock::new(),
-            policy: SnapshotPolicy::default(),
+            policy: PolicyCell::new(SnapshotPolicy::default()),
+            open_snapshots: AtomicUsize::new(0),
+            open_connections: AtomicUsize::new(0),
+            next_connection_id: AtomicU64::new(1),
             store: Some(store),
             embedded_dir,
         })
@@ -253,10 +315,54 @@ impl ServerHandle {
         self.published.subscribe()
     }
 
-    /// The snapshot policy front ends start with. A snapshot never
+    /// The snapshot policy capabilities open under. A snapshot never
     /// outlives its TTL, so storage it reads stays for that long.
     pub fn snapshot_policy(&self) -> SnapshotPolicy {
-        self.policy
+        self.policy.get()
+    }
+
+    fn set_snapshot_policy(&self, policy: SnapshotPolicy) {
+        self.policy.set(policy);
+    }
+
+    /// Snapshot capabilities holding a read transaction, over every
+    /// connection.
+    pub fn open_snapshots(&self) -> usize {
+        self.open_snapshots.load(Ordering::Acquire)
+    }
+
+    /// Hubs and metadata hubs currently admitted.
+    pub fn open_connections(&self) -> usize {
+        self.open_connections.load(Ordering::Acquire)
+    }
+
+    fn connection_id(&self) -> u64 {
+        self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Count one more open snapshot unless `max` are open.
+    fn claim_snapshot(self: &Arc<Self>, max: usize) -> Option<SnapshotClaim> {
+        self.open_snapshots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < max).then_some(open + 1)
+            })
+            .ok()
+            .map(|_| SnapshotClaim {
+                handle: Arc::clone(self),
+            })
+    }
+
+    /// Admit one more connection unless `max_connections` are open.
+    fn admit_connection(self: &Arc<Self>) -> Option<Admission> {
+        let max = self.snapshot_policy().max_connections;
+        self.open_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < max).then_some(open + 1)
+            })
+            .ok()
+            .map(|_| Admission {
+                handle: Arc::clone(self),
+            })
     }
 
     pub(crate) fn authoring_backend(&self) -> Arc<dyn AuthoringBackend> {
@@ -472,31 +578,54 @@ fn embedded_state_dir() -> PathBuf {
 // Front end
 
 thread_local! {
+    /// Each thread's admin front end, by handle ([`Server::attach`]).
     static FRONT_ENDS: RefCell<HashMap<u64, Weak<Inner>>> = RefCell::new(HashMap::new());
 }
 
-/// This thread's front end of one served store. Cheap to clone; not `Send`.
+/// A front end of one served store: one connection's, or a thread's admin
+/// front end ([`Server::attach`]). Cheap to clone; not `Send`.
 /// [`Server::root`] hands out the `Send` bootstrap for other threads.
 #[derive(Clone)]
 pub struct Server {
     pub(crate) inner: Rc<Inner>,
 }
 
+/// One front end's state. A connection's is reachable only from that
+/// connection's capabilities, and so only from the thread serving it.
 pub(crate) struct Inner {
     /// Current-state reads: fences, the change log, CAS bytes, artifacts.
     pub(crate) reader: StoreReader,
-    idle_readers: RefCell<Vec<StoreReader>>,
-    /// Snapshots of one version share a read transaction.
+    /// This front end's snapshots of one version share a read transaction.
     current_txn: RefCell<Weak<SnapshotTxn>>,
-    connections: RefCell<Vec<Weak<RefCell<ConnectionState>>>>,
-    /// Open snapshots, oldest first, for the snapshot bound.
+    /// This front end's open snapshots, oldest first.
     snapshots: RefCell<VecDeque<Weak<SnapshotHold>>>,
-    policy: Cell<SnapshotPolicy>,
-    next_connection_id: Cell<u64>,
-    pub(crate) build_results: RefCell<HashMap<BuildKey, BuildResolution>>,
-    /// The last change-log row this front end has delivered.
-    cursor: Cell<i64>,
     pub(crate) handle: Arc<ServerHandle>,
+    /// A connection's place under `max_connections`; none for an admin
+    /// front end.
+    _admission: Option<Admission>,
+}
+
+/// One admitted connection, released when its front end drops.
+struct Admission {
+    handle: Arc<ServerHandle>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.handle.open_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One open snapshot counted against `max_snapshots`, released with the
+/// snapshot's read transaction.
+pub(crate) struct SnapshotClaim {
+    handle: Arc<ServerHandle>,
+}
+
+impl Drop for SnapshotClaim {
+    fn drop(&mut self) {
+        self.handle.open_snapshots.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl fmt::Debug for Server {
@@ -516,13 +645,6 @@ pub struct Root {
 impl fmt::Debug for Root {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Root").finish_non_exhaustive()
-    }
-}
-
-impl Root {
-    /// This thread's front end.
-    pub(crate) fn server(&self) -> Server {
-        Server::attach(&self.handle)
     }
 }
 
@@ -575,7 +697,9 @@ impl Server {
         Ok(Self::attach(&handle))
     }
 
-    /// This thread's front end of `handle`.
+    /// This thread's admin front end of `handle`: commits, installs, and
+    /// current-state reads. It holds no connection state; every connection
+    /// gets a front end of its own ([`Root::connect`]).
     pub fn attach(handle: &Arc<ServerHandle>) -> Self {
         FRONT_ENDS.with(|front_ends| {
             let mut front_ends = front_ends.borrow_mut();
@@ -583,45 +707,33 @@ impl Server {
                 return Self { inner };
             }
             front_ends.retain(|_, inner| inner.strong_count() > 0);
-            let reader = StoreReader::open(handle.config.clone())
-                .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
-            let cursor = reader
-                .change_log_head()
-                .unwrap_or_else(|error| panic!("cannot read the served change log: {error}"));
-            let inner = Rc::new(Inner {
-                reader,
-                idle_readers: RefCell::new(Vec::new()),
-                current_txn: RefCell::new(Weak::new()),
-                connections: RefCell::new(Vec::new()),
-                snapshots: RefCell::new(VecDeque::new()),
-                policy: Cell::new(handle.policy),
-                next_connection_id: Cell::new(1),
-                build_results: RefCell::new(HashMap::new()),
-                cursor: Cell::new(cursor),
-                handle: Arc::clone(handle),
-            });
+            let inner = Rc::new(Inner::open(handle, None));
             front_ends.insert(handle.id, Rc::downgrade(&inner));
             Self { inner }
         })
+    }
+
+    /// A front end of its own for one admitted connection.
+    fn connection(handle: &Arc<ServerHandle>, admission: Admission) -> Self {
+        Self {
+            inner: Rc::new(Inner::open(handle, Some(admission))),
+        }
     }
 
     pub fn handle(&self) -> Arc<ServerHandle> {
         Arc::clone(&self.inner.handle)
     }
 
-    /// Replace this front end's snapshot policy. Lowering a bound releases
-    /// the oldest snapshots or connections at once.
+    /// Replace the snapshot policy. It applies to snapshots and connections
+    /// opened afterwards; what is open keeps its TTL and is not released.
     pub fn install_snapshot_policy(&self, policy: SnapshotPolicy) -> Result<(), &'static str> {
-        self.inner.policy.set(policy.validate()?);
-        self.inner.enforce_snapshot_bound(0);
-        self.inner.enforce_connection_bound(0);
+        self.inner.handle.set_snapshot_policy(policy.validate()?);
         Ok(())
     }
 
-    /// How many snapshots this front end holds open.
+    /// How many snapshots are open, over every connection.
     pub fn open_snapshots(&self) -> usize {
-        self.inner.enforce_snapshot_bound(0);
-        self.inner.snapshots.borrow().len()
+        self.inner.handle.open_snapshots()
     }
 
     /// Install the lazy-build implementation. Install backends once, before
@@ -1137,42 +1249,21 @@ pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFai
 // ---------------------------------------------------------------------------
 // Snapshots
 
-/// One read transaction pinning one input version, shared by every snapshot of
-/// that version on this front end. The immutable facts are read once.
+/// One read transaction pinning one input version, on a connection of its
+/// own, shared by every snapshot of that version on one front end. The
+/// immutable facts are read once.
 pub(crate) struct SnapshotTxn {
-    snapshot: Option<distill_store::served::StoreSnapshot>,
+    snapshot: distill_store::served::StoreSnapshot,
     pub(crate) stamp: SnapshotStamp,
     pub(crate) configuration: ConfigurationStatus,
     pipeline_installed_at: InputVersion,
     pipeline: PipelineDiagnostic,
-    inner: Weak<Inner>,
 }
 
 impl SnapshotTxn {
     pub(crate) fn snapshot(&self) -> &StoreReader {
-        self.snapshot.as_ref().expect("snapshot owns its transaction")
+        &self.snapshot
     }
-}
-
-impl Drop for SnapshotTxn {
-    fn drop(&mut self) {
-        let Some(snapshot) = self.snapshot.take() else {
-            return;
-        };
-        let Ok(reader) = snapshot.into_reader() else {
-            return;
-        };
-        if let Some(inner) = self.inner.upgrade() {
-            inner.return_reader(reader);
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct BuildKey {
-    pub(crate) basis: SnapshotStamp,
-    pub(crate) target: String,
-    pub(crate) asset: AssetUuid,
 }
 
 #[derive(Debug, Clone)]
@@ -1182,9 +1273,15 @@ pub(crate) enum BuildResolution {
     Drifted(DriftedInput),
 }
 
+/// A held read transaction and its place under `max_snapshots`.
+struct HeldTxn {
+    txn: Rc<SnapshotTxn>,
+    _claim: SnapshotClaim,
+}
+
 /// A snapshot capability's read transaction, until it is released: on drop,
 /// on eviction past the snapshot bound, or when its expiry timer fires.
-pub(crate) type SnapshotSlot = Rc<RefCell<Option<Rc<SnapshotTxn>>>>;
+type SnapshotSlot = Rc<RefCell<Option<HeldTxn>>>;
 
 /// What one snapshot capability (and its clones) holds.
 pub(crate) struct SnapshotHold {
@@ -1198,23 +1295,23 @@ impl SnapshotHold {
     }
 
     pub(crate) fn txn(&self) -> Option<Rc<SnapshotTxn>> {
-        self.slot.borrow().clone()
+        self.slot.borrow().as_ref().map(|held| Rc::clone(&held.txn))
     }
 
     pub(crate) fn expire(&self) {
-        let txn = self.slot.borrow_mut().take();
-        drop(txn);
+        let held = self.slot.borrow_mut().take();
+        drop(held);
     }
 
-    /// Release the snapshot once its TTL passes. Call on the RPC thread's
-    /// `LocalSet`.
+    /// Release the snapshot once its TTL passes. Call on the `LocalSet` of
+    /// the thread serving the connection: the timer runs there.
     pub(crate) fn expire_later(&self) {
         let slot = Rc::clone(&self.slot);
         let ttl = self.ttl;
         tokio::task::spawn_local(async move {
             tokio::time::sleep(ttl).await;
-            let txn = slot.borrow_mut().take();
-            drop(txn);
+            let held = slot.borrow_mut().take();
+            drop(held);
         });
     }
 }
@@ -1228,39 +1325,30 @@ impl Drop for SnapshotHold {
 // ---------------------------------------------------------------------------
 // Connections
 
+/// A target connection's own state: its fences, subscriptions, and delta
+/// queue. Only its connection's capabilities reach it.
 pub(crate) struct ConnectionState {
     pub(crate) id: u64,
     pub(crate) target: String,
     target_generation: u64,
     protocol_epoch: u32,
     pipeline_generation: u64,
-    /// Change-log rows up to here predate the connection.
+    /// The change-log cursor: rows up to here are delivered or predate the
+    /// connection.
     seen_seq: i64,
     /// A reconnect event was delivered; no further deltas are.
     fenced: bool,
-    active: bool,
     pub(crate) subscribed_assets: BTreeSet<AssetUuid>,
     pub(crate) subscribed_paths: BTreeSet<String>,
+    /// Undelivered stream events, at most `MAX_PENDING_STREAM_EVENTS`: past
+    /// that the queue collapses into one `ResyncRequired` (a reconnect
+    /// prompt survives on its own).
     pub(crate) queue: VecDeque<StreamEvent>,
     pub(crate) stream_installed: bool,
     pub(crate) notify: Rc<Notify>,
 }
 
 impl ConnectionState {
-    pub(crate) fn alive(&self) -> bool {
-        self.active
-    }
-
-    pub(crate) fn expire(&mut self) {
-        if !std::mem::replace(&mut self.active, false) {
-            return;
-        }
-        self.subscribed_assets.clear();
-        self.subscribed_paths.clear();
-        self.queue.clear();
-        self.notify.notify_waiters();
-    }
-
     pub(crate) fn enqueue(&mut self, event: StreamEvent) {
         if self.queue.len() >= MAX_PENDING_STREAM_EVENTS {
             let basis = event.basis().clone();
@@ -1353,25 +1441,32 @@ pub(crate) fn history_deltas(instance: StoreInstanceId, rows: &[ChangeEntry]) ->
     deltas
 }
 
+/// Read several facts from one committed version, on a reader of its own.
+fn read_consistent<T>(
+    config: &StoreConfig,
+    read: impl FnOnce(&StoreReader) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let snapshot = StoreReader::open(config.clone())?.begin_snapshot()?;
+    read(&snapshot)
+}
+
 impl Inner {
+    fn open(handle: &Arc<ServerHandle>, admission: Option<Admission>) -> Self {
+        let reader = StoreReader::open(handle.config.clone())
+            .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
+        Self {
+            reader,
+            current_txn: RefCell::new(Weak::new()),
+            snapshots: RefCell::new(VecDeque::new()),
+            handle: Arc::clone(handle),
+            _admission: admission,
+        }
+    }
+
     pub(crate) fn current_stamp(&self) -> SnapshotStamp {
         SnapshotStamp {
             instance: self.handle.instance,
             version: self.reader.input_version(),
-        }
-    }
-
-    fn take_reader(&self) -> Result<StoreReader, StoreError> {
-        match self.idle_readers.borrow_mut().pop() {
-            Some(reader) => Ok(reader),
-            None => StoreReader::open(self.handle.config.clone()),
-        }
-    }
-
-    fn return_reader(&self, reader: StoreReader) {
-        let mut idle = self.idle_readers.borrow_mut();
-        if idle.len() < MAX_IDLE_READERS {
-            idle.push(reader);
         }
     }
 
@@ -1380,33 +1475,29 @@ impl Inner {
         &self,
         read: impl FnOnce(&StoreReader) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let snapshot = self.take_reader()?.begin_snapshot()?;
-        let result = read(&snapshot);
-        if let Ok(reader) = snapshot.into_reader() {
-            self.return_reader(reader);
-        }
-        result
+        read_consistent(&self.handle.config, read)
     }
 
-    /// The read transaction pinning the current version.
-    pub(crate) fn current_snapshot(self: &Rc<Self>) -> Result<Rc<SnapshotTxn>, StoreError> {
+    /// The read transaction pinning the current version. Snapshots of one
+    /// version on this front end share it; each new version opens a read
+    /// transaction on a connection of its own.
+    pub(crate) fn current_snapshot(&self) -> Result<Rc<SnapshotTxn>, StoreError> {
         let current = self.reader.input_version();
         if let Some(txn) = self.current_txn.borrow().upgrade() {
             if txn.stamp.version == current {
                 return Ok(txn);
             }
         }
-        let snapshot = self.take_reader()?.begin_snapshot()?;
+        let snapshot = StoreReader::open(self.handle.config.clone())?.begin_snapshot()?;
         let configuration = configuration_status(&snapshot.configuration_state()?);
         let (pipeline_installed_at, pipeline) =
             read_served_pipeline(snapshot.served_blob(SERVED_PIPELINE)?)?;
         let txn = Rc::new(SnapshotTxn {
             stamp: snapshot.stamp(),
-            snapshot: Some(snapshot),
+            snapshot,
             configuration,
             pipeline_installed_at,
             pipeline,
-            inner: Rc::downgrade(self),
         });
         *self.current_txn.borrow_mut() = Rc::downgrade(&txn);
         Ok(txn)
@@ -1440,71 +1531,61 @@ impl Inner {
         }
     }
 
-    /// Hold one snapshot of the current version.
-    pub(crate) fn register_snapshot(self: &Rc<Self>, txn: Rc<SnapshotTxn>) -> Rc<SnapshotHold> {
+    /// Hold one snapshot of the current version under the snapshot bound:
+    /// past it this front end releases its own oldest snapshots, and is
+    /// refused when it has none left to release.
+    pub(crate) fn register_snapshot(
+        &self,
+        txn: Rc<SnapshotTxn>,
+    ) -> Result<Rc<SnapshotHold>, RpcFailure> {
+        let policy = self.handle.snapshot_policy();
+        self.release_snapshots_beyond(policy.max_snapshots - 1);
+        let claim = loop {
+            if let Some(claim) = self.handle.claim_snapshot(policy.max_snapshots) {
+                break claim;
+            }
+            if !self.release_oldest_snapshot() {
+                return Err(RpcFailure::ResourceLimit {
+                    resource: "open snapshots".to_owned(),
+                    limit: policy.max_snapshots,
+                });
+            }
+        };
         let hold = Rc::new(SnapshotHold {
-            slot: Rc::new(RefCell::new(Some(txn))),
-            ttl: self.policy.get().ttl,
+            slot: Rc::new(RefCell::new(Some(HeldTxn { txn, _claim: claim }))),
+            ttl: policy.ttl,
         });
-        self.enforce_snapshot_bound(1);
         self.snapshots.borrow_mut().push_back(Rc::downgrade(&hold));
-        hold
+        Ok(hold)
     }
 
-    fn connection_id(&self) -> u64 {
-        let id = self.next_connection_id.get();
-        self.next_connection_id.set(id + 1);
-        id
+    /// This front end's open snapshots, oldest first; released ones are
+    /// forgotten.
+    fn live_snapshots(&self) -> std::cell::RefMut<'_, VecDeque<Weak<SnapshotHold>>> {
+        let mut snapshots = self.snapshots.borrow_mut();
+        snapshots.retain(|hold| hold.upgrade().is_some_and(|hold| hold.alive()));
+        snapshots
     }
 
-    fn enforce_snapshot_bound(&self, reserve: usize) {
-        self.snapshots
-            .borrow_mut()
-            .retain(|hold| hold.upgrade().is_some_and(|hold| hold.alive()));
-        let max = self.policy.get().max_snapshots;
-        loop {
-            let oldest = {
-                let mut snapshots = self.snapshots.borrow_mut();
-                if snapshots.len() + reserve <= max {
-                    break;
-                }
-                snapshots.pop_front()
-            };
-            if let Some(hold) = oldest.and_then(|hold| hold.upgrade()) {
+    fn release_oldest_snapshot(&self) -> bool {
+        let oldest = self.live_snapshots().pop_front();
+        match oldest.and_then(|hold| hold.upgrade()) {
+            Some(hold) => {
                 hold.expire();
+                true
             }
+            None => false,
         }
     }
 
-    /// Live connections, oldest first; expired ones are dropped.
-    pub(crate) fn live_connections(&self) -> Vec<Rc<RefCell<ConnectionState>>> {
-        let mut live = Vec::new();
-        self.connections.borrow_mut().retain(|weak| {
-            let Some(connection) = weak.upgrade() else {
-                return false;
-            };
-            let mut state = connection.borrow_mut();
-            if !state.alive() {
-                state.expire();
-                return false;
-            }
-            drop(state);
-            live.push(connection);
-            true
-        });
-        live
-    }
-
-    fn enforce_connection_bound(&self, reserve: usize) {
-        let max = self.policy.get().max_connections;
-        let mut live = self.live_connections();
-        while live.len() + reserve > max {
-            live.remove(0).borrow_mut().expire();
+    fn release_snapshots_beyond(&self, keep: usize) {
+        while self.live_snapshots().len() > keep {
+            self.release_oldest_snapshot();
         }
-        self.live_connections();
     }
 
-    /// Open one target connection with its fences read at one version.
+    /// Open one target connection with its fences read at one version;
+    /// change-log rows after `head` are its to deliver.
     pub(crate) fn open_connection(
         &self,
         target: String,
@@ -1512,27 +1593,20 @@ impl Inner {
         fences: &distill_store::served::RpcFences,
         head: i64,
     ) -> Rc<RefCell<ConnectionState>> {
-        self.pump_until(Some(head));
-        self.enforce_connection_bound(1);
-        let connection = Rc::new(RefCell::new(ConnectionState {
-            id: self.connection_id(),
+        Rc::new(RefCell::new(ConnectionState {
+            id: self.handle.connection_id(),
             target,
             target_generation,
             protocol_epoch: fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION),
             pipeline_generation: fences.pipeline_generation,
             seen_seq: head,
             fenced: false,
-            active: true,
             subscribed_assets: BTreeSet::new(),
             subscribed_paths: BTreeSet::new(),
             queue: VecDeque::new(),
             stream_installed: false,
             notify: Rc::new(Notify::new()),
-        }));
-        self.connections
-            .borrow_mut()
-            .push(Rc::downgrade(&connection));
-        connection
+        }))
     }
 
     /// Why `connection` must reconnect, if it must.
@@ -1560,14 +1634,18 @@ impl Inner {
         }
     }
 
-    /// Deliver every change-log row published since the last pump.
-    pub(crate) fn pump(&self) {
-        self.pump_until(None);
+    /// Deliver to `connection` every change-log row published since its
+    /// cursor.
+    pub(crate) fn pump(&self, connection: &RefCell<ConnectionState>) {
+        self.pump_until(connection, None);
     }
 
-    /// Deliver change-log rows up to `limit` (all when `None`).
-    pub(crate) fn pump_until(&self, limit: Option<i64>) {
-        let cursor = self.cursor.get();
+    /// Deliver to `connection` the change-log rows after its cursor, up to
+    /// `limit` (all when `None`), and advance the cursor past them. Each
+    /// connection reads the log itself: a publication costs the publisher
+    /// one watch signal, whatever the number of connections.
+    pub(crate) fn pump_until(&self, connection: &RefCell<ConnectionState>, limit: Option<i64>) {
+        let cursor = connection.borrow().seen_seq;
         if limit.is_some_and(|limit| limit <= cursor) {
             return;
         }
@@ -1584,11 +1662,9 @@ impl Inner {
         let Some(last) = rows.last().map(|row| row.seq) else {
             return;
         };
-        self.cursor.set(last);
-        let live = self.live_connections();
-        if live.is_empty() {
-            return;
-        }
+        let mut connection = connection.borrow_mut();
+        let connection = &mut *connection;
+        connection.seen_seq = last;
         let instance = self.handle.instance;
         let mut index = 0;
         while index < rows.len() {
@@ -1606,21 +1682,14 @@ impl Inner {
                     {
                         index += 1;
                     }
-                    let first_seq = rows[start].seq;
-                    let group = history_deltas(instance, &rows[start..index]);
-                    for connection in &live {
-                        let mut connection = connection.borrow_mut();
-                        if connection.fenced || first_seq <= connection.seen_seq {
-                            continue;
-                        }
-                        let connection = &mut *connection;
-                        for delta in &group {
-                            if let Some(delta) = delta.filtered(
-                                &connection.subscribed_assets,
-                                &connection.subscribed_paths,
-                            ) {
-                                connection.enqueue(StreamEvent::Delta(delta));
-                            }
+                    if connection.fenced {
+                        continue;
+                    }
+                    for delta in history_deltas(instance, &rows[start..index]) {
+                        if let Some(delta) =
+                            delta.filtered(&connection.subscribed_assets, &connection.subscribed_paths)
+                        {
+                            connection.enqueue(StreamEvent::Delta(delta));
                         }
                     }
                     continue;
@@ -1631,51 +1700,27 @@ impl Inner {
                         _ => None,
                     };
                     match reconnect_reason(*reason) {
+                        Ok(_) if target.is_some_and(|target| &connection.target != target) => {}
                         Ok(reason) => {
-                            for connection in &live {
-                                let mut connection = connection.borrow_mut();
-                                if row.seq <= connection.seen_seq
-                                    || target.is_some_and(|target| &connection.target != target)
-                                {
-                                    continue;
-                                }
-                                connection.fenced = true;
-                                connection.enqueue(StreamEvent::Asset {
-                                    basis: RpcBasis { snapshot: stamp },
-                                    event: AssetEvent::ReconnectRequired { reason },
-                                });
-                            }
+                            connection.fenced = true;
+                            connection.enqueue(StreamEvent::Asset {
+                                basis: RpcBasis { snapshot: stamp },
+                                event: AssetEvent::ReconnectRequired { reason },
+                            });
                         }
                         Err(error) => tracing::error!(%error, "skipping a corrupt change-log row"),
                     }
                 }
                 Change::RestartRequired { keys } => {
-                    if !keys.is_empty() {
-                        for connection in &live {
-                            let mut connection = connection.borrow_mut();
-                            if row.seq <= connection.seen_seq || !connection.stream_installed {
-                                continue;
-                            }
-                            connection.enqueue(StreamEvent::Asset {
-                                basis: RpcBasis { snapshot: stamp },
-                                event: AssetEvent::RestartRequired { keys: keys.clone() },
-                            });
-                        }
+                    if !keys.is_empty() && connection.stream_installed {
+                        connection.enqueue(StreamEvent::Asset {
+                            basis: RpcBasis { snapshot: stamp },
+                            event: AssetEvent::RestartRequired { keys: keys.clone() },
+                        });
                     }
                 }
             }
             index += 1;
-        }
-    }
-
-    /// Cache a build outcome for its snapshot, only while that snapshot is
-    /// the current version.
-    pub(crate) fn cache_build(&self, key: BuildKey, resolution: BuildResolution) {
-        let current = self.current_stamp();
-        let mut results = self.build_results.borrow_mut();
-        results.retain(|key, _| key.basis == current);
-        if key.basis == current {
-            results.insert(key, resolution);
         }
     }
 
@@ -1686,45 +1731,40 @@ impl Inner {
 
 impl Root {
     /// Target- and compiled-registry-free bootstrap for failure-safe metadata,
-    /// diagnostics, authored-value inspection, and immutable CAS reads.
+    /// diagnostics, authored-value inspection, and immutable CAS reads. The
+    /// metadata hub is a connection of its own.
     pub fn metadata(&self, protocol: u32) -> MetadataConnectOutcome {
-        self.server().metadata(protocol)
-    }
-
-    pub fn connect(&self, request: ConnectRequest) -> ConnectOutcome {
-        self.server().connect(request)
-    }
-}
-
-impl Server {
-    fn metadata_binding(&self, protocol_epoch: u32) -> Rc<MetadataBinding> {
-        Rc::new(MetadataBinding {
-            id: self.inner.connection_id(),
-            protocol_epoch,
-        })
-    }
-
-    fn metadata(&self, protocol: u32) -> MetadataConnectOutcome {
-        let expected = self.inner.protocol_epoch();
+        let handle = &self.handle;
+        let expected = read_consistent(&handle.config, |reader| reader.rpc_fences())
+            .map(|fences| fences.protocol_epoch.unwrap_or(PROTOCOL_VERSION))
+            .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
         if protocol != expected {
             return MetadataConnectOutcome::ProtocolMismatch {
                 expected,
                 observed: protocol,
             };
         }
+        let Some(admission) = handle.admit_connection() else {
+            return MetadataConnectOutcome::Refused(connection_limit(handle));
+        };
         MetadataConnectOutcome::Connected(MetadataConnected {
             hub: MetadataHub {
-                binding: self.metadata_binding(expected),
-                server: self.clone(),
+                binding: Rc::new(MetadataBinding {
+                    id: handle.connection_id(),
+                    protocol_epoch: expected,
+                }),
+                server: Server::connection(handle, admission),
             },
-            instance: self.inner.handle.instance,
+            instance: handle.instance,
             protocol_epoch: expected,
         })
     }
 
-    fn connect(&self, request: ConnectRequest) -> ConnectOutcome {
+    /// Bind a target connection: its own front end, fences, and stream.
+    pub fn connect(&self, request: ConnectRequest) -> ConnectOutcome {
+        let handle = &self.handle;
         let target_name = request.target.nfc().collect::<String>();
-        let read = self.inner.read_consistent(|reader| {
+        let read = read_consistent(&handle.config, |reader| {
             Ok((
                 reader.rpc_fences()?,
                 reader.rpc_target(&target_name)?,
@@ -1767,16 +1807,25 @@ impl Server {
             }
             Err(error) => panic!("cannot read the served pipeline: {error}"),
         }
-        let connection =
-            self.inner
-                .open_connection(target_name, target.generation, &fences, head);
+        let Some(admission) = handle.admit_connection() else {
+            return ConnectOutcome::Refused(connection_limit(handle));
+        };
+        let server = Server::connection(handle, admission);
+        let connection = server
+            .inner
+            .open_connection(target_name, target.generation, &fences, head);
         ConnectOutcome::Connected(Connected {
-            hub: Hub {
-                connection,
-                server: self.clone(),
-            },
-            instance: self.inner.handle.instance,
+            hub: Hub { connection, server },
+            instance: handle.instance,
         })
+    }
+}
+
+/// Why a connection past `max_connections` is refused.
+fn connection_limit(handle: &ServerHandle) -> RpcFailure {
+    RpcFailure::ResourceLimit {
+        resource: "connections".to_owned(),
+        limit: handle.snapshot_policy().max_connections,
     }
 }
 
@@ -1830,12 +1879,9 @@ pub(crate) fn is_embedded(server: &Server) -> bool {
 mod bound_tests {
     use super::*;
 
-    fn connect(server: &Server) -> Hub {
+    fn connect(server: &Server) -> ConnectOutcome {
         let request = ConnectRequest::new("dev", TargetDefinitionHash([7; 32]));
-        match server.root().connect(request) {
-            ConnectOutcome::Connected(connected) => connected.hub,
-            other => panic!("expected connection, got {other:?}"),
-        }
+        server.root().connect(request)
     }
 
     #[test]
@@ -1853,7 +1899,10 @@ mod bound_tests {
             })
             .unwrap();
 
-        let first_hub = connect(&server);
+        let ConnectOutcome::Connected(first) = connect(&server) else {
+            panic!("the first connection is admitted");
+        };
+        let first_hub = first.hub;
         let mut snapshots = Vec::new();
         for _ in 0..4096 {
             snapshots.push(match first_hub.snapshot() {
@@ -1862,20 +1911,23 @@ mod bound_tests {
             });
         }
         assert!(
-            server.inner.snapshots.borrow().len() <= 1,
-            "evicted snapshots accumulated despite a one-snapshot bound"
+            first_hub.server.inner.snapshots.borrow().len() <= 1,
+            "released snapshots accumulated despite a one-snapshot bound"
         );
+        assert_eq!(server.open_snapshots(), 1);
 
-        let mut hubs = vec![first_hub];
         for _ in 0..4096 {
-            hubs.push(connect(&server));
+            assert!(matches!(
+                connect(&server),
+                ConnectOutcome::Refused(RpcFailure::ResourceLimit { limit: 1, .. })
+            ));
         }
-        assert!(
-            server.inner.connections.borrow().len() <= 1,
-            "evicted connections accumulated despite a one-connection bound"
-        );
+        assert_eq!(server.handle().open_connections(), 1);
 
-        assert_eq!(snapshots.len(), 4096);
-        assert_eq!(hubs.len(), 4097);
+        drop(snapshots);
+        assert_eq!(server.open_snapshots(), 0);
+        drop(first_hub);
+        assert_eq!(server.handle().open_connections(), 0);
+        assert!(matches!(connect(&server), ConnectOutcome::Connected(_)));
     }
 }
