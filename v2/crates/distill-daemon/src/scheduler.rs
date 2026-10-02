@@ -313,6 +313,27 @@ enum ClaimReply<O> {
 pub(crate) struct ScheduledPool<O> {
     inbox: mpsc::Sender<Message<O>>,
     ids: Arc<AtomicU64>,
+    /// The scheduler thread, joined when the handle drops: it owns the
+    /// idle writers and the opener, which hold the state directory's lock.
+    actor: Option<std::thread::JoinHandle<()>>,
+}
+
+thread_local! {
+    /// Set on a pool worker while it runs a job.
+    static IN_POOL_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `job` marked as a pool job (see [`ScheduledPool`]'s `Drop`).
+fn as_pool_job<T>(job: impl FnOnce() -> T) -> T {
+    struct Unmark;
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            IN_POOL_JOB.with(|marked| marked.set(false));
+        }
+    }
+    IN_POOL_JOB.with(|marked| marked.set(true));
+    let _unmark = Unmark;
+    job()
 }
 
 impl<O: CellOutcome> ScheduledPool<O> {
@@ -338,10 +359,14 @@ impl<O: CellOutcome> ScheduledPool<O> {
         // The actor keeps a sender for the workers it spawns; it stops once
         // the handle is gone and no job is running. Cells still queued then
         // are dropped, and their tickets resolve as lost.
-        std::thread::Builder::new()
+        let actor = std::thread::Builder::new()
             .name("distill-scheduler".to_owned())
             .spawn(move || actor.run(messages))?;
-        Ok(Self { inbox, ids })
+        Ok(Self {
+            inbox,
+            ids,
+            actor: Some(actor),
+        })
     }
 
     fn next_id(&self) -> u64 {
@@ -434,8 +459,20 @@ impl<O: CellOutcome> ScheduledPool<O> {
 }
 
 impl<O> Drop for ScheduledPool<O> {
+    /// Close the pool and wait for its scheduler thread, which stops once no
+    /// job runs: then every writer it lent or kept is closed, so the state
+    /// directory can be opened again at once. On a pool worker running a
+    /// job (whose captures held the last handle) it does not wait: the
+    /// scheduler waits for that job. Nor on the scheduler thread itself,
+    /// which drops queued jobs (and their captures) as it stops.
     fn drop(&mut self) {
         let _ = self.inbox.send(Message::Closed);
+        if let Some(actor) = self.actor.take() {
+            let on_actor = actor.thread().id() == std::thread::current().id();
+            if !on_actor && !IN_POOL_JOB.with(std::cell::Cell::get) {
+                let _ = actor.join();
+            }
+        }
     }
 }
 
@@ -858,7 +895,7 @@ impl<O: CellOutcome> Actor<O> {
                     let mut writer = writer.unwrap_or_else(|error| {
                         panic!("cannot open a writer for a build job: {error}")
                     });
-                    job(&mut writer);
+                    as_pool_job(|| job(&mut writer));
                     completion.finish(writer);
                 });
                 continue;
@@ -891,7 +928,7 @@ impl<O: CellOutcome> Actor<O> {
                     return;
                 };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    job(&mut writer, &worker)
+                    as_pool_job(|| job(&mut writer, &worker))
                 }))
                 .map_or_else(|_| Arc::new(O::lost()), Arc::new);
                 let _ = worker.inbox.send(Message::Finished {
