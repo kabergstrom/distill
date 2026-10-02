@@ -363,6 +363,26 @@ pub struct ArtifactPartsView<'a> {
     pub content_hash: ContentHash,
 }
 
+/// The layout hash an artifact's header declares, read without hashing or
+/// validating the rest of the file. A transport uses it to fetch the DSWL
+/// tree it then authenticates against this hash; the artifact's own identity
+/// is checked later by [`parse_artifact_parts`].
+pub fn artifact_header_layout_hash(structural: &[u8]) -> Result<LayoutHash, ArtifactError> {
+    let mut r = Reader {
+        bytes: structural,
+        pos: 0,
+    };
+    if r.take(8)? != ARTIFACT_MAGIC {
+        return Err(ArtifactError::BadMagic);
+    }
+    let version = r.u32()?;
+    if version != ARTIFACT_FORMAT_VERSION {
+        return Err(ArtifactError::UnsupportedVersion { got: version });
+    }
+    r.take(4 * 16 + 32)?;
+    Ok(LayoutHash(r.bytes32()?))
+}
+
 /// Parse a fetched artifact whose canonical structural prefix and blob
 /// extents arrived separately. The blob list must be in blob-table order.
 pub fn parse_artifact_parts<'a>(

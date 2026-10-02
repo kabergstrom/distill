@@ -4,8 +4,8 @@
 use distill_bundle::PathComponent;
 use distill_core::id::{AssetUuid, LayoutHash, LogicalHash, TypeUuid};
 use distill_wire::artifact::{
-    assemble_artifact, canonical_blob_order, content_hash, parse_artifact, parse_artifact_parts,
-    split_artifact, write_artifact,
+    artifact_header_layout_hash, assemble_artifact, canonical_blob_order, content_hash,
+    parse_artifact, parse_artifact_parts, split_artifact, write_artifact,
     ArtifactError, ArtifactHeader, ARTIFACT_FORMAT_VERSION, ARTIFACT_MAGIC,
 };
 
@@ -127,6 +127,24 @@ fn split_transport_reconstructs_metadata_and_complete_content_identity() {
     assert_eq!(split.fixed, complete.fixed);
     assert_eq!(split.variable, complete.variable);
     assert_eq!(split.content_hash, content_hash(&bytes));
+}
+
+#[test]
+fn header_layout_hash_reads_the_header_alone() {
+    let bytes = write_simple(&[AssetUuid([9; 16])], &[1, 2, 3, 4], &[5, 6], &[]);
+    let header_len = 8 + 4 + 4 * 16 + 32 + 32;
+    assert_eq!(artifact_header_layout_hash(&bytes).unwrap(), header().layout_hash);
+    assert_eq!(
+        artifact_header_layout_hash(&bytes[..header_len]).unwrap(),
+        header().layout_hash
+    );
+    assert!(matches!(
+        artifact_header_layout_hash(&bytes[..header_len - 1]),
+        Err(ArtifactError::Truncated { .. })
+    ));
+    let mut bad = bytes.clone();
+    bad[0] ^= 1;
+    assert!(matches!(artifact_header_layout_hash(&bad), Err(ArtifactError::BadMagic)));
 }
 
 #[test]
