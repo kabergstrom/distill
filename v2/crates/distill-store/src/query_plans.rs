@@ -902,26 +902,25 @@ fn bundles_with_root_names_are_one_join() {
 }
 
 /// A refinement finds the tag rows it must redo by one search of an index
-/// per kind of staleness (poisoned, another schema epoch, another module's
+/// per kind of staleness (poisoned, among them pending; another module's
 /// migration), never by walking every row; and finds exactly those.
 #[test]
 fn stale_tag_rows_are_index_searches() {
     let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, mut store) = store_with(200);
-    let (epoch, old_epoch, module, old_module) = ([7; 32], [3; 32], [9; 32], [8; 32]);
+    let (module, old_module) = ([9; 32], [8; 32]);
     let updates = (0..200)
         .map(|index| {
-            let (tag_epoch, dylib_hash, poison) = match index % 50 {
-                0 => (epoch, None, Some("tag indexing pending".to_owned())),
-                1 => (old_epoch, None, None),
-                2 => (epoch, Some(old_module), None),
-                3 => (epoch, Some(module), None),
-                _ => (epoch, None, None),
+            let (dylib_hash, poison) = match index % 50 {
+                0 => (None, Some("tag indexing pending".to_owned())),
+                2 => (Some(old_module), None),
+                3 => (Some(module), None),
+                _ => (None, None),
             };
             TagIndexUpdate {
                 asset: asset_uuid(index, 1),
                 tags: BTreeMap::new(),
-                tag_epoch,
+                tag_epoch: [7; 32],
                 planner_version: None,
                 dylib_hash,
                 trace: Vec::new(),
@@ -933,7 +932,7 @@ fn stale_tag_rows_are_index_searches() {
     store.refine_unpublished_tag_index(version, &updates).unwrap();
     let stale = |module| {
         store
-            .stale_tag_index_assets(epoch, module)
+            .stale_tag_index_assets(module)
             .unwrap()
             .into_iter()
             .map(|(asset, bundle)| {
@@ -945,13 +944,13 @@ fn stale_tag_rows_are_index_searches() {
     };
     let mut kinds = stale(Some(module));
     kinds.sort_unstable();
-    assert_eq!(kinds, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
+    assert_eq!(kinds, [0, 0, 0, 0, 2, 2, 2, 2]);
     let mut kinds = stale(None);
     kinds.sort_unstable();
-    assert_eq!(kinds, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+    assert_eq!(kinds, [0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 3, 3]);
 
     store.read.conn.trace(Some(trace));
-    store.stale_tag_index_assets(epoch, Some(module)).unwrap();
+    store.stale_tag_index_assets(Some(module)).unwrap();
     store.read.conn.trace(None);
     let statements = std::mem::take(&mut *TRACED.lock().unwrap());
     let sql = statements
@@ -968,12 +967,6 @@ fn stale_tag_rows_are_index_searches() {
             "SCAN i USING INDEX asset_tag_index_poisoned",
             assets,
             "UNION USING TEMP B-TREE",
-            "SEARCH i USING INDEX asset_tag_index_by_epoch (tag_epoch<?)",
-            assets,
-            "UNION USING TEMP B-TREE",
-            "SEARCH i USING INDEX asset_tag_index_by_epoch (tag_epoch>?)",
-            assets,
-            "UNION USING TEMP B-TREE",
             "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash<?)",
             assets,
             "UNION USING TEMP B-TREE",
@@ -981,5 +974,137 @@ fn stale_tag_rows_are_index_searches() {
             assets,
         ],
         "{sql}"
+    );
+}
+
+/// The statements a configuration change issues, with their plans.
+fn configuration_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String, Vec<String>)> {
+    store.read.conn.trace(Some(trace));
+    run(store);
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    statements
+        .into_iter()
+        .filter(|sql| !sql.starts_with("SAVEPOINT") && !sql.starts_with("RELEASE"))
+        .map(|sql| {
+            let plan = explain(&store.read.conn, &sql);
+            (sql, plan)
+        })
+        .filter(|(_, plan)| !plan.is_empty())
+        .collect()
+}
+
+/// A type whose tag epoch changes has exactly its rows marked pending, by
+/// one search of `assets_by_type`; an unchanged epoch marks nothing; the
+/// epochs are one read of the per-type table.
+#[test]
+fn a_changed_tag_epoch_marks_only_its_types_rows() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let refined = |store: &mut Store| {
+        let version = store.input_version();
+        let updates = [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
+            .into_iter()
+            .map(|asset| TagIndexUpdate {
+                asset,
+                tags: BTreeMap::new(),
+                tag_epoch: [7; 32],
+                planner_version: None,
+                dylib_hash: None,
+                trace: Vec::new(),
+                poison: None,
+            })
+            .collect::<Vec<_>>();
+        store.refine_unpublished_tag_index(version, &updates).unwrap();
+    };
+    let epochs = |record: u8| BTreeMap::from([(RUNTIME_TYPE, [1; 32]), (RECORD_TYPE, [record; 32])]);
+    let pending = |store: &Store| {
+        [asset_uuid(3, 1), asset_uuid(3, 2), asset_uuid(4, 1)]
+            .into_iter()
+            .filter(|asset| store.stale_tag_index_assets(None).unwrap().contains_key(asset))
+            .collect::<Vec<_>>()
+    };
+    let mark = |store: &mut Store, epochs: &BTreeMap<TypeUuid, [u8; 32]>| {
+        store.replace_tag_epochs(epochs).unwrap()
+    };
+    refined(&mut store);
+    assert!(pending(&store).is_empty());
+    // Every type is new to an empty table.
+    assert_eq!(
+        mark(&mut store, &epochs(2)),
+        std::collections::BTreeSet::from([RUNTIME_TYPE, RECORD_TYPE])
+    );
+    assert_eq!(pending(&store).len(), 3);
+    refined(&mut store);
+    assert!(mark(&mut store, &epochs(2)).is_empty());
+    assert!(pending(&store).is_empty());
+
+    let plans = configuration_plans(&mut store, |store| {
+        assert_eq!(
+            store.replace_tag_epochs(&epochs(3)).unwrap(),
+            std::collections::BTreeSet::from([RECORD_TYPE])
+        );
+    });
+    assert_eq!(pending(&store), [asset_uuid(3, 2)]);
+    let plans = plans.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        plans,
+        [
+            vec!["SCAN tag_epochs".to_owned()],
+            vec![
+                "SEARCH asset_tag_index USING COVERING INDEX sqlite_autoindex_asset_tag_index_1 (asset_uuid=?)"
+                    .to_owned(),
+                "LIST SUBQUERY 1".to_owned(),
+                "SEARCH assets USING INDEX assets_by_type (type_uuid=?)".to_owned(),
+            ],
+            vec!["SEARCH tag_epochs USING PRIMARY KEY (type_uuid=?)".to_owned()],
+        ],
+        "{plans:#?}"
+    );
+}
+
+/// A configuration change finds the sources it claims again by searches:
+/// the bundles of a type (or only its poisoned ones) through
+/// `assets_by_type`, and the malformed and colliding sources through
+/// `source_claims_by_subject`.
+#[test]
+fn reconfigured_sources_are_index_searches() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(1000);
+    let plans = configuration_plans(&mut store, |store| {
+        let records = store.bundle_sources_of_type(RECORD_TYPE, false).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records.iter().all(|(_, path)| *path == bundle_path(3)));
+        let poisoned = store.bundle_sources_of_type(RUNTIME_TYPE, true).unwrap();
+        assert_eq!(
+            poisoned.into_iter().map(|(_, path)| path).collect::<Vec<_>>(),
+            [bundle_path(199), bundle_path(699)]
+        );
+        store.unpublished_claim_sources().unwrap();
+    });
+    let plans = plans.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+    let source_type = [
+        "SEARCH a USING INDEX assets_by_type (type_uuid=?)",
+        "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
+        "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+    ];
+    assert_eq!(
+        plans,
+        [
+            source_type.to_vec(),
+            source_type.to_vec(),
+            vec![
+                "COMPOUND QUERY",
+                "LEFT-MOST SUBQUERY",
+                "SEARCH t USING INDEX source_claims_by_subject (kind=?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+                "UNION USING TEMP B-TREE",
+                // The collisions: the defects, never the namespace's claims.
+                "SCAN c",
+                "SEARCH t USING INDEX source_claims_by_subject (kind=? AND subject=?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+        ],
+        "{plans:#?}"
     );
 }

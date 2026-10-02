@@ -10,6 +10,8 @@ name = "distilld"
 path = "src/bin/distill-daemon.rs"
 
 [dependencies]
+# A schema type's canonical text for its tag epoch (`build::type_tag_epochs`).
+serde_json = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 blake3 = { workspace = true }
@@ -52,6 +54,5 @@ distill-asset-macro = { path = "../distill-asset-macro" }
 distill-loader = { path = "../distill-loader" }
 newgameplus-assets = { path = "../../../../newgameplus/newgameplus-assets" }
 rafx-api = { path = "../../../../rafx/rafx-api", features = ["serde-support"] }
-serde_json = "1"
 tempfile = "3"
 distill-store = { path = "../distill-store", features = ["test-hooks"] }

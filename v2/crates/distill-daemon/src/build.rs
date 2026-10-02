@@ -1542,14 +1542,72 @@ pub(crate) fn doctor_verify_builds(
     Ok(defects)
 }
 
+/// Each authored type's tag epoch under `authority`: a digest of the
+/// type's logical hash and of every schema type its value can reach, with
+/// their attributes (tag markers and renames included), numbered in the
+/// order the walk reaches them so an unrelated type elsewhere in the schema
+/// leaves it unchanged. Tag extraction and `load_current` read nothing else
+/// of the authority, so a type whose epoch holds keeps its tag rows.
+pub(crate) fn type_tag_epochs(authority: &ProjectSchemaAuthority) -> BTreeMap<TypeUuid, [u8; 32]> {
+    use distill_schema::ngp_schema::SchemaTypeId;
+    let types = &authority.schema().types;
+    authority
+        .project_types()
+        .iter()
+        .map(|(type_uuid, project)| {
+            let mut order = vec![project.schema_type];
+            let mut local = BTreeMap::from([(project.schema_type, 0usize)]);
+            let mut next = 0;
+            while let Some(id) = order.get(next).copied() {
+                next += 1;
+                let Some(ty) = types.get(id.0) else { continue };
+                for reached in ty
+                    .fields
+                    .iter()
+                    .map(|field| field.type_id)
+                    .chain(ty.generic_argument_ids.iter().copied())
+                {
+                    if !local.contains_key(&reached) {
+                        local.insert(reached, order.len());
+                        order.push(reached);
+                    }
+                }
+            }
+            let renumber = |id: SchemaTypeId| SchemaTypeId(local[&id]);
+            let epoch = distill_core::canonical::domain_digest(*b"DSTE", 1, |encoder| {
+                encoder.raw(&type_uuid.0);
+                encoder.raw(&project.logical_hash.0);
+                for id in &order {
+                    let Some(ty) = types.get(id.0) else {
+                        encoder.str("");
+                        continue;
+                    };
+                    let mut ty = ty.clone();
+                    ty.id = renumber(ty.id);
+                    for field in &mut ty.fields {
+                        field.type_id = renumber(field.type_id);
+                    }
+                    for argument in &mut ty.generic_argument_ids {
+                        *argument = renumber(*argument);
+                    }
+                    encoder.str(&serde_json::to_string(&ty).expect("a schema type serializes"));
+                }
+            });
+            (*type_uuid, epoch)
+        })
+        .collect()
+}
+
 /// Finish §10 tag indexing against a namespace that has advanced durably but
 /// is not yet served, inside the open input that publishes `commit`, and
 /// carry the refined tags in `commit`.
 ///
 /// It refines the assets `commit` sets and, when `stale`, every tag row the
-/// store holds that refining would change: pending or poisoned rows, rows of
-/// another schema epoch, and migrated rows of another pipeline module (see
-/// [`StoreReader::stale_tag_index_assets`]). Every other row already holds
+/// store holds that refining would change: it first records each authored
+/// type's tag epoch under `authority`, which marks pending the rows of the
+/// types whose epoch changed ([`Store::replace_tag_epochs`]), then takes the
+/// pending or poisoned rows and the migrated rows of another pipeline module
+/// (see [`StoreReader::stale_tag_index_assets`]). Every other row already holds
 /// what refining it would write, so a publication costs the rows it changed.
 /// Assets `commit` removes become tag removals. If refining fails, every
 /// asset it set out to refine is poisoned, in the store and in `commit`
@@ -1584,9 +1642,12 @@ pub(crate) fn refine_tag_index(
             (Ok(epoch), Some(_)) => Some(epoch.dylib_hash()),
             _ => None,
         };
+        store
+            .replace_tag_epochs(&type_tag_epochs(&authority))
+            .map_err(|error| format!("record the tag epochs: {error}"))?;
         assets.extend(
             store
-                .stale_tag_index_assets(tag_epoch, module)
+                .stale_tag_index_assets(module)
                 .map_err(|error| format!("find the stale tag-index rows: {error}"))?,
         );
     }

@@ -260,11 +260,18 @@ CREATE TABLE asset_tag_index (
 -- candidates; this lists exactly the poisoned rows.
 CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid)
     WHERE poison IS NOT NULL;
--- A refinement redoes the rows of another schema epoch, and the migrated
--- rows (those a pipeline module's migration produced) of another module.
-CREATE INDEX asset_tag_index_by_epoch ON asset_tag_index(tag_epoch);
+-- A refinement redoes the migrated rows (those a pipeline module's
+-- migration produced) of another module.
 CREATE INDEX asset_tag_index_migrated ON asset_tag_index(dylib_hash)
     WHERE dylib_hash IS NOT NULL;
+-- Per authored type, the tag epoch its tag rows were refined under: a
+-- digest of what the schema authority says about the type (see the
+-- daemon's `type_tag_epochs`). A type whose epoch changes has every row
+-- of its assets marked pending in the input that changes it.
+CREATE TABLE tag_epochs (
+    type_uuid BLOB NOT NULL PRIMARY KEY,
+    epoch     BLOB NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE path_index (
     path       TEXT NOT NULL,
     root_id    INTEGER NOT NULL,
@@ -1054,6 +1061,27 @@ impl StoreReader {
             details.push(row.get::<_, String>(3)?);
         }
         Ok(details)
+    }
+
+    /// Test hook: every row of `table`, each column debug-formatted, in
+    /// sorted order: two stores compare equal table by table.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn table_rows(&self, table: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare(&format!("SELECT * FROM {table}"))?;
+        let columns = statement.column_count();
+        let mut rows = statement.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let values = (0..columns)
+                .map(|index| {
+                    row.get::<_, rusqlite::types::Value>(index)
+                        .map(|value| format!("{value:?}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push(values.join(" | "));
+        }
+        out.sort();
+        Ok(out)
     }
 
     pub fn instance_id(&self) -> StoreInstanceId {

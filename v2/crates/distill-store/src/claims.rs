@@ -394,6 +394,26 @@ impl StoreReader {
         NamespaceError::canonical_set(errors).map_err(invalid_namespace_error)
     }
 
+    /// The (root, path) of every source whose claims do not publish as they
+    /// stand: a malformed source (no complete skeleton) and every source
+    /// claiming a colliding bundle or asset. Searches of
+    /// `source_claims_by_subject`, so it costs the defects, not the
+    /// namespace.
+    pub fn unpublished_claim_sources(&self) -> Result<BTreeSet<(String, String)>, StoreError> {
+        Ok(self
+            .query_rows(
+                "SELECT r.name, t.path FROM source_claims t JOIN roots r USING (root_id)
+                 WHERE t.kind = 5
+                 UNION SELECT r.name, t.path FROM claim_collisions c
+                 CROSS JOIN source_claims t ON t.kind IN (0, 1, 2) AND t.subject = c.subject
+                 JOIN roots r ON r.root_id = t.root_id",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .into_iter()
+            .collect())
+    }
+
     /// The distinct sources claiming `bundle`.
     pub fn bundle_claim_sources(
         &self,
