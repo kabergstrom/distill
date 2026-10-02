@@ -3926,7 +3926,8 @@ sources and those of colliding claims, whose claims publish nothing to
 compare. A pipeline-module-only change reaches no source; its migrated tag
 rows are refinement's. Only a root replacement, or a process that has not
 yet observed the roots or compiled the store's version, scans and
-publishes completely.
+publishes completely; a complete publication too republishes the
+poisoned bundles of the types whose tag epoch changed.
 
 Recorded dependencies live in daemon state and double as the reverse indexes
 for change propagation (v1's `reverse_path_refs` table was the precursor).

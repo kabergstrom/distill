@@ -1048,6 +1048,10 @@ should reach zero by the end of phase 6.
     the malformed and colliding sources. A module-only change republishes
     nothing. Only a roots change scans; `ScanSnapshot::load` is the test
     oracle's.
+  - A complete publication (a roots change, a full step) republishes the
+    same poisoned bundles of reschemaed types, though their summary and
+    asset set are unchanged: the authority validates their skeleton, whose
+    tags it may change.
   - The import index is kept by dirty work. Every bundle publication queues
     its paths, and a pass reindexes the dirty bundle sources (one parse
     each) before acknowledging them. A whole-namespace import check

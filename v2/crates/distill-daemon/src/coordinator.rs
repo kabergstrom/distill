@@ -785,6 +785,7 @@ impl DaemonCoordinator {
                         Some(&pipeline),
                         &projection,
                         &retyped,
+                        Some(&schema_authority),
                         tag_epoch,
                         claims,
                     ),
@@ -2226,6 +2227,7 @@ fn publish_scan(
     pipeline: Option<&ConfigurationPipelinePublication>,
     projection: &PipelineProjection,
     retyped: &BTreeSet<TypeUuid>,
+    authority: Option<&ProjectSchemaAuthority>,
     tag_epoch: [u8; 32],
     claims: &[SourceClaims],
 ) -> Result<Commit, StoreError> {
@@ -2294,8 +2296,26 @@ fn publish_scan(
         .filter(|bundle| bundle.assets.values().any(|entry| retyped.contains(&entry.type_uuid)))
         .map(|bundle| bundle.uuid)
         .collect::<BTreeSet<_>>();
-    let assets_changed =
-        |bundle: &BundleUuid| retyped_bundles.contains(bundle) || assets_changed(bundle);
+    // So does a poisoned one holding an asset of a type whose tag epoch the
+    // authority changed: the authority validates its skeleton, which its
+    // summary and asset set do not show.
+    let revalidated = match authority {
+        Some(authority) => {
+            let sources = reschemaed_poisoned_sources(store, authority)?;
+            old_bundle_summaries
+                .iter()
+                .filter(|(_, old)| {
+                    !sources.is_empty()
+                        && sources.contains(&(old.root_name.clone(), old.path.clone()))
+                })
+                .map(|(bundle, _)| *bundle)
+                .collect()
+        }
+        None => BTreeSet::new(),
+    };
+    let assets_changed = |bundle: &BundleUuid| {
+        retyped_bundles.contains(bundle) || revalidated.contains(bundle) || assets_changed(bundle)
+    };
     let changed_bundles = current_bundle_summaries
         .iter()
         .filter_map(|(bundle, current)| {
@@ -2489,6 +2509,23 @@ fn publish_scan(
     commit.pipeline = Some(next_pipeline);
     commit.configuration = Some(configuration_status(configuration));
     Ok(commit)
+}
+
+/// The (root, path) of each poisoned bundle holding an asset of a type whose
+/// tag epoch under `authority` differs from the one its rows were refined
+/// under (see [`crate::build::type_tag_epochs`]): the authority validates a
+/// poisoned bundle's skeleton, so a complete publication republishes such a
+/// bundle, as [`publish_reconfiguration`] does. One read of `tag_epochs`,
+/// then one search of `assets_by_type` per changed type.
+fn reschemaed_poisoned_sources(
+    store: &StoreReader,
+    authority: &ProjectSchemaAuthority,
+) -> Result<BTreeSet<(String, String)>, StoreError> {
+    let mut sources = BTreeSet::new();
+    for type_uuid in store.tag_epoch_changes(&crate::build::type_tag_epochs(authority))? {
+        sources.extend(store.bundle_sources_of_type(type_uuid, true)?);
+    }
+    Ok(sources)
 }
 
 /// Publish a configuration candidate whose roots are unchanged, inside its
@@ -3953,7 +3990,7 @@ mod projection_tests {
         let candidate = ScanCandidate::build(scanner.scan().unwrap(), None).unwrap();
         let claims = bundle_claims(candidate.scan.bundle_rows(), projection, None).unwrap();
         let base = store.input_version();
-        publish_scan(store, base, candidate, false, None, projection, retyped, [0; 32], &claims).unwrap();
+        publish_scan(store, base, candidate, false, None, projection, retyped, None, [0; 32], &claims).unwrap();
     }
 
     #[test]

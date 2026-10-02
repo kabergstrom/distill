@@ -568,6 +568,7 @@ fn publish_completely(
         Some(&configuration.pipeline),
         &configuration.projection,
         retyped,
+        Some(authority),
         authority.source_hash(),
         &claims,
     )
@@ -727,4 +728,177 @@ fn a_reconfiguration_publishes_what_a_complete_publication_does() {
         &configuration(typed_authority(true), None, 1),
     );
     assert_eq!(reads, 3);
+}
+
+const LABEL_TYPE: TypeUuid = TypeUuid([0x64; 16]);
+
+/// An authority over one asset type, a struct of one string `category`,
+/// which is a search tag when `tagged` (an edit its logical hash does not
+/// see, but its tag epoch does).
+fn labeled_authority(tagged: bool) -> Arc<ProjectSchemaAuthority> {
+    use distill_schema::ngp_schema::{
+        Field, FieldAttrs, FieldIdentifier, FieldLayout, PrimitiveType, SchemaTypeId, TypeAttrs,
+        TypeDef, TypeLayout, TypePath,
+    };
+    let path = |krate: &str, name: &str| TypePath {
+        name: Some(name.to_owned()),
+        containing_type: None,
+        modules: Vec::new(),
+        krate: krate.to_owned(),
+    };
+    let def = |id: usize, kind, path, uuid, fields| TypeDef {
+        id: SchemaTypeId(id),
+        kind,
+        path,
+        uuid,
+        attrs: TypeAttrs::default(),
+        fields,
+        generic_parameters: Vec::new(),
+        generic_argument_ids: Vec::new(),
+        generic_const_arguments: Vec::new(),
+        has_default: id == 1,
+        has_explicit_discriminants: false,
+    };
+    let string = std::mem::size_of::<String>() as u64;
+    let layout = |fields| TypeLayout {
+        size: Some(string),
+        align: Some(std::mem::align_of::<String>() as u64),
+        layout_complete: true,
+        tag_encoding: None,
+        fields,
+    };
+    Arc::new(
+        ProjectSchemaAuthority::from_schema(
+            Schema {
+                source_hashes: BTreeMap::new(),
+                type_ops_hash: String::new(),
+                layout_hashes: Default::default(),
+                rustc_version: String::new(),
+                types: vec![
+                    def(
+                        0,
+                        PrimitiveType::Struct,
+                        path("game", "Labeled"),
+                        Some(LABEL_TYPE),
+                        vec![Field {
+                            id: FieldIdentifier::Name("category".to_owned()),
+                            type_id: SchemaTypeId(1),
+                            attrs: FieldAttrs {
+                                tag: tagged,
+                                ..FieldAttrs::default()
+                            },
+                        }],
+                    ),
+                    def(1, PrimitiveType::String, path("alloc", "String"), None, Vec::new()),
+                ],
+                layouts: vec![SchemaLayouts {
+                    identity: layout_identity(),
+                    layouts: vec![
+                        layout(vec![FieldLayout {
+                            offset: Some(0),
+                            field_size: Some(string),
+                        }]),
+                        layout(Vec::new()),
+                    ],
+                }],
+            },
+            [u8::from(tagged) + 30; 32],
+        )
+        .unwrap(),
+    )
+}
+
+/// After a schema edit that makes a field a search tag, a complete
+/// publication (a root replacement) validates again the skeleton of a
+/// poisoned bundle whose bytes, and so its summary and asset set, are
+/// unchanged, as a reconfiguration does: the skeleton carries the new tag,
+/// and a query for that tag fails naming the bundle instead of answering
+/// nothing.
+#[test]
+fn a_complete_publication_revalidates_a_poisoned_skeleton_after_a_schema_edit() {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let authority = labeled_authority(false);
+    let project = authority.project_type(LABEL_TYPE).unwrap();
+    let bundle = BundleUuid([0x64; 16]);
+    let malformed = distill_bundle::write_bundle(&Bundle {
+        format_version: 1,
+        uuid: bundle,
+        primary: Some("entry".into()),
+        schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+        assets: BTreeMap::from([(
+            "entry".into(),
+            AssetEntry {
+                uuid: AssetUuid([0x64; 16]),
+                type_uuid: LABEL_TYPE,
+                schema_hash: project.logical_hash,
+                authoring_only: false,
+                data: AuthoredValue::Object(BTreeMap::from([(
+                    "category".to_owned(),
+                    AuthoredValue::Str("enemy".to_owned()),
+                )])),
+            },
+        )]),
+    })
+    .unwrap();
+    let mut value = distill_json::parse(std::str::from_utf8(&malformed).unwrap()).unwrap();
+    let AuthoredValue::Object(envelope) = &mut value else {
+        panic!("a bundle envelope is an object");
+    };
+    envelope.insert("future-extension".to_owned(), AuthoredValue::UInt(1));
+    std::fs::write(assets.join("malformed.bundle"), distill_json::write(&value).unwrap()).unwrap();
+
+    let scanner = RootedScanner::new([AssetRoot::new("main", &assets)]).unwrap();
+    let configuration = |tagged| {
+        let authority = labeled_authority(tagged);
+        Configuration {
+            projection: PipelineProjection::build(
+                Vec::new(),
+                [9; 32],
+                &BTreeMap::from([("dev".to_owned(), build_target(false))]),
+                [LABEL_TYPE],
+            )
+            .unwrap(),
+            pipeline: pipeline_publication(&authority, 1),
+            authority,
+        }
+    };
+    let (before, after) = (configuration(false), configuration(true));
+    let query = |store: &Store| {
+        let filter = distill_store::bundles::AssetFilter {
+            tag: Some(("category".to_owned(), Some("enemy".to_owned()))),
+            ..Default::default()
+        };
+        store
+            .namespace_assets_matching(&filter, |_| true)
+            .unwrap()
+            .map(|rows| rows.len())
+    };
+    let mut complete = Store::open(StoreConfig::new(temp.path().join("complete"))).unwrap();
+    let mut reconfigured = Store::open(StoreConfig::new(temp.path().join("reconfigured"))).unwrap();
+    for store in [&mut complete, &mut reconfigured] {
+        publish_completely(store, &scanner, &before, &BTreeSet::new());
+        assert_eq!(query(store), Ok(0), "untagged, the skeleton answers no tag query");
+    }
+
+    publish_completely(&mut complete, &scanner, &after, &BTreeSet::new());
+    publish_reconfiguration(
+        &mut reconfigured,
+        &after.pipeline,
+        &after.projection,
+        &BTreeSet::new(),
+        &after.authority,
+        after.authority.source_hash(),
+    )
+    .unwrap();
+    reconfigured
+        .replace_tag_epochs(&crate::build::type_tag_epochs(&after.authority))
+        .unwrap();
+    assert_eq!(query(&reconfigured), Err(vec![bundle]));
+    assert_eq!(query(&complete), Err(vec![bundle]), "the complete publication kept the old skeleton");
+    let (complete, reconfigured) = (published_tables(&complete), published_tables(&reconfigured));
+    for table in ["bundles", "assets", "asset_tags"] {
+        assert_eq!(complete[table], reconfigured[table], "{table}");
+    }
 }

@@ -1013,6 +1013,7 @@ impl DaemonCoordinator {
                     None,
                     tags.compiled.projection(),
                     &BTreeSet::new(),
+                    tags.authority().as_deref(),
                     tags.tag_epoch,
                     &step.claims,
                 )
