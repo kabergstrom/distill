@@ -137,28 +137,29 @@ impl RegisteredImporter {
 }
 
 impl AuthoringService {
-    /// Index every bundle's import record and directory rules, on `rebuild`
-    /// or if the store holds no complete index yet. The store marks the index
-    /// built in the transaction that writes its rows.
-    fn ensure_import_index(&self, store: &mut Store, rebuild: bool) -> Result<(), RpcFailure> {
-        if !rebuild && store.import_index_built().map_err(invalid)? {
-            return Ok(());
-        }
-        // The index is read from the bundles in the transaction that
-        // writes it.
-        store.write_transaction_with(invalid, |store| {
-            let mut rows = Vec::new();
-            for meta in store.all_bundles().map_err(invalid)? {
-                rows.push(self.index_import_bundle(store, &meta)?);
+    /// Bring the import index up to date. It is current but for the bundle
+    /// sources pending file work names: every bundle publication queues its
+    /// paths, and work is acknowledged only after a pass reindexed it. A
+    /// pass with no `work` of its own reindexes the store's pending work.
+    fn refresh_import_index(
+        &self,
+        store: &mut Store,
+        work: Option<(
+            &[distill_store::files::DirtyEntry],
+            &[distill_store::files::RenameEvent],
+        )>,
+    ) -> Result<(BTreeSet<(String, String)>, Vec<DirectoryRuleSource>), RpcFailure> {
+        match work {
+            Some((dirty, _)) => self.refresh_dirty_import_index(store, dirty),
+            None => {
+                let pending = store.pending_file_work().map_err(invalid)?;
+                self.refresh_dirty_import_index(store, &pending.dirty)
             }
-            store.replace_import_index(None, &rows).map_err(invalid)
-        })?;
-        self.directory_rule_entries(store)?;
-        Ok(())
+        }
     }
 
-    /// Reindex the bundle sources `dirty` names. Returns their keys and the
-    /// directory rules they held before.
+    /// Reindex the bundle sources `dirty` names, parsing each once. Returns
+    /// their keys and the directory rules they held before.
     fn refresh_dirty_import_index(
         &self,
         store: &mut Store,
@@ -174,36 +175,55 @@ impl AuthoringService {
                     continue;
                 };
                 let source = crate::scanner::scanned_bundle(root, path, bytes);
-                let Ok(bundle) = &source.parsed else {
+                let Ok(bundle) = source.parsed else {
                     continue;
                 };
                 let Some(meta) = store.bundle(bundle.uuid).map_err(invalid)? else {
                     continue;
                 };
-                rows.push(self.index_import_bundle(store, &meta)?);
+                // The published bundle of this UUID may be another source's.
+                let bundle = if meta.path == *path
+                    && store.root_name(meta.root).map_err(invalid)?.as_deref() == Some(root.as_str())
+                {
+                    bundle
+                } else {
+                    self.cached_bundle(store, &meta)?
+                };
+                rows.push(self.index_import_bundle(store, &meta, bundle)?);
             }
             if !keys.is_empty() {
                 let sources = keys.iter().cloned().collect::<Vec<_>>();
                 store
-                    .replace_import_index(Some(&sources), &rows)
+                    .replace_import_index(&sources, &rows)
                     .map_err(invalid)?;
             }
             Ok((keys, previous))
         })
     }
 
+    /// The import index rows of the published bundle `meta`, parsed as
+    /// `bundle`.
     fn index_import_bundle(
         &self,
         store: &StoreReader,
         meta: &BundleMeta,
+        bundle: Bundle,
     ) -> Result<ImportIndexSource, RpcFailure> {
         let root_name = store
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root is not interned"))?;
-        let bundle = self.cached_bundle(store, meta)?;
+        let mut directory_rules = Vec::new();
+        for entry in bundle
+            .assets
+            .values()
+            .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
+        {
+            decode_directory_rules(&entry.data)?;
+            directory_rules.push((bundle.uuid, entry.uuid));
+        }
         let mut watched = None;
-        if let Ok(prior) = self.read_prior_import_cached(store, meta) {
+        if let Ok(prior) = decode_prior_import(bundle) {
             if prior.model.record.watch {
                 let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
                     Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
@@ -220,15 +240,6 @@ impl AuthoringService {
                     });
                 }
             }
-        }
-        let mut directory_rules = Vec::new();
-        for entry in bundle
-            .assets
-            .values()
-            .filter(|entry| entry.type_uuid == DIRECTORY_IMPORT_RULES_TYPE_UUID)
-        {
-            decode_directory_rules(&entry.data)?;
-            directory_rules.push((bundle.uuid, entry.uuid));
         }
         Ok(ImportIndexSource {
             root_name,
@@ -311,10 +322,9 @@ impl AuthoringService {
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
         let compiled = self.compiled(store)?;
         let capabilities = self.importer_capabilities(&compiled)?;
-        self.ensure_import_index(store, work.is_none())?;
+        self.refresh_import_index(store, work)?;
         let watched = match work {
             Some((dirty, renames)) => {
-                self.refresh_dirty_import_index(store, dirty)?;
                 let paths = dirty.iter().map(|entry| entry.path.as_str()).chain(
                     renames
                         .iter()
@@ -385,11 +395,7 @@ impl AuthoringService {
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
         let compiled = self.compiled(store)?;
         let capabilities = self.importer_capabilities(&compiled)?;
-        self.ensure_import_index(store, work.is_none())?;
-        let (changed, previous) = match work {
-            Some((dirty, _)) => self.refresh_dirty_import_index(store, dirty)?,
-            None => Default::default(),
-        };
+        let (changed, previous) = self.refresh_import_index(store, work)?;
         let entries = self.directory_rule_entries(&store)?;
         let mut backend = RootedImportBackend::over(compiled.scanner(), &store, &capabilities, overlay);
         let mut groups = BTreeMap::new();
@@ -673,15 +679,12 @@ impl AuthoringService {
     /// indexes them: a watched import reading the path or listing a query
     /// it matches, or directory rules whose listing it matches. A cheap
     /// check on the committed index before a pass plans the imports chained
-    /// to its outputs; an index not built yet may.
+    /// to its outputs.
     pub(crate) fn may_read_outputs(
         &self,
         store: &StoreReader,
         outputs: &[(String, String)],
     ) -> Result<bool, RpcFailure> {
-        if !store.import_index_built().map_err(invalid)? {
-            return Ok(true);
-        }
         let paths = outputs
             .iter()
             .map(|(_, path)| path.as_str())
@@ -1540,9 +1543,10 @@ impl AuthoringService {
     /// success's, a revert to that source revalidates and the failure never
     /// clears.
     fn reindex_watched_bundle(&self, store: &mut Store, meta: &BundleMeta) -> Result<(), RpcFailure> {
-        let row = self.index_import_bundle(store, meta)?;
+        let bundle = self.cached_bundle(store, meta)?;
+        let row = self.index_import_bundle(store, meta, bundle)?;
         let source = [(row.root_name.clone(), row.path.clone())];
-        store.replace_import_index(Some(&source), &[row]).map_err(invalid)
+        store.replace_import_index(&source, &[row]).map_err(invalid)
     }
 
     /// Memoize a watched run's failure. `Some(true)` once memoized;

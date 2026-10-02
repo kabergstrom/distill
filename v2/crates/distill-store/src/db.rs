@@ -1131,11 +1131,6 @@ impl StoreReader {
         Ok(meta_get_u64(&self.conn, "compiled_version")?.map(InputVersion))
     }
 
-    /// Whether the complete import index has been built: written in the
-    /// transaction that writes the index rows, so it rolls back with them.
-    pub fn import_index_built(&self) -> Result<bool, StoreError> {
-        Ok(meta_get_u64(&self.conn, "import_index_built")?.is_some_and(|built| built != 0))
-    }
 }
 
 

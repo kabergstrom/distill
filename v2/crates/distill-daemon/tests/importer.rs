@@ -1375,3 +1375,62 @@ fn an_import_cycle_is_cut_and_reported() {
     assert_eq!(x, 51, "x read a's new output");
     assert_changes_exactly(&changed_assets(&reader, version), &assets, &["a", "x", "y"]);
 }
+
+/// Pages a whole-namespace watched-import check reads beside `filler`
+/// ordinary bundles, once their publication's work is indexed and
+/// acknowledged.
+fn import_index_pages(filler: usize) -> u64 {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let (_, schema, schema_hash) = ordinary_bundle();
+    for index in 0..filler {
+        let mut uuid = [0; 16];
+        uuid[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+        let entry = AssetEntry {
+            uuid: AssetUuid(uuid),
+            type_uuid: TYPE_UUID,
+            schema_hash,
+            authoring_only: false,
+            data: AuthoredValue::UInt(1),
+        };
+        let bytes = distill_bundle::write_bundle(&Bundle {
+            format_version: 1,
+            uuid: BundleUuid(uuid),
+            primary: Some("entry".into()),
+            schemas: BTreeMap::from([(schema_hash, schema.clone())]),
+            assets: BTreeMap::from([("entry".into(), entry)]),
+        })
+        .unwrap();
+        let directory = assets.join(format!("filler/d{}", index % 40));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(format!("b{index}.bundle")), bytes).unwrap();
+    }
+    let coordinator = DaemonCoordinator::open(
+        StoreConfig::new(temp.path().join(".distill")),
+        vec![AssetRoot::new("main", &assets)],
+        vec![target()],
+        64,
+    )
+    .unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let authoring = coordinator.authoring_service();
+    assert!(authoring.watched_imports_needing_reimport(&mut writer).unwrap().is_empty());
+    let work = coordinator.pending_file_work(&mut writer).unwrap();
+    assert!(coordinator.acknowledge_file_work(&mut writer, &work).unwrap());
+
+    let before = writer.pages_fetched().unwrap();
+    assert!(authoring.watched_imports_needing_reimport(&mut writer).unwrap().is_empty());
+    writer.pages_fetched().unwrap() - before
+}
+
+/// The import index is kept by the dirty work bundle publication queues: a
+/// whole-namespace import check with no pending work reindexes nothing.
+#[test]
+fn an_indexed_namespace_is_not_reindexed() {
+    let small = import_index_pages(20);
+    let large = import_index_pages(2000);
+    println!("watched-import check: {small} pages beside 20 bundles, {large} beside 2000");
+    assert!(large <= small + 16, "{small} pages beside 20 bundles, {large} beside 2000");
+}
