@@ -2938,7 +2938,7 @@ pub(crate) fn publish_incremental_paths(
                 compiled.build_targets(),
                 coordinator.operational_configuration().max_dependency_depth,
                 &affected,
-            )
+            )?
             .apply_incremental(&mut commit);
         }
     }

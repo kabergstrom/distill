@@ -1567,6 +1567,7 @@ pub(crate) fn refine_published_tag_index(
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
 ) -> Result<PublishedTagIndex, String> {
+    let tag_epoch = authority.source_hash();
     match try_refine_published_tag_index(
         &mut *input.0,
         scanner,
@@ -1577,12 +1578,41 @@ pub(crate) fn refine_published_tag_index(
         None,
     ) {
         Ok(indexed) => Ok(indexed),
-        Err(_) => input
-            .0
-            .all_asset_bundles()
-            .map(|assets| PublishedTagIndex::conservatively_poisoned(&assets))
-            .map_err(|error| format!("read the assets to poison their tags: {error}")),
+        Err(error) => {
+            let assets = input
+                .0
+                .all_asset_bundles()
+                .map_err(|error| format!("read the assets to poison their tags: {error}"))?;
+            poison_tag_index(input.0, &assets, tag_epoch, &error)
+        }
     }
+}
+
+/// The conservative half of a failed refinement, in the store and in the
+/// served projection alike: every asset of `assets` loses its tags and
+/// carries the failure as its tag poison, under `tag_epoch`.
+fn poison_tag_index(
+    store: &mut Store,
+    assets: &BTreeMap<AssetUuid, BundleUuid>,
+    tag_epoch: [u8; 32],
+    error: &str,
+) -> Result<PublishedTagIndex, String> {
+    let updates = assets
+        .keys()
+        .map(|asset| TagIndexUpdate {
+            asset: *asset,
+            tags: BTreeMap::new(),
+            tag_epoch,
+            planner_version: None,
+            dylib_hash: None,
+            trace: Vec::new(),
+            poison: Some(format!("tag indexing failed: {error}")),
+        })
+        .collect::<Vec<_>>();
+    store
+        .refine_unpublished_tag_index(store.input_version(), &updates)
+        .map_err(|error| format!("poison the tag index: {error}"))?;
+    Ok(PublishedTagIndex::conservatively_poisoned(assets))
 }
 
 /// Reindex only identities whose authored rows changed in the same input
@@ -1596,27 +1626,30 @@ pub(crate) fn refine_published_tag_index_incremental(
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
     affected: &BTreeMap<AssetUuid, Option<BundleUuid>>,
-) -> PublishedTagIndex {
+) -> Result<PublishedTagIndex, String> {
     let current = affected
         .iter()
         .filter_map(|(asset, bundle)| bundle.map(|bundle| (*asset, bundle)))
         .collect::<BTreeMap<_, _>>();
     let assets = current.keys().copied().collect::<Vec<_>>();
-    let mut indexed = try_refine_published_tag_index(
-        input.0,
+    let tag_epoch = authority.source_hash();
+    let mut indexed = match try_refine_published_tag_index(
+        &mut *input.0,
         scanner,
         authority,
         pipeline,
         targets,
         max_depth,
         Some(assets),
-    )
-    .unwrap_or_else(|_| PublishedTagIndex::conservatively_poisoned(&current));
+    ) {
+        Ok(indexed) => indexed,
+        Err(error) => poison_tag_index(input.0, &current, tag_epoch, &error)?,
+    };
     indexed.removed = affected
         .iter()
         .filter_map(|(asset, bundle)| bundle.is_none().then_some(*asset))
         .collect();
-    indexed
+    Ok(indexed)
 }
 
 fn try_refine_published_tag_index(
@@ -5061,6 +5094,22 @@ mod tests {
             .compiled_at(&coordinator.open_reader().unwrap())
             .unwrap();
         let mut writer = coordinator.open_writer().unwrap();
+        let refine = |writer: &mut distill_store::StoreWriter| {
+            refine_published_tag_index(
+                OpenInput::new(writer).unwrap(),
+                compiled.scanner().clone(),
+                compiled.schema_authority().unwrap(),
+                compiled.pipeline_snapshot(),
+                compiled.build_targets(),
+                64,
+            )
+            .unwrap()
+        };
+        writer.open_input().unwrap();
+        refine(&mut writer);
+        writer.finish_input(true).unwrap();
+        let before = writer.tag_index_state(ASSET).unwrap().unwrap();
+        assert_eq!(before.poison, None, "{before:?}");
         writer.open_input().unwrap();
         FAIL_TAG_REFINEMENT.with(|fail| fail.set(true));
         let indexed = refine_published_tag_index(
@@ -5072,6 +5121,10 @@ mod tests {
             64,
         )
         .unwrap();
+        // The store says what the served projection says: no reader trusts
+        // the row the failed refinement left.
+        let after = writer.tag_index_state(ASSET).unwrap().unwrap();
+        assert!(after.poison.is_some(), "{after:?}");
         writer.finish_input(false).unwrap();
         assert_eq!(indexed.poisons, BTreeMap::from([(ASSET, BUNDLE)]));
         assert_eq!(indexed.tags, BTreeMap::from([(ASSET, BTreeMap::new())]));

@@ -983,7 +983,7 @@ impl DaemonCoordinator {
                             tags.compiled.build_targets(),
                             tags.max_dependency_depth,
                             &affected,
-                        )
+                        )?
                         .apply_incremental(&mut commit);
                     }
                 }
