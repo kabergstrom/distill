@@ -685,9 +685,11 @@ impl StoreReader {
             "SELECT {BUNDLE_COLUMNS}, r.name FROM bundles JOIN roots r USING (root_id)
              ORDER BY bundle_uuid"
         ))?;
+        debug_assert_eq!(statement.column_count(), BUNDLE_COLUMN_COUNT + 1);
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            visit(row.get(9)?, bundle_meta_row(row)?)?;
+            // The root name follows the bundle columns.
+            visit(row.get(BUNDLE_COLUMN_COUNT)?, bundle_meta_row(row)?)?;
         }
         Ok(())
     }
@@ -1233,6 +1235,9 @@ impl StoreReader {
 
 const BUNDLE_COLUMNS: &str = "bundle_uuid, root_id, path, format_version, content_hash,
      origin_rules_bundle, origin_rule, origin_group_root, origin_group_path, import_watched";
+/// The number of columns in [`BUNDLE_COLUMNS`]; a column selected after them
+/// has this index.
+const BUNDLE_COLUMN_COUNT: usize = 10;
 
 fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
     let origin = match (
