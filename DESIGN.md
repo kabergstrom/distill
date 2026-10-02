@@ -6073,11 +6073,39 @@ instead.
 
 ### Plumbing
 
-RpcIO owns one **IO thread**: capnp's single-threaded `RpcSystem`, the
-subscription stream, and in-flight resolve/fetch futures live there. Two
-bounded channels cross to the engine thread: commands in (resolve, fetch,
-subscribe/unsubscribe driven by handle create/drop), completions out
-(content hashes, payload buffers, deltas, errors). **Completions
+RpcIO has **no thread of its own**. It owns a single-threaded tokio
+runtime and a `LocalSet` on which capnp's `RpcSystem`, the subscription
+stream, and every in-flight resolve/fetch run as tasks, and it steps them
+on the engine thread whenever the loader polls it: each step runs the tasks
+that are ready, polls the socket reactor with a zero timeout, and repeats
+until nothing is ready or a small time budget (2 ms by default) is spent.
+Calls (resolve, fetch, subscribe/unsubscribe driven by handle create/drop)
+only record work; answers (content hashes, payload buffers, deltas,
+errors) collect in a plain queue that `poll` hands over. Three invariants
+are part of the contract:
+
+- **The engine never waits on IO.** No `LoaderIO` call blocks on the
+  daemon; a frame pays at most the step budget plus one bounded turn.
+- **IO never waits on the engine.** Nothing the IO does is gated on the
+  loader draining it: answers queue, and memory pressure spools rather
+  than waits.
+- **Limits are applied at admission.** Requests queue in RpcIO and start
+  only while fewer than a configured number are in flight (fetches under
+  a lower cap within it); a fetched payload reserves its bytes against
+  the memory budget when its size is known. Work beyond a limit is not
+  started, rather than started and parked.
+
+A sweep holds its basis, a snapshot capability, from `begin_sweep` until
+`end_sweep`; `begin_sweep` returns the newest snapshot RpcIO already holds
+and never waits. RpcIO keeps that snapshot current: an event that makes
+the loader start a new round (a delta, a `Drifted` resolve, an expired
+snapshot) is published only once a snapshot that answers it is held, and
+an idle snapshot is renewed well inside the daemon's TTL. `end_sweep`
+cancels by dropping: the sweep's queued and running requests are dropped
+with their partial payloads, spool files, and admission, no answer to them
+is delivered, and the snapshot is released unless it is still current. A
+rebind does the same for everything of the old connection, which fences
+it: nothing from the old connection follows a rebind. **Completions
 correlate by request generation, never by name**: every command carries
 a loader-minted, never-reused `ReqId` (declared below) that its
 completion echoes; the loader keeps (handle, purpose, snapshot basis,
@@ -6104,15 +6132,14 @@ thread: mmap lookups and zstd block decompression run inline in
 `process()` (blocks are ≤256 KiB, §16's canonical boundary; a decode
 pool is a later optimization, not
 a design change). Deserialization and fixup always run game-side, using
-fixup plans registered by the asset-types crate. In-flight fetch memory is
-bounded by config; the command channel applies backpressure by parking
-further resolves, never by dropping. Admission for oversized payloads
-is pinned (§13's oversize records): a single fetch larger than the
-budget is admitted **alone** — the budget admits it exclusively rather
-than deadlocking on an unsatisfiable reservation — and beyond a pinned
-spool threshold RpcIO streams the payload to a temporary spool file
-and hands the loader a mapped buffer, never an unbounded in-memory
-copy.
+fixup plans registered by the asset-types crate. Fetched payload memory
+is bounded by config: payload bytes held in memory (in flight or awaiting
+`poll`) reserve against one aggregate budget until the loader takes them.
+Admission for oversized payloads is pinned (§13's oversize records): a
+payload beyond the pinned spool threshold, or one that does not fit what
+is left of the budget, streams to a temporary spool file and the loader
+gets a mapped buffer — never an unbounded in-memory copy, and never a
+wait for memory the engine would have to free.
 
 ```rust
 /// Loader-minted request generation: unique per command, never reused.
@@ -6123,12 +6150,19 @@ pub struct ReqId(pub u64);
 
 pub trait LoaderIO {                     // RpcIO (dev) | PackfileIO (ship), no third path
     /// The basis every call of the coming sweep is issued under: RpcIO
-    /// returns the current adopted snapshot's stamp; PackfileIO the
-    /// mounted manifest hash. Explicit, never ambient — the loader
+    /// returns the stamp of the newest snapshot it holds (never waiting:
+    /// an event that starts a new round is published only once such a
+    /// snapshot answers it); PackfileIO the mounted manifest hash.
+    /// Explicit, never ambient — the loader
     /// obtains one per sweep and threads it through every resolution,
     /// so an IO implementation can neither erase the basis nor answer
     /// two members of one component from two bases undetected.
     fn begin_sweep(&mut self) -> IoBasis;
+    /// The sweep is complete or abandoned: requests issued under `basis`
+    /// are cancelled (no answer is delivered for them) and what the IO
+    /// held for them — snapshot, payloads, spool files, admission — is
+    /// released. The loader retires their outstanding entries itself.
+    fn end_sweep(&mut self, basis: &IoBasis);
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis);
                                          // RpcIO: snapshot-pinned, retry-refreshed;
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis);
@@ -8643,7 +8677,9 @@ put production image codecs, mesh optimization, or shader compilers in core.
   manifest), and RpcIO's admission rule is pinned: an oversized fetch
   is admitted alone against the bounded budget, and beyond a pinned
   threshold responses stream/spool to disk rather than buffer in
-  memory.
+  memory. (Refined with the single-threaded RpcIO, §15 Plumbing: a
+  payload that does not fit the remaining budget spools instead of
+  waiting for it, so admission never waits on the engine.)
 - **Manifest fields cross-check headers, both ways** (§13, §16): the
   manifest duplicates authored/terminal types, logical hash, and load
   deps from artifact headers with no required comparison — a generator
