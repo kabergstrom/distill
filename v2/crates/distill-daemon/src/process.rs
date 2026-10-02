@@ -249,6 +249,7 @@ impl DaemonProcess {
             cas_sweeper: SegmentSweeper::new(
                 coordinator.server_handle().snapshot_policy().ttl + CAS_DELETE_MARGIN,
             ),
+            cas_swept: None,
             capabilities_pending: false,
             work_pending: false,
         };
@@ -420,6 +421,9 @@ struct ProcessLoop {
     /// The server's publication count the last pass saw.
     publications: u64,
     cas_sweeper: SegmentSweeper,
+    /// The CAS write count and cache limit the last complete CAS sweep ran
+    /// at: with neither changed there is nothing to evict or compact.
+    cas_swept: Option<(u64, u64)>,
     /// An accepted configuration candidate changed the importer registry or
     /// its capabilities, and the capability-driven reimport has not yet
     /// completed. A requeued pass keeps it: the configuration watch reports
@@ -626,10 +630,11 @@ impl ProcessLoop {
     fn fire(&mut self) -> bool {
         let now = Instant::now();
         if self.schedule.take_cas_pass(now) {
-            if let Err(error) = self
-                .coordinator
-                .maintain_cas(&mut self.store, &mut self.cas_sweeper)
-            {
+            if let Err(error) = crate::coordinator::maintain_cas(
+                &mut self.store,
+                &mut self.cas_sweeper,
+                &mut self.cas_swept,
+            ) {
                 tracing::warn!(%error, "CAS maintenance failed");
             }
         }

@@ -554,6 +554,13 @@ impl std::ops::Deref for Store {
 }
 
 impl Store {
+    /// Test hook: [`StoreReader::trace_statements`] on the writer's
+    /// connection.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn trace_statements(&mut self, hook: Option<fn(&str)>) {
+        self.read.trace_statements(hook);
+    }
+
     /// Open (creating if absent) the daemon state under
     /// `config.state_path`, run CAS recovery, and return the writer
     /// together with what recovery found and did (§13's classification).

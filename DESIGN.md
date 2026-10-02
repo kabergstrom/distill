@@ -5098,7 +5098,8 @@ before one SQLite transaction flips the index, and old segments are deleted
 only when no live snapshot or mmap reader pins their generation.
 **Segments are the durable record within daemon state; the index is
 rebuildable by a segment scan.** GC is Bitcask-style
-compaction driven by cache policy (LRU / size cap) — everything in the CAS
+compaction driven by the size cap (random eviction, each victim one
+sampled index probe; the pass runs only after the CAS index changed) — everything in the CAS
 is rebuildable, so eviction is always safe. But never observable: eviction
 may not remove a ContentHash referenced by any current or last-good manifest
 entry, live snapshot lease, in-flight build, or open pack-build session —

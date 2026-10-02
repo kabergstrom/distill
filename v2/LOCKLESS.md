@@ -1043,6 +1043,19 @@ should reach zero by the end of phase 6.
   holds. It replaced the preload pass that read and decoded the whole
   bucket, revalidated, and then a lookup that read and decoded it again.
   Node lookups read lazily too.
+- **The CAS pass costs its changes.** Every CAS index write
+  (`index_segments`, `evict_result`, `evict_installed`) bumps
+  `store_meta.cas_writes` in its own transaction. The loop's pass
+  (`maintain_cas`) skips eviction and compaction while the count and the
+  cache limit stand where the last pass that ended within the limit left
+  them; only the dead-segment sweep runs. When it does run, the
+  cache-limit sweep sums the live bytes once and subtracts each victim's
+  freed bytes (`DELETE … RETURNING len`). Each victim is one index probe
+  (`cas_refs_by_hash` at a random hash), at most 4096 per sweep. This
+  replaces a prune, a re-summing of every extent after each victim, and a
+  `DISTINCT … ORDER BY random()` over every holder. The prune is left to
+  recovery, since release already deletes an extent with its last
+  reference.
 
 ## 7. Test baseline
 

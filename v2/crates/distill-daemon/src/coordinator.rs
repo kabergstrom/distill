@@ -951,19 +951,6 @@ impl DaemonCoordinator {
         }
     }
 
-    /// The loop's CAS pass: evict to the cache limit, compact, and delete
-    /// the dead segments whose grace has passed.
-    pub(crate) fn maintain_cas(
-        &self,
-        store: &mut Store,
-        sweeper: &mut distill_store::cas::SegmentSweeper,
-    ) -> Result<(), distill_store::StoreError> {
-        store.enforce_cache_limit()?;
-        store.compact()?;
-        sweeper.sweep(store)?;
-        Ok(())
-    }
-
     /// Reconcile one complete identity-checked namespace scan, as a pass
     /// with no imports.
     pub fn reconcile_full_scan(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
@@ -1073,6 +1060,97 @@ impl DaemonCoordinator {
         store
             .acknowledge_file_work(work)
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
+    }
+}
+
+/// The loop's CAS pass: evict to the cache limit and compact, unless neither
+/// the CAS (its write count) nor the limit changed since `swept`, the last
+/// pass that finished within the limit; then delete the dead segment files
+/// no read can reach any more.
+pub(crate) fn maintain_cas(
+    store: &mut Store,
+    sweeper: &mut distill_store::cas::SegmentSweeper,
+    swept: &mut Option<(u64, u64)>,
+) -> Result<(), distill_store::StoreError> {
+    let state = (store.cas_writes()?, store.config().cache_limit);
+    if *swept != Some(state) {
+        *swept = None;
+        let sweep = store.enforce_cache_limit()?;
+        store.compact()?;
+        if sweep.live_bytes <= state.1 {
+            *swept = Some((store.cas_writes()?, state.1));
+        }
+    }
+    sweeper.sweep(store)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod cas_pass_tests {
+    use super::*;
+    use distill_store::cas::record::KeyKind;
+    use distill_store::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind, SegmentSweeper};
+
+    static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_statement(sql: &str) {
+        STATEMENTS.lock().unwrap().push(sql.to_owned());
+    }
+
+    fn commit(store: &mut Store, key: u8) {
+        store
+            .commit_build(BuildCommit {
+                wire_trees: Vec::new(),
+                key_kind: KeyKind::Processor,
+                static_input_key: [key; 32],
+                asset_uuid: AssetUuid([7; 16]),
+                static_inputs_canonical: vec![],
+                trace: vec![key],
+                outcome: CommitOutcome::Success {
+                    payload_kind: PayloadKind::ProcessorOutput,
+                    outputs: vec![OutputSpec {
+                        output_key: String::new(),
+                        type_uuids: vec![],
+                        bytes: vec![key; 64],
+                    }],
+                    aux: vec![],
+                },
+            })
+            .unwrap();
+    }
+
+    /// The statements one pass runs.
+    fn pass(store: &mut Store, swept: &mut Option<(u64, u64)>) -> Vec<String> {
+        let mut sweeper = SegmentSweeper::new(std::time::Duration::ZERO);
+        store.trace_statements(Some(record_statement));
+        STATEMENTS.lock().unwrap().clear();
+        maintain_cas(store, &mut sweeper, swept).unwrap();
+        store.trace_statements(None);
+        std::mem::take(&mut *STATEMENTS.lock().unwrap())
+    }
+
+    /// A pass after no CAS write sums nothing and evicts nothing: it reads
+    /// the write count and the dead segments only, however large the CAS.
+    #[test]
+    fn a_pass_with_no_cas_write_skips_the_sweeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        let mut swept = None;
+        let mut idle = Vec::new();
+        for writes in [2u8, 40] {
+            for key in 0..writes {
+                commit(&mut store, key.wrapping_add(idle.len() as u8 * 100));
+            }
+            let first = pass(&mut store, &mut swept);
+            assert!(first.iter().any(|sql| sql.contains("SUM(len)")), "{first:?}");
+            let again = pass(&mut store, &mut swept);
+            assert!(!again.iter().any(|sql| sql.contains("SUM(len)")), "{again:?}");
+            idle.push(again.len());
+        }
+        assert_eq!(idle[0], idle[1], "{idle:?}");
+        commit(&mut store, 250);
+        let after_write = pass(&mut store, &mut swept);
+        assert!(after_write.iter().any(|sql| sql.contains("SUM(len)")), "{after_write:?}");
     }
 }
 

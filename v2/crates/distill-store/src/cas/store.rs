@@ -800,9 +800,21 @@ impl Store {
     }
 }
 
+/// Count one change to the CAS index (`store_meta.cas_writes`), in its write
+/// transaction: the CAS pass skips its sweeps while the count stands still.
+pub(crate) fn count_cas_write(txn: &rusqlite::Connection) -> Result<(), StoreError> {
+    txn.prepare_cached(
+        "INSERT INTO store_meta(key, value) VALUES ('cas_writes', 1)
+         ON CONFLICT(key) DO UPDATE SET value = value + 1",
+    )?
+    .execute([])?;
+    Ok(())
+}
+
 /// Record how far each touched segment is indexed, and seal an oversize
 /// segment once its one record is.
 fn index_segments(txn: &rusqlite::Connection, touched: &[(u64, u64)]) -> Result<(), StoreError> {
+    count_cas_write(txn)?;
     for (segment, len) in touched {
         txn.execute(
             "UPDATE cas_segments SET indexed_len = ?2,
@@ -820,6 +832,12 @@ fn index_segments(txn: &rusqlite::Connection, touched: &[(u64, u64)]) -> Result<
 }
 
 impl StoreReader {
+    /// How many changes the CAS index has counted ([`count_cas_write`]):
+    /// an unchanged count is an unchanged CAS index. One primary-key read.
+    pub fn cas_writes(&self) -> Result<u64, StoreError> {
+        Ok(crate::db::meta_get_u64(&self.conn, "cas_writes")?.unwrap_or(0))
+    }
+
     /// The candidate bucket for a static-input key, most recently
     /// committed first (§13), each candidate read and decoded. A pure read;
     /// a caller that stops at the first candidate that holds reads the
