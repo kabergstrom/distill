@@ -149,7 +149,7 @@ work. If that work fails, SQLite and memory diverge:
   - 4349–4374.
   - 446–461 and 469–472.
 - `refine_unpublished_tag_index` is a second transaction inside every publication, and its failure is swallowed as a poison.
-- `importer.rs`: `clear_watched_import_failure` (1292), `record_directory_orphans*` (633, 695), and `acknowledge_file_work` are separate commits.
+- `importer.rs`: `clear_watched_import_failure` (1292), `record_directory_orphans*` (633, 695), and `acknowledge_file_work` are separate commits. Done for the process loop: they join the pass's one input (§6.1).
 - `retire_publication_group` does check-then-act as three autocommits.
 - `lookup_candidates` was a "read" that wrote `last_used`. Done: lookups are pure and the cache-limit sweep evicts at random, so a hit never writes (LRU drops to zero hits once the working set exceeds the cap).
 
@@ -184,16 +184,21 @@ a connection of its own, and SQLite's write lock orders the writers.
 - **The process loop** owns the `WatcherQueue`, `ConfigWatch` and codegen.
   It reconciles watcher events once the filesystem has settled (each
   event restarts a trailing quiet window, `watch.quiet_ms`), publishes
-  scans and imports, and runs startup. Its scan state (the pending
-  rejection and health) sits in a `Mutex` other publications read.
+  scans and imports, and runs startup. Each pass (`coordinator/pass.rs`)
+  publishes one input version: the scan, directory and watched imports,
+  the dirty-queue acknowledgement and the runtime pipeline-failure sync.
+  Its scan state (the pending rejection and health) sits in a `Mutex`
+  other publications read.
 - **watcher** forwards `notify` events to the loop and holds no queue
   state. It stops on its command channel.
 - **Imports and authoring calls** run on the calling thread: the process
   loop's, or the RPC connection's own thread, which blocks only that
   connection. A publication reads its base inside its own transaction and
   is refused if the base moved. An RPC import runs its importer on a
-  blocking worker before it opens the input; watched reconciliation runs importers in parallel,
-  outside any write.
+  blocking worker before it opens the input; a process-loop pass plans in
+  a rolled-back write, runs its importers in parallel outside any write
+  against an overlay of the planned file state, and applies them all in
+  one coordinated input (`Stale`, and rerun whole, if the base moved).
 - **Builds** run on scheduler workers. A worker does memo lookup and trace
   revalidation against its reader, builds dependency reads inline, and
   commits the CAS index, `artifact_load_edges` and `resolutions` in one
@@ -817,6 +822,25 @@ should reach zero by the end of phase 6.
       rolls back and leaves the flag set, so the old index stands until
       the next full import pass.
     - A stopping watcher delivers the events queued before `Stop`.
+- **One pass, one input version.** A process-loop pass
+  (`coordinator/pass.rs`) plans in a write that always rolls back, runs
+  importers in parallel outside any write against a `FileOverlay` of the
+  planned file state, then applies inside one `coordinated_maybe_commit`:
+  the runtime pipeline-failure sync first, the scan step with its tag
+  refinement, every import matched to its run, and the dirty-queue
+  acknowledgement. The merged `Commit`s publish as one version. An outside
+  write between plan and apply makes the pass `Stale` and it reruns whole.
+  An import whose read set drifted, or that the plan did not run, is
+  skipped; its paths stay queued and the loop retries. The acknowledgement
+  is per path: a path with newer work stays queued instead of failing the
+  pass, so the background error clears on the next good pass. Kept out of
+  the single input: configuration/schema/pipeline candidate publications
+  (their own versions, before the pass), codegen, chained imports (the
+  next pass) and import output disk writes. The watcher's echo of a
+  pass's own bundle writes publishes nothing: a rename from a path never
+  observed (the atomic write's temporary file) moves no identity. The
+  import index flag is an
+  `AtomicBool` the pass restores when its plan rolls back.
 - **After phase 11: one owner per writer.** RPC connections each run on a
   thread of their own and share only the `ServerHandle`. `SharedStore`,
   its thread-local `HELD`/`READERS`/`OPEN_GUARDS`, `WriteGuard` and

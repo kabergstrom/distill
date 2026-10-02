@@ -5495,6 +5495,31 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   Coalescing may replace repeated final-state events for one path, but it must
   preserve the ordered rename chain needed for live identity and dependency
   updates.
+- **One pass, one input version.** A settled batch is reconciled by one pass
+  that publishes exactly one input version: the path-local scan, directory
+  and watched imports for the affected bundles, the dirty-queue
+  acknowledgement and the runtime pipeline-failure sync all land in it, so
+  no snapshot ever pins a half-reconciled burst. The pass plans in a write
+  that always rolls back (to learn which imports the new file state needs),
+  runs the importers in parallel outside any write against an overlay of
+  that file state, then applies everything in one coordinated input whose
+  base must still be the version the plan read. An outside write (an RPC
+  authoring edit) in between makes the pass `Stale`: nothing is applied and
+  the whole pass reruns, so no import is applied twice. An import whose
+  read-set moved between plan and apply is not applied; it and the pending
+  paths stay queued for a retry pass. One bundle's importer failure does not
+  hold back the rest: the failing bundle keeps its last good result (with
+  the failure memoized) or, with nothing to keep, is reported as the pass's
+  background error, which clears when a later pass succeeds. Outside the
+  single input remain: configuration/schema/pipeline candidate
+  publications (each its own version, before the pass, because they install
+  the epoch and importers the pass uses), codegen (files only, no version),
+  chained imports whose source is another import's output (they join the
+  next pass's version), and the disk writes of import outputs (written
+  before the input commits, as before). The pass observes those outputs in
+  its own input, so the watcher's echo of them publishes nothing: an echo
+  whose namespace observation is unchanged and whose renames start from a
+  path never observed (an atomic write's temporary file) is no change.
 - **Incremental-workload invariant.** After a successful startup scan, ordinary
   filesystem activity never invokes the complete-root scanner. Complete scans
   are restricted to process startup, an accepted configured-root replacement,
@@ -5534,12 +5559,15 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   InvalidFileType|SymlinkIdentityChanged|IoDataLoss }`; no unreadable branch is
   silently treated as an empty directory or synthesized deletion set.
 - **Dirty queue discipline.** Downstream consumers capture a dirty/rename
-  prefix, publish their idempotent input results, then clear that prefix in one
-  unversioned maintenance compare-and-delete transaction. The acknowledgement
-  compares each path's stored observation generation with the generation the
-  consumer used;
-  a mismatch, crash, or failed consumer clears nothing and the prefix retries,
-  while rows appended after the captured sequence survive. Queue maintenance
+  prefix, publish their idempotent input results, then clear that prefix with
+  a compare-and-delete; the process loop's acknowledgement joins the pass's
+  input (above), other consumers use an unversioned maintenance transaction.
+  The acknowledgement compares each path's stored observation generation with
+  the generation the consumer used, path by path: a path whose generation
+  moved is newer work, not an error, and stays queued for the next pass while
+  settled paths clear; a crash or failed consumer clears nothing and the
+  prefix retries, and rows appended after the captured sequence survive.
+  Queue maintenance
   never fabricates a new externally visible input version. For watched
   imports the comparison is total: the entire outcome-bearing read-set —
   failed reads/probes/listings and importer-capability hit/miss included —
