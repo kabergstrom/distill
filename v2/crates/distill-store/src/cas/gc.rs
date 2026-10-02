@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::cas::record::{decode_record, KeyKind, RecordKind, RECORD_HEADER_LEN};
 use crate::cas::store::{
-    fsync_dir, read_segment, segment_file_name, segment_open_options, SegmentKind,
+    count_cas_write, fsync_dir, read_segment, segment_file_name, segment_open_options, SegmentKind,
     HOLDER_INSTALLED, HOLDER_RESULT, SEGMENT_DEAD, SEGMENT_OPEN, SEGMENT_SEALED,
 };
 use crate::db::Store;
@@ -56,40 +56,46 @@ fn prune(txn: &rusqlite::Connection) -> Result<usize, StoreError> {
     )?)
 }
 
-/// Drop one holder's references and the extents only it held.
+/// Drop one holder's references and the extents only it held; the extent
+/// bytes that freed.
 fn release_holder(
     txn: &rusqlite::Connection,
     holder_kind: i64,
     holder: &[u8],
-) -> Result<(), StoreError> {
+) -> Result<u64, StoreError> {
+    use rusqlite::OptionalExtension;
     let hashes: Vec<Vec<u8>> = {
-        let mut statement = txn.prepare(
+        let mut statement = txn.prepare_cached(
             "SELECT content_hash FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2",
         )?;
         let rows = statement.query_map(rusqlite::params![holder_kind, holder], |row| row.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
-    txn.execute(
-        "DELETE FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2",
-        rusqlite::params![holder_kind, holder],
-    )?;
+    txn.prepare_cached("DELETE FROM cas_refs WHERE holder_kind = ?1 AND holder = ?2")?
+        .execute(rusqlite::params![holder_kind, holder])?;
+    let mut freed = 0;
     for hash in hashes {
-        txn.execute(
-            "DELETE FROM cas_extents WHERE content_hash = ?1
-               AND NOT EXISTS (SELECT 1 FROM cas_refs WHERE content_hash = ?1)",
-            [hash],
-        )?;
+        freed += txn
+            .prepare_cached(
+                "DELETE FROM cas_extents WHERE content_hash = ?1
+                   AND NOT EXISTS (SELECT 1 FROM cas_refs WHERE content_hash = ?1)
+                 RETURNING len",
+            )?
+            .query_row([hash], |row| row.get::<_, i64>(0))
+            .optional()?
+            .map_or(0, |len| len as u64);
     }
-    Ok(())
+    Ok(freed)
 }
 
-/// Evict one result row and everything only it held.
+/// Evict one result row and everything only it held; `None` when there is
+/// no such row, else the extent bytes that freed.
 fn evict_result_rows(
     txn: &rusqlite::Connection,
     key_kind: i64,
     static_key: &[u8],
     trace_digest: &[u8],
-) -> Result<bool, StoreError> {
+) -> Result<Option<u64>, StoreError> {
     use rusqlite::OptionalExtension;
     let memo_seq: Option<i64> = txn
         .query_row(
@@ -100,7 +106,7 @@ fn evict_result_rows(
         )
         .optional()?;
     let Some(memo_seq) = memo_seq else {
-        return Ok(false);
+        return Ok(None);
     };
     txn.execute(
         "DELETE FROM result_candidates
@@ -112,9 +118,22 @@ fn evict_result_rows(
     holder.push(key_kind as u8);
     holder.extend_from_slice(static_key);
     holder.extend_from_slice(trace_digest);
-    release_holder(txn, HOLDER_RESULT, &holder)?;
-    Ok(true)
+    release_holder(txn, HOLDER_RESULT, &holder).map(Some)
 }
+
+/// One eviction victim, sampled: the holder of the first reference at or
+/// after a random content hash (`cas_refs_by_hash`), so a holder is drawn
+/// about in proportion to the extents it holds.
+pub(crate) const SAMPLE_HOLDER: &str = "SELECT holder_kind, holder FROM cas_refs
+     WHERE content_hash >= randomblob(32) ORDER BY content_hash LIMIT 1";
+/// The holder of the least reference, when the random hash lay past them.
+pub(crate) const FIRST_HOLDER: &str =
+    "SELECT holder_kind, holder FROM cas_refs ORDER BY content_hash LIMIT 1";
+/// The extent bytes the index holds.
+pub(crate) const LIVE_BYTES: &str = "SELECT COALESCE(SUM(len), 0) FROM cas_extents";
+/// Most victims one sweep samples; a sweep that stops short leaves the rest
+/// to the next pass.
+const MAX_VICTIMS: usize = 4096;
 
 /// A record compaction copies, and the index row that points at it.
 enum Moved {
@@ -140,18 +159,23 @@ impl Store {
         trace_digest: &[u8; 32],
     ) -> Result<bool, StoreError> {
         self.write_txn(|store| {
-            evict_result_rows(
+            count_cas_write(&store.conn)?;
+            Ok(evict_result_rows(
                 &store.conn,
                 key_kind as i64,
                 static_key.as_slice(),
                 trace_digest.as_slice(),
-            )
+            )?
+            .is_some())
         })
     }
 
     /// Evict one installed artifact or wire tree, and what only it held.
     pub fn evict_installed(&mut self, hash: &[u8; 32]) -> Result<(), StoreError> {
-        self.write_txn(|store| release_holder(&store.conn, HOLDER_INSTALLED, hash))
+        self.write_txn(|store| {
+            count_cas_write(&store.conn)?;
+            release_holder(&store.conn, HOLDER_INSTALLED, hash).map(drop)
+        })
     }
 
     /// The cache-limit sweep (§18's `cas.cache_limit`, operational-live):
@@ -159,48 +183,43 @@ impl Store {
     /// indexed extent bytes fit the cap. Random rather than LRU: with a
     /// working set larger than the cap, LRU evicts each result just before
     /// its next use and the hit rate falls to zero; random eviction degrades
-    /// gracefully. One write transaction; no segment bytes are read.
+    /// gracefully. One write transaction; no segment bytes are read. The
+    /// live bytes are summed once and each victim's freed bytes subtracted;
+    /// victims are sampled one index probe each, at most [`MAX_VICTIMS`] a
+    /// sweep (a sweep that stops short reports bytes above the cap).
     pub fn enforce_cache_limit(&mut self) -> Result<EvictionSweep, StoreError> {
+        use rusqlite::OptionalExtension;
         let cache_limit = self.config.cache_limit;
         self.write_txn(|store| {
             let txn = &*store.conn;
-            prune(txn)?;
-            let live = || -> Result<u64, StoreError> {
-                Ok(txn.query_row("SELECT COALESCE(SUM(len), 0) FROM cas_extents", [], |r| {
-                    r.get::<_, i64>(0)
-                })? as u64)
-            };
-            let mut live_bytes = live()?;
+            let mut live_bytes = txn.query_row(LIVE_BYTES, [], |r| r.get::<_, i64>(0))? as u64;
             let mut evicted = 0usize;
-            if live_bytes <= cache_limit {
-                return Ok(EvictionSweep {
-                    evicted,
-                    live_bytes,
-                });
-            }
-            let victims: Vec<(i64, Vec<u8>)> = {
-                let mut statement = txn.prepare(
-                    "SELECT holder_kind, holder FROM
-                       (SELECT DISTINCT holder_kind, holder FROM cas_refs)
-                     ORDER BY random()",
-                )?;
-                let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<Result<_, _>>()?
-            };
-            for (holder_kind, holder) in victims {
-                if live_bytes <= cache_limit {
+            while live_bytes > cache_limit && evicted < MAX_VICTIMS {
+                let sample = |sql| {
+                    txn.prepare_cached(sql)?
+                        .query_row([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                        .optional()
+                };
+                let victim = match sample(SAMPLE_HOLDER)? {
+                    Some(victim) => Some(victim),
+                    None => sample(FIRST_HOLDER)?,
+                };
+                let Some((holder_kind, holder)) = victim else {
                     break;
-                }
-                if holder_kind == HOLDER_RESULT {
-                    if holder.len() != 65 {
-                        continue;
-                    }
-                    evict_result_rows(txn, i64::from(holder[0]), &holder[1..33], &holder[33..65])?;
+                };
+                // A result holder whose row is gone still has its
+                // references released, so no sample draws it again.
+                let row = if holder_kind == HOLDER_RESULT && holder.len() == 65 {
+                    evict_result_rows(txn, i64::from(holder[0]), &holder[1..33], &holder[33..65])?
                 } else {
-                    release_holder(txn, holder_kind, &holder)?;
-                }
+                    None
+                };
+                let freed = match row {
+                    Some(freed) => freed,
+                    None => release_holder(txn, holder_kind, &holder)?,
+                };
                 evicted += 1;
-                live_bytes = live()?;
+                live_bytes = live_bytes.saturating_sub(freed);
             }
             Ok(EvictionSweep {
                 evicted,
@@ -529,6 +548,111 @@ mod tests {
     use crate::cas::record::KeyKind;
     use crate::cas::{BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
     use crate::{Store, StoreConfig, StoreError};
+
+    use super::{FIRST_HOLDER, LIVE_BYTES, SAMPLE_HOLDER};
+
+    #[test]
+    fn eviction_reads_are_planned_on_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+        let cases: &[(&str, &[&str])] = &[
+            (
+                SAMPLE_HOLDER,
+                &["SEARCH cas_refs USING COVERING INDEX cas_refs_by_hash (content_hash>?)"],
+            ),
+            (FIRST_HOLDER, &["SCAN cas_refs USING COVERING INDEX cas_refs_by_hash"]),
+            // The pass's one whole read.
+            (LIVE_BYTES, &["SCAN cas_extents"]),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(&store.query_plan_details(sql).unwrap(), expected, "{sql}");
+        }
+    }
+
+    static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_statement(sql: &str) {
+        STATEMENTS.lock().unwrap().push(sql.to_owned());
+    }
+
+    fn commit_result(store: &mut Store, index: u32) {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&index.to_le_bytes());
+        store
+            .commit_build(BuildCommit {
+                wire_trees: Vec::new(),
+                key_kind: KeyKind::Processor,
+                static_input_key: key,
+                asset_uuid: AssetUuid([7; 16]),
+                static_inputs_canonical: vec![],
+                trace: vec![1],
+                outcome: CommitOutcome::Success {
+                    payload_kind: PayloadKind::ProcessorOutput,
+                    outputs: vec![OutputSpec {
+                        output_key: String::new(),
+                        type_uuids: vec![],
+                        bytes: format!("output {index}").into_bytes(),
+                    }],
+                    aux: vec![],
+                },
+            })
+            .unwrap();
+    }
+
+    /// The statements one sweep runs, with the cap `under` bytes below the
+    /// live bytes; `(evicted, statements, live sums)`.
+    fn sweep_statements(results: u32, under: u64) -> (usize, usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig::new(dir.path().join("state"));
+        let live = {
+            let mut store = Store::open(config.clone()).unwrap();
+            for index in 0..results {
+                commit_result(&mut store, index);
+            }
+            store.conn.query_row(LIVE_BYTES, [], |r| r.get::<_, i64>(0)).unwrap() as u64
+        };
+        let mut config = config;
+        config.cache_limit = live - under;
+        let mut store = Store::open(config).unwrap();
+        store.trace_statements(Some(record_statement));
+        STATEMENTS.lock().unwrap().clear();
+        let sweep = store.enforce_cache_limit().unwrap();
+        store.trace_statements(None);
+        let statements = std::mem::take(&mut *STATEMENTS.lock().unwrap());
+        // A sample past the last hash falls back to the first: one more.
+        let fallbacks = statements.iter().filter(|sql| sql.as_str() == FIRST_HOLDER).count();
+        let sums = statements.iter().filter(|sql| sql.as_str() == LIVE_BYTES).count();
+        (sweep.evicted, statements.len() - fallbacks, sums)
+    }
+
+    /// A sweep sums the live bytes once and then costs per victim, never
+    /// per extent: within the cap it is one statement, and one eviction
+    /// costs the same over 20 results as over 400.
+    #[test]
+    fn a_sweep_costs_its_victims_not_the_cas() {
+        let within: Vec<_> = [20, 400].map(|results| sweep_statements(results, 0)).into();
+        assert_eq!(within[0], within[1], "{within:?}");
+        assert_eq!(within[0].0, 0);
+        assert_eq!(within[0].2, 1);
+        let one: Vec<_> = [20, 400].map(|results| sweep_statements(results, 1)).into();
+        assert_eq!(one[0], one[1], "{one:?}");
+        assert_eq!(one[0].0, 1);
+        assert_eq!(one[0].2, 1);
+    }
+
+    #[test]
+    fn the_cas_write_count_moves_only_with_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join("state"))).unwrap();
+        let start = store.cas_writes().unwrap();
+        commit_result(&mut store, 1);
+        let committed = store.cas_writes().unwrap();
+        assert!(committed > start);
+        store.enforce_cache_limit().unwrap();
+        store.compact().unwrap();
+        store.lookup_candidates(KeyKind::Processor, &[0; 32]).unwrap();
+        assert_eq!(store.cas_writes().unwrap(), committed);
+    }
 
     #[test]
     fn a_prune_racing_a_commit_never_leaves_a_dangling_reference() {

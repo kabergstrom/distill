@@ -141,6 +141,7 @@ fn multi_table_input_transactions_are_all_or_nothing() {
                 format_version: 1,
                 content_hash: ContentHash([1u8; 32]),
                 origin: None,
+                import_watched: false,
             })?;
             txn.upsert_asset(&AssetRecord {
                 asset: AssetUuid([2u8; 16]),

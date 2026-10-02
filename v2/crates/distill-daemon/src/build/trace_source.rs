@@ -3,13 +3,13 @@
 //! A build's trace records what it observed of the project; a cached
 //! result serves a snapshot where every recorded question gets the same
 //! answer there. [`StoreTraceSource`] answers each question when it is
-//! asked, by indexed reads in the snapshot's read transaction
-//! (`distill_store::trace_reads`): an entry is one primary-key read, a path
-//! one `path_index` range, a query the index range of its most selective
-//! selector, a tool one ToolEpoch row. Nothing reads the whole project
-//! unless a query names no indexed selector at all (its answer may then be
-//! the whole project). Answers are kept per snapshot in [`TraceAnswers`],
-//! so a build that asks a question again does not read again.
+//! asked, by indexed reads in the snapshot's read transaction: an entry is
+//! one primary-key read (`distill_store::trace_reads`), a path one
+//! `path_index` range, a query one asset query driven by its most selective
+//! selector (DESIGN.md §13, asset queries), a tool one ToolEpoch row.
+//! Nothing reads the whole project unless a query names no indexed
+//! selector at all (its answer may then be the whole project). Nothing is
+//! kept between questions: SQLite is the one copy of the snapshot.
 //!
 //! The source answers infallibly, as [`TraceSource`] requires. A store
 //! failure while answering is kept and reported by
@@ -18,8 +18,7 @@
 //! decides anything.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::rc::Rc;
+use std::collections::{BTreeMap, BTreeSet};
 
 use distill_build::pipeline::{PipelineRegistry, Target};
 use distill_build::query::{asset_query_result_hash, AssetQuery};
@@ -28,55 +27,13 @@ use distill_build::trace::{
     StableFailureFingerprint, TraceSource,
 };
 use distill_core::id::{AssetUuid, BundleFileHash, BundleUuid, ContentHash, TypeUuid};
+use distill_store::bundles::AssetFilter;
+use distill_store::files::{GlobKeys, GLOBSET_META};
 use distill_store::state::InputVersion;
+use distill_store::trace_reads::TraceEntry;
 use distill_store::StoreReader;
 
 use super::{no_trace, node_content_hashes, BuildError, CurrentLoadSource, NodeResult};
-
-/// One asset row as a trace observes it.
-pub(super) struct TraceEntry {
-    pub(super) asset: AssetUuid,
-    pub(super) bundle: BundleUuid,
-    pub(super) bundle_path: String,
-    pub(super) bundle_hash: BundleFileHash,
-    pub(super) local_id: String,
-    pub(super) authored_type: TypeUuid,
-    pub(super) terminal_type: TypeUuid,
-    pub(super) role: EntryRole,
-    pub(super) tags: BTreeMap<String, Option<String>>,
-}
-
-/// What the trace sources of one snapshot have read: the answers to the
-/// questions asked so far, never a copy of a table. Shared by every source
-/// at that snapshot (one build's view, one resolve's snapshot).
-#[derive(Default)]
-pub(super) struct TraceAnswers {
-    entries: RefCell<HashMap<AssetUuid, Option<Rc<TraceEntry>>>>,
-    /// A derived child's terminal type; `None` for an asset that is none.
-    derived: RefCell<HashMap<AssetUuid, Option<TypeUuid>>>,
-    paths: RefCell<HashMap<String, Rc<[AssetUuid]>>>,
-    queries: RefCell<HashMap<AssetQuery, Rc<[AssetUuid]>>>,
-    /// The least tag-poisoned bundle among a tagless query's candidates.
-    query_poisons: RefCell<HashMap<AssetQuery, Option<BundleUuid>>>,
-    tools: RefCell<HashMap<String, Option<[u8; 32]>>>,
-    /// The authored types whose chains end at a terminal type, with those
-    /// whose chains fail (their assets fail any query reaching them).
-    terminal_sources: RefCell<HashMap<TypeUuid, Rc<[TypeUuid]>>>,
-    current_load: OnceCell<CurrentLoadSource>,
-}
-
-impl TraceAnswers {
-    /// The capabilities of the loaded pipeline, captured on first use.
-    pub(super) fn current_load(
-        &self,
-        capture: impl FnOnce() -> Result<CurrentLoadSource, BuildError>,
-    ) -> Result<&CurrentLoadSource, BuildError> {
-        if self.current_load.get().is_none() {
-            let _ = self.current_load.set(capture()?);
-        }
-        Ok(self.current_load.get().expect("set above"))
-    }
-}
 
 /// Where a source finds the contents of the nodes built so far: a build's
 /// memo, or a lookup's nodes.
@@ -98,10 +55,10 @@ pub(super) struct TraceBasis<'a> {
 pub(super) struct StoreTraceSource<'a> {
     store: &'a StoreReader,
     basis: TraceBasis<'a>,
-    answers: &'a TraceAnswers,
     current_load: &'a CurrentLoadSource,
     built: BuiltNodes<'a>,
-    /// The built nodes' contents by asset, gathered on the first `read`.
+    /// The built nodes' contents by asset, gathered on the first `read`
+    /// (from the nodes, not the store).
     contents: OnceCell<BTreeMap<AssetUuid, ContentHash>>,
     failure: RefCell<Option<BuildError>>,
 }
@@ -113,18 +70,55 @@ pub(super) trait TraceQueries: TraceSource {
     fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid>;
 }
 
+/// The asset filter of a runtime asset query (a build's or a codegen's):
+/// every selector but the terminal type, which depends on the target, and
+/// the glob, which contributes its keys (when it compiles) and is matched
+/// on the rows. `authoring_only` is not a selector here: such a query
+/// selects runtime rows only.
+pub(crate) fn runtime_asset_filter(query: &AssetQuery) -> AssetFilter {
+    let filter = AssetFilter {
+        asset: query.uuid,
+        bundle: query.bundle_uuid,
+        bundle_path: query.bundle_path.clone(),
+        local_id: query.local_id.clone(),
+        authored_type: query.authored_type,
+        tag: query
+            .tag
+            .as_ref()
+            .map(|tag| (tag.tag.clone(), tag.value.clone())),
+        path_prefixes: query.path_prefix.iter().cloned().collect(),
+        authoring_only: Some(false),
+        ..AssetFilter::default()
+    };
+    match query
+        .path_glob
+        .as_deref()
+        .filter(|pattern| globset::Glob::new(pattern).is_ok())
+    {
+        Some(pattern) => filter.with_glob_keys(GlobKeys::of(pattern, GLOBSET_META)),
+        None => filter,
+    }
+}
+
+/// The matcher of a query's glob; an invalid glob selects every path.
+pub(super) fn query_glob(query: &AssetQuery) -> Option<globset::GlobMatcher> {
+    query
+        .path_glob
+        .as_ref()
+        .and_then(|pattern| globset::Glob::new(pattern).ok())
+        .map(|glob| glob.compile_matcher())
+}
+
 impl<'a> StoreTraceSource<'a> {
     pub(super) fn new(
         store: &'a StoreReader,
         basis: TraceBasis<'a>,
-        answers: &'a TraceAnswers,
         current_load: &'a CurrentLoadSource,
         built: BuiltNodes<'a>,
     ) -> Self {
         Self {
             store,
             basis,
-            answers,
             current_load,
             built,
             contents: OnceCell::new(),
@@ -148,102 +142,70 @@ impl<'a> StoreTraceSource<'a> {
         })
     }
 
-    /// The asset row of `asset`: one primary-key read of `assets` (with its
-    /// tags and its bundle's poison) and one of `bundles`.
-    fn entry(&self, asset: AssetUuid) -> Result<Option<Rc<TraceEntry>>, BuildError> {
-        if let Some(known) = self.answers.entries.borrow().get(&asset) {
-            return Ok(known.clone());
-        }
-        let entry = match self.store.entry(asset).map_err(BuildError::failed)? {
-            None => None,
-            Some(entry) => {
-                let bundle = self
-                    .store
-                    .bundle(entry.bundle)
-                    .map_err(BuildError::infrastructure)?
-                    .ok_or_else(|| {
-                        BuildError::Infrastructure(
-                            "trace entry owner bundle hash is missing".to_owned(),
-                        )
-                    })?;
-                Some(Rc::new(TraceEntry {
-                    asset,
-                    bundle: entry.bundle,
-                    bundle_path: bundle.path,
-                    bundle_hash: BundleFileHash(bundle.content_hash.0),
-                    local_id: entry.local_id,
-                    authored_type: entry.type_uuid,
-                    terminal_type: self
-                        .basis
-                        .registry
-                        .chain(entry.type_uuid, self.basis.target)
-                        .map_err(BuildError::failed)?
-                        .terminal,
-                    role: if entry.authoring_only {
-                        EntryRole::AuthoringOnly
-                    } else {
-                        EntryRole::Runtime
-                    },
-                    tags: entry.tags,
-                }))
-            }
-        };
-        self.answers
-            .entries
-            .borrow_mut()
-            .insert(asset, entry.clone());
-        Ok(entry)
+    /// The asset row of `asset`: one primary-key read of `assets` joined to
+    /// its bundle's row.
+    fn entry(&self, asset: AssetUuid) -> Result<Option<TraceEntry>, BuildError> {
+        self.store.trace_entry(asset).map_err(BuildError::failed)
+    }
+
+    /// The terminal type of an asset of authored type `authored`.
+    fn chain_terminal(&self, authored: TypeUuid) -> Result<TypeUuid, BuildError> {
+        Ok(self
+            .basis
+            .registry
+            .chain(authored, self.basis.target)
+            .map_err(BuildError::failed)?
+            .terminal)
     }
 
     /// The terminal type of `asset` as a derived child of its parent's
     /// chain: one primary-key read of `derived_outputs`.
     fn derived_terminal(&self, asset: AssetUuid) -> Result<Option<TypeUuid>, BuildError> {
-        if let Some(known) = self.answers.derived.borrow().get(&asset) {
-            return Ok(*known);
-        }
-        let terminal = match self
+        let Some((parent, output_key)) = self
             .store
             .resolve_child(asset)
             .map_err(BuildError::infrastructure)?
-        {
-            None => None,
-            Some((parent, output_key)) => {
-                let parent = self.entry(parent)?.ok_or_else(|| {
-                    BuildError::Infrastructure(
-                        "derived parent is absent from trace index".to_owned(),
-                    )
-                })?;
-                Some(
-                    self.basis
-                        .registry
-                        .chain(parent.authored_type, self.basis.target)
-                        .map_err(BuildError::failed)?
-                        .extras
-                        .get(&output_key)
-                        .copied()
-                        .ok_or_else(|| {
-                            BuildError::Infrastructure(
-                                "derived output is absent from the pinned pipeline map".to_owned(),
-                            )
-                        })?,
-                )
-            }
+        else {
+            return Ok(None);
         };
-        self.answers.derived.borrow_mut().insert(asset, terminal);
-        Ok(terminal)
+        let parent = self.entry(parent)?.ok_or_else(|| {
+            BuildError::Infrastructure("derived parent is absent from trace index".to_owned())
+        })?;
+        self.basis
+            .registry
+            .chain(parent.type_uuid, self.basis.target)
+            .map_err(BuildError::failed)?
+            .extras
+            .get(&output_key)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| {
+                BuildError::Infrastructure(
+                    "derived output is absent from the pinned pipeline map".to_owned(),
+                )
+            })
     }
 
     fn terminal_type(&self, asset: AssetUuid) -> Result<Option<TypeUuid>, BuildError> {
         match self.derived_terminal(asset)? {
             Some(terminal) => Ok(Some(terminal)),
-            None => Ok(self.entry(asset)?.map(|entry| entry.terminal_type)),
+            None => self
+                .entry(asset)?
+                .map(|entry| self.chain_terminal(entry.type_uuid))
+                .transpose(),
         }
     }
 
     fn role(&self, asset: AssetUuid) -> Result<Option<EntryRole>, BuildError> {
         match self.derived_terminal(asset)? {
             Some(_) => Ok(Some(EntryRole::Runtime)),
-            None => Ok(self.entry(asset)?.map(|entry| entry.role)),
+            None => Ok(self.entry(asset)?.map(|entry| {
+                if entry.authoring_only {
+                    EntryRole::AuthoringOnly
+                } else {
+                    EntryRole::Runtime
+                }
+            })),
         }
     }
 
@@ -264,43 +226,13 @@ impl<'a> StoreTraceSource<'a> {
         Ok(self.contents.get().expect("set above"))
     }
 
-    fn resolved(&self, path: &str) -> Result<Rc<[AssetUuid]>, BuildError> {
-        if let Some(known) = self.answers.paths.borrow().get(path) {
-            return Ok(Rc::clone(known));
-        }
-        let assets: Rc<[AssetUuid]> = self
-            .store
-            .path_assets(path)
-            .map_err(BuildError::infrastructure)?
-            .into_iter()
-            .collect();
-        self.answers
-            .paths
-            .borrow_mut()
-            .insert(path.to_owned(), Rc::clone(&assets));
-        Ok(assets)
-    }
-
-    fn tool_hash(&self, id: &str) -> Result<Option<[u8; 32]>, BuildError> {
-        if let Some(known) = self.answers.tools.borrow().get(id) {
-            return Ok(*known);
-        }
-        let hash = self
-            .store
-            .tool_hash_at(id, self.basis.tool_version)
-            .map_err(BuildError::infrastructure)?;
-        self.answers.tools.borrow_mut().insert(id.to_owned(), hash);
-        Ok(hash)
-    }
-
-    /// The authored types an asset of terminal type `terminal` can have.
-    fn terminal_sources(&self, terminal: TypeUuid) -> Rc<[TypeUuid]> {
-        if let Some(known) = self.answers.terminal_sources.borrow().get(&terminal) {
-            return Rc::clone(known);
-        }
+    /// The authored types an asset of terminal type `terminal` can have:
+    /// those whose chains end there, and those whose chains fail (an asset
+    /// of one fails any query reaching it).
+    fn terminal_sources(&self, terminal: TypeUuid) -> Vec<TypeUuid> {
         // A type no registration takes ends its own chain, so only the
         // terminal itself and registered input types can end at it.
-        let sources: Rc<[TypeUuid]> = std::iter::once(terminal)
+        std::iter::once(terminal)
             .chain(self.basis.registry.input_types())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -310,235 +242,65 @@ impl<'a> StoreTraceSource<'a> {
                     .chain(*authored, self.basis.target)
                     .map_or(true, |chain| chain.terminal == terminal)
             })
-            .collect();
-        self.answers
-            .terminal_sources
-            .borrow_mut()
-            .insert(terminal, Rc::clone(&sources));
-        sources
+            .collect()
     }
 
-    /// A superset of the assets `query` can select, from the index of its
-    /// most selective selector: an identity or exact name (a bundle path, a
-    /// glob's literal final segment, a local id) before a tag value, a type,
-    /// a path prefix and a bare tag. `None` when it names no indexed
-    /// selector: a bare `*` or `**` glob, or `authoring_only` alone, selects
-    /// every runtime asset (intake refuses `authoring_only = true`).
-    fn candidates(&self, query: &AssetQuery) -> Result<Option<Vec<AssetUuid>>, BuildError> {
-        let store = self.store;
-        let found = if let Some(uuid) = query.uuid {
-            Ok(vec![uuid])
-        } else if let (Some(bundle), Some(local_id)) = (query.bundle_uuid, &query.local_id) {
-            store.local_asset_ids(bundle, local_id)
-        } else if let (Some(path), Some(local_id)) = (&query.bundle_path, &query.local_id) {
-            store.local_asset_ids_at_bundle_path(path, local_id)
-        } else if let Some(bundle) = query.bundle_uuid {
-            store
-                .asset_ids_in_bundle(bundle)
-                .map(|assets| assets.into_iter().collect())
-        } else if let Some(path) = &query.bundle_path {
-            store.asset_ids_at_bundle_path(path)
-        } else if let Some(name) = glob_name(query) {
-            store.asset_ids_at_bundle_name(name)
-        } else if let Some(local_id) = &query.local_id {
-            store.asset_ids_with_local_id(local_id)
-        } else if let Some(tag) = query.tag.as_ref().filter(|tag| tag.value.is_some()) {
-            store.asset_ids_with_tag(&tag.tag, tag.value.as_deref())
-        } else if let Some(authored) = query.authored_type {
-            store.asset_ids_of_type(authored)
-        } else if let Some(prefix) = path_prefix(query) {
-            store.asset_ids_under_bundle_path(&prefix)
-        } else if let Some(terminal) = query.terminal_type {
-            let mut assets = Vec::new();
-            for authored in self.terminal_sources(terminal).iter() {
-                assets.extend(
-                    store
-                        .asset_ids_of_type(*authored)
-                        .map_err(BuildError::infrastructure)?,
-                );
-            }
-            assets.sort_unstable();
-            assets.dedup();
-            Ok(assets)
-        } else if let Some(tag) = &query.tag {
-            store.asset_ids_with_tag(&tag.tag, None)
-        } else {
-            return Ok(None);
-        };
-        found.map(Some).map_err(BuildError::infrastructure)
-    }
-
-    fn try_query_results(&self, query: &AssetQuery) -> Result<Rc<[AssetUuid]>, BuildError> {
-        if let Some(known) = self.answers.queries.borrow().get(query) {
-            return Ok(Rc::clone(known));
-        }
-        let candidates = match self.candidates(query)? {
-            Some(candidates) => candidates,
-            None => self
-                .store
-                .all_asset_ids()
-                .map_err(BuildError::infrastructure)?,
-        };
-        let glob = query_glob(query);
-        let mut results = Vec::new();
-        for asset in candidates {
-            if let Some(entry) = self.entry(asset)? {
-                if entry.role == EntryRole::Runtime && entry_matches(&entry, query, glob.as_ref()) {
-                    results.push(asset);
-                }
-            }
-        }
-        let results: Rc<[AssetUuid]> = results.into();
-        self.answers
-            .queries
-            .borrow_mut()
-            .insert(query.clone(), Rc::clone(&results));
-        Ok(results)
-    }
-
-    /// The least bundle among `query`'s candidates (a query without a tag)
-    /// whose tag index is poisoned.
-    fn query_poison(&self, query: &AssetQuery) -> Result<Option<BundleUuid>, BuildError> {
-        if let Some(known) = self.answers.query_poisons.borrow().get(query) {
-            return Ok(*known);
+    /// The runtime assets `query` selects, in asset order, by one asset
+    /// query; or the least poisoned bundle it reaches (DESIGN.md §13,
+    /// asset queries). A terminal type selects the authored types whose
+    /// chains end at it on this target.
+    fn try_query_results(
+        &self,
+        query: &AssetQuery,
+    ) -> Result<Result<Vec<AssetUuid>, BundleUuid>, BuildError> {
+        let mut filter = runtime_asset_filter(query);
+        if let Some(terminal) = query.terminal_type {
+            filter.authored_type_in = Some(self.terminal_sources(terminal));
         }
         let glob = query_glob(query);
-        let selected = |asset: AssetUuid| -> Result<Option<BundleUuid>, BuildError> {
-            Ok(self.entry(asset)?.and_then(|entry| {
-                (entry.role == EntryRole::Runtime && entry_matches(&entry, query, glob.as_ref()))
-                    .then_some(entry.bundle)
-            }))
-        };
-        let mut least: Option<BundleUuid> = None;
-        match self.candidates(query)? {
-            // Few candidates: ask each whether its tag index is poisoned.
-            Some(candidates) => {
-                for asset in candidates {
-                    if let Some(bundle) = selected(asset)? {
-                        if self
-                            .store
-                            .tag_index_poisoned(asset)
-                            .map_err(BuildError::infrastructure)?
-                        {
-                            least = Some(least.map_or(bundle, |least| least.min(bundle)));
-                        }
-                    }
-                }
-            }
-            // Every asset is a candidate: only the poisoned ones matter.
-            None => {
-                for asset in self
-                    .store
-                    .tag_poisoned_asset_ids()
-                    .map_err(BuildError::infrastructure)?
-                {
-                    if let Some(bundle) = selected(asset)? {
-                        least = Some(least.map_or(bundle, |least| least.min(bundle)));
-                    }
-                }
-            }
-        }
-        self.answers
-            .query_poisons
-            .borrow_mut()
-            .insert(query.clone(), least);
-        Ok(least)
-    }
-}
-
-/// The final segment every path a query's (valid) glob matches ends in,
-/// when its last segment is literal.
-fn glob_name(query: &AssetQuery) -> Option<&str> {
-    let pattern = query.path_glob.as_deref()?;
-    globset::Glob::new(pattern).ok()?;
-    distill_store::files::GlobKeys::of(pattern, distill_store::files::GLOBSET_META).name
-}
-
-/// The literal prefix every path a query selects starts with: its path
-/// prefix, or the part of its glob before the first glob syntax, whichever
-/// is longer. `None` when both are empty or absent.
-fn path_prefix(query: &AssetQuery) -> Option<String> {
-    let glob = query
-        .path_glob
-        .as_deref()
-        .filter(|pattern| globset::Glob::new(pattern).is_ok())
-        .map(|pattern| {
-            let end = pattern
-                .find(['*', '?', '[', ']', '{', '}', ',', '\\', '!'])
-                .unwrap_or(pattern.len());
-            pattern[..end].to_owned()
-        });
-    [query.path_prefix.clone(), glob]
-        .into_iter()
-        .flatten()
-        .filter(|prefix| !prefix.is_empty())
-        .max_by_key(String::len)
-}
-
-pub(super) fn query_glob(query: &AssetQuery) -> Option<globset::GlobMatcher> {
-    query
-        .path_glob
-        .as_ref()
-        .and_then(|pattern| globset::Glob::new(pattern).ok())
-        .map(|glob| glob.compile_matcher())
-}
-
-/// Whether `entry` meets every selector of `query` but its role.
-fn entry_matches(
-    entry: &TraceEntry,
-    query: &AssetQuery,
-    glob: Option<&globset::GlobMatcher>,
-) -> bool {
-    query.uuid.is_none_or(|uuid| uuid == entry.asset)
-        && query
-            .bundle_path
-            .as_ref()
-            .is_none_or(|path| path == &entry.bundle_path)
-        && query
-            .local_id
-            .as_ref()
-            .is_none_or(|local_id| local_id == &entry.local_id)
-        && query
-            .bundle_uuid
-            .is_none_or(|bundle| bundle == entry.bundle)
-        && query
-            .authored_type
-            .is_none_or(|authored| authored == entry.authored_type)
-        && query
-            .terminal_type
-            .is_none_or(|terminal| terminal == entry.terminal_type)
-        && query.tag.as_ref().is_none_or(|tag| {
-            entry.tags.get(&tag.tag).is_some_and(|actual| {
-                tag.value
-                    .as_ref()
-                    .is_none_or(|wanted| actual.as_ref() == Some(wanted))
+        let answer = self
+            .store
+            .namespace_assets_matching(&filter, |path| {
+                glob.as_ref().is_none_or(|glob| glob.is_match(path))
             })
-        })
-        && query
-            .path_prefix
-            .as_ref()
-            .is_none_or(|prefix| entry.bundle_path.starts_with(prefix))
-        && glob.is_none_or(|glob| glob.is_match(&entry.bundle_path))
+            .map_err(BuildError::infrastructure)?;
+        let matched = match answer {
+            Ok(matched) => matched,
+            Err(bundles) => return Ok(Err(*bundles.first().expect("a poison names its bundle"))),
+        };
+        let mut results = Vec::with_capacity(matched.len());
+        for matched in matched {
+            // A selected type whose chain fails fails the query.
+            if let Some(terminal) = query.terminal_type {
+                if self.chain_terminal(matched.type_uuid)? != terminal {
+                    continue;
+                }
+            }
+            results.push(matched.asset);
+        }
+        Ok(Ok(results))
+    }
 }
 
 impl TraceQueries for StoreTraceSource<'_> {
     fn query_results(&self, query: &AssetQuery) -> Vec<AssetUuid> {
-        match self.try_query_results(query) {
-            Ok(results) => results.to_vec(),
-            Err(error) => {
-                self.failure.borrow_mut().get_or_insert(error);
-                Vec::new()
+        let failure = match self.try_query_results(query) {
+            Ok(Ok(results)) => return results,
+            Ok(Err(bundle)) => {
+                BuildError::Failed(format!("asset query {query:?} reaches poisoned bundle {bundle}"))
             }
-        }
+            Err(error) => error,
+        };
+        self.failure.borrow_mut().get_or_insert(failure);
+        Vec::new()
     }
 }
 
 impl TraceSource for StoreTraceSource<'_> {
     fn authoring_read(&self, asset: AssetUuid) -> Observed<Option<BundleFileHash>> {
-        self.answer(
-            self.entry(asset)
-                .map(|entry| Observed::Ok(entry.map(|entry| entry.bundle_hash))),
-        )
+        self.answer(self.entry(asset).map(|entry| {
+            Observed::Ok(entry.map(|entry| BundleFileHash(entry.bundle_hash.0)))
+        }))
     }
 
     fn read(&self, asset: AssetUuid) -> Observed<ContentHash> {
@@ -557,7 +319,12 @@ impl TraceSource for StoreTraceSource<'_> {
     }
 
     fn resolve(&self, path: &str) -> Observed<Option<AssetUuid>> {
-        self.answer(self.resolved(path).map(|assets| match &*assets {
+        let assets = self
+            .store
+            .path_assets(path)
+            .map(|assets| assets.into_iter().collect::<Vec<_>>())
+            .map_err(BuildError::infrastructure);
+        self.answer(assets.map(|assets| match assets.as_slice() {
             [] => Observed::Ok(None),
             [asset] => Observed::Ok(Some(*asset)),
             conflicting => Observed::Err(StableFailureFingerprint::Ambiguous {
@@ -567,22 +334,18 @@ impl TraceSource for StoreTraceSource<'_> {
     }
 
     fn query(&self, query: &AssetQuery) -> Observed<[u8; 32]> {
-        self.answer((|| {
-            if query.tag.is_some() {
-                let mut without_tag = query.clone();
-                without_tag.tag = None;
-                if let Some(bundle) = self.query_poison(&without_tag)? {
-                    return Ok(Observed::Err(StableFailureFingerprint::Poisoned { bundle }));
-                }
-            }
-            Ok(Observed::Ok(asset_query_result_hash(
-                &self.try_query_results(query)?,
-            )))
-        })())
+        self.answer(self.try_query_results(query).map(|answer| match answer {
+            Ok(results) => Observed::Ok(asset_query_result_hash(&results)),
+            Err(bundle) => Observed::Err(StableFailureFingerprint::Poisoned { bundle }),
+        }))
     }
 
     fn tool(&self, id: &str) -> Observed<[u8; 32]> {
-        self.answer(self.tool_hash(id).map(|hash| {
+        self.answer(
+            self.store
+                .tool_hash_at(id, self.basis.tool_version)
+                .map_err(BuildError::infrastructure)
+                .map(|hash| {
             hash.map_or_else(
                 || {
                     Observed::Err(StableFailureFingerprint::MissingCapability {

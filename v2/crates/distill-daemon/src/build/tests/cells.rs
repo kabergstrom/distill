@@ -265,8 +265,6 @@ impl Cells {
     }
 
     fn request(&self, uuid: AssetUuid, class: BuildWorkClass) -> BuildRequest {
-        let project = self.authority.project_type(TYPE).unwrap();
-        let (value, file) = &self.files[&uuid];
         BuildRequest {
             work_class: class,
             target: "dev".to_owned(),
@@ -274,25 +272,10 @@ impl Cells {
             requested_asset: uuid,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid,
-                bundle: bundle(uuid.0[0]),
-                local_id: "entry".to_owned(),
-                normalized_path: file.clone(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: project.logical_hash,
-                logical_schema: Arc::from(
-                    snapshot_to_json(&project.logical_schema)
-                        .unwrap()
-                        .into_bytes(),
-                ),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(format!("{{\"value\":{value}}}").into_bytes()),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(uuid),
         }

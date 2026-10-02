@@ -188,7 +188,8 @@ fn bundles_carry_the_physical_key_poison_and_directory_origin() {
             "origin_rules_bundle",
             "origin_rule",
             "origin_group_root",
-            "origin_group_path"
+            "origin_group_path",
+            "import_watched"
         ]
     );
     assert_eq!(pk_columns(&conn, "bundles"), ["bundle_uuid"]);

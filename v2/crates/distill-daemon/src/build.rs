@@ -17,7 +17,6 @@
 
 use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use distill_build::artifact_encode::{
@@ -33,7 +32,8 @@ use distill_build::keys::{
     NodeStage, NodeType, OutputHash, StaticInputs,
 };
 use distill_build::persist::{
-    lookup_persisted_candidate, persisted_candidate_traces, PersistedOutcome,
+    hydrate_persisted_candidate, lookup_persisted_candidate, persisted_candidate, PersistedHit,
+    PersistedOutcome,
 };
 use distill_build::pipeline::{
     PipelineChain, PipelineRegistry, PipelineStage, ProcessorRegistration, Target,
@@ -88,7 +88,8 @@ use crate::scheduler::{CellOutcome, CellRun, CellWorker, Claim, WorkClass};
 
 mod trace_source;
 
-use trace_source::{BuiltNodes, StoreTraceSource, TraceAnswers, TraceBasis, TraceQueries};
+use trace_source::{BuiltNodes, StoreTraceSource, TraceBasis, TraceQueries};
+pub(crate) use trace_source::runtime_asset_filter;
 
 const MIGRATION_PLANNER_VERSION: u32 = 1;
 
@@ -512,6 +513,8 @@ struct NodeEnv {
     target_definition: [u8; 32],
     dylib_hash: [u8; 32],
     max_depth: usize,
+    /// The loaded pipeline's capabilities, derived from its epoch.
+    current_load: CurrentLoadSource,
 }
 
 impl NodeEnv {
@@ -550,6 +553,7 @@ impl NodeEnv {
             authority,
             registry,
             target,
+            current_load: CurrentLoadSource::capture(epoch, dylib_hash),
             dylib_hash,
             max_depth,
             pipeline,
@@ -695,7 +699,6 @@ struct NodeLookup<'a> {
     view: &'a StoreReader,
     latest: &'a StoreReader,
     tool_version: distill_store::state::InputVersion,
-    answers: Rc<TraceAnswers>,
     nodes: BTreeMap<AssetUuid, Option<NodeResult>>,
     visiting: BTreeSet<AssetUuid>,
 }
@@ -712,7 +715,6 @@ impl<'a> NodeLookup<'a> {
             view,
             latest,
             tool_version,
-            answers: Rc::default(),
             nodes: BTreeMap::new(),
             visiting: BTreeSet::new(),
         }
@@ -741,11 +743,19 @@ impl<'a> NodeLookup<'a> {
         let Some(key) = self.key(asset)? else {
             return Ok(None);
         };
-        let candidates = self
+        let rows = self
             .latest
-            .lookup_candidates(KeyKind::Node, &key.digest)
+            .candidate_rows(KeyKind::Node, &key.digest)
             .map_err(BuildError::infrastructure)?;
-        for candidate in candidates {
+        // Each record is read when the walk reaches it.
+        for row in rows {
+            let Some(candidate) = self
+                .latest
+                .read_candidate(&row)
+                .map_err(BuildError::infrastructure)?
+            else {
+                continue;
+            };
             if candidate.payload.key_kind != KeyKind::Node || candidate.asset_uuid != asset {
                 return Err(BuildError::Infrastructure(
                     "a node candidate names another key kind or asset".to_owned(),
@@ -806,9 +816,6 @@ impl<'a> NodeLookup<'a> {
     /// a `read` sees the nodes looked up so far.
     fn source(&self) -> Result<StoreTraceSource<'_>, BuildError> {
         let env = self.env;
-        let current_load = self.answers.current_load(|| {
-            Ok(CurrentLoadSource::capture(env.epoch()?, env.dylib_hash))
-        })?;
         Ok(StoreTraceSource::new(
             self.view,
             TraceBasis {
@@ -816,8 +823,7 @@ impl<'a> NodeLookup<'a> {
                 target: &env.target,
                 tool_version: self.tool_version,
             },
-            &self.answers,
-            current_load,
+            &env.current_load,
             BuiltNodes::Lookup(&self.nodes),
         ))
     }
@@ -927,19 +933,13 @@ struct LoadedAsset {
 }
 
 /// The ToolEpoch visible at a build's view, read one key at a time as
-/// tools are run (one primary-key read each) and kept for the rest of the
-/// build.
+/// tools are run: one primary-key read per use.
 impl ToolEpochSnapshot for BuildContext<'_> {
     fn tool(&self, id: &str) -> Result<Option<RegisteredTool>, StoreError> {
-        if let Some(known) = self.tools.borrow().get(id) {
-            return Ok(known.clone());
-        }
-        let tool = match &self.stores {
+        match &self.stores {
             BuildStores::Worker { view, .. } => view.tool_at(id, self.tool_version),
             BuildStores::Inline(store) => store.borrow().tool_at(id, self.tool_version),
-        }?;
-        self.tools.borrow_mut().insert(id.to_owned(), tool.clone());
-        Ok(tool)
+        }
     }
 }
 
@@ -1014,17 +1014,12 @@ struct BuildContext<'s> {
     env: NodeEnv,
     scanner: RootedScanner,
     tool_version: distill_store::state::InputVersion,
-    /// The ToolEpoch rows read at the view so far (see its `ToolEpochSnapshot`).
-    tools: RefCell<BTreeMap<String, Option<RegisteredTool>>>,
     execution_root: std::path::PathBuf,
     visiting: BTreeSet<AssetUuid>,
     callback_chain: Vec<AssetUuid>,
     memo: BTreeMap<AssetUuid, NodeResult>,
     verify_fresh: bool,
     cells: Option<CellScope<'s>>,
-    /// The trace answers read at the view so far; content hashes come from
-    /// the memo at each use.
-    trace_answers: Rc<TraceAnswers>,
     writes: RefCell<Vec<BuildWrite>>,
     /// Artifact bytes this build produced, readable before (or, verifying,
     /// without) their publication.
@@ -1053,14 +1048,12 @@ impl<'s> BuildContext<'s> {
             env,
             scanner,
             tool_version,
-            tools: RefCell::default(),
             execution_root,
             visiting: BTreeSet::new(),
             callback_chain: Vec::new(),
             memo: BTreeMap::new(),
             verify_fresh,
             cells,
-            trace_answers: Rc::default(),
             writes: RefCell::new(Vec::new()),
             artifacts: RefCell::new(BTreeMap::new()),
         })
@@ -1921,8 +1914,7 @@ fn index_one_tag_entry(
         ));
     };
     let migrated = entry.schema_hash != project.logical_hash;
-    let current_load =
-        current_load(context).map_err(|error| (format!("{error:?}"), Vec::new(), migrated))?;
+    let current_load = &context.env.current_load;
     let mut trace = Vec::new();
     let current = load_current_entry(
         &context.env.pipeline,
@@ -2119,7 +2111,6 @@ fn node_lookup<'a>(
     latest: &'a StoreReader,
 ) -> NodeLookup<'a> {
     let mut lookup = NodeLookup::new(&context.env, view, latest, context.tool_version);
-    lookup.answers = Rc::clone(&context.trace_answers);
     lookup.nodes = context
         .memo
         .iter()
@@ -2405,7 +2396,7 @@ fn process_chain(
     let mut current_value = match current_value {
         Some(value) => value,
         None => {
-            let current_load = current_load(context)?;
+            let current_load = &context.env.current_load;
             let mut trace = Vec::new();
             load_current_value(context, loaded, project, current_load, &mut trace)?
         }
@@ -2643,16 +2634,7 @@ fn hydrate_processor_stage(
     static_inputs: &StaticInputs,
 ) -> Result<Option<HydratedProcessorStage>, BuildError> {
     let key = static_inputs_digest(static_inputs);
-    preload_persisted_reads(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
-    let hit = if context.verify_fresh {
-        None
-    } else {
-        ask_trace(context, |source| {
-            let store = latest_store(context);
-            lookup_persisted_candidate(&store, KeyKind::Processor, &key, loaded.entry.uuid, source)
-        })?
-        .map_err(BuildError::infrastructure)?
-    };
+    let hit = persisted_hit(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
     let Some(hit) = hit else {
         return Ok(None);
     };
@@ -2715,32 +2697,43 @@ fn hydrate_processor_stage(
     }
 }
 
-fn preload_persisted_reads(
+/// The newest persisted result of `static_key` whose trace holds at this
+/// build's view, in one walk of its bucket: each candidate is read when
+/// reached, its successful reads materialized, its trace revalidated, and
+/// the first that holds hydrated (or, verifying fresh, only materialized).
+/// A stale candidate's now-unavailable read is a cache miss, never
+/// authority to fail the current build.
+fn persisted_hit(
     context: &mut BuildContext,
     key_kind: KeyKind,
     static_key: &[u8; 32],
     asset: AssetUuid,
-) -> Result<(), BuildError> {
-    let traces = {
-        let store = latest_store(context);
-        persisted_candidate_traces(&store, key_kind, static_key, asset)
-            .map_err(BuildError::infrastructure)?
-    };
-    // Candidates are newest-first. Materialize only until one complete trace
-    // revalidates; a stale candidate's now-unavailable successful read is a
-    // cache miss, never authority to fail the current build.
-    for trace in &traces {
-        match preload_trace_reads(context, trace) {
-            Ok(()) => {
-                if ask_trace(context, |source| revalidate(trace, source))? {
-                    break;
-                }
-            }
+) -> Result<Option<PersistedHit>, BuildError> {
+    let rows = latest_store(context)
+        .candidate_rows(key_kind, static_key)
+        .map_err(BuildError::infrastructure)?;
+    for row in rows {
+        let candidate = persisted_candidate(&latest_store(context), &row, key_kind, asset)
+            .map_err(BuildError::infrastructure)?;
+        let Some((candidate, trace)) = candidate else {
+            continue;
+        };
+        match preload_trace_reads(context, &trace) {
+            Ok(()) => {}
             Err(error) if cache_candidate_miss(&error) => continue,
             Err(error) => return Err(error),
         }
+        if !ask_trace(context, |source| revalidate(&trace, source))? {
+            continue;
+        }
+        if context.verify_fresh {
+            return Ok(None);
+        }
+        return hydrate_persisted_candidate(&latest_store(context), candidate, trace)
+            .map(Some)
+            .map_err(BuildError::infrastructure);
     }
-    Ok(())
+    Ok(None)
 }
 
 fn cache_candidate_miss(error: &BuildError) -> bool {
@@ -3322,23 +3315,12 @@ fn ask_trace<T>(
             target: &context.env.target,
             tool_version: context.tool_version,
         },
-        &context.trace_answers,
-        current_load(context)?,
+        &context.env.current_load,
         BuiltNodes::Memo(&context.memo),
     );
     let answer = ask(&source);
     source.check()?;
     Ok(answer)
-}
-
-/// The loaded pipeline's capabilities, captured once per build.
-fn current_load<'c>(context: &'c BuildContext) -> Result<&'c CurrentLoadSource, BuildError> {
-    context.trace_answers.current_load(|| {
-        Ok(CurrentLoadSource::capture(
-            context.env.epoch()?,
-            context.env.dylib_hash,
-        ))
-    })
 }
 
 struct EpochDefaults<'a> {
@@ -3825,7 +3807,7 @@ fn encode_or_hydrate(
     validator_dylib_hash: Option<[u8; 32]>,
     trace_out: &mut Vec<TraceOp>,
 ) -> Result<EncodedBuildImport, BuildError> {
-    let current_load = current_load(context)?;
+    let current_load = &context.env.current_load;
     let (migrations, automatic_migration) =
         migration_key_inputs(loaded, project, context.env.dylib_hash);
     let key = build_import_digest(&BuildImportInputs {
@@ -4261,12 +4243,12 @@ mod tests {
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_json::AuthoredValue;
     use distill_rpc::{
-        ArtifactPayload, AuthoringEntry, AuthoringEntryRole, AuthoringValue,
+        ArtifactPayload, BuildEntry,
         BuildArtifactPublication, BuildPublication, BuildWireTree, TargetDefinition,
         TargetDefinitionHash,
     };
     use distill_schema::ngp_schema::{
-        node_hash, snapshot_to_json, Field, FieldAttrs, FieldIdentifier, FieldLayout,
+        node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout,
         LayoutIdentity, LogicalSchema, PrimitiveKind, PrimitiveType, Schema, SchemaLayouts,
         SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
     };
@@ -4937,21 +4919,10 @@ mod tests {
             requested_asset: ASSET,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid: ASSET,
-                bundle: BUNDLE,
-                local_id: "entry".to_owned(),
-                normalized_path: "widen.bundle".to_owned(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: old_hash,
-                logical_schema: Arc::from(snapshot_to_json(&old_schema).unwrap().into_bytes()),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };
@@ -5117,25 +5088,10 @@ mod tests {
             requested_asset: ASSET,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid: ASSET,
-                bundle: BUNDLE,
-                local_id: "entry".to_owned(),
-                normalized_path: "byte.bundle".to_owned(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: project.logical_hash,
-                logical_schema: Arc::from(
-                    snapshot_to_json(&project.logical_schema)
-                        .unwrap()
-                        .into_bytes(),
-                ),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };
@@ -5463,25 +5419,10 @@ mod tests {
             requested_asset: ASSET,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid: ASSET,
-                bundle: BUNDLE,
-                local_id: "entry".to_owned(),
-                normalized_path: "byte.bundle".to_owned(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: project.logical_hash,
-                logical_schema: Arc::from(
-                    snapshot_to_json(&project.logical_schema)
-                        .unwrap()
-                        .into_bytes(),
-                ),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };

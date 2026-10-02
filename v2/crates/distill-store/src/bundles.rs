@@ -40,6 +40,9 @@ pub struct BundleMeta {
     /// `DirectoryOrigin` record riding in the bundle's `$record` entry,
     /// never from precious rows. `None` means explicit import.
     pub origin: Option<DirectoryOrigin>,
+    /// Whether the bundle's `$record` import record is watched (§8): derived
+    /// at scan from the record, like `origin`.
+    pub import_watched: bool,
 }
 
 /// A generated bundle's directory-import provenance (§2, §8, §13): who
@@ -204,8 +207,9 @@ impl InputTxn<'_> {
         self.clear_path_refs(meta.bundle)?;
         self.txn.execute(
             "INSERT INTO bundles(bundle_uuid, root_id, path, format_version, content_hash, poison,
-                                 origin_rules_bundle, origin_rule, origin_group_root, origin_group_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
+                                 origin_rules_bundle, origin_rule, origin_group_root, origin_group_path,
+                                 import_watched)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(bundle_uuid) DO UPDATE SET
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
@@ -213,7 +217,8 @@ impl InputTxn<'_> {
                origin_rules_bundle = excluded.origin_rules_bundle,
                origin_rule = excluded.origin_rule,
                origin_group_root = excluded.origin_group_root,
-               origin_group_path = excluded.origin_group_path",
+               origin_group_path = excluded.origin_group_path,
+               import_watched = excluded.import_watched",
             rusqlite::params![
                 meta.bundle.0.as_slice(),
                 meta.root.0,
@@ -224,6 +229,7 @@ impl InputTxn<'_> {
                 meta.origin.as_ref().map(|o| o.rule.0.as_slice()),
                 meta.origin.as_ref().map(|o| o.group_root.as_str()),
                 meta.origin.as_ref().map(|o| o.group_path.as_str()),
+                meta.import_watched,
             ],
         )?;
         Ok(())
@@ -448,7 +454,8 @@ impl InputTxn<'_> {
              ON CONFLICT(bundle_uuid) DO UPDATE SET
                root_id = excluded.root_id, path = excluded.path,
                format_version = excluded.format_version,
-               content_hash = excluded.content_hash, poison = excluded.poison",
+               content_hash = excluded.content_hash, poison = excluded.poison,
+               import_watched = 0",
             rusqlite::params![
                 skeleton.bundle.0.as_slice(),
                 skeleton.root.0,
@@ -630,23 +637,6 @@ impl StoreReader {
             .optional()?)
     }
 
-    // `CROSS JOIN` keeps the poisoned partial index the outer loop: the
-    // planner would otherwise walk every asset to avoid the sort.
-    fn tag_poisoned_bundles(&self, authoring_only: bool) -> Result<Vec<BundleUuid>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT DISTINCT a.bundle_uuid
-             FROM asset_tag_index i CROSS JOIN assets a ON a.asset_uuid = i.asset_uuid
-             WHERE i.poison IS NOT NULL AND a.authoring_only = ?1
-             ORDER BY a.bundle_uuid",
-        )?;
-        let rows =
-            statement.query_map([i64::from(authoring_only)], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.map(|row| row.map(|bytes| BundleUuid(blob16(bytes))))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
-    /// The bundle row at (root name, path), if any.
     pub fn bundle_at(&self, root_name: &str, path: &str) -> Result<Option<BundleMeta>, StoreError> {
         let bundle = self
             .conn
@@ -712,15 +702,27 @@ impl StoreReader {
     }
 
     /// Every bundle a directory import generated (its row carries a
-    /// [`DirectoryOrigin`]), by bundle UUID.
+    /// [`DirectoryOrigin`]), by bundle UUID: a walk of the partial
+    /// `bundles_by_origin`, whose rows are sorted after (the order alone
+    /// would walk every bundle's primary key).
     pub fn generated_bundles(&self) -> Result<Vec<BundleMeta>, StoreError> {
         self.query_rows(
             &format!(
-                "SELECT {BUNDLE_COLUMNS} FROM bundles
+                "SELECT {BUNDLE_COLUMNS} FROM bundles INDEXED BY bundles_by_origin
                  WHERE origin_rules_bundle IS NOT NULL ORDER BY bundle_uuid"
             ),
             [],
             bundle_meta_row,
+        )
+    }
+
+    /// The bundles whose import record is watched, by UUID: a walk of the
+    /// partial `bundles_import_watched`.
+    pub fn import_watched_bundles(&self) -> Result<Vec<BundleUuid>, StoreError> {
+        self.bundle_ids(
+            "SELECT bundle_uuid FROM bundles INDEXED BY bundles_import_watched
+             WHERE import_watched ORDER BY bundle_uuid",
+            [],
         )
     }
 
@@ -729,21 +731,6 @@ impl StoreReader {
         self.bundle_ids(
             "SELECT bundle_uuid FROM bundles WHERE poison IS NOT NULL ORDER BY bundle_uuid",
             [],
-        )
-    }
-
-    /// Every bundle holding an entry under the reserved (`$`-prefixed) local
-    /// id `local_id`, by UUID.
-    pub fn bundles_with_reserved_entry(&self, local_id: &str) -> Result<Vec<BundleUuid>, StoreError> {
-        if !local_id.starts_with('$') {
-            return Err(StoreError::InvalidConfiguration {
-                error: format!("{local_id:?} is not a reserved local id"),
-            });
-        }
-        self.bundle_ids(
-            "SELECT DISTINCT bundle_uuid FROM assets INDEXED BY assets_by_local_id
-             WHERE local_id = ?1 ORDER BY bundle_uuid",
-            [local_id],
         )
     }
 
@@ -784,90 +771,6 @@ impl StoreReader {
             .conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM assets WHERE asset_uuid = ?1)")?
             .query_row([asset.0.as_slice()], |row| row.get(0))?)
-    }
-
-    /// The error [`StoreReader::entry`] returns for the first asset, in UUID
-    /// order, whose entry cannot be read: one owned by a poisoned bundle, or
-    /// a row with no logical hash. `Ok(())` when every entry reads. Both
-    /// sets come from partial indexes; healthy rows are never visited.
-    pub fn check_entries(&self) -> Result<(), StoreError> {
-        let first = self
-            .conn
-            .prepare_cached(
-                "SELECT asset_uuid FROM (
-                     SELECT asset_uuid FROM assets WHERE logical_hash IS NULL
-                     UNION
-                     SELECT a.asset_uuid FROM bundles b
-                       JOIN assets a ON a.bundle_uuid = b.bundle_uuid
-                      WHERE b.poison IS NOT NULL)
-                 ORDER BY asset_uuid LIMIT 1",
-            )?
-            .query_row([], |row| row.get::<_, Vec<u8>>(0))
-            .optional()?;
-        match first {
-            Some(asset) => self.entry(AssetUuid(blob16(asset))).map(drop),
-            None => Ok(()),
-        }
-    }
-
-    /// The failures [`StoreReader::assets_by_tag_value`] (or, with
-    /// `authoring_only`, [`StoreReader::authoring_assets_by_tag_value`])
-    /// reports for this selector, without collecting its assets.
-    pub fn check_tag_selector(
-        &self,
-        tag: &str,
-        value: Option<&str>,
-        authoring_only: bool,
-    ) -> Result<(), StoreError> {
-        let poisoned = self.tag_poisoned_bundles(authoring_only)?;
-        if !poisoned.is_empty() {
-            return Err(StoreError::TagIndexPoisoned { bundles: poisoned });
-        }
-        let poisoned_owner = self
-            .conn
-            .prepare_cached(
-                // Driven from the poisoned bundles' partial index: a
-                // common tag must not walk every tagged asset.
-                "SELECT b.bundle_uuid, b.poison
-                 FROM bundles b CROSS JOIN assets a ON a.bundle_uuid = b.bundle_uuid
-                 WHERE b.poison IS NOT NULL AND a.authoring_only = ?3
-                   AND EXISTS (SELECT 1 FROM asset_tags t
-                               WHERE t.asset_uuid = a.asset_uuid AND t.tag = ?1
-                                 AND (?2 IS NULL OR t.value = ?2))
-                 ORDER BY a.asset_uuid LIMIT 1",
-            )?
-            .query_row(
-                rusqlite::params![tag, value, i64::from(authoring_only)],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        match poisoned_owner {
-            Some((bundle, error)) => Err(StoreError::BundlePoisoned {
-                bundle: BundleUuid(blob16(bundle)),
-                error,
-            }),
-            None => Ok(()),
-        }
-    }
-
-    /// The asset rows of non-poisoned bundles that `filter` selects, with
-    /// their bundle and its logical path, by asset UUID. Every selector is
-    /// a SQL condition; the most selective drives the query from its index.
-    pub fn namespace_assets_matching(
-        &self,
-        filter: &AssetFilter,
-    ) -> Result<Vec<MatchedAsset>, StoreError> {
-        let mut params = Vec::new();
-        let conditions = filter.sql_conditions(&mut params);
-        self.query_rows(
-            &format!(
-                "SELECT a.asset_uuid, a.bundle_uuid, b.path FROM {}
-                 WHERE b.poison IS NULL{conditions} ORDER BY a.asset_uuid",
-                filter.sql_from()
-            ),
-            rusqlite::params_from_iter(params),
-            matched_asset_row,
-        )
     }
 
     /// Complete deterministic entry projection for one bundle. Poisoned
@@ -1276,87 +1179,6 @@ impl StoreReader {
         }
     }
 
-    /// Tag lookup over the search tags (§13's `assets` row). A selector
-    /// matching any poisoned bundle's entries fails naming that bundle —
-    /// the same shape as §10's tag poisoning.
-    pub fn assets_by_tag(&self, tag: &str) -> Result<Vec<AssetUuid>, StoreError> {
-        self.assets_by_tag_value(tag, None)
-    }
-
-    pub fn assets_by_tag_value(
-        &self,
-        tag: &str,
-        value: Option<&str>,
-    ) -> Result<Vec<AssetUuid>, StoreError> {
-        let poisoned = self.tag_poisoned_bundles(false)?;
-        if !poisoned.is_empty() {
-            return Err(StoreError::TagIndexPoisoned { bundles: poisoned });
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT a.asset_uuid, b.bundle_uuid, b.poison FROM asset_tags t
-             JOIN assets a ON a.asset_uuid = t.asset_uuid
-             JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-             WHERE t.tag = ?1 AND (?2 IS NULL OR t.value = ?2)
-               AND a.authoring_only = 0 ORDER BY a.asset_uuid",
-        )?;
-        let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>)> = stmt
-            .query_map(rusqlite::params![tag, value], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (asset_bytes, bundle_bytes, poison) in rows {
-            if let Some(error) = poison {
-                return Err(StoreError::BundlePoisoned {
-                    bundle: BundleUuid(blob16(bundle_bytes)),
-                    error,
-                });
-            }
-            out.push(AssetUuid(blob16(asset_bytes)));
-        }
-        Ok(out)
-    }
-
-    /// Explicit tooling-only tag lookup. This surface cannot be used as a
-    /// processor-input, runtime-reference, or pack-root selector.
-    pub fn authoring_assets_by_tag(&self, tag: &str) -> Result<Vec<AssetUuid>, StoreError> {
-        self.authoring_assets_by_tag_value(tag, None)
-    }
-
-    pub fn authoring_assets_by_tag_value(
-        &self,
-        tag: &str,
-        value: Option<&str>,
-    ) -> Result<Vec<AssetUuid>, StoreError> {
-        let poisoned = self.tag_poisoned_bundles(true)?;
-        if !poisoned.is_empty() {
-            return Err(StoreError::TagIndexPoisoned { bundles: poisoned });
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT a.asset_uuid, b.bundle_uuid, b.poison FROM asset_tags t
-             JOIN assets a ON a.asset_uuid = t.asset_uuid
-             JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-             WHERE t.tag = ?1 AND (?2 IS NULL OR t.value = ?2)
-               AND a.authoring_only = 1 ORDER BY a.asset_uuid",
-        )?;
-        let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>)> = stmt
-            .query_map(rusqlite::params![tag, value], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (asset_bytes, bundle_bytes, poison) in rows {
-            if let Some(error) = poison {
-                return Err(StoreError::BundlePoisoned {
-                    bundle: BundleUuid(blob16(bundle_bytes)),
-                    error,
-                });
-            }
-            out.push(AssetUuid(blob16(asset_bytes)));
-        }
-        Ok(out)
-    }
-
     /// Reverse dependency lookup by selector (§13's `deps` indexes).
     pub fn deps_on(&self, kind: DepKind, target: &str) -> Result<Vec<AssetUuid>, StoreError> {
         let mut stmt = self
@@ -1410,7 +1232,7 @@ impl StoreReader {
 }
 
 const BUNDLE_COLUMNS: &str = "bundle_uuid, root_id, path, format_version, content_hash,
-     origin_rules_bundle, origin_rule, origin_group_root, origin_group_path";
+     origin_rules_bundle, origin_rule, origin_group_root, origin_group_path, import_watched";
 
 fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
     let origin = match (
@@ -1434,11 +1256,15 @@ fn bundle_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BundleMeta> {
         format_version: row.get(3)?,
         content_hash: ContentHash(blob32(row.get(4)?)),
         origin,
+        import_watched: row.get(9)?,
     })
 }
 
 /// A conjunction of asset selectors, answered by SQL over the `assets`,
 /// `bundles` and `asset_tags` indexes. An absent selector selects every row.
+/// This is the one asset query: build traces, codegen and the RPC each turn
+/// their query into a filter and ask [`StoreReader::namespace_assets_matching`]
+/// or [`StoreReader::served_assets_matching`] (DESIGN.md §13, asset queries).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AssetFilter {
     pub asset: Option<AssetUuid>,
@@ -1449,6 +1275,11 @@ pub struct AssetFilter {
     pub bundle_name: Option<String>,
     pub local_id: Option<String>,
     pub authored_type: Option<TypeUuid>,
+    /// The authored type is one of these: a build's terminal type, which
+    /// depends on its target, asks for the authored types whose chains end
+    /// there. An empty set selects nothing.
+    pub authored_type_in: Option<Vec<TypeUuid>>,
+    /// The served terminal type (`assets.terminal_type`).
     pub terminal_type: Option<TypeUuid>,
     /// A search tag, with its value when `Some`: an asset carrying the tag
     /// with any value (`None`) or exactly that value.
@@ -1459,18 +1290,20 @@ pub struct AssetFilter {
     /// Only authoring-only rows (`Some(true)`) or only runtime rows. Alone,
     /// `Some(false)` selects every runtime row: it narrows nothing.
     pub authoring_only: Option<bool>,
-    /// Only assets whose tag index is poisoned (pending or failed).
-    pub tag_index_poisoned: bool,
 }
+
+/// What an asset query answers: the rows it selects, by asset UUID, or the
+/// poisoned bundles (by UUID) whose rows it could select.
+pub type AssetAnswer = Result<Vec<MatchedAsset>, Vec<BundleUuid>>;
 
 /// The selector a filter's query is driven from, and so the index it
 /// names. SQLite keeps no statistics here and cannot tell a basename from
-/// a type by selectivity, so the filter decides, in the order build traces
-/// pick their candidates in: an identity or exact name first (asset, bundle,
-/// bundle path, bundle name, local id), then the poisoned tag-index rows
-/// (normally none), a tag value, an authored type, a path prefix, a terminal
-/// type and a bare tag, then the authoring-only rows. Every other selector is checked on the rows the
-/// driver finds.
+/// a type by selectivity, so the filter decides: an identity or exact name
+/// first (asset, bundle, bundle path, bundle name, local id), then the
+/// poisoned tag-index rows (normally none; only when looking for them), a
+/// tag value, an authored type, a path prefix, a set of authored types, a
+/// terminal type and a bare tag, then the authoring-only rows. Every other
+/// selector is checked on the rows the driver finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Driver {
     Asset,
@@ -1481,8 +1314,9 @@ enum Driver {
     TagPoisoned,
     Tag,
     AuthoredType,
-    TerminalType,
     PathPrefix,
+    AuthoredTypes,
+    TerminalType,
     AuthoringOnly,
     Everything,
 }
@@ -1500,7 +1334,31 @@ impl AssetFilter {
         self
     }
 
-    fn driver(&self) -> Driver {
+    /// The one path prefix the others imply (every path starting with the
+    /// longest starts with each shorter one, or none matches): `Err(())`
+    /// when two prefixes contradict each other.
+    fn path_prefix(&self) -> Result<Option<&str>, ()> {
+        let longest = self
+            .path_prefixes
+            .iter()
+            .map(String::as_str)
+            .filter(|prefix| !prefix.is_empty())
+            .max_by_key(|prefix| prefix.len());
+        match longest {
+            Some(longest) if self.path_prefixes.iter().any(|p| !longest.starts_with(p.as_str())) => {
+                Err(())
+            }
+            longest => Ok(longest),
+        }
+    }
+
+    /// Whether no row can satisfy the filter, without asking SQLite.
+    fn selects_nothing(&self) -> bool {
+        self.path_prefix().is_err()
+            || self.authored_type_in.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    fn driver(&self, tag_poisoned: bool) -> Driver {
         let tag_value = self.tag.as_ref().is_some_and(|(_, value)| value.is_some());
         if self.asset.is_some() {
             Driver::Asset
@@ -1512,14 +1370,16 @@ impl AssetFilter {
             Driver::BundleName
         } else if self.local_id.is_some() {
             Driver::LocalId
-        } else if self.tag_index_poisoned {
+        } else if tag_poisoned {
             Driver::TagPoisoned
         } else if tag_value {
             Driver::Tag
         } else if self.authored_type.is_some() {
             Driver::AuthoredType
-        } else if self.path_prefixes.iter().any(|prefix| !prefix.is_empty()) {
+        } else if matches!(self.path_prefix(), Ok(Some(_))) {
             Driver::PathPrefix
+        } else if self.authored_type_in.is_some() {
+            Driver::AuthoredTypes
         } else if self.terminal_type.is_some() {
             Driver::TerminalType
         } else if self.tag.is_some() {
@@ -1531,12 +1391,12 @@ impl AssetFilter {
         }
     }
 
-    /// The `assets a`, `bundles b` join this filter's driver walks, outer
-    /// table first, each table on the index it must use.
-    pub(crate) fn sql_from(&self) -> &'static str {
+    /// The `assets a`, `bundles b` join the driver walks, outer table
+    /// first, each table on the index it must use.
+    fn sql_from(driver: Driver) -> &'static str {
         const BY_ASSET: &str = "assets a INDEXED BY sqlite_autoindex_assets_1
              CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid";
-        match self.driver() {
+        match driver {
             Driver::Asset | Driver::TagPoisoned | Driver::Tag | Driver::Everything => BY_ASSET,
             Driver::Bundle => {
                 "assets a INDEXED BY assets_by_bundle
@@ -1546,7 +1406,7 @@ impl AssetFilter {
                 "assets a INDEXED BY assets_by_local_id
                  CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
             }
-            Driver::AuthoredType => {
+            Driver::AuthoredType | Driver::AuthoredTypes => {
                 "assets a INDEXED BY assets_by_type
                  CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
             }
@@ -1570,15 +1430,20 @@ impl AssetFilter {
     }
 
     /// `AND`-prefixed conditions over [`Self::sql_from`]'s join, pushing
-    /// their parameters (numbered from `params.len() + 1`).
-    pub(crate) fn sql_conditions(&self, params: &mut Vec<rusqlite::types::Value>) -> String {
+    /// their parameters (numbered from `params.len() + 1`). With
+    /// `tag_poisoned`, only rows whose tag index is poisoned.
+    fn sql_conditions(
+        &self,
+        driver: Driver,
+        tag_poisoned: bool,
+        params: &mut Vec<rusqlite::types::Value>,
+    ) -> String {
         use rusqlite::types::Value;
         /// Bind `value` and return its parameter number.
         fn bind(params: &mut Vec<Value>, value: Value) -> usize {
             params.push(value);
             params.len()
         }
-        let driver = self.driver();
         let mut conditions = Vec::new();
         if let Some(asset) = self.asset {
             let n = bind(params, Value::Blob(asset.0.to_vec()));
@@ -1604,13 +1469,21 @@ impl AssetFilter {
             let n = bind(params, Value::Blob(type_uuid.0.to_vec()));
             conditions.push(format!("a.type_uuid = ?{n}"));
         }
+        if let Some(types) = &self.authored_type_in {
+            let list = types
+                .iter()
+                .map(|type_uuid| format!("?{}", bind(params, Value::Blob(type_uuid.0.to_vec()))))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("a.type_uuid IN ({list})"));
+        }
         if let Some(type_uuid) = self.terminal_type {
             let n = bind(params, Value::Blob(type_uuid.0.to_vec()));
             conditions.push(format!("a.terminal_type = ?{n}"));
         }
-        // Every path starts with the empty prefix.
-        for prefix in self.path_prefixes.iter().filter(|prefix| !prefix.is_empty()) {
-            let n = bind(params, Value::Text(prefix.clone()));
+        // The longest prefix implies the others.
+        if let Ok(Some(prefix)) = self.path_prefix() {
+            let n = bind(params, Value::Text(prefix.to_owned()));
             conditions.push(crate::files::starts_with_sql("b.path", n));
         }
         if let Some((tag, value)) = &self.tag {
@@ -1637,7 +1510,7 @@ impl AssetFilter {
         if let Some(authoring_only) = self.authoring_only {
             conditions.push(format!("a.authoring_only = {}", i64::from(authoring_only)));
         }
-        if self.tag_index_poisoned {
+        if tag_poisoned {
             conditions.push(if driver == Driver::TagPoisoned {
                 "a.asset_uuid IN (SELECT i.asset_uuid FROM asset_tag_index i
                                   WHERE i.poison IS NOT NULL)"
@@ -1653,23 +1526,121 @@ impl AssetFilter {
             .map(|condition| format!(" AND {condition}"))
             .collect()
     }
+
+    /// The statement selecting this filter's rows among `rows` (a condition
+    /// on the join), and its parameters. Each row is (asset, bundle, path,
+    /// authored type, whether its bundle is poisoned). Every row a poisoned
+    /// bundle's skeleton holds is selected beside `rows`, so the one walk
+    /// that answers the query also finds the poisons that fail it.
+    pub(crate) fn rows_sql(&self, rows: &str) -> (String, Vec<rusqlite::types::Value>) {
+        let driver = self.driver(false);
+        let mut params = Vec::new();
+        let conditions = self.sql_conditions(driver, false, &mut params);
+        let sql = format!(
+            "SELECT a.asset_uuid, a.bundle_uuid, b.path, a.type_uuid, b.poison IS NOT NULL
+             FROM {} WHERE (b.poison IS NOT NULL OR ({rows})){conditions}
+             ORDER BY a.asset_uuid",
+            Self::sql_from(driver)
+        );
+        (sql, params)
+    }
+
+    /// The statement selecting the bundle and path of each row among `rows`
+    /// this filter selects without its tag whose tag index is poisoned.
+    pub(crate) fn tag_poisons_sql(&self, rows: &str) -> (String, Vec<rusqlite::types::Value>) {
+        let untagged = Self {
+            tag: None,
+            ..self.clone()
+        };
+        let driver = untagged.driver(true);
+        let mut params = Vec::new();
+        let conditions = untagged.sql_conditions(driver, true, &mut params);
+        let sql = format!(
+            "SELECT a.bundle_uuid, b.path FROM {} WHERE b.poison IS NULL AND ({rows}){conditions}",
+            Self::sql_from(driver)
+        );
+        (sql, params)
+    }
 }
 
-/// One asset a filter selected: its UUID, owning bundle, and the bundle's
-/// logical path.
+/// The rows of a published namespace an asset query reads: every asset of
+/// a bundle that is not poisoned (a poisoned bundle's skeleton rows are
+/// read beside them, see [`AssetFilter::rows_sql`]).
+pub(crate) const NAMESPACE_ROWS: &str = "b.poison IS NULL";
+
+impl StoreReader {
+    /// The asset rows of non-poisoned bundles that `filter` selects and
+    /// whose owning bundle's path `glob` matches, with their bundle and its
+    /// logical path, by asset UUID. Fails naming the poisoned bundles whose
+    /// rows the query could select (DESIGN.md §13, asset queries).
+    pub fn namespace_assets_matching(
+        &self,
+        filter: &AssetFilter,
+        glob: impl Fn(&str) -> bool,
+    ) -> Result<AssetAnswer, StoreError> {
+        self.assets_matching(filter, NAMESPACE_ROWS, glob)
+    }
+
+    /// One asset query over the rows `rows` admits: at most two statements,
+    /// each driven by the most selective index the filter names. Rows are
+    /// streamed and matched against `glob` as they arrive.
+    pub(crate) fn assets_matching(
+        &self,
+        filter: &AssetFilter,
+        rows: &str,
+        glob: impl Fn(&str) -> bool,
+    ) -> Result<AssetAnswer, StoreError> {
+        if filter.selects_nothing() {
+            return Ok(Ok(Vec::new()));
+        }
+        let mut poisoned = BTreeSet::new();
+        if filter.tag.is_some() {
+            let (sql, params) = filter.tag_poisons_sql(rows);
+            let mut statement = self.conn.prepare_cached(&sql)?;
+            let mut found = statement.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = found.next()? {
+                if glob(&row.get::<_, String>(1)?) {
+                    poisoned.insert(BundleUuid(blob16(row.get(0)?)));
+                }
+            }
+        }
+        let (sql, params) = filter.rows_sql(rows);
+        let mut statement = self.conn.prepare_cached(&sql)?;
+        let mut found = statement.query(rusqlite::params_from_iter(params))?;
+        let mut matched = Vec::new();
+        while let Some(row) = found.next()? {
+            let path = row.get::<_, String>(2)?;
+            if !glob(&path) {
+                continue;
+            }
+            let bundle = BundleUuid(blob16(row.get(1)?));
+            if row.get::<_, bool>(4)? {
+                poisoned.insert(bundle);
+            } else if poisoned.is_empty() {
+                matched.push(MatchedAsset {
+                    asset: AssetUuid(blob16(row.get(0)?)),
+                    bundle,
+                    path,
+                    type_uuid: TypeUuid(blob16(row.get(3)?)),
+                });
+            }
+        }
+        Ok(if poisoned.is_empty() {
+            Ok(matched)
+        } else {
+            Err(poisoned.into_iter().collect())
+        })
+    }
+}
+
+/// One asset a filter selected: its UUID, owning bundle, the bundle's
+/// logical path and the asset's authored type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedAsset {
     pub asset: AssetUuid,
     pub bundle: BundleUuid,
     pub path: String,
-}
-
-pub(crate) fn matched_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MatchedAsset> {
-    Ok(MatchedAsset {
-        asset: AssetUuid(blob16(row.get(0)?)),
-        bundle: BundleUuid(blob16(row.get(1)?)),
-        path: row.get(2)?,
-    })
+    pub type_uuid: TypeUuid,
 }
 
 pub(crate) fn blob16(bytes: Vec<u8>) -> [u8; 16] {

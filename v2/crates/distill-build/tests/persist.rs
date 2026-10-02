@@ -127,3 +127,47 @@ fn durable_bucket_revalidates_newest_first_and_hydrates_the_selected_extent() {
     };
     assert_eq!(outputs[0].bytes, b"new-basis artifact");
 }
+
+static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_statement(sql: &str) {
+    STATEMENTS.lock().unwrap().push(sql.to_owned());
+}
+
+/// A lookup whose newest candidate holds reads that candidate's record and
+/// no other: the statements it runs do not grow with the bucket.
+#[test]
+fn a_lookup_reads_only_the_candidates_it_reaches() {
+    let mut counts = Vec::new();
+    for size in [2, 40] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(directory.path())).unwrap();
+        let key = [7; 32];
+        let asset = AssetUuid([1; 16]);
+        for index in 0..size {
+            commit(
+                &mut store,
+                key,
+                asset,
+                vec![TraceOp::Resolve {
+                    path: format!("asset{index}.bundle"),
+                    observed: Observed::Ok(None),
+                }],
+                format!("artifact {index}").as_bytes(),
+            );
+        }
+        let mut reader = store.reader().unwrap();
+        reader.trace_statements(Some(record_statement));
+        STATEMENTS.lock().unwrap().clear();
+        let hit = lookup_persisted_candidate(&reader, KeyKind::Processor, &key, asset, &Snapshot::default())
+            .unwrap()
+            .unwrap();
+        reader.trace_statements(None);
+        let PersistedOutcome::Success { outputs, .. } = hit.outcome else {
+            panic!("expected success")
+        };
+        assert_eq!(outputs[0].bytes, format!("artifact {}", size - 1).as_bytes());
+        counts.push(std::mem::take(&mut *STATEMENTS.lock().unwrap()).len());
+    }
+    assert_eq!(counts[0], counts[1], "{counts:?}");
+}

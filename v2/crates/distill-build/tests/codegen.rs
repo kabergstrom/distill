@@ -74,7 +74,6 @@ fn stale_basis_or_newly_discovered_dependency_discards_and_requeues() {
         CodegenPublication::Requeued
     );
     assert!(world.published.is_empty());
-    assert_eq!(coordinator.requeue_count(), 1);
 
     let attempt = CodegenAttempt::success(
         7,
@@ -86,7 +85,7 @@ fn stale_basis_or_newly_discovered_dependency_discards_and_requeues() {
         CodegenPublication::Requeued
     );
     assert!(world.published.is_empty());
-    assert_eq!(coordinator.requeue_count(), 2);
+    assert!(!coordinator.holds(&world), "a requeued attempt installs nothing");
 }
 
 #[test]
@@ -107,7 +106,9 @@ fn complete_batch_and_trace_publish_together_after_immediate_revalidation() {
     assert!(matches!(published, CodegenPublication::Published { .. }));
     assert_eq!(world.published.len(), 1);
     assert!(world.published[0].1[0].relative_path() < world.published[0].1[1].relative_path());
-    assert_eq!(coordinator.last_trace(), query_trace([3; 32]));
+    assert!(coordinator.holds(&world));
+    world.query = [4; 32];
+    assert!(!coordinator.holds(&world));
 }
 
 #[test]
@@ -130,7 +131,7 @@ fn duplicate_namespace_claims_fail_before_any_write() {
         CodegenPublication::Failed(CodegenFailure::NamespaceCollision { .. })
     ));
     assert!(world.published.is_empty());
-    assert!(coordinator.last_trace().is_empty());
+    assert!(!coordinator.holds(&world));
 }
 
 #[test]
@@ -148,8 +149,7 @@ fn typed_generation_failure_is_published_only_if_its_basis_stays_current() {
         coordinator.finish(attempt, &mut world),
         CodegenPublication::Failed(failure.clone())
     );
-    assert_eq!(coordinator.last_trace(), query_trace([7; 32]));
-    assert_eq!(coordinator.last_failure(), Some(&failure));
+    assert!(coordinator.holds(&world));
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn publication_error_does_not_install_trace_or_partial_state() {
         coordinator.finish(attempt, &mut world),
         CodegenPublication::PublicationFailed(_)
     ));
-    assert!(coordinator.last_trace().is_empty());
+    assert!(!coordinator.holds(&world));
 }
 
 #[test]

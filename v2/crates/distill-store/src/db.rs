@@ -189,6 +189,11 @@ CREATE TABLE bundles (
     origin_rule         BLOB,
     origin_group_root   TEXT,
     origin_group_path   TEXT,
+    -- Schema 38 (reads-query): whether the bundle's `$record` import
+    -- record is watched (§8), derived at publication from the parsed
+    -- record so readers need not parse the bundle. 0 for a poisoned
+    -- bundle.
+    import_watched      INTEGER NOT NULL DEFAULT 0,
     -- The final segment of `path`: what a glob whose last segment is
     -- literal (`**/name.bundle`) is looked up by. Derived on write. (No
     -- extension column: every bundle path ends in `.bundle`.)
@@ -201,6 +206,8 @@ CREATE INDEX bundles_by_origin ON bundles(origin_rules_bundle)
 CREATE INDEX bundles_by_path ON bundles(path, root_id);
 CREATE INDEX bundles_by_name ON bundles(name);
 CREATE INDEX bundles_poisoned ON bundles(bundle_uuid) WHERE poison IS NOT NULL;
+-- Schema 38 (reads-query): the watched imports' bundles.
+CREATE INDEX bundles_import_watched ON bundles(bundle_uuid) WHERE import_watched;
 -- The logical path strings each bundle's AssetRef/WeakRef fields name
 -- (a bare string or an object's `path` field): what a rename rewrites.
 -- Derived at scan from the published bundle, with its `bundles` row.
@@ -568,6 +575,13 @@ impl std::ops::Deref for Store {
 }
 
 impl Store {
+    /// Test hook: [`StoreReader::trace_statements`] on the writer's
+    /// connection.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn trace_statements(&mut self, hook: Option<fn(&str)>) {
+        self.read.trace_statements(hook);
+    }
+
     /// Open (creating if absent) the daemon state under
     /// `config.state_path`, run CAS recovery, and return the writer
     /// together with what recovery found and did (§13's classification).

@@ -829,7 +829,8 @@ should reach zero by the end of phase 6.
       in-process pack path is gone. The daemon does not own the output
       directory, so it must lie outside every asset root.
     - Snapshots of one version on one front end share a `SnapshotTxn`;
-      each capability has its own expiry.
+      each capability has its own expiry. The configuration and the
+      pipeline are read through it per request, not copied at open.
     - Only the capnp transport arms expiry. In-process callers (tests)
       release on drop.
     - The snapshot policy is per front end: a test installs it on the
@@ -887,13 +888,31 @@ should reach zero by the end of phase 6.
   entry, bundle, path, derived output, tag poison and tool into maps for
   each build, is gone, and so is `PinnedToolEpoch`'s copy of the tools
   table. Each trace question is a point query in the snapshot's read
-  transaction (`distill-store` `trace_reads`), kept in the build's
-  `TraceAnswers`; tools are read per id at the build's tool version. New
+  transaction (`distill-store` `trace_reads`); tools are read per id at
+  the build's tool version. New
   indexes `bundles_by_path`, `assets_by_type`, the partial
   `asset_tag_index_poisoned`, and `assets_by_bundle` keyed by bundle and
   local id (SCHEMA_VERSION 36 on that branch; the merged schema is 37,
   below). A store failure fails
   only the questions that reach it, where the capture failed every build.
+- **One asset query.** The four asset-query implementations (the trace
+  source's candidate reads, `AssetFilter`, codegen's checks, the RPC's
+  two-pass query) are one `AssetFilter` query, at most two statements
+  (DESIGN.md §13, asset queries): the trace no longer reads each
+  candidate's entry (N+1), an unindexable filter is one streamed
+  statement, and the driver is the filter's most selective index. Bundle
+  and tag-index poisons fail the same way everywhere: a query fails naming
+  the poisoned bundles it reaches, and only then. Codegen's global
+  `check_entries`/`check_tag_selector` (any poisoned bundle failed every
+  codegen query) and the RPC's silent exclusion of skeleton rows are
+  gone; a trace query reaching a poisoned bundle is
+  `Observed::Err(Poisoned)`, where it failed the build. The per-build
+  `TraceAnswers` memo is gone: each question reads again (a primary-key
+  read or one asset query); `CurrentLoadSource`, derived from the
+  pipeline epoch, is captured once with `NodeEnv`. A trace entry is one
+  `assets`/`bundles` join without tags. One glob key cutter
+  (`files::GlobKeys`) serves traces, codegen, the RPC and import
+  enumeration.
 - **Compiled state by store version.** SQLite is the only source of truth
   for what the daemon compiled; memory holds derivations of it, each keyed
   by the version it derives from.
@@ -1048,6 +1067,58 @@ should reach zero by the end of phase 6.
 - **Loader step counters.** `RpcIo::last_step()` reports a step's turns,
   task polls and most polls in one turn; the backpressure tests assert
   those counts, not wall time.
+- **Build requests carry what a build takes.** `BuildRequest::entry` is a
+  `BuildEntry` (uuid, authored type, terminal type) instead of a whole
+  `AuthoringEntry`: the build reads the rest at its view. Runtime resolve
+  builds it from the metadata it already read, and doctor verify names
+  every runtime entry by one three-column statement
+  (`served_runtime_entry_types`) instead of reading each entry's tags,
+  schema and value. An entry whose schema snapshot is missing now fails
+  its own verification build instead of the whole request set.
+- **Candidate buckets are read once, lazily.** `candidate_rows` reads a
+  bucket's index rows and `read_candidate` one record when a walk reaches
+  it. A processor stage's lookup is one walk (`persisted_hit`):
+  materialize a candidate's reads, revalidate, hydrate the first that
+  holds. It replaced the preload pass that read and decoded the whole
+  bucket, revalidated, and then a lookup that read and decoded it again.
+  Node lookups read lazily too.
+- **The CAS pass costs its changes.** Every CAS index write
+  (`index_segments`, `evict_result`, `evict_installed`) bumps
+  `store_meta.cas_writes` in its own transaction. The loop's pass
+  (`maintain_cas`) skips eviction and compaction while the count and the
+  cache limit stand where the last pass that ended within the limit left
+  them; only the dead-segment sweep runs. When it does run, the
+  cache-limit sweep sums the live bytes once and subtracts each victim's
+  freed bytes (`DELETE … RETURNING len`). Each victim is one index probe
+  (`cas_refs_by_hash` at a random hash), at most 4096 per sweep. This
+  replaces a prune, a re-summing of every extent after each victim, and a
+  `DISTINCT … ORDER BY random()` over every holder. The prune is left to
+  recovery, since release already deletes an extent with its last
+  reference.
+- **Codegen runs when its inputs moved.** `CodegenCoordinator` keeps only
+  the installed trace, and `CodegenService` keeps that trace's pipeline
+  epoch. A new basis whose epoch is the same and whose installed trace still
+  holds (`holds`) skips the run and its publication.
+  - Removed: `last_failure`, the requeue counter and the `last_trace` getter.
+    They were written and never read outside tests.
+- **A snapshot reads what it pins when asked.** `SnapshotTxn` holds only its
+  read transaction and stamp. `configuration()` and `pipeline()` are each one
+  primary-key read through it, and `effective_pipeline` reads the pinned row
+  and the current one. Before, both were copied into the struct at open.
+  `pipeline_failure` takes the read's result, so a store error gates a request
+  like a pipeline failure does.
+- **A build reads a tool per use.** `BuildContext` no longer keeps the
+  ToolEpoch rows it read: `tool()` is one `tools` primary-key read
+  (`TOOL_AT`, plan pinned) at the build's tool version each time.
+  The version is pinned, so the read's answer cannot change during a build.
+- **The watch flag is a column.** Schema 38 adds `bundles.import_watched`
+  and the partial index `bundles_import_watched`. Publication writes the
+  flag from the `$record` it already decodes for the directory origin
+  (`decoded_record_facts`), and poison clears it. Doctor's fixpoint check
+  now gets the watched bundles in one partial-index walk
+  (`import_watched_bundles`). It used to parse every bundle that has a
+  `$record` row just to read the flag. Poisoned bundles are still read
+  from disk, and `bundles_with_reserved_entry` is gone.
 
 ## 7. Test baseline
 

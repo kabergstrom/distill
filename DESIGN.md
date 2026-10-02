@@ -2389,6 +2389,11 @@ read-set reproduces it byte-identically. `doctor` and CI verify that
 fixpoint for every watched bundle, so the
 committed-the-source-but-not-the-bundle case fails loudly instead of
 churning working trees after checkout.
+Publication records each bundle's watch flag in its `bundles` row
+(`import_watched`, set when the bundle's `$record` is watched). `doctor`
+finds the watched bundles through that row's partial index, without parsing
+a bundle. A poisoned bundle's row cannot record the flag, so its file is read
+instead.
 
 The matching importer from the pipeline module (or a built-in) parses the
 external format and returns canonical asset values keyed by `local_id`; the
@@ -3906,6 +3911,9 @@ a walk of every asset. Each bundle is read and parsed once per refinement,
 however many of its entries it refines. A refinement that fails writes
 poison rows for exactly the entries it was refining, in the same input; the
 in-memory commit alone would not reach a store that applies deltas.
+Those rows are the tag poisons §13's asset queries fail on. A pending row
+counts as poisoned too, but the input that marks it also refines it, so a
+published version holds one only where that refinement failed.
 
 **A configuration change publishes its difference.** A candidate whose
 roots are unchanged republishes, through the incremental publication a
@@ -4980,6 +4988,40 @@ principle). Fixing the file heals
 on the next version; cross-file identity collisions keep §7's
 version-global poison.
 
+#### Asset queries
+
+Every asset query — a build trace's `TraceOp::Query`, a codegen's query, the
+RPC's `query_assets` and pure-metadata query — is one `AssetFilter` answered
+by `StoreReader::namespace_assets_matching` (or `served_assets_matching` over
+the served rows). Each caller only translates its query: a build's
+target-dependent `terminal_type` becomes the set of authored types whose
+chains end there on its target (plus the types whose chains fail, so an
+asset of one fails the build rather than vanishing); a glob contributes its
+keys (literal prefix and literal final segment, one shared cutter,
+`files::GlobKeys`) and is matched on the streamed rows. The filter is driven
+by its most selective indexed selector and runs as at most two statements
+whatever the namespace size — a filter with no indexed selector is one
+streamed statement over every row, never a read per row.
+
+One poison semantics holds for every caller. A query answers the
+non-poisoned rows of its role that match every selector, glob included. It
+**fails, naming the poisoned bundles** (sorted, deduplicated):
+
+- when a poisoned bundle's skeleton row (§7, above) matches every selector
+  the skeleton carries — tag included; a skeleton has no served terminal
+  type, so a served `terminal_type` selector never reaches one; or
+- for a tag query, when a non-poisoned row matching every selector but the
+  tag has a poisoned tag index (§10): its `asset_tag_index` row carries
+  a poison, written by the failed refinement of exactly that row.
+
+A query that cannot reach a poison answers normally: one malformed file
+fails only the questions whose selectors could match its entries. The trace
+records the failure as `Observed::Err(Poisoned { bundle })` naming the least
+bundle (it revalidates like any answer); codegen fails the run with the
+bundles named; the RPC answers `TagIndexPoisoned { bundles }` for either
+kind of poison. A reference resolved through a query that reaches a poison
+fails the build.
+
 ### Log-structured CAS (artifact store)
 
 Append-only segment files of framed records, pinned:
@@ -5097,7 +5139,8 @@ before one SQLite transaction flips the index, and old segments are deleted
 only when no live snapshot or mmap reader pins their generation.
 **Segments are the durable record within daemon state; the index is
 rebuildable by a segment scan.** GC is Bitcask-style
-compaction driven by cache policy (LRU / size cap) — everything in the CAS
+compaction driven by the size cap (random eviction, each victim one
+sampled index probe; the pass runs only after the CAS index changed) — everything in the CAS
 is rebuildable, so eviction is always safe. But never observable: eviction
 may not remove a ContentHash referenced by any current or last-good manifest
 entry, live snapshot lease, in-flight build, or open pack-build session —
@@ -7539,6 +7582,12 @@ including newly discovered membership, a previously missed dependency, or an
 event consumed while generation ran — it discards the whole proposed batch
 and outcome and requeues against the newest basis. No stale trace is published,
 and no filesystem mutation starts from bytes computed for a mismatched basis.
+The trace of the last attempt whose outcome stands (published, or failed
+deterministically) is kept with its pipeline epoch. At each new basis, the
+service revalidates that trace first. While the epoch is the same and every
+observation still holds, a run would generate what stands, so codegen does not
+run. Revalidation costs the trace's reads, and a run costs the codegens plus a
+publication over the whole namespace.
 
 Generated files are **daemon-owned, declared so**: `rs_mod_path` names a
 directory whose generated `<pipeline>.rs` files and `mod.rs` chain
