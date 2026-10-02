@@ -927,9 +927,8 @@ should reach zero by the end of phase 6.
     write them, so an RPC write keeps them (`publish_incremental_paths` no
     longer replaces the rejection's namespace errors) and a restart keeps
     them with their subjects.
-  - The import index's built flag is `store_meta.import_index_built`,
-    written in the savepoint that writes the index rows, so a rolled-back
-    plan leaves it unset.
+  - The import index has no built flag (schema 38): it is kept by the
+    dirty work every bundle publication queues, never rebuilt whole.
   - `ServerHandle::replace_target` writes only the served target hash;
     builds take targets from the compiled entry, so it installs nothing in
     memory.
@@ -961,12 +960,10 @@ should reach zero by the end of phase 6.
   - A complete publication diffs `files`, the per-bundle asset sets, the
     asset deletions and the path index by ordered merges of streamed rows,
     holding only the differences.
-  - Still whole: `published_scan` and the no-coordinator fallback of
-    `publish_incremental_paths` republish the complete namespace, so they
-    load it; `ensure_import_index` rebuilds every row. A failed complete
-    tag refinement (a full rescan or configuration publication) reads
-    `all_asset_bundles` inside its open input to poison every asset: a
-    bulk operation of a bulk publication, read only on that failure.
+  - Still whole: a configuration candidate whose roots are unchanged
+    loads the published scan (`published_scan`) and republishes it in
+    full, since claims and bundle poison are rederived under the new
+    projection and schema authority. The rest moved in schema 38 (below).
 - **Merged schema 37.** The build-cells, db-truth and db-queries branches each
   defined a schema 36; the merge is one SCHEMA_VERSION 37 with the union of
   their tables and one copy of each index. `assets_by_bundle` is
@@ -996,6 +993,40 @@ should reach zero by the end of phase 6.
   (`*.ext` globs over `files`) and the reserved-entry lookup (`$record` by
   local id). None needs a composite index beyond `assets_by_bundle`: each
   has one selective driver, and the rest filter its rows.
+- **Reads that cost their answer (schema 38).** Each changed query is
+  pinned in `query_plans.rs`; the per-edit and per-request paths have page
+  guards that compare a small namespace with a large one.
+  - Subtree reads search one `(root_id, path)` range: a prefix's upper
+    bound is its byte successor, the whole root is the root's rows, and
+    `symlinks_targeting` is bounded the same way.
+  - An incremental step holds no baseline scan. It reads `(path, hash)`
+    under the affected prefixes (`bundle_file_hashes_under`,
+    `observes_under`), and its publication reads back its own mutations.
+  - A configuration source error, and the heal that clears it, write the
+    error row and the configuration status in one input, and nothing
+    else. `ConfigWatch` reads whether the configuration is rejected from
+    that row; the only process state it keeps is which candidate it staged.
+  - A complete step's file overlay holds only the rows it changes,
+    compared with the committed rows by a streamed merge. Every other
+    lookup reads the committed selection.
+  - `directories.canonical_path` is unique (`directories_by_canonical`).
+    An alias is an inconsistent table, so the alias check is gone.
+  - A complete publication reads every bundle with its root's name in one
+    join.
+  - A projection change republishes the bundles that hold an asset of a
+    type whose terminal it changes, so `terminal_type` cannot go stale on
+    an unchanged bundle.
+  - Tag refinement redoes the pending rows, plus the rows whose
+    `tag_epoch` or `dylib_hash` is stale; each is an index search. It
+    parses each bundle once. A failed refinement writes poison rows for
+    the entries it was refining. Delta apply ignores the in-memory commit,
+    so `all_asset_bundles` is no longer read outside tests.
+  - `publish_incremental_paths` is always incremental.
+  - The import index is kept by dirty work. Every bundle publication queues
+    its paths, and a pass reindexes the dirty bundle sources (one parse
+    each) before acknowledging them. A whole-namespace import check
+    reindexes only the pending work, and the `import_index_built` marker
+    is gone.
 - **Chained imports in one pass.** A pass runs imports in levels: after a
   level runs, the rolled-back plan input finds the imports that read a
   changed output (over the overlay plus those outputs) and runs them next,

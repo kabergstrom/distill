@@ -3890,6 +3890,17 @@ watched shared schema. Its source hash is the conservative local
 tag-annotation epoch: any schema edit re-extracts tags for affected entries —
 metadata-only work, no artifacts touched.
 
+Refinement redoes exactly the stale rows. A publication marks the rows of
+the entries it changed pending; a complete step or a configuration
+candidate also redoes the rows whose `tag_epoch` differs from the current
+epoch or whose recorded `dylib_hash` differs from the current module's —
+each an index search (`asset_tag_index_by_epoch`, and the partial
+`asset_tag_index_migrated` over the rows where code ran), never a walk of
+every asset. Each bundle is read and parsed once per refinement, however
+many of its entries it refines. A refinement that fails writes poison rows
+for exactly the entries it was refining, in the same input; the in-memory
+commit alone would not reach a store that applies deltas.
+
 Recorded dependencies live in daemon state and double as the reverse indexes
 for change propagation (v1's `reverse_path_refs` table was the precursor).
 This replaces v1's stubbed transitive build-dependency propagation: deps are
@@ -4884,9 +4895,11 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `files` | **(root id, normalized root-relative path)** → mtime, size, kind, content hash — last-known tree state. Physical tracking is per root: multiple roots form one *logical* namespace (§18), and a single-path key could hold only one of two same-path observations, silently choosing a root. The logical path index derives as a multimap with three states — `Missing`, `Unique(root)`, `Ambiguous(roots)` — and ambiguity is representable, not pre-collapsed |
 | `dirty_files` | pending incremental work (root id, path, exists/deleted), enqueued atomically with the corresponding `files` mutation and later cleared atomically with the downstream work it triggers |
 | `rename_events` | ordered live-rename log from the watcher, consumed transactionally before the batch is acknowledged |
+| `import_records`, `import_reads`, `directory_rule_sources` | the import index: each watched import bundle's read set by path, listing and capability key, and each directory-import rules asset by its source (root id, path). Derived from the committed bundles and kept by source: every bundle publication queues its paths in `dirty_files`, and an import pass reindexes the dirty bundle sources, parsing each once, before it acknowledges that work, so the index is current but for pending work. It is never rebuilt whole; a store starts with no bundles and an empty index |
+| `directories` | **(root id, path)** → the directory's canonical path, unique across roots (`directories_by_canonical`): two observed directories with one canonical path are an inconsistent table, not an alias to choose between |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
 | `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
-| `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags |
+| `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags, terminal type. A pipeline-map change republishes the rows of every bundle holding an asset whose terminal type it changes, whether or not the bundle changed |
 | `path_index` | path/primary resolution index |
 | `deps` | recorded content / resolution / query dependencies + selector indexes |
 | `schemas` | logical hash → schema JSON (cache, rebuilt from bundle snapshots) |
