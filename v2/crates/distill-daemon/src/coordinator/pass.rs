@@ -972,20 +972,17 @@ impl DaemonCoordinator {
                 )
                 .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority.filter(|_| refine_tags) {
-                    let affected = commit_affected_asset_bundles(&commit);
-                    if !affected.is_empty() {
-                        crate::build::refine_published_tag_index_incremental(
-                            crate::build::OpenInput::new(store)
-                                .expect("tag-index refinement runs inside its input"),
-                            tags.compiled.scanner().clone(),
-                            authority,
-                            tags.compiled.pipeline_snapshot(),
-                            tags.compiled.build_targets(),
-                            tags.max_dependency_depth,
-                            &affected,
-                        )?
-                        .apply_incremental(&mut commit);
-                    }
+                    crate::build::refine_tag_index(
+                        crate::build::OpenInput::new(store)
+                            .expect("tag-index refinement runs inside its input"),
+                        tags.compiled.scanner().clone(),
+                        authority,
+                        tags.compiled.pipeline_snapshot(),
+                        tags.compiled.build_targets(),
+                        tags.max_dependency_depth,
+                        &mut commit,
+                        false,
+                    )?;
                 }
                 Ok(Some(commit))
             }
@@ -1008,7 +1005,7 @@ impl DaemonCoordinator {
                 )
                 .map_err(|error| error.to_string())?;
                 if let Some(authority) = authority {
-                    crate::build::refine_published_tag_index(
+                    crate::build::refine_tag_index(
                         crate::build::OpenInput::new(store)
                             .expect("tag-index refinement runs inside its input"),
                         tags.compiled.scanner().clone(),
@@ -1016,8 +1013,9 @@ impl DaemonCoordinator {
                         tags.compiled.pipeline_snapshot(),
                         tags.compiled.build_targets(),
                         tags.max_dependency_depth,
-                    )?
-                    .apply(&mut commit);
+                        &mut commit,
+                        true,
+                    )?;
                 }
                 Ok(Some(commit))
             }

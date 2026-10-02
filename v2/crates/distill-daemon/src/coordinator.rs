@@ -826,15 +826,16 @@ impl DaemonCoordinator {
                 let compiled = Arc::clone(entry.entry());
                 staged = Some(entry);
                 published_pipeline = Some(diagnostic);
-                crate::build::refine_published_tag_index(
+                crate::build::refine_tag_index(
                     crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
                     compiled.scanner().clone(),
                     Arc::clone(&schema_authority),
                     compiled.pipeline_snapshot(),
                     compiled.build_targets(),
                     max_dependency_depth,
-                )?
-                .apply(&mut commit);
+                    &mut commit,
+                    true,
+                )?;
                 commit.pipeline_epoch_changed = true;
                 #[cfg(test)]
                 compiled_tests::candidate_staged()?;
@@ -2928,32 +2929,18 @@ pub(crate) fn publish_incremental_paths(
     )
     .map_err(|error| error.to_string())?;
     if let (Some(coordinator), Some(authority)) = (coordinator, authority) {
-        let affected = commit_affected_asset_bundles(&commit);
-        if !affected.is_empty() {
-            crate::build::refine_published_tag_index_incremental(
-                crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
-                scanner.clone(),
-                authority,
-                compiled.pipeline_snapshot(),
-                compiled.build_targets(),
-                coordinator.operational_configuration().max_dependency_depth,
-                &affected,
-            )?
-            .apply_incremental(&mut commit);
-        }
+        crate::build::refine_tag_index(
+            crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
+            scanner.clone(),
+            authority,
+            compiled.pipeline_snapshot(),
+            compiled.build_targets(),
+            coordinator.operational_configuration().max_dependency_depth,
+            &mut commit,
+            false,
+        )?;
     }
     Ok(commit)
-}
-
-fn commit_affected_asset_bundles(commit: &Commit) -> BTreeMap<AssetUuid, Option<BundleUuid>> {
-    commit
-        .authoring
-        .iter()
-        .map(|mutation| match mutation {
-            AuthoringMutation::Set(entry) => (entry.uuid, Some(entry.bundle)),
-            AuthoringMutation::Remove { uuid } => (*uuid, None),
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

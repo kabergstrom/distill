@@ -12,6 +12,7 @@ use rusqlite::Connection;
 
 use crate::bundles::{
     AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, ServedAuthoring, SkeletonEntry,
+    TagIndexUpdate,
 };
 use crate::db::{ReaderConn, StoreReader};
 use crate::files::{path_name, FileKind, FileObservation, FileState, PathSelection};
@@ -897,5 +898,88 @@ fn bundles_with_root_names_are_one_join() {
             "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
         ],
         "{plans:#?}"
+    );
+}
+
+/// A refinement finds the tag rows it must redo by one search of an index
+/// per kind of staleness (poisoned, another schema epoch, another module's
+/// migration), never by walking every row; and finds exactly those.
+#[test]
+fn stale_tag_rows_are_index_searches() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let (epoch, old_epoch, module, old_module) = ([7; 32], [3; 32], [9; 32], [8; 32]);
+    let updates = (0..200)
+        .map(|index| {
+            let (tag_epoch, dylib_hash, poison) = match index % 50 {
+                0 => (epoch, None, Some("tag indexing pending".to_owned())),
+                1 => (old_epoch, None, None),
+                2 => (epoch, Some(old_module), None),
+                3 => (epoch, Some(module), None),
+                _ => (epoch, None, None),
+            };
+            TagIndexUpdate {
+                asset: asset_uuid(index, 1),
+                tags: BTreeMap::new(),
+                tag_epoch,
+                planner_version: None,
+                dylib_hash,
+                trace: Vec::new(),
+                poison,
+            }
+        })
+        .collect::<Vec<_>>();
+    let version = store.input_version();
+    store.refine_unpublished_tag_index(version, &updates).unwrap();
+    let stale = |module| {
+        store
+            .stale_tag_index_assets(epoch, module)
+            .unwrap()
+            .into_iter()
+            .map(|(asset, bundle)| {
+                let index = (0..200).find(|index| asset_uuid(*index, 1) == asset).unwrap();
+                assert_eq!(bundle, bundle_uuid(index));
+                index % 50
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut kinds = stale(Some(module));
+    kinds.sort_unstable();
+    assert_eq!(kinds, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
+    let mut kinds = stale(None);
+    kinds.sort_unstable();
+    assert_eq!(kinds, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+
+    store.read.conn.trace(Some(trace));
+    store.stale_tag_index_assets(epoch, Some(module)).unwrap();
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    let sql = statements
+        .iter()
+        .find(|sql| sql.contains("asset_tag_index i"))
+        .unwrap();
+    let plan = explain(&store.read.conn, sql);
+    let assets = "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)";
+    assert_eq!(
+        plan,
+        [
+            "COMPOUND QUERY",
+            "LEFT-MOST SUBQUERY",
+            "SCAN i USING INDEX asset_tag_index_poisoned",
+            assets,
+            "UNION USING TEMP B-TREE",
+            "SEARCH i USING INDEX asset_tag_index_by_epoch (tag_epoch<?)",
+            assets,
+            "UNION USING TEMP B-TREE",
+            "SEARCH i USING INDEX asset_tag_index_by_epoch (tag_epoch>?)",
+            assets,
+            "UNION USING TEMP B-TREE",
+            "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash<?)",
+            assets,
+            "UNION USING TEMP B-TREE",
+            "SEARCH i USING INDEX asset_tag_index_migrated (dylib_hash>?)",
+            assets,
+        ],
+        "{sql}"
     );
 }

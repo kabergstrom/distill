@@ -260,6 +260,11 @@ CREATE TABLE asset_tag_index (
 -- candidates; this lists exactly the poisoned rows.
 CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid)
     WHERE poison IS NOT NULL;
+-- A refinement redoes the rows of another schema epoch, and the migrated
+-- rows (those a pipeline module's migration produced) of another module.
+CREATE INDEX asset_tag_index_by_epoch ON asset_tag_index(tag_epoch);
+CREATE INDEX asset_tag_index_migrated ON asset_tag_index(dylib_hash)
+    WHERE dylib_hash IS NOT NULL;
 CREATE TABLE path_index (
     path       TEXT NOT NULL,
     root_id    INTEGER NOT NULL,

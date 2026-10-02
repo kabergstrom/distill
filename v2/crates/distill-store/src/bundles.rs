@@ -910,10 +910,53 @@ impl StoreReader {
             .map_err(StoreError::from)
     }
 
+    /// The tag-index rows a refinement under `tag_epoch` and the pipeline
+    /// module `dylib_hash` (none when no module is loaded) must redo, each
+    /// with its asset's bundle: poisoned rows (pending ones included), rows
+    /// of another schema epoch, and migrated rows of another module. Every
+    /// other row already holds what refining it would write. Each kind is
+    /// one search of its index, so this costs the rows it returns.
+    pub fn stale_tag_index_assets(
+        &self,
+        tag_epoch: [u8; 32],
+        dylib_hash: Option<[u8; 32]>,
+    ) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
+        // No module: every migrated row is stale, and every blob sorts
+        // after the empty one.
+        let module = dylib_hash.map_or_else(Vec::new, |hash| hash.to_vec());
+        let mut statement = self.conn.prepare_cached(
+            "SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.poison IS NOT NULL
+             UNION SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.tag_epoch < ?1
+             UNION SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.tag_epoch > ?1
+             UNION SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.dylib_hash < ?2
+             UNION SELECT i.asset_uuid, a.bundle_uuid
+             FROM asset_tag_index i JOIN assets a USING (asset_uuid)
+             WHERE i.dylib_hash > ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![tag_epoch.as_slice(), module],
+            |row| {
+                Ok((
+                    AssetUuid(blob16(row.get::<_, Vec<u8>>(0)?)),
+                    BundleUuid(blob16(row.get::<_, Vec<u8>>(1)?)),
+                ))
+            },
+        )?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Raw deterministic asset-to-bundle projection, including poisoned
-    /// skeleton rows. A whole-namespace bulk read: only a failed complete
-    /// tag-index refinement (a full rescan or configuration publication)
-    /// reads it, inside its open input, to poison every asset's tags.
+    /// skeleton rows. A whole-namespace bulk read no publication makes: the
+    /// tests compare the bounded reads against it.
     pub fn all_asset_bundles(&self) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
         let mut statement = self
             .conn
