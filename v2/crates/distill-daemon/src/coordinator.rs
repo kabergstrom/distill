@@ -457,6 +457,12 @@ impl DaemonCoordinator {
         self.operational.request(key, class, job)
     }
 
+    /// How many build cells are queued or running.
+    #[cfg(test)]
+    pub(crate) fn build_cells_in_flight(&self) -> usize {
+        self.operational.cells_in_flight()
+    }
+
     /// Run `run` on a build worker, on the writer the scheduler lends the
     /// job, and wait for it. Test-only: builds are requested through their
     /// cells ([`Self::request_build`]), never waited on like this.

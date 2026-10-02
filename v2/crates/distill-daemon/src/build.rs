@@ -4362,6 +4362,8 @@ impl TraceSource for StoreTraceSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod cells;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
