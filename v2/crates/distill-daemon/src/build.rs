@@ -32,7 +32,8 @@ use distill_build::keys::{
     NodeStage, NodeType, OutputHash, StaticInputs,
 };
 use distill_build::persist::{
-    lookup_persisted_candidate, persisted_candidate_traces, PersistedOutcome,
+    hydrate_persisted_candidate, lookup_persisted_candidate, persisted_candidate, PersistedHit,
+    PersistedOutcome,
 };
 use distill_build::pipeline::{
     PipelineChain, PipelineRegistry, PipelineStage, ProcessorRegistration, Target,
@@ -750,11 +751,19 @@ impl<'a> NodeLookup<'a> {
         let Some(key) = self.key(asset)? else {
             return Ok(None);
         };
-        let candidates = self
+        let rows = self
             .latest
-            .lookup_candidates(KeyKind::Node, &key.digest)
+            .candidate_rows(KeyKind::Node, &key.digest)
             .map_err(BuildError::infrastructure)?;
-        for candidate in candidates {
+        // Each record is read when the walk reaches it.
+        for row in rows {
+            let Some(candidate) = self
+                .latest
+                .read_candidate(&row)
+                .map_err(BuildError::infrastructure)?
+            else {
+                continue;
+            };
             if candidate.payload.key_kind != KeyKind::Node || candidate.asset_uuid != asset {
                 return Err(BuildError::Infrastructure(
                     "a node candidate names another key kind or asset".to_owned(),
@@ -2509,16 +2518,7 @@ fn hydrate_processor_stage(
     static_inputs: &StaticInputs,
 ) -> Result<Option<HydratedProcessorStage>, BuildError> {
     let key = static_inputs_digest(static_inputs);
-    preload_persisted_reads(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
-    let hit = if context.verify_fresh {
-        None
-    } else {
-        ask_trace(context, |source| {
-            let store = latest_store(context);
-            lookup_persisted_candidate(&store, KeyKind::Processor, &key, loaded.entry.uuid, source)
-        })?
-        .map_err(BuildError::infrastructure)?
-    };
+    let hit = persisted_hit(context, KeyKind::Processor, &key, loaded.entry.uuid)?;
     let Some(hit) = hit else {
         return Ok(None);
     };
@@ -2581,32 +2581,43 @@ fn hydrate_processor_stage(
     }
 }
 
-fn preload_persisted_reads(
+/// The newest persisted result of `static_key` whose trace holds at this
+/// build's view, in one walk of its bucket: each candidate is read when
+/// reached, its successful reads materialized, its trace revalidated, and
+/// the first that holds hydrated (or, verifying fresh, only materialized).
+/// A stale candidate's now-unavailable read is a cache miss, never
+/// authority to fail the current build.
+fn persisted_hit(
     context: &mut BuildContext,
     key_kind: KeyKind,
     static_key: &[u8; 32],
     asset: AssetUuid,
-) -> Result<(), BuildError> {
-    let traces = {
-        let store = latest_store(context);
-        persisted_candidate_traces(&store, key_kind, static_key, asset)
-            .map_err(BuildError::infrastructure)?
-    };
-    // Candidates are newest-first. Materialize only until one complete trace
-    // revalidates; a stale candidate's now-unavailable successful read is a
-    // cache miss, never authority to fail the current build.
-    for trace in &traces {
-        match preload_trace_reads(context, trace) {
-            Ok(()) => {
-                if ask_trace(context, |source| revalidate(trace, source))? {
-                    break;
-                }
-            }
+) -> Result<Option<PersistedHit>, BuildError> {
+    let rows = latest_store(context)
+        .candidate_rows(key_kind, static_key)
+        .map_err(BuildError::infrastructure)?;
+    for row in rows {
+        let candidate = persisted_candidate(&latest_store(context), &row, key_kind, asset)
+            .map_err(BuildError::infrastructure)?;
+        let Some((candidate, trace)) = candidate else {
+            continue;
+        };
+        match preload_trace_reads(context, &trace) {
+            Ok(()) => {}
             Err(error) if cache_candidate_miss(&error) => continue,
             Err(error) => return Err(error),
         }
+        if !ask_trace(context, |source| revalidate(&trace, source))? {
+            continue;
+        }
+        if context.verify_fresh {
+            return Ok(None);
+        }
+        return hydrate_persisted_candidate(&latest_store(context), candidate, trace)
+            .map(Some)
+            .map_err(BuildError::infrastructure);
     }
-    Ok(())
+    Ok(None)
 }
 
 fn cache_candidate_miss(error: &BuildError) -> bool {

@@ -860,3 +860,16 @@ fn runtime_entry_types_are_one_statement() {
     }
     assert!(answered[1] > 9 * answered[0] && answered[0] > 0, "{answered:?}");
 }
+
+/// A candidate bucket's rows are one search of its primary key.
+#[test]
+fn candidate_rows_search_their_bucket() {
+    let (_dir, store) = store_with(10);
+    assert_eq!(
+        store.query_plan_details(crate::cas::store::CANDIDATE_ROWS).unwrap(),
+        [
+            "SEARCH result_candidates USING INDEX sqlite_autoindex_result_candidates_1 (key_kind=? AND static_key=?)",
+            "USE TEMP B-TREE FOR ORDER BY",
+        ]
+    );
+}

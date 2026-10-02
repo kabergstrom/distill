@@ -1036,6 +1036,13 @@ should reach zero by the end of phase 6.
   (`served_runtime_entry_types`) instead of reading each entry's tags,
   schema and value. An entry whose schema snapshot is missing now fails
   its own verification build instead of the whole request set.
+- **Candidate buckets are read once, lazily.** `candidate_rows` reads a
+  bucket's index rows and `read_candidate` one record when a walk reaches
+  it. A processor stage's lookup is one walk (`persisted_hit`):
+  materialize a candidate's reads, revalidate, hydrate the first that
+  holds. It replaced the preload pass that read and decoded the whole
+  bucket, revalidated, and then a lookup that read and decoded it again.
+  Node lookups read lazily too.
 
 ## 7. Test baseline
 

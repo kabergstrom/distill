@@ -17,3 +17,6 @@ distill-pipeline-api = { path = "../distill-pipeline-api" }
 distill-schema = { path = "../distill-schema" }
 distill-store = { path = "../distill-store" }
 distill-wire = { path = "../distill-wire" }
+
+[dev-dependencies]
+distill-store = { path = "../distill-store", features = ["test-hooks"] }

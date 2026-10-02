@@ -135,6 +135,22 @@ pub struct CommitReceipt {
     pub unverified_assertions: Vec<(AssetUuid, String)>,
 }
 
+/// Where one bucket candidate's record lies (§13), by its row in
+/// `result_candidates`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateRow {
+    pub trace_digest: [u8; 32],
+    pub memo_seq: MemoSeq,
+    segment: u64,
+    offset: u64,
+    len: u64,
+}
+
+/// A candidate bucket's rows, newest first (the primary key).
+pub(crate) const CANDIDATE_ROWS: &str =
+    "SELECT trace_digest, memo_seq, segment, offset, len FROM result_candidates
+     WHERE key_kind = ?1 AND static_key = ?2 ORDER BY memo_seq DESC";
+
 /// One bucket candidate, most-recently-committed-first (§13).
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -805,49 +821,67 @@ fn index_segments(txn: &rusqlite::Connection, touched: &[(u64, u64)]) -> Result<
 
 impl StoreReader {
     /// The candidate bucket for a static-input key, most recently
-    /// committed first (§13). A pure read.
+    /// committed first (§13), each candidate read and decoded. A pure read;
+    /// a caller that stops at the first candidate that holds reads the
+    /// bucket's rows by [`Self::candidate_rows`] and each record by
+    /// [`Self::read_candidate`] as it reaches it.
     pub fn lookup_candidates(
         &self,
         key_kind: KeyKind,
         static_key: &[u8; 32],
     ) -> Result<Vec<Candidate>, StoreError> {
-        let rows: Vec<(Vec<u8>, i64, i64, i64, i64)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT trace_digest, memo_seq, segment, offset, len FROM result_candidates
-                 WHERE key_kind = ?1 AND static_key = ?2 ORDER BY memo_seq DESC",
-            )?;
-            let mapped = stmt.query_map(
-                rusqlite::params![key_kind as i64, static_key.as_slice()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
-            mapped.collect::<Result<_, _>>()?
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for (trace_digest, memo_seq, segment, offset, len) in rows {
-            // A segment deleted since the lookup is a cache miss.
-            let bytes = match self.read_extent(segment as u64, offset as u64, len as u64) {
-                Ok(bytes) => bytes,
-                Err(StoreError::Io { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    continue
-                }
-                Err(error) => return Err(error),
-            };
-            let decoded: DecodedRecord = decode_record(&bytes, segment as u64, offset as u64)?;
-            let payload = ResultPayload::decode(&decoded.record.payload)?;
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(&trace_digest);
-            out.push(Candidate {
-                trace_digest: digest,
-                memo_seq: MemoSeq(memo_seq as u64),
-                asset_uuid: decoded.record.asset_uuid,
-                payload,
-                segment: segment as u64,
-                offset: offset as u64,
-            });
+        let mut out = Vec::new();
+        for row in self.candidate_rows(key_kind, static_key)? {
+            out.extend(self.read_candidate(&row)?);
         }
         Ok(out)
+    }
+
+    /// The candidate bucket's rows for a static-input key, most recently
+    /// committed first: where each record lies, nothing read from it.
+    pub fn candidate_rows(
+        &self,
+        key_kind: KeyKind,
+        static_key: &[u8; 32],
+    ) -> Result<Vec<CandidateRow>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(CANDIDATE_ROWS)?;
+        let rows = stmt.query_map(
+            rusqlite::params![key_kind as i64, static_key.as_slice()],
+            |r| {
+                Ok(CandidateRow {
+                    trace_digest: crate::bundles::blob32(r.get(0)?),
+                    memo_seq: MemoSeq(r.get::<_, i64>(1)? as u64),
+                    segment: r.get::<_, i64>(2)? as u64,
+                    offset: r.get::<_, i64>(3)? as u64,
+                    len: r.get::<_, i64>(4)? as u64,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The candidate `row` locates, read and decoded; `None` when its
+    /// segment was deleted since the rows were read (a cache miss).
+    pub fn read_candidate(&self, row: &CandidateRow) -> Result<Option<Candidate>, StoreError> {
+        let bytes = match self.read_extent(row.segment, row.offset, row.len) {
+            Ok(bytes) => bytes,
+            Err(StoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let decoded: DecodedRecord = decode_record(&bytes, row.segment, row.offset)?;
+        let payload = ResultPayload::decode(&decoded.record.payload)?;
+        Ok(Some(Candidate {
+            trace_digest: row.trace_digest,
+            memo_seq: row.memo_seq,
+            asset_uuid: decoded.record.asset_uuid,
+            payload,
+            segment: row.segment,
+            offset: row.offset,
+        }))
     }
 
     pub(crate) fn segment_path(&self, segment_id: u64) -> PathBuf {
