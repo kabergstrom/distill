@@ -370,11 +370,9 @@ impl ScanSnapshot {
     /// bundle, directory or symlink alias a rename from there would move.
     pub(crate) fn observes_at_or_under(&self, root: &str, path: &str) -> bool {
         fn any_under<V>(map: &BTreeMap<(String, String), V>, root: &str, path: &str) -> bool {
-            // Every key with `path` as a string prefix, then only those at or
-            // below it: a sibling such as `path.txt` sorts among them.
-            map.range((root.to_owned(), path.to_owned())..)
-                .take_while(|(key, _)| key.0 == root && key.1.starts_with(path))
-                .any(|(key, _)| path_matches(root, path, &key.0, &key.1))
+            subtree_entries(map, &(root.to_owned(), path.to_owned()))
+                .next()
+                .is_some()
         }
         any_under(&self.files, root, path)
             || any_under(&self.bundles, root, path)
@@ -1957,24 +1955,39 @@ fn key_matches(prefix: &(String, String), candidate: &(String, String)) -> bool 
     path_matches(&prefix.0, &prefix.1, &candidate.0, &candidate.1)
 }
 
+/// The entries of `map` at or below `prefix` (every entry of its root when
+/// the path is empty), in key order: the exact key, then the keys in
+/// `[path/, path0)`. Siblings such as `path.txt` or `path-old/x` sort between
+/// `path` and `path/`, so a walk from `path` that stopped at the first
+/// non-matching key would never reach the subtree.
+fn subtree_entries<'a, V>(
+    map: &'a BTreeMap<(String, String), V>,
+    prefix: &(String, String),
+) -> Box<dyn Iterator<Item = (&'a (String, String), &'a V)> + 'a> {
+    let (root, path) = prefix;
+    if path.is_empty() {
+        let root = root.clone();
+        return Box::new(
+            map.range((root.clone(), String::new())..)
+                .take_while(move |(key, _)| key.0 == root),
+        );
+    }
+    let below = map.range((root.clone(), format!("{path}/"))..(root.clone(), format!("{path}0")));
+    Box::new(map.get_key_value(prefix).into_iter().chain(below))
+}
+
 fn matching_values<'a, V>(
     map: &'a BTreeMap<(String, String), V>,
     prefix: &(String, String),
 ) -> impl Iterator<Item = &'a V> {
-    let start = prefix.clone();
-    let prefix = prefix.clone();
-    map.range(start..)
-        .take_while(move |(key, _)| key_matches(&prefix, key))
-        .map(|(_, value)| value)
+    subtree_entries(map, prefix).map(|(_, value)| value)
 }
 
 fn matching_keys<V>(
     map: &BTreeMap<(String, String), V>,
     prefix: &(String, String),
 ) -> Vec<(String, String)> {
-    let start = prefix.clone();
-    map.range(start..)
-        .take_while(|(key, _)| key_matches(prefix, key))
+    subtree_entries(map, prefix)
         .map(|(key, _)| key.clone())
         .collect()
 }
@@ -2561,6 +2574,83 @@ mod tests {
             );
         }
         assert_eq!(decode_diagnostic(&[7]), None);
+    }
+
+    fn scanned(path: &str, kind: ScannedFileKind, hash: u8) -> ((String, String), ScannedFile) {
+        (
+            ("main".to_owned(), path.to_owned()),
+            ScannedFile {
+                root_name: "main".to_owned(),
+                normalized_path: path.to_owned(),
+                kind,
+                modified_nanos: 1,
+                size: 1,
+                content_hash: (kind != ScannedFileKind::Directory).then_some(ContentHash([hash; 32])),
+                raw_relative_path: PlatformPathBytes::Unix(path.as_bytes().to_vec()),
+            },
+        )
+    }
+
+    fn snapshot(files: impl IntoIterator<Item = ((String, String), ScannedFile)>) -> ScanSnapshot {
+        let mut snapshot = ScanSnapshot {
+            files: files.into_iter().collect(),
+            ..ScanSnapshot::default()
+        };
+        rebuild_reverse_indexes(&mut snapshot).unwrap();
+        snapshot
+    }
+
+    /// `dir.txt` and `dir-old` sort between `dir` and `dir/child`; a subtree
+    /// walk that stops at the first key outside `dir` never reaches the child.
+    #[test]
+    fn subtree_walks_reach_children_past_sorting_siblings() {
+        let baseline = snapshot([
+            scanned("dir", ScannedFileKind::Directory, 0),
+            scanned("dir-old", ScannedFileKind::File, 1),
+            scanned("dir-old/x", ScannedFileKind::File, 2),
+            scanned("dir.txt", ScannedFileKind::File, 3),
+            scanned("dir/child", ScannedFileKind::File, 4),
+        ]);
+        let affected = ("main".to_owned(), "dir".to_owned());
+        assert_eq!(
+            matching_keys(&baseline.files, &affected),
+            [
+                ("main".to_owned(), "dir".to_owned()),
+                ("main".to_owned(), "dir/child".to_owned())
+            ]
+        );
+        assert!(baseline.observes_at_or_under("main", "dir/child"));
+        assert!(!baseline.observes_at_or_under("main", "di"));
+
+        // The child changed: the delta is not the same observation.
+        let changed = ScanDelta {
+            affected: vec![affected.clone()],
+            observed: snapshot([
+                scanned("dir", ScannedFileKind::Directory, 0),
+                scanned("dir/child", ScannedFileKind::File, 5),
+            ]),
+        };
+        assert!(!changed.is_same_namespace_observation(&baseline));
+        let unchanged = ScanDelta {
+            affected: vec![affected.clone()],
+            observed: snapshot([
+                scanned("dir", ScannedFileKind::Directory, 0),
+                scanned("dir/child", ScannedFileKind::File, 4),
+            ]),
+        };
+        assert!(unchanged.is_same_namespace_observation(&baseline));
+
+        // Removing the child replaces the subtree and leaves the siblings.
+        let mut applied = baseline.clone();
+        applied.apply_delta(ScanDelta {
+            affected: vec![affected],
+            observed: snapshot([scanned("dir", ScannedFileKind::Directory, 0)]),
+        });
+        assert_eq!(
+            applied.files.keys().map(|key| key.1.as_str()).collect::<Vec<_>>(),
+            ["dir", "dir-old", "dir-old/x", "dir.txt"]
+        );
+        assert_eq!(applied.logical_roots.get("dir/child"), None);
     }
 
     #[test]
