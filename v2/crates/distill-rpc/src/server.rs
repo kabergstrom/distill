@@ -721,12 +721,12 @@ impl Server {
     /// inline, inside the input the verification runs in.
     pub fn verification_build_requests(&self) -> Result<Vec<BuildRequest>, RpcFailure> {
         let txn = self.inner.current_snapshot().map_err(store_failure)?;
-        if let ConfigurationStatus::Failed(error) = &txn.configuration {
+        if let ConfigurationStatus::Failed(error) = txn.configuration().map_err(store_failure)? {
             return Err(RpcFailure::InvalidQuery {
                 detail: format!("cannot verify failed configuration: {error:?}"),
             });
         }
-        if let Some(error) = pipeline_failure(&self.inner.effective_pipeline(&txn)) {
+        if let Some(error) = pipeline_failure(self.inner.effective_pipeline(&txn)) {
             return Err(error);
         }
         let snapshot = txn.snapshot();
@@ -1280,10 +1280,15 @@ pub(crate) fn entry_role(authoring_only: bool) -> AuthoringEntryRole {
     }
 }
 
-pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFailure> {
-    match diagnostic.clone() {
-        PipelineDiagnostic::Ready => None,
-        PipelineDiagnostic::Failed(failure) => Some(RpcFailure::PipelineUnavailable(Box::new(
+/// The failure a pipeline diagnostic gates a request with; a store error
+/// reading it is one.
+pub(crate) fn pipeline_failure(
+    diagnostic: Result<PipelineDiagnostic, StoreError>,
+) -> Option<RpcFailure> {
+    match diagnostic.map_err(store_failure) {
+        Err(error) => Some(error),
+        Ok(PipelineDiagnostic::Ready) => None,
+        Ok(PipelineDiagnostic::Failed(failure)) => Some(RpcFailure::PipelineUnavailable(Box::new(
             PipelineUnavailableDiagnostic::PipelineFailure(failure),
         ))),
     }
@@ -1293,19 +1298,26 @@ pub(crate) fn pipeline_failure(diagnostic: &PipelineDiagnostic) -> Option<RpcFai
 // Snapshots
 
 /// One read transaction pinning one input version, on a connection of its
-/// own, shared by every snapshot of that version on one front end. The
-/// immutable facts are read once.
+/// own, shared by every snapshot of that version on one front end. What it
+/// pins is read through it when asked, each a primary-key read.
 pub(crate) struct SnapshotTxn {
     snapshot: distill_store::served::StoreSnapshot,
     pub(crate) stamp: SnapshotStamp,
-    pub(crate) configuration: ConfigurationStatus,
-    pipeline_installed_at: InputVersion,
-    pipeline: PipelineDiagnostic,
 }
 
 impl SnapshotTxn {
     pub(crate) fn snapshot(&self) -> &StoreReader {
         &self.snapshot
+    }
+
+    /// The configuration status this snapshot pins.
+    pub(crate) fn configuration(&self) -> Result<ConfigurationStatus, StoreError> {
+        Ok(configuration_status(&self.snapshot.configuration_state()?))
+    }
+
+    /// The served pipeline this snapshot pins, and its installing version.
+    pub(crate) fn pipeline(&self) -> Result<(InputVersion, PipelineDiagnostic), StoreError> {
+        read_served_pipeline(self.snapshot.served_blob(SERVED_PIPELINE)?)
     }
 }
 
@@ -1539,15 +1551,9 @@ impl Inner {
             }
         }
         let snapshot = StoreReader::open(self.handle.config.clone())?.begin_snapshot()?;
-        let configuration = configuration_status(&snapshot.configuration_state()?);
-        let (pipeline_installed_at, pipeline) =
-            read_served_pipeline(snapshot.served_blob(SERVED_PIPELINE)?)?;
         let txn = Rc::new(SnapshotTxn {
             stamp: snapshot.stamp(),
             snapshot,
-            configuration,
-            pipeline_installed_at,
-            pipeline,
         });
         *self.current_txn.borrow_mut() = Rc::downgrade(&txn);
         Ok(txn)
@@ -1560,15 +1566,17 @@ impl Inner {
 
     /// A snapshot's pipeline: the current diagnostic while the epoch it
     /// pinned is still installed (a runtime failure reaches it), else its own.
-    pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> PipelineDiagnostic {
-        match self.current_pipeline() {
-            Ok((installed_at, current)) if installed_at == txn.pipeline_installed_at => current,
-            Ok(_) => txn.pipeline.clone(),
+    /// Two primary-key reads: the pinned row and the current one.
+    pub(crate) fn effective_pipeline(&self, txn: &SnapshotTxn) -> Result<PipelineDiagnostic, StoreError> {
+        let (pinned_at, pinned) = txn.pipeline()?;
+        Ok(match self.current_pipeline() {
+            Ok((installed_at, current)) if installed_at == pinned_at => current,
+            Ok(_) => pinned,
             Err(error) => {
                 tracing::error!(%error, "cannot read the served pipeline");
-                txn.pipeline.clone()
+                pinned
             }
-        }
+        })
     }
 
     pub(crate) fn protocol_epoch(&self) -> u32 {

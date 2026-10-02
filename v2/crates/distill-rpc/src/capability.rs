@@ -592,10 +592,14 @@ fn authoring_gate(
         Ok(txn) => txn,
         Err(error) => return Some(AuthoringGate::Failure(store_failure(error))),
     };
-    if let ConfigurationStatus::Failed(error) = &txn.configuration {
-        return Some(AuthoringGate::ConfigurationFailed(error.clone()));
+    match txn.configuration() {
+        Ok(ConfigurationStatus::Failed(error)) => {
+            return Some(AuthoringGate::ConfigurationFailed(error));
+        }
+        Ok(ConfigurationStatus::Ready) => {}
+        Err(error) => return Some(AuthoringGate::Failure(store_failure(error))),
     }
-    if let Some(error) = pipeline_failure(&server.inner.effective_pipeline(&txn)) {
+    if let Some(error) = pipeline_failure(server.inner.effective_pipeline(&txn)) {
         return Some(AuthoringGate::Failure(error));
     }
     None
@@ -788,8 +792,8 @@ impl MetadataHub {
         let txn = metadata_try!(self.server.inner.current_snapshot());
         MetadataCall::Success(MetadataDiagnostics {
             stamp: txn.stamp,
-            configuration: txn.configuration.clone(),
-            pipeline: self.server.inner.effective_pipeline(&txn),
+            configuration: metadata_try!(txn.configuration()),
+            pipeline: metadata_try!(self.server.inner.effective_pipeline(&txn)),
             namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
         })
     }
@@ -913,8 +917,8 @@ impl MetadataSnapshot {
         };
         MetadataCall::Success(MetadataDiagnostics {
             stamp: self.basis.snapshot,
-            configuration: txn.configuration.clone(),
-            pipeline: self.server.inner.effective_pipeline(&txn),
+            configuration: metadata_try!(txn.configuration()),
+            pipeline: metadata_try!(self.server.inner.effective_pipeline(&txn)),
             namespace_errors: metadata_try!(txn.snapshot().namespace_errors()),
         })
     }
@@ -1721,7 +1725,7 @@ impl Snapshot {
 
     pub fn configuration(&self) -> RpcResult<ConfigurationStatus> {
         match self.preflight() {
-            Ok(txn) => RpcResult::Success(txn.configuration.clone()),
+            Ok(txn) => RpcResult::Success(rpc_try!(txn.configuration())),
             Err(result) => result,
         }
     }
@@ -1759,7 +1763,7 @@ impl Snapshot {
             Err(result) => return result,
         };
         if query.terminal_type.is_some() {
-            if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
+            if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn)) {
                 return RpcResult::Failure(error);
             }
         }
@@ -1781,7 +1785,7 @@ impl Snapshot {
             Ok(txn) => txn,
             Err(result) => return result,
         };
-        if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
+        if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn)) {
             return RpcResult::Failure(error);
         }
         match rpc_try!(txn.snapshot().served_entry_meta(uuid)) {
@@ -1856,11 +1860,11 @@ impl Snapshot {
             Ok(txn) => txn,
             Err(result) => return done(result),
         };
-        if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn)) {
+        if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn)) {
             return done(RpcResult::Failure(error));
         }
-        if let ConfigurationStatus::Failed(error) = &txn.configuration {
-            return done(RpcResult::ConfigurationFailed(error.clone()));
+        if let ConfigurationStatus::Failed(error) = txn.configuration()? {
+            return done(RpcResult::ConfigurationFailed(error));
         }
         let snapshot = txn.snapshot();
         let derived = snapshot.served_derived_output(uuid)?;
@@ -2002,7 +2006,7 @@ impl Snapshot {
         }
         match self.preflight::<()>() {
             Ok(txn) => {
-                if let Some(error) = pipeline_failure(&self.server.inner.effective_pipeline(&txn))
+                if let Some(error) = pipeline_failure(self.server.inner.effective_pipeline(&txn))
                 {
                     outcome = Err(error);
                 }

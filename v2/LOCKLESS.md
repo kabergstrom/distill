@@ -829,7 +829,8 @@ should reach zero by the end of phase 6.
       in-process pack path is gone. The daemon does not own the output
       directory, so it must lie outside every asset root.
     - Snapshots of one version on one front end share a `SnapshotTxn`;
-      each capability has its own expiry.
+      each capability has its own expiry. The configuration and the
+      pipeline are read through it per request, not copied at open.
     - Only the capnp transport arms expiry. In-process callers (tests)
       release on drop.
     - The snapshot policy is per front end: a test installs it on the
@@ -1062,6 +1063,12 @@ should reach zero by the end of phase 6.
   holds (`holds`) skips the run and its publication.
   - Removed: `last_failure`, the requeue counter and the `last_trace` getter.
     They were written and never read outside tests.
+- **A snapshot reads what it pins when asked.** `SnapshotTxn` holds only its
+  read transaction and stamp. `configuration()` and `pipeline()` are each one
+  primary-key read through it, and `effective_pipeline` reads the pinned row
+  and the current one. Before, both were copied into the struct at open.
+  `pipeline_failure` takes the read's result, so a store error gates a request
+  like a pipeline failure does.
 
 ## 7. Test baseline
 
