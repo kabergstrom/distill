@@ -181,6 +181,7 @@ fn selective_reads(reader: &StoreReader) {
     let path = bundle_path(42);
     reader.bundles_at_path(&path).unwrap();
     reader.poisoned_bundles().unwrap();
+    reader.generated_bundles().unwrap();
     reader.bundles_with_reserved_entry("$record").unwrap();
     reader.bundles_referencing_path(REFERENCED).unwrap();
     reader.asset_exists(asset_uuid(42, 1)).unwrap();
@@ -801,4 +802,35 @@ fn reading_bundle_file_hashes_skips_their_bytes() {
     println!("hashes: {hash_read} bytes read; bundle bytes: {bytes_read}");
     assert!(hash_read <= 512 * 1024, "{hash_read} bytes read");
     assert!(bytes_read >= 20 * hash_read, "{hash_read} against {bytes_read} bytes read");
+}
+
+/// Reads of rare rows walk their partial index, whatever order they answer
+/// in: the generated bundles (`bundles_by_origin`), the poisoned ones
+/// (`bundles_poisoned`).
+#[test]
+fn rare_row_reads_walk_their_partial_index() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, store) = store_with(200);
+    let mut reader = store.reader().unwrap();
+    let cases: [(&dyn Fn(&StoreReader), &[&str]); 2] = [
+        (
+            &|reader| drop(reader.generated_bundles().unwrap()),
+            &[
+                "SEARCH bundles USING INDEX bundles_by_origin (origin_rules_bundle>?)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ],
+        ),
+        (
+            &|reader| drop(reader.poisoned_bundles().unwrap()),
+            &["SCAN bundles USING INDEX bundles_poisoned"],
+        ),
+    ];
+    for (read, expected) in cases {
+        connection(&mut reader).trace(Some(trace));
+        read(&reader);
+        connection(&mut reader).trace(None);
+        let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        assert_eq!(explain(connection(&mut reader), &statements[0]), expected);
+    }
 }

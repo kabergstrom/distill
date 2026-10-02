@@ -640,11 +640,13 @@ impl StoreReader {
     }
 
     /// Every bundle a directory import generated (its row carries a
-    /// [`DirectoryOrigin`]), by bundle UUID.
+    /// [`DirectoryOrigin`]), by bundle UUID: a walk of the partial
+    /// `bundles_by_origin`, whose rows are sorted after (the order alone
+    /// would walk every bundle's primary key).
     pub fn generated_bundles(&self) -> Result<Vec<BundleMeta>, StoreError> {
         self.query_rows(
             &format!(
-                "SELECT {BUNDLE_COLUMNS} FROM bundles
+                "SELECT {BUNDLE_COLUMNS} FROM bundles INDEXED BY bundles_by_origin
                  WHERE origin_rules_bundle IS NOT NULL ORDER BY bundle_uuid"
             ),
             [],
