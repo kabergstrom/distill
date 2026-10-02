@@ -2419,9 +2419,9 @@ impl ImportBackend for RootedImportBackend<'_> {
 
 /// The rows SQL narrows a (valid) query's enumeration to, by its most
 /// selective key: the final segment its glob names, the prefix subtree or
-/// the glob's literal prefix, then the extension its glob's literal tail
-/// names. The query's filters still decide every row. A bare `*` or `**`
-/// selects every row.
+/// the glob's literal prefix (whichever is longer; every answer lies in
+/// both), then the extension its glob's literal tail names. The query's
+/// filters still decide every row. A bare `*` or `**` selects every row.
 fn file_selection(query: &FileQuery) -> PathSelection<'_> {
     let keys = query
         .path_glob
@@ -2430,6 +2430,9 @@ fn file_selection(query: &FileQuery) -> PathSelection<'_> {
         .unwrap_or_default();
     match (keys.name, &query.path_prefix, keys.extension) {
         (Some(name), _, _) => PathSelection::Name(name),
+        (None, Some(prefix), _) if prefix.len() < keys.prefix.len() => {
+            PathSelection::Prefix(keys.prefix)
+        }
         (None, Some(prefix), _) => PathSelection::Subtree(prefix),
         (None, None, _) if !keys.prefix.is_empty() => PathSelection::Prefix(keys.prefix),
         (None, None, Some(extension)) => PathSelection::Extension(extension),
@@ -4076,6 +4079,11 @@ mod enumerate_tests {
             FileQuery {
                 path_prefix: None,
                 path_glob: Some("*.png".into()),
+            },
+            // The glob's literal prefix is longer than the subtree.
+            FileQuery {
+                path_prefix: Some("bulk".into()),
+                path_glob: Some("bulk/b1234?".into()),
             },
         ] {
             let before = reader.pages_fetched().unwrap();
