@@ -1552,6 +1552,13 @@ pub(crate) fn doctor_verify_builds(
 
 /// Finish §10 tag indexing against a namespace that has advanced durably but
 /// is not yet served: the open input applies its RPC delta afterwards.
+///
+/// A whole-namespace bulk operation, run only by publications that replace
+/// the complete namespace (a full rescan, a configuration candidate): it
+/// reindexes every asset row and replaces the served tag projection. If
+/// indexing fails, every asset row the input now holds is poisoned with its
+/// bundle, read from the input only then; a failure of that read fails the
+/// publication, which then commits nothing.
 pub(crate) fn refine_published_tag_index(
     input: OpenInput<'_>,
     scanner: RootedScanner,
@@ -1559,18 +1566,23 @@ pub(crate) fn refine_published_tag_index(
     pipeline: PipelineSnapshot,
     targets: &BTreeMap<String, Target>,
     max_depth: usize,
-    fallback_assets: &BTreeMap<AssetUuid, BundleUuid>,
-) -> PublishedTagIndex {
-    try_refine_published_tag_index(
-        input.0,
+) -> Result<PublishedTagIndex, String> {
+    match try_refine_published_tag_index(
+        &mut *input.0,
         scanner,
         authority,
         pipeline,
         targets,
         max_depth,
         None,
-    )
-    .unwrap_or_else(|_| PublishedTagIndex::conservatively_poisoned(fallback_assets))
+    ) {
+        Ok(indexed) => Ok(indexed),
+        Err(_) => input
+            .0
+            .all_asset_bundles()
+            .map(|assets| PublishedTagIndex::conservatively_poisoned(&assets))
+            .map_err(|error| format!("read the assets to poison their tags: {error}")),
+    }
 }
 
 /// Reindex only identities whose authored rows changed in the same input
@@ -1617,6 +1629,10 @@ fn try_refine_published_tag_index(
     requested_assets: Option<Vec<AssetUuid>>,
 ) -> Result<PublishedTagIndex, String> {
     let tag_epoch = authority.source_hash();
+    #[cfg(test)]
+    if tests::FAIL_TAG_REFINEMENT.with(|fail| fail.replace(false)) {
+        return Err("injected tag-index refinement failure".to_owned());
+    }
     let basis = store.input_version();
     let assets = match requested_assets {
         Some(assets) => assets,
@@ -4100,6 +4116,12 @@ mod tests {
     mod eager_trace;
     mod lazy_trace;
     use eager_trace::{EagerEntry, EagerTraceSource};
+
+    thread_local! {
+        /// Fail the next tag-index refinement on this thread.
+        pub(super) static FAIL_TAG_REFINEMENT: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -4766,8 +4788,8 @@ mod tests {
             pipeline,
             &BTreeMap::from([("dev".to_owned(), build_target)]),
             64,
-            &BTreeMap::from([(ASSET, BUNDLE)]),
-        );
+        )
+        .unwrap();
         writer.finish_input(true).unwrap();
         let indexed = coordinator
             .open_reader()
@@ -5029,6 +5051,33 @@ mod tests {
     /// A requester's answer comes from the compiled state its own snapshot
     /// sees: a snapshot older than a pipeline failure still answers from its
     /// epoch, while a newer one sees the failure.
+    /// A complete refinement that fails poisons the tags of every asset row
+    /// its open input holds, each with its bundle, read only then.
+    #[test]
+    fn a_failed_complete_tag_refinement_poisons_every_asset_of_its_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, _request, calls) = identity_fixture(&temp);
+        let compiled = coordinator
+            .compiled_at(&coordinator.open_reader().unwrap())
+            .unwrap();
+        let mut writer = coordinator.open_writer().unwrap();
+        writer.open_input().unwrap();
+        FAIL_TAG_REFINEMENT.with(|fail| fail.set(true));
+        let indexed = refine_published_tag_index(
+            OpenInput::new(&mut writer).unwrap(),
+            compiled.scanner().clone(),
+            compiled.schema_authority().unwrap(),
+            compiled.pipeline_snapshot(),
+            compiled.build_targets(),
+            64,
+        )
+        .unwrap();
+        writer.finish_input(false).unwrap();
+        assert_eq!(indexed.poisons, BTreeMap::from([(ASSET, BUNDLE)]));
+        assert_eq!(indexed.tags, BTreeMap::from([(ASSET, BTreeMap::new())]));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn a_build_answers_under_the_compiled_state_of_its_snapshot() {
         let temp = tempfile::tempdir().unwrap();

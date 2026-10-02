@@ -764,12 +764,6 @@ impl DaemonCoordinator {
                         .map_err(|error| error.to_string())?;
                 }
                 let authority = tags.authority().filter(|_| refine_tags);
-                let fallback_bundles = match authority {
-                    Some(_) => store
-                        .all_asset_bundles()
-                        .map_err(|error| error.to_string())?,
-                    None => BTreeMap::new(),
-                };
                 let mut commit = publish_scan(
                     store,
                     store.input_version(),
@@ -790,8 +784,7 @@ impl DaemonCoordinator {
                         tags.compiled.pipeline_snapshot(),
                         tags.compiled.build_targets(),
                         tags.max_dependency_depth,
-                        &commit_asset_bundles(&commit, &fallback_bundles),
-                    )
+                    )?
                     .apply(&mut commit);
                 }
                 Ok(Some(commit))

@@ -894,9 +894,9 @@ impl StoreReader {
     }
 
     /// Raw deterministic asset-to-bundle projection, including poisoned
-    /// skeleton rows. Coordinated publishers capture it before advancing the
-    /// durable version so an in-memory tag-index fallback can retain the exact
-    /// affected bundle identity without a fallible post-commit store read.
+    /// skeleton rows. A whole-namespace bulk read: only a failed complete
+    /// tag-index refinement (a full rescan or configuration publication)
+    /// reads it, inside its open input, to poison every asset's tags.
     pub fn all_asset_bundles(&self) -> Result<BTreeMap<AssetUuid, BundleUuid>, StoreError> {
         let mut statement = self
             .conn

@@ -727,16 +727,6 @@ impl DaemonCoordinator {
         let tag_epoch = schema_authority.source_hash();
         let max_dependency_depth = self.operational_configuration().max_dependency_depth;
         let base = self.server.stamp_of(store).version;
-        let fallback_bundles = match store.all_asset_bundles() {
-            Ok(bundles) => bundles,
-            Err(error) => {
-                if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
-                    drop(runtime);
-                    return self.publish_pipeline_rejection(store, failure);
-                }
-                return Err(CoordinatorError::InvalidManifest(error.to_string()));
-            }
-        };
         let mut staged: Option<StagedCompiled<'_>> = None;
         let mut published_pipeline = None;
         let result = self
@@ -808,8 +798,7 @@ impl DaemonCoordinator {
                     compiled.pipeline_snapshot(),
                     compiled.build_targets(),
                     max_dependency_depth,
-                    &commit_asset_bundles(&commit, &fallback_bundles),
-                )
+                )?
                 .apply(&mut commit);
                 commit.pipeline_epoch_changed = true;
                 #[cfg(test)]
@@ -2974,24 +2963,6 @@ pub(crate) fn publish_incremental_paths(
     )
     .map_err(|error| error.to_string())?;
     Ok(commit)
-}
-
-fn commit_asset_bundles(
-    commit: &Commit,
-    previous: &BTreeMap<AssetUuid, BundleUuid>,
-) -> BTreeMap<AssetUuid, BundleUuid> {
-    let mut bundles = previous.clone();
-    for mutation in &commit.authoring {
-        match mutation {
-            AuthoringMutation::Set(entry) => {
-                bundles.insert(entry.uuid, entry.bundle);
-            }
-            AuthoringMutation::Remove { uuid } => {
-                bundles.remove(uuid);
-            }
-        }
-    }
-    bundles
 }
 
 fn commit_affected_asset_bundles(commit: &Commit) -> BTreeMap<AssetUuid, Option<BundleUuid>> {
