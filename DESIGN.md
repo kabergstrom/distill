@@ -5429,6 +5429,21 @@ One writer, many snapshot readers:
 - **Metadata snapshots** — the hot metadata index is an immutable in-memory
   structure versioned by the coordinator; taking or holding a snapshot is an
   `Arc` clone. RPC snapshot capabilities (§17) pin one.
+- **Compiled state** — what the daemon compiles from a configuration (the
+  schema authority, build targets, pipeline projection and importers, the
+  pipeline epoch or its failure, the scanner and its roots) is one immutable
+  entry keyed by the input version that published it
+  (`store_meta.compiled_version`, written in that version's input). Every
+  owner of a store connection (the process loop, each RPC connection, each
+  build worker) looks the entry up for the version its own transaction
+  sees; a version with no entry is a typed retryable error, never another
+  version's state. A publication stages its entry before it commits and
+  confirms it after, so a failed publication changes nothing; the module
+  host and the watcher's roots change only after the commit. Superseded
+  entries live while held, and a bounded number stay for a while for older
+  snapshots. State with no compiled form (the pending scan rejection with
+  the subjects that heal it, the configuration source's error) is SQLite
+  rows that only the scan and configuration publications write.
 - **Build pool** — pure work (imports, processing, artifact encoding) runs on
   a work-stealing pool sized by `parallelism`. Jobs read a pinned snapshot,
   never the live store, and return results to the coordinator for commit.
@@ -5483,9 +5498,10 @@ for one target. Its key (`KeyKind::Node`, canonical `DSNK` bytes) holds
 only its *static* inputs: the asset uuid, its entry metadata and its
 bundle's content hash, the chain (each stage's processor identity and
 types, the terminal and extra types, the pipeline dylib hash), the target
-definition, the validated flag, and the migration-planner and artifact
-format versions. Everything a build discovers while it runs (reads of
-other assets' built artifacts, path resolutions, queries, tool and control
+definition, the validated flag, every type the chain names with its
+logical and layout hashes and build-only policy, and the migration-planner
+and artifact format versions. Everything a build discovers while it runs
+(reads of other assets' built artifacts, path resolutions, queries, tool and control
 calls, reference and role checks) is *dynamic*: it is recorded in the
 node's trace rather than its key, and a strong load dependency enters the
 trace as a `Read` of the content its dependency built to. A cached node

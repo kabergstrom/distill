@@ -85,3 +85,40 @@ fn a_source_replacement_drops_only_that_source() {
     assert!(store.watched_imports_reading(["x"], false).unwrap().is_empty());
     assert_eq!(bundles(store.watched_imports_reading(["y"], false).unwrap()), [2]);
 }
+
+#[test]
+fn the_built_marker_commits_and_rolls_back_with_the_complete_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig::new(dir.path().join(".distill"));
+    {
+        let mut store = Store::open(config.clone()).unwrap();
+        assert!(!store.import_index_built().unwrap());
+        // A per-source replacement is not the complete index.
+        store
+            .replace_import_index(Some(&[("main".to_owned(), "a.bundle".to_owned())]), &[])
+            .unwrap();
+        assert!(!store.import_index_built().unwrap());
+        // A complete build whose transaction rolls back marks nothing.
+        let rolled_back: Result<(), distill_store::StoreError> = store.write_transaction_with(
+            |error| error,
+            |store| {
+                store.replace_import_index(None, &[source("a.bundle", 1, Vec::new())])?;
+                assert!(store.import_index_built()?);
+                Err(distill_store::StoreError::Rejected {
+                    detail: "rolled back".to_owned(),
+                })
+            },
+        );
+        assert!(rolled_back.is_err());
+        assert!(!store.import_index_built().unwrap());
+        assert!(store.watched_imports().unwrap().is_empty());
+        store
+            .replace_import_index(None, &[source("a.bundle", 1, Vec::new())])
+            .unwrap();
+        assert!(store.import_index_built().unwrap());
+    }
+    // A restart sees the built index.
+    let store = Store::open(config).unwrap();
+    assert!(store.import_index_built().unwrap());
+    assert_eq!(bundles(store.watched_imports().unwrap()), [1]);
+}

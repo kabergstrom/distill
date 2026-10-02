@@ -33,7 +33,6 @@
 //! publishes in the next pass's version.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::Ordering;
 
 use distill_store::files::ObservedDiagnostic;
 
@@ -68,7 +67,6 @@ pub(super) enum ScanStep {
     Diagnostics {
         under: Option<Vec<(String, String)>>,
         rows: Vec<ObservedDiagnostic>,
-        heals: bool,
     },
     Incremental(Box<IncrementalStep>),
     Full(Box<FullStep>),
@@ -81,11 +79,10 @@ pub(super) struct IncrementalStep {
     baseline: ScanSnapshot,
     delta: ScanDelta,
     claims: Vec<SourceClaims>,
-    configuration_error: Option<ConfigurationError>,
-    namespace_errors: Vec<NamespaceError>,
     renames: Vec<LogicalRename>,
     tags: TagInputs,
-    /// The batch revalidated a pending scan rejection's subjects.
+    /// The batch revalidated a pending scan rejection's subjects: the
+    /// publication heals it.
     heals: bool,
 }
 
@@ -93,23 +90,39 @@ pub(super) struct FullStep {
     candidate: ScanCandidate,
     claims: Vec<SourceClaims>,
     tags: TagInputs,
+    /// The scan observed every root: the publication heals the pending scan
+    /// rejection.
     heals: bool,
+    source_error: SourceError,
 }
 
 pub(super) struct RejectionStep {
-    pending: PendingScanRejection,
-    configuration: ConfigurationStatus,
+    observed: PendingScanRejection,
+    /// The scan observed every root: its rejection replaces the pending
+    /// one instead of joining it.
+    replaces_pending: bool,
 }
 
-/// What a scan publication pins for its projection and tag index.
+/// What a step does to the configuration source's stored error.
+#[derive(Clone)]
+pub(super) enum SourceError {
+    Keep,
+    Set(ConfigurationError),
+    Heal,
+}
+
+/// What a scan publication pins for its projection and tag index: the
+/// compiled state of the version the pass starts from.
 struct TagInputs {
-    projection: PipelineProjection,
-    authority: Option<Arc<ProjectSchemaAuthority>>,
+    compiled: Arc<Compiled>,
     tag_epoch: [u8; 32],
-    pipeline: PipelineSnapshot,
-    targets: Arc<BTreeMap<String, Target>>,
     max_dependency_depth: usize,
-    scanner: RootedScanner,
+}
+
+impl TagInputs {
+    fn authority(&self) -> Option<Arc<ProjectSchemaAuthority>> {
+        self.compiled.schema_authority()
+    }
 }
 
 /// Which imports a pass reconciles.
@@ -191,8 +204,9 @@ impl DaemonCoordinator {
         batch: &WatcherBatch,
         capabilities_changed: bool,
     ) -> Result<PassOutcome, CoordinatorError> {
+        let compiled = self.loop_compiled(store)?;
         let base = self.server.stamp_of(store).version;
-        let step = self.incremental_step(store, batch)?;
+        let step = self.incremental_step(&compiled, store, batch)?;
         self.pass(
             store,
             base,
@@ -214,9 +228,10 @@ impl DaemonCoordinator {
         queue: &mut WatcherQueue,
     ) -> Result<PassOutcome, CoordinatorError> {
         loop {
+            let compiled = self.loop_compiled(store)?;
             queue.arm_scan();
             let base = self.server.stamp_of(store).version;
-            let step = self.full_step(store);
+            let step = self.full_step(&compiled, store);
             let action = queue.finish_scan();
             if let WatcherAction::FullRescan = action {
                 continue;
@@ -242,18 +257,9 @@ impl DaemonCoordinator {
         use rayon::prelude::*;
 
         // The import index is built in an input; one that rolls back takes
-        // the index rows with it.
-        let index_built = self.authoring.import_index_built.load(Ordering::Acquire);
-        let restore_index = || {
-            self.authoring
-                .import_index_built
-                .store(index_built, Ordering::Release)
-        };
-
+        // the index rows and their built marker with it.
         let (planned, overlay) = if self.needs_plan(store, &step, scope)? {
-            let plan = self.plan(store, base, &step, scope);
-            restore_index();
-            plan?
+            self.plan(store, base, &step, scope)?
         } else {
             (Vec::new(), None)
         };
@@ -330,13 +336,7 @@ impl DaemonCoordinator {
             }
             Ok(commit)
         });
-        let published = match published {
-            Ok(published) => published,
-            Err(error) => {
-                restore_index();
-                return Err(CoordinatorError::Coordinated(error));
-            }
-        };
+        let published = published.map_err(CoordinatorError::Coordinated)?;
         self.finish_scan_step(&step);
         Ok(PassOutcome {
             stamp: published.unwrap_or_else(|| self.server.stamp_of(store)),
@@ -482,21 +482,21 @@ impl DaemonCoordinator {
 
     /// The step for one watcher batch: reopen only its affected paths or
     /// directory subtrees and merge those observations into the published
-    /// state.
+    /// state, under `compiled`, the compiled state of the pass's base.
     pub(super) fn incremental_step(
         &self,
+        compiled: &Arc<Compiled>,
         store: &mut Store,
         batch: &WatcherBatch,
     ) -> Result<ScanStep, CoordinatorError> {
-        let pending_subjects = locked(&self.scan)
-            .rejection
-            .as_ref()
-            .map(|pending| pending.subjects.clone())
-            .unwrap_or_default();
+        let scanner = compiled.scanner();
+        let pending = PendingScanRejection::stored(store)?;
+        let healthy = pending.is_none();
+        let pending_subjects = pending.map(|pending| pending.subjects).unwrap_or_default();
         let event_keys = batch
             .paths
             .iter()
-            .filter_map(|event| self.scanner.event_path_key(event).ok().flatten())
+            .filter_map(|event| scanner.event_path_key(event).ok().flatten())
             .collect::<Vec<_>>();
         let logical_contains = |prefix: &(String, String), candidate: &(String, String)| {
             prefix.0 == candidate.0
@@ -512,8 +512,7 @@ impl DaemonCoordinator {
                 event == subject || subject.starts_with(event) || event.starts_with(subject)
             });
             physical_overlap
-                || self
-                    .scanner
+                || scanner
                     .event_path_key(subject)
                     .ok()
                     .flatten()
@@ -536,8 +535,8 @@ impl DaemonCoordinator {
         }
         let mut renames = Vec::new();
         for rename in &batch.renames {
-            let from = self.scanner.event_path_key(&rename.from)?;
-            let to = self.scanner.event_path_key(&rename.to)?;
+            let from = scanner.event_path_key(&rename.from)?;
+            let to = scanner.event_path_key(&rename.to)?;
             if let (Some((from_root, from_path)), Some((to_root, to_path))) = (from, to) {
                 if from_root == to_root {
                     renames.push(LogicalRename {
@@ -550,7 +549,7 @@ impl DaemonCoordinator {
         }
         let (delta, baseline) = {
             let stored = StoredBaseline::new(store);
-            let delta = self.scanner.scan_incremental_delta(&stored, &scan_paths);
+            let delta = scanner.scan_incremental_delta(&stored, &scan_paths);
             stored.finish()?;
             match delta {
                 Ok(None) => return Ok(ScanStep::Unchanged),
@@ -559,10 +558,7 @@ impl DaemonCoordinator {
                     let baseline = ScanSnapshot::load_under(store, delta.affected_prefixes())?;
                     (delta, baseline)
                 }
-                Err(error) => {
-                    locked(&self.scan).healthy = false;
-                    return self.rejection_step(&error, heals);
-                }
+                Err(error) => return self.rejection_step(compiled, &error, heals),
             }
         };
         // A rename from a path never observed (the temporary file of an
@@ -572,36 +568,27 @@ impl DaemonCoordinator {
             && renames.iter().all(|rename| {
                 delta.rename_moves_nothing(&baseline, &rename.root_name, &rename.from_path)
             })
-            && locked(&self.scan).healthy
+            && healthy
         {
             // Diagnostics are replaced with their affected subtree even when
             // the authored namespace itself did not change.
             return Ok(ScanStep::Diagnostics {
                 under: Some(delta.affected_prefixes().to_vec()),
                 rows: delta.observed().encoded_diagnostic_rows(),
-                heals,
             });
         }
-        let tags = self.tag_inputs();
+        let tags = self.tag_inputs(compiled);
         let claims = bundle_claims(
             delta
                 .observed_bundle_entries()
                 .map(|(_, source)| source.as_ref()),
-            &tags.projection,
-            tags.authority.as_deref(),
+            compiled.projection(),
+            tags.authority().as_deref(),
         )?;
-        // A healed rejection's errors are not this publication's.
-        let (configuration_error, namespace_errors) = if heals {
-            (locked(&self.configuration_error).clone(), Vec::new())
-        } else {
-            (self.configuration_error(), self.pending_scan_errors())
-        };
         Ok(ScanStep::Incremental(Box::new(IncrementalStep {
             baseline,
             delta,
             claims,
-            configuration_error,
-            namespace_errors,
             renames,
             tags,
             heals,
@@ -609,10 +596,15 @@ impl DaemonCoordinator {
     }
 
     /// The step for one complete identity-checked namespace scan.
-    pub(super) fn full_step(&self, store: &mut Store) -> Result<ScanStep, CoordinatorError> {
-        match self.scanner.scan() {
+    pub(super) fn full_step(
+        &self,
+        compiled: &Arc<Compiled>,
+        store: &mut Store,
+    ) -> Result<ScanStep, CoordinatorError> {
+        match compiled.scanner().scan() {
             Ok(scan)
-                if locked(&self.scan).healthy && self.scan_initialized.get().is_some() =>
+                if PendingScanRejection::stored(store)?.is_none()
+                    && self.scan_initialized.get().is_some() =>
             {
                 if scan.same_namespace_observation(&ScanSnapshot::load(store)?) {
                     // Warning-grade exclusions are scanner state, not authored
@@ -620,106 +612,74 @@ impl DaemonCoordinator {
                     Ok(ScanStep::Diagnostics {
                         under: None,
                         rows: scan.encoded_diagnostic_rows(),
-                        heals: false,
                     })
                 } else {
-                    self.candidate_step(scan, &[], true)
+                    self.candidate_step(compiled, scan, &[], true, SourceError::Keep)
                 }
             }
-            Ok(scan) => self.candidate_step(scan, &[], true),
-            Err(error) => {
-                locked(&self.scan).healthy = false;
-                self.rejection_step(&error, true)
-            }
+            Ok(scan) => self.candidate_step(compiled, scan, &[], true, SourceError::Keep),
+            Err(error) => self.rejection_step(compiled, &error, true),
         }
     }
 
-    /// The step publishing `scan` as the complete namespace.
+    /// The step publishing `scan` as the complete namespace. `heals` when
+    /// it observed every root.
     pub(super) fn candidate_step(
         &self,
+        compiled: &Arc<Compiled>,
         scan: ScanSnapshot,
         renames: &[LogicalRename],
         heals: bool,
+        source_error: SourceError,
     ) -> Result<ScanStep, CoordinatorError> {
-        let tags = self.tag_inputs();
-        let mut candidate =
-            ScanCandidate::build(scan, self.configuration_error(), tags.authority.as_deref())?;
-        if !heals {
-            candidate
-                .namespace_errors
-                .extend(self.pending_scan_errors());
-        }
+        let tags = self.tag_inputs(compiled);
+        let authority = tags.authority();
+        let mut candidate = ScanCandidate::build(scan, authority.as_deref())?;
         candidate.renames.extend_from_slice(renames);
         let claims = bundle_claims(
             candidate.scan.bundle_rows(),
-            &tags.projection,
-            tags.authority.as_deref(),
+            compiled.projection(),
+            authority.as_deref(),
         )?;
         Ok(ScanStep::Full(Box::new(FullStep {
             candidate,
             claims,
             tags,
             heals,
+            source_error,
         })))
     }
 
-    /// The step recording a scan that could not observe some subjects.
+    /// The step recording a scan that could not observe some subjects. Its
+    /// rejection replaces the pending one when `replaces_pending`, and joins
+    /// it otherwise.
     fn rejection_step(
         &self,
+        compiled: &Compiled,
         error: &ScanError,
         replaces_pending: bool,
     ) -> Result<ScanStep, CoordinatorError> {
-        let observed_rejection = classify_scan_rejection(&self.scanner, error)?;
-        let previous_pending = locked(&self.scan).rejection.clone();
-        let rejection = if replaces_pending {
-            observed_rejection
-        } else {
-            select_scan_rejection(
-                previous_pending
-                    .as_ref()
-                    .map(|pending| pending.rejection.clone())
-                    .into_iter()
-                    .chain([observed_rejection]),
-            )?
-        };
-        let mut subjects = self.scanner.rejection_subjects(error);
-        if !replaces_pending {
-            if let Some(previous) = &previous_pending {
-                subjects.extend(previous.subjects.iter().cloned());
-            }
-        }
+        let scanner = compiled.scanner();
+        let rejection = classify_scan_rejection(scanner, error)?;
+        let mut subjects = scanner.rejection_subjects(error);
         subjects.sort_unstable();
         subjects.dedup();
-        let source_configuration = locked(&self.configuration_error).clone();
-        let external_configuration = ConfigurationError::select_canonical(
-            source_configuration
-                .into_iter()
-                .chain(rejection.configuration.clone()),
-        )
-        .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?;
-        let configuration =
-            external_configuration.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed);
         Ok(ScanStep::Rejection(Box::new(RejectionStep {
-            pending: PendingScanRejection {
+            observed: PendingScanRejection {
                 rejection,
                 subjects,
             },
-            configuration,
+            replaces_pending,
         })))
     }
 
-    fn tag_inputs(&self) -> TagInputs {
-        let authority = self.schema_authority();
+    fn tag_inputs(&self, compiled: &Arc<Compiled>) -> TagInputs {
         TagInputs {
-            projection: self.authoring.pipeline_projection(),
-            tag_epoch: authority
-                .as_ref()
+            tag_epoch: compiled
+                .schema_authority()
                 .map_or([0; 32], |authority| authority.source_hash()),
-            authority,
-            pipeline: self.pipeline_snapshot(),
-            targets: self.build_targets.load(),
+            compiled: Arc::clone(compiled),
             max_dependency_depth: self.operational_configuration().max_dependency_depth,
-            scanner: self.scanner.clone(),
         }
     }
 
@@ -733,7 +693,7 @@ impl DaemonCoordinator {
     ) -> Result<Option<Commit>, String> {
         match step {
             ScanStep::Unchanged => Ok(None),
-            ScanStep::Diagnostics { under, rows, .. } => {
+            ScanStep::Diagnostics { under, rows } => {
                 store
                     .replace_scan_diagnostics(under.as_deref(), rows)
                     .map_err(|error| error.to_string())?;
@@ -741,10 +701,15 @@ impl DaemonCoordinator {
             }
             ScanStep::Incremental(step) => {
                 let tags = &step.tags;
+                if step.heals {
+                    // The batch revalidated every rejected subject.
+                    store
+                        .input_transaction(|transaction| transaction.set_scan_rejection(None))
+                        .map_err(|error| error.to_string())?;
+                }
+                let authority = tags.authority();
                 let inputs = PlanInputs {
-                    configuration_error: step.configuration_error.clone(),
-                    namespace_errors: step.namespace_errors.clone(),
-                    authority: tags.authority.as_deref(),
+                    authority: authority.as_deref(),
                     fresh: fresh_bundles(&step.delta),
                 };
                 let mut commit = publish_incremental_scan(
@@ -755,20 +720,20 @@ impl DaemonCoordinator {
                     &step.claims,
                     &inputs,
                     &step.renames,
-                    &tags.projection,
+                    tags.compiled.projection(),
                     tags.tag_epoch,
                 )
                 .map_err(|error| error.to_string())?;
-                if let Some(authority) = tags.authority.clone().filter(|_| refine_tags) {
+                if let Some(authority) = authority.filter(|_| refine_tags) {
                     let affected = commit_affected_asset_bundles(&commit);
                     if !affected.is_empty() {
                         crate::build::refine_published_tag_index_incremental(
                             crate::build::OpenInput::new(store)
                                 .expect("tag-index refinement runs inside its input"),
-                            tags.scanner.clone(),
+                            tags.compiled.scanner().clone(),
                             authority,
-                            tags.pipeline.clone(),
-                            &tags.targets,
+                            tags.compiled.pipeline_snapshot(),
+                            tags.compiled.build_targets(),
                             tags.max_dependency_depth,
                             &affected,
                         )
@@ -779,7 +744,26 @@ impl DaemonCoordinator {
             }
             ScanStep::Full(step) => {
                 let tags = &step.tags;
-                let authority = tags.authority.clone().filter(|_| refine_tags);
+                if step.heals || !matches!(step.source_error, SourceError::Keep) {
+                    store
+                        .input_transaction(|transaction| {
+                            if step.heals {
+                                transaction.set_scan_rejection(None)?;
+                            }
+                            match &step.source_error {
+                                SourceError::Keep => {}
+                                SourceError::Set(error) => {
+                                    transaction.set_configuration_source_error(Some(error))?
+                                }
+                                SourceError::Heal => {
+                                    transaction.set_configuration_source_error(None)?
+                                }
+                            }
+                            Ok(())
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
+                let authority = tags.authority().filter(|_| refine_tags);
                 let fallback_bundles = match authority {
                     Some(_) => store
                         .all_asset_bundles()
@@ -792,7 +776,7 @@ impl DaemonCoordinator {
                     step.candidate.clone(),
                     false,
                     None,
-                    &tags.projection,
+                    tags.compiled.projection(),
                     tags.tag_epoch,
                     &step.claims,
                 )
@@ -801,10 +785,10 @@ impl DaemonCoordinator {
                     crate::build::refine_published_tag_index(
                         crate::build::OpenInput::new(store)
                             .expect("tag-index refinement runs inside its input"),
-                        tags.scanner.clone(),
+                        tags.compiled.scanner().clone(),
                         authority,
-                        tags.pipeline.clone(),
-                        &tags.targets,
+                        tags.compiled.pipeline_snapshot(),
+                        tags.compiled.build_targets(),
                         tags.max_dependency_depth,
                         &commit_asset_bundles(&commit, &fallback_bundles),
                     )
@@ -813,14 +797,34 @@ impl DaemonCoordinator {
                 Ok(Some(commit))
             }
             ScanStep::Rejection(step) => {
-                let rejection = &step.pending.rejection;
-                let configuration = &step.configuration;
-                let version = store
+                let failed = |error: CoordinatorError| error.to_string();
+                // The rejection joins the one the store holds, unless this
+                // scan observed every root.
+                let pending = if step.replaces_pending {
+                    step.observed.clone()
+                } else {
+                    let previous = PendingScanRejection::stored(store)
+                        .map_err(|error| error.to_string())?;
+                    let rejection = select_scan_rejection(
+                        previous
+                            .as_ref()
+                            .map(|previous| previous.rejection.clone())
+                            .into_iter()
+                            .chain([step.observed.rejection.clone()]),
+                    )
+                    .map_err(failed)?;
+                    let mut subjects = step.observed.subjects.clone();
+                    subjects.extend(previous.into_iter().flat_map(|previous| previous.subjects));
+                    subjects.sort_unstable();
+                    subjects.dedup();
+                    PendingScanRejection {
+                        rejection,
+                        subjects,
+                    }
+                };
+                let claims_errors = store
                     .claims_namespace_errors()
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .chain(rejection.version.iter().cloned())
-                    .collect::<Vec<_>>();
+                    .map_err(|error| error.to_string())?;
                 let generation = match store
                     .configuration_state()
                     .map_err(|error| error.to_string())?
@@ -830,55 +834,30 @@ impl DaemonCoordinator {
                         last_good.map_or(0, |epoch| epoch.generation)
                     }
                 };
-                store
+                let (configuration, _) = store
                     .input_transaction(|transaction| {
-                        transaction.set_namespace_errors(version.iter().cloned())?;
-                        match configuration {
-                            ConfigurationStatus::Ready => {
-                                transaction.publish_configuration_ready(generation)?
-                            }
-                            ConfigurationStatus::Failed(error) => transaction
-                                .publish_configuration_error(&error.detail, &error.message)?,
-                        }
-                        Ok(())
+                        transaction.set_namespace_errors(claims_errors)?;
+                        transaction.set_scan_rejection(Some(&pending.record()))?;
+                        transaction.publish_configuration_status(generation)
                     })
                     .map_err(|error| error.to_string())?;
+                let namespace_errors = store
+                    .namespace_errors()
+                    .map_err(|error| error.to_string())?;
                 Ok(Some(Commit {
-                    configuration: Some(configuration.clone()),
-                    namespace_errors: Some(version),
+                    configuration: Some(configuration_status(configuration)),
+                    namespace_errors: Some(namespace_errors),
                     ..Commit::default()
                 }))
             }
         }
     }
 
-    /// The scan health a committed `step` leaves behind.
+    /// What a committed `step` leaves behind in this process: a full scan
+    /// is this process's own observation.
     fn finish_scan_step(&self, step: &ScanStep) {
-        match step {
-            ScanStep::Unchanged => {}
-            ScanStep::Diagnostics { heals, .. } => {
-                if *heals {
-                    locked(&self.scan).rejection.take();
-                }
-            }
-            ScanStep::Incremental(step) => {
-                let mut scan = locked(&self.scan);
-                if step.heals {
-                    scan.rejection.take();
-                }
-                scan.healthy = scan.rejection.is_none();
-            }
-            ScanStep::Full(step) => {
-                let _ = self.scan_initialized.set(());
-                let mut scan = locked(&self.scan);
-                if step.heals {
-                    scan.rejection.take();
-                }
-                scan.healthy = scan.rejection.is_none();
-            }
-            ScanStep::Rejection(step) => {
-                locked(&self.scan).rejection = Some(step.pending.clone());
-            }
+        if let ScanStep::Full(_) = step {
+            let _ = self.scan_initialized.set(());
         }
     }
 }

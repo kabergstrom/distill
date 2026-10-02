@@ -142,6 +142,7 @@ impl BuildBackend for TestBackend {
 
     fn runtime_type_policy(
         &self,
+        _snapshot: &distill_store::StoreReader,
         request: &RuntimeTypePolicyRequest,
     ) -> Result<RuntimeTypePolicy, RpcFailure> {
         if request.type_uuid == STALL {

@@ -22,7 +22,7 @@ use distill_store::{Store, StoreReader};
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::coordinator::publish_incremental_paths;
 use crate::atomic::{atomic_write_expecting, remove_expecting, AtomicWriteError};
-use crate::pipeline_map::PipelineProjection;
+use crate::compiled::CompiledRegistry;
 use crate::scanner::RootedScanner;
 
 impl AuthoringService {
@@ -33,8 +33,7 @@ impl AuthoringService {
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         let runtime = OperationRuntime {
-            scanner: self.scanner.clone(),
-            pipeline_projection: self.pipeline_projection(),
+            compiled: self.compiled_registry(),
             tag_index_coordinator: self
                 .tag_index_coordinator()
                 .as_ref()
@@ -45,7 +44,7 @@ impl AuthoringService {
                 let request = RenameWithFixupsRequest::decode(payload)
                     .map_err(|error| invalid(error.to_string()))?;
                 validate_rooted_destination(
-                    &self.scanner,
+                    self.compiled(store)?.scanner(),
                     &request.destination_root,
                     &request.destination_path,
                 )?;
@@ -110,6 +109,8 @@ impl AuthoringService {
         request: &RenameWithFixupsRequest,
     ) -> Result<Vec<OperationFile>, RpcFailure> {
         require_base(store, base)?;
+        let compiled = self.compiled(store)?;
+        let scanner = compiled.scanner();
         let moving = store
             .bundle(request.bundle)
             .map_err(invalid)?
@@ -118,12 +119,10 @@ impl AuthoringService {
             .root_name(moving.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let source = self
-            .scanner
+        let source = scanner
             .physical_path(&old_root, &moving.path)
             .map_err(invalid)?;
-        let destination = self
-            .scanner
+        let destination = scanner
             .physical_path(&request.destination_root, &request.destination_path)
             .map_err(invalid)?;
         if source == destination {
@@ -139,11 +138,10 @@ impl AuthoringService {
                 .root_name(meta.root)
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("bundle root identity is missing"))?;
-            let path = self
-                .scanner
+            let path = scanner
                 .physical_path(&root, &meta.path)
                 .map_err(invalid)?;
-            let bytes = self.scanner.read_identity_checked(&path).map_err(invalid)?;
+            let bytes = scanner.read_identity_checked(&path).map_err(invalid)?;
             let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
             if observed != meta.content_hash {
                 return Err(invalid(format!(
@@ -178,10 +176,11 @@ impl AuthoringService {
 
 }
 
+/// What a deferred operation completes with: it reads the compiled state of
+/// the version its own input sees, not the state it was prepared under.
 #[derive(Clone)]
 struct OperationRuntime {
-    scanner: RootedScanner,
-    pipeline_projection: PipelineProjection,
+    compiled: Arc<CompiledRegistry>,
     tag_index_coordinator: Weak<crate::coordinator::DaemonCoordinator>,
 }
 
@@ -254,12 +253,12 @@ impl OperationRuntime {
             .iter()
             .map(|file| file.target.clone())
             .collect::<Vec<_>>();
+        let compiled = self.compiled.at(store).map_err(|error| error.to_string())?;
         let commit = publish_incremental_paths(
-            &self.scanner,
             &changed_paths,
             store,
             base,
-            &self.pipeline_projection,
+            &compiled,
             self.tag_index_coordinator.upgrade().as_deref(),
         )?;
         Ok(DeferredOperationResult {
@@ -298,7 +297,8 @@ impl OperationRuntime {
             Vec::new()
         };
         let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
-            let observed = self.scanner.scan().map_err(|error| error.to_string())?;
+            let compiled = self.compiled.at(store).map_err(|error| error.to_string())?;
+            let observed = compiled.scanner().scan().map_err(|error| error.to_string())?;
             let published = crate::scanner::ScanSnapshot::load(store)
                 .map_err(|error| error.to_string())?;
             let mismatch = !observed.same_observation(&published);

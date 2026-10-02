@@ -37,6 +37,7 @@ use distill_store::{Store, StoreError, StoreOpener, StoreReader};
 use globset::Glob;
 
 use crate::authoring::{invalid, require_base, AuthoringService};
+use crate::compiled::Compiled;
 use crate::scanner::{RootedScanner, ScanError};
 use distill_store::files::{FileKind, ObservedFile};
 
@@ -137,9 +138,10 @@ impl RegisteredImporter {
 
 impl AuthoringService {
     /// Index every bundle's import record and directory rules, on `rebuild`
-    /// or if this process has not built the index yet.
+    /// or if the store holds no complete index yet. The store marks the index
+    /// built in the transaction that writes its rows.
     fn ensure_import_index(&self, store: &mut Store, rebuild: bool) -> Result<(), RpcFailure> {
-        if !rebuild && self.import_index_built.load(std::sync::atomic::Ordering::Acquire) {
+        if !rebuild && store.import_index_built().map_err(invalid)? {
             return Ok(());
         }
         // The index is read from the bundles in the transaction that
@@ -152,8 +154,6 @@ impl AuthoringService {
             store.replace_import_index(None, &rows).map_err(invalid)
         })?;
         self.directory_rule_entries(store)?;
-        self.import_index_built
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -307,7 +307,8 @@ impl AuthoringService {
         )>,
         capabilities_changed: bool,
     ) -> Result<Vec<BundleUuid>, RpcFailure> {
-        let capabilities = self.importer_capabilities()?;
+        let compiled = self.compiled(store)?;
+        let capabilities = self.importer_capabilities(&compiled)?;
         self.ensure_import_index(store, work.is_none())?;
         let watched = match work {
             Some((dirty, renames)) => {
@@ -334,7 +335,7 @@ impl AuthoringService {
             }) {
                 continue;
             }
-            let mut backend = RootedImportBackend::new(&self.scanner, &store, &capabilities);
+            let mut backend = RootedImportBackend::new(compiled.scanner(), &store, &capabilities);
             if !revalidate_read_set(&basis, &mut backend) {
                 pending.push(meta.bundle);
             }
@@ -378,14 +379,15 @@ impl AuthoringService {
         )>,
         capabilities_changed: bool,
     ) -> Result<Vec<DirectoryImportTask>, RpcFailure> {
-        let capabilities = self.importer_capabilities()?;
+        let compiled = self.compiled(store)?;
+        let capabilities = self.importer_capabilities(&compiled)?;
         self.ensure_import_index(store, work.is_none())?;
         let (changed, previous) = match work {
             Some((dirty, _)) => self.refresh_dirty_import_index(store, dirty)?,
             None => Default::default(),
         };
         let entries = self.directory_rule_entries(&store)?;
-        let mut backend = RootedImportBackend::new(&self.scanner, &store, &capabilities);
+        let mut backend = RootedImportBackend::new(compiled.scanner(), &store, &capabilities);
         let mut groups = BTreeMap::new();
         let mut touched = BTreeSet::<(BundleUuid, AssetUuid, usize, RootedPath)>::new();
         let mut touched_origins = BTreeSet::<StoredDirectoryOrigin>::new();
@@ -547,7 +549,8 @@ impl AuthoringService {
     ) -> Result<(), RpcFailure> {
         let mut failures = Vec::new();
         {
-            let mut backend = RootedImportBackend::new(&self.scanner, store, capabilities);
+            let compiled = self.compiled(store)?;
+            let mut backend = RootedImportBackend::new(compiled.scanner(), store, capabilities);
             for meta in orphaned {
                 let Some(origin) = &meta.origin else {
                     continue;
@@ -608,7 +611,8 @@ impl AuthoringService {
                 let invocation = self
                     .directory_import_invocation(store, base, task)
                     .map_err(ImportExecutionError::unmemoized);
-                self.defer_unavailable(&task.importer, &task.destination_path, invocation)?
+                let compiled = self.compiled(store)?;
+                self.defer_unavailable(&compiled, &task.importer, &task.destination_path, invocation)?
             }
             PassImport::Watched(bundle) => {
                 let invocation = self
@@ -639,8 +643,9 @@ impl AuthoringService {
         } = planned;
         let id = importer.id.clone();
         let destination = invocation.destination.path.clone();
+        let compiled = Arc::clone(&invocation.compiled);
         let result = self.run_import(base, importer, invocation, overlay);
-        self.defer_unavailable(&id, &destination, result)
+        self.defer_unavailable(&compiled, &id, &destination, result)
     }
 
     /// Publish a pass's run into the pass's input, at the version that
@@ -680,13 +685,16 @@ impl AuthoringService {
     /// requeues it.
     fn defer_unavailable<T>(
         &self,
+        compiled: &Compiled,
         importer: &str,
         destination: &str,
         result: Result<T, ImportExecutionError>,
     ) -> Result<Option<T>, RpcFailure> {
         match result {
             Ok(value) => Ok(Some(value)),
-            Err(error) if error.importer_unavailable || !self.importer_registered(importer) => {
+            Err(error)
+                if error.importer_unavailable || !self.importer_registered(compiled, importer) =>
+            {
                 tracing::warn!(
                     importer,
                     path = %destination,
@@ -699,12 +707,12 @@ impl AuthoringService {
         }
     }
 
-    fn importer_registered(&self, id: &str) -> bool {
+    fn importer_registered(&self, compiled: &Compiled, id: &str) -> bool {
         let Ok(id) = normalize_identifier(id) else {
             return false;
         };
-        let importers = self.importers();
-        importers.pipeline.contains_key(&id) || importers.builtin.contains_key(&id)
+        self.builtin_importers().contains_key(&id)
+            || compiled.pipeline_importers().contains_key(&id)
     }
 
     /// A read snapshot of the store's committed state, for a run that
@@ -739,7 +747,10 @@ impl AuthoringService {
         match result {
             Ok(value) => Ok(Some(value)),
             Err(error) => match self.recorded_importer(store, bundle) {
-                Ok((importer, path)) => self.defer_unavailable(&importer, &path, Err(error)),
+                Ok((importer, path)) => {
+                    let compiled = self.compiled(store)?;
+                    self.defer_unavailable(&compiled, &importer, &path, Err(error))
+                }
                 Err(_) => Err(error.into_rpc()),
             },
         }
@@ -751,7 +762,8 @@ impl AuthoringService {
         base: InputVersion,
         task: &DirectoryImportTask,
     ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
-        let importer = self.registered_importer(&task.importer)?;
+        let compiled = self.compiled(store)?;
+        let importer = self.registered_importer(&compiled, &task.importer)?;
         validate_default_settings(
             importer.settings_type_uuid,
             importer.settings_hash,
@@ -786,6 +798,7 @@ impl AuthoringService {
         Ok((
             importer,
             ImportInvocation {
+                compiled,
                 destination,
                 prior,
                 sources: task.sources.clone(),
@@ -833,8 +846,8 @@ impl AuthoringService {
         {
             return Ok(true);
         }
-        let mut backend =
-            RootedImportBackend::new(&self.scanner, store, capabilities);
+        let compiled = self.compiled(store)?;
+        let mut backend = RootedImportBackend::new(compiled.scanner(), store, capabilities);
         let basis = match store.watched_import_failure(meta.bundle).map_err(invalid)? {
             Some(failure) if failure.terminal == WatchedImportTerminal::DirectoryOrphan => {
                 return Ok(true);
@@ -904,7 +917,8 @@ impl AuthoringService {
         base: InputVersion,
         request: &ImportRequest,
     ) -> Result<(RegisteredImporter, ImportInvocation), RpcFailure> {
-        let importer = self.registered_importer(&request.importer)?;
+        let compiled = self.compiled(store)?;
+        let importer = self.registered_importer(&compiled, &request.importer)?;
         let settings_snapshot = snapshot_to_json(&importer.settings_schema).map_err(invalid)?;
         let settings = decode_authoring_payload(
             importer.settings_hash,
@@ -922,13 +936,15 @@ impl AuthoringService {
             .map(|meta| self.read_prior_import(store, meta))
             .transpose()?;
 
-        let capabilities = self.importer_capabilities()?;
+        let capabilities = self.importer_capabilities(&compiled)?;
         let mut backend =
-            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities, None)?;
+            RootedImportBackend::open(compiled.scanner(), &self.opener, &capabilities, None)?;
         let sources = root_explicit_sources(&mut backend, &destination.root, &request.sources)?;
+        drop(backend);
         Ok((
             importer,
             ImportInvocation {
+                compiled,
                 destination,
                 prior,
                 sources,
@@ -1013,7 +1029,8 @@ impl AuthoringService {
             .map_err(invalid)?
             .ok_or_else(|| invalid(format!("cannot reimport unknown bundle {bundle}")))?;
         let prior = self.read_prior_import(store, &meta)?;
-        let importer = self.registered_importer(&prior.model.record.importer)?;
+        let compiled = self.compiled(store)?;
+        let importer = self.registered_importer(&compiled, &prior.model.record.importer)?;
         if prior.settings_type_uuid != importer.settings_type_uuid {
             return Err(invalid(
                 "the recorded settings entry type no longer matches the importer registration",
@@ -1023,8 +1040,8 @@ impl AuthoringService {
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let target = self
-            .scanner
+        let target = compiled
+            .scanner()
             .physical_path(&root, &meta.path)
             .map_err(invalid)?;
         let destination = ImportDestination {
@@ -1038,6 +1055,7 @@ impl AuthoringService {
         Ok((
             importer,
             ImportInvocation {
+                compiled,
                 destination,
                 prior: Some(prior),
                 sources,
@@ -1073,6 +1091,7 @@ impl AuthoringService {
         overlay: Option<&FileOverlay>,
     ) -> Result<ImportRun, ImportExecutionError> {
         let ImportInvocation {
+            compiled,
             destination,
             prior,
             sources,
@@ -1082,10 +1101,10 @@ impl AuthoringService {
             basis_deps,
         } = invocation;
         let capabilities = self
-            .importer_capabilities()
+            .importer_capabilities(&compiled)
             .map_err(ImportExecutionError::unmemoized)?;
         let mut backend =
-            RootedImportBackend::open(&self.scanner, &self.opener, &capabilities, overlay)
+            RootedImportBackend::open(compiled.scanner(), &self.opener, &capabilities, overlay)
                 .map_err(ImportExecutionError::unmemoized)?;
         let mut context = ImportContext::new(&importer.id, sources.clone(), &mut backend)
             .map_err(invalid)
@@ -1283,11 +1302,15 @@ impl AuthoringService {
         .map_err(ImportExecutionError::unmemoized)?;
 
         require_base(store, base).map_err(ImportExecutionError::unmemoized)?;
-        let capabilities = self
-            .importer_capabilities()
+        // The publishing version's compiled state: a run from an earlier
+        // base whose capabilities moved fails its revalidation.
+        let compiled = self
+            .compiled(store)
             .map_err(ImportExecutionError::unmemoized)?;
-        let mut recheck =
-            RootedImportBackend::new(&self.scanner, store, &capabilities);
+        let capabilities = self
+            .importer_capabilities(&compiled)
+            .map_err(ImportExecutionError::unmemoized)?;
+        let mut recheck = RootedImportBackend::new(compiled.scanner(), store, &capabilities);
         if !revalidate_read_set(&read_set, &mut recheck) {
             return Err(ImportExecutionError::drifted(invalid(
                 "import read-set changed before publication; the result was discarded",
@@ -1295,7 +1318,7 @@ impl AuthoringService {
         }
         let authority = self
             .tag_index_coordinator()
-            .and_then(|coordinator| coordinator.schema_authority());
+            .and_then(|_| compiled.schema_authority());
         let bytes = build_import_bundle(
             store,
             authority.as_deref(),
@@ -1336,8 +1359,8 @@ impl AuthoringService {
         }
         let preimage = destination.meta.as_ref().map(|meta| meta.content_hash);
         if mode == ImportExecutionMode::Verify {
-            let observed = self
-                .scanner
+            let observed = compiled
+                .scanner()
                 .read_identity_checked(&destination.target)
                 .map_err(invalid)
                 .map_err(ImportExecutionError::unmemoized)?;
@@ -1402,10 +1425,11 @@ impl AuthoringService {
             return Ok(None);
         };
         let basis = encode_attempt_basis(read_set)?;
-        let capabilities = self.importer_capabilities()?;
+        let compiled = self.compiled(store)?;
+        let capabilities = self.importer_capabilities(&compiled)?;
         // Revalidated against the store as this input sees it: a pass's own
         // uncommitted observation is the current one.
-        let mut backend = RootedImportBackend::new(&self.scanner, store, &capabilities);
+        let mut backend = RootedImportBackend::new(compiled.scanner(), store, &capabilities);
         if !revalidate_read_set(read_set, &mut backend) {
             return Ok(Some(false));
         }
@@ -1428,33 +1452,35 @@ impl AuthoringService {
         Ok(Some(true))
     }
 
-    fn registered_importer(&self, id: &str) -> Result<RegisteredImporter, RpcFailure> {
+    /// The importer `id` at `compiled`: a built-in id is the built-in's.
+    fn registered_importer(
+        &self,
+        compiled: &Compiled,
+        id: &str,
+    ) -> Result<RegisteredImporter, RpcFailure> {
         let id = normalize_identifier(id).map_err(invalid)?;
-        let importers = self.importers();
-        importers
-            .pipeline
+        self.builtin_importers()
             .get(&id)
-            .or_else(|| importers.builtin.get(&id))
+            .or_else(|| compiled.pipeline_importers().get(&id))
             .cloned()
             .ok_or_else(|| invalid(format!("importer {id:?} is not registered")))
     }
 
-    fn importer_capabilities(&self) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
-        let importers = self.importers();
-        let mut capabilities = importers
-            .builtin
+    /// Every importer's capability at `compiled`: a built-in id is the
+    /// built-in's.
+    fn importer_capabilities(
+        &self,
+        compiled: &Compiled,
+    ) -> Result<BTreeMap<String, [u8; 32]>, RpcFailure> {
+        let mut capabilities = self
+            .builtin_importers()
             .iter()
             .map(|(id, importer)| (id.clone(), importer.capability_hash))
             .collect::<BTreeMap<_, _>>();
-        for (id, importer) in importers.pipeline.iter() {
-            if capabilities
-                .insert(id.clone(), importer.capability_hash)
-                .is_some()
-            {
-                return Err(invalid(format!(
-                    "importer {id:?} is registered by both the built-in and pipeline registries"
-                )));
-            }
+        for (id, importer) in compiled.pipeline_importers() {
+            capabilities
+                .entry(id.clone())
+                .or_insert(importer.capability_hash);
         }
         Ok(capabilities)
     }
@@ -1465,6 +1491,7 @@ impl AuthoringService {
         path: &str,
         requested_root: &str,
     ) -> Result<ImportDestination, RpcFailure> {
+        let compiled = self.compiled(store)?;
         let matches = store
             .all_bundles()
             .map_err(invalid)?
@@ -1486,7 +1513,7 @@ impl AuthoringService {
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("bundle root identity is missing"))?
         } else if requested_root.is_empty() {
-            match self.roots_snapshot().as_slice() {
+            match compiled.roots() {
                 [root] => root.name.clone(),
                 _ => {
                     return Err(invalid(
@@ -1496,16 +1523,12 @@ impl AuthoringService {
             }
         } else {
             let root = normalize_identifier(requested_root).map_err(invalid)?;
-            if !self
-                .roots_snapshot()
-                .iter()
-                .any(|candidate| candidate.name == root)
-            {
+            if !compiled.roots().iter().any(|candidate| candidate.name == root) {
                 return Err(invalid(format!("unknown import destination root {root:?}")));
             }
             root
         };
-        let target = self.scanner.physical_path(&root, path).map_err(invalid)?;
+        let target = compiled.scanner().physical_path(&root, path).map_err(invalid)?;
         Ok(ImportDestination {
             root,
             path: path.to_owned(),
@@ -1522,11 +1545,8 @@ impl AuthoringService {
     ) -> Result<ImportDestination, RpcFailure> {
         let root = normalize_identifier(root).map_err(invalid)?;
         let path = normalize_path(path).map_err(invalid)?;
-        if !self
-            .roots_snapshot()
-            .iter()
-            .any(|candidate| candidate.name == root)
-        {
+        let compiled = self.compiled(store)?;
+        if !compiled.roots().iter().any(|candidate| candidate.name == root) {
             return Err(invalid(format!(
                 "unknown directory import destination root {root:?}"
             )));
@@ -1545,7 +1565,7 @@ impl AuthoringService {
                 break;
             }
         }
-        let target = self.scanner.physical_path(&root, &path).map_err(invalid)?;
+        let target = compiled.scanner().physical_path(&root, &path).map_err(invalid)?;
         if meta.is_none() && std::fs::symlink_metadata(&target).is_ok() {
             return Err(invalid(format!(
                 "directory import destination {}:{} is occupied by a non-bundle file",
@@ -1595,12 +1615,13 @@ impl AuthoringService {
             .root_name(meta.root)
             .map_err(invalid)?
             .ok_or_else(|| invalid("bundle root identity is missing"))?;
-        let target = self
-            .scanner
+        let compiled = self.compiled(store)?;
+        let target = compiled
+            .scanner()
             .physical_path(&root, &meta.path)
             .map_err(invalid)?;
-        let bytes = self
-            .scanner
+        let bytes = compiled
+            .scanner()
             .read_identity_checked(&target)
             .map_err(invalid)?;
         if ContentHash(*blake3::hash(&bytes).as_bytes()) != meta.content_hash {
@@ -3399,6 +3420,9 @@ fn destination_unchanged(
 }
 
 struct ImportInvocation {
+    /// The compiled state of the version the invocation was made at: the
+    /// importer, its capabilities and the roots its run reads.
+    compiled: Arc<Compiled>,
     destination: ImportDestination,
     prior: Option<PriorImport>,
     sources: Vec<RootedPath>,

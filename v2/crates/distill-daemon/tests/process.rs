@@ -1,8 +1,10 @@
 use std::io::Write;
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use distill_core::id::ContentHash;
+use distill_daemon::compiled::Compiled;
 use distill_daemon::config::DaemonConfig;
 use distill_daemon::process::DaemonProcess;
 use distill_daemon::scanner::{DaemonOwnedDirectoryKind, ScanDiagnostic};
@@ -81,6 +83,13 @@ fn write_schema_path(path: &std::path::Path, marker: &str) {
         }],
     };
     std::fs::write(path, serde_json::to_vec(&schema).unwrap()).unwrap();
+}
+
+/// The compiled state the process's latest committed version sees.
+fn compiled(process: &DaemonProcess) -> Option<Arc<Compiled>> {
+    let coordinator = process.coordinator();
+    let reader = coordinator.opener().open_reader().unwrap();
+    coordinator.compiled_at(&reader).ok()
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
@@ -592,13 +601,12 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
     let temp = tempfile::tempdir().unwrap();
     let process = DaemonProcess::start(config(&temp)).unwrap();
     wait_until(
-        || process.coordinator().build_target("dev").is_some(),
+        || compiled(&process).and_then(|compiled| compiled.build_target("dev")).is_some(),
         "initial build target was not retained",
     );
     assert!(
-        !process
-            .coordinator()
-            .build_target("dev")
+        !compiled(&process)
+            .and_then(|compiled| compiled.build_target("dev"))
             .expect("initial target is retained for build execution")
             .optimize
     );
@@ -618,9 +626,8 @@ fn target_configuration_and_pipeline_validation_publish_as_one_version() {
         after
     );
     assert!(
-        process
-            .coordinator()
-            .build_target("dev")
+        compiled(&process)
+            .and_then(|compiled| compiled.build_target("dev"))
             .expect("published target is retained for build execution")
             .optimize
     );
@@ -688,9 +695,8 @@ fn same_path_schema_edits_publish_exactly_one_atomic_candidate_version() {
     let expected_schema_hash =
         *blake3::hash(&std::fs::read(temp.path().join("schema.json")).unwrap()).as_bytes();
     assert_eq!(
-        process
-            .coordinator()
-            .schema_authority()
+        compiled(&process)
+            .and_then(|compiled| compiled.schema_authority())
             .unwrap()
             .source_hash(),
         expected_schema_hash

@@ -127,9 +127,9 @@ tables, so the ~50 rpc test call sites keep working.
 | `ScanProjectionIndex` (claimants, collisions, pending sets) | memory only; only the outcome reaches SQLite | `asset_claims(asset_uuid, bundle_uuid)` with no uniqueness constraint. Collisions are queries (`GROUP BY … HAVING count > 1`) that produce per-asset error rows, and the pending sets disappear (one transaction). |
 | `ImportWatchIndex` | memory, lazily built from bundle files | `import_records(bundle_uuid, importer, settings, watch)` + `import_reads(bundle_uuid, root, path, observed)` indexed by path. Dirty files join against `import_reads`. |
 | `PipelineProjection`, `RegisteredImporters` | memory | part of the immutable `PipelineRuntime`. The projection's durable consequence goes in a `type_projection` table. |
-| `schema_authority`, `build_targets`, `lineage_destination`, roots, quarantine | `RwLock`s filled from config | immutable `Arc<ActiveConfig>` owned by the authority and passed with jobs. Its hash and generation live in `configuration_state`. |
-| `configuration_poison`, `scan_rejection` | memory only (and `PendingScanRejection.subjects` is lost on restart) | `errors` |
-| `scan_initialized` / `scan_healthy` | atomics | authority-local |
+| `schema_authority`, `build_targets`, `lineage_destination`, roots, quarantine | `RwLock`s filled from config | immutable `Arc<ActiveConfig>` owned by the authority and passed with jobs. Its hash and generation live in `configuration_state`. Done for the schema authority, build targets, roots, scanner, projection, pipeline importers and pipeline snapshot: one `Compiled` entry per `store_meta.compiled_version` (§6.1). |
+| `configuration_poison`, `scan_rejection` | memory only (and `PendingScanRejection.subjects` is lost on restart) | `errors`. Done: `errors` families 2–4 and `scan_rejection_subjects` (§6.1). |
+| `scan_initialized` / `scan_healthy` | atomics | authority-local. Done: `scan_initialized` is set only after a commit; healthy is "no stored rejection". |
 | `Store.input_version` / `memo_seq` | cached copies | read from `store_meta` in the transaction |
 | `Store.cas: CasInner` | memory | owned by the authority (the writer). Readers resolve segment names from `cas_segments`, not from `CasInner`. |
 | `Store.last_recovery` | memory | returned from `open` and logged |
@@ -840,7 +840,8 @@ should reach zero by the end of phase 6.
       pinning it.
     - The import index flag is per process. A forced rebuild that fails
       rolls back and leaves the flag set, so the old index stands until
-      the next full import pass.
+      the next full import pass. (Superseded: the flag is now a
+      `store_meta` marker, see "Compiled state by store version".)
     - A stopping watcher delivers the events queued before `Stop`.
 - **One pass, one input version.** A process-loop pass
   (`coordinator/pass.rs`) plans in a write that always rolls back, runs
@@ -859,8 +860,8 @@ should reach zero by the end of phase 6.
   next pass) and import output disk writes. The watcher's echo of a
   pass's own bundle writes publishes nothing: a rename from a path never
   observed (the atomic write's temporary file) moves no identity. The
-  import index flag is an
-  `AtomicBool` the pass restores when its plan rolls back.
+  import index flag was an `AtomicBool` the pass restored when its plan
+  rolled back; it is now a `store_meta` marker (below).
 - **After phase 11: one owner per writer.** RPC connections each run on a
   thread of their own and share only the `ServerHandle`. `SharedStore`,
   its thread-local `HELD`/`READERS`/`OPEN_GUARDS`, `WriteGuard` and
@@ -892,6 +893,48 @@ should reach zero by the end of phase 6.
   `asset_tag_index_poisoned`, and `assets_by_bundle` now on
   `(bundle_uuid, local_id)` (SCHEMA_VERSION 36). A store failure fails
   only the questions that reach it, where the capture failed every build.
+- **Compiled state by store version.** SQLite is the only source of truth
+  for what the daemon compiled; memory holds derivations of it, each keyed
+  by the version it derives from.
+  - `crate::compiled`: the schema authority, build targets, pipeline
+    projection, pipeline importers, pipeline snapshot, scanner and roots
+    are one immutable `Compiled` entry in a `CompiledRegistry` keyed by
+    `store_meta.compiled_version`, which every compiled publication (a
+    configuration candidate, a pipeline rejection) writes in its own input.
+    `DaemonCoordinator::compiled_at(reader)` is the only lookup, an exact
+    one: the process loop, RPC readers and writers (authoring, importers,
+    operations), codegen, build `NodeEnv` capture (the requester's
+    snapshot in `start`, the worker's view in `build_cell`, the input's
+    rows inline) and `runtime_type_policy` (given the requester's
+    snapshot) resolve the state their own transaction sees. A key with no
+    entry is `CompiledLookupError` (`NotLoaded`, or `Superseded`, which RPC
+    answers as `SnapshotExpired`), never another version's state. A process
+    opening a store marked by an earlier process registers no entry for
+    that key; its loop first publishes "no pipeline epoch has been
+    published" so the store says what it holds.
+  - A publication stages its entry under the version it will publish
+    (invisible: no reader sees that key before the commit), confirms it
+    after the commit, and drops it on failure, so a failed publication
+    changes nothing. The module host, the watcher's roots and
+    `scan_initialized` change only after the commit. Superseded entries
+    live while held; the newest 4 stay for 120 s.
+  - The pending scan rejection (its namespace errors, its configuration
+    error, its subjects) and the configuration source's error are rows
+    (`errors` families 2–4, `scan_rejection_subjects`); healthy is "no
+    stored rejection", and the configuration status is selected from them
+    inside each publishing input. Only scan and configuration publications
+    write them, so an RPC write keeps them (`publish_incremental_paths` no
+    longer replaces the rejection's namespace errors) and a restart keeps
+    them with their subjects.
+  - The import index's built flag is `store_meta.import_index_built`,
+    written in the savepoint that writes the index rows, so a rolled-back
+    plan leaves it unset.
+  - `ServerHandle::replace_target` writes only the served target hash;
+    builds take targets from the compiled entry, so it installs nothing in
+    memory.
+  - The node key (`DSNK` v2) includes each named type's build-only policy,
+    so a policy change cannot serve a cached node.
+  - The unused `publish_pipeline_candidate` is gone.
 
 ## 7. Test baseline
 
@@ -919,3 +962,7 @@ stdin-drain test now passes).
 Lazy trace reads: 1157 passed, no failures (6 new: the store's plan and
 prefix-bound tests, and the lazy-against-eager equivalence, revalidation,
 poisoned-bundle and 20 000-asset scale tests).
+Compiled state by store version: 1162 passed, no failures. (One earlier
+full run failed the timing-sensitive `distill-loader --test
+rpc_io_backpressure fetch_throughput_is_not_one_per_two_frames` once
+under load; it passed on every rerun.)

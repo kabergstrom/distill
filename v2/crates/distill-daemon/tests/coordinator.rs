@@ -941,3 +941,114 @@ fn the_echo_of_an_atomic_write_through_an_unobserved_temporary_file_publishes_no
     let echo = coordinator.reconcile_incremental(&mut writer, &batch).unwrap();
     assert_eq!(echo.version, published.version);
 }
+
+/// A pending scan rejection is durable state: an RPC authoring write keeps
+/// its errors, a restart keeps it with its subjects, and only the scan that
+/// revalidates those subjects heals it.
+#[cfg(unix)]
+#[test]
+fn a_pending_scan_rejection_survives_an_authoring_write_and_a_restart() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
+    std::fs::create_dir_all(temp.path().join("assets")).unwrap();
+    let bundle_path = temp.path().join("assets/ordinary.bundle");
+    std::fs::write(&bundle_path, bytes).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    let link = temp.path().join("assets/escape");
+
+    let pending = {
+        let coordinator = coordinator(&temp);
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        symlink(&outside, &link).unwrap();
+        coordinator
+            .reconcile_incremental(&mut writer, &WatcherBatch {
+                paths: vec![link.clone()],
+                renames: Vec::new(),
+            })
+            .unwrap();
+        let pending = coordinator
+            .open_reader()
+            .unwrap()
+            .scan_rejection()
+            .unwrap()
+            .expect("the unreadable subtree leaves a pending rejection");
+        assert!(matches!(
+            pending.errors[..],
+            [ref error] if matches!(error.detail, NamespaceErrorV1::UnreadableScanSubtree { .. })
+        ));
+        assert!(!pending.subjects.is_empty());
+
+        // An RPC authoring write publishes its own version beside it.
+        let parsed = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
+        let original = &parsed.assets["entry"];
+        let logical_schema = snapshot_to_json(&parsed.schemas[&original.schema_hash]).unwrap();
+        let operation = AuthoringOp::Set(AuthoringEntry {
+            uuid: asset_uuid,
+            bundle: bundle_uuid,
+            local_id: "entry".into(),
+            normalized_path: "ordinary.bundle".into(),
+            type_uuid: original.type_uuid,
+            terminal_type: original.type_uuid,
+            schema_hash: original.schema_hash,
+            logical_schema: Arc::from(logical_schema.into_bytes()),
+            role: AuthoringEntryRole::Runtime,
+            tags: BTreeMap::new(),
+            value: RpcAuthoringValue {
+                canonical_value: Arc::from(&b"9"[..]),
+                blobs: Vec::new(),
+            },
+        });
+        let backend = Arc::clone(coordinator.authoring_service());
+        let base = coordinator.server().current_stamp().version;
+        let stamp = coordinator
+            .coordinated_commit(&mut writer, base, |store| {
+                backend
+                    .prepare_write(store, base, &[operation], false)
+                    .map_err(|error| format!("{error:?}"))?
+                    .ok_or_else(|| "production authoring returned no commit".to_owned())
+            })
+            .unwrap();
+        assert_eq!(stamp.version, InputVersion(base.0 + 1));
+        let store = coordinator.open_reader().unwrap();
+        assert_eq!(store.scan_rejection().unwrap().as_ref(), Some(&pending));
+        assert_eq!(store.namespace_errors().unwrap(), pending.errors);
+        pending
+    };
+
+    // A restart keeps it, subjects included.
+    let coordinator = coordinator(&temp);
+    let store = coordinator.open_reader().unwrap();
+    assert_eq!(store.scan_rejection().unwrap().as_ref(), Some(&pending));
+    assert_eq!(store.namespace_errors().unwrap(), pending.errors);
+    drop(store);
+
+    // An unrelated observation does not heal it; revalidating the stored
+    // subject does.
+    let mut writer = coordinator.open_writer().unwrap();
+    std::fs::remove_file(&link).unwrap();
+    let unrelated = temp.path().join("assets/unrelated.txt");
+    std::fs::write(&unrelated, b"new observation").unwrap();
+    coordinator
+        .reconcile_incremental(&mut writer, &WatcherBatch {
+            paths: vec![unrelated],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        coordinator.open_reader().unwrap().scan_rejection().unwrap().as_ref(),
+        Some(&pending)
+    );
+    coordinator
+        .reconcile_incremental(&mut writer, &WatcherBatch {
+            paths: vec![link],
+            renames: Vec::new(),
+        })
+        .unwrap();
+    let store = coordinator.open_reader().unwrap();
+    assert_eq!(store.scan_rejection().unwrap(), None);
+    assert!(store.namespace_errors().unwrap().is_empty());
+}

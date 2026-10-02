@@ -80,6 +80,7 @@ use crate::callbacks::{
     CallbackInvokeError, DiagnosticSeverity, PipelineProcessContext, ProcessArtifact,
     ProcessContextError, ProcessOutputs,
 };
+use crate::compiled::Compiled;
 use crate::coordinator::DaemonCoordinator;
 use crate::epoch::{PipelineEpoch, PipelineSnapshot};
 use crate::scanner::RootedScanner;
@@ -188,7 +189,8 @@ impl BuildBackend for CoordinatorBuildBackend {
         let Some(coordinator) = self.coordinator.upgrade() else {
             return BuildStart::Answered(Err(coordinator_stopped()));
         };
-        let env = match NodeEnv::capture(&coordinator, &request.target)
+        let env = match compiled_for_build(&coordinator, view.snapshot)
+            .and_then(|compiled| NodeEnv::capture(&coordinator, &compiled, &request.target))
             .and_then(|env| check_request(&env, request).map(|()| env))
         {
             Ok(env) => env,
@@ -239,6 +241,7 @@ impl BuildBackend for CoordinatorBuildBackend {
 
     fn runtime_type_policy(
         &self,
+        snapshot: &StoreReader,
         request: &RuntimeTypePolicyRequest,
     ) -> Result<RuntimeTypePolicy, RpcFailure> {
         let coordinator =
@@ -247,8 +250,10 @@ impl BuildBackend for CoordinatorBuildBackend {
                 .ok_or_else(|| RpcFailure::AuthoringBackendUnavailable {
                     operation: "runtime type-policy coordinator stopped".to_owned(),
                 })?;
+        // The policy of the compiled state the requester's snapshot sees.
+        let compiled = coordinator.compiled_at(snapshot)?;
         let target =
-            coordinator
+            compiled
                 .build_target(&request.target)
                 .ok_or_else(|| RpcFailure::InvalidQuery {
                     detail: format!(
@@ -264,7 +269,7 @@ impl BuildBackend for CoordinatorBuildBackend {
                 ),
             });
         }
-        let authority = coordinator.schema_authority().ok_or_else(|| {
+        let authority = compiled.schema_authority().ok_or_else(|| {
             RpcFailure::AuthoringBackendUnavailable {
                 operation: "runtime type-policy schema authority is not published".to_owned(),
             }
@@ -466,7 +471,9 @@ fn build_cell(
     view: StoreSnapshot,
     latest: StoreReader,
 ) -> Result<NodeResult, BuildError> {
-    let env = NodeEnv::capture(coordinator, target)?;
+    // The compiled state of the worker's own view.
+    let compiled = compiled_for_build(coordinator, &view)?;
+    let env = NodeEnv::capture(coordinator, &compiled, target)?;
     // The requester keyed the cell at its snapshot; this view may be newer.
     // Inputs that moved since make every requester of the key stale.
     match node_key(&env, &view, asset)? {
@@ -481,7 +488,7 @@ fn build_cell(
             latest,
             writer: RefCell::new(store),
         },
-        coordinator.scanner(),
+        compiled.scanner().clone(),
         Some(CellScope {
             worker,
             root: asset,
@@ -493,8 +500,18 @@ fn build_cell(
     build_asset(&mut context, asset)
 }
 
-/// The pipeline one answer or one cell runs under, captured from the
-/// coordinator once and never mixed with another.
+/// The compiled state `reader` sees: a build runs under its own view's.
+fn compiled_for_build(
+    coordinator: &DaemonCoordinator,
+    reader: &StoreReader,
+) -> Result<Arc<Compiled>, BuildError> {
+    coordinator
+        .compiled_at(reader)
+        .map_err(|error| BuildError::Unavailable(error.into()))
+}
+
+/// The pipeline one answer or one cell runs under, captured from one
+/// compiled state and never mixed with another.
 struct NodeEnv {
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -506,16 +523,20 @@ struct NodeEnv {
 }
 
 impl NodeEnv {
-    fn capture(coordinator: &DaemonCoordinator, target: &str) -> Result<Self, BuildError> {
-        let authority = coordinator.schema_authority().ok_or_else(|| {
+    fn capture(
+        coordinator: &DaemonCoordinator,
+        compiled: &Compiled,
+        target: &str,
+    ) -> Result<Self, BuildError> {
+        let authority = compiled.schema_authority().ok_or_else(|| {
             BuildError::Failed("project schema authority is not published".to_owned())
         })?;
-        let target = coordinator.build_target(target).ok_or_else(|| {
+        let target = compiled.build_target(target).ok_or_else(|| {
             BuildError::Failed(format!("build target {target:?} is not published"))
         })?;
         Self::new(
             authority,
-            coordinator.pipeline_snapshot(),
+            compiled.pipeline_snapshot(),
             target,
             coordinator.operational_configuration().max_dependency_depth,
         )
@@ -634,6 +655,7 @@ fn node_key(
             type_uuid,
             logical: project.logical_hash,
             layout: project.layout_hash,
+            build_only: project.build_only,
         });
     }
     let inputs = NodeInputs {
@@ -843,6 +865,8 @@ enum BuildError {
     Failed(String),
     Deterministic { message: String, facts: Box<DslfV1> },
     Infrastructure(String),
+    /// The compiled state the build needs is not loaded (retryable).
+    Unavailable(RpcFailure),
 }
 
 impl BuildError {
@@ -880,6 +904,7 @@ impl BuildError {
                     operation: format!("build: {error}"),
                 })
             }
+            Self::Unavailable(failure) => BuildOutcome::Unavailable(failure),
         }
     }
 
@@ -897,6 +922,7 @@ impl BuildError {
             Self::Infrastructure(error) => Err(RpcFailure::AuthoringBackendUnavailable {
                 operation: format!("build: {error}"),
             }),
+            Self::Unavailable(failure) => Err(failure),
         }
     }
 }
@@ -1444,12 +1470,14 @@ fn build_inline(
     request: &BuildRequest,
     verify_fresh: bool,
 ) -> Result<NodeResult, BuildError> {
-    let env = NodeEnv::capture(coordinator, &request.target)?;
+    // The compiled state of the input's own rows.
+    let compiled = compiled_for_build(coordinator, &input.0)?;
+    let env = NodeEnv::capture(coordinator, &compiled, &request.target)?;
     check_request(&env, request)?;
     let mut context = BuildContext::new(
         env,
         BuildStores::Inline(RefCell::new(&mut *input.0)),
-        coordinator.scanner(),
+        compiled.scanner().clone(),
         None,
         verify_fresh,
         "tool-runs",
@@ -4462,7 +4490,8 @@ mod tests {
             Ok(BuildAnswer::Drifted { input }) => return Err(BuildError::Drifted(input)),
             Err(failure) => return Err(BuildError::Infrastructure(format!("{failure:?}"))),
         };
-        let env = NodeEnv::capture(coordinator, &request.target)?;
+        let compiled = compiled_for_build(coordinator, &requester.snapshot)?;
+        let env = NodeEnv::capture(coordinator, &compiled, &request.target)?;
         let node = NodeLookup::new(
             &env,
             &requester.snapshot,
@@ -4728,12 +4757,13 @@ mod tests {
             },
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
+        let pipeline = coordinator.compiled_at(&writer).unwrap().pipeline_snapshot();
         writer.open_input().unwrap();
         refine_published_tag_index(
             OpenInput::new(&mut writer).unwrap(),
             coordinator.scanner(),
             Arc::clone(&authority),
-            coordinator.pipeline_snapshot(),
+            pipeline,
             &BTreeMap::from([("dev".to_owned(), build_target)]),
             64,
             &BTreeMap::from([(ASSET, BUNDLE)]),
@@ -4856,6 +4886,179 @@ mod tests {
         assert_eq!(build(&coordinator, &request).unwrap(), function);
         assert_eq!(migration_calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A coordinator serving one byte asset through an identity processor
+    /// that counts its calls, and the request for the asset's terminal.
+    fn identity_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (Arc<DaemonCoordinator>, BuildRequest, Arc<AtomicUsize>) {
+        let assets = temp.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let authority = Arc::new(authority());
+        let project = authority.project_type(TYPE).unwrap();
+        let bundle = Bundle {
+            format_version: 1,
+            uuid: BUNDLE,
+            primary: Some("entry".to_owned()),
+            schemas: BTreeMap::from([(project.logical_hash, project.logical_schema.clone())]),
+            assets: BTreeMap::from([(
+                "entry".to_owned(),
+                AssetEntry {
+                    uuid: ASSET,
+                    type_uuid: TYPE,
+                    schema_hash: project.logical_hash,
+                    authoring_only: false,
+                    data: AuthoredValue::Object(BTreeMap::from([(
+                        "value".to_owned(),
+                        AuthoredValue::UInt(7),
+                    )])),
+                },
+            )]),
+        };
+        std::fs::write(
+            assets.join("byte.bundle"),
+            distill_bundle::write_bundle(&bundle).unwrap(),
+        )
+        .unwrap();
+        let build_target = Target::new(
+            TargetOs::Linux,
+            TargetArch::X86_64,
+            BTreeSet::from([GraphicsApi::new("vulkan").unwrap()]),
+            false,
+            true,
+            authority.identity().clone(),
+        )
+        .unwrap();
+        let target_hash =
+            TargetDefinitionHash(distill_build::keys::target_definition_hash(&build_target));
+        let coordinator = Arc::new(
+            DaemonCoordinator::open(
+                StoreConfig::new(temp.path().join("state")),
+                vec![AssetRoot::new("main", &assets)],
+                vec![rpc_target(target_hash)],
+                64,
+            )
+            .unwrap(),
+        );
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
+        coordinator.install_schema_authority_for_test(Arc::clone(&authority));
+        coordinator.install_build_target_for_test("dev", build_target);
+        let calls = Arc::new(AtomicUsize::new(0));
+        coordinator.install_pipeline_epoch_for_test(crate::epoch::processor_test_epoch(
+            "dev",
+            target_hash.0,
+            crate::callbacks::ProcessorDescriptor {
+                id: "identity".to_owned(),
+                version: 1,
+                input: TYPE,
+                selector: TargetSelector::new(None, None).unwrap(),
+                outputs: OutputDecls::new(TERMINAL, Vec::<(String, TypeUuid)>::new()).unwrap(),
+            },
+            PrimaryCountingProcessor(Arc::clone(&calls)),
+        ));
+        let request = BuildRequest {
+            work_class: BuildWorkClass::Interactive,
+            target: "dev".to_owned(),
+            target_definition: target_hash,
+            requested_asset: ASSET,
+            output_key: String::new(),
+            requested_terminal_type: TERMINAL,
+            entry: AuthoringEntry {
+                uuid: ASSET,
+                bundle: BUNDLE,
+                local_id: "entry".to_owned(),
+                normalized_path: "byte.bundle".to_owned(),
+                type_uuid: TYPE,
+                terminal_type: TERMINAL,
+                schema_hash: project.logical_hash,
+                logical_schema: Arc::from(
+                    snapshot_to_json(&project.logical_schema)
+                        .unwrap()
+                        .into_bytes(),
+                ),
+                role: AuthoringEntryRole::Runtime,
+                tags: BTreeMap::new(),
+                value: AuthoringValue {
+                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
+                    blobs: Vec::new(),
+                },
+            },
+            drifted_input: DriftedInput::Asset(ASSET),
+        };
+        (coordinator, request, calls)
+    }
+
+    /// The schema authority's build-only policy is a node input: marking the
+    /// terminal build-only changes no logical or layout hash, yet the cached
+    /// node does not serve, and the closure fails as build-only.
+    #[test]
+    fn a_build_only_policy_change_does_not_serve_a_cached_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, request, calls) = identity_fixture(&temp);
+        let first = build(&coordinator, &request).unwrap();
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let normal = authority();
+        let mut schema = normal.schema().clone();
+        schema.types[2].attrs.build_only = true;
+        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 32]).unwrap();
+        let (was, now) = (
+            normal.project_type(TERMINAL).unwrap(),
+            build_only.project_type(TERMINAL).unwrap(),
+        );
+        assert_eq!(
+            (was.logical_hash, was.layout_hash),
+            (now.logical_hash, now.layout_hash)
+        );
+        assert!(now.build_only && !was.build_only);
+        coordinator.install_schema_authority_for_test(Arc::new(build_only));
+        assert!(matches!(
+            build(&coordinator, &request),
+            Err(BuildError::Failed(message)) if message.contains("build-only type")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        coordinator.install_schema_authority_for_test(Arc::new(normal));
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A requester's answer comes from the compiled state its own snapshot
+    /// sees: a snapshot older than a pipeline failure still answers from its
+    /// epoch, while a newer one sees the failure.
+    #[test]
+    fn a_build_answers_under_the_compiled_state_of_its_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, request, calls) = identity_fixture(&temp);
+        let first = build(&coordinator, &request).unwrap();
+        let old = Requester::at_current(&coordinator);
+
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator
+            .publish_pipeline_rejection(&mut writer, crate::epoch::unpublished_failure())
+            .unwrap();
+        let new = Requester::at_current(&coordinator);
+        assert!(new.snapshot.stamp().version > old.snapshot.stamp().version);
+        assert!(coordinator
+            .compiled_at(&new.snapshot)
+            .unwrap()
+            .pipeline_epoch()
+            .is_err());
+
+        assert_eq!(
+            resolve(&coordinator, &old, &request),
+            Ok(BuildAnswer::Built {
+                content_hash: first.root_content_hash
+            })
+        );
+        assert!(!matches!(
+            resolve(&coordinator, &new, &request),
+            Ok(BuildAnswer::Built { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5001,12 +5204,15 @@ mod tests {
         let payload_backend = CoordinatorBuildBackend::new(&coordinator);
         assert_eq!(
             payload_backend
-                .runtime_type_policy(&RuntimeTypePolicyRequest {
-                    basis: coordinator.server().current_stamp(),
-                    target: request.target.clone(),
-                    target_definition: request.target_definition,
-                    type_uuid: TYPE,
-                })
+                .runtime_type_policy(
+                    &coordinator.opener().open_reader().unwrap(),
+                    &RuntimeTypePolicyRequest {
+                        basis: coordinator.server().current_stamp(),
+                        target: request.target.clone(),
+                        target_definition: request.target_definition,
+                        type_uuid: TYPE,
+                    },
+                )
                 .unwrap(),
             RuntimeTypePolicy { build_only: false }
         );

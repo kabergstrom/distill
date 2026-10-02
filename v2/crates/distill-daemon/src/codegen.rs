@@ -87,7 +87,9 @@ impl CodegenService {
             .ok_or_else(|| "enabled codegen service has no output directory".to_owned())?;
         output.verify()?;
 
-        let snapshot = daemon.pipeline_snapshot();
+        // The pipeline compiled for the version this store sees.
+        let compiled = daemon.compiled_at(store).map_err(|error| error.to_string())?;
+        let snapshot = compiled.pipeline_snapshot();
         let epoch = snapshot.epoch().map_err(|failure| failure.to_string())?;
         let basis = store.input_version();
         if self.last_attempted == Some(basis) {
@@ -98,7 +100,7 @@ impl CodegenService {
             return Ok(());
         }
 
-        let scanner = daemon.scanner();
+        let scanner = compiled.scanner().clone();
         let mut context = AuthoredCodegenContext::new(store, scanner.clone(), basis);
         let result = epoch.invoke_codegens(&mut context);
         let trace = context.trace;

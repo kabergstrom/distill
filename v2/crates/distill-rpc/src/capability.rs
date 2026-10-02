@@ -1714,9 +1714,10 @@ impl Snapshot {
     /// target/pipeline epoch as this snapshot. The second fence prevents a
     /// concurrent epoch replacement from publishing a stale policy answer.
     pub fn runtime_type_policy(&self, type_uuid: TypeUuid) -> RpcResult<RuntimeTypePolicy> {
-        if let Err(result) = self.preflight::<RuntimeTypePolicy>() {
-            return result;
-        }
+        let txn = match self.preflight::<RuntimeTypePolicy>() {
+            Ok(txn) => txn,
+            Err(result) => return result,
+        };
         let target = self.connection.borrow().target.clone();
         let Some(row) = rpc_try!(self.server.inner.reader.rpc_target(&target)) else {
             return RpcResult::ReconnectRequired {
@@ -1734,7 +1735,7 @@ impl Snapshot {
             .inner
             .handle
             .build_backend()
-            .runtime_type_policy(&request)
+            .runtime_type_policy(txn.snapshot(), &request)
         {
             Ok(policy) => policy,
             Err(error) => return RpcResult::Failure(error),

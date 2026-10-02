@@ -1273,6 +1273,25 @@ pub struct PipelineSnapshot {
 }
 
 impl PipelineSnapshot {
+    /// A Ready snapshot of `epoch`. Its runtime failure still latches
+    /// through the epoch's token.
+    pub(crate) fn ready(epoch: PipelineEpoch) -> Self {
+        Self {
+            state: PublishedState::Ready(epoch),
+        }
+    }
+
+    pub(crate) fn failed(failure: PipelineFailure) -> Self {
+        Self {
+            state: PublishedState::Failed(failure),
+        }
+    }
+
+    /// What serves before any epoch is published.
+    pub(crate) fn unpublished() -> Self {
+        Self::failed(unpublished_failure())
+    }
+
     pub fn epoch(&self) -> Result<&PipelineEpoch, PipelineFailure> {
         match &self.state {
             PublishedState::Failed(error) => Err(error.clone()),
@@ -1291,6 +1310,16 @@ impl PipelineSnapshot {
             }
         }
     }
+}
+
+/// The failure that serves before any epoch is published.
+pub(crate) fn unpublished_failure() -> PipelineFailure {
+    pipeline_failure(
+        PipelineFailureCode::CandidateOpen,
+        PipelineFailureOrigin::CandidateOpen,
+        CandidateCleanupDisposition::None,
+        "no pipeline epoch has been published",
+    )
 }
 
 /// Why [`ModuleHost::prepare_candidate`] produced no epoch.
@@ -1324,14 +1353,10 @@ impl ModuleHost {
     }
 
     pub fn snapshot(&self) -> PipelineSnapshot {
-        let state = self.published.clone().unwrap_or_else(|| {
-            PublishedState::Failed(pipeline_failure(
-                PipelineFailureCode::CandidateOpen,
-                PipelineFailureOrigin::CandidateOpen,
-                CandidateCleanupDisposition::None,
-                "no pipeline epoch has been published",
-            ))
-        });
+        let state = self
+            .published
+            .clone()
+            .unwrap_or_else(|| PublishedState::Failed(unpublished_failure()));
         PipelineSnapshot { state }
     }
 

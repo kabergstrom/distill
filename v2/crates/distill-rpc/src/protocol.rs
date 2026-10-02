@@ -931,8 +931,11 @@ pub trait BuildBackend: Send + Sync {
     /// build.
     fn start(&self, view: BuildView<'_>, request: &BuildRequest) -> BuildStart;
 
+    /// The runtime policy of `request`'s type under the compiled state
+    /// `snapshot` sees.
     fn runtime_type_policy(
         &self,
+        _snapshot: &distill_store::StoreReader,
         _request: &RuntimeTypePolicyRequest,
     ) -> Result<RuntimeTypePolicy, RpcFailure> {
         Err(RpcFailure::AuthoringBackendUnavailable {
