@@ -427,36 +427,52 @@ fn request_floods_never_block_the_caller_and_are_all_answered() {
 }
 
 // H5: the engine's frame never waits on the daemon. With a deep backlog in
-// flight, every `poll` returns within the step budget plus one turn.
+// flight, every `poll` does at most the step budget's turns plus one, each
+// of at most one `LocalSet` tick (61 task polls); with no budget, exactly
+// one turn. Counted, so a loaded machine cannot fail it.
 #[test]
 fn poll_stays_within_its_step_budget_under_a_backlog() {
-    watchdog(Duration::from_secs(30), || {
-        let daemon = serve(1, 256 * 1024);
-        let (mut io, basis) = bound(daemon.address, RpcIoConfig::default());
-        let (uuid, hash) = daemon.assets[0];
-        for req in 0..400 {
-            io.fetch(ReqId(req), hash, &basis);
-            io.resolve(ReqId(10_000 + req), uuid, &basis);
-        }
-        let mut slowest = Duration::ZERO;
-        let mut delivered = 0;
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while delivered < 800 {
-            assert!(Instant::now() < deadline, "only {delivered}/800 delivered");
-            let started = Instant::now();
-            delivered += io.poll().len();
-            slowest = slowest.max(started.elapsed());
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            slowest < Duration::from_millis(40),
-            "a poll took {slowest:?} with a 2 ms step budget"
-        );
-    });
+    for step_budget in [RpcIoConfig::default().step_budget, Duration::ZERO] {
+        watchdog(Duration::from_secs(30), move || {
+            let daemon = serve(1, 256 * 1024);
+            let (mut io, basis) = bound(
+                daemon.address,
+                RpcIoConfig {
+                    step_budget,
+                    ..RpcIoConfig::default()
+                },
+            );
+            let (uuid, hash) = daemon.assets[0];
+            for req in 0..400 {
+                io.fetch(ReqId(req), hash, &basis);
+                io.resolve(ReqId(10_000 + req), uuid, &basis);
+            }
+            let mut delivered = 0;
+            let mut polls = 0;
+            while delivered < 800 {
+                delivered += io.poll().len();
+                polls += 1;
+                let step = io.last_step();
+                assert!(step.turns >= 1, "{step:?}");
+                assert!(step.most_task_polls_in_a_turn <= 61, "{step:?}");
+                assert!(step.task_polls <= 61 * step.turns, "{step:?}");
+                if step_budget.is_zero() {
+                    assert_eq!(step.turns, 1, "a spent budget stops after one turn");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if step_budget.is_zero() {
+                // 800 answers, 400 of 256 KiB in 64 KiB chunks, at most one
+                // tick a poll: the backlog took many polls.
+                assert!(polls > 800 / 61, "{polls} polls");
+            }
+        });
+    }
 }
 
 // H6: fetches are answered as fast as the daemon serves them, not one per
-// two frames.
+// two frames: the IO completes them while it steps, whatever the frames
+// take, and one frame's `poll` delivers every answer it holds.
 #[test]
 fn fetch_throughput_is_not_one_per_two_frames() {
     watchdog(Duration::from_secs(30), || {
@@ -466,14 +482,12 @@ fn fetch_throughput_is_not_one_per_two_frames() {
         for req in 0..200 {
             io.fetch(ReqId(req), hash, &basis);
         }
-        let (events, frames) = frames_until(&mut io, Duration::from_secs(20), |events| {
-            count(events, is_fetched) == 200
+        step_until(&mut io, Duration::from_secs(20), |stats| {
+            stats.undelivered_events == 200
         });
+        let events = io.poll();
+        assert_eq!(count(&events, is_fetched), 200, "one frame delivers every answer");
         assert_eq!(events.len(), 200);
-        assert!(
-            frames < 100,
-            "200 fetches took {frames} frames; one per two frames would take 400"
-        );
     });
 }
 

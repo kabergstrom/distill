@@ -199,12 +199,27 @@ pub struct RpcIoStats {
     pub control_tasks: usize,
 }
 
+/// What one [`RpcIo::step`] did: the work a frame's `poll` may do, which
+/// the module docs bound ("Stepping") by the step budget plus one turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepStats {
+    /// Turns the step ran: one, then more only while work was ready and
+    /// the budget not spent.
+    pub turns: usize,
+    /// Polls of the IO's own tasks (requests, control, rebind) in the step.
+    pub task_polls: usize,
+    /// Polls of the IO's own tasks in its busiest turn. The `LocalSet` runs
+    /// at most 61 task polls a turn, capnp's `RpcSystem` among them.
+    pub most_task_polls_in_a_turn: usize,
+}
+
 pub struct RpcIo {
     shared: Rc<Shared>,
     max_in_flight_requests: usize,
     max_in_flight_fetches: usize,
     step_budget: Duration,
     queued: VecDeque<Queued>,
+    last_step: StepStats,
     queued_fetches: VecDeque<Queued>,
     /// The last basis `begin_sweep` returned, for a sweep begun while no
     /// connection is bound: requests under it fail as stale.
@@ -260,6 +275,7 @@ impl RpcIo {
             max_in_flight_fetches: config.max_in_flight_fetches.max(1),
             step_budget: config.step_budget,
             queued: VecDeque::new(),
+            last_step: StepStats::default(),
             queued_fetches: VecDeque::new(),
             last_basis: basis,
             local,
@@ -275,6 +291,11 @@ impl RpcIo {
             return None;
         }
         self.shared.import_failures.borrow().clone()
+    }
+
+    /// What the last [`Self::step`] (or `poll`) did.
+    pub fn last_step(&self) -> StepStats {
+        self.last_step
     }
 
     pub fn stats(&self) -> RpcIoStats {
@@ -300,9 +321,16 @@ impl RpcIo {
     /// step budget is spent. [`LoaderIO::poll`] calls this.
     pub fn step(&mut self) {
         let started = Instant::now();
+        self.last_step = StepStats::default();
         self.admit();
         loop {
+            let polls = self.shared.task_polls.get();
             let woken = self.turn();
+            let polled = self.shared.task_polls.get() - polls;
+            self.last_step.turns += 1;
+            self.last_step.task_polls += polled;
+            self.last_step.most_task_polls_in_a_turn =
+                self.last_step.most_task_polls_in_a_turn.max(polled);
             if started.elapsed() >= self.step_budget {
                 break;
             }
@@ -430,7 +458,7 @@ impl LoaderIO for RpcIo {
         }
         self.discard();
         let _local = self.local.enter();
-        let task = tokio::task::spawn_local(rebind(Rc::clone(&self.shared), target.clone()));
+        let task = self.shared.spawn(rebind(Rc::clone(&self.shared), target.clone()));
         *self.shared.link.borrow_mut() = Link::Rebinding {
             target,
             task: task.abort_handle(),
@@ -570,6 +598,8 @@ struct Shared {
     /// Signalled whenever a snapshot refresh ends.
     refreshed: tokio::sync::Notify,
     next_serial: Cell<u64>,
+    /// Polls of the tasks this IO spawned, ever (see [`StepStats`]).
+    task_polls: Rc<Cell<usize>>,
 }
 
 enum Link {
@@ -772,7 +802,19 @@ impl Shared {
             import_failures_changed: Cell::new(false),
             refreshed: tokio::sync::Notify::new(),
             next_serial: Cell::new(1),
+            task_polls: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// Spawn `task` on the `LocalSet`, counting its polls.
+    fn spawn<T: 'static>(
+        &self,
+        task: impl Future<Output = T> + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        tokio::task::spawn_local(Counted {
+            polls: Rc::clone(&self.task_polls),
+            task: Box::pin(task),
+        })
     }
 
     fn connection(&self) -> Option<Rc<Connection>> {
@@ -821,7 +863,7 @@ impl Shared {
     }
 
     fn spawn_control(&self, task: impl Future<Output = ()> + 'static) {
-        let handle = tokio::task::spawn_local(task).abort_handle();
+        let handle = self.spawn(task).abort_handle();
         let mut control = self.control.borrow_mut();
         control.retain(|task| !task.is_finished());
         control.push(handle);
@@ -903,7 +945,7 @@ impl Shared {
             req,
             fetch,
         };
-        let task = tokio::task::spawn_local(run_request(
+        let task = self.spawn(run_request(
             Rc::clone(self),
             connection,
             snapshot,
@@ -1513,5 +1555,20 @@ fn drifted_input(input: RpcDriftedInput) -> DriftedInput {
         RpcDriftedInput::Query(query) => DriftedInput::Query(query),
         RpcDriftedInput::Dylib => DriftedInput::Dylib,
         RpcDriftedInput::Tool(tool) => DriftedInput::Tool(tool),
+    }
+}
+
+/// A task that counts its polls.
+struct Counted<T> {
+    polls: Rc<Cell<usize>>,
+    task: Pin<Box<dyn Future<Output = T>>>,
+}
+
+impl<T> Future for Counted<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        self.polls.set(self.polls.get() + 1);
+        self.task.as_mut().poll(cx)
     }
 }

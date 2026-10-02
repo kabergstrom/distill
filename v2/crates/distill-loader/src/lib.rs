@@ -17,7 +17,7 @@ pub mod storage;
 
 pub use admission::{Admit, FetchAdmission, Reservation};
 pub use basis::{IoBasis, ManifestHash};
-pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats};
+pub use capnp_io::{RpcIo, RpcIoConfig, RpcIoInitError, RpcIoStats, StepStats};
 pub use component::{
     load_cycles, AdoptionDecision, CandidateAsset, CandidateOutcome, ComponentPlanner,
     MemberFailure,
