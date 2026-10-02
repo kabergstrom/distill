@@ -1159,3 +1159,7 @@ sibling fix: 1170 passed, no failures.
 Merge of db-truth and db-queries (schema 37), with the tag-refinement
 fallback read only on failure, chained imports in one pass, counted loader
 steps, the scheduler join and the query drivers: 1196 passed, no failures.
+Merge of reads-scan and reads-query (one schema 38), with a complete
+publication republishing the poisoned bundles of reschemaed types: 1217
+passed, no failures (12 from reads-scan, 8 from reads-query, 1 new: the
+complete publication's re-validated poisoned skeleton).
