@@ -960,10 +960,8 @@ should reach zero by the end of phase 6.
   - A complete publication diffs `files`, the per-bundle asset sets, the
     asset deletions and the path index by ordered merges of streamed rows,
     holding only the differences.
-  - Still whole: a configuration candidate whose roots are unchanged
-    loads the published scan (`published_scan`) and republishes it in
-    full, since claims and bundle poison are rederived under the new
-    projection and schema authority. The rest moved in schema 38 (below).
+  - A configuration candidate whose roots are unchanged no longer loads
+    the published scan; it publishes its difference (schema 38, below).
 - **Merged schema 37.** The build-cells, db-truth and db-queries branches each
   defined a schema 36; the merge is one SCHEMA_VERSION 37 with the union of
   their tables and one copy of each index. `assets_by_bundle` is
@@ -1016,12 +1014,21 @@ should reach zero by the end of phase 6.
   - A projection change republishes the bundles that hold an asset of a
     type whose terminal it changes, so `terminal_type` cannot go stale on
     an unchanged bundle.
-  - Tag refinement redoes the pending rows, plus the rows whose
-    `tag_epoch` or `dylib_hash` is stale; each is an index search. It
+  - Tag epochs are per type (`tag_epochs`): a digest of the type and the
+    schema types its value reaches. A complete step or a configuration
+    candidate marks pending only the rows of types whose epoch changed.
+    Tag refinement redoes the pending rows, plus the rows whose
+    `dylib_hash` is stale; each is an index search. It
     parses each bundle once. A failed refinement writes poison rows for
     the entries it was refining. Delta apply ignores the in-memory commit,
     so `all_asset_bundles` is no longer read outside tests.
   - `publish_incremental_paths` is always incremental.
+  - A configuration candidate whose roots are unchanged republishes, by
+    the incremental publication, only the bundles of retyped types, the
+    poisoned bundles of reschemaed types, and (when either is non-empty)
+    the malformed and colliding sources. A module-only change republishes
+    nothing. Only a roots change scans; `ScanSnapshot::load` is the test
+    oracle's.
   - The import index is kept by dirty work. Every bundle publication queues
     its paths, and a pass reindexes the dirty bundle sources (one parse
     each) before acknowledging them. A whole-namespace import check

@@ -3890,16 +3890,35 @@ watched shared schema. Its source hash is the conservative local
 tag-annotation epoch: any schema edit re-extracts tags for affected entries —
 metadata-only work, no artifacts touched.
 
-Refinement redoes exactly the stale rows. A publication marks the rows of
-the entries it changed pending; a complete step or a configuration
-candidate also redoes the rows whose `tag_epoch` differs from the current
-epoch or whose recorded `dylib_hash` differs from the current module's —
-each an index search (`asset_tag_index_by_epoch`, and the partial
-`asset_tag_index_migrated` over the rows where code ran), never a walk of
-every asset. Each bundle is read and parsed once per refinement, however
-many of its entries it refines. A refinement that fails writes poison rows
-for exactly the entries it was refining, in the same input; the in-memory
-commit alone would not reach a store that applies deltas.
+The epoch is kept per authored type, not for the schema as a whole: a
+digest of the type's logical hash and of every schema type its value
+reaches, attributes included (tag markers, renames), numbered in the order
+the walk reaches them, so an edit elsewhere in the schema leaves it
+unchanged. `tag_epochs` holds, per type, the epoch its rows were refined
+under; a complete step or a configuration candidate records the current
+epochs, and each type whose epoch changed has its rows marked pending, by
+one search of `assets_by_type`, in that input. Refinement then redoes
+exactly the stale rows: those a publication or an epoch change marked
+pending (a search of the partial `asset_tag_index_poisoned`), and the rows
+whose recorded `dylib_hash` differs from the current module's (a search of
+the partial `asset_tag_index_migrated` over the rows where code ran), never
+a walk of every asset. Each bundle is read and parsed once per refinement,
+however many of its entries it refines. A refinement that fails writes
+poison rows for exactly the entries it was refining, in the same input; the
+in-memory commit alone would not reach a store that applies deltas.
+
+**A configuration change publishes its difference.** A candidate whose
+roots are unchanged republishes, through the incremental publication a
+watcher edit uses, only the sources its difference from the published
+state reaches: every bundle holding an asset of a type whose pipeline
+interface (terminal type, derived outputs) changed; the poisoned bundles
+holding an asset of a type whose tag epoch changed, since the authority
+validates their skeleton; and, when either set is non-empty, the malformed
+sources and those of colliding claims, whose claims publish nothing to
+compare. A pipeline-module-only change reaches no source; its migrated tag
+rows are refinement's. Only a root replacement, or a process that has not
+yet observed the roots or compiled the store's version, scans and
+publishes completely.
 
 Recorded dependencies live in daemon state and double as the reverse indexes
 for change propagation (v1's `reverse_path_refs` table was the precursor).
