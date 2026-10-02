@@ -5459,9 +5459,12 @@ One writer, many snapshot readers:
   job and interactive work, so neither class can starve. A live pool
   resize re-clamps the reservation to these bounds; already active excess
   slots drain naturally and are never cancelled or reassigned mid-job.
-- **RPC task** — capnp's `RpcSystem` is single-threaded; it runs on its own
-  task, resolving reads against snapshots and forwarding writes to the
-  coordinator.
+- **RPC threads** — one listener thread accepts; every client connection is
+  served on an OS thread of its own (capnp's `RpcSystem` is single-threaded,
+  so each runs on that thread's current-thread runtime), resolving reads
+  against its own snapshots and forwarding writes to the coordinator. A
+  stalled or large request delays only its own connection (§17 Server
+  threading).
 - **Watcher thread** — OS watcher events batch into coordinator messages
   (§14).
 
@@ -6905,6 +6908,61 @@ cancellable progress and still commit through §14's journaled
 swap-verify-or-restore protocol. Subscription, snapshot, and authoring
 capabilities are bounded and leased so abandoned clients cannot retain
 unbounded daemon state.
+
+### Server threading
+
+The daemon's listener runs on one thread and does nothing but accept. Each
+accepted connection gets an OS thread of its own with a current-thread
+tokio runtime and a `LocalSet`, on which that connection's `RpcSystem`, its
+capabilities and its pending calls live. A request that stalls inside a
+backend, or a fetch streaming a large artifact, therefore delays only its own
+connection; other connections and new connects proceed.
+
+**Nothing mutable is shared between connections.** A connection owns its
+front end outright: its own store reader, its own snapshots (each an open
+read transaction on a reader of its own; calls on one connection at one
+version share it), its own subscription set, delta queue and change-log
+cursor. None of it is reachable from another thread, so none of it is
+locked. What connections share is the server handle, which is `Send + Sync`
+and holds no per-connection state: the store configuration and identity,
+the backends, the publication `watch` signal, the snapshot policy and two counters, open snapshots and admitted
+connections, all atomics. Writes go through the store,
+whose write lock orders them; the build backend memoizes builds, so the
+RPC layer keeps no build cache of its own. The RPC layer takes no lock of its
+own, so it has no lock order: the bounds are claimed by compare-and-swap,
+and the only lock a connection waits on is the store's.
+
+**Snapshots.** A connection opening a snapshot claims one slot of the
+global `max_snapshots` bound by compare-and-swap. Past the bound it first
+releases its own oldest snapshot; a connection holding none is refused with
+a typed `ResourceLimit` rather than evicting another connection's. A
+snapshot served over the wire expires `ttl` after it opens; the expiry runs
+on the owning connection's thread, and releasing a snapshot (expiry, refresh
+past the bound, the client dropping it, or the connection closing) returns
+its slot.
+
+**Delta fan-out.** A commit publishes by bumping the `watch` value; it
+never touches a connection. Each connection waiting on its delta stream
+wakes, reads the durable change log after its own cursor, filters it to its
+subscriptions and fences, and advances the cursor. The writer is never
+blocked by a slow reader and there is no polling. Undelivered events per
+connection are bounded (1024): past that the queue collapses into one
+`resyncRequired`, and a pending `reconnectRequired` is kept instead, so a
+client that stops reading costs a bounded queue and a resync, never memory
+or the writer's time.
+
+**Limits and lifecycle.** `max_connections` bounds both the connection
+threads (the listener closes a connection past the bound unserved) and the
+hubs and metadata hubs bound through `Root.connect` and `Root.metadata`
+(refused with the typed `ResourceLimit` in the existing error arm, so the
+wire protocol is unchanged). A connection's thread ends when its client
+disconnects; its front end, snapshots and slots are released with it. On
+shutdown the listener stops accepting and closes every connection by
+shutting its socket down, so capnp-rpc runs its own disconnect and releases
+every capability; it then waits a bounded grace (1 s) for the threads. A
+thread stuck inside a backend call is left to finish that call and exit on
+its own, never joined indefinitely. A panic on a connection thread is caught
+at the thread boundary, logged, and ends only that connection.
 
 ### Runtime boundary
 

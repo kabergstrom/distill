@@ -160,7 +160,7 @@ a connection of its own, and SQLite's write lock orders the writers.
 
 ```
  notify ──▶ watcher ──WatcherEvent──▶ process loop ──(own writer)──▶ SQLite
- rpc (LocalSet front end: connections, snapshots, subscriptions)
+ rpc listener ──▶ one thread per connection (LocalSet front end: snapshots, subscriptions)
     ├─ reads: own StoreReader, one read transaction per snapshot
     └─ writes, imports, builds: spawn_blocking ──(own writer)──▶ SQLite
  scheduler workers: builds, each on its own reader and writer
@@ -186,12 +186,14 @@ a connection of its own, and SQLite's write lock orders the writers.
   revalidation against its reader, builds dependency reads inline, and
   commits the CAS index, `artifact_load_edges` and `resolutions` in one
   transaction on its own writer.
-- **rpc front ends** are cheap, `!Send`, per-thread values
-  (`Rc<RefCell<…>>` state on a `LocalSet`). Each owns its connections,
-  subscriptions, in-flight build map and snapshots. A snapshot is a read
-  transaction; the capnp transport expires it after a fixed TTL (30 s by
-  default, `SnapshotPolicy`), with a `spawn_local` timer, and caps the
-  number open. A call on an expired snapshot fails with
+- **rpc front ends** are cheap, `!Send` values, one per client
+  connection, each on that connection's own thread (`Rc<RefCell<…>>` state
+  on its `LocalSet`). Each owns its reader, subscriptions, delta queue,
+  change-log cursor and snapshots; no front end reaches another. A
+  snapshot is a read transaction; the capnp transport expires it after a
+  fixed TTL (30 s by default, `SnapshotPolicy`), with a `spawn_local`
+  timer. The number open across connections, and the number of
+  connections, are capped by atomic counters on the `ServerHandle`. A call on an expired snapshot fails with
   `SnapshotExpired`, and the client retries on a new one. Nothing pins
   artifacts or CAS segments.
 - **CAS reclamation** deletes a retired segment once no read transaction
