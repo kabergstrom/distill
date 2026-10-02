@@ -1,7 +1,8 @@
 //! One thread per RPC connection: isolation between connections, the
 //! connection and snapshot bounds, delta and fence fan-out, cleanup when a
-//! client vanishes, prompt shutdown, panic isolation, and a concurrent
-//! stress run. Every test runs under a watchdog.
+//! client vanishes, prompt shutdown, panic isolation, a concurrent stress
+//! run, and writers: each connection writes on a writer of its own. Every
+//! test runs under a watchdog.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -11,7 +12,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use distill_rpc::capnp_loader::{RemoteCall, RemoteHub, RemoteSnapshot};
-use distill_rpc::capnp_transport::{CapnpClient, ConnectionHandle, StagedListener};
+use distill_rpc::capnp_transport::{
+    schema, CapnpClient, ConnectionHandle, RemoteConnectOutcome, StagedListener,
+};
 use distill_rpc::*;
 
 const TARGET_HASH: TargetDefinitionHash = TargetDefinitionHash([7; 32]);
@@ -1001,5 +1004,379 @@ fn concurrent_snapshots_resolves_fetches_and_commits_stay_consistent() {
         assert!(eventually(Duration::from_secs(5), || {
             server.open_snapshots() == 0 && server.handle().open_connections() == 0
         }));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 9. Writers: every connection writes through a writer of its own
+
+/// Publishes every write, and writes a row of its own (the clean
+/// watermark: the version it publishes) through the writer it is given,
+/// inside the input. Records each base and the segment size its writer
+/// saw.
+#[derive(Default)]
+struct LedgerBackend {
+    bases: Mutex<Vec<InputVersion>>,
+    segment_sizes: Mutex<Vec<u64>>,
+    /// Hold each write open this long, so writes on two connections
+    /// overlap.
+    hold: Duration,
+}
+
+fn store_failure(error: distill_store::StoreError) -> RpcFailure {
+    RpcFailure::InvalidAuthoringRequest {
+        detail: error.to_string(),
+    }
+}
+
+/// The served projection of the version `next`: `ASSET` fails with a
+/// message naming it.
+fn ledger_commit(next: InputVersion) -> Commit {
+    Commit {
+        assets: vec![AssetMutation::Set {
+            uuid: ASSET,
+            resolution: StoredResolve::Failed {
+                error: format!("v{}", next.0),
+            },
+            delta: AssetDeltaState::Changed,
+        }],
+        ..Commit::default()
+    }
+}
+
+/// The backend's row for the version `next`, written through `store`.
+fn ledger_row(store: &mut distill_store::Store, next: InputVersion) -> Result<(), distill_store::StoreError> {
+    store
+        .input_transaction(|transaction| transaction.set_clean_watermark(next.0 as i64))
+        .map(|_| ())
+}
+
+impl AuthoringBackend for LedgerBackend {
+    fn prepare_write(
+        &self,
+        store: &mut distill_store::Store,
+        base: InputVersion,
+        _operations: &[AuthoringOp],
+        _force_lossy: bool,
+    ) -> Result<Option<Commit>, RpcFailure> {
+        let next = InputVersion(base.0 + 1);
+        ledger_row(store, next).map_err(store_failure)?;
+        std::thread::sleep(self.hold);
+        self.bases.lock().unwrap().push(base);
+        self.segment_sizes
+            .lock()
+            .unwrap()
+            .push(store.config().segment_size);
+        Ok(Some(ledger_commit(next)))
+    }
+
+    fn prepare_import(
+        &self,
+        _store: &mut distill_store::Store,
+        _base: InputVersion,
+        _request: &ImportRequest,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("the ledger backend only writes")
+    }
+
+    fn prepare_reimport(
+        &self,
+        _store: &mut distill_store::Store,
+        _base: InputVersion,
+        _bundle: BundleUuid,
+    ) -> Result<PreparedImportCommit, RpcFailure> {
+        unreachable!("the ledger backend only writes")
+    }
+
+    fn prepare_operation(
+        &self,
+        _store: &mut distill_store::Store,
+        _base: InputVersion,
+        _operation: &LongRunningOp,
+    ) -> Result<PreparedOperationCommit, RpcFailure> {
+        unreachable!("the ledger backend only writes")
+    }
+}
+
+fn ledger_server(backend: Arc<LedgerBackend>) -> Server {
+    Server::new_with_authoring_backend(
+        StoreInstanceId([9; 16]),
+        vec![TargetDefinition::new("dev", TARGET_HASH)],
+        backend,
+    )
+    .unwrap()
+}
+
+/// Connect, keeping the raw hub for the authoring calls `RemoteHub` does
+/// not wrap.
+async fn connect_writer(address: SocketAddr) -> (CapnpClient, RemoteHub, schema::hub::Client) {
+    let client = CapnpClient::connect_local(address).await.unwrap();
+    let raw = match client.connect(&request()).await.unwrap() {
+        RemoteConnectOutcome::Connected { hub, instance } => (hub, instance),
+        _ => panic!("expected a connected hub"),
+    };
+    let hub = RemoteHub::connected(RemoteConnectOutcome::Connected {
+        hub: raw.0.clone(),
+        instance: raw.1,
+    })
+    .unwrap();
+    (client, hub, raw.0)
+}
+
+/// One write at `base`: the version it published, or the error code.
+async fn write_at(hub: &schema::hub::Client, base: InputVersion) -> Result<InputVersion, u16> {
+    let mut call = hub.write_request();
+    {
+        let mut params = call.get();
+        params.set_base(base.0);
+        let mut ops = params.reborrow().init_ops(1);
+        ops.reborrow().get(0).init_remove().set_bytes(&ASSET.0);
+    }
+    let response = call.send().promise.await.unwrap();
+    match response.get().unwrap().get_result().unwrap().which().unwrap() {
+        schema::u_int64_call::Which::Success(version) => Ok(InputVersion(version)),
+        schema::u_int64_call::Which::Error(error) => Err(error.unwrap().get_code()),
+        _ => panic!("unexpected write outcome"),
+    }
+}
+
+/// Write at the current version until one write publishes.
+async fn write_once(hub: &RemoteHub, raw: &schema::hub::Client) -> InputVersion {
+    for _ in 0..1000 {
+        let base = snapshot(hub).await.basis().snapshot.version;
+        if let Ok(version) = write_at(raw, base).await {
+            return version;
+        }
+    }
+    panic!("no write published in 1000 attempts");
+}
+
+/// Two connections write at once, each on its own writer. SQLite's write
+/// lock orders them: every write publishes exactly the version after its
+/// base, no version is lost or published twice, and each connection's
+/// versions rise.
+#[test]
+fn two_connections_writing_concurrently_both_commit_in_order() {
+    watchdog(Duration::from_secs(60), || {
+        let backend = Arc::new(LedgerBackend {
+            hold: Duration::from_millis(2),
+            ..LedgerBackend::default()
+        });
+        let server = ledger_server(Arc::clone(&backend));
+        let daemon = Daemon::start(server.root());
+        let address = daemon.address;
+        let start = server.current_stamp().version;
+        const WRITES: u64 = 15;
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writers = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                on_thread(move || async move {
+                    let (_client, hub, raw) = connect_writer(address).await;
+                    barrier.wait();
+                    let mut versions = Vec::new();
+                    for _ in 0..WRITES {
+                        versions.push(write_once(&hub, &raw).await);
+                    }
+                    versions
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut all = Vec::new();
+        for writer in writers {
+            let versions = writer.join().unwrap();
+            assert!(
+                versions.windows(2).all(|pair| pair[0] < pair[1]),
+                "a connection's versions rise: {versions:?}"
+            );
+            all.extend(versions);
+        }
+        all.sort();
+        let expected = (1..=2 * WRITES)
+            .map(|offset| InputVersion(start.0 + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(all, expected, "every write published one version");
+        // The backend ran inside each input in commit order: each base is
+        // the version before.
+        assert_eq!(
+            *backend.bases.lock().unwrap(),
+            (0..2 * WRITES)
+                .map(|offset| InputVersion(start.0 + offset))
+                .collect::<Vec<_>>(),
+        );
+        let reader = server.handle().opener().open_reader().unwrap();
+        let last = InputVersion(start.0 + 2 * WRITES);
+        assert_eq!(reader.input_version(), last);
+        assert_eq!(reader.clean_watermark().unwrap(), Some(last.0 as i64));
+    });
+}
+
+/// A coordinated commit's durable step (the backend's row) and the served
+/// projection it returns land in one input: a reader's snapshot sees both
+/// or neither, at every version.
+#[test]
+fn a_coordinated_commits_backend_row_and_served_projection_land_together() {
+    watchdog(Duration::from_secs(60), || {
+        let server = ledger_server(Arc::new(LedgerBackend::default()));
+        let handle = server.handle();
+        let start = server.current_stamp().version;
+        const COMMITS: u64 = 150;
+
+        let committer = {
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || {
+                // An owner of its own: this thread's writer.
+                let admin = Server::open(&handle);
+                for _ in 0..COMMITS {
+                    let base = admin.current_stamp().version;
+                    let next = InputVersion(base.0 + 1);
+                    admin
+                        .coordinated_commit(base, |store| {
+                            ledger_row(store, next).map_err(|error| error.to_string())?;
+                            Ok(ledger_commit(next))
+                        })
+                        .unwrap();
+                }
+            })
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let last = InputVersion(start.0 + COMMITS);
+        loop {
+            let snapshot = handle
+                .opener()
+                .open_reader()
+                .unwrap()
+                .begin_snapshot()
+                .unwrap();
+            let version = snapshot.input_version();
+            let watermark = snapshot.clean_watermark().unwrap();
+            let served = snapshot.asset_resolution(ASSET).unwrap();
+            if version == start {
+                assert_eq!(watermark, None);
+            } else {
+                assert_eq!(watermark, Some(version.0 as i64), "backend row at {version:?}");
+                assert_eq!(
+                    served,
+                    Some(distill_store::served::ResolutionRow::Failed(format!(
+                        "v{}",
+                        version.0
+                    ))),
+                    "served projection at {version:?}"
+                );
+            }
+            seen.insert(version);
+            if version == last {
+                break;
+            }
+        }
+        committer.join().unwrap();
+        assert!(seen.len() > 2, "the reader saw versions while commits ran: {seen:?}");
+    });
+}
+
+/// A connection whose write waits on SQLite's write lock blocks only
+/// itself: another connection snapshots, resolves and subscribes
+/// meanwhile, and receives the delta once the write publishes.
+#[test]
+fn a_connection_blocked_on_the_write_lock_does_not_stall_another() {
+    watchdog(Duration::from_secs(60), || {
+        let server = ledger_server(Arc::new(LedgerBackend::default()));
+        let start = server
+            .commit(ledger_commit(InputVersion(1)))
+            .unwrap()
+            .version;
+        let daemon = Daemon::start(server.root());
+        let address = daemon.address;
+
+        // Another owner holds the write lock.
+        let mut holder = server.handle().opener().open_writer().unwrap();
+        holder.open_input().unwrap();
+
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer = on_thread(move || async move {
+            let (_client, _hub, raw) = connect_writer(address).await;
+            written_tx.send(write_at(&raw, start).await).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(written_rx.try_recv().is_err(), "the write waits on the lock");
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (delta_tx, delta_rx) = mpsc::channel();
+        let reader = on_thread(move || async move {
+            let started = Instant::now();
+            let (_client, hub) = connect(address).await;
+            let snapshot = snapshot(&hub).await;
+            assert_eq!(snapshot.basis().snapshot.version, start);
+            assert!(matches!(
+                snapshot.resolve(ASSET).await.unwrap(),
+                RemoteCall::Success(_)
+            ));
+            let mut subscription = match hub.subscribe(start, vec![ASSET], vec![]).await.unwrap() {
+                RemoteCall::Success(subscription) => subscription,
+                other => panic!("subscribe failed: {other:?}"),
+            };
+            assert!(matches!(
+                subscription.next().await.unwrap(),
+                Some(StreamEvent::InitialDelta { .. })
+            ));
+            ready_tx.send(started.elapsed()).unwrap();
+            delta_tx
+                .send(subscription.next().await.unwrap().expect("the stream ended"))
+                .unwrap();
+        });
+        let elapsed = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the other connection was served at once, took {elapsed:?}"
+        );
+        assert!(
+            written_rx.try_recv().is_err(),
+            "the write still waits on the lock"
+        );
+
+        holder.finish_input(false).unwrap();
+        let next = InputVersion(start.0 + 1);
+        assert_eq!(
+            written_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(next)
+        );
+        assert!(matches!(
+            delta_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            StreamEvent::Delta(Delta { basis, .. }) if basis.snapshot.version == next
+        ));
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+/// An operational configuration change reaches a connection's writer that
+/// was opened before it, from its next transaction on.
+#[test]
+fn a_configuration_change_reaches_open_writers() {
+    watchdog(Duration::from_secs(60), || {
+        let backend = Arc::new(LedgerBackend::default());
+        let server = ledger_server(Arc::clone(&backend));
+        let daemon = Daemon::start(server.root());
+        let address = daemon.address;
+        let handle = server.handle();
+        let before = handle.opener().config().segment_size;
+
+        let (step_tx, step_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = on_thread(move || async move {
+            let (_client, hub, raw) = connect_writer(address).await;
+            write_once(&hub, &raw).await;
+            done_tx.send(()).unwrap();
+            step_rx.recv().unwrap();
+            write_once(&hub, &raw).await;
+        });
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut changed = distill_store::StoreConfig::clone(&handle.opener().config());
+        changed.segment_size = before * 2;
+        handle.opener().apply_operational_config(&changed).unwrap();
+        step_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(*backend.segment_sizes.lock().unwrap(), [before, before * 2]);
     });
 }
