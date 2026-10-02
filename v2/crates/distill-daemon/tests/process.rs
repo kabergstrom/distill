@@ -256,6 +256,105 @@ fn disabled_existing_codegen_output_is_still_excluded() {
     assert!(output.join("owned.rs").is_file());
 }
 
+/// Directory-import rules generating one `collide.bundle` from each `*.src`:
+/// a collision no pass can reconcile while two sources exist.
+fn colliding_directory_rules_bundle() -> Vec<u8> {
+    use distill_core::bootstrap::{
+        BootstrapControlSpecV1, BootstrapControlSymbol, DIRECTORY_IMPORT_RULES_TYPE_UUID,
+    };
+    use distill_json::AuthoredValue;
+    let object = |fields: Vec<(&str, AuthoredValue)>| {
+        AuthoredValue::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+        )
+    };
+    let row = BootstrapControlSpecV1::embedded()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| row.symbol == BootstrapControlSymbol::DirectoryImportRules)
+        .unwrap();
+    let schema = distill_schema::ngp_schema::node_from_bytes(&row.logical_schema).unwrap();
+    let query = || {
+        object(vec![
+            ("path_glob", AuthoredValue::Str("*.src".into())),
+            ("path_prefix", AuthoredValue::Null),
+        ])
+    };
+    let rule = |id: u8| {
+        object(vec![
+            ("group", object(vec![("PerFile", object(Vec::new()))])),
+            (
+                "id",
+                AuthoredValue::Array(vec![AuthoredValue::UInt(id.into()); 16]),
+            ),
+            ("importer", AuthoredValue::Str("missing-importer".into())),
+            ("matches", query()),
+            ("output", AuthoredValue::Str("collide.bundle".into())),
+            (
+                "settings",
+                object(vec![("UInt", object(vec![("value", AuthoredValue::UInt(5))]))]),
+            ),
+        ])
+    };
+    let data = object(vec![
+        ("listing", query()),
+        ("rules", AuthoredValue::Array(vec![rule(1)])),
+    ]);
+    distill_bundle::write_bundle(&distill_bundle::Bundle {
+        format_version: 1,
+        uuid: distill_core::id::BundleUuid([31; 16]),
+        primary: None,
+        schemas: [(row.logical_hash, schema)].into_iter().collect(),
+        assets: [(
+            "rules".to_owned(),
+            distill_bundle::AssetEntry {
+                uuid: distill_core::id::AssetUuid([32; 16]),
+                type_uuid: DIRECTORY_IMPORT_RULES_TYPE_UUID,
+                schema_hash: row.logical_hash,
+                authoring_only: true,
+                data,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    })
+    .unwrap()
+}
+
+/// A failed pass reports its error, and keeps retrying, until a later pass
+/// succeeds: that pass clears the error.
+#[test]
+fn a_background_error_clears_once_a_later_pass_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let process = DaemonProcess::start(config(&temp)).unwrap();
+    std::fs::write(
+        temp.path().join("assets/rules.bundle"),
+        colliding_directory_rules_bundle(),
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("assets/foo.src"), b"1").unwrap();
+    let source = temp.path().join("assets/bar.src");
+    std::fs::write(&source, b"2").unwrap();
+    wait_until(
+        || {
+            process
+                .last_background_error()
+                .is_some_and(|error| error.contains("directory import rules collide"))
+        },
+        "the colliding rules did not fail the pass",
+    );
+
+    std::fs::remove_file(&source).unwrap();
+    wait_until(
+        || process.last_background_error().is_none(),
+        "the pass that succeeded did not clear the error",
+    );
+}
+
 #[test]
 fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -1167,21 +1266,28 @@ fn pipeline_with_an_unchanged_layout_is_adopted_ahead_of_source_walk() {
     let temp = tempfile::tempdir().unwrap();
     let process = start_gate_daemon(&temp, &variants.v2);
     assert_eq!(imported_value(&temp).as_deref(), Some("v2:note"));
-    // Let the watcher publish the import's own bundle write first: in the
-    // same pass as the module swap, the reimport would rewrite the bundle
-    // that pass's file work observed, and its acknowledgement would fail
-    // (and be retried).
-    std::thread::sleep(SETTLED);
     let generation = pipeline_generation(&process);
 
-    // Only fn bodies changed: the schema already describes this build.
+    // Only fn bodies changed: the schema already describes this build. The
+    // swap can share a pass with the watcher work of the import's own bundle
+    // write, which the capability-driven reimport rewrites: more work for
+    // the next pass, never an error.
     install_gate_pipeline(&temp, &variants.v3);
+    let no_error = || {
+        assert_eq!(process.last_background_error(), None);
+    };
     wait_long(
-        || ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3)),
+        || {
+            no_error();
+            ready_dylib_hash(&process) == Some(dylib_hash(&variants.v3))
+        },
         "a layout-preserving pipeline was not adopted ahead of source-walk",
     );
     wait_long(
-        || imported_value(&temp).as_deref() == Some("v3:note"),
+        || {
+            no_error();
+            imported_value(&temp).as_deref() == Some("v3:note")
+        },
         "the new importer version did not reimport the watched import",
     );
     assert_eq!(pipeline_generation(&process), generation + 1);
