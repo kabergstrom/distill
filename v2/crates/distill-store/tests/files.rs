@@ -331,3 +331,36 @@ fn scan_structure_is_replaced_per_subtree() {
         .unwrap();
     assert_eq!(store.scan_diagnostics().unwrap(), [diagnostic("c")]);
 }
+
+#[test]
+fn acknowledgement_clears_settled_paths_and_keeps_paths_with_newer_work() {
+    let (_directory, mut store) = store();
+    let (root, _) = store
+        .input_transaction(|transaction| {
+            let root = transaction.intern_root("main")?;
+            transaction.upsert_file(root, "settled.txt", &file_state(1).into(), InputVersion(1))?;
+            transaction.push_dirty(root, "settled.txt", true, InputVersion(1))?;
+            transaction.upsert_file(root, "moving.txt", &file_state(1).into(), InputVersion(1))?;
+            transaction.push_dirty(root, "moving.txt", true, InputVersion(1))?;
+            Ok(root)
+        })
+        .unwrap();
+    let captured = store.pending_file_work().unwrap();
+    store
+        .input_transaction(|transaction| {
+            transaction.upsert_file(root, "moving.txt", &file_state(2).into(), InputVersion(2))?;
+            transaction.push_dirty(root, "moving.txt", true, InputVersion(2))
+        })
+        .unwrap();
+
+    // The newer observation of one path is more work, not a failure: the
+    // settled path clears and the moving path keeps all its rows.
+    assert!(!store.acknowledge_file_work(&captured).unwrap());
+    let remaining = store.pending_file_work().unwrap();
+    assert_eq!(remaining.dirty.len(), 2);
+    assert!(remaining.dirty.iter().all(|entry| entry.path == "moving.txt"));
+
+    // Once a pass captures the newest observation, it clears.
+    assert!(store.acknowledge_file_work(&remaining).unwrap());
+    assert!(store.pending_file_work().unwrap().dirty.is_empty());
+}

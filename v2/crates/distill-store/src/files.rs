@@ -361,10 +361,14 @@ impl Store {
     }
 
 
-    /// Atomically compare and clear one completed watcher-work prefix without
-    /// fabricating a new input snapshot. Downstream publications are already
-    /// durable; if any file observation changed, no captured row is cleared
-    /// and the whole fold is retried. Rows appended after the prefix survive.
+    /// Clear the watcher work a pass has completed without fabricating a new
+    /// input snapshot. Each captured path is compared on its own: when the
+    /// stored observation still matches the newest captured entry for that
+    /// path, its rows up to that entry are cleared; when it does not, more
+    /// work arrived for the path and every row for it stays pending for the
+    /// next pass. Rows appended after the capture survive either way, and the
+    /// captured rename events, which the pass has applied, are cleared.
+    /// Returns whether every captured path was cleared.
     pub fn acknowledge_file_work(&mut self, work: &PendingFileWork) -> Result<bool, StoreError> {
         self.write_txn(|store| {
             let transaction = store.read.conn.savepoint()?;
@@ -372,6 +376,7 @@ impl Store {
             for entry in &work.dirty {
                 latest.insert((entry.root, entry.path.as_str()), entry);
             }
+            let mut complete = true;
             for ((root, path), entry) in latest {
                 let current = transaction
                     .query_row(
@@ -385,18 +390,20 @@ impl Store {
                     (false, None) => true,
                     _ => false,
                 };
-                if !matches {
-                    return Ok(false);
+                if matches {
+                    transaction.execute(
+                        "DELETE FROM dirty_files WHERE root_id = ?1 AND path = ?2 AND seq <= ?3",
+                        rusqlite::params![root.0, path, entry.seq],
+                    )?;
+                } else {
+                    complete = false;
                 }
-            }
-            if let Some(last) = work.dirty.last() {
-                transaction.execute("DELETE FROM dirty_files WHERE seq <= ?1", [last.seq])?;
             }
             if let Some(last) = work.renames.last() {
                 transaction.execute("DELETE FROM rename_events WHERE seq <= ?1", [last.seq])?;
             }
             transaction.commit()?;
-            Ok(true)
+            Ok(complete)
         })
     }
 }
