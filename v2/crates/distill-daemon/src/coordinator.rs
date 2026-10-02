@@ -2886,70 +2886,50 @@ pub(crate) fn publish_incremental_paths(
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "authored path is outside every configured root".to_owned())?
     };
+    // The tag index is refined only beside a coordinator, which knows the
+    // dependency depth; without one the publication leaves it pending.
     let authority = coordinator.and_then(|_| compiled.schema_authority());
     let tag_epoch = authority
         .as_ref()
         .map_or([0; 32], |authority| authority.source_hash());
-
-    if let Some(coordinator) = coordinator {
-        let claims = bundle_claims(
-            delta
-                .observed_bundle_entries()
-                .map(|(_, source)| source.as_ref()),
-            projection,
-            authority.as_deref(),
-        )
-        .map_err(|error| error.to_string())?;
-        let inputs = PlanInputs {
-            authority: authority.as_deref(),
-            fresh: fresh_bundles(&delta),
-        };
-        let mut commit = publish_incremental_scan(
-            store,
-            base,
-            &delta,
-            &claims,
-            &inputs,
-            &[],
-            projection,
-            tag_epoch,
-        )
-        .map_err(|error| error.to_string())?;
-        if let Some(authority) = authority.clone() {
-            let affected = commit_affected_asset_bundles(&commit);
-            if !affected.is_empty() {
-                crate::build::refine_published_tag_index_incremental(
-                    crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
-                    scanner.clone(),
-                    authority,
-                    compiled.pipeline_snapshot(),
-                    compiled.build_targets(),
-                    coordinator.operational_configuration().max_dependency_depth,
-                    &affected,
-                )
-                .apply_incremental(&mut commit);
-            }
-        }
-        return Ok(commit);
-    }
-
-    let mut scan = ScanSnapshot::load(store).map_err(|error| error.to_string())?;
-    scan.apply_delta(delta);
-    let claims = bundle_claims(scan.bundle_rows(), projection, authority.as_deref())
-        .map_err(|error| error.to_string())?;
-    let candidate = ScanCandidate::build(scan, authority.as_deref())
-    .map_err(|error| error.to_string())?;
-    let commit = publish_scan(
-        store,
-        base,
-        candidate,
-        false,
-        None,
+    let claims = bundle_claims(
+        delta
+            .observed_bundle_entries()
+            .map(|(_, source)| source.as_ref()),
         projection,
-        tag_epoch,
-        &claims,
+        authority.as_deref(),
     )
     .map_err(|error| error.to_string())?;
+    let inputs = PlanInputs {
+        authority: authority.as_deref(),
+        fresh: fresh_bundles(&delta),
+    };
+    let mut commit = publish_incremental_scan(
+        store,
+        base,
+        &delta,
+        &claims,
+        &inputs,
+        &[],
+        projection,
+        tag_epoch,
+    )
+    .map_err(|error| error.to_string())?;
+    if let (Some(coordinator), Some(authority)) = (coordinator, authority) {
+        let affected = commit_affected_asset_bundles(&commit);
+        if !affected.is_empty() {
+            crate::build::refine_published_tag_index_incremental(
+                crate::build::OpenInput::new(store).expect("tag-index refinement runs inside its input"),
+                scanner.clone(),
+                authority,
+                compiled.pipeline_snapshot(),
+                compiled.build_targets(),
+                coordinator.operational_configuration().max_dependency_depth,
+                &affected,
+            )
+            .apply_incremental(&mut commit);
+        }
+    }
     Ok(commit)
 }
 
