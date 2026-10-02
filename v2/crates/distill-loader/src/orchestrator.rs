@@ -631,6 +631,7 @@ impl<I: LoaderIO> Loader<I> {
     pub fn process(&mut self, storage: &mut dyn AssetStorage) -> Result<(), LoaderError> {
         self.prune_released(storage);
         self.poll_pending(storage);
+        self.requests.forget_cancelled();
         for event in self.io.poll() {
             self.handle_event(event, storage)?;
         }
@@ -659,9 +660,6 @@ impl<I: LoaderIO> Loader<I> {
             self.rollback_updates(storage, pending.adoption, &pending.updates);
         }
         self.dirty.extend(pending_members);
-        if let Some(sweep) = &self.sweep {
-            self.dirty_paths.extend(sweep.pending_paths.iter().cloned());
-        }
         self.restart_sweep();
 
         let materialized = self
@@ -818,11 +816,31 @@ impl<I: LoaderIO> Loader<I> {
         }
     }
 
+    /// Drop the live sweep. Its requests are cancelled at the IO (no answer
+    /// arrives for them) and retired here; its unanswered path resolves are
+    /// owed again by the next sweep.
     fn abandon_sweep(&mut self) {
         if let Some(sweep) = self.sweep.take() {
+            self.dirty_paths.extend(sweep.pending_paths.iter().cloned());
+            self.end_sweep(&sweep.basis);
             for candidate in sweep.candidates.into_values() {
                 destroy_candidate_values(candidate.terminal);
             }
+        }
+    }
+
+    fn end_sweep(&mut self, basis: &IoBasis) {
+        self.io.end_sweep(basis);
+        self.requests.retire_basis(basis);
+    }
+
+    /// A completion the tracker rejected. Answers to requests of a sweep
+    /// this `process` ended are expected (the IO had already delivered
+    /// them in this batch) and are dropped without a diagnostic.
+    fn note_stale(&mut self, disposition: CompletionDisposition) {
+        if disposition != CompletionDisposition::Cancelled {
+            self.diagnostics
+                .push(LoaderDiagnostic::StaleCompletion(disposition));
         }
     }
 
@@ -1058,6 +1076,11 @@ impl<I: LoaderIO> Loader<I> {
                 .map_err(|_| LoaderError::RequestIdsExhausted)?;
             self.io.resolve_path(req, &path, &basis);
             self.dirty_paths.remove(&path);
+            // The sweep completes only once this answers; ending it earlier
+            // would cancel the request.
+            if let Some(sweep) = &mut self.sweep {
+                sweep.pending_paths.insert(path);
+            }
         }
         let pending = self
             .sweep
@@ -1230,8 +1253,7 @@ impl<I: LoaderIO> Loader<I> {
                 let record = self.requests.outstanding(req).cloned();
                 let disposition = self.requests.complete(req, &basis);
                 if disposition != CompletionDisposition::Accepted {
-                    self.diagnostics
-                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    self.note_stale(disposition);
                     return Ok(());
                 }
                 if !record.is_some_and(|record| {
@@ -1252,8 +1274,7 @@ impl<I: LoaderIO> Loader<I> {
                 let record = self.requests.outstanding(req).cloned();
                 let disposition = self.requests.complete(req, &basis);
                 if disposition != CompletionDisposition::Accepted {
-                    self.diagnostics
-                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    self.note_stale(disposition);
                     return Ok(());
                 }
                 if !record.is_some_and(|record| {
@@ -1277,8 +1298,7 @@ impl<I: LoaderIO> Loader<I> {
                 let record = self.requests.outstanding(req).cloned();
                 let disposition = self.requests.complete(req, &basis);
                 if disposition != CompletionDisposition::Accepted {
-                    self.diagnostics
-                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    self.note_stale(disposition);
                     return Ok(());
                 }
                 let Some(asset_uuid) = record.and_then(|record| match record {
@@ -1301,13 +1321,11 @@ impl<I: LoaderIO> Loader<I> {
                 }
                 let disposition = self.requests.complete(req, &basis);
                 if disposition != CompletionDisposition::Accepted {
-                    self.diagnostics
-                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    self.note_stale(disposition);
                     return Ok(());
                 }
                 // Retry the round at a new snapshot.
-                if let Some(sweep) = self.sweep.as_ref().filter(|sweep| sweep.basis == basis) {
-                    self.dirty_paths.extend(sweep.pending_paths.iter().cloned());
+                if self.sweep.as_ref().is_some_and(|sweep| sweep.basis == basis) {
                     self.sweep_retries += 1;
                     self.restart_sweep();
                 }
@@ -1320,8 +1338,7 @@ impl<I: LoaderIO> Loader<I> {
                 let record = self.requests.outstanding(req).cloned();
                 let disposition = self.requests.complete(req, &basis);
                 if disposition != CompletionDisposition::Accepted {
-                    self.diagnostics
-                        .push(LoaderDiagnostic::StaleCompletion(disposition));
+                    self.note_stale(disposition);
                     return Ok(());
                 }
                 match record.map(|record| (record.purpose, record.owner)) {
@@ -1998,6 +2015,8 @@ impl<I: LoaderIO> Loader<I> {
             return Ok(());
         }
         let mut sweep = self.sweep.take().expect("checked Some");
+        // Every candidate and path answered: release the sweep's basis.
+        self.end_sweep(&sweep.basis);
         self.sweep_retries = 0;
         let processed_dirty = std::mem::take(&mut sweep.dirty_seeds);
         for decision in decisions {

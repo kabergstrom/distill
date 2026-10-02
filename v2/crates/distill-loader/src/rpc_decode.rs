@@ -3,9 +3,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use distill_core::id::{ContentHash, LayoutHash};
+use distill_core::id::LayoutHash;
 use distill_rpc::RpcBasis;
-use distill_wire::artifact::parse_artifact_parts;
 use distill_wire::exec::Blob;
 
 use crate::basis::IoBasis;
@@ -15,49 +14,6 @@ pub(crate) fn io_basis(basis: &RpcBasis) -> IoBasis {
     IoBasis::Rpc {
         snapshot: basis.snapshot,
     }
-}
-
-pub(crate) fn artifact_layout_hash(
-    content_hash: ContentHash,
-    structural: &[u8],
-    raw_blobs: &[Vec<u8>],
-) -> Result<LayoutHash, String> {
-    let blob_parts = raw_blobs.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    artifact_layout_hash_parts(content_hash, structural, &blob_parts)
-}
-
-pub(crate) fn artifact_layout_hash_parts(
-    content_hash: ContentHash,
-    structural: &[u8],
-    raw_blobs: &[&[u8]],
-) -> Result<LayoutHash, String> {
-    let parsed = parse_artifact_parts(structural, raw_blobs)
-        .map_err(|error| format!("invalid fetched artifact: {error}"))?;
-    if parsed.content_hash != content_hash {
-        return Err("fetched artifact ContentHash mismatch".into());
-    }
-    Ok(parsed.layout_hash)
-}
-
-pub(crate) fn artifact_layout_hash_backed(
-    content_hash: ContentHash,
-    backing: &(dyn AsRef<[u8]> + Send + Sync),
-    structural: &Range<usize>,
-    blobs: &[Range<usize>],
-) -> Result<LayoutHash, String> {
-    let bytes = backing.as_ref();
-    let structural = bytes
-        .get(structural.clone())
-        .ok_or_else(|| "spooled structural range is out of bounds".to_owned())?;
-    let blob_parts = blobs
-        .iter()
-        .map(|range| {
-            bytes
-                .get(range.clone())
-                .ok_or_else(|| "spooled blob range is out of bounds".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    artifact_layout_hash_parts(content_hash, structural, &blob_parts)
 }
 
 pub(crate) fn fetched_artifact(

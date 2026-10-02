@@ -1,6 +1,6 @@
 //! Client manifest transitions and request-generation fencing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use distill_core::id::{AssetUuid, ContentHash};
 use distill_store::state::SnapshotStamp;
@@ -126,6 +126,9 @@ pub enum CompletionDisposition {
     Superseded,
     WrongConnection,
     WrongBasis,
+    /// The loader ended the request's sweep (`retire_basis`) in this
+    /// `process`; its answer was already delivered.
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -134,6 +137,8 @@ pub struct RequestTracker {
     connection: ConnectionEpoch,
     outstanding: BTreeMap<ReqId, OutstandingRequest>,
     newest: BTreeMap<RequestOwner, ReqId>,
+    /// Requests retired by `retire_basis` since `forget_cancelled`.
+    cancelled: BTreeSet<ReqId>,
 }
 
 impl RequestTracker {
@@ -143,6 +148,7 @@ impl RequestTracker {
             connection: ConnectionEpoch(1),
             outstanding: BTreeMap::new(),
             newest: BTreeMap::new(),
+            cancelled: BTreeSet::new(),
         }
     }
 
@@ -158,6 +164,7 @@ impl RequestTracker {
             .ok_or(RequestError::Exhausted)?;
         self.outstanding.clear();
         self.newest.clear();
+        self.cancelled.clear();
         Ok(self.connection)
     }
 
@@ -185,6 +192,9 @@ impl RequestTracker {
     /// event can never become acceptable after another state transition.
     pub fn complete(&mut self, req: ReqId, event_basis: &IoBasis) -> CompletionDisposition {
         let Some(record) = self.outstanding.remove(&req) else {
+            if self.cancelled.remove(&req) {
+                return CompletionDisposition::Cancelled;
+            }
             return CompletionDisposition::UnknownOrRetired;
         };
         if record.connection != self.connection {
@@ -198,6 +208,27 @@ impl RequestTracker {
         }
         self.newest.remove(&record.owner);
         CompletionDisposition::Accepted
+    }
+
+    /// Retire every request issued under `basis`: the IO cancelled them, so
+    /// no completion arrives for them after the current batch.
+    pub fn retire_basis(&mut self, basis: &IoBasis) {
+        let cancelled = &mut self.cancelled;
+        self.outstanding.retain(|req, record| {
+            let keep = &record.basis != basis;
+            if !keep {
+                cancelled.insert(*req);
+            }
+            keep
+        });
+        let outstanding = &self.outstanding;
+        self.newest.retain(|_, req| outstanding.contains_key(req));
+    }
+
+    /// Forget the requests retired before this batch: their answers can no
+    /// longer arrive.
+    pub fn forget_cancelled(&mut self) {
+        self.cancelled.clear();
     }
 
     pub fn outstanding(&self, req: ReqId) -> Option<&OutstandingRequest> {

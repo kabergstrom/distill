@@ -427,6 +427,19 @@ impl LoaderIO for PackfileIO {
         self.basis.clone()
     }
 
+    /// Answers are computed when requested, so cancelling drops the queued
+    /// answers to requests under `basis`.
+    fn end_sweep(&mut self, basis: &IoBasis) {
+        self.events.retain(|event| match event {
+            IoEvent::Resolved { basis: answered, .. }
+            | IoEvent::PathResolved { basis: answered, .. }
+            | IoEvent::Fetched { basis: answered, .. }
+            | IoEvent::RequestError { basis: answered, .. }
+            | IoEvent::SnapshotExpired { basis: answered, .. } => answered != basis,
+            _ => true,
+        });
+    }
+
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis) {
         if !self.basis_matches(basis) {
             self.events.push_back(IoEvent::RequestError {

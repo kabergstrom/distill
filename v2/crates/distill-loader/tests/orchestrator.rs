@@ -121,6 +121,7 @@ enum Command {
     SubscribePath(String),
     Unsubscribe(AssetUuid),
     UnsubscribePath,
+    EndSweep(IoBasis),
 }
 
 struct MockIo {
@@ -200,6 +201,10 @@ impl LoaderIO for MockIo {
     fn begin_sweep(&mut self) -> IoBasis {
         self.sweeps += 1;
         self.basis.clone()
+    }
+
+    fn end_sweep(&mut self, basis: &IoBasis) {
+        self.commands.push(Command::EndSweep(basis.clone()));
     }
 
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis) {
@@ -527,6 +532,44 @@ fn one_basis_resolve_fetch_and_fixup_commit_at_process_boundary() {
     assert_eq!(loader.status(&handle), LoadStatus::Loaded);
     assert_eq!(storage.updates.len(), 1);
     assert_eq!(storage.commits, storage.updates);
+}
+
+#[test]
+fn a_sweep_is_ended_at_the_io_when_abandoned_and_when_complete() {
+    let token = ModuleEpochToken::new(1);
+    let mut loader = Loader::new(mock_io());
+    register(&mut loader, 1, &token);
+    let asset_uuid = uuid(1);
+    let handle = loader.add_ref::<A>(asset_uuid).unwrap();
+    let mut storage = Storage::default();
+    loader.process(&mut storage).unwrap();
+    let (abandoned_req, _) = loader.io().resolve_for(asset_uuid);
+    let ended = |loader: &Loader<MockIo>| {
+        loader
+            .io()
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::EndSweep(ended) if *ended == basis()))
+            .count()
+    };
+
+    loader.io_mut().push(IoEvent::Delta {
+        stamp: stamp(1),
+        assets: vec![(uuid(2), distill_loader::AssetDeltaState::Changed)],
+        paths: Vec::new(),
+    });
+    loader.process(&mut storage).unwrap();
+    assert_eq!(ended(&loader), 1, "the abandoned sweep was not ended");
+    let (req, _) = loader.io().resolve_for(asset_uuid);
+    assert_ne!(req, abandoned_req, "the next sweep resolves again");
+
+    let (hash, fetched_artifact) = artifact::<A>(asset_uuid, &[]);
+    resolve(&mut loader, asset_uuid, hash);
+    loader.process(&mut storage).unwrap();
+    fetched(&mut loader, hash, fetched_artifact);
+    loader.process(&mut storage).unwrap();
+    assert_eq!(loader.status(&handle), LoadStatus::Loaded);
+    assert_eq!(ended(&loader), 2, "the completed sweep was not ended");
 }
 
 #[test]

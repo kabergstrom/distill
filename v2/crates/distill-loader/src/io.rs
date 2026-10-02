@@ -186,9 +186,26 @@ pub enum IoEvent {
     },
 }
 
+/// The loader's only IO boundary (DESIGN.md §15, Plumbing).
+///
+/// Every method is called from the engine thread and returns without
+/// waiting on IO: requests are answered later through [`Self::poll`], each
+/// by exactly one request-terminal event unless its sweep ends first.
+/// Implementations bound their own work by admission; they never park the
+/// caller to apply backpressure.
 pub trait LoaderIO {
+    /// Drop everything issued so far and (re)bind the runtime target;
+    /// answered by `TargetBound` or `TargetRejected`.
     fn bind_target(&mut self, target: RuntimeTarget);
+    /// The basis of a new sweep: the newest basis the IO already holds.
+    /// Never waits. Every event that makes the loader start a new round
+    /// (a delta, a drift, an expired snapshot) is published only once the
+    /// basis returned here answers it.
     fn begin_sweep(&mut self) -> IoBasis;
+    /// The loader wants no further answers under `basis`: requests issued
+    /// under it are cancelled (no event is delivered for them) and what the
+    /// IO held for them is released.
+    fn end_sweep(&mut self, basis: &IoBasis);
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis);
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis);
     /// Resolve `path` to an asset UUID: its path's primary, or the asset of

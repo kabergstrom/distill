@@ -45,6 +45,47 @@ fn requests_are_fenced_by_generation_basis_and_connection_epoch() {
 }
 
 #[test]
+fn retiring_a_basis_cancels_its_requests_until_the_next_batch() {
+    let mut tracker = RequestTracker::new();
+    let ended = tracker
+        .issue(
+            RequestOwner::Handle(HandleId(1)),
+            OutstandingPurpose::Resolve,
+            basis(1),
+        )
+        .unwrap();
+    let late = tracker
+        .issue(
+            RequestOwner::Handle(HandleId(2)),
+            OutstandingPurpose::Resolve,
+            basis(1),
+        )
+        .unwrap();
+    let other = tracker
+        .issue(
+            RequestOwner::Handle(HandleId(3)),
+            OutstandingPurpose::Resolve,
+            basis(2),
+        )
+        .unwrap();
+    tracker.retire_basis(&basis(1));
+    assert!(tracker.outstanding(ended).is_none());
+    assert_eq!(
+        tracker.complete(ended, &basis(1)),
+        CompletionDisposition::Cancelled
+    );
+    tracker.forget_cancelled();
+    assert_eq!(
+        tracker.complete(late, &basis(1)),
+        CompletionDisposition::UnknownOrRetired
+    );
+    assert_eq!(
+        tracker.complete(other, &basis(2)),
+        CompletionDisposition::Accepted
+    );
+}
+
+#[test]
 fn successful_completion_is_consumed_exactly_once() {
     let mut tracker = RequestTracker::new();
     let request = tracker

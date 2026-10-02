@@ -108,7 +108,7 @@ fn fixture() -> Fixture {
 }
 
 #[test]
-fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
+fn rpc_io_drives_the_same_loader_boundary_on_the_callers_thread() {
     let Fixture {
         server,
         request,
@@ -165,25 +165,20 @@ fn rpc_io_drives_the_same_loader_boundary_on_its_own_capnp_thread() {
 
     io.fetch(ReqId(10), hash, &basis);
     io.fetch(ReqId(11), hash, &basis);
-    std::thread::sleep(Duration::from_millis(100));
-    let first_fetch = io.poll();
+    // The DSWL tree does not fit the budget: both payloads spool rather
+    // than wait for memory.
+    let both = poll_until(&mut io, 2);
     assert_eq!(
-        first_fetch
-            .iter()
+        both.iter()
             .filter(|event| matches!(event, IoEvent::Fetched { .. }))
             .count(),
-        1,
-        "the first queued payload must retain its exclusive permit until consumed"
+        2,
+        "{both:?}"
     );
-    assert_eq!(
-        io.begin_sweep(),
-        basis,
-        "control commands must bypass a queued fetch waiting for residency admission"
-    );
-    drop(first_fetch);
-    assert!(poll_until(&mut io, 1)
-        .iter()
-        .any(|event| matches!(event, IoEvent::Fetched { .. })));
+    assert_eq!(io.stats().resident_fetch_bytes, 0);
+    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 2);
+    drop(both);
+    assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
 
     io.resolve(ReqId(1), asset, &basis);
     io.fetch(ReqId(2), hash, &basis);
@@ -293,9 +288,9 @@ fn rpc_io_accepts_multiple_asset_subscriptions_on_one_delta_stream() {
 
     io.subscribe(first);
     io.subscribe(second);
-    // This synchronous command is queued after both subscriptions and proves
-    // that both installs completed before the live commit below.
-    io.begin_sweep();
+    // Both subscribe calls have answered once only the delta stream and the
+    // maintenance task remain.
+    poll_while(&mut io, |io| io.stats().control_tasks > 2);
     server
         .commit(Commit {
             assets: vec![
@@ -463,7 +458,7 @@ fn rpc_io_reconnects_a_closed_connection_and_restores_subscriptions() {
         .iter()
         .any(|event| matches!(event, IoEvent::TargetBound { .. })));
     io.subscribe(asset);
-    std::thread::sleep(Duration::from_millis(100));
+    poll_for(&mut io, Duration::from_millis(100));
     close_tx.send(()).unwrap();
 
     assert!(poll_until(&mut io, 1).iter().any(|event| matches!(
@@ -561,33 +556,40 @@ fn rpc_io_drop_interrupts_a_stalled_reconnect() {
         epoch: distill_loader::GameModuleEpoch(1),
         target_definition_hash: request.target_definition_hash.0,
     };
-    let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
-    io.bind_target(target.clone());
-    assert!(poll_until(&mut io, 1)
-        .iter()
-        .any(|event| matches!(event, IoEvent::TargetBound { .. })));
-
-    stalled_ready_rx.recv().unwrap();
-    io.bind_target(target);
-    stalled_rx.recv().unwrap();
+    // RpcIO is driven by the thread that owns it; this one plays the engine.
     let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
-    let drop_thread = std::thread::spawn(move || {
+    let engine = std::thread::spawn(move || {
+        let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
+        io.bind_target(target.clone());
+        assert!(poll_until(&mut io, 1)
+            .iter()
+            .any(|event| matches!(event, IoEvent::TargetBound { .. })));
+
+        stalled_ready_rx.recv().unwrap();
+        io.bind_target(target);
+        // Step until the rebind's connection is accepted and stalls.
+        while stalled_rx.try_recv().is_err() {
+            io.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let started = Instant::now();
         drop(io);
-        dropped_tx.send(()).unwrap();
+        dropped_tx.send(started.elapsed()).unwrap();
     });
-    let dropped_promptly = dropped_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let elapsed = dropped_rx.recv_timeout(Duration::from_secs(5));
 
     release_tx.send(()).unwrap();
-    drop_thread.join().unwrap();
+    engine.join().unwrap();
     server_thread.join().unwrap();
+    let elapsed = elapsed.expect("RpcIO drop never returned");
     assert!(
-        dropped_promptly,
-        "RpcIO drop waited for the stalled reconnect timeout"
+        elapsed < Duration::from_millis(100),
+        "RpcIO drop waited for the stalled reconnect: {elapsed:?}"
     );
 }
 
 #[test]
-fn rpc_io_full_completion_channel_does_not_cancel_candidate_publication() {
+fn rpc_io_rebind_fences_everything_of_the_old_connection() {
     let Fixture {
         server,
         request,
@@ -595,7 +597,6 @@ fn rpc_io_full_completion_channel_does_not_cancel_candidate_publication() {
         ..
     } = fixture();
     let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
-    let (candidate_connected_tx, candidate_connected_rx) = std::sync::mpsc::sync_channel(1);
     let root = server.root();
     let server_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -608,7 +609,6 @@ fn rpc_io_full_completion_channel_does_not_cancel_candidate_publication() {
             let initial = listener.accept_one().await.unwrap();
             let first_bind = listener.accept_one().await.unwrap();
             let candidate = listener.accept_one().await.unwrap();
-            candidate_connected_tx.send(()).unwrap();
             for connection in [initial, first_bind, candidate] {
                 connection.await.unwrap().unwrap();
             }
@@ -624,49 +624,40 @@ fn rpc_io_full_completion_channel_does_not_cancel_candidate_publication() {
         .iter()
         .any(|event| matches!(event, IoEvent::TargetBound { .. })));
 
+    // Requests of the old connection, some answered and undelivered, some
+    // queued, and some failed on a foreign basis.
+    let basis = io.begin_sweep();
+    for request_id in 0..300 {
+        io.resolve(ReqId(request_id), asset, &basis);
+    }
     let stale_basis = IoBasis::Pack {
         manifest: ManifestHash([0; 32]),
     };
-    for request_id in 0..256 {
-        io.resolve(ReqId(request_id), asset, &stale_basis);
-    }
+    io.resolve(ReqId(1_000), asset, &stale_basis);
+    io.step();
+    io.step();
     let candidate_target = RuntimeTarget {
         epoch: distill_loader::GameModuleEpoch(2),
         target_definition_hash: TARGET_HASH,
     };
     io.bind_target(candidate_target.clone());
-    candidate_connected_rx.recv().unwrap();
-
-    // Leave the candidate's TargetBound blocked longer than the peer timeout.
-    // The old ordering committed the candidate inside that timeout, canceled
-    // this acknowledgment, cleared rebind, and therefore never retried it.
-    std::thread::sleep(Duration::from_millis(2_200));
-    let mut published = io.poll();
-    assert_eq!(
-        published
-            .iter()
-            .filter(|event| matches!(event, IoEvent::RequestError { .. }))
-            .count(),
-        256
-    );
-    assert!(!published
-        .iter()
-        .any(|event| matches!(event, IoEvent::TargetRejected { .. })));
-    if !published.iter().any(|event| {
+    // A second report of the same lost connection keeps the rebind underway.
+    io.bind_target(candidate_target.clone());
+    let published = poll_until(&mut io, 1);
+    assert!(
         matches!(
-            event,
-            IoEvent::TargetBound { target, .. } if target == &candidate_target
-        )
-    }) {
-        published.extend(poll_until(&mut io, 1));
-    }
-    assert!(published.iter().any(|event| matches!(
-        event,
-        IoEvent::TargetBound { target, .. } if target == &candidate_target
-    )));
-    assert!(!published
-        .iter()
-        .any(|event| matches!(event, IoEvent::TargetRejected { .. })));
+            published.as_slice(),
+            [IoEvent::TargetBound { target, .. }] if target == &candidate_target
+        ),
+        "only the candidate's binding may follow a rebind: {published:?}"
+    );
+    let stats = io.stats();
+    assert_eq!(
+        (stats.queued_requests, stats.in_flight_requests),
+        (0, 0),
+        "{stats:?}"
+    );
+    poll_for(&mut io, Duration::from_millis(100));
 
     drop(io);
     server_thread.join().unwrap();
@@ -693,6 +684,7 @@ fn rpc_io_polls_import_failures_and_reports_only_changes() {
     let mut io = RpcIo::connect(address_rx.recv().unwrap(), request).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     let first = loop {
+        io.poll();
         if let Some(failures) = io.take_import_failures() {
             break failures;
         }
@@ -701,19 +693,19 @@ fn rpc_io_polls_import_failures_and_reports_only_changes() {
     };
     assert!(first.is_empty());
     // The next poll returns the same list: not a change.
-    std::thread::sleep(Duration::from_millis(1200));
+    poll_for(&mut io, Duration::from_millis(1200));
     assert_eq!(io.take_import_failures(), None);
     drop(io);
     server_thread.join().unwrap();
 }
 
 fn poll_until(io: &mut RpcIo, minimum: usize) -> Vec<IoEvent> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut events = Vec::new();
     while events.len() < minimum && Instant::now() < deadline {
         events.extend(io.poll());
         if events.len() < minimum {
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
     assert!(
@@ -721,4 +713,22 @@ fn poll_until(io: &mut RpcIo, minimum: usize) -> Vec<IoEvent> {
         "RPC IO events timed out: {events:?}"
     );
     events
+}
+
+/// Step `io` for `duration`, as frames would.
+fn poll_for(io: &mut RpcIo, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        assert!(io.poll().is_empty());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn poll_while(io: &mut RpcIo, mut condition: impl FnMut(&RpcIo) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while condition(io) {
+        assert!(io.poll().is_empty());
+        assert!(Instant::now() < deadline, "RPC IO never settled: {:?}", io.stats());
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }

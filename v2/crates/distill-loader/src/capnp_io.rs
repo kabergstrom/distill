@@ -1,15 +1,80 @@
-//! Development `LoaderIO` driven by Cap'n Proto on a dedicated local IO thread.
+//! Development `LoaderIO`: Cap'n Proto to the local daemon, driven on the
+//! caller's thread. There is no IO thread.
+//!
+//! # Ownership
+//!
+//! `RpcIo` owns a tokio `current_thread` runtime and a `LocalSet`
+//! (capnp-rpc clients are `!Send`). Every request, the delta stream, the
+//! subscription calls, the reconnect attempts, and capnp's `RpcSystem` are
+//! tasks on that `LocalSet`. They run only while `RpcIo` steps the runtime,
+//! which it does from [`LoaderIO::poll`]; every other method only records
+//! work or cancels it. Tasks hand their results to a plain queue in
+//! [`Shared`]; `poll` drains it. Nothing crosses a thread, so nothing can
+//! wait for the engine and the engine never waits for IO.
+//!
+//! # Stepping
+//!
+//! One *turn* is `runtime.block_on(f)`, where `f`
+//!
+//! 1. polls the `LocalSet` once, through a waker that records whether it
+//!    was woken: the `LocalSet` runs up to its per-tick budget of ready
+//!    tasks (tasks woken while it runs, such as capnp's `RpcSystem` waking a
+//!    request whose answer it just read, run in the same tick); then
+//! 2. awaits `tokio::task::yield_now()`. Inside a runtime that defers its
+//!    wake-up to the scheduler, so `block_on` finds no ready task and a
+//!    pending deferred wake and calls `park_yield`: the IO driver polls
+//!    epoll with a **zero** timeout and the time driver fires due timers.
+//!    Readiness wakes the tasks waiting on it, which schedules them on the
+//!    `LocalSet` and calls its registered waker (step 1's), which records
+//!    the wake. The deferred wake then completes `f`.
+//!
+//! A turn therefore never blocks: it runs what is ready and collects what
+//! the kernel has ready. [`RpcIo::step`] repeats turns while the previous
+//! turn reported a wake (more work is ready) or admission started new work,
+//! and stops when quiescent or when `RpcIoConfig::step_budget` has elapsed.
+//! The budget is checked between turns; one turn is bounded by the
+//! `LocalSet`'s tick budget (61 task polls), and each task poll does bounded
+//! work (one RPC answer, one 64 KiB chunk, or one artifact's final checks).
+//!
+//! # Snapshots and sweeps
+//!
+//! `RpcIo` keeps the newest snapshot capability it holds (`current`), plus
+//! the snapshot of every sweep begun and not yet ended. `begin_sweep`
+//! returns `current`'s stamp without IO. `current` is kept fresh by the
+//! tasks that learn it is stale, *before* they publish what they learned: a
+//! delta, a `Drifted` resolve, or an expired snapshot is pushed only after a
+//! snapshot that answers it is installed. So the round the loader starts
+//! in response always gets a basis that answers it. A periodic refresh
+//! keeps `current` well inside the daemon's snapshot TTL while idle.
+//!
+//! # Admission and cancellation
+//!
+//! Requests queue in `RpcIo` and start (as tasks) only while the in-flight
+//! count is under `max_in_flight_requests`, and fetches also under
+//! `max_in_flight_fetches`. A fetch's payload bytes are reserved against
+//! `fetch_memory_budget` until the loader takes the payload from `poll`;
+//! a payload that does not fit spools to disk instead of waiting.
+//! `end_sweep` cancels by dropping: queued requests are removed, running
+//! tasks are aborted (the `LocalSet` drops them at its next turn, releasing
+//! their admission slot, snapshot reference, partial payload, and spool
+//! file), and undelivered answers are discarded. `bind_target` does the
+//! same for everything of the old connection, which fences the old
+//! connection: no event from it can follow a rebind. Dropping `RpcIo` drops
+//! every task without running it.
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::mpsc as sync_mpsc;
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
 
 use distill_build::trace::EntryRole;
 use distill_core::id::{AssetUuid, ContentHash};
@@ -20,28 +85,29 @@ use distill_rpc::capnp_transport::{
 use distill_rpc::{
     AssetEvent, ConnectRequest, DriftedInput as RpcDriftedInput, ImportFailure, StreamEvent,
 };
-use tokio::sync::{mpsc, watch};
+use distill_store::state::{InputVersion, SnapshotStamp};
+use tokio::task::{AbortHandle, LocalSet};
 
-use crate::admission::{Admission, FetchAdmission};
+use crate::admission::FetchAdmission;
 use crate::io::{
-    AssetDeltaState, AssetPath, DriftedInput, IoEvent, LoaderIO, PathResolveResult, ReconnectReason, ReqId,
-    ResolveResult, RuntimeTarget,
+    AssetDeltaState, AssetPath, DriftedInput, IoEvent, LoaderIO, PathResolveResult,
+    ReconnectReason, ReqId, ResolveResult, RuntimeTarget,
 };
-use crate::rpc_decode::{
-    artifact_layout_hash, artifact_layout_hash_backed, fetched_artifact, fetched_artifact_backed,
-    io_basis,
-};
+use crate::rpc_decode::{fetched_artifact, fetched_artifact_backed, io_basis};
 use crate::IoBasis;
 
 const DEFAULT_FETCH_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
-const COMMAND_CHANNEL_CAPACITY: usize = 256;
-const COMPLETION_CHANNEL_CAPACITY: usize = 256;
-const IN_FLIGHT_REQUEST_LIMIT: usize = 256;
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
+const DEFAULT_MAX_IN_FLIGHT_FETCHES: usize = 32;
+const DEFAULT_STEP_BUDGET: Duration = Duration::from_millis(2);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Well inside the daemon's default snapshot TTL (30 s).
+const DEFAULT_SNAPSHOT_REFRESH_AFTER: Duration = Duration::from_secs(10);
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Watched-import failures publish no version; the driver polls them.
+/// Watched-import failures publish no version; RpcIO polls them.
 const IMPORT_FAILURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Consecutive failed rebind attempts before the game hears of them. A
 /// pipeline swap briefly fences connections (the daemon answers
@@ -51,12 +117,26 @@ const DEFAULT_TARGET_REJECTION_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcIoConfig {
+    /// Fetched payload bytes RpcIO holds in memory, in flight or awaiting
+    /// `poll`. A payload that does not fit spools to disk.
     pub fetch_memory_budget: usize,
+    /// A payload larger than this always spools.
     pub spool_threshold: usize,
     pub spool_directory: Option<PathBuf>,
     /// Consecutive failed rebind attempts after which `TargetRejected` is
     /// reported (once per rebind). Retries continue either way.
     pub target_rejection_after: u32,
+    /// Resolve, path, and fetch requests running at once; the rest queue.
+    pub max_in_flight_requests: usize,
+    /// Fetches running at once, within `max_in_flight_requests`.
+    pub max_in_flight_fetches: usize,
+    /// How long one `poll` may keep stepping the runtime while work is
+    /// ready. Checked between turns.
+    pub step_budget: Duration,
+    /// How long `connect` may wait for the daemon before failing.
+    pub connect_timeout: Duration,
+    /// Age after which the held snapshot is reopened in the background.
+    pub snapshot_refresh_after: Duration,
 }
 
 impl Default for RpcIoConfig {
@@ -66,6 +146,11 @@ impl Default for RpcIoConfig {
             spool_threshold: DEFAULT_SPOOL_THRESHOLD,
             spool_directory: None,
             target_rejection_after: DEFAULT_TARGET_REJECTION_AFTER,
+            max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            max_in_flight_fetches: DEFAULT_MAX_IN_FLIGHT_FETCHES,
+            step_budget: DEFAULT_STEP_BUDGET,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            snapshot_refresh_after: DEFAULT_SNAPSHOT_REFRESH_AFTER,
         }
     }
 }
@@ -84,15 +169,47 @@ impl std::fmt::Display for RpcIoInitError {
 
 impl std::error::Error for RpcIoInitError {}
 
+impl RpcIoInitError {
+    fn message(self) -> String {
+        match self {
+            Self::Unavailable(message) => message,
+            Self::ReconnectRequired(reason) => format!("RPC reconnection required: {reason:?}"),
+        }
+    }
+}
+
+/// What RpcIO holds right now; every count is bounded by admission or by
+/// what the loader asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RpcIoStats {
+    /// Requests waiting for admission.
+    pub queued_requests: usize,
+    /// Request tasks alive, fetches included.
+    pub in_flight_requests: usize,
+    pub in_flight_fetches: usize,
+    /// Events waiting for the next `poll`.
+    pub undelivered_events: usize,
+    /// Fetched payload bytes reserved in memory.
+    pub resident_fetch_bytes: usize,
+    /// Snapshot capabilities held: the current one plus live sweeps'.
+    pub held_snapshots: usize,
+    /// Subscription, stream, and maintenance tasks alive.
+    pub control_tasks: usize,
+}
+
 pub struct RpcIo {
-    commands: mpsc::Sender<Command>,
-    shutdown: watch::Sender<bool>,
-    events: mpsc::Receiver<Completion>,
-    pending: Vec<IoEvent>,
-    delivered_fetches: Vec<FetchPermit>,
-    basis: IoBasis,
-    import_failures: watch::Receiver<Option<Vec<ImportFailure>>>,
-    thread: Option<JoinHandle<()>>,
+    shared: Rc<Shared>,
+    max_in_flight_requests: usize,
+    max_in_flight_fetches: usize,
+    step_budget: Duration,
+    queued: VecDeque<Queued>,
+    queued_fetches: VecDeque<Queued>,
+    /// The last basis `begin_sweep` returned, for a sweep begun while no
+    /// connection is bound: requests under it fail as stale.
+    last_basis: IoBasis,
+    // Dropped after everything above, the tasks before the runtime.
+    local: LocalSet,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl RpcIo {
@@ -100,53 +217,51 @@ impl RpcIo {
         Self::connect_with_config(address, request, RpcIoConfig::default())
     }
 
+    /// Open the initial connection, waiting at most `connect_timeout`. This
+    /// is the only call that waits on the daemon.
     pub fn connect_with_config(
         address: SocketAddr,
         request: ConnectRequest,
         config: RpcIoConfig,
     ) -> Result<Self, RpcIoInitError> {
-        let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let (event_tx, events) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
-        let (init_tx, init_rx) = sync_mpsc::sync_channel(1);
-        let (import_failures_tx, import_failures) = watch::channel(None);
-        let thread = std::thread::Builder::new()
-            .name("distill-rpc-io".into())
-            .spawn(move || {
-                run_thread(
-                    address,
-                    request,
-                    config,
-                    command_rx,
-                    shutdown_rx,
-                    event_tx,
-                    init_tx,
-                    import_failures_tx,
-                )
-            })
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .map_err(|error| RpcIoInitError::Unavailable(error.to_string()))?;
-        let basis = match init_rx.recv() {
-            Ok(Ok(basis)) => basis,
-            Ok(Err(error)) => {
-                let _ = thread.join();
-                return Err(error);
-            }
+        let local = LocalSet::new();
+        let connect_timeout = config.connect_timeout;
+        let opened = runtime.block_on(local.run_until(async {
+            tokio::time::timeout(
+                connect_timeout,
+                open_connection(address, &request, Vec::new(), Vec::new()),
+            )
+            .await
+        }));
+        let opened = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(error)) => return Err(error),
             Err(_) => {
-                let _ = thread.join();
-                return Err(RpcIoInitError::Unavailable(
-                    "RPC IO thread stopped during initialization".into(),
-                ));
+                return Err(RpcIoInitError::Unavailable(format!(
+                    "the daemon at {address} did not answer within {} ms",
+                    connect_timeout.as_millis()
+                )))
             }
         };
+        let shared = Rc::new(Shared::new(address, request.target, &config));
+        let basis = {
+            let _local = local.enter();
+            shared.commit(opened)
+        };
         Ok(Self {
-            commands,
-            shutdown,
-            events,
-            pending: Vec::new(),
-            delivered_fetches: Vec::new(),
-            basis,
-            import_failures,
-            thread: Some(thread),
+            shared,
+            max_in_flight_requests: config.max_in_flight_requests.max(1),
+            max_in_flight_fetches: config.max_in_flight_fetches.max(1),
+            step_budget: config.step_budget,
+            queued: VecDeque::new(),
+            queued_fetches: VecDeque::new(),
+            last_basis: basis,
+            local,
+            runtime,
         })
     }
 
@@ -154,304 +269,405 @@ impl RpcIo {
     /// the last call; `None` when unchanged or not yet polled. Each names a
     /// bundle still serving its last good contents.
     pub fn take_import_failures(&mut self) -> Option<Vec<ImportFailure>> {
-        if !self.import_failures.has_changed().unwrap_or(false) {
+        if !self.shared.import_failures_changed.replace(false) {
             return None;
         }
-        self.import_failures.borrow_and_update().clone()
+        self.shared.import_failures.borrow().clone()
     }
 
-    fn send(&mut self, command: Command) {
-        if self.commands.blocking_send(command).is_err() {
-            self.pending.push(IoEvent::ConnectionError {
-                message: "RPC IO thread is unavailable".into(),
-            });
+    pub fn stats(&self) -> RpcIoStats {
+        let shared = &self.shared;
+        RpcIoStats {
+            queued_requests: self.queued.len() + self.queued_fetches.len(),
+            in_flight_requests: shared.in_flight.borrow().len(),
+            in_flight_fetches: shared.in_flight_fetches.get(),
+            undelivered_events: shared.completions.borrow().len(),
+            resident_fetch_bytes: shared.admission.resident(),
+            held_snapshots: shared.snapshots.borrow().held.len(),
+            control_tasks: shared
+                .control
+                .borrow()
+                .iter()
+                .filter(|task| !task.is_finished())
+                .count(),
         }
+    }
+
+    /// Run ready IO without blocking: turns until nothing is ready or the
+    /// step budget is spent. [`LoaderIO::poll`] calls this.
+    pub fn step(&mut self) {
+        let started = Instant::now();
+        self.admit();
+        loop {
+            let woken = self.turn();
+            if started.elapsed() >= self.step_budget {
+                break;
+            }
+            let admitted = self.admit();
+            if !woken && admitted == 0 {
+                break;
+            }
+        }
+    }
+
+    /// One non-blocking pass over the runtime (module docs, "Stepping"):
+    /// true when a `LocalSet` task was woken, i.e. more work is ready.
+    fn turn(&mut self) -> bool {
+        let Self { runtime, local, .. } = self;
+        let woken = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&woken);
+        runtime.block_on(async move {
+            std::future::poll_fn(|cx| {
+                let waker = Waker::from(Arc::new(TurnWaker {
+                    woken: Arc::clone(&flag),
+                    inner: cx.waker().clone(),
+                }));
+                let _ = Pin::new(&mut *local).poll(&mut Context::from_waker(&waker));
+                Poll::Ready(())
+            })
+            .await;
+            tokio::task::yield_now().await;
+        });
+        woken.load(Ordering::Relaxed)
+    }
+
+    /// Start queued requests while admission allows; how many started.
+    fn admit(&mut self) -> usize {
+        let _local = self.local.enter();
+        let mut started = 0;
+        loop {
+            if self.shared.in_flight.borrow().len() >= self.max_in_flight_requests {
+                break;
+            }
+            let next = if self.shared.in_flight_fetches.get() < self.max_in_flight_fetches
+                && !self.queued_fetches.is_empty()
+            {
+                self.queued_fetches.pop_front()
+            } else {
+                self.queued.pop_front()
+            };
+            let Some(queued) = next else {
+                break;
+            };
+            self.shared.start(queued);
+            started += 1;
+        }
+        started
+    }
+
+    fn enqueue(&mut self, req: ReqId, basis: &IoBasis, kind: RequestKind) {
+        let held = match basis {
+            IoBasis::Rpc { snapshot } => self
+                .shared
+                .snapshots
+                .borrow()
+                .held
+                .contains_key(snapshot)
+                .then_some(*snapshot),
+            IoBasis::Pack { .. } => None,
+        };
+        let Some(stamp) = held else {
+            self.shared.push_request(
+                basis.rpc_snapshot(),
+                request_error(req, basis.clone(), "stale RPC basis".into()),
+                None,
+            );
+            return;
+        };
+        let queued = Queued { req, stamp, kind };
+        if matches!(queued.kind, RequestKind::Fetch(_)) {
+            self.queued_fetches.push_back(queued);
+        } else {
+            self.queued.push_back(queued);
+        }
+    }
+
+    /// Drop everything of the current connection: queued and running
+    /// requests, undelivered events, stream and control tasks, snapshots,
+    /// and a pending rebind. Aborted tasks are dropped at the next turn.
+    fn discard(&mut self) {
+        self.queued.clear();
+        self.queued_fetches.clear();
+        let shared = &self.shared;
+        let mut aborts = shared
+            .in_flight
+            .borrow()
+            .values()
+            .map(|in_flight| in_flight.abort.clone())
+            .collect::<Vec<_>>();
+        aborts.append(&mut shared.control.borrow_mut());
+        let link = shared.link.replace(Link::Closed);
+        if let Link::Rebinding { task, .. } = &link {
+            aborts.push(task.clone());
+        }
+        for abort in aborts {
+            abort.abort();
+        }
+        let completions = std::mem::take(&mut *shared.completions.borrow_mut());
+        let snapshots = shared.snapshots.replace(Snapshots::default());
+        drop((link, completions, snapshots));
     }
 }
 
 impl Drop for RpcIo {
     fn drop(&mut self) {
-        self.delivered_fetches.clear();
-        let (_closed_sender, replacement) = mpsc::channel(1);
-        drop(std::mem::replace(&mut self.events, replacement));
-        let _ = self.shutdown.send(true);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // Nothing runs again: the LocalSet drops every task unpolled, which
+        // closes the connection. No join, no wait on the daemon.
+        self.discard();
     }
 }
 
 impl LoaderIO for RpcIo {
     fn bind_target(&mut self, target: RuntimeTarget) {
-        self.send(Command::BindTarget(target));
+        // A rebind to the same target is already underway: keep its backoff
+        // (several requests can report one lost connection).
+        if matches!(&*self.shared.link.borrow(), Link::Rebinding { target: pending, .. } if *pending == target)
+        {
+            return;
+        }
+        self.discard();
+        let _local = self.local.enter();
+        let task = tokio::task::spawn_local(rebind(Rc::clone(&self.shared), target.clone()));
+        *self.shared.link.borrow_mut() = Link::Rebinding {
+            target,
+            task: task.abort_handle(),
+        };
     }
 
     fn begin_sweep(&mut self) -> IoBasis {
-        let (reply, receive) = sync_mpsc::sync_channel(1);
-        if self
-            .commands
-            .blocking_send(Command::BeginSweep { reply })
-            .is_err()
-        {
-            self.pending.push(IoEvent::ConnectionError {
-                message: "RPC IO thread is unavailable".into(),
-            });
-            return self.basis.clone();
+        let mut snapshots = self.shared.snapshots.borrow_mut();
+        if let Some(stamp) = snapshots.current {
+            snapshots.sweeps.insert(stamp);
+            self.last_basis = IoBasis::Rpc { snapshot: stamp };
         }
-        match receive.recv() {
-            Ok(Some(basis)) => {
-                self.basis = basis;
-                self.basis.clone()
-            }
-            Ok(None) => self.basis.clone(),
-            Err(_) => {
-                self.pending.push(IoEvent::ConnectionError {
-                    message: "RPC IO thread stopped while refreshing its snapshot".into(),
-                });
-                self.basis.clone()
-            }
+        self.last_basis.clone()
+    }
+
+    fn end_sweep(&mut self, basis: &IoBasis) {
+        let Some(stamp) = basis.rpc_snapshot() else {
+            return;
+        };
+        let released = {
+            let mut snapshots = self.shared.snapshots.borrow_mut();
+            snapshots.sweeps.remove(&stamp);
+            snapshots.release_unused(stamp)
+        };
+        self.queued.retain(|queued| queued.stamp != stamp);
+        self.queued_fetches.retain(|queued| queued.stamp != stamp);
+        let aborts = self
+            .shared
+            .in_flight
+            .borrow()
+            .values()
+            .filter(|in_flight| in_flight.stamp == stamp)
+            .map(|in_flight| in_flight.abort.clone())
+            .collect::<Vec<_>>();
+        for abort in aborts {
+            abort.abort();
         }
+        let purged = {
+            let mut completions = self.shared.completions.borrow_mut();
+            let (purged, kept) = std::mem::take(&mut *completions)
+                .into_iter()
+                .partition::<VecDeque<_>, _>(|completion| completion.request == Some(stamp));
+            *completions = kept;
+            purged
+        };
+        drop((released, purged));
     }
 
     fn resolve(&mut self, req: ReqId, uuid: AssetUuid, basis: &IoBasis) {
-        self.send(Command::Resolve {
-            req,
-            uuid,
-            basis: basis.clone(),
-        });
+        self.enqueue(req, basis, RequestKind::Resolve(uuid));
     }
 
     fn fetch(&mut self, req: ReqId, content_hash: ContentHash, basis: &IoBasis) {
-        self.send(Command::Fetch {
-            req,
-            content_hash,
-            basis: basis.clone(),
-        });
+        self.enqueue(req, basis, RequestKind::Fetch(content_hash));
     }
 
     fn resolve_path(&mut self, req: ReqId, path: &AssetPath, basis: &IoBasis) {
-        self.send(Command::ResolvePath {
-            req,
-            path: path.to_owned(),
-            basis: basis.clone(),
-        });
+        self.enqueue(req, basis, RequestKind::Path(path.to_owned()));
     }
 
     fn subscribe(&mut self, uuid: AssetUuid) {
-        self.send(Command::SubscribeAsset(uuid));
+        if self.shared.subscriptions.borrow_mut().assets.insert(uuid) {
+            let _local = self.local.enter();
+            self.shared.subscribe(vec![uuid], Vec::new());
+        }
     }
 
     fn unsubscribe(&mut self, uuid: AssetUuid) {
-        self.send(Command::UnsubscribeAsset(uuid));
+        if self.shared.subscriptions.borrow_mut().assets.remove(&uuid) {
+            let _local = self.local.enter();
+            self.shared.unsubscribe(vec![uuid], Vec::new());
+        }
     }
 
     fn subscribe_path(&mut self, path: &str) {
-        self.send(Command::SubscribePath(path.to_owned()));
+        if self.shared.subscriptions.borrow_mut().paths.insert(path.to_owned()) {
+            let _local = self.local.enter();
+            self.shared.subscribe(Vec::new(), vec![path.to_owned()]);
+        }
     }
 
     fn unsubscribe_path(&mut self, path: &str) {
-        self.send(Command::UnsubscribePath(path.to_owned()));
+        if self.shared.subscriptions.borrow_mut().paths.remove(path) {
+            let _local = self.local.enter();
+            self.shared.unsubscribe(Vec::new(), vec![path.to_owned()]);
+        }
     }
 
     fn poll(&mut self) -> Vec<IoEvent> {
-        self.delivered_fetches.clear();
-        while let Ok(completion) = self.events.try_recv() {
-            if let Some(permit) = completion.fetch_permit {
-                self.delivered_fetches.push(permit);
-            }
-            self.pending.push(completion.event);
-        }
-        std::mem::take(&mut self.pending)
+        self.step();
+        let completions = std::mem::take(&mut *self.shared.completions.borrow_mut());
+        // Each payload's memory reservation ends here: the loader owns it.
+        completions
+            .into_iter()
+            .map(|completion| completion.event)
+            .collect()
     }
 }
 
-struct Completion {
-    event: IoEvent,
-    fetch_permit: Option<FetchPermit>,
+/// Records that the `LocalSet` was woken during a turn.
+struct TurnWaker {
+    woken: Arc<AtomicBool>,
+    inner: Waker,
 }
 
-struct FetchPermit {
-    _slot: tokio::sync::OwnedSemaphorePermit,
-}
+impl Wake for TurnWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
 
-async fn send_event(events: &mpsc::Sender<Completion>, event: IoEvent) -> bool {
-    events.send(Completion::event(event)).await.is_ok()
-}
-
-impl Completion {
-    fn event(event: IoEvent) -> Self {
-        Self {
-            event,
-            fetch_permit: None,
-        }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Relaxed);
+        self.inner.wake_by_ref();
     }
 }
 
-enum Command {
-    BindTarget(RuntimeTarget),
-    BeginSweep {
-        reply: sync_mpsc::SyncSender<Option<IoBasis>>,
-    },
-    Resolve {
-        req: ReqId,
-        uuid: AssetUuid,
-        basis: IoBasis,
-    },
-    Fetch {
-        req: ReqId,
-        content_hash: ContentHash,
-        basis: IoBasis,
-    },
-    ResolvePath {
-        req: ReqId,
-        path: AssetPath,
-        basis: IoBasis,
-    },
-    SubscribeAsset(AssetUuid),
-    UnsubscribeAsset(AssetUuid),
-    SubscribePath(String),
-    UnsubscribePath(String),
-}
-
-fn run_thread(
+/// State shared by `RpcIo` and its tasks. Every borrow is short and never
+/// held across an `.await` or a turn.
+struct Shared {
     address: SocketAddr,
-    request: ConnectRequest,
-    config: RpcIoConfig,
-    commands: mpsc::Receiver<Command>,
-    shutdown: watch::Receiver<bool>,
-    events: mpsc::Sender<Completion>,
-    init: sync_mpsc::SyncSender<Result<IoBasis, RpcIoInitError>>,
-    import_failures: watch::Sender<Option<Vec<ImportFailure>>>,
-) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = init.send(Err(RpcIoInitError::Unavailable(error.to_string())));
-            return;
-        }
-    };
-    tokio::task::LocalSet::new().block_on(&runtime, async move {
-        let client = match CapnpClient::connect_local(address).await {
-            Ok(client) => client,
-            Err(error) => {
-                let _ = init.send(Err(RpcIoInitError::Unavailable(error.to_string())));
-                return;
-            }
-        };
-        let outcome = match client.connect(&request).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = init.send(Err(RpcIoInitError::Unavailable(error.to_string())));
-                return;
-            }
-        };
-        let hub = match RemoteHub::connected(outcome) {
-            Ok(hub) => hub,
-            Err(outcome) => {
-                let error = match *outcome {
-                    RemoteConnectOutcome::ConfigurationFailed(error) => {
-                        format!("daemon configuration failed: {}", error.message)
-                    }
-                    other => format!("RPC connection rejected: {other:?}"),
-                };
-                let _ = init.send(Err(RpcIoInitError::Unavailable(error)));
-                return;
-            }
-        };
-        let snapshot = match hub.snapshot().await {
-            Ok(RemoteCall::Success(snapshot)) => snapshot,
-            Ok(call) => {
-                let _ = init.send(Err(init_remote_failure(call)));
-                return;
-            }
-            Err(error) => {
-                let _ = init.send(Err(RpcIoInitError::Unavailable(error.to_string())));
-                return;
-            }
-        };
-        let basis = io_basis(snapshot.basis());
-        if init.send(Ok(basis)).is_err() {
-            return;
-        }
-        Driver {
-            address,
-            target: request.target,
-            client,
-            hub,
-            snapshot,
-            commands,
-            shutdown,
-            events,
-            subscriptions: Rc::new(RefCell::new(Subscriptions::default())),
-            delta_task: None,
-            rebind: None,
-            fetch_admission: FetchAdmission::new(
-                config.fetch_memory_budget,
-                config.spool_threshold,
-            ),
-            request_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                IN_FLIGHT_REQUEST_LIMIT,
-            )),
-            fetch_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-            spool_directory: config.spool_directory,
-            import_failures,
-            next_import_failure_poll: tokio::time::Instant::now(),
-            target_rejection_after: config.target_rejection_after.max(1),
-        }
-        .run()
-        .await;
-    });
-}
-
-struct Driver {
-    address: SocketAddr,
-    target: String,
-    client: CapnpClient,
-    hub: RemoteHub,
-    snapshot: RemoteSnapshot,
-    commands: mpsc::Receiver<Command>,
-    shutdown: watch::Receiver<bool>,
-    events: mpsc::Sender<Completion>,
-    subscriptions: Rc<RefCell<Subscriptions>>,
-    delta_task: Option<tokio::task::JoinHandle<()>>,
-    rebind: Option<RebindState>,
-    fetch_admission: FetchAdmission,
-    request_slots: std::sync::Arc<tokio::sync::Semaphore>,
-    fetch_slot: std::sync::Arc<tokio::sync::Semaphore>,
+    target_name: String,
+    admission: Rc<FetchAdmission>,
     spool_directory: Option<PathBuf>,
-    import_failures: watch::Sender<Option<Vec<ImportFailure>>>,
-    next_import_failure_poll: tokio::time::Instant,
     target_rejection_after: u32,
+    snapshot_refresh_after: Duration,
+    completions: RefCell<VecDeque<Completion>>,
+    in_flight: RefCell<HashMap<ReqId, InFlight>>,
+    in_flight_fetches: Cell<usize>,
+    snapshots: RefCell<Snapshots>,
+    link: RefCell<Link>,
+    subscriptions: RefCell<Subscriptions>,
+    /// Stream, subscription, and maintenance tasks of the current
+    /// connection.
+    control: RefCell<Vec<AbortHandle>>,
+    import_failures: RefCell<Option<Vec<ImportFailure>>>,
+    import_failures_changed: Cell<bool>,
+    /// Signalled whenever a snapshot refresh ends.
+    refreshed: tokio::sync::Notify,
+    next_serial: Cell<u64>,
 }
 
-struct RebindState {
-    target: RuntimeTarget,
-    next_attempt: tokio::time::Instant,
-    backoff: Duration,
-    failures: u32,
-    reported: bool,
+enum Link {
+    Connected(Rc<Connection>),
+    Rebinding {
+        target: RuntimeTarget,
+        task: AbortHandle,
+    },
+    Closed,
 }
 
-impl RebindState {
-    /// Count a failed attempt; true exactly when this failure is the one to
-    /// report (the `report_after`th in a row).
-    fn record_failure(&mut self, report_after: u32) -> bool {
-        self.failures = self.failures.saturating_add(1);
-        let report = !self.reported && self.failures >= report_after;
-        self.reported |= report;
-        report
+struct Connection {
+    _client: CapnpClient,
+    hub: RemoteHub,
+    /// At most one `ReconnectRequired` per connection reaches the loader.
+    reconnect_reported: Cell<bool>,
+    refreshing: Cell<bool>,
+    stream_installed: Cell<bool>,
+}
+
+#[derive(Default)]
+struct Snapshots {
+    /// The newest snapshot held: what `begin_sweep` returns.
+    current: Option<SnapshotStamp>,
+    held: HashMap<SnapshotStamp, Held>,
+    /// Bases of sweeps begun and not yet ended.
+    sweeps: HashSet<SnapshotStamp>,
+}
+
+struct Held {
+    snapshot: RemoteSnapshot,
+    serial: u64,
+    opened: Instant,
+}
+
+impl Snapshots {
+    /// Hold `snapshot`; it becomes current unless it is older than current.
+    fn install(&mut self, snapshot: RemoteSnapshot, serial: u64) -> Option<Held> {
+        let stamp = snapshot.basis().snapshot;
+        if let Some(current) = self.current {
+            if current.instance == stamp.instance && stamp.version < current.version {
+                return None;
+            }
+        }
+        let replaced = self.held.insert(
+            stamp,
+            Held {
+                snapshot,
+                serial,
+                opened: Instant::now(),
+            },
+        );
+        match self.current.replace(stamp) {
+            Some(previous) if previous != stamp => self.release_unused(previous),
+            _ => replaced,
+        }
+    }
+
+    /// Drop `stamp`'s snapshot unless it is current or a live sweep's.
+    fn release_unused(&mut self, stamp: SnapshotStamp) -> Option<Held> {
+        if self.current == Some(stamp) || self.sweeps.contains(&stamp) {
+            return None;
+        }
+        self.held.remove(&stamp)
+    }
+
+    fn satisfies(&self, need: &Need) -> bool {
+        let Some(current) = self.current.and_then(|stamp| Some((stamp, self.held.get(&stamp)?)))
+        else {
+            return false;
+        };
+        match need {
+            Need::AtLeast(stamp) => {
+                current.0.instance == stamp.instance && current.0.version >= stamp.version
+            }
+            Need::Replace(serial) => current.1.serial != *serial,
+        }
+    }
+
+    /// The cursor a new subscription names: no later than any basis the
+    /// loader may still be resolving at, so no delta after it is missed.
+    fn subscription_cursor(&self) -> InputVersion {
+        let Some(current) = self.current else {
+            return InputVersion(0);
+        };
+        self.sweeps
+            .iter()
+            .filter(|stamp| stamp.instance == current.instance)
+            .map(|stamp| stamp.version)
+            .chain([current.version])
+            .min()
+            .unwrap_or(current.version)
     }
 }
 
-struct ReconnectCandidate {
-    target: RuntimeTarget,
-    client: CapnpClient,
-    hub: RemoteHub,
-    snapshot: RemoteSnapshot,
-    subscription: Option<RemoteSubscription>,
+/// What the current snapshot must satisfy before an event is published.
+enum Need {
+    /// At least this version: a delta or drift reported it.
+    AtLeast(SnapshotStamp),
+    /// Any capability but this one: it expired.
+    Replace(u64),
 }
 
 #[derive(Default)]
@@ -460,422 +676,553 @@ struct Subscriptions {
     paths: BTreeSet<String>,
 }
 
-impl Driver {
-    async fn run(mut self) {
-        'driver: loop {
-            if *self.shutdown.borrow() {
-                break;
-            }
-            let retry_at = self.rebind.as_ref().map(|rebind| rebind.next_attempt);
-            let poll_at = self.next_import_failure_poll;
-            let wake = if let Some(retry_at) = retry_at {
-                tokio::select! {
-                    biased;
-                    _ = self.shutdown.changed() => DriverWake::Shutdown,
-                    command = self.commands.recv() => DriverWake::Command(command),
-                    () = tokio::time::sleep_until(retry_at) => DriverWake::Reconnect,
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = self.shutdown.changed() => DriverWake::Shutdown,
-                    command = self.commands.recv() => DriverWake::Command(command),
-                    () = tokio::time::sleep_until(poll_at) => DriverWake::PollImportFailures,
-                }
-            };
-            match wake {
-                DriverWake::Shutdown => break,
-                DriverWake::PollImportFailures => self.poll_import_failures().await,
-                DriverWake::Command(Some(command)) => {
-                    if !self.handle(command).await {
-                        break;
-                    }
-                }
-                DriverWake::Command(None) => break,
-                DriverWake::Reconnect => {
-                    let target = self
-                        .rebind
-                        .as_ref()
-                        .expect("reconnect wake requires pending state")
-                        .target
-                        .clone();
-                    let attempt = {
-                        let mut shutdown = self.shutdown.clone();
-                        let attempt = tokio::time::timeout(
-                            RECONNECT_ATTEMPT_TIMEOUT,
-                            self.prepare_reconnect(target),
-                        );
-                        tokio::pin!(attempt);
-                        tokio::select! {
-                            biased;
-                            _ = shutdown.changed() => break 'driver,
-                            result = &mut attempt => result,
-                        }
-                    };
-                    match attempt {
-                        Ok(Ok(candidate)) => self.commit_reconnect(candidate).await,
-                        Ok(Err(message)) => self.defer_reconnect(message).await,
-                        Err(_) => {
-                            self.defer_reconnect(format!(
-                                "RPC reconnection attempt timed out after {} ms",
-                                RECONNECT_ATTEMPT_TIMEOUT.as_millis(),
-                            ))
-                            .await;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(task) = self.delta_task.take() {
-            task.abort();
-        }
+impl Subscriptions {
+    fn lists(&self) -> (Vec<AssetUuid>, Vec<String>) {
+        (
+            self.assets.iter().copied().collect(),
+            self.paths.iter().cloned().collect(),
+        )
     }
+}
 
-    /// Publish the daemon's watched-import failures when they changed. A
-    /// failed poll keeps the last list; reconnection is the command path's
-    /// job.
-    async fn poll_import_failures(&mut self) {
-        self.next_import_failure_poll =
-            tokio::time::Instant::now() + IMPORT_FAILURE_POLL_INTERVAL;
-        if let Ok(RemoteCall::Success(failures)) = self.hub.import_failures().await {
-            self.import_failures.send_if_modified(|current| {
-                if current.as_ref() == Some(&failures) {
-                    return false;
-                }
-                *current = Some(failures);
-                true
-            });
-        }
-    }
+struct Queued {
+    req: ReqId,
+    stamp: SnapshotStamp,
+    kind: RequestKind,
+}
 
-    async fn handle(&mut self, command: Command) -> bool {
-        match command {
-            Command::BindTarget(target) => self.begin_reconnect(target),
-            Command::BeginSweep { reply } => {
-                // Each round reads one snapshot of its own.
-                let basis = match self.hub.snapshot().await {
-                    Ok(RemoteCall::Success(snapshot)) => {
-                        self.snapshot = snapshot;
-                        Some(io_basis(self.snapshot.basis()))
-                    }
-                    Ok(call) => {
-                        let _ = send_event(&self.events, connection_event(call)).await;
-                        None
-                    }
-                    Err(_error) => {
-                        let _ = send_event(
-                            &self.events,
-                            IoEvent::ReconnectRequired {
-                                reason: ReconnectReason::ConnectionLost,
-                            },
-                        )
-                        .await;
-                        None
-                    }
-                };
-                let _ = reply.send(basis);
-            }
-            Command::Resolve { req, uuid, basis } => {
-                if !self.basis_matches(&basis) {
-                    let _ = send_event(
-                        &self.events,
-                        request_error(req, basis, "stale RPC basis".into()),
-                    )
-                    .await;
-                    return true;
-                }
-                let request_slots = std::sync::Arc::clone(&self.request_slots);
-                let Ok(request_slot) = request_slots.acquire_owned().await else {
-                    return false;
-                };
-                let snapshot = self.snapshot.clone();
-                let events = self.events.clone();
-                tokio::task::spawn_local(async move {
-                    let _request_slot = request_slot;
-                    let event = resolve_event(snapshot, req, uuid, basis).await;
-                    let _ = send_event(&events, event).await;
-                });
-            }
-            Command::Fetch {
-                req,
-                content_hash,
-                basis,
-            } => {
-                if !self.basis_matches(&basis) {
-                    let _ = send_event(
-                        &self.events,
-                        request_error(req, basis, "stale RPC basis".into()),
-                    )
-                    .await;
-                    return true;
-                }
-                let request_slots = std::sync::Arc::clone(&self.request_slots);
-                let Ok(request_slot) = request_slots.acquire_owned().await else {
-                    return false;
-                };
-                let fetch_slot = std::sync::Arc::clone(&self.fetch_slot);
-                let hub = self.hub.clone();
-                let snapshot = self.snapshot.clone();
-                let events = self.events.clone();
-                let admission = self.fetch_admission;
-                let spool_directory = self.spool_directory.clone();
-                tokio::task::spawn_local(async move {
-                    let _request_slot = request_slot;
-                    let Ok(fetch_slot) = fetch_slot.acquire_owned().await else {
-                        return;
-                    };
-                    let completion = fetch_event(
-                        (hub, snapshot),
-                        req,
-                        content_hash,
-                        basis,
-                        admission,
-                        FetchPermit { _slot: fetch_slot },
-                        spool_directory,
-                    )
-                    .await;
-                    let _ = events.send(completion).await;
-                });
-            }
-            Command::ResolvePath { req, path, basis } => {
-                if !self.basis_matches(&basis) {
-                    let _ = send_event(
-                        &self.events,
-                        request_error(req, basis, "stale RPC basis".into()),
-                    )
-                    .await;
-                    return true;
-                }
-                let request_slots = std::sync::Arc::clone(&self.request_slots);
-                let Ok(request_slot) = request_slots.acquire_owned().await else {
-                    return false;
-                };
-                let snapshot = self.snapshot.clone();
-                let events = self.events.clone();
-                tokio::task::spawn_local(async move {
-                    let _request_slot = request_slot;
-                    let event = path_event(snapshot, req, path, basis).await;
-                    let _ = send_event(&events, event).await;
-                });
-            }
-            Command::SubscribeAsset(uuid) => {
-                let inserted = self.subscriptions.borrow_mut().assets.insert(uuid);
-                if inserted && self.rebind.is_none() {
-                    let _ = self.subscribe(vec![uuid], Vec::new()).await;
-                }
-            }
-            Command::UnsubscribeAsset(uuid) => {
-                let removed = self.subscriptions.borrow_mut().assets.remove(&uuid);
-                if removed && self.rebind.is_none() {
-                    self.unsubscribe(vec![uuid], Vec::new()).await;
-                }
-            }
-            Command::SubscribePath(path) => {
-                let inserted = self.subscriptions.borrow_mut().paths.insert(path.clone());
-                if inserted && self.rebind.is_none() {
-                    let _ = self.subscribe(Vec::new(), vec![path]).await;
-                }
-            }
-            Command::UnsubscribePath(path) => {
-                let removed = self.subscriptions.borrow_mut().paths.remove(&path);
-                if removed && self.rebind.is_none() {
-                    self.unsubscribe(Vec::new(), vec![path]).await;
-                }
-            }
-        }
-        true
-    }
+enum RequestKind {
+    Resolve(AssetUuid),
+    Path(AssetPath),
+    Fetch(ContentHash),
+}
 
-    fn begin_reconnect(&mut self, target: RuntimeTarget) {
-        if let Some(task) = self.delta_task.take() {
-            task.abort();
-        }
-        self.rebind = Some(RebindState {
-            target,
-            next_attempt: tokio::time::Instant::now(),
-            backoff: RECONNECT_INITIAL_BACKOFF,
-            failures: 0,
-            reported: false,
-        });
-    }
+struct InFlight {
+    stamp: SnapshotStamp,
+    abort: AbortHandle,
+}
 
-    async fn prepare_reconnect(&self, target: RuntimeTarget) -> Result<ReconnectCandidate, String> {
-        let request = connect_request(&self.target, &target);
-        let client = CapnpClient::connect_local(self.address)
-            .await
-            .map_err(|error| error.to_string())?;
-        let outcome = client
-            .connect(&request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let hub = RemoteHub::connected(outcome)
-            .map_err(|outcome| format!("RPC reconnection rejected: {outcome:?}"))?;
-        let snapshot = match hub.snapshot().await {
-            Ok(RemoteCall::Success(snapshot)) => snapshot,
-            Ok(call) => return Err(remote_message(call)),
-            Err(error) => return Err(error.to_string()),
-        };
-        let (assets, paths) = {
-            let subscriptions = self.subscriptions.borrow();
-            (
-                subscriptions.assets.iter().copied().collect::<Vec<_>>(),
-                subscriptions.paths.iter().cloned().collect::<Vec<_>>(),
-            )
-        };
-        let subscription = if assets.is_empty() && paths.is_empty() {
-            None
-        } else {
-            match hub
-                .subscribe(snapshot.basis().snapshot.version, assets, paths)
-                .await
-            {
-                Ok(RemoteCall::Success(subscription)) => Some(subscription),
-                Ok(call) => return Err(remote_message(call)),
-                Err(error) => return Err(error.to_string()),
-            }
-        };
+/// One event for the next `poll`.
+struct Completion {
+    event: IoEvent,
+    /// The basis a request-terminal event's request was issued under.
+    request: Option<SnapshotStamp>,
+    _reservation: Option<Reservation>,
+}
 
-        Ok(ReconnectCandidate {
-            target,
-            client,
-            hub,
-            snapshot,
-            subscription,
+/// Fetched payload bytes held in memory against the budget.
+struct Reservation {
+    admission: Rc<FetchAdmission>,
+    bytes: usize,
+}
+
+impl Reservation {
+    fn admit(admission: &Rc<FetchAdmission>, bytes: usize) -> Option<Self> {
+        (admission.admit(bytes) == crate::admission::Admission::Memory).then(|| Self {
+            admission: Rc::clone(admission),
+            bytes,
         })
     }
 
-    async fn commit_reconnect(&mut self, candidate: ReconnectCandidate) {
-        let target_bound = IoEvent::TargetBound {
-            target: candidate.target,
-            basis: io_basis(candidate.snapshot.basis()),
-        };
-        // Queue the acknowledgment while the previous connection and durable
-        // rebind state still own the driver. A full completion channel may
-        // delay this local publication, but it is not a failed peer handshake
-        // and must not consume the reconnect timeout or expose candidate state.
-        if !send_event(&self.events, target_bound).await {
+    fn grow(&mut self, bytes: usize) -> bool {
+        let grown = self.admission.grow(self.bytes, bytes);
+        if grown {
+            self.bytes += bytes;
+        }
+        grown
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.admission.release(self.bytes);
+    }
+}
+
+/// Removes its request from the in-flight table when the task ends,
+/// whether it completed or was dropped.
+struct InFlightGuard {
+    shared: Rc<Shared>,
+    req: ReqId,
+    fetch: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.shared.in_flight.borrow_mut().remove(&self.req);
+        if self.fetch {
+            let fetches = &self.shared.in_flight_fetches;
+            fetches.set(fetches.get().saturating_sub(1));
+        }
+    }
+}
+
+/// Marks a snapshot refresh in flight on a connection; waiters re-check
+/// when it ends, however it ends.
+struct Refreshing<'a> {
+    shared: &'a Shared,
+    connection: &'a Connection,
+}
+
+impl Drop for Refreshing<'_> {
+    fn drop(&mut self) {
+        self.connection.refreshing.set(false);
+        self.shared.refreshed.notify_waiters();
+    }
+}
+
+struct Opened {
+    client: CapnpClient,
+    hub: RemoteHub,
+    snapshot: RemoteSnapshot,
+    subscription: Option<RemoteSubscription>,
+    subscribed: (Vec<AssetUuid>, Vec<String>),
+}
+
+impl Shared {
+    fn new(address: SocketAddr, target_name: String, config: &RpcIoConfig) -> Self {
+        Self {
+            address,
+            target_name,
+            admission: Rc::new(FetchAdmission::new(
+                config.fetch_memory_budget,
+                config.spool_threshold,
+            )),
+            spool_directory: config.spool_directory.clone(),
+            target_rejection_after: config.target_rejection_after.max(1),
+            snapshot_refresh_after: config.snapshot_refresh_after,
+            completions: RefCell::new(VecDeque::new()),
+            in_flight: RefCell::new(HashMap::new()),
+            in_flight_fetches: Cell::new(0),
+            snapshots: RefCell::new(Snapshots::default()),
+            link: RefCell::new(Link::Closed),
+            subscriptions: RefCell::new(Subscriptions::default()),
+            control: RefCell::new(Vec::new()),
+            import_failures: RefCell::new(None),
+            import_failures_changed: Cell::new(false),
+            refreshed: tokio::sync::Notify::new(),
+            next_serial: Cell::new(1),
+        }
+    }
+
+    fn connection(&self) -> Option<Rc<Connection>> {
+        match &*self.link.borrow() {
+            Link::Connected(connection) => Some(Rc::clone(connection)),
+            _ => None,
+        }
+    }
+
+    fn push(&self, event: IoEvent) {
+        self.completions.borrow_mut().push_back(Completion {
+            event,
+            request: None,
+            _reservation: None,
+        });
+    }
+
+    fn push_request(
+        &self,
+        request: Option<SnapshotStamp>,
+        event: IoEvent,
+        reservation: Option<Reservation>,
+    ) {
+        self.completions.borrow_mut().push_back(Completion {
+            event,
+            request,
+            _reservation: reservation,
+        });
+    }
+
+    /// Connection-level events: `ReconnectRequired` once per connection.
+    fn push_connection(&self, connection: &Connection, event: IoEvent) {
+        if matches!(event, IoEvent::ReconnectRequired { .. })
+            && connection.reconnect_reported.replace(true)
+        {
             return;
         }
-        if let Some(task) = self.delta_task.take() {
-            task.abort();
-        }
-        self.client = candidate.client;
-        self.hub = candidate.hub;
-        self.snapshot = candidate.snapshot;
-        if let Some(subscription) = candidate.subscription {
-            self.install_delta_stream(subscription);
-        }
-        self.rebind = None;
+        self.push(event);
     }
 
-    async fn defer_reconnect(&mut self, message: String) {
-        let report_after = self.target_rejection_after;
-        let report = self
-            .rebind
-            .as_mut()
-            .is_some_and(|state| state.record_failure(report_after));
-        if report {
-            let _ = send_event(&self.events, IoEvent::TargetRejected { message }).await;
-        }
-        if let Some(state) = &mut self.rebind {
-            state.next_attempt = tokio::time::Instant::now() + state.backoff;
-            state.backoff = state.backoff.saturating_mul(2).min(RECONNECT_MAX_BACKOFF);
-        }
+    fn install(&self, snapshot: RemoteSnapshot) {
+        let serial = self.next_serial.get();
+        self.next_serial.set(serial + 1);
+        let released = self.snapshots.borrow_mut().install(snapshot, serial);
+        drop(released);
     }
 
-    fn basis_matches(&self, basis: &IoBasis) -> bool {
-        io_basis(self.snapshot.basis()) == *basis
+    fn spawn_control(&self, task: impl Future<Output = ()> + 'static) {
+        let handle = tokio::task::spawn_local(task).abort_handle();
+        let mut control = self.control.borrow_mut();
+        control.retain(|task| !task.is_finished());
+        control.push(handle);
     }
 
-    async fn subscribe(&mut self, assets: Vec<AssetUuid>, paths: Vec<String>) -> bool {
-        match self
-            .hub
-            .subscribe(self.snapshot.basis().snapshot.version, assets, paths)
-            .await
-        {
-            Ok(RemoteCall::Success(subscription)) => {
-                if self.delta_task.is_none() {
-                    self.install_delta_stream(subscription);
-                }
-                true
-            }
-            Ok(call) => {
-                let _ = send_event(&self.events, connection_event(call)).await;
-                false
-            }
-            Err(_error) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::ReconnectRequired {
-                        reason: ReconnectReason::ConnectionLost,
-                    },
-                )
-                .await;
-                false
-            }
+    /// Make `opened` the connection: its snapshot becomes current, its
+    /// stream and maintenance start, and subscriptions changed since it
+    /// subscribed are reconciled. Must run inside the `LocalSet`.
+    fn commit(self: &Rc<Self>, opened: Opened) -> IoBasis {
+        let basis = io_basis(opened.snapshot.basis());
+        let connection = Rc::new(Connection {
+            _client: opened.client,
+            hub: opened.hub,
+            reconnect_reported: Cell::new(false),
+            refreshing: Cell::new(false),
+            stream_installed: Cell::new(false),
+        });
+        *self.link.borrow_mut() = Link::Connected(Rc::clone(&connection));
+        self.install(opened.snapshot);
+        if let Some(subscription) = opened.subscription {
+            connection.stream_installed.set(true);
+            self.spawn_control(delta_stream(
+                Rc::clone(self),
+                Rc::clone(&connection),
+                subscription,
+            ));
         }
+        let (assets, paths) = self.subscriptions.borrow().lists();
+        let (subscribed_assets, subscribed_paths) = opened.subscribed;
+        let added_assets = assets
+            .iter()
+            .filter(|asset| !subscribed_assets.contains(asset))
+            .copied()
+            .collect::<Vec<_>>();
+        let added_paths = paths
+            .iter()
+            .filter(|path| !subscribed_paths.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed_assets = subscribed_assets
+            .into_iter()
+            .filter(|asset| !assets.contains(asset))
+            .collect::<Vec<_>>();
+        let removed_paths = subscribed_paths
+            .into_iter()
+            .filter(|path| !paths.contains(path))
+            .collect::<Vec<_>>();
+        if !added_assets.is_empty() || !added_paths.is_empty() {
+            self.subscribe(added_assets, added_paths);
+        }
+        if !removed_assets.is_empty() || !removed_paths.is_empty() {
+            self.unsubscribe(removed_assets, removed_paths);
+        }
+        self.spawn_control(maintain(Rc::clone(self), connection));
+        basis
     }
 
-    fn install_delta_stream(&mut self, mut subscription: RemoteSubscription) {
-        let events = self.events.clone();
-        let subscriptions = Rc::clone(&self.subscriptions);
-        self.delta_task = Some(tokio::task::spawn_local(async move {
-            loop {
-                match subscription.next().await {
-                    Ok(Some(event)) => {
-                        let filtered = {
-                            let subscriptions = subscriptions.borrow();
-                            stream_events(event, &subscriptions.assets, &subscriptions.paths)
-                        };
-                        for event in filtered {
-                            if !send_event(&events, event).await {
-                                return;
-                            }
-                        }
+    /// Start a queued request as a task. Must run inside the `LocalSet`.
+    fn start(self: &Rc<Self>, queued: Queued) {
+        let Queued { req, stamp, kind } = queued;
+        let basis = IoBasis::Rpc { snapshot: stamp };
+        let held = self
+            .snapshots
+            .borrow()
+            .held
+            .get(&stamp)
+            .map(|held| (held.snapshot.clone(), held.serial));
+        let (Some(connection), Some((snapshot, serial))) = (self.connection(), held) else {
+            self.push_request(
+                Some(stamp),
+                request_error(req, basis, "stale RPC basis".into()),
+                None,
+            );
+            return;
+        };
+        let fetch = matches!(kind, RequestKind::Fetch(_));
+        let guard = InFlightGuard {
+            shared: Rc::clone(self),
+            req,
+            fetch,
+        };
+        let task = tokio::task::spawn_local(run_request(
+            Rc::clone(self),
+            connection,
+            snapshot,
+            serial,
+            req,
+            stamp,
+            kind,
+            guard,
+        ));
+        if fetch {
+            self.in_flight_fetches.set(self.in_flight_fetches.get() + 1);
+        }
+        self.in_flight.borrow_mut().insert(
+            req,
+            InFlight {
+                stamp,
+                abort: task.abort_handle(),
+            },
+        );
+    }
+
+    /// Subscribe on the current connection; with none, the next connection
+    /// subscribes the whole set. Must run inside the `LocalSet`.
+    fn subscribe(self: &Rc<Self>, assets: Vec<AssetUuid>, paths: Vec<String>) {
+        let Some(connection) = self.connection() else {
+            return;
+        };
+        let since = self.snapshots.borrow().subscription_cursor();
+        let shared = Rc::clone(self);
+        self.spawn_control(async move {
+            match connection.hub.subscribe(since, assets, paths).await {
+                Ok(RemoteCall::Success(subscription)) => {
+                    // The connection carries one stream for every subscription.
+                    if !connection.stream_installed.replace(true) {
+                        let stream =
+                            delta_stream(Rc::clone(&shared), Rc::clone(&connection), subscription);
+                        shared.spawn_control(stream);
                     }
-                    Ok(None) | Err(_) => {
-                        let _ = send_event(
-                            &events,
-                            IoEvent::ReconnectRequired {
-                                reason: ReconnectReason::ConnectionLost,
-                            },
-                        )
-                        .await;
-                        return;
-                    }
                 }
+                Ok(call) => shared.push_connection(&connection, connection_event(call)),
+                Err(_) => shared.push_connection(&connection, connection_lost()),
             }
-        }));
+        });
     }
 
-    async fn unsubscribe(&self, assets: Vec<AssetUuid>, paths: Vec<String>) {
-        match self.hub.unsubscribe(assets, paths).await {
-            Ok(RemoteCall::Success(())) => {}
-            Ok(call) => {
-                let _ = send_event(&self.events, connection_event(call)).await;
+    fn unsubscribe(self: &Rc<Self>, assets: Vec<AssetUuid>, paths: Vec<String>) {
+        let Some(connection) = self.connection() else {
+            return;
+        };
+        let shared = Rc::clone(self);
+        self.spawn_control(async move {
+            match connection.hub.unsubscribe(assets, paths).await {
+                Ok(RemoteCall::Success(())) => {}
+                Ok(call) => shared.push_connection(&connection, connection_event(call)),
+                Err(error) => shared.push(IoEvent::ConnectionError {
+                    message: error.to_string(),
+                }),
             }
-            Err(error) => {
-                let _ = send_event(
-                    &self.events,
-                    IoEvent::ConnectionError {
-                        message: error.to_string(),
-                    },
-                )
-                .await;
+        });
+    }
+
+    fn set_import_failures(&self, failures: Vec<ImportFailure>) {
+        let mut current = self.import_failures.borrow_mut();
+        if current.as_ref() != Some(&failures) {
+            *current = Some(failures);
+            self.import_failures_changed.set(true);
+        }
+    }
+}
+
+/// Make the current snapshot satisfy `need`, refreshing it when it does
+/// not. Concurrent callers share one refresh per connection.
+async fn ensure_current(
+    shared: &Shared,
+    connection: &Connection,
+    need: Need,
+) -> Result<(), IoEvent> {
+    loop {
+        let notified = shared.refreshed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if shared.snapshots.borrow().satisfies(&need) {
+            return Ok(());
+        }
+        if !connection.refreshing.get() {
+            break;
+        }
+        notified.await;
+    }
+    connection.refreshing.set(true);
+    let _refreshing = Refreshing { shared, connection };
+    match connection.hub.snapshot().await {
+        Ok(RemoteCall::Success(snapshot)) => {
+            shared.install(snapshot);
+            Ok(())
+        }
+        Ok(call) => Err(connection_event(call)),
+        Err(_) => Err(connection_lost()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_request(
+    shared: Rc<Shared>,
+    connection: Rc<Connection>,
+    snapshot: RemoteSnapshot,
+    serial: u64,
+    req: ReqId,
+    stamp: SnapshotStamp,
+    kind: RequestKind,
+    _guard: InFlightGuard,
+) {
+    let basis = IoBasis::Rpc { snapshot: stamp };
+    let (event, reservation) = match kind {
+        RequestKind::Resolve(uuid) => (resolve_event(&snapshot, req, uuid, basis).await, None),
+        RequestKind::Path(path) => (path_event(&snapshot, req, path, basis).await, None),
+        RequestKind::Fetch(content_hash) => {
+            fetch_event(&shared, &connection.hub, &snapshot, req, content_hash, basis).await
+        }
+    };
+    // The loader answers these with a new round: publish them only once the
+    // basis that round will get answers them.
+    let need = match &event {
+        IoEvent::Resolved {
+            result: ResolveResult::Drifted { current, .. },
+            ..
+        } => Some(Need::AtLeast(*current)),
+        IoEvent::SnapshotExpired { .. } => Some(Need::Replace(serial)),
+        _ => None,
+    };
+    if let Some(need) = need {
+        if let Err(event) = ensure_current(&shared, &connection, need).await {
+            shared.push_connection(&connection, event);
+        }
+    }
+    match event {
+        IoEvent::ReconnectRequired { .. } | IoEvent::ConnectionError { .. } => {
+            shared.push_connection(&connection, event)
+        }
+        event => shared.push_request(Some(stamp), event, reservation),
+    }
+}
+
+/// Deltas in stream order, each published once the current snapshot is at
+/// least as new as it.
+async fn delta_stream(
+    shared: Rc<Shared>,
+    connection: Rc<Connection>,
+    mut subscription: RemoteSubscription,
+) {
+    loop {
+        match subscription.next().await {
+            Ok(Some(event)) => {
+                let events = {
+                    let subscriptions = shared.subscriptions.borrow();
+                    stream_events(event, &subscriptions.assets, &subscriptions.paths)
+                };
+                let newest = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        IoEvent::Delta { stamp, .. } => Some(*stamp),
+                        _ => None,
+                    })
+                    .max_by_key(|stamp| stamp.version);
+                if let Some(stamp) = newest {
+                    if let Err(event) = ensure_current(&shared, &connection, Need::AtLeast(stamp)).await
+                    {
+                        shared.push_connection(&connection, event);
+                    }
+                }
+                for event in events {
+                    shared.push_connection(&connection, event);
+                }
+            }
+            Ok(None) | Err(_) => {
+                shared.push_connection(&connection, connection_lost());
+                return;
             }
         }
     }
 }
 
-enum DriverWake {
-    Command(Option<Command>),
-    Reconnect,
-    PollImportFailures,
-    Shutdown,
+/// Per connection: poll watched-import failures and keep the current
+/// snapshot well inside the daemon's TTL.
+async fn maintain(shared: Rc<Shared>, connection: Rc<Connection>) {
+    loop {
+        if let Ok(RemoteCall::Success(failures)) = connection.hub.import_failures().await {
+            shared.set_import_failures(failures);
+        }
+        let stale = shared.snapshots.borrow().current.and_then(|stamp| {
+            let held = shared.snapshots.borrow().held.get(&stamp).map(|held| (held.serial, held.opened))?;
+            (held.1.elapsed() >= shared.snapshot_refresh_after).then_some(held.0)
+        });
+        if let Some(serial) = stale {
+            if let Err(event) = ensure_current(&shared, &connection, Need::Replace(serial)).await {
+                shared.push_connection(&connection, event);
+            }
+        }
+        tokio::time::sleep(IMPORT_FAILURE_POLL_INTERVAL).await;
+    }
+}
+
+/// Rebind to `target`: attempt, back off, report after repeated failure,
+/// and commit the first connection that binds.
+async fn rebind(shared: Rc<Shared>, target: RuntimeTarget) {
+    let mut backoff = RECONNECT_INITIAL_BACKOFF;
+    let mut failures = 0u32;
+    let mut reported = false;
+    loop {
+        let (assets, paths) = shared.subscriptions.borrow().lists();
+        let request = connect_request(&shared.target_name, &target);
+        let attempt = tokio::time::timeout(
+            RECONNECT_ATTEMPT_TIMEOUT,
+            open_connection(shared.address, &request, assets, paths),
+        )
+        .await;
+        let message = match attempt {
+            Ok(Ok(opened)) => {
+                let basis = shared.commit(opened);
+                shared.push(IoEvent::TargetBound { target, basis });
+                return;
+            }
+            Ok(Err(error)) => error.message(),
+            Err(_) => format!(
+                "RPC reconnection attempt timed out after {} ms",
+                RECONNECT_ATTEMPT_TIMEOUT.as_millis()
+            ),
+        };
+        failures = failures.saturating_add(1);
+        if !reported && failures >= shared.target_rejection_after {
+            reported = true;
+            shared.push(IoEvent::TargetRejected { message });
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(RECONNECT_MAX_BACKOFF);
+    }
+}
+
+/// Connect, bind, open a snapshot, and subscribe `assets`/`paths` at it.
+async fn open_connection(
+    address: SocketAddr,
+    request: &ConnectRequest,
+    assets: Vec<AssetUuid>,
+    paths: Vec<String>,
+) -> Result<Opened, RpcIoInitError> {
+    let unavailable = |error: &dyn std::fmt::Display| RpcIoInitError::Unavailable(error.to_string());
+    let client = CapnpClient::connect_local(address)
+        .await
+        .map_err(|error| unavailable(&error))?;
+    let outcome = client
+        .connect(request)
+        .await
+        .map_err(|error| unavailable(&error))?;
+    let hub = RemoteHub::connected(outcome).map_err(|outcome| {
+        RpcIoInitError::Unavailable(match *outcome {
+            RemoteConnectOutcome::ConfigurationFailed(error) => {
+                format!("daemon configuration failed: {}", error.message)
+            }
+            other => format!("RPC connection rejected: {other:?}"),
+        })
+    })?;
+    let snapshot = match hub.snapshot().await {
+        Ok(RemoteCall::Success(snapshot)) => snapshot,
+        Ok(call) => return Err(init_remote_failure(call)),
+        Err(error) => return Err(unavailable(&error)),
+    };
+    let subscription = if assets.is_empty() && paths.is_empty() {
+        None
+    } else {
+        match hub
+            .subscribe(snapshot.basis().snapshot.version, assets.clone(), paths.clone())
+            .await
+        {
+            Ok(RemoteCall::Success(subscription)) => Some(subscription),
+            Ok(call) => return Err(init_remote_failure(call)),
+            Err(error) => return Err(unavailable(&error)),
+        }
+    };
+    Ok(Opened {
+        client,
+        hub,
+        snapshot,
+        subscription,
+        subscribed: (assets, paths),
+    })
 }
 
 async fn resolve_event(
-    snapshot: RemoteSnapshot,
+    snapshot: &RemoteSnapshot,
     req: ReqId,
     uuid: AssetUuid,
     request_basis: IoBasis,
@@ -910,7 +1257,7 @@ async fn resolve_event(
 }
 
 async fn path_event(
-    snapshot: RemoteSnapshot,
+    snapshot: &RemoteSnapshot,
     req: ReqId,
     path: AssetPath,
     request_basis: IoBasis,
@@ -937,104 +1284,66 @@ async fn path_event(
     }
 }
 
+/// Fetch one artifact and its DSWL tree; the reservation covers the
+/// payload while it is in memory and travels with the event.
 async fn fetch_event(
-    remote: (RemoteHub, RemoteSnapshot),
+    shared: &Shared,
+    hub: &RemoteHub,
+    snapshot: &RemoteSnapshot,
     req: ReqId,
     content_hash: ContentHash,
     request_basis: IoBasis,
-    admission: FetchAdmission,
-    permit: FetchPermit,
-    spool_directory: Option<PathBuf>,
-) -> Completion {
-    let (hub, snapshot) = remote;
+) -> (IoEvent, Option<Reservation>) {
+    let fail = |message: String| (request_error(req, request_basis.clone(), message), None);
     let mut terminal = match snapshot.fetch(content_hash).await {
         Ok(RemoteCall::Success(terminal)) => terminal,
-        Ok(call) => return Completion::event(remote_request_event(call, req, request_basis)),
-        Err(error) => {
-            return Completion::event(request_error(req, request_basis, error.to_string()))
-        }
+        Ok(call) => return (remote_request_event(call, req, request_basis.clone()), None),
+        Err(error) => return fail(error.to_string()),
     };
     let basis = io_basis(&terminal.basis);
     let load_edges = terminal.value.load_edges().to_vec();
-    let total_bytes = match usize::try_from(terminal.value.total_bytes()) {
-        Ok(total_bytes) => total_bytes,
-        Err(_) => {
-            return Completion::event(request_error(
-                req,
-                request_basis,
-                "fetched artifact is too large for this client".into(),
-            ))
+    let Ok(total_bytes) = usize::try_from(terminal.value.total_bytes()) else {
+        return fail("fetched artifact is too large for this client".into());
+    };
+    let mut reservation = Reservation::admit(&shared.admission, total_bytes);
+    let directory = shared.spool_directory.as_deref();
+    let payload = if reservation.is_some() {
+        match collect_remote_chunks(&mut terminal.value, total_bytes).await {
+            Ok((structural, blobs)) => FetchPayload::Memory { structural, blobs },
+            Err(error) => return fail(error),
+        }
+    } else {
+        match spool_remote_chunks(&mut terminal.value, total_bytes, directory).await {
+            Ok(payload) => payload,
+            Err(error) => return fail(error),
         }
     };
-    let payload = match admission.admit(total_bytes) {
-        Admission::Memory => match collect_remote_chunks(&mut terminal.value, total_bytes).await {
-            Ok((structural, blobs)) => {
-                let observed = blobs.iter().try_fold(structural.len(), |total, blob| {
-                    total.checked_add(blob.len())
-                });
-                if observed != Some(total_bytes) {
-                    return Completion::event(request_error(
-                        req,
-                        request_basis,
-                        "artifact stream length differs from its authenticated total".into(),
-                    ));
-                }
-                FetchPayload::Memory { structural, blobs }
-            }
-            Err(error) => {
-                return Completion::event(request_error(req, request_basis, error));
-            }
-        },
-        Admission::Spool => {
-            match spool_remote_chunks(&mut terminal.value, total_bytes, spool_directory.as_deref())
-                .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    return Completion::event(request_error(req, request_basis, error));
-                }
-            }
-        }
-    };
-    let layout_hash = match payload.layout_hash(content_hash) {
+    let layout_hash = match payload.layout_hash() {
         Ok(layout_hash) => layout_hash,
-        Err(error) => return Completion::event(request_error(req, request_basis, error)),
+        Err(error) => return fail(error),
     };
     let wire_layout = match hub.wire_tree(layout_hash).await {
         Ok(RemoteCall::Success(bytes)) => bytes,
-        Ok(call) => return Completion::event(remote_request_event(call, req, request_basis)),
-        Err(error) => {
-            return Completion::event(request_error(req, request_basis, error.to_string()))
-        }
+        Ok(call) => return (remote_request_event(call, req, request_basis.clone()), None),
+        Err(error) => return fail(error.to_string()),
     };
-    let admitted_bytes = match total_bytes.checked_add(wire_layout.len()) {
-        Some(bytes) => bytes,
-        None => {
-            return Completion::event(request_error(
-                req,
-                request_basis,
-                "artifact plus DSWL length overflows this client".into(),
-            ))
-        }
-    };
-    let spool = admission.should_spool(admitted_bytes);
-    match payload.finish(
-        layout_hash,
-        load_edges,
-        wire_layout,
-        spool,
-        spool_directory.as_deref(),
-    ) {
-        Ok(artifact) => Completion {
-            event: IoEvent::Fetched {
+    let in_memory = reservation
+        .as_mut()
+        .is_some_and(|reservation| reservation.grow(wire_layout.len()));
+    if !in_memory {
+        reservation = None;
+    }
+    match payload.finish(layout_hash, load_edges, wire_layout, !in_memory, directory) {
+        Ok(artifact) => (
+            IoEvent::Fetched {
                 req,
                 content_hash,
                 artifact,
                 basis,
             },
-            fetch_permit: Some(permit),
-        },
-        Err(error) => Completion::event(request_error(req, request_basis, error)),
+            reservation,
+        ),
+        Err(error) => fail(error),
     }
 }
 
@@ -1096,24 +1405,28 @@ enum FetchPayload {
 type ArcMappedSpool = std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>;
 
 impl FetchPayload {
-    fn layout_hash(
-        &self,
-        content_hash: ContentHash,
-    ) -> Result<distill_core::id::LayoutHash, String> {
+    /// The layout hash the artifact header declares. The loader
+    /// authenticates the artifact itself (content hash, structure) when it
+    /// parses it; hashing every byte here as well would double that cost on
+    /// the engine thread.
+    fn layout_hash(&self) -> Result<distill_core::id::LayoutHash, String> {
+        let header = |structural: &[u8]| {
+            distill_wire::artifact::artifact_header_layout_hash(structural)
+                .map_err(|error| format!("invalid fetched artifact: {error}"))
+        };
         match self {
-            Self::Memory { structural, blobs } => {
-                artifact_layout_hash(content_hash, structural, blobs)
-            }
+            Self::Memory { structural, .. } => header(structural),
             Self::Spool {
-                file,
-                structural,
-                blobs,
+                file, structural, ..
             } => {
                 // Safety: the temporary is flushed before this point and no
                 // writer runs while this short-lived validation map exists.
                 let mapping = unsafe { memmap2::MmapOptions::new().map(file.as_file()) }
                     .map_err(|error| format!("cannot map fetch spool: {error}"))?;
-                artifact_layout_hash_backed(content_hash, &mapping, structural, blobs)
+                let bytes = mapping
+                    .get(structural.clone())
+                    .ok_or_else(|| "spooled structural range is out of bounds".to_owned())?;
+                header(bytes)
             }
         }
     }
@@ -1315,6 +1628,12 @@ fn map_spool(file: tempfile::NamedTempFile) -> Result<ArcMappedSpool, String> {
     }))
 }
 
+fn connection_lost() -> IoEvent {
+    IoEvent::ReconnectRequired {
+        reason: ReconnectReason::ConnectionLost,
+    }
+}
+
 fn remote_request_event<T: std::fmt::Debug>(
     call: RemoteCall<T>,
     req: ReqId,
@@ -1328,9 +1647,7 @@ fn remote_request_event<T: std::fmt::Debug>(
         RemoteCall::Error(error) if error.code == ARTIFACT_NOT_FOUND => {
             IoEvent::SnapshotExpired { req, basis }
         }
-        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => IoEvent::ReconnectRequired {
-            reason: ReconnectReason::ConnectionLost,
-        },
+        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => connection_lost(),
         other => request_error(req, basis, remote_message(other)),
     }
 }
@@ -1340,9 +1657,7 @@ fn connection_event<T: std::fmt::Debug>(call: RemoteCall<T>) -> IoEvent {
         RemoteCall::ReconnectRequired(reason) => IoEvent::ReconnectRequired {
             reason: reconnect_reason(reason),
         },
-        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => IoEvent::ReconnectRequired {
-            reason: ReconnectReason::ConnectionLost,
-        },
+        RemoteCall::Error(error) if error.code == CONNECTION_CLOSED => connection_lost(),
         other => IoEvent::ConnectionError {
             message: remote_message(other),
         },
@@ -1466,28 +1781,5 @@ fn drifted_input(input: RpcDriftedInput) -> DriftedInput {
         RpcDriftedInput::Query(query) => DriftedInput::Query(query),
         RpcDriftedInput::Dylib => DriftedInput::Dylib,
         RpcDriftedInput::Tool(tool) => DriftedInput::Tool(tool),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_rebind_reports_once_after_consecutive_failures() {
-        let mut state = RebindState {
-            target: RuntimeTarget {
-                epoch: crate::GameModuleEpoch(1),
-                target_definition_hash: [0; 32],
-            },
-            next_attempt: tokio::time::Instant::now(),
-            backoff: RECONNECT_INITIAL_BACKOFF,
-            failures: 0,
-            reported: false,
-        };
-        let reports = (0..6)
-            .map(|_| state.record_failure(DEFAULT_TARGET_REJECTION_AFTER))
-            .collect::<Vec<_>>();
-        assert_eq!(reports, [false, false, true, false, false, false]);
     }
 }
