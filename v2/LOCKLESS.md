@@ -162,26 +162,37 @@ a connection of its own, and SQLite's write lock orders the writers.
  notify ──▶ watcher ──WatcherEvent──▶ process loop ──(own writer)──▶ SQLite
  rpc listener ──▶ one thread per connection (LocalSet front end: snapshots, subscriptions)
     ├─ reads: own StoreReader, one read transaction per snapshot
-    └─ writes, imports, builds: spawn_blocking ──(own writer)──▶ SQLite
- scheduler workers: builds, each on its own reader and writer
+    ├─ importer runs, builds: blocking worker (the connection keeps serving)
+    └─ writes, import publications, operations: inline ──(own writer)──▶ SQLite
+ scheduler: lends each build job a writer it owns ──▶ worker ──▶ SQLite
 ```
 
-- **Writers.** `SharedStore` hands each thread a writer from an idle pool.
-  Every write transaction takes the lock up front (`BEGIN IMMEDIATE`), so
-  a transaction reads the state it writes over. A thread with a
-  transaction open keeps its writer, and its reads go through it; nested
-  calls join that transaction (`write_transaction_with`). Reads otherwise
-  use the thread's own `StoreReader`.
+- **Writers.** Each owner opens a writer of its own from the daemon's
+  `StoreOpener` (config, instance id, CAS directory and the state-dir
+  lock; immutable but for the operational configuration, which a writer
+  rereads as each transaction begins): the process loop, every RPC
+  connection (lazily, on its first write), and each build job, which the
+  scheduler lends one of its writers. The owner passes it as `&mut Store`
+  to whatever writes on its behalf (authoring, importer, build,
+  operations, coordinator, codegen); nothing finds a writer through
+  thread-local or shared state. Every write transaction takes the lock up
+  front (`BEGIN IMMEDIATE`), so a transaction reads the state it writes
+  over; nested calls join that transaction (`write_transaction_with`).
+  Reads inside an open input go through its writer; an import run
+  outside any write reads a snapshot of its own. A writer's CAS segment
+  is sealed when its owner closes it.
 - **The process loop** owns the `WatcherQueue`, `ConfigWatch` and codegen.
   It debounces watcher events against a deadline, publishes scans and
   imports, and runs startup. Its scan state (the pending rejection and
   health) sits in a `Mutex` other publications read.
 - **watcher** forwards `notify` events to the loop and holds no queue
   state. It stops on its command channel.
-- **Imports and authoring calls** run on the calling thread, or on a
-  blocking worker for RPC. A publication reads its base inside its own
-  transaction and is refused if the base moved. No importer runs on the
-  RPC thread or inside a write transaction.
+- **Imports and authoring calls** run on the calling thread: the process
+  loop's, or the RPC connection's own thread, which blocks only that
+  connection. A publication reads its base inside its own transaction and
+  is refused if the base moved. An RPC import runs its importer on a
+  blocking worker before it opens the input; watched reconciliation runs importers in parallel,
+  outside any write.
 - **Builds** run on scheduler workers. A worker does memo lookup and trace
   revalidation against its reader, builds dependency reads inline, and
   commits the CAS index, `artifact_load_edges` and `resolutions` in one
@@ -223,7 +234,8 @@ a connection of its own, and SQLite's write lock orders the writers.
   sends it each accepted configuration's jobs over its channel; it touches
   no store state: the daemon adopts the pipeline module and schema the
   steps write through the ordinary watch.
-- The only atomics are ID and temp-name sequences.
+- The only atomics are ID and temp-name sequences, and the RPC server's
+  admission counters and snapshot policy.
 
 ## 4. Error model: per-entity rows instead of poisons
 
@@ -802,6 +814,15 @@ should reach zero by the end of phase 6.
       rolls back and leaves the flag set, so the old index stands until
       the next full import pass.
     - A stopping watcher delivers the events queued before `Stop`.
+- **After phase 11: one owner per writer.** RPC connections each run on a
+  thread of their own and share only the `ServerHandle`. `SharedStore`,
+  its thread-local `HELD`/`READERS`/`OPEN_GUARDS`, `WriteGuard` and
+  `ReadGuard`, `WriteCall` with its `spawn_blocking` hop, and
+  `FRONT_ENDS`/`Server::attach` are gone: owners open writers from a
+  `StoreOpener` and pass them explicitly (§3). `SharedStore::idle` and
+  `NEXT_SHARED_ID` went with it. Doctor verification rebuilds inline on
+  the writer whose input it completes in, as the old in-transaction path
+  did.
 
 ## 7. Test baseline
 
