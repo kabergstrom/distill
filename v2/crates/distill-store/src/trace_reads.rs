@@ -118,6 +118,10 @@ mod tests {
                 TOOL_HASH_AT,
                 &["SEARCH tools USING INDEX sqlite_autoindex_tools_1 (tool_key=? AND input_version<?)"],
             ),
+            (
+                crate::pipeline::TOOL_AT,
+                &["SEARCH tools USING INDEX sqlite_autoindex_tools_1 (tool_key=? AND input_version<?)"],
+            ),
         ];
         for (sql, expected) in cases {
             let plan = store.query_plan_details(sql).unwrap();

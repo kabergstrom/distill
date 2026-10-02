@@ -1069,6 +1069,10 @@ should reach zero by the end of phase 6.
   and the current one. Before, both were copied into the struct at open.
   `pipeline_failure` takes the read's result, so a store error gates a request
   like a pipeline failure does.
+- **A build reads a tool per use.** `BuildContext` no longer keeps the
+  ToolEpoch rows it read: `tool()` is one `tools` primary-key read
+  (`TOOL_AT`, plan pinned) at the build's tool version each time.
+  The version is pinned, so the read's answer cannot change during a build.
 
 ## 7. Test baseline
 

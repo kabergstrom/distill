@@ -867,6 +867,11 @@ impl Store {
     }
 }
 
+/// The last ToolEpoch row of one key at a pinned version (primary key).
+pub(crate) const TOOL_AT: &str = "SELECT present, identity_object, tool_hash, input_version
+     FROM tools WHERE tool_key = ?1 AND input_version <= ?2
+     ORDER BY input_version DESC LIMIT 1";
+
 impl StoreReader {
     /// The published pipeline state, or `None` before any publication.
     pub fn pipeline_state(&self) -> Result<Option<PipelineState>, StoreError> {
@@ -1014,7 +1019,8 @@ impl StoreReader {
 
     /// Resolve the last ToolEpoch mapping visible at an exact pinned input
     /// version. Historical package roots coexist, so an older job never
-    /// launches a replacement registration.
+    /// launches a replacement registration. One primary-key read
+    /// ([`TOOL_AT`]); a build reads it per tool use.
     pub fn tool_at(
         &self,
         key: &str,
@@ -1022,12 +1028,8 @@ impl StoreReader {
     ) -> Result<Option<RegisteredTool>, StoreError> {
         let row = self
             .conn
+            .prepare_cached(TOOL_AT)?
             .query_row(
-                "SELECT present, identity_object, tool_hash, input_version
-                   FROM tools
-                  WHERE tool_key = ?1 AND input_version <= ?2
-                  ORDER BY input_version DESC
-                  LIMIT 1",
                 rusqlite::params![key, i64::try_from(basis.0).unwrap_or(i64::MAX)],
                 |r| {
                     Ok((

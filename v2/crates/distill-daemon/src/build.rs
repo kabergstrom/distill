@@ -941,19 +941,13 @@ struct LoadedAsset {
 }
 
 /// The ToolEpoch visible at a build's view, read one key at a time as
-/// tools are run (one primary-key read each) and kept for the rest of the
-/// build.
+/// tools are run: one primary-key read per use.
 impl ToolEpochSnapshot for BuildContext<'_> {
     fn tool(&self, id: &str) -> Result<Option<RegisteredTool>, StoreError> {
-        if let Some(known) = self.tools.borrow().get(id) {
-            return Ok(known.clone());
-        }
-        let tool = match &self.stores {
+        match &self.stores {
             BuildStores::Worker { view, .. } => view.tool_at(id, self.tool_version),
             BuildStores::Inline(store) => store.borrow().tool_at(id, self.tool_version),
-        }?;
-        self.tools.borrow_mut().insert(id.to_owned(), tool.clone());
-        Ok(tool)
+        }
     }
 }
 
@@ -1028,8 +1022,6 @@ struct BuildContext<'s> {
     env: NodeEnv,
     scanner: RootedScanner,
     tool_version: distill_store::state::InputVersion,
-    /// The ToolEpoch rows read at the view so far (see its `ToolEpochSnapshot`).
-    tools: RefCell<BTreeMap<String, Option<RegisteredTool>>>,
     execution_root: std::path::PathBuf,
     visiting: BTreeSet<AssetUuid>,
     callback_chain: Vec<AssetUuid>,
@@ -1064,7 +1056,6 @@ impl<'s> BuildContext<'s> {
             env,
             scanner,
             tool_version,
-            tools: RefCell::default(),
             execution_root,
             visiting: BTreeSet::new(),
             callback_chain: Vec::new(),
