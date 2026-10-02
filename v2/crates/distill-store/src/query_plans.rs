@@ -661,3 +661,183 @@ fn reading_bundle_file_hashes_skips_their_bytes() {
     assert!(hash_read <= 512 * 1024, "{hash_read} bytes read");
     assert!(bytes_read >= 20 * hash_read, "{hash_read} against {bytes_read} bytes read");
 }
+
+/// Scan-structure and claim rows under every scanned bundle's directory,
+/// and a symlink beside every hundredth bundle, for the subtree reads.
+fn populate_scan_structure(store: &mut Store, count: u32) {
+    let mut directories = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut claims = Vec::new();
+    for index in 0..count {
+        let root = ["main", "alt"][(index % 2) as usize].to_owned();
+        let path = bundle_path(index);
+        directories.push(crate::files::ObservedDirectory {
+            root_name: root.clone(),
+            path: format!("{path}.d"),
+            canonical_path: format!("/c/{index}").into_bytes(),
+            physical_path: format!("/p/{index}").into_bytes(),
+        });
+        diagnostics.push(crate::files::ObservedDiagnostic {
+            root_name: root.clone(),
+            path: format!("{path}.x"),
+            detail: Vec::new(),
+        });
+        claims.push(crate::claims::SourceClaims {
+            root_name: root,
+            path: path.clone(),
+            claims: vec![crate::claims::SourceClaim::PrimaryPath {
+                path,
+                asset: asset_uuid(index, 1),
+            }],
+        });
+    }
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            txn.replace_scan_structure(None, &directories, &diagnostics)?;
+            txn.replace_source_claims(None, &claims)?;
+            let root = txn.intern_root("main")?;
+            for index in (0..count).step_by(100) {
+                txn.upsert_file(
+                    root,
+                    &format!("links/l{index:05}"),
+                    &FileObservation {
+                        state: FileState {
+                            mtime: 0,
+                            size: 0,
+                            kind: FileKind::Symlink,
+                            content_hash: None,
+                        },
+                        raw_path: Vec::new(),
+                        symlink_target: Some(format!("/t/d{:02}/x{index}", index % 50).into_bytes()),
+                    },
+                    version,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The statements `run` issues that read a subtree of one root (they join
+/// `roots` by name), each with its plan.
+fn subtree_plans(store: &mut Store, run: impl FnOnce(&mut Store)) -> Vec<(String, Vec<String>)> {
+    store.read.conn.trace(Some(trace));
+    run(store);
+    store.read.conn.trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    statements
+        .into_iter()
+        .filter(|sql| sql.contains("JOIN roots r USING (root_id)") || sql.contains("symlink_target >="))
+        .map(|sql| {
+            let plan = explain(&store.read.conn, &sql);
+            (sql, plan)
+        })
+        .collect()
+}
+
+/// A subtree read (the scan baseline of a watcher batch or an RPC write, the
+/// structure and claims it replaces, a pass's file overlay) is one range
+/// search of its table's `(root_id, path)` key; a whole-root read is one
+/// search of the root's rows. Symlinks targeting a path are one range of
+/// their target index.
+#[test]
+fn subtree_reads_search_one_key_range() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    populate_scan_structure(&mut store, 200);
+    let roots = "SEARCH r USING COVERING INDEX sqlite_autoindex_roots_1 (name=?)";
+    for (prefix, key) in [("d07", "root_id=? AND path>? AND path<?"), ("", "root_id=?")] {
+        let search = |table: &str, covering: bool| {
+            let index = if covering { "COVERING INDEX" } else { "INDEX" };
+            format!("SEARCH t USING {index} sqlite_autoindex_{table}_1 ({key})")
+        };
+        let read = |table: &str| vec![roots.to_owned(), search(table, false)];
+        let delete = |table: &str| {
+            vec![
+                format!("SEARCH {table} USING INTEGER PRIMARY KEY (rowid=?)"),
+                "LIST SUBQUERY 1".to_owned(),
+                roots.to_owned(),
+                search(table, true),
+            ]
+        };
+        let reads = subtree_plans(&mut store, |store| {
+            store.observed_files_under("main", prefix).unwrap();
+            store.observed_directories_under("main", prefix).unwrap();
+            store.scan_diagnostics_under("main", prefix).unwrap();
+            store.bundle_files_under("main", prefix).unwrap();
+        });
+        let plans = reads.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            plans,
+            ["files", "directories", "scan_diagnostics", "bundle_files"].map(read),
+            "{prefix:?}: {reads:#?}"
+        );
+        let under = [("main".to_owned(), prefix.to_owned())];
+        let writes = subtree_plans(&mut store, |store| {
+            store.replace_scan_diagnostics(Some(&under), &[]).unwrap();
+            store
+                .input_transaction(|txn| {
+                    txn.replace_scan_structure(Some(&under), &[], &[])?;
+                    txn.replace_source_claims(Some(&under), &[])
+                })
+                .unwrap();
+        });
+        let plans = writes.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            plans,
+            [
+                delete("scan_diagnostics"),
+                delete("directories"),
+                delete("scan_diagnostics"),
+                vec![roots.to_owned(), search("source_claims", true)],
+                delete("source_claims"),
+            ],
+            "{prefix:?}: {writes:#?}"
+        );
+    }
+    let links = subtree_plans(&mut store, |store| {
+        let rows = store.symlinks_targeting(b"/t/d07").unwrap();
+        assert_eq!(rows.len(), 0);
+        let rows = store.symlinks_targeting(b"/t/d00").unwrap();
+        assert_eq!(rows.len(), 2);
+    });
+    for (sql, plan) in links {
+        assert_eq!(
+            plan,
+            [
+                "SEARCH t USING INDEX files_by_symlink_target (symlink_target>? AND symlink_target<?)",
+                "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+            "{sql}"
+        );
+    }
+}
+
+/// Reading one subtree of a large root fetches pages for its rows, not the
+/// root's.
+#[test]
+fn a_subtree_read_of_a_large_root_touches_its_rows() {
+    let (_dir, mut store) = store_with(20_000);
+    populate_scan_structure(&mut store, 20_000);
+    let reader = store.reader().unwrap();
+    // "d08" holds every 50th bundle, all even, so all "main"'s: 400 of its
+    // 10,000, each with a directory and a diagnostic row below it.
+    let mut rows = 0;
+    let narrow = pages(&reader, || {
+        rows = reader.observed_files_under("main", "d08").unwrap().len();
+        rows += reader.observed_directories_under("main", "d08").unwrap().len();
+        rows += reader.scan_diagnostics_under("main", "d08").unwrap().len();
+        rows += reader.bundle_files_under("main", "d08").unwrap().len();
+    });
+    let whole = pages(&reader, || {
+        drop(reader.observed_files_under("main", "").unwrap());
+        drop(reader.observed_directories_under("main", "").unwrap());
+        drop(reader.scan_diagnostics_under("main", "").unwrap());
+        drop(reader.bundle_files_under("main", "").unwrap());
+    });
+    println!("subtree: {rows} rows in {narrow} pages (whole root: {whole} pages)");
+    assert_eq!(rows, 4 * 400);
+    assert!(narrow <= 16 + 2 * rows as u64, "{narrow} pages for {rows} rows");
+    assert!(whole >= 10 * narrow, "{narrow} pages against {whole}");
+}

@@ -290,10 +290,22 @@ pub(crate) fn intern_root(conn: &rusqlite::Connection, name: &str) -> Result<Roo
     Ok(RootId(conn.last_insert_rowid()))
 }
 
-/// Rows of `table` (aliased `t`, joined to `roots` as `r`) under one
-/// (root name, prefix) subtree bound as `?1`, `?2`.
-pub(crate) const UNDER: &str = "r.name = ?1 AND (?2 = '' OR t.path = ?2
-     OR (t.path >= ?2 || '/' AND t.path < ?2 || '0'))";
+/// The predicate selecting the rows of a table (aliased `t`, joined to
+/// `roots` as `r`) under one (root name, prefix) subtree bound as `?1`,
+/// `?2`: the whole root when the prefix is empty, else the prefix itself and
+/// every path below it. Each form is one search of the table's
+/// `(root_id, path)` key. A subtree is the range `[prefix, prefix || '0')`
+/// (`'0'` follows `'/'`) less the paths in it that only extend the prefix's
+/// last segment (`prefix.txt`), which sort before `prefix || '/'`.
+pub(crate) fn under_sql(prefix: &str) -> &'static str {
+    if prefix.is_empty() {
+        // `?2` is bound either way.
+        "r.name = ?1 AND ?2 = ''"
+    } else {
+        "r.name = ?1 AND t.path >= ?2 AND t.path < ?2 || '0'
+         AND (t.path = ?2 OR t.path >= ?2 || '/')"
+    }
+}
 
 fn clear_structure(
     conn: &rusqlite::Connection,
@@ -316,7 +328,8 @@ fn clear_structure(
                         &format!(
                             "DELETE FROM {table} WHERE rowid IN (
                                SELECT t.rowid FROM {table} t JOIN roots r USING (root_id)
-                               WHERE {UNDER})"
+                               WHERE {})",
+                            under_sql(prefix)
                         ),
                         rusqlite::params![root, prefix],
                     )?;
@@ -603,7 +616,7 @@ impl StoreReader {
         prefix: &str,
     ) -> Result<Vec<ObservedFile>, StoreError> {
         self.query_rows(
-            &format!("{OBSERVED_FILE} WHERE {UNDER} ORDER BY t.path"),
+            &format!("{OBSERVED_FILE} WHERE {} ORDER BY t.path", under_sql(prefix)),
             rusqlite::params![root_name, prefix],
             observed_file_row,
         )
@@ -634,25 +647,25 @@ impl StoreReader {
     /// Symlinked file rows whose canonical target starts with the bytes of
     /// `prefix`, in target order.
     pub fn symlinks_targeting(&self, prefix: &[u8]) -> Result<Vec<ObservedFile>, StoreError> {
-        let mut rows = self.query_rows(
-            &format!(
-                "{OBSERVED_FILE} WHERE t.symlink_target >= ?1 AND t.symlink_target IS NOT NULL
-                 ORDER BY t.symlink_target"
+        // Targets are platform path bytes, compared bytewise: those starting
+        // with `prefix` are the range up to its successor, the least byte
+        // string above every extension of it (what `under_sql`'s
+        // `prefix || '0'` is for `/`-separated text).
+        match bytes_successor(prefix) {
+            Some(end) => self.query_rows(
+                &format!(
+                    "{OBSERVED_FILE} WHERE t.symlink_target >= ?1 AND t.symlink_target < ?2
+                     ORDER BY t.symlink_target"
+                ),
+                rusqlite::params![prefix, end],
+                observed_file_row,
             ),
-            [prefix],
-            observed_file_row,
-        )?;
-        let end = rows
-            .iter()
-            .position(|row| {
-                !row.file
-                    .symlink_target
-                    .as_deref()
-                    .is_some_and(|target| target.starts_with(prefix))
-            })
-            .unwrap_or(rows.len());
-        rows.truncate(end);
-        Ok(rows)
+            None => self.query_rows(
+                &format!("{OBSERVED_FILE} WHERE t.symlink_target >= ?1 ORDER BY t.symlink_target"),
+                [prefix],
+                observed_file_row,
+            ),
+        }
     }
 
     /// Every traversed directory, in (root name, path) order.
@@ -675,7 +688,8 @@ impl StoreReader {
             &format!(
                 "SELECT r.name, t.path, t.canonical_path, t.physical_path
                  FROM directories t JOIN roots r USING (root_id)
-                 WHERE {UNDER} ORDER BY t.path"
+                 WHERE {} ORDER BY t.path",
+                under_sql(prefix)
             ),
             rusqlite::params![root_name, prefix],
             observed_directory_row,
@@ -725,7 +739,8 @@ impl StoreReader {
             &format!(
                 "SELECT r.name, t.path, t.detail
                  FROM scan_diagnostics t JOIN roots r USING (root_id)
-                 WHERE {UNDER} ORDER BY t.path"
+                 WHERE {} ORDER BY t.path",
+                under_sql(prefix)
             ),
             rusqlite::params![root_name, prefix],
             |row| {
@@ -764,7 +779,8 @@ impl StoreReader {
             &format!(
                 "SELECT r.name, t.path, t.bytes
                  FROM bundle_files t JOIN roots r USING (root_id)
-                 WHERE {UNDER} ORDER BY t.path"
+                 WHERE {} ORDER BY t.path",
+                under_sql(prefix)
             ),
             rusqlite::params![root_name, prefix],
             |row| {
@@ -878,6 +894,16 @@ impl<'a> GlobKeys<'a> {
             extension: segment_tail.rsplit_once('.').map(|(_, extension)| extension),
         }
     }
+}
+
+/// The least byte string greater than every string starting with `prefix`:
+/// `prefix` without its trailing `FF` bytes, its last byte incremented;
+/// `None` when it has no other byte, and nothing bounds its extensions.
+fn bytes_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|&byte| byte != 0xFF)?;
+    let mut end = prefix[..=last].to_vec();
+    end[last] += 1;
+    Some(end)
 }
 
 /// The SQL range over `column` that selects exactly the paths starting with

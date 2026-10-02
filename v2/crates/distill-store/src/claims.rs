@@ -209,7 +209,7 @@ impl InputTxn<'_> {
                     let mut select = conn.prepare_cached(&format!(
                         "SELECT t.kind, t.subject FROM source_claims t JOIN roots r USING (root_id)
                          WHERE {}",
-                        crate::files::UNDER
+                        crate::files::under_sql(prefix)
                     ))?;
                     let rows = select.query_map(rusqlite::params![root, prefix], |row| {
                         Ok((row.get(0)?, row.get(1)?))
@@ -222,7 +222,7 @@ impl InputTxn<'_> {
                             "DELETE FROM source_claims WHERE rowid IN (
                                SELECT t.rowid FROM source_claims t JOIN roots r USING (root_id)
                                WHERE {})",
-                            crate::files::UNDER
+                            crate::files::under_sql(prefix)
                         ),
                         rusqlite::params![root, prefix],
                     )?;
