@@ -169,6 +169,9 @@ pub struct NodeType {
     pub type_uuid: TypeUuid,
     pub logical: LogicalHash,
     pub layout: LayoutHash,
+    /// The schema authority's build-only policy: a runtime closure that
+    /// names a build-only type fails, so a policy change is a new node.
+    pub build_only: bool,
 }
 
 /// The static inputs of one asset node: everything its served outputs are a
@@ -201,7 +204,7 @@ pub struct NodeInputs {
 
 /// The `"DSNK"` node key.
 pub fn node_digest(inputs: &NodeInputs) -> [u8; 32] {
-    domain_digest(DSNK, 1, |e| encode_node(e, inputs))
+    domain_digest(DSNK, 2, |e| encode_node(e, inputs))
 }
 
 /// Canonical DSNK body retained in the node's result record.
@@ -246,6 +249,7 @@ fn encode_node(e: &mut CanonicalEncoder, inputs: &NodeInputs) {
         e.raw(&node_type.type_uuid.0);
         e.raw(&node_type.logical.0);
         e.raw(&node_type.layout.0);
+        e.bool(node_type.build_only);
     });
     e.u32(inputs.migration_planner_version);
     e.u32(inputs.artifact_format_version);

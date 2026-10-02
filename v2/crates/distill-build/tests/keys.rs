@@ -211,11 +211,13 @@ fn node_inputs() -> distill_build::keys::NodeInputs {
                 type_uuid: TypeUuid([8; 16]),
                 logical: LogicalHash([11; 32]),
                 layout: LayoutHash([12; 32]),
+                build_only: false,
             },
             NodeType {
                 type_uuid: TypeUuid([4; 16]),
                 logical: LogicalHash([5; 32]),
                 layout: LayoutHash([13; 32]),
+                build_only: false,
             },
         ],
         migration_planner_version: 1,
@@ -250,6 +252,14 @@ fn the_node_key_covers_static_inputs_only_and_ignores_declaration_order() {
     let mut relaid = inputs.clone();
     relaid.types[0].layout = LayoutHash([99; 32]);
     assert_ne!(node_digest(&relaid), key);
+
+    let mut build_only = inputs.clone();
+    build_only.types[1].build_only = true;
+    assert_ne!(
+        node_digest(&build_only),
+        key,
+        "a build-only policy change is a new node"
+    );
 
     assert!(!node_canonical_bytes(&inputs).is_empty());
 }

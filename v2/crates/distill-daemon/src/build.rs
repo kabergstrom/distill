@@ -651,6 +651,7 @@ fn node_key(
             type_uuid,
             logical: project.logical_hash,
             layout: project.layout_hash,
+            build_only: project.build_only,
         });
     }
     let inputs = NodeInputs {
@@ -5279,6 +5280,42 @@ mod tests {
             drifted_input: DriftedInput::Asset(ASSET),
         };
         (coordinator, request, calls)
+    }
+
+    /// The schema authority's build-only policy is a node input: marking the
+    /// terminal build-only changes no logical or layout hash, yet the cached
+    /// node does not serve, and the closure fails as build-only.
+    #[test]
+    fn a_build_only_policy_change_does_not_serve_a_cached_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let (coordinator, request, calls) = identity_fixture(&temp);
+        let first = build(&coordinator, &request).unwrap();
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let normal = authority();
+        let mut schema = normal.schema().clone();
+        schema.types[2].attrs.build_only = true;
+        let build_only = ProjectSchemaAuthority::from_schema(schema, [9; 32]).unwrap();
+        let (was, now) = (
+            normal.project_type(TERMINAL).unwrap(),
+            build_only.project_type(TERMINAL).unwrap(),
+        );
+        assert_eq!(
+            (was.logical_hash, was.layout_hash),
+            (now.logical_hash, now.layout_hash)
+        );
+        assert!(now.build_only && !was.build_only);
+        coordinator.install_schema_authority_for_test(Arc::new(build_only));
+        assert!(matches!(
+            build(&coordinator, &request),
+            Err(BuildError::Failed(message)) if message.contains("build-only type")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        coordinator.install_schema_authority_for_test(Arc::new(normal));
+        assert_eq!(build(&coordinator, &request).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// A requester's answer comes from the compiled state its own snapshot
