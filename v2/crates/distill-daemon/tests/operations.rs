@@ -47,11 +47,12 @@ fn target() -> TargetDefinition {
 }
 
 fn complete(
+    store: &mut distill_store::Store,
     publication: PreparedOperationPublication,
     base: InputVersion,
 ) -> DeferredOperationResult {
     match publication {
-        PreparedOperationPublication::Deferred(operation) => operation.complete(base).unwrap(),
+        PreparedOperationPublication::Deferred(operation) => operation.complete(store, base).unwrap(),
         PreparedOperationPublication::Immediate(_) => panic!("production operations are deferred"),
     }
 }
@@ -63,10 +64,11 @@ fn complete_and_publish(
     publication: PreparedOperationPublication,
     base: InputVersion,
 ) -> Option<String> {
+    let mut writer = coordinator.open_writer().unwrap();
     let mut terminal_error = None;
     coordinator
-        .coordinated_commit(base, || {
-            let completed = complete(publication, base);
+        .coordinated_commit(&mut writer, base, |store| {
+            let completed = complete(store, publication, base);
             terminal_error = completed.terminal_error;
             Ok(completed.commit)
         })
@@ -116,14 +118,15 @@ fn rename_with_fixups_is_deferred_and_rescanned_as_one_version() {
         64,
     )
     .unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     let base = InputVersion(1);
     let request = RenameWithFixupsRequest {
         bundle: BundleUuid([83; 16]),
         destination_root: "main".into(),
         destination_path: "renamed.bundle".into(),
     };
-    let prepared = coordinator.authoring_service().prepare_operation(base, &LongRunningOp::RenameWithFixups(request.encode()))
+    let prepared = coordinator.authoring_service().prepare_operation(&mut writer, base, &LongRunningOp::RenameWithFixups(request.encode()))
         .unwrap();
 
     assert!(assets.join("old.bundle").exists());
@@ -146,7 +149,7 @@ fn rename_with_fixups_is_deferred_and_rescanned_as_one_version() {
         AuthoredValue::Str("renamed.bundle".into())
     );
     assert_eq!(
-        coordinator.store().read().input_version(),
+        coordinator.open_reader().unwrap().input_version(),
         InputVersion(2)
     );
     assert_eq!(

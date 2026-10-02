@@ -264,6 +264,7 @@ struct RecordingAuthoringBackend {
 impl AuthoringBackend for RecordingAuthoringBackend {
     fn prepare_import(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -276,6 +277,7 @@ impl AuthoringBackend for RecordingAuthoringBackend {
 
     fn prepare_reimport(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -288,6 +290,7 @@ impl AuthoringBackend for RecordingAuthoringBackend {
 
     fn prepare_operation(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {

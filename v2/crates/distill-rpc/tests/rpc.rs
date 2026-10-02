@@ -458,6 +458,7 @@ struct RecordingAuthoringBackend {
 impl AuthoringBackend for RecordingAuthoringBackend {
     fn prepare_import(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -470,6 +471,7 @@ impl AuthoringBackend for RecordingAuthoringBackend {
 
     fn prepare_reimport(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -482,6 +484,7 @@ impl AuthoringBackend for RecordingAuthoringBackend {
 
     fn prepare_operation(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
@@ -522,6 +525,7 @@ struct DurableWriteBackend {
 impl AuthoringBackend for DurableWriteBackend {
     fn prepare_write(
         &self,
+        _store: &mut distill_store::Store,
         base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
@@ -532,6 +536,7 @@ impl AuthoringBackend for DurableWriteBackend {
 
     fn prepare_import(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         _request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -540,6 +545,7 @@ impl AuthoringBackend for DurableWriteBackend {
 
     fn prepare_reimport(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         _bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -548,6 +554,7 @@ impl AuthoringBackend for DurableWriteBackend {
 
     fn prepare_operation(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         _operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
@@ -584,7 +591,7 @@ fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
     let server = server_with(&[(1, false)]);
     let mut called = false;
     assert_eq!(
-        server.coordinated_commit(InputVersion(9), || {
+        server.coordinated_commit(InputVersion(9), |_| {
             called = true;
             Ok(Commit::default())
         }),
@@ -596,7 +603,7 @@ fn external_coordinator_cas_runs_publication_only_at_the_exact_server_base() {
     assert!(!called);
     assert_eq!(
         server
-            .coordinated_commit(InputVersion(0), || Ok(Commit::default()))
+            .coordinated_commit(InputVersion(0), |_| Ok(Commit::default()))
             .unwrap()
             .version,
         InputVersion(1)
@@ -1673,7 +1680,7 @@ fn published_runtime_failure_fences_shared_epoch_without_minting_a_version() {
     let mut persisted = false;
 
     server
-        .coordinated_runtime_pipeline_failure(failure.clone(), || {
+        .coordinated_runtime_pipeline_failure(failure.clone(), |_| {
             persisted = true;
             Ok(())
         })
@@ -2688,7 +2695,7 @@ fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_remove
         .coordinated_replace_target_set(
             InputVersion(0),
             vec![target_with(8, &[(1, false)])],
-            || Ok(Commit::default()),
+            |_| Ok(Commit::default()),
         )
         .unwrap();
     assert_eq!(stamp.version, InputVersion(1));
@@ -2699,7 +2706,7 @@ fn coordinated_target_set_replacement_advances_once_and_fences_changed_or_remove
         other => panic!("expected replacement connection, got {other:?}"),
     };
     let stamp = server
-        .coordinated_replace_target_set(InputVersion(1), Vec::new(), || Ok(Commit::default()))
+        .coordinated_replace_target_set(InputVersion(1), Vec::new(), |_| Ok(Commit::default()))
         .unwrap();
     assert_eq!(stamp.version, InputVersion(2));
     assert_reconnect(

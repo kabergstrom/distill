@@ -27,6 +27,7 @@ use crate::watcher::{
 };
 use distill_store::config::RestartOnlyChange;
 use distill_store::cas::SegmentSweeper;
+use distill_store::{Store, StoreWriter};
 use distill_store::state::{ConfigurationSourceFailureCode, ConfigurationSourcePath, DscpV1};
 
 /// How long the process loop lets watcher events gather before it
@@ -113,6 +114,9 @@ impl DaemonProcess {
         let (errors, last_background_error) = watch::channel(None);
         let (ready, started) = mpsc::sync_channel(1);
         let mut process_loop = ProcessLoop {
+            store: coordinator
+                .open_writer()
+                .map_err(CoordinatorInitError::Store)?,
             coordinator: Arc::clone(&coordinator),
             queue: WatcherQueue::new(),
             config_watch,
@@ -282,6 +286,9 @@ enum LoopMessage {
 /// publications; builds, imports and RPC writes publish from wherever they
 /// run.
 struct ProcessLoop {
+    /// The loop's own writer: every reconciliation, configuration change,
+    /// codegen publication and CAS pass writes through it.
+    store: StoreWriter,
     coordinator: Arc<DaemonCoordinator>,
     queue: WatcherQueue,
     config_watch: ConfigWatch,
@@ -309,8 +316,10 @@ impl ProcessLoop {
         // performs its mandatory startup scan. Otherwise an authored symlink
         // to that output can be misclassified as a root escape during the
         // narrow gap between candidate publication and service construction.
+        let store = &mut *self.store;
         self.config_watch.reconcile(
             &self.coordinator,
+            store,
             &self.watcher_control,
             ControlInvalidation::all(),
         )?;
@@ -318,11 +327,11 @@ impl ProcessLoop {
             .replace_roots(&self.coordinator.scanner())
             .map_err(CoordinatorError::InvalidManifest)?;
         let started = Instant::now();
-        self.coordinator.reconcile_startup(&mut self.queue)?;
+        self.coordinator.reconcile_startup(store, &mut self.queue)?;
         tracing::info!(elapsed = ?started.elapsed(), "startup scan reconciled");
-        reconcile_imports(&self.coordinator, true, false)?;
+        reconcile_imports(&self.coordinator, store, true, false)?;
         tracing::info!(elapsed = ?started.elapsed(), "startup imports reconciled");
-        if let Err(error) = self.codegen.run(&self.coordinator) {
+        if let Err(error) = self.codegen.run(&self.coordinator, store) {
             self.errors.send_replace(Some(error));
         }
         Ok(())
@@ -353,10 +362,11 @@ impl ProcessLoop {
             WatcherAction::None | WatcherAction::Failed(_) => None,
         };
         let coordinator = &self.coordinator;
+        let store = &mut *self.store;
         let result = match control_invalidation {
             Some(invalidation) => {
                 self.config_watch
-                    .reconcile(coordinator, &self.watcher_control, invalidation)
+                    .reconcile(coordinator, store, &self.watcher_control, invalidation)
                     .and_then(|capabilities_changed| {
                         // A configuration may have replaced the roots.
                         self.watcher_control
@@ -374,14 +384,14 @@ impl ProcessLoop {
         .and_then(|capabilities_changed| match action {
             WatcherAction::None => Ok(()),
             WatcherAction::Batch(batch) => coordinator
-                .reconcile_incremental(&batch)
-                .and_then(|_| reconcile_imports(coordinator, false, capabilities_changed)),
+                .reconcile_incremental(store, &batch)
+                .and_then(|_| reconcile_imports(coordinator, store, false, capabilities_changed)),
             WatcherAction::FullRescan => coordinator
-                .reconcile_startup(&mut self.queue)
-                .and_then(|_| reconcile_imports(coordinator, true, false)),
+                .reconcile_startup(store, &mut self.queue)
+                .and_then(|_| reconcile_imports(coordinator, store, true, false)),
             WatcherAction::Failed(_) => unreachable!("handled before reconciliation"),
         });
-        let failure_result = coordinator.sync_runtime_pipeline_failure().map(|_| ());
+        let failure_result = coordinator.sync_runtime_pipeline_failure(store).map(|_| ());
         let result = result.and(failure_result);
         match result {
             // Another publication (an RPC import, say) moved the input
@@ -404,7 +414,7 @@ impl ProcessLoop {
                 if reconciled {
                     tracing::info!(elapsed = ?started.elapsed(), "reconciled");
                 }
-                if let Err(error) = self.codegen.run(&self.coordinator) {
+                if let Err(error) = self.codegen.run(&self.coordinator, store) {
                     tracing::warn!(%error, "codegen failed");
                     self.errors.send_replace(Some(error));
                     self.schedule(Instant::now() + DEBOUNCE);
@@ -455,7 +465,10 @@ impl ProcessLoop {
         let now = Instant::now();
         if now >= self.next_cas_pass {
             self.next_cas_pass = now + CAS_PASS_INTERVAL;
-            if let Err(error) = self.coordinator.maintain_cas(&mut self.cas_sweeper) {
+            if let Err(error) = self
+                .coordinator
+                .maintain_cas(&mut self.store, &mut self.cas_sweeper)
+            {
                 tracing::warn!(%error, "CAS maintenance failed");
             }
             if self.due.is_none_or(|due| due > now) && now < self.next_idle_pass {
@@ -622,6 +635,7 @@ impl ConfigWatch {
     fn reconcile(
         &mut self,
         coordinator: &DaemonCoordinator,
+        store: &mut Store,
         watcher: &WatcherControl,
         invalidation: ControlInvalidation,
     ) -> Result<bool, CoordinatorError> {
@@ -642,6 +656,7 @@ impl ConfigWatch {
                 .expect("a non-configuration invalidation follows initial reconciliation");
             return self.reconcile_valid(
                 coordinator,
+                store,
                 watcher,
                 state,
                 self.staged.clone(),
@@ -660,7 +675,7 @@ impl ConfigWatch {
                     %message,
                     "configuration rejected; the active one (and its rebuild jobs) stays"
                 );
-                coordinator.publish_configuration_rejection(reason, message)?;
+                coordinator.publish_configuration_rejection(store, reason, message)?;
                 self.rejected = true;
                 self.source_rejected = true;
                 self.observed = Some(observation.state);
@@ -668,6 +683,7 @@ impl ConfigWatch {
             }
             Ok(candidate) => self.reconcile_valid(
                 coordinator,
+                store,
                 watcher,
                 observation.state,
                 candidate,
@@ -692,6 +708,7 @@ impl ConfigWatch {
     fn reconcile_valid(
         &mut self,
         coordinator: &DaemonCoordinator,
+        store: &mut Store,
         watcher: &WatcherControl,
         config_state: ConfigSourceState,
         candidate: DaemonConfig,
@@ -786,9 +803,9 @@ impl ConfigWatch {
                 )
                 .expect("schema candidate failure tuple is valid");
                 if self.rejected {
-                    coordinator.publish_pipeline_rejection_healing_configuration(failure)?;
+                    coordinator.publish_pipeline_rejection_healing_configuration(store, failure)?;
                 } else {
-                    coordinator.publish_pipeline_rejection(failure)?;
+                    coordinator.publish_pipeline_rejection(store, failure)?;
                 }
                 if self.rejected {
                     self.staged = candidate;
@@ -821,7 +838,7 @@ impl ConfigWatch {
                             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))?
                             .expect("execution staging returned at least one defect");
                         coordinator
-                            .publish_configuration_rejection(*selected.detail, selected.message)?;
+                            .publish_configuration_rejection(store, *selected.detail, selected.message)?;
                         self.staged = candidate;
                         self.observed = Some(config_state);
                         self.observed_schema = Some(schema.state.clone());
@@ -834,6 +851,7 @@ impl ConfigWatch {
                     }
                 };
                 let published = coordinator.publish_configuration_candidate(
+                    store,
                     crate::coordinator::ConfigurationCandidate {
                         roots: candidate.asset_roots(),
                         targets: staged.targets,
@@ -860,7 +878,7 @@ impl ConfigWatch {
                 }
             }
             Ok(_) if self.rejected => {
-                coordinator.heal_configuration_rejection()?;
+                coordinator.heal_configuration_rejection(store)?;
             }
             Ok(_) => {}
         }
@@ -874,9 +892,9 @@ impl ConfigWatch {
 
         let restart = restart_changes(&self.active, &candidate);
         if !restart.is_empty() {
-            coordinator.stage_restart_configuration(&restart)?;
+            coordinator.stage_restart_configuration(store, &restart)?;
         } else {
-            coordinator.clear_restart_configuration()?;
+            coordinator.clear_restart_configuration(store)?;
         }
 
         apply_live_values(&mut self.active, &candidate);
@@ -1061,26 +1079,27 @@ fn configuration_source_path(path: &Path) -> ConfigurationSourcePath {
 
 fn reconcile_imports(
     coordinator: &DaemonCoordinator,
+    store: &mut Store,
     revalidate_all: bool,
     capabilities_changed: bool,
 ) -> Result<(), CoordinatorError> {
-    let work = coordinator.pending_file_work()?;
+    let work = coordinator.pending_file_work(store)?;
     let directories = if revalidate_all {
-        coordinator.reconcile_directory_imports()
+        coordinator.reconcile_directory_imports(store)
     } else {
-        coordinator.reconcile_directory_imports_affected(&work, capabilities_changed)
+        coordinator.reconcile_directory_imports_affected(store, &work, capabilities_changed)
     };
     let reconcile = directories.and_then(|_| {
         if revalidate_all {
-            coordinator.reconcile_watched_imports()
+            coordinator.reconcile_watched_imports(store)
         } else {
-            coordinator.reconcile_watched_imports_affected(&work, capabilities_changed)
+            coordinator.reconcile_watched_imports_affected(store, &work, capabilities_changed)
         }
     });
     if reconcile.is_ok() {
-        coordinator.acknowledge_file_work(&work)?;
+        coordinator.acknowledge_file_work(store, &work)?;
     }
-    let failure = coordinator.sync_runtime_pipeline_failure().map(|_| ());
+    let failure = coordinator.sync_runtime_pipeline_failure(store).map(|_| ());
     reconcile.and(failure)
 }
 

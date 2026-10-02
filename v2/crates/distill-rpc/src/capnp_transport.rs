@@ -54,15 +54,6 @@ use crate::{
 
 pub use crate::distill_rpc_capnp as schema;
 
-/// Run `call` on a blocking worker: a publication may wait on SQLite's
-/// write lock, and the connection's `RpcSystem` keeps serving its other
-/// calls meanwhile.
-async fn run_blocking<T: Send + 'static>(call: crate::WriteCall<T>) -> Result<T, capnp::Error> {
-    tokio::task::spawn_blocking(move || call.run())
-        .await
-        .map_err(|error| capnp::Error::failed(format!("publication failed: {error}")))
-}
-
 const WIRE_INVALID_UUID: u16 = 1001;
 const WIRE_INVALID_HASH: u16 = 1002;
 const WIRE_INVALID_INSTANCE: u16 = 1003;
@@ -773,14 +764,13 @@ impl schema::hub::Server for HubService {
                     return Ok(());
                 }
             };
-            let result = match self.hub.write_call(
+            // A publication waits on SQLite's write lock on this
+            // connection's own thread; no other connection waits with it.
+            let result = self.hub.write(
                 InputVersion(params.get_base()),
                 ops,
                 params.get_force_lossy(),
-            ) {
-                Ok(call) => crate::write_call_outcome(run_blocking(call).await?),
-                Err(result) => result,
-            };
+            );
             write_uint64_result(
                 results.get().init_result(),
                 result.map_success(|version| version.0),
@@ -823,10 +813,7 @@ impl schema::hub::Server for HubService {
                         .map_err(|error| {
                             capnp::Error::failed(format!("import worker failed: {error}"))
                         })?;
-                    match self.hub.import_publish_call(finished) {
-                        Ok(call) => crate::import_call_outcome(run_blocking(call).await?),
-                        Err(result) => result,
-                    }
+                    self.hub.import_finish(finished)
                 }
                 Err(result) => result,
             };
@@ -865,10 +852,7 @@ impl schema::hub::Server for HubService {
                         .map_err(|error| {
                             capnp::Error::failed(format!("import worker failed: {error}"))
                         })?;
-                    match self.hub.import_publish_call(finished) {
-                        Ok(call) => crate::import_call_outcome(run_blocking(call).await?),
-                        Err(result) => result,
-                    }
+                    self.hub.import_finish(finished)
                 }
                 Err(result) => result,
             };
@@ -1588,18 +1572,8 @@ impl schema::progress_stream::Server for ProgressStreamService {
         mut results: schema::progress_stream::NextResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
-            let step = self.stream.borrow_mut().next_step();
-            let progress = match step {
-                None => None,
-                Some(crate::ProgressStep::Event(event)) => Some(event),
-                Some(crate::ProgressStep::Complete { event, call }) => {
-                    let outcome = match call {
-                        Ok(call) => run_blocking(call).await?,
-                        Err(error) => Err(error),
-                    };
-                    Some(self.stream.borrow_mut().finish_completion(event, outcome))
-                }
-            };
+            // A completion publishes here, on this connection's writer.
+            let progress = self.stream.borrow_mut().next();
             let mut output = results.get();
             match progress {
                 Some(progress) => {

@@ -653,8 +653,12 @@ pub struct PreparedImportCommit {
 pub trait DeferredOperation: Send + Sync {
     /// Execute the already-validated operation against `base`. The RPC server
     /// invokes this only when the client consumes the terminal Completed
-    /// event, inside the input that publishes it.
-    fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String>;
+    /// event, inside the input open on `store` that publishes it.
+    fn complete(
+        &self,
+        store: &mut distill_store::Store,
+        base: InputVersion,
+    ) -> Result<DeferredOperationResult, String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,8 +711,10 @@ impl PreparedOperationCommit {
 }
 
 /// The publishing step of an import run: publish what ran on a worker, or
-/// fail. It runs inside the input that publishes it.
-pub type ImportJob = Box<dyn FnOnce() -> Result<PreparedImportCommit, RpcFailure> + Send>;
+/// fail. It runs inside the input open on the writer it is given, which
+/// then publishes it.
+pub type ImportJob =
+    Box<dyn FnOnce(&mut distill_store::Store) -> Result<PreparedImportCommit, RpcFailure> + Send>;
 
 /// Daemon integration seam for workflows that require importer, filesystem,
 /// migration, or doctor services. Implementations prepare a side-effect-free
@@ -719,12 +725,14 @@ pub trait AuthoringBackend: Send + Sync + 'static {
     /// publication. `Ok(None)` retains the in-memory-only implementation used
     /// by embedders and tests that have no filesystem authority.
     ///
-    /// The RPC server invokes this inside the input that publishes it;
-    /// production implementations must compare their durable store version
-    /// with `base`, publish, rescan, and advance that store exactly once before
-    /// returning. They must not call back into the [`crate::Server`].
+    /// The RPC server invokes this inside the input open on `store` that
+    /// publishes it; production implementations must compare that store's
+    /// version with `base`, publish, rescan, and advance it exactly once
+    /// before returning, all through `store`. They must not call back into
+    /// the [`crate::Server`].
     fn prepare_write(
         &self,
+        _store: &mut distill_store::Store,
         _base: InputVersion,
         _operations: &[AuthoringOp],
         _force_lossy: bool,
@@ -734,25 +742,27 @@ pub trait AuthoringBackend: Send + Sync + 'static {
 
     fn prepare_import(
         &self,
+        store: &mut distill_store::Store,
         base: InputVersion,
         request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure>;
 
     fn prepare_reimport(
         &self,
+        store: &mut distill_store::Store,
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure>;
 
-    /// Run an import on a worker, off the RPC thread, and return the step
-    /// that publishes it while still at `base`. The default leaves all the work to that
-    /// step.
+    /// Run an import on a worker, off the RPC thread (on a reader or writer
+    /// of the backend's own), and return the step that publishes it while
+    /// still at `base`. The default leaves all the work to that step.
     fn run_import(
         self: Arc<Self>,
         base: InputVersion,
         request: ImportRequest,
     ) -> Result<ImportJob, RpcFailure> {
-        Ok(Box::new(move || self.prepare_import(base, &request)))
+        Ok(Box::new(move |store| self.prepare_import(store, base, &request)))
     }
 
     /// [`AuthoringBackend::run_import`] for a reimport.
@@ -761,11 +771,14 @@ pub trait AuthoringBackend: Send + Sync + 'static {
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<ImportJob, RpcFailure> {
-        Ok(Box::new(move || self.prepare_reimport(base, bundle)))
+        Ok(Box::new(move |store| self.prepare_reimport(store, base, bundle)))
     }
 
+    /// Check an operation against `store` and describe its progress; a
+    /// deferred publication runs later, in its own input.
     fn prepare_operation(
         &self,
+        store: &mut distill_store::Store,
         base: InputVersion,
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure>;
@@ -965,21 +978,9 @@ impl ChunkStream {
 }
 
 pub(crate) trait ProgressCompletion {
-    /// Check the completion here; the returned job publishes it.
-    fn complete_call(&self) -> Result<crate::WriteCall<Result<(), String>>, String>;
+    /// Check and publish the completion, on the connection's own writer.
+    fn complete(&self) -> Result<(), String>;
     fn cancel(&self) -> bool;
-}
-
-/// A step of a [`ProgressStream`].
-pub enum ProgressStep {
-    Event(AuthoringProgressEvent),
-    /// The operation completed; its publication is pending. Run `call`
-    /// (off the RPC thread) and hand its outcome to
-    /// [`ProgressStream::finish_completion`].
-    Complete {
-        event: AuthoringProgressEvent,
-        call: Result<crate::WriteCall<Result<(), String>>, String>,
-    },
 }
 
 pub struct ProgressStream {
@@ -1020,12 +1021,13 @@ impl ProgressStream {
 }
 
 impl ProgressStream {
-    /// The next event; a completion comes back as its pending publication.
-    pub fn next_step(&mut self) -> Option<ProgressStep> {
+    /// The next event. A completion publishes before it is answered: a
+    /// failed publication turns it into `Failed`.
+    fn next_event(&mut self) -> Option<AuthoringProgressEvent> {
         let event = self.events.pop_front()?;
         if event.state == AuthoringProgressState::Completed {
-            let call = self.completion.complete_call();
-            return Some(ProgressStep::Complete { event, call });
+            let outcome = self.completion.complete();
+            return Some(self.finish_completion(event, outcome));
         }
         if matches!(
             event.state,
@@ -1033,11 +1035,11 @@ impl ProgressStream {
         ) {
             self.completion.cancel();
         }
-        Some(ProgressStep::Event(self.settle(event)))
+        Some(self.settle(event))
     }
 
     /// The completion event, once its publication ran.
-    pub fn finish_completion(
+    fn finish_completion(
         &mut self,
         mut event: AuthoringProgressEvent,
         outcome: Result<(), String>,
@@ -1061,13 +1063,7 @@ impl Iterator for ProgressStream {
 
     /// Runs a completion's publication on this thread.
     fn next(&mut self) -> Option<Self::Item> {
-        match self.next_step()? {
-            ProgressStep::Event(event) => Some(event),
-            ProgressStep::Complete { event, call } => {
-                let outcome = call.and_then(|call| call.run());
-                Some(self.finish_completion(event, outcome))
-            }
-        }
+        self.next_event()
     }
 }
 

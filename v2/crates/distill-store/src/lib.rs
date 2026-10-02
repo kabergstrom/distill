@@ -20,11 +20,11 @@ pub mod files;
 pub mod imports;
 pub mod pipeline;
 pub mod served;
-pub mod shared;
+pub mod opener;
 pub mod state;
 
 pub use current::Current;
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
 pub use db::{InputTxn, Store, StoreReader, SCHEMA_VERSION};
 pub use error::StoreError;
-pub use shared::SharedStore;
+pub use opener::{StoreOpener, StoreWriter};

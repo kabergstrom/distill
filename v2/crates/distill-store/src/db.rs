@@ -461,6 +461,10 @@ pub struct Store {
     pub(crate) read: StoreReader,
     pub(crate) cas: crate::cas::store::CasInner,
     input: InputState,
+    /// The operational configuration this writer follows
+    /// ([`crate::StoreOpener::apply_operational_config`]), reloaded as each
+    /// transaction begins.
+    pub(crate) config_source: Option<Arc<crate::Current<StoreConfig>>>,
     /// Held for as long as any writer of this process is open: one process
     /// per state directory.
     pub(crate) _state_lock: Arc<std::fs::File>,
@@ -551,6 +555,7 @@ impl Store {
             },
             cas: crate::cas::store::CasInner::new(cas_dir),
             input: InputState::Closed,
+            config_source: None,
             _state_lock: state_lock,
             #[cfg(test)]
             before_commit: None,
@@ -570,12 +575,14 @@ impl Store {
     /// thread: its own connection and its own CAS segment. Recovery ran
     /// when this store opened; nothing runs here.
     pub fn open_writer(&self) -> Result<Store, StoreError> {
-        Self::open_sibling(
+        let mut writer = Self::open_sibling(
             Arc::new((*self.config).clone()),
             self.instance_id(),
             self.cas.dir.clone(),
             Arc::clone(&self._state_lock),
-        )
+        )?;
+        writer.config_source = self.config_source.clone();
+        Ok(writer)
     }
 
     pub(crate) fn open_sibling(
@@ -593,6 +600,7 @@ impl Store {
             },
             cas: crate::cas::store::CasInner::new(cas_dir),
             input: InputState::Closed,
+            config_source: None,
             _state_lock: state_lock,
             #[cfg(test)]
             before_commit: None,
@@ -693,6 +701,7 @@ impl Store {
         if !self.read.conn.is_autocommit() {
             return self.joined_input_transaction(f, false).map(|(out, _)| out);
         }
+        self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.joined_input_transaction(f, false)
@@ -767,6 +776,7 @@ impl Store {
 
     fn begin_input(&mut self) -> Result<(), StoreError> {
         assert_eq!(self.input, InputState::Armed, "an input begins once armed");
+        self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
         let base = match meta_get_u64(&self.read.conn, "input_version") {
             Ok(version) => InputVersion(version.unwrap_or(0)),
@@ -824,6 +834,7 @@ impl Store {
             }
             return out;
         }
+        self.refresh_config();
         self.read.conn.execute_batch("BEGIN IMMEDIATE")?;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let out = match out {
@@ -869,6 +880,17 @@ impl Store {
             })
         });
         out.map_err(|error| failed.take().unwrap_or_else(|| lift(error)))
+    }
+
+    /// Follow the opener's current operational configuration. Called as a
+    /// transaction begins, so one transaction sees one configuration.
+    fn refresh_config(&mut self) {
+        if let Some(source) = &self.config_source {
+            let config = source.load();
+            if !Arc::ptr_eq(&self.read.config, &config) {
+                self.read.config = config;
+            }
+        }
     }
 
     /// Whether this writer has a transaction open or an input armed: its

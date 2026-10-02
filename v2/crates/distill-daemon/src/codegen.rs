@@ -9,7 +9,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 use distill_build::codegen::{
     CodegenAttempt, CodegenCoordinator, CodegenFailure, CodegenPublication, CodegenPublisher,
@@ -18,9 +17,8 @@ use distill_build::codegen::{
 use distill_build::query::{asset_query_result_hash, AssetQuery};
 use distill_build::trace::{Observed, TraceOp};
 use distill_core::id::{AssetUuid, BundleFileHash, ContentHash};
-use distill_store::shared::WriteGuard;
 use distill_store::state::InputVersion;
-use distill_store::{SharedStore, StoreReader};
+use distill_store::{Store, StoreReader};
 
 use crate::callbacks::{
     CallbackInvokeError, CodegenAsset, CodegenContextError, PipelineCodegenContext,
@@ -77,7 +75,9 @@ impl CodegenService {
     /// Run at most once for the current input version. A stale attempt is not
     /// remembered, so the coordinator loop can retry after publishing the
     /// filesystem event that made it stale.
-    pub fn run(&mut self, daemon: &DaemonCoordinator) -> Result<(), String> {
+    /// Run the pipeline's codegens at `store`'s current version and publish
+    /// what they generate, through `store`.
+    pub fn run(&mut self, daemon: &DaemonCoordinator, store: &mut Store) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
         }
@@ -89,8 +89,7 @@ impl CodegenService {
 
         let snapshot = daemon.pipeline_snapshot();
         let epoch = snapshot.epoch().map_err(|failure| failure.to_string())?;
-        let store_handle = daemon.store();
-        let basis = store_handle.read().input_version();
+        let basis = store.input_version();
         if self.last_attempted == Some(basis) {
             return Ok(());
         }
@@ -99,9 +98,8 @@ impl CodegenService {
             return Ok(());
         }
 
-        let store = daemon.store();
         let scanner = daemon.scanner();
-        let mut context = AuthoredCodegenContext::new(Arc::clone(&store), scanner.clone(), basis);
+        let mut context = AuthoredCodegenContext::new(store, scanner.clone(), basis);
         let result = epoch.invoke_codegens(&mut context);
         let trace = context.trace;
         let attempt = match result {
@@ -122,7 +120,7 @@ impl CodegenService {
                 if retryable_codegen_callback_failure(&error) {
                     return Err(error.to_string());
                 }
-                let _ = daemon.sync_runtime_pipeline_failure();
+                let _ = daemon.sync_runtime_pipeline_failure(store);
                 self.last_attempted = Some(basis);
                 return Err(error.to_string());
             }
@@ -152,16 +150,16 @@ fn retryable_codegen_callback_failure(error: &CallbackInvokeError<CodegenFailure
     matches!(error, CallbackInvokeError::HostRejected(_))
 }
 
-struct AuthoredCodegenContext {
-    store: Arc<SharedStore>,
+struct AuthoredCodegenContext<'s> {
+    store: &'s StoreReader,
     scanner: RootedScanner,
     basis: InputVersion,
     trace: Vec<TraceOp>,
     stopped: bool,
 }
 
-impl AuthoredCodegenContext {
-    fn new(store: Arc<SharedStore>, scanner: RootedScanner, basis: InputVersion) -> Self {
+impl<'s> AuthoredCodegenContext<'s> {
+    fn new(store: &'s StoreReader, scanner: RootedScanner, basis: InputVersion) -> Self {
         Self {
             store,
             scanner,
@@ -188,7 +186,7 @@ impl AuthoredCodegenContext {
     }
 }
 
-impl PipelineCodegenContext for AuthoredCodegenContext {
+impl PipelineCodegenContext for AuthoredCodegenContext<'_> {
     fn query(&mut self, query: &AssetQuery) -> Result<Vec<AssetUuid>, CodegenContextError> {
         if self.stopped {
             return Err(CodegenContextError::AttemptStopped);
@@ -203,11 +201,10 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
         if query.terminal_type.is_some() {
             return self.stop("target-dependent terminal_type is unavailable to Rust codegen");
         }
-        let store_handle = Arc::clone(&self.store);
         let result = {
-            let store = store_handle.read();
-            self.check_basis(&store)?;
-            query_results(&store, &query).map_err(CodegenContextError::Failed)?
+            let store = self.store;
+            self.check_basis(store)?;
+            query_results(store, &query).map_err(CodegenContextError::Failed)?
         };
         self.trace.push(TraceOp::Query {
             query: Box::new(query),
@@ -220,11 +217,10 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
         if self.stopped {
             return Err(CodegenContextError::AttemptStopped);
         }
-        let store_handle = Arc::clone(&self.store);
         let loaded = {
-            let store = store_handle.read();
-            self.check_basis(&store)?;
-            load_authored_asset(&store, &self.scanner, asset)
+            let store = self.store;
+            self.check_basis(store)?;
+            load_authored_asset(store, &self.scanner, asset)
         };
         let (observed, value) = match loaded {
             Ok(Some((hash, value))) => (Observed::Ok(Some(hash)), Some(value)),
@@ -237,24 +233,24 @@ impl PipelineCodegenContext for AuthoredCodegenContext {
 }
 
 struct CodegenWorld<'a> {
-    store: Arc<SharedStore>,
+    store: &'a mut Store,
     scanner: RootedScanner,
     output: &'a OutputDirectory,
 }
 
 impl CodegenSnapshot<InputVersion> for CodegenWorld<'_> {
     fn current_basis(&self) -> InputVersion {
-        self.store.read().input_version()
+        self.store.input_version()
     }
 
     fn observe(&self, op: &TraceOp) -> bool {
-        let store = self.store.read();
+        let store: &StoreReader = self.store;
         match op {
-            TraceOp::Query { query, observed } => query_results(&store, query)
+            TraceOp::Query { query, observed } => query_results(store, query)
                 .map(|results| Observed::Ok(asset_query_result_hash(&results)) == *observed)
                 .unwrap_or(false),
             TraceOp::AuthoringRead { asset, observed } => {
-                observe_authored_asset(&store, &self.scanner, *asset)
+                observe_authored_asset(store, &self.scanner, *asset)
                     .map(|actual| Observed::Ok(actual) == *observed)
                     .unwrap_or(false)
             }
@@ -284,11 +280,11 @@ impl CodegenWorld<'_> {
         basis: InputVersion,
         files: &[GeneratedFile],
     ) -> Result<(), String> {
-        self.output.verify()?;
-        let mut store = write_store(&self.store)?;
+        let output = self.output;
+        output.verify()?;
         // The basis check, the file writes and the rows share one write
         // transaction.
-        store.write_transaction_with(|error| error.to_string(), |store| {
+        self.store.write_transaction_with(|error| error.to_string(), |store| {
             if store.input_version() != basis {
                 return Err("codegen input version changed before publication".into());
             }
@@ -298,9 +294,9 @@ impl CodegenWorld<'_> {
                 .iter()
                 .map(|(path, bytes)| (path.clone(), content_hash(bytes)))
                 .collect::<BTreeMap<_, _>>();
-            let current = self.verify_preimages(&previous, &proposed)?;
+            let current = Self::verify_preimages(output, &previous, &proposed)?;
 
-            for change in publication_changes(&previous, &desired, &proposed, &self.output.path) {
+            for change in publication_changes(&previous, &desired, &proposed, &output.path) {
                 let relative = change
                     .target
                     .file_name()
@@ -310,7 +306,7 @@ impl CodegenWorld<'_> {
                 if on_disk == proposed.get(relative).copied() {
                     continue;
                 }
-                self.output.verify()?;
+                output.verify()?;
                 match change.bytes.as_deref() {
                     Some(bytes) => atomic_write_expecting(&change.target, bytes, on_disk.into()),
                     None => remove_expecting(&change.target, on_disk.map_or(Expected::Absent, Expected::Hash)),
@@ -330,7 +326,7 @@ impl CodegenWorld<'_> {
     /// or the proposed bytes (a publication cut short before its rows were
     /// committed), and return what each one holds now.
     fn verify_preimages(
-        &self,
+        output: &OutputDirectory,
         previous: &BTreeMap<String, ContentHash>,
         proposed: &BTreeMap<String, ContentHash>,
     ) -> Result<BTreeMap<String, Option<ContentHash>>, String> {
@@ -339,8 +335,8 @@ impl CodegenWorld<'_> {
             if current.contains_key(relative) {
                 continue;
             }
-            let target = self.output.path.join(relative);
-            let actual = self.output.read_owned(&target)?.map(|bytes| content_hash(&bytes));
+            let target = output.path.join(relative);
+            let actual = output.read_owned(&target)?.map(|bytes| content_hash(&bytes));
             let recorded = previous.get(relative).copied();
             if actual != recorded && actual != proposed.get(relative).copied() {
                 return Err(match recorded {
@@ -350,7 +346,7 @@ impl CodegenWorld<'_> {
             }
             current.insert(relative.clone(), actual);
         }
-        for entry in self.output.entry_names()?
+        for entry in output.entry_names()?
  {
             let Some(name) = entry.to_str().map(str::to_owned) else {
                 continue;
@@ -359,7 +355,7 @@ impl CodegenWorld<'_> {
             if is_generated_name && !previous.contains_key(&name) && !proposed.contains_key(&name) {
                 return Err(format!(
                     "unowned path {} occupies the generated namespace",
-                    self.output.path.join(entry).display()
+                    output.path.join(entry).display()
                 ));
             }
         }
@@ -746,9 +742,6 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
     }
 }
 
-fn write_store(store: &Arc<SharedStore>) -> Result<WriteGuard<'_>, String> {
-    Ok(store.write())
-}
 
 #[cfg(test)]
 mod tests {
@@ -762,16 +755,14 @@ mod tests {
 
     fn publication_world(
         temp: &tempfile::TempDir,
-    ) -> (Arc<SharedStore>, RootedScanner, OutputDirectory) {
+    ) -> (Store, RootedScanner, OutputDirectory) {
         let assets = temp.path().join("assets");
         let output = temp.path().join("generated");
         fs::create_dir(&assets).unwrap();
         let scanner = RootedScanner::new([crate::scanner::AssetRoot::new("main", &assets)])
         .unwrap();
         let output = OutputDirectory::open(&output).unwrap();
-        let store = Arc::new(SharedStore::new(
-            distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
-        ));
+        let store = distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
         (store, scanner, output)
     }
 
@@ -792,14 +783,14 @@ mod tests {
     #[test]
     fn complete_namespace_publishes_diffs_and_skips_unchanged_bytes() {
         let temp = tempfile::tempdir().unwrap();
-        let (store, scanner, output) = publication_world(&temp);
-        let basis = store.write().input_version();
+        let (mut store, scanner, output) = publication_world(&temp);
+        let basis = store.input_version();
         let first = generated(1, b"pub const VALUE: u8 = 1;\n");
         let second = generated(2, b"pub const VALUE: u8 = 2;\n");
         let first_path = output.path.join(first.relative_path());
         let second_path = output.path.join(second.relative_path());
         let mut world = CodegenWorld {
-            store: Arc::clone(&store),
+            store: &mut store,
             scanner,
             output: &output,
         };
@@ -807,7 +798,7 @@ mod tests {
         world
             .publish_files(basis, &[first.clone(), second.clone()])
             .unwrap();
-        let first_memo = store.write().memo_seq();
+        let first_memo = world.store.memo_seq();
         assert_eq!(fs::read(&first_path).unwrap(), first.bytes());
         assert_eq!(fs::read(&second_path).unwrap(), second.bytes());
         assert_eq!(
@@ -822,28 +813,28 @@ mod tests {
         world
             .publish_files(basis, &[first.clone(), second])
             .unwrap();
-        assert_eq!(store.write().memo_seq(), first_memo);
+        assert_eq!(world.store.memo_seq(), first_memo);
 
         world.publish_files(basis, &[first]).unwrap();
         assert!(first_path.exists());
         assert!(!second_path.exists());
-        assert_eq!(store.write().codegen_outputs().unwrap().len(), 2);
+        assert_eq!(world.store.codegen_outputs().unwrap().len(), 2);
     }
 
     #[test]
     fn hand_edits_and_unknown_generated_names_are_never_overwritten() {
         let temp = tempfile::tempdir().unwrap();
-        let (store, scanner, output) = publication_world(&temp);
-        let basis = store.write().input_version();
+        let (mut store, scanner, output) = publication_world(&temp);
+        let basis = store.input_version();
         let file = generated(3, b"original\n");
         let target = output.path.join(file.relative_path());
         let mut world = CodegenWorld {
-            store: Arc::clone(&store),
+            store: &mut store,
             scanner,
             output: &output,
         };
         world.publish_files(basis, &[file]).unwrap();
-        let expected = store.write().codegen_outputs().unwrap();
+        let expected = world.store.codegen_outputs().unwrap();
 
         fs::write(&target, b"human edit\n").unwrap();
         assert!(world
@@ -851,7 +842,7 @@ mod tests {
             .unwrap_err()
             .contains("edited outside distill"));
         assert_eq!(fs::read(&target).unwrap(), b"human edit\n");
-        assert_eq!(store.write().codegen_outputs().unwrap(), expected);
+        assert_eq!(world.store.codegen_outputs().unwrap(), expected);
 
         fs::write(&target, b"original\n").unwrap();
         fs::write(
@@ -897,11 +888,8 @@ mod tests {
         })
         .unwrap();
         fs::write(assets.join("shader.bundle"), &bytes).unwrap();
-        let store = Arc::new(SharedStore::new(
-            distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap(),
-        ));
+        let mut store = distill_store::Store::open(StoreConfig::new(temp.path().join("state"))).unwrap();
         let basis = {
-            let mut store = store.write();
             let (root, _) = store
                 .input_transaction(|transaction| {
                     let root = transaction.intern_root("main")?;
@@ -929,7 +917,7 @@ mod tests {
             assert_eq!(root.0, 1);
             store.input_version()
         };
-        let mut context = AuthoredCodegenContext::new(Arc::clone(&store), scanner.clone(), basis);
+        let mut context = AuthoredCodegenContext::new(&store, scanner.clone(), basis);
         let results = context
             .query(&AssetQuery {
                 authored_type: Some(type_uuid),
@@ -950,14 +938,16 @@ mod tests {
             }
         ));
 
+        let trace = context.trace;
+
         fs::write(assets.join("shader.bundle"), b"concurrent edit").unwrap();
         let output = OutputDirectory::open(&temp.path().join("generated")).unwrap();
         let world = CodegenWorld {
-            store,
+            store: &mut store,
             scanner,
             output: &output,
         };
-        assert!(!world.observe(&context.trace[1]));
+        assert!(!world.observe(&trace[1]));
     }
 
     #[cfg(unix)]
@@ -981,13 +971,13 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
-        let (store, scanner, output) = publication_world(&temp);
-        let basis = store.write().input_version();
+        let (mut store, scanner, output) = publication_world(&temp);
+        let basis = store.input_version();
         let initial = generated(4, b"initial\n");
         let replacement = generated(4, b"replacement\n");
         let relative = initial.relative_path().to_owned();
         let mut world = CodegenWorld {
-            store,
+            store: &mut store,
             scanner,
             output: &output,
         };
@@ -1010,23 +1000,23 @@ mod tests {
     #[test]
     fn files_written_before_a_crash_are_adopted_by_the_next_publication() {
         let temp = tempfile::tempdir().unwrap();
-        let (store, scanner, output) = publication_world(&temp);
-        let basis = store.write().input_version();
+        let (mut store, scanner, output) = publication_world(&temp);
+        let basis = store.input_version();
         let first = generated(5, b"pub const VALUE: u8 = 5;\n");
         let files = [first.clone()];
         // The files reached the disk, the rows were never committed.
         for (relative, bytes) in desired_namespace(&files).unwrap() {
             crate::atomic::atomic_write(&output.path.join(relative), &bytes).unwrap();
         }
-        assert!(store.write().codegen_outputs().unwrap().is_empty());
+        assert!(store.codegen_outputs().unwrap().is_empty());
 
         let mut world = CodegenWorld {
-            store: Arc::clone(&store),
+            store: &mut store,
             scanner,
             output: &output,
         };
         world.publish_files(basis, &files).unwrap();
-        let outputs = store.write().codegen_outputs().unwrap();
+        let outputs = world.store.codegen_outputs().unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(
             outputs[first.relative_path()],

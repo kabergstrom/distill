@@ -139,8 +139,8 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
     let process = DaemonProcess::start(config.clone()).unwrap();
     let pipeline_state = process
         .coordinator()
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .pipeline_state()
         .unwrap();
     assert!(

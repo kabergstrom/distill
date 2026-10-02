@@ -1,5 +1,6 @@
 //! Snapshot-pinned lazy build execution and durable build-import caching.
 
+use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use std::sync::{Arc, Weak};
@@ -53,8 +54,7 @@ use distill_store::cas::record::{
 };
 use distill_store::cas::{AuxSpec, BuildCommit, CommitOutcome, OutputSpec, PayloadKind};
 use distill_store::pipeline::RegisteredTool;
-use distill_store::shared::ReadGuard;
-use distill_store::{SharedStore, Store, StoreError, StoreReader};
+use distill_store::{Store, StoreError, StoreReader};
 use distill_wire::artifact::{parse_artifact, ArtifactError, ARTIFACT_FORMAT_VERSION};
 use distill_wire::encode::EncodeError;
 
@@ -164,9 +164,9 @@ impl BuildBackend for CoordinatorBuildBackend {
         };
         let scheduled_request = request.clone();
         let job_coordinator = Arc::clone(&coordinator);
-        let (result, failure) = coordinator.run_scheduled(class, move || {
-            let result = build_with_runtime(&job_coordinator, &scheduled_request);
-            let failure = job_coordinator.sync_runtime_pipeline_failure();
+        let (result, failure) = coordinator.run_scheduled(class, move |store| {
+            let result = build_with_runtime(&job_coordinator, store, &scheduled_request);
+            let failure = job_coordinator.sync_runtime_pipeline_failure(store);
             (result, failure)
         });
         match failure {
@@ -297,8 +297,11 @@ struct NodePublication {
     wire_trees: BTreeMap<LayoutHash, BuildWireTree>,
 }
 
-struct BuildContext {
-    store: Arc<SharedStore>,
+/// One build, on the writer of whoever runs it: a scheduler job's own, or
+/// the open input that refines the tag index, whose uncommitted rows the
+/// build must see.
+struct BuildContext<'s> {
+    store: RefCell<&'s mut Store>,
     store_instance: distill_store::state::StoreInstanceId,
     drifted_input: DriftedInput,
     scanner: RootedScanner,
@@ -358,10 +361,10 @@ impl ToolEpochSnapshot for PinnedToolEpoch {
     }
 }
 
-fn lock_build_store(context: &BuildContext) -> Result<ReadGuard<'_>, BuildError> {
-    let store = context
-        .store
-        .read();
+/// Read the build's store, still at the build's basis. A write is never
+/// made while a read is borrowed.
+fn lock_build_store<'c>(context: &'c BuildContext<'_>) -> Result<Ref<'c, Store>, BuildError> {
+    let store = Ref::map(context.store.borrow(), |store| &**store);
     if store.instance_id() != context.store_instance || store.input_version() != context.basis {
         return Err(BuildError::Drifted(context.drifted_input.clone()));
     }
@@ -377,7 +380,7 @@ fn write_build_store<R>(
     let (instance, basis) = (context.store_instance, context.basis);
     context
         .store
-        .write()
+        .borrow_mut()
         .write_transaction_with(BuildError::infrastructure, |store| {
             if store.instance_id() != instance || store.input_version() != basis {
                 return Err(BuildError::Drifted(context.drifted_input.clone()));
@@ -391,8 +394,8 @@ fn ensure_build_basis(context: &BuildContext) -> Result<(), BuildError> {
     Ok(())
 }
 
-struct BuildProcessContext<'a> {
-    context: &'a mut BuildContext,
+struct BuildProcessContext<'a, 's> {
+    context: &'a mut BuildContext<'s>,
     origin_bundle: BundleUuid,
     outputs: ProcessOutputs,
     trace: Vec<TraceOp>,
@@ -402,9 +405,9 @@ struct BuildProcessContext<'a> {
     fatal: Option<BuildError>,
 }
 
-impl<'a> BuildProcessContext<'a> {
+impl<'a, 's> BuildProcessContext<'a, 's> {
     fn new(
-        context: &'a mut BuildContext,
+        context: &'a mut BuildContext<'s>,
         origin_bundle: BundleUuid,
         parent: AssetUuid,
         declarations: distill_build::outputs::OutputDecls,
@@ -461,7 +464,7 @@ impl<'a> BuildProcessContext<'a> {
     }
 }
 
-impl PipelineProcessContext for BuildProcessContext<'_> {
+impl PipelineProcessContext for BuildProcessContext<'_, '_> {
     fn read(
         &mut self,
         asset: AssetUuid,
@@ -691,13 +694,15 @@ fn build_process_artifact(
 
 fn build_with_runtime(
     coordinator: &DaemonCoordinator,
+    store: &mut Store,
     request: &BuildRequest,
 ) -> Result<BuildPublication, BuildError> {
-    build_with_runtime_mode(coordinator, request, false)
+    build_with_runtime_mode(coordinator, store, request, false)
 }
 
 fn build_with_runtime_mode(
     coordinator: &DaemonCoordinator,
+    store: &mut Store,
     request: &BuildRequest,
     verify_fresh: bool,
 ) -> Result<BuildPublication, BuildError> {
@@ -757,24 +762,22 @@ fn build_with_runtime_mode(
     {
         return Err(BuildError::Drifted(request.drifted_input.clone()));
     }
-    let store_handle = coordinator.store();
     let scanner = coordinator.scanner();
     let (root, tools, execution_root) = {
-        let store = store_handle.read();
         if store.instance_id() != request.basis.instance
             || store.input_version() != request.basis.version
         {
             return Err(BuildError::Drifted(request.drifted_input.clone()));
         }
-        let root = load_asset(&store, &scanner, request.entry.uuid)?;
-        let tools = PinnedToolEpoch::capture(&store, request.basis.version)?;
+        let root = load_asset(store, &scanner, request.entry.uuid)?;
+        let tools = PinnedToolEpoch::capture(store, request.basis.version)?;
         let execution_root = store.state_path().join("tool-runs");
         (root, tools, execution_root)
     };
     verify_request_entry(request, &root, &authority)?;
 
     let mut context = BuildContext {
-        store: store_handle,
+        store: RefCell::new(store),
         store_instance: request.basis.instance,
         drifted_input: request.drifted_input.clone(),
         scanner,
@@ -815,26 +818,27 @@ fn build(
 ) -> Result<BuildPublication, BuildError> {
     let request = request.clone();
     let job_coordinator = Arc::clone(coordinator);
-    coordinator.run_scheduled(WorkClass::Interactive, move || {
-        build_with_runtime(&job_coordinator, &request)
+    coordinator.run_scheduled(WorkClass::Interactive, move |store| {
+        build_with_runtime(&job_coordinator, store, &request)
     })
 }
 
+/// Rebuild each request three times, on `store`: doctor verification runs
+/// inside the input it completes in, so its builds see that input and must
+/// not wait on its write lock from another writer.
 pub(crate) fn doctor_verify_builds(
     coordinator: &Arc<DaemonCoordinator>,
+    store: &mut Store,
     requests: &[BuildRequest],
 ) -> Result<Vec<String>, String> {
     let mut defects = Vec::new();
     for request in requests {
-        let run = |request: BuildRequest, verify_fresh| {
-            let job_coordinator = Arc::clone(coordinator);
-            coordinator.run_scheduled(WorkClass::Batch, move || {
-                build_with_runtime_mode(&job_coordinator, &request, verify_fresh)
-            })
+        let mut run = |request: &BuildRequest, verify_fresh| {
+            build_with_runtime_mode(coordinator, store, request, verify_fresh)
         };
-        let published = run(request.clone(), false);
-        let first = run(request.clone(), true);
-        let second = run(request.clone(), true);
+        let published = run(request, false);
+        let first = run(request, true);
+        let second = run(request, true);
         match (published, first, second) {
             (Ok(published), Ok(first), Ok(second))
                 if published == first && first == second => {}
@@ -877,7 +881,7 @@ pub(crate) fn doctor_verify_builds(
 /// Finish §10 tag indexing against a namespace that has advanced durably but
 /// is not yet served: the open input applies its RPC delta afterwards.
 pub(crate) fn refine_published_tag_index(
-    store_handle: Arc<SharedStore>,
+    store: &mut Store,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -886,7 +890,7 @@ pub(crate) fn refine_published_tag_index(
     fallback_assets: &BTreeMap<AssetUuid, BundleUuid>,
 ) -> PublishedTagIndex {
     try_refine_published_tag_index(
-        store_handle,
+        store,
         scanner,
         authority,
         pipeline,
@@ -901,7 +905,7 @@ pub(crate) fn refine_published_tag_index(
 /// publication. Deleted identities become bounded removals; unrelated tag
 /// rows and cached traces are not enumerated.
 pub(crate) fn refine_published_tag_index_incremental(
-    store_handle: Arc<SharedStore>,
+    store: &mut Store,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -915,7 +919,7 @@ pub(crate) fn refine_published_tag_index_incremental(
         .collect::<BTreeMap<_, _>>();
     let assets = current.keys().copied().collect::<Vec<_>>();
     let mut indexed = try_refine_published_tag_index(
-        store_handle,
+        store,
         scanner,
         authority,
         pipeline,
@@ -932,7 +936,7 @@ pub(crate) fn refine_published_tag_index_incremental(
 }
 
 fn try_refine_published_tag_index(
-    store_handle: Arc<SharedStore>,
+    store: &mut Store,
     scanner: RootedScanner,
     authority: Arc<ProjectSchemaAuthority>,
     pipeline: PipelineSnapshot,
@@ -942,7 +946,6 @@ fn try_refine_published_tag_index(
 ) -> Result<PublishedTagIndex, String> {
     let tag_epoch = authority.source_hash();
     let (store_instance, basis, assets, tools, execution_root) = {
-        let store = store_handle.read();
         (
             store.instance_id(),
             store.input_version(),
@@ -952,7 +955,7 @@ fn try_refine_published_tag_index(
                     .all_asset_ids()
                     .map_err(|error| format!("enumerate tag-index assets: {error}"))?,
             },
-            PinnedToolEpoch::capture(&store, store.input_version())
+            PinnedToolEpoch::capture(store, store.input_version())
                 .map_err(|error| format!("pin tag-index tools: {error:?}"))?,
             store.state_path().join("tag-index-runs"),
         )
@@ -991,7 +994,7 @@ fn try_refine_published_tag_index(
         let dylib_hash = epoch.dylib_hash();
         let target_definition = distill_build::keys::target_definition_hash(&target);
         let mut context = BuildContext {
-            store: Arc::clone(&store_handle),
+            store: RefCell::new(&mut *store),
             store_instance,
             drifted_input: DriftedInput::Dylib,
             scanner: scanner.clone(),
@@ -1036,10 +1039,9 @@ fn try_refine_published_tag_index(
             || "no build target is published".to_owned(),
             |error| error.to_string(),
         );
-        let store = store_handle.read();
         for asset in assets {
             let direct = (|| {
-                let loaded = load_asset(&store, &scanner, asset)
+                let loaded = load_asset(store, &scanner, asset)
                     .map_err(|error| (BundleUuid([0; 16]), format!("{error:?}"), false))?;
                 let bundle = loaded.meta.bundle;
                 let project = authority
@@ -1097,8 +1099,7 @@ fn try_refine_published_tag_index(
             }
         }
     }
-    store_handle
-        .write()
+    store
         .refine_unpublished_tag_index(basis, &updates)
         .map_err(|error| format!("publish tag index: {error}"))?;
     Ok(PublishedTagIndex {
@@ -3931,6 +3932,7 @@ mod tests {
 
     struct StoreLockProbeProcessor {
         calls: Arc<AtomicUsize>,
+        opener: Arc<distill_store::StoreOpener>,
         observed_unlocked: Arc<AtomicBool>,
     }
 
@@ -3941,8 +3943,14 @@ mod tests {
             context: &mut dyn PipelineProcessContext,
         ) -> Result<ProcessorProducts, ProcessorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.observed_unlocked
-                .store(!distill_store::shared::guard_held(), Ordering::SeqCst);
+            // The build holds no write transaction while a processor runs:
+            // another writer takes the write lock at once.
+            let unlocked = self
+                .opener
+                .open_writer()
+                .and_then(|mut writer| writer.write_transaction(|_| Ok(())))
+                .is_ok();
+            self.observed_unlocked.store(unlocked, Ordering::SeqCst);
             let AuthoredValue::Object(fields) = &input else {
                 panic!("processor input is a struct");
             };
@@ -4059,7 +4067,8 @@ mod tests {
             )
             .unwrap(),
         );
-        coordinator.reconcile_full_scan().unwrap();
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
         coordinator.install_schema_authority_for_test(authority.clone());
         coordinator.install_build_target_for_test("dev", build_target.clone());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4076,7 +4085,7 @@ mod tests {
             PrimaryCountingProcessor(Arc::clone(&calls)),
         ));
         refine_published_tag_index(
-            coordinator.store(),
+            &mut writer,
             coordinator.scanner(),
             Arc::clone(&authority),
             coordinator.pipeline_snapshot(),
@@ -4085,8 +4094,8 @@ mod tests {
             &BTreeMap::from([(ASSET, BUNDLE)]),
         );
         let indexed = coordinator
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .tag_index_state(ASSET)
             .unwrap()
             .unwrap();
@@ -4277,7 +4286,8 @@ mod tests {
             )
             .unwrap(),
         );
-        coordinator.reconcile_full_scan().unwrap();
+        let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
         coordinator.install_schema_authority_for_test(authority.clone());
         coordinator.install_build_target_for_test("dev", build_target);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4296,6 +4306,7 @@ mod tests {
             },
             StoreLockProbeProcessor {
                 calls: Arc::clone(&calls),
+                opener: Arc::clone(coordinator.opener()),
                 observed_unlocked: Arc::clone(&observed_unlocked),
             },
             move |arena| {
@@ -4369,8 +4380,8 @@ mod tests {
                 .collect::<Vec<&[u8]>>();
             assert_eq!(
                 coordinator
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .cas_read(&artifact.content_hash.0)
                     .unwrap(),
                 distill_wire::artifact::assemble_artifact(&artifact.payload.structural, &blobs),
@@ -4384,14 +4395,14 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 coordinator
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .wire_tree_read(wire_tree.layout_hash)
                     .unwrap(),
                 wire_tree.bytes.to_vec(),
             );
         }
-        let first_memo = coordinator.store().read().memo_seq();
+        let first_memo = coordinator.open_reader().unwrap().memo_seq();
         let import_key = build_import_digest(&BuildImportInputs {
             asset: ASSET,
             bundle: BUNDLE,
@@ -4407,8 +4418,8 @@ mod tests {
             artifact_format_version: ARTIFACT_FORMAT_VERSION,
         });
         let import_candidates = coordinator
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .lookup_candidates(KeyKind::BuildImport, &import_key)
             .unwrap();
         let distill_store::cas::record::ResultOutcome::Success { outputs, .. } =
@@ -4471,20 +4482,20 @@ mod tests {
 
         let hydrated = build(&coordinator, &request).unwrap();
         assert_eq!(hydrated, first);
-        assert_eq!(coordinator.store().read().memo_seq(), first_memo);
+        assert_eq!(coordinator.open_reader().unwrap().memo_seq(), first_memo);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 
         let noncanonical = [b"\n  ".as_slice(), bundle_bytes.as_slice()].concat();
         std::fs::write(assets.join("byte.bundle"), noncanonical).unwrap();
-        coordinator.reconcile_full_scan().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
         request.basis = coordinator.server().current_stamp();
         assert_eq!(build(&coordinator, &request).unwrap(), first);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
 
         assert_eq!(
-            build_with_runtime_mode(&coordinator, &request, true).unwrap(),
+            build_with_runtime_mode(&coordinator, &mut writer, &request, true).unwrap(),
             first
         );
         assert_eq!(calls.load(Ordering::SeqCst), 4);

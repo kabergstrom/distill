@@ -102,8 +102,8 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     assert!(matches!(
         process
             .coordinator()
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .pipeline_state()
             .unwrap(),
         Some(PipelineState::Failed { .. })
@@ -118,8 +118,8 @@ fn process_serves_rpc_and_consumes_watcher_changes_until_drop() {
     assert!(matches!(
         process
             .coordinator()
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .pipeline_state()
             .unwrap(),
         Some(PipelineState::Failed { .. })
@@ -144,8 +144,8 @@ fn a_write_whose_rows_were_never_committed_is_adopted_on_restart() {
     let indexed = |process: &DaemonProcess, hash: ContentHash| {
         process
             .coordinator()
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .all_files()
             .unwrap()
             .iter()
@@ -183,7 +183,7 @@ fn disabled_existing_codegen_output_is_still_excluded() {
     let process = DaemonProcess::start(config).unwrap();
     assert!(process
         .coordinator()
-        .scan_diagnostics()
+        .scan_diagnostics(&process.coordinator().open_reader().unwrap())
         .unwrap()
         .iter()
         .any(|diagnostic| matches!(
@@ -196,8 +196,8 @@ fn disabled_existing_codegen_output_is_still_excluded() {
         )));
     assert!(process
         .coordinator()
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .all_files()
         .unwrap()
         .iter()
@@ -217,8 +217,8 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
             matches!(
                 process
                     .coordinator()
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Failed { reason, .. }
@@ -243,8 +243,8 @@ fn malformed_configuration_publishes_once_and_a_valid_edit_heals_it() {
             let version = process.coordinator().server().current_stamp().version;
             let state = process
                 .coordinator()
-                .store()
-                .read()
+                .open_reader()
+                .unwrap()
                 .configuration_state()
                 .unwrap();
             version > failed && matches!(state, ConfigurationState::Ready(_))
@@ -264,8 +264,8 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
             matches!(
                 process
                     .coordinator()
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Failed { reason, .. }
@@ -279,8 +279,7 @@ fn valid_configuration_with_malformed_schema_fails_only_the_pipeline() {
     std::fs::write(&config_path, config_source(&temp)).unwrap();
     wait_until(
         || {
-            let store = process.coordinator().store();
-            let store = store.read();
+            let store = process.coordinator().open_reader().unwrap();
             matches!(
                 store.configuration_state().unwrap(),
                 ConfigurationState::Ready(_)
@@ -313,8 +312,8 @@ fn simultaneous_configuration_defects_choose_canonical_authority() {
             matches!(
                 process
                     .coordinator()
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Failed { reason, .. }
@@ -342,8 +341,8 @@ fn schema_bound_target_mismatches_publish_configuration_error() {
             matches!(
                 process
                     .coordinator()
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .configuration_state()
                     .unwrap(),
                 ConfigurationState::Failed { reason, .. }
@@ -381,7 +380,7 @@ fn operational_configuration_applies_live_without_an_input_version() {
         before
     );
     assert_eq!(
-        process.coordinator().store().config().parallelism,
+        process.coordinator().opener().config().parallelism,
         3
     );
 }
@@ -398,8 +397,8 @@ fn restart_only_configuration_is_staged_without_an_input_version() {
         || {
             process
                 .coordinator()
-                .store()
-                .read()
+                .open_reader()
+                .unwrap()
                 .pending_restart()
                 .unwrap()
                 .is_some_and(|pending| pending.keys == ["codegen.auto_codegen"])
@@ -497,8 +496,8 @@ fn root_configuration_reconciles_new_namespace_in_the_same_version() {
             process.coordinator().server().current_stamp().version > before
                 && process
                     .coordinator()
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .all_files()
                     .unwrap()
                     .iter()
@@ -604,8 +603,8 @@ fn malformed_schema_is_a_stable_pipeline_failure_and_a_valid_edit_retries() {
             matches!(
                 process
                     .coordinator()
-                    .store()
-                    .read()
+                    .open_reader()
+                    .unwrap()
                     .pipeline_state()
                     .unwrap(),
                 Some(PipelineState::Failed { error, .. })
@@ -1038,7 +1037,7 @@ fn dylib_hash(variant: &GateVariant) -> [u8; 32] {
 }
 
 fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
-    match process.coordinator().store().read().pipeline_state().unwrap() {
+    match process.coordinator().open_reader().unwrap().pipeline_state().unwrap() {
         Some(PipelineState::Ready(epoch)) => Some(epoch.dylib_hash),
         _ => None,
     }
@@ -1047,8 +1046,8 @@ fn ready_dylib_hash(process: &DaemonProcess) -> Option<[u8; 32]> {
 fn pipeline_generation(process: &DaemonProcess) -> u64 {
     process
         .coordinator()
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .rpc_fences()
         .unwrap()
         .pipeline_generation

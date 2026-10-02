@@ -17,7 +17,7 @@ use distill_rpc::{
     RenameWithFixupsRequest, RpcFailure,
 };
 use distill_schema::ngp_schema::SchemaNode;
-use distill_store::SharedStore;
+use distill_store::{Store, StoreReader};
 
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::coordinator::publish_incremental_paths;
@@ -28,11 +28,11 @@ use crate::scanner::RootedScanner;
 impl AuthoringService {
     pub(crate) fn prepare_long_operation(
         &self,
+        store: &mut Store,
         base: InputVersion,
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
         let runtime = OperationRuntime {
-            store: Arc::clone(&self.store),
             scanner: self.scanner.clone(),
             pipeline_projection: self.pipeline_projection(),
             tag_index_coordinator: self
@@ -50,7 +50,7 @@ impl AuthoringService {
                     &request.destination_path,
                 )?;
                 PlannedOperation::Files {
-                    files: self.plan_rename_with_fixups(base, &request)?,
+                    files: self.plan_rename_with_fixups(store, base, &request)?,
                     failures: Vec::new(),
                 }
             }
@@ -105,13 +105,11 @@ impl AuthoringService {
 
     fn plan_rename_with_fixups(
         &self,
+        store: &StoreReader,
         base: InputVersion,
         request: &RenameWithFixupsRequest,
     ) -> Result<Vec<OperationFile>, RpcFailure> {
-        let store = self
-            .store
-            .read();
-        require_base(&store, base)?;
+        require_base(store, base)?;
         let moving = store
             .bundle(request.bundle)
             .map_err(invalid)?
@@ -182,7 +180,6 @@ impl AuthoringService {
 
 #[derive(Clone)]
 struct OperationRuntime {
-    store: Arc<SharedStore>,
     scanner: RootedScanner,
     pipeline_projection: PipelineProjection,
     tag_index_coordinator: Weak<crate::coordinator::DaemonCoordinator>,
@@ -205,15 +202,19 @@ struct DeferredAuthoringOperation {
 }
 
 impl DeferredOperation for DeferredAuthoringOperation {
-    fn complete(&self, base: InputVersion) -> Result<DeferredOperationResult, String> {
+    fn complete(
+        &self,
+        store: &mut Store,
+        base: InputVersion,
+    ) -> Result<DeferredOperationResult, String> {
         match &self.planned {
             PlannedOperation::Files { files, failures } => {
-                self.runtime.publish_files(base, files, failures)
+                self.runtime.publish_files(store, base, files, failures)
             }
             PlannedOperation::Doctor {
                 request,
                 build_requests,
-            } => self.runtime.run_doctor(base, *request, build_requests),
+            } => self.runtime.run_doctor(store, base, *request, build_requests),
         }
     }
 }
@@ -221,18 +222,19 @@ impl DeferredOperation for DeferredAuthoringOperation {
 impl OperationRuntime {
     fn publish_files(
         &self,
+        store: &mut Store,
         base: InputVersion,
         files: &[OperationFile],
         initial_failures: &[String],
     ) -> Result<DeferredOperationResult, String> {
         if files.is_empty() {
             return self.advance_empty(
+                store,
                 base,
                 (!initial_failures.is_empty()).then(|| initial_failures.join("; ")),
             );
         }
-        let store = self.store.write();
-        require_base(&store, base).map_err(|error| format!("{error:?}"))?;
+        require_base(store, base).map_err(|error| format!("{error:?}"))?;
         let mut failures = initial_failures.to_vec();
         for file in files {
             let expected = file.preimage.into();
@@ -248,7 +250,6 @@ impl OperationRuntime {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        drop(store);
         let changed_paths = files
             .iter()
             .map(|file| file.target.clone())
@@ -256,7 +257,7 @@ impl OperationRuntime {
         let commit = publish_incremental_paths(
             &self.scanner,
             &changed_paths,
-            &self.store,
+            store,
             base,
             &self.pipeline_projection,
             self.tag_index_coordinator.upgrade().as_deref(),
@@ -269,6 +270,7 @@ impl OperationRuntime {
 
     fn run_doctor(
         &self,
+        store: &mut Store,
         base: InputVersion,
         request: DoctorRequest,
         build_requests: &Result<Vec<BuildRequest>, String>,
@@ -290,19 +292,15 @@ impl OperationRuntime {
                 .as_ref()
                 .expect("verify coordinator was required")
                 .authoring_service()
-                .verify_watched_import_fixpoints(base)
+                .verify_watched_import_fixpoints(store, base)
                 .map_err(|error| format!("{error:?}"))?
         } else {
             Vec::new()
         };
         let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
             let observed = self.scanner.scan().map_err(|error| error.to_string())?;
-            let published = crate::scanner::ScanSnapshot::load(
-                &**self
-                    .store
-                    .write(),
-            )
-            .map_err(|error| error.to_string())?;
+            let published = crate::scanner::ScanSnapshot::load(store)
+                .map_err(|error| error.to_string())?;
             let mismatch = !observed.same_observation(&published);
             let diagnostics = observed
                 .diagnostic_rows()
@@ -318,6 +316,7 @@ impl OperationRuntime {
                     coordinator
                         .as_ref()
                         .expect("verify coordinator was required"),
+                    store,
                     requests,
                 )?,
                 Err(defect) => vec![defect.clone()],
@@ -325,10 +324,7 @@ impl OperationRuntime {
         } else {
             Vec::new()
         };
-        let store = self
-            .store
-            .write();
-        require_base(&store, base).map_err(|error| format!("{error:?}"))?;
+        require_base(store, base).map_err(|error| format!("{error:?}"))?;
         let terminal_error = match request {
             DoctorRequest::Verify => {
                 store
@@ -361,19 +357,16 @@ impl OperationRuntime {
                 None
             }
         };
-        drop(store);
-        self.advance_empty(base, terminal_error)
+        self.advance_empty(store, base, terminal_error)
     }
 
     fn advance_empty(
         &self,
+        store: &mut Store,
         base: InputVersion,
         terminal_error: Option<String>,
     ) -> Result<DeferredOperationResult, String> {
-        let mut store = self
-            .store
-            .write();
-        require_base(&store, base).map_err(|error| format!("{error:?}"))?;
+        require_base(store, base).map_err(|error| format!("{error:?}"))?;
         store
             .input_transaction(|_| Ok(()))
             .map_err(|error| error.to_string())?;

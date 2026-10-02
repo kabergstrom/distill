@@ -21,8 +21,7 @@ use distill_rpc::{
     Commit, ImportJob, ImportRequest, InputVersion, LongRunningOp, PreparedImportCommit,
     PreparedOperationCommit, RpcFailure,
 };
-use distill_store::shared::WriteGuard;
-use distill_store::{Current, SharedStore, StoreReader};
+use distill_store::{Current, Store, StoreOpener, StoreReader};
 
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
@@ -31,7 +30,9 @@ use crate::pipeline_map::PipelineProjection;
 use crate::scanner::{AssetRoot, RootedScanner, ScanError};
 
 pub struct AuthoringService {
-    pub(crate) store: Arc<SharedStore>,
+    /// Opens the reader an import run reads through when it runs outside
+    /// any write.
+    pub(crate) opener: Arc<StoreOpener>,
     pub(crate) scanner: RootedScanner,
     /// The asset roots and what hangs off them, replaced together when the
     /// configuration changes.
@@ -68,12 +69,12 @@ impl AuthoringFilesystemCandidate {
 
 impl AuthoringService {
     pub fn new(
-        store: Arc<SharedStore>,
+        opener: Arc<StoreOpener>,
         roots: Vec<AssetRoot>,
         scanner: RootedScanner,
     ) -> Self {
         Self {
-            store,
+            opener,
             scanner,
             filesystem: Current::new(AuthoringFilesystem { roots }),
             importers: Current::new(Importers::default()),
@@ -204,15 +205,15 @@ impl AuthoringService {
 
     fn prepare_direct_write(
         &self,
+        store: &mut Store,
         base: InputVersion,
         operations: &[AuthoringOp],
         force_lossy: bool,
     ) -> Result<Commit, RpcFailure> {
-        let store = self.write_store()?;
-        require_base(&store, base)?;
-        let planned = self.plan_bundle_mutation(&store, operations, force_lossy)?;
-        drop(store);
+        require_base(store, base)?;
+        let planned = self.plan_bundle_mutation(store, operations, force_lossy)?;
         self.publish_file(
+            store,
             base,
             planned.target,
             planned.preimage,
@@ -225,24 +226,23 @@ impl AuthoringService {
     /// longer holds `preimage` the publication fails with a conflict.
     pub(crate) fn publish_file(
         &self,
+        store: &mut Store,
         base: InputVersion,
         target: PathBuf,
         preimage: Option<ContentHash>,
         proposed: Option<Vec<u8>>,
     ) -> Result<Commit, RpcFailure> {
-        let store = self.write_store()?;
-        require_base(&store, base)?;
+        require_base(store, base)?;
         match proposed.as_deref() {
             Some(bytes) => atomic_write_expecting(&target, bytes, preimage.into()),
             None => remove_expecting(&target, preimage.into()),
         }
         .map_err(invalid)?;
-        drop(store);
 
         publish_incremental_paths(
             &self.scanner,
             std::slice::from_ref(&target),
-            &self.store,
+            store,
             base,
             &self.pipeline_projection(),
             self.tag_index_coordinator().as_deref(),
@@ -542,36 +542,35 @@ impl AuthoringService {
             .epoch()
             .is_ok_and(|epoch| epoch.migration_function_keys().contains(&key.id()))
     }
-
-    fn write_store(&self) -> Result<WriteGuard<'_>, RpcFailure> {
-        Ok(self.store.write())
-    }
 }
 
 impl AuthoringBackend for AuthoringService {
     fn prepare_write(
         &self,
+        store: &mut Store,
         base: InputVersion,
         operations: &[AuthoringOp],
         force_lossy: bool,
     ) -> Result<Option<Commit>, RpcFailure> {
-        self.prepare_direct_write(base, operations, force_lossy).map(Some)
+        self.prepare_direct_write(store, base, operations, force_lossy).map(Some)
     }
 
     fn prepare_import(
         &self,
+        store: &mut Store,
         base: InputVersion,
         request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
-        self.prepare_import_request(base, request)
+        self.prepare_import_request(store, base, request)
     }
 
     fn prepare_reimport(
         &self,
+        store: &mut Store,
         base: InputVersion,
         bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
-        self.prepare_reimport_bundle(base, bundle)
+        self.prepare_reimport_bundle(store, base, bundle)
     }
 
     fn run_import(
@@ -580,7 +579,7 @@ impl AuthoringBackend for AuthoringService {
         request: ImportRequest,
     ) -> Result<ImportJob, RpcFailure> {
         let run = self.run_import_request(base, &request)?;
-        Ok(Box::new(move || self.publish_import_run(base, run)))
+        Ok(Box::new(move |store| self.publish_import_run(store, base, run)))
     }
 
     fn run_reimport(
@@ -589,15 +588,16 @@ impl AuthoringBackend for AuthoringService {
         bundle: BundleUuid,
     ) -> Result<ImportJob, RpcFailure> {
         let run = self.run_reimport_bundle(base, bundle)?;
-        Ok(Box::new(move || self.publish_import_run(base, run)))
+        Ok(Box::new(move |store| self.publish_import_run(store, base, run)))
     }
 
     fn prepare_operation(
         &self,
+        store: &mut Store,
         base: InputVersion,
         operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
-        self.prepare_long_operation(base, operation)
+        self.prepare_long_operation(store, base, operation)
     }
 
 }

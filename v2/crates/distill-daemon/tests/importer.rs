@@ -106,6 +106,7 @@ fn target() -> TargetDefinition {
 /// Publish a Ready pipeline epoch whose registry names `schema_hash` as the
 /// current schema of `TYPE_UUID`: importer outputs are written at it.
 fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: LogicalHash) {
+    let mut writer = coordinator.open_writer().unwrap();
     let mut schema_registry = bootstrap_control_logical_registry_v1().unwrap();
     schema_registry.insert(TYPE_UUID, schema_hash);
     let epoch = ValidatedPipelineEpoch::validate(PipelineEpoch {
@@ -119,12 +120,10 @@ fn publish_schema_registry(coordinator: &DaemonCoordinator, schema_hash: Logical
         registrations: Vec::new(),
     })
     .unwrap();
-    let store = coordinator.store();
     let base = coordinator.server().current_stamp().version;
     coordinator
-        .coordinated_commit(base, || {
+        .coordinated_commit(&mut writer, base, |store| {
             store
-                .write()
                 .input_transaction(|transaction| transaction.publish_pipeline_epoch(&epoch))
                 .map_err(|error| error.to_string())?;
             Ok(Commit::default())
@@ -244,7 +243,8 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         64,
     )
     .unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     publish_schema_registry(&coordinator, schema_hash);
 
@@ -256,9 +256,9 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     let imported_bundle = Arc::new(std::sync::Mutex::new(None));
     let captured = Arc::clone(&imported_bundle);
     coordinator
-        .coordinated_commit(InputVersion(2), || {
+        .coordinated_commit(&mut writer, InputVersion(2), |store| {
             let prepared = backend
-                .prepare_import(
+                .prepare_import(store, 
                     InputVersion(2),
                     &ImportRequest {
                         importer: "byte-importer".into(),
@@ -284,24 +284,24 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(first.assets["asset"].data, AuthoredValue::UInt(7));
     assert_eq!(first.assets["$settings"].data, AuthoredValue::UInt(3));
     assert!(first.assets.contains_key("$record"));
-    assert!(coordinator.authoring_service().watched_imports_needing_reimport()
+    assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
         .unwrap()
         .is_empty());
 
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     assert_eq!(
-        coordinator.authoring_service().watched_imports_needing_reimport()
+        coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
             .unwrap(),
         vec![imported_bundle]
     );
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![assets.join("source.txt")],
             renames: Vec::new(),
         })
         .unwrap();
     assert_eq!(
-        coordinator.reconcile_watched_imports().unwrap(),
+        coordinator.reconcile_watched_imports(&mut writer).unwrap(),
         vec![imported_bundle]
     );
     let second = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
@@ -310,21 +310,21 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(second.assets["asset"].data, AuthoredValue::UInt(8));
     assert_eq!(second.assets["$settings"].data, AuthoredValue::UInt(3));
     assert_eq!(
-        coordinator.store().read().input_version(),
+        coordinator.open_reader().unwrap().input_version(),
         InputVersion(5)
     );
 
     std::fs::write(assets.join("source.txt"), b"not-a-byte").unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![assets.join("source.txt")],
             renames: Vec::new(),
         })
         .unwrap();
-    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
     let failed = coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .watched_import_failure(imported_bundle)
         .unwrap()
         .expect("stable failed attempt is retained");
@@ -333,7 +333,7 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
         distill_store::imports::WatchedImportTerminal::Importer { code: 3 }
     );
     assert_eq!(
-        coordinator.store().read().input_version(),
+        coordinator.open_reader().unwrap().input_version(),
         InputVersion(6),
         "memoizing a failure is not an input event"
     );
@@ -342,30 +342,30 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(failures[0].0, "imported.bundle");
     assert!(failures[0].1.contains("invalid digit"), "{failures:?}");
     let failed_memo = failed.memo_seq;
-    assert!(coordinator.authoring_service().watched_imports_needing_reimport()
+    assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
         .unwrap()
         .is_empty());
-    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
     assert_eq!(
-        coordinator.store().read().memo_seq(),
+        coordinator.open_reader().unwrap().memo_seq(),
         failed_memo,
         "an unchanged failure must not spin"
     );
 
     std::fs::write(assets.join("source.txt"), b"9").unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![assets.join("source.txt")],
             renames: Vec::new(),
         })
         .unwrap();
     assert_eq!(
-        coordinator.reconcile_watched_imports().unwrap(),
+        coordinator.reconcile_watched_imports(&mut writer).unwrap(),
         vec![imported_bundle]
     );
     assert!(coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .watched_import_failure(imported_bundle)
         .unwrap()
         .is_none());
@@ -373,46 +373,46 @@ fn explicit_import_and_reimport_publish_controls_read_set_and_stable_identities(
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(9));
     assert!(import_failures(&coordinator).is_empty());
     assert_eq!(
-        coordinator.store().read().input_version(),
+        coordinator.open_reader().unwrap().input_version(),
         InputVersion(8)
     );
 
     std::fs::remove_file(assets.join("source.txt")).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![assets.join("source.txt")],
             renames: Vec::new(),
         })
         .unwrap();
-    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
     assert_eq!(
         coordinator
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .watched_import_failure(imported_bundle)
             .unwrap()
             .unwrap()
             .terminal,
         distill_store::imports::WatchedImportTerminal::Dependency
     );
-    assert!(coordinator.authoring_service().watched_imports_needing_reimport()
+    assert!(coordinator.authoring_service().watched_imports_needing_reimport(&mut writer)
         .unwrap()
         .is_empty());
     std::fs::write(assets.join("source.txt"), b"10").unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![assets.join("source.txt")],
             renames: Vec::new(),
         })
         .unwrap();
     assert_eq!(
-        coordinator.reconcile_watched_imports().unwrap(),
+        coordinator.reconcile_watched_imports(&mut writer).unwrap(),
         vec![imported_bundle]
     );
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(healed.assets["asset"].data, AuthoredValue::UInt(10));
     assert_eq!(
-        coordinator.store().read().input_version(),
+        coordinator.open_reader().unwrap().input_version(),
         InputVersion(11)
     );
 }
@@ -433,22 +433,23 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         64,
     )
     .unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
         .register_importer(Arc::new(ByteImporter { schema }))
         .unwrap();
 
-    let imported = coordinator.reconcile_directory_imports().unwrap();
+    let imported = coordinator.reconcile_directory_imports(&mut writer).unwrap();
     assert_eq!(imported.len(), 1);
     let generated_path = assets.join("foo.bundle");
     let generated = distill_bundle::parse_bundle(&std::fs::read(&generated_path).unwrap()).unwrap();
     assert_eq!(generated.assets["asset"].data, AuthoredValue::UInt(9));
     assert_eq!(generated.assets["$settings"].data, AuthoredValue::UInt(5));
     let meta = coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .bundle(generated.uuid)
         .unwrap()
         .unwrap();
@@ -458,26 +459,26 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     assert_eq!(origin.group_root, "main");
     assert_eq!(origin.group_path, "foo.src");
     assert!(coordinator
-        .reconcile_directory_imports()
+        .reconcile_directory_imports(&mut writer)
         .unwrap()
         .is_empty());
 
     std::fs::remove_file(assets.join("foo.src")).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![assets.join("foo.src")],
             renames: Vec::new(),
         })
         .unwrap();
-    let work = coordinator.pending_file_work().unwrap();
+    let work = coordinator.pending_file_work(&mut writer).unwrap();
     assert!(coordinator
-        .reconcile_directory_imports_affected(&work, false)
+        .reconcile_directory_imports_affected(&mut writer, &work, false)
         .unwrap()
         .is_empty());
-    coordinator.acknowledge_file_work(&work).unwrap();
+    coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
     let failure = coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .watched_import_failure(generated.uuid)
         .unwrap()
         .expect("listing loss is durable orphan state");
@@ -487,11 +488,11 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     );
     let orphan_memo = failure.memo_seq;
     assert!(coordinator
-        .reconcile_directory_imports()
+        .reconcile_directory_imports(&mut writer)
         .unwrap()
         .is_empty());
     assert_eq!(
-        coordinator.store().read().memo_seq(),
+        coordinator.open_reader().unwrap().memo_seq(),
         orphan_memo,
         "an unchanged orphan must not spin memo state"
     );
@@ -501,11 +502,11 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     );
 
     std::fs::write(assets.join("foo.src"), b"9").unwrap();
-    coordinator.reconcile_full_scan().unwrap();
-    coordinator.reconcile_directory_imports().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
     assert!(coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .watched_import_failure(generated.uuid)
         .unwrap()
         .is_none());
@@ -515,15 +516,15 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
         directory_rules_bundle_with_rule(false),
     )
     .unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert!(coordinator
-        .reconcile_directory_imports()
+        .reconcile_directory_imports(&mut writer)
         .unwrap()
         .is_empty());
     assert_eq!(
         coordinator
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .watched_import_failure(generated.uuid)
             .unwrap()
             .unwrap()
@@ -533,11 +534,11 @@ fn directory_rules_publish_owned_bundles_and_listing_loss_only_orphans_them() {
     );
 
     std::fs::write(assets.join("rules.bundle"), directory_rules_bundle()).unwrap();
-    coordinator.reconcile_full_scan().unwrap();
-    coordinator.reconcile_directory_imports().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    coordinator.reconcile_directory_imports(&mut writer).unwrap();
     assert!(coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .watched_import_failure(generated.uuid)
         .unwrap()
         .is_none());
@@ -565,7 +566,8 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     };
     let imported_bundle = {
         let coordinator = open();
-        coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+        coordinator.reconcile_full_scan(&mut writer).unwrap();
         publish_schema_registry(&coordinator, schema_hash);
         coordinator
             .authoring_service()
@@ -578,9 +580,9 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
         let imported = Arc::new(std::sync::Mutex::new(None));
         let captured = Arc::clone(&imported);
         coordinator
-            .coordinated_commit(base, || {
+            .coordinated_commit(&mut writer, base, |store| {
                 let prepared = backend
-                    .prepare_import(
+                    .prepare_import(store, 
                         base,
                         &ImportRequest {
                             importer: "byte-importer".into(),
@@ -607,21 +609,22 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
     // Restart with the source edited and no importer registered.
     std::fs::write(assets.join("source.txt"), b"8").unwrap();
     let coordinator = open();
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(
         coordinator
             .authoring_service()
-            .watched_imports_needing_reimport()
+            .watched_imports_needing_reimport(&mut writer)
             .unwrap(),
         vec![imported_bundle]
     );
-    assert!(coordinator.reconcile_watched_imports().unwrap().is_empty());
+    assert!(coordinator.reconcile_watched_imports(&mut writer).unwrap().is_empty());
     let unchanged = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(unchanged.assets["asset"].data, AuthoredValue::UInt(7));
     assert!(
         coordinator
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .watched_import_failure(imported_bundle)
             .unwrap()
             .is_none(),
@@ -633,7 +636,7 @@ fn watched_imports_defer_while_their_importer_is_unregistered() {
         .register_importer(Arc::new(ByteImporter { schema }))
         .unwrap();
     assert_eq!(
-        coordinator.reconcile_watched_imports().unwrap(),
+        coordinator.reconcile_watched_imports(&mut writer).unwrap(),
         vec![imported_bundle]
     );
     let healed = distill_bundle::parse_bundle(&std::fs::read(&path).unwrap()).unwrap();
@@ -658,7 +661,8 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
         64,
     )
     .unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     publish_schema_registry(&coordinator, schema_hash);
     coordinator
         .authoring_service()
@@ -667,9 +671,9 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
     let backend = Arc::clone(coordinator.authoring_service());
     let base = coordinator.server().current_stamp().version;
     coordinator
-        .coordinated_commit(base, || {
+        .coordinated_commit(&mut writer, base, |store| {
             let prepared = backend
-                .prepare_import(
+                .prepare_import(store, 
                     base,
                     &ImportRequest {
                         importer: "byte-importer".into(),
@@ -688,21 +692,21 @@ fn reverting_a_failed_watched_import_clears_its_failure_incrementally() {
         })
         .unwrap();
     // Build the import index as the startup pass does.
-    coordinator.reconcile_watched_imports().unwrap();
+    coordinator.reconcile_watched_imports(&mut writer).unwrap();
 
-    let edit = |content: &[u8]| {
+    let mut edit = |content: &[u8]| {
         std::fs::write(assets.join("source.txt"), content).unwrap();
         coordinator
-            .reconcile_incremental(&WatcherBatch {
+            .reconcile_incremental(&mut writer, &WatcherBatch {
                 paths: vec![assets.join("source.txt")],
                 renames: Vec::new(),
             })
             .unwrap();
-        let work = coordinator.pending_file_work().unwrap();
+        let work = coordinator.pending_file_work(&mut writer).unwrap();
         coordinator
-            .reconcile_watched_imports_affected(&work, false)
+            .reconcile_watched_imports_affected(&mut writer, &work, false)
             .unwrap();
-        coordinator.acknowledge_file_work(&work).unwrap();
+        coordinator.acknowledge_file_work(&mut writer, &work).unwrap();
     };
     edit(b"broken");
     assert_eq!(import_failures(&coordinator).len(), 1);

@@ -336,7 +336,7 @@ fn rpc_io_reports_an_expired_snapshot_and_the_next_round_reads_a_new_one() {
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&runtime, async move {
-            let front = Server::attach(&handle);
+            let front = Server::open(&handle);
             front
                 .install_snapshot_policy(SnapshotPolicy {
                     ttl: Duration::from_millis(100),

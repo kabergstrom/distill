@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
+use distill_store::{Store, StoreOpener, StoreWriter};
 use rayon::ThreadPool;
 
 pub const DEFAULT_DEPENDENCY_DEPTH: usize = 32;
@@ -198,11 +199,18 @@ impl Scheduler {
     }
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+/// A job runs on the writer the scheduler lends it.
+type Job = Box<dyn FnOnce(&mut Store) + Send>;
 
 enum Message {
-    Submit { id: u64, class: WorkClass, job: Job },
-    Complete(u64),
+    Submit {
+        id: u64,
+        class: WorkClass,
+        job: Job,
+        completion: Completion,
+    },
+    /// A job finished; its writer comes back unless it was lost.
+    Complete(u64, Option<StoreWriter>),
     Reconfigure {
         config: SchedulerConfig,
         pool: Option<Arc<ThreadPool>>,
@@ -214,36 +222,47 @@ enum Message {
 /// A [`Scheduler`] on a thread of its own, admitting jobs onto a worker
 /// pool. Jobs and completions arrive as messages; the thread stops once
 /// every handle and every running job is gone.
+///
+/// The scheduler thread owns its jobs' store writers: it lends one to each
+/// job it admits, which hands it back on completion. A writer is only ever
+/// in one place, and idle ones beyond the pool's parallelism are closed.
 pub(crate) struct ScheduledPool {
     inbox: mpsc::Sender<Message>,
     next_id: AtomicU64,
 }
 
 impl ScheduledPool {
-    pub(crate) fn start(scheduler: Scheduler, pool: Arc<ThreadPool>) -> std::io::Result<Self> {
+    pub(crate) fn start(
+        scheduler: Scheduler,
+        pool: Arc<ThreadPool>,
+        opener: Arc<StoreOpener>,
+    ) -> std::io::Result<Self> {
         let (inbox, messages) = mpsc::channel();
         std::thread::Builder::new()
             .name("distill-scheduler".to_owned())
-            .spawn(move || admit_jobs(scheduler, pool, messages))?;
+            .spawn(move || admit_jobs(scheduler, pool, opener, messages))?;
         Ok(Self {
             inbox,
             next_id: AtomicU64::new(1),
         })
     }
 
-    /// Queue `job` in `class`; it runs on the pool once admitted.
-    pub(crate) fn submit(&self, class: WorkClass, job: impl FnOnce() + Send + 'static) {
+    /// Queue `job` in `class`; it runs on the pool once admitted, on a
+    /// writer the scheduler lends it.
+    pub(crate) fn submit(&self, class: WorkClass, job: impl FnOnce(&mut Store) + Send + 'static) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let completion = Completion {
             id,
             inbox: self.inbox.clone(),
+            writer: None,
         };
-        let job: Job = Box::new(move || {
-            let _completion = completion;
-            job();
-        });
         self.inbox
-            .send(Message::Submit { id, class, job })
+            .send(Message::Submit {
+                id,
+                class,
+                job: Box::new(job),
+                completion,
+            })
             .expect("the scheduler thread outlives its handles");
     }
 
@@ -273,31 +292,61 @@ impl ScheduledPool {
     }
 }
 
-/// Reports a job complete when dropped, so a panicking job frees its slot too.
+/// Reports a job complete when dropped, so a panicking job frees its slot
+/// too, and hands back the writer it was lent.
 struct Completion {
     id: u64,
     inbox: mpsc::Sender<Message>,
+    writer: Option<StoreWriter>,
+}
+
+impl Completion {
+    /// Report the job complete and hand its writer back.
+    fn finish(mut self, writer: StoreWriter) {
+        self.writer = Some(writer);
+    }
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
-        let _ = self.inbox.send(Message::Complete(self.id));
+        let _ = self
+            .inbox
+            .send(Message::Complete(self.id, self.writer.take()));
     }
 }
 
-fn admit_jobs(mut scheduler: Scheduler, mut pool: Arc<ThreadPool>, messages: mpsc::Receiver<Message>) {
-    let mut queued = BTreeMap::<u64, Job>::new();
+fn admit_jobs(
+    mut scheduler: Scheduler,
+    mut pool: Arc<ThreadPool>,
+    opener: Arc<StoreOpener>,
+    messages: mpsc::Receiver<Message>,
+) {
+    let mut queued = BTreeMap::<u64, (Job, Completion)>::new();
+    let mut idle = Vec::<StoreWriter>::new();
     for message in messages {
         match message {
-            Message::Submit { id, class, job } => {
+            Message::Submit {
+                id,
+                class,
+                job,
+                completion,
+            } => {
                 scheduler
                     .try_enqueue(id, class)
                     .expect("scheduler job identities are unique");
-                queued.insert(id, job);
+                queued.insert(id, (job, completion));
             }
-            Message::Complete(id) => scheduler
-                .complete(id)
-                .expect("scheduled job remains active until its worker returns"),
+            Message::Complete(id, writer) => {
+                scheduler
+                    .complete(id)
+                    .expect("scheduled job remains active until its worker returns");
+                // A writer left inside a transaction is not lent again.
+                if let Some(writer) = writer.filter(|writer| !writer.in_transaction()) {
+                    if idle.len() < scheduler.config().parallelism {
+                        idle.push(writer);
+                    }
+                }
+            }
             Message::Reconfigure {
                 config,
                 pool: replacement,
@@ -316,8 +365,15 @@ fn admit_jobs(mut scheduler: Scheduler, mut pool: Arc<ThreadPool>, messages: mps
             }
         }
         for id in scheduler.admit() {
-            let job = queued.remove(&id).expect("an admitted job was queued");
-            pool.spawn_fifo(job);
+            let (job, completion) = queued.remove(&id).expect("an admitted job was queued");
+            let writer = idle.pop().map_or_else(|| opener.open_writer(), Ok);
+            pool.spawn_fifo(move || {
+                let mut writer = writer.unwrap_or_else(|error| {
+                    panic!("cannot open a writer for a build job: {error}")
+                });
+                job(&mut writer);
+                completion.finish(writer);
+            });
         }
     }
 }

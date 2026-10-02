@@ -17,7 +17,7 @@ use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 use distill_store::served::{ResolutionRow, ServedEntryMeta, SERVED_RESTART_KEYS};
-use distill_store::{StoreError, StoreReader};
+use distill_store::{Store, StoreError, StoreReader};
 
 use crate::persist::decode_drifted_input;
 use crate::server::{
@@ -557,8 +557,8 @@ fn validate_progress(events: &[AuthoringProgressEvent]) -> Result<(), String> {
     Ok(())
 }
 
-/// What a [`Hub::write_call`] answered.
-pub fn write_call_outcome(outcome: Option<RpcResult<InputVersion>>) -> RpcResult<InputVersion> {
+/// What a write answered: `None` when the backend declined.
+fn write_outcome(outcome: Option<RpcResult<InputVersion>>) -> RpcResult<InputVersion> {
     outcome.unwrap_or_else(|| {
         RpcResult::Failure(RpcFailure::AuthoringBackendUnavailable {
             operation: "write".to_owned(),
@@ -566,26 +566,22 @@ pub fn write_call_outcome(outcome: Option<RpcResult<InputVersion>>) -> RpcResult
     })
 }
 
-/// What a [`Hub::import_publish_call`] answered.
-pub fn import_call_outcome(outcome: Option<RpcResult<BundleUuid>>) -> RpcResult<BundleUuid> {
-    outcome.expect("an import always publishes")
-}
-
-/// Complete a prepared operation as one input, still at `base`.
-fn complete_publication_call(
+/// Complete a prepared operation as one input on `server`'s writer, still
+/// at `base`.
+fn complete_publication(
     server: &Server,
     base: InputVersion,
     publication: PreparedOperationPublication,
     what: &'static str,
-) -> WriteCall<Result<(), String>> {
-    server.write_call(move |server| {
+) -> Result<(), String> {
+    {
         let mut failed = None;
         let mut terminal = None;
-        let published = server.coordinated_maybe_commit(base, || {
+        let published = server.coordinated_maybe_commit(base, |store| {
             let (commit, terminal_error) = match publication {
                 PreparedOperationPublication::Immediate(commit) => (*commit, None),
                 PreparedOperationPublication::Deferred(operation) => {
-                    match operation.complete(base) {
+                    match operation.complete(store, base) {
                         Ok(completed) => (completed.commit, completed.terminal_error),
                         Err(error) => {
                             failed = Some(error);
@@ -608,7 +604,7 @@ fn complete_publication_call(
                 coordinated_failure(error)
             )),
         }
-    })
+    }
 }
 
 /// A coordinated publication's failure as the RPC reports it.
@@ -635,7 +631,7 @@ struct ServerOperationCompletion {
 }
 
 impl ProgressCompletion for ServerOperationCompletion {
-    fn complete_call(&self) -> Result<WriteCall<Result<(), String>>, String> {
+    fn complete(&self) -> Result<(), String> {
         let publication = self
             .publication
             .borrow_mut()
@@ -646,12 +642,7 @@ impl ProgressCompletion for ServerOperationCompletion {
                 "long-running operation lost its publication basis: {gate:?}"
             ));
         }
-        Ok(complete_publication_call(
-            &self.server,
-            self.base,
-            publication,
-            "long-running operation",
-        ))
+        complete_publication(&self.server, self.base, publication, "long-running operation")
     }
 
     fn cancel(&self) -> bool {
@@ -1012,43 +1003,33 @@ impl Hub {
         }
     }
 
-    /// Run the backend's `prepare` and publish its commit as one input,
-    /// still at `base`. `None` when the backend declined.
-    fn prepared<T: Send + 'static>(
+    /// Run the backend's `prepare` on this connection's writer and publish
+    /// its commit as one input, still at `base`. `None` when the backend
+    /// declined.
+    fn prepared<T>(
         &self,
         base: InputVersion,
-        prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure>
-            + Send
-            + 'static,
+        prepare: impl FnOnce(&dyn AuthoringBackend, &mut Store) -> Result<Option<(Commit, T)>, RpcFailure>,
     ) -> Option<RpcResult<T>> {
-        self.prepared_call(base, prepare).run()
-    }
-
-    /// [`Hub::prepared`] as a job for a blocking thread.
-    fn prepared_call<T: Send + 'static>(
-        &self,
-        base: InputVersion,
-        prepare: impl FnOnce(&dyn AuthoringBackend) -> Result<Option<(Commit, T)>, RpcFailure>
-            + Send
-            + 'static,
-    ) -> WriteCall<Option<RpcResult<T>>> {
-        let backend = self.server.inner.handle.authoring_backend();
-        self.server.write_call(move |server| {
+        let handle = &self.server.inner.handle;
+        let backend = handle.authoring_backend();
+        self.server.with_writer(|store| {
             let mut value = None;
             let mut failed = None;
-            let published = server.coordinated_maybe_commit(base, || match prepare(&*backend) {
-                Ok(Some((commit, prepared))) => {
-                    value = Some(prepared);
-                    Ok(Some(commit))
-                }
-                Ok(None) => Ok(None),
-                // What the backend made durable before it failed (a memoized
-                // failure) still commits; nothing is published.
-                Err(error) => {
-                    failed = Some(error);
-                    Ok(None)
-                }
-            });
+            let published =
+                handle.coordinated_maybe_commit(store, base, |store| match prepare(&*backend, store) {
+                    Ok(Some((commit, prepared))) => {
+                        value = Some(prepared);
+                        Ok(Some(commit))
+                    }
+                    Ok(None) => Ok(None),
+                    // What the backend made durable before it failed (a
+                    // memoized failure) still commits; nothing is published.
+                    Err(error) => {
+                        failed = Some(error);
+                        Ok(None)
+                    }
+                });
             match published {
                 Ok(_) if failed.is_some() => Some(RpcResult::Failure(failed.expect("checked"))),
                 Ok(Some(_)) => Some(RpcResult::Success(value.expect("a publication has a value"))),
@@ -1059,52 +1040,38 @@ impl Hub {
     }
 
     /// `force_lossy` writes even when data held under the on-disk schema
-    /// would be dropped (see [`RpcFailure::LossyWrite`]).
+    /// would be dropped (see [`RpcFailure::LossyWrite`]). The write
+    /// publishes on this connection's own writer: waiting on SQLite's write
+    /// lock holds up only this connection.
     pub fn write(
         &self,
         base: InputVersion,
         ops: Vec<AuthoringOp>,
         force_lossy: bool,
     ) -> RpcResult<InputVersion> {
-        match self.write_call(base, ops, force_lossy) {
-            Ok(call) => write_call_outcome(call.run()),
-            Err(result) => result,
-        }
-    }
-
-    /// Check a write. Against a daemon, the returned job publishes it
-    /// (`None`: the backend declined); transports run it off the RPC
-    /// thread. An embedded server answers here.
-    #[allow(clippy::type_complexity)]
-    pub fn write_call(
-        &self,
-        base: InputVersion,
-        ops: Vec<AuthoringOp>,
-        force_lossy: bool,
-    ) -> Result<WriteCall<Option<RpcResult<InputVersion>>>, RpcResult<InputVersion>> {
         if let Some(result) = self.authoring_gate(base) {
-            return Err(result);
+            return result;
         }
         if ops.is_empty() {
-            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
                 detail: "authoring operation batch must not be empty".to_owned(),
-            }));
+            });
         }
         if ops.iter().any(|operation| {
             matches!(operation, AuthoringOp::Set(entry) if entry.local_id.starts_with('$'))
         }) {
-            return Err(RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
+            return RpcResult::Failure(RpcFailure::InvalidAuthoringRequest {
                 detail: "daemon-owned '$settings' and '$record' entries cannot be written directly"
                     .to_owned(),
-            }));
+            });
         }
         let next = InputVersion(base.0 + 1);
         if is_embedded(&self.server) {
-            return Err(self.embedded_write(base, ops, force_lossy, next));
+            return self.embedded_write(base, ops, force_lossy, next);
         }
-        Ok(self.prepared_call(base, move |backend| {
+        write_outcome(self.prepared(base, move |backend, store| {
             Ok(backend
-                .prepare_write(base, &ops, force_lossy)?
+                .prepare_write(store, base, &ops, force_lossy)?
                 .map(|commit| (commit, next)))
         }))
     }
@@ -1117,9 +1084,9 @@ impl Hub {
         next: InputVersion,
     ) -> RpcResult<InputVersion> {
         let backend_ops = ops.clone();
-        if let Some(result) = self.prepared(base, move |backend| {
+        if let Some(result) = self.prepared(base, move |backend, store| {
             Ok(backend
-                .prepare_write(base, &backend_ops, force_lossy)?
+                .prepare_write(store, base, &backend_ops, force_lossy)?
                 .map(|commit| (commit, next)))
         }) {
             return result;
@@ -1262,20 +1229,9 @@ impl Hub {
         })
     }
 
-    /// Publish a finished import, only while still at its base.
+    /// Publish a finished import on this connection's writer, only while
+    /// still at its base.
     pub fn import_finish(&self, finished: FinishedImport) -> RpcResult<BundleUuid> {
-        match self.import_publish_call(finished) {
-            Ok(call) => import_call_outcome(call.run()),
-            Err(result) => result,
-        }
-    }
-
-    /// [`Hub::import_finish`] as a job for a blocking thread.
-    #[allow(clippy::type_complexity)]
-    pub fn import_publish_call(
-        &self,
-        finished: FinishedImport,
-    ) -> Result<WriteCall<Option<RpcResult<BundleUuid>>>, RpcResult<BundleUuid>> {
         let FinishedImport {
             base,
             reimport,
@@ -1283,17 +1239,18 @@ impl Hub {
         } = finished;
         let job = match job {
             Ok(job) => job,
-            Err(error) => return Err(RpcResult::Failure(error)),
+            Err(error) => return RpcResult::Failure(error),
         };
-        Ok(self.prepared_call(base, move |_| {
-            let prepared = job()?;
+        let published = self.prepared(base, move |_, store| {
+            let prepared = job(store)?;
             if reimport.is_some_and(|bundle| bundle != prepared.bundle) {
                 return Err(RpcFailure::InvalidAuthoringRequest {
                     detail: "reimport backend changed the bundle identity".to_owned(),
                 });
             }
             Ok(Some((prepared.commit, prepared.bundle)))
-        }))
+        });
+        published.expect("an import always publishes")
     }
 
     pub fn operation(
@@ -1304,12 +1261,10 @@ impl Hub {
         if let Some(result) = self.authoring_gate(base) {
             return result;
         }
+        let backend = self.server.inner.handle.authoring_backend();
         let prepared = match self
             .server
-            .inner
-            .handle
-            .authoring_backend()
-            .prepare_operation(base, &operation)
+            .with_writer(|store| backend.prepare_operation(store, base, &operation))
         {
             Ok(prepared) => prepared,
             Err(error) => return RpcResult::Failure(error),

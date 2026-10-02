@@ -79,7 +79,8 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     std::fs::write(&first_path, first_bytes).unwrap();
     std::fs::write(&second_path, second_bytes).unwrap();
     let coordinator = coordinator(&temp);
-    let startup = coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    let startup = coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     let hub = match coordinator
         .server()
@@ -102,7 +103,7 @@ fn incremental_bundle_edit_does_not_invalidate_an_unrelated_bundle() {
     edited.assets.get_mut("entry").unwrap().data = AuthoredValue::UInt(9);
     std::fs::write(&first_path, distill_bundle::write_bundle(&edited).unwrap()).unwrap();
     let published = coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![first_path],
             renames: Vec::new(),
         })
@@ -126,19 +127,19 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
     let manifest_path = assets.join("schema/sample.bundle");
     std::fs::write(&manifest_path, &manifest).unwrap();
     let coordinator = coordinator(&temp);
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     std::fs::write(&manifest_path, add_unknown_envelope_key(&manifest)).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![manifest_path.clone()],
             renames: Vec::new(),
         })
         .unwrap();
 
     {
-        let store = coordinator.store();
-        let store = store.read();
+        let store = coordinator.open_reader().unwrap();
         let errors = store.namespace_errors().unwrap();
         assert_eq!(errors.len(), 1);
         assert!(matches!(
@@ -154,13 +155,12 @@ fn complete_malformed_skeleton_is_bundle_scoped_and_heals_incrementally() {
 
     std::fs::write(&manifest_path, manifest).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![manifest_path],
             renames: Vec::new(),
         })
         .unwrap();
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert!(store.namespace_errors().unwrap().is_empty());
     assert!(store.entry(AssetUuid([94; 16])).unwrap().is_some());
 }
@@ -211,19 +211,19 @@ fn assert_only_the_shared_asset_is_withheld(store: &StoreReader) {
 fn a_colliding_asset_is_withheld_alone_and_heals_when_one_claimant_leaves() {
     let temp = tempfile::tempdir().unwrap();
     let coordinator = collision_fixture(&temp, true);
-    coordinator.reconcile_full_scan().unwrap();
-    assert_only_the_shared_asset_is_withheld(&coordinator.store().read());
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    assert_only_the_shared_asset_is_withheld(&coordinator.open_reader().unwrap());
 
     let second = temp.path().join("assets/second.bundle");
     std::fs::remove_file(&second).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![second],
             renames: Vec::new(),
         })
         .unwrap();
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert!(store.namespace_errors().unwrap().is_empty());
     assert!(store.entry(AssetUuid([32; 16])).unwrap().is_some());
     assert!(store.entry(AssetUuid([34; 16])).unwrap().is_none());
@@ -234,10 +234,11 @@ fn a_colliding_asset_is_withheld_alone_and_heals_when_one_claimant_leaves() {
 fn an_incremental_collision_withholds_the_asset_and_republishes_the_survivor_on_heal() {
     let temp = tempfile::tempdir().unwrap();
     let coordinator = collision_fixture(&temp, false);
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert!(coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .entry(AssetUuid([40; 16]))
         .unwrap()
         .is_some());
@@ -245,24 +246,23 @@ fn an_incremental_collision_withholds_the_asset_and_republishes_the_survivor_on_
     let second = temp.path().join("assets/second.bundle");
     std::fs::write(&second, bundle_sharing(33, 34, AssetUuid([40; 16]))).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![second.clone()],
             renames: Vec::new(),
         })
         .unwrap();
-    assert_only_the_shared_asset_is_withheld(&coordinator.store().read());
+    assert_only_the_shared_asset_is_withheld(&coordinator.open_reader().unwrap());
 
     // The second bundle drops the shared asset: the first bundle, whose
     // bytes never changed, publishes it again.
     std::fs::write(&second, ordinary_bundle_with(33, 34, 1).0).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![second],
             renames: Vec::new(),
         })
         .unwrap();
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert!(store.namespace_errors().unwrap().is_empty());
     assert!(store.entry(AssetUuid([34; 16])).unwrap().is_some());
     assert!(store.entry(AssetUuid([40; 16])).unwrap().is_some());
@@ -297,8 +297,7 @@ fn startup_adopts_the_pending_restart_generation_before_rpc_construction() {
     };
 
     let coordinator = coordinator(&temp);
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert_eq!(store.input_version(), InputVersion(1));
     assert!(store.pending_restart().unwrap().is_none());
     assert!(matches!(
@@ -316,13 +315,13 @@ fn full_scan_publishes_one_store_and_rpc_version() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle, asset) = ordinary_bundle();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     std::fs::write(temp.path().join("assets/ordinary.bundle"), bytes).unwrap();
 
-    let stamp = coordinator.reconcile_full_scan().unwrap();
+    let stamp = coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(stamp.version, InputVersion(1));
     assert_eq!(coordinator.server().current_stamp(), stamp);
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert_eq!(store.input_version(), InputVersion(1));
     assert!(store.bundle(bundle).unwrap().is_some());
     assert_eq!(store.entry(asset).unwrap().unwrap().local_id, "entry");
@@ -352,16 +351,16 @@ fn watcher_trigger_reconciles_an_offline_delete_in_exactly_one_version() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle, asset) = ordinary_bundle();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     let path = temp.path().join("assets/ordinary.bundle");
     std::fs::write(&path, bytes).unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     std::fs::remove_file(path).unwrap();
-    let stamp = coordinator.reconcile_full_scan().unwrap();
+    let stamp = coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert_eq!(stamp.version, InputVersion(2));
 
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert!(store.bundle(bundle).unwrap().is_none());
     assert!(store.entry(asset).unwrap().is_none());
     assert_eq!(store.input_version(), InputVersion(2));
@@ -372,9 +371,10 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     let bundle_path = temp.path().join("assets/ordinary.bundle");
     std::fs::write(&bundle_path, bytes).unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     let parsed = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     let original = &parsed.assets["entry"];
@@ -397,9 +397,9 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     });
     let backend = Arc::clone(coordinator.authoring_service());
     let stamp = coordinator
-        .coordinated_commit(InputVersion(1), || {
+        .coordinated_commit(&mut writer, InputVersion(1), |store| {
             backend
-                .prepare_write(InputVersion(1), &[operation], false)
+                .prepare_write(store, InputVersion(1), &[operation], false)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or_else(|| "production authoring returned no commit".to_owned())
         })
@@ -408,23 +408,22 @@ fn direct_authoring_rewrites_and_deletes_the_bundle_durably() {
     let rewritten = distill_bundle::parse_bundle(&std::fs::read(&bundle_path).unwrap()).unwrap();
     assert_eq!(rewritten.assets["entry"].data, AuthoredValue::UInt(9));
     assert_eq!(
-        coordinator.store().read().input_version(),
+        coordinator.open_reader().unwrap().input_version(),
         InputVersion(2)
     );
 
     let backend = Arc::clone(coordinator.authoring_service());
     let stamp = coordinator
-        .coordinated_commit(InputVersion(2), || {
+        .coordinated_commit(&mut writer, InputVersion(2), |store| {
             backend
-                .prepare_write(InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
+                .prepare_write(store, InputVersion(2), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or_else(|| "production authoring returned no commit".to_owned())
         })
         .unwrap();
     assert_eq!(stamp.version, InputVersion(3));
     assert!(!bundle_path.exists());
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert_eq!(store.input_version(), InputVersion(3));
     assert!(store.bundle(bundle_uuid).unwrap().is_none());
     assert!(store.entry(asset_uuid).unwrap().is_none());
@@ -435,16 +434,17 @@ fn a_coordinated_publication_is_invisible_until_it_commits_whole() {
     let temp = tempfile::tempdir().unwrap();
     let (bytes, bundle_uuid, asset_uuid) = ordinary_bundle();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     let bundle_path = temp.path().join("assets/ordinary.bundle");
     std::fs::write(&bundle_path, bytes).unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     let backend = Arc::clone(coordinator.authoring_service());
     let state = temp.path().join(".distill");
     let stamp = coordinator
-        .coordinated_commit(InputVersion(1), || {
+        .coordinated_commit(&mut writer, InputVersion(1), |store| {
             let commit = backend
-                .prepare_write(InputVersion(1), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
+                .prepare_write(store, InputVersion(1), &[AuthoringOp::Remove { uuid: asset_uuid }], false)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or_else(|| "production authoring returned no commit".to_owned())?;
             // The namespace is written, but not yet as a version anyone else
@@ -469,27 +469,28 @@ fn unreadable_scan_state_publishes_a_typed_version_and_heals() {
 
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     let outside = temp.path().join("outside");
     std::fs::write(&outside, b"outside").unwrap();
     let link = temp.path().join("assets/escape");
     symlink(&outside, &link).unwrap();
 
     assert_eq!(
-        coordinator.reconcile_full_scan().unwrap().version,
+        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
         InputVersion(1)
     );
-    let store = coordinator.store();
+    let store = coordinator.open_reader().unwrap();
     assert!(matches!(
-        store.read().namespace_errors().unwrap()[0].detail,
+        store.namespace_errors().unwrap()[0].detail,
         NamespaceErrorV1::UnreadableScanSubtree { .. }
     ));
 
     std::fs::remove_file(link).unwrap();
     assert_eq!(
-        coordinator.reconcile_full_scan().unwrap().version,
+        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
         InputVersion(2)
     );
-    assert!(store.read().namespace_errors().unwrap().is_empty());
+    assert!(store.namespace_errors().unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -499,8 +500,9 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
 
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     assert_eq!(
-        coordinator.reconcile_full_scan().unwrap().version,
+        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
         InputVersion(1)
     );
     let outside = temp.path().join("outside");
@@ -509,7 +511,7 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     symlink(&outside, &link).unwrap();
     assert_eq!(
         coordinator
-            .reconcile_incremental(&WatcherBatch {
+            .reconcile_incremental(&mut writer, &WatcherBatch {
                 paths: vec![link.clone()],
                 renames: Vec::new(),
             })
@@ -521,7 +523,7 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
     std::fs::remove_file(&link).unwrap();
     assert_eq!(
         coordinator
-            .reconcile_incremental(&WatcherBatch {
+            .reconcile_incremental(&mut writer, &WatcherBatch {
                 paths: vec![link],
                 renames: Vec::new(),
             })
@@ -530,8 +532,8 @@ fn incremental_scan_error_heals_when_observation_returns_to_last_good() {
         InputVersion(3)
     );
     assert!(coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .namespace_errors()
         .unwrap()
         .is_empty());
@@ -544,8 +546,9 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
 
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     assert_eq!(
-        coordinator.reconcile_full_scan().unwrap().version,
+        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
         InputVersion(1)
     );
     let outside = temp.path().join("outside");
@@ -553,7 +556,7 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
     let link = temp.path().join("assets/escape");
     symlink(&outside, &link).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![link.clone()],
             renames: Vec::new(),
         })
@@ -562,28 +565,28 @@ fn unrelated_incremental_observation_does_not_heal_pending_scan_error() {
     let unrelated = temp.path().join("assets/unrelated.txt");
     std::fs::write(&unrelated, b"new observation").unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![unrelated],
             renames: Vec::new(),
         })
         .unwrap();
     assert!(!coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .namespace_errors()
         .unwrap()
         .is_empty());
 
     std::fs::remove_file(&link).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![link],
             renames: Vec::new(),
         })
         .unwrap();
     assert!(coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .namespace_errors()
         .unwrap()
         .is_empty());
@@ -602,17 +605,18 @@ fn configuration_scan_rejection_preserves_existing_namespace_errors() {
     std::fs::write(assets.join("first.bundle"), &bytes).unwrap();
     std::fs::write(assets.join("second.bundle"), &bytes).unwrap();
     let coordinator = coordinator(&temp);
-    coordinator.reconcile_full_scan().unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     let initial = coordinator
-        .store()
-        .read()
+        .open_reader()
+        .unwrap()
         .namespace_errors()
         .unwrap();
 
     let alias = assets.join("alias");
     symlink(&real, &alias).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![alias],
             renames: Vec::new(),
         })
@@ -620,8 +624,8 @@ fn configuration_scan_rejection_preserves_existing_namespace_errors() {
 
     assert_eq!(
         coordinator
-            .store()
-            .read()
+            .open_reader()
+            .unwrap()
             .namespace_errors()
             .unwrap(),
         initial
@@ -638,14 +642,15 @@ fn directory_alias_publishes_configuration_error_without_aborting_the_version() 
     std::fs::create_dir_all(&directory).unwrap();
     symlink(&directory, temp.path().join("assets/alias")).unwrap();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
 
     assert_eq!(
-        coordinator.reconcile_full_scan().unwrap().version,
+        coordinator.reconcile_full_scan(&mut writer).unwrap().version,
         InputVersion(1)
     );
-    let store = coordinator.store();
+    let store = coordinator.open_reader().unwrap();
     assert!(matches!(
-        store.read().configuration_state().unwrap(),
+        store.configuration_state().unwrap(),
         ConfigurationState::Failed { reason, .. }
             if matches!(reason.detail.as_ref(), DscpV1::DirectoryAlias { .. })
     ));
@@ -663,21 +668,21 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
     let ordinary_path = assets.join("ordinary.bundle");
     std::fs::write(&ordinary_path, ordinary).unwrap();
     let coordinator = Arc::new(coordinator(&temp));
+    let mut writer = coordinator.open_writer().unwrap();
     coordinator.attach_build_backend();
     let alias = assets.join("daemon-state-alias");
     symlink(temp.path().join(".distill"), &alias).unwrap();
 
-    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
     assert!(matches!(
-        coordinator.scan_diagnostics().unwrap().as_slice(),
+        coordinator.scan_diagnostics(&mut writer).unwrap().as_slice(),
         [ScanDiagnostic::DaemonOwnedDirectoryAlias {
             root_name,
             normalized_path,
             ..
         }] if root_name == "main" && normalized_path == "daemon-state-alias"
     ));
-    let store = coordinator.store();
-    let store = store.read();
+    let store = coordinator.open_reader().unwrap();
     assert!(matches!(
         store.configuration_state().unwrap(),
         ConfigurationState::Ready(_)
@@ -693,21 +698,21 @@ fn daemon_state_alias_is_diagnosed_and_never_scanned() {
 
     std::fs::remove_file(&alias).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![alias.clone()],
             renames: Vec::new(),
         })
         .unwrap();
-    assert!(coordinator.scan_diagnostics().unwrap().is_empty());
+    assert!(coordinator.scan_diagnostics(&mut writer).unwrap().is_empty());
     assert_eq!(coordinator.server().current_stamp().version, version);
     symlink(temp.path().join(".distill"), &alias).unwrap();
     coordinator
-        .reconcile_incremental(&WatcherBatch {
+        .reconcile_incremental(&mut writer, &WatcherBatch {
             paths: vec![alias],
             renames: Vec::new(),
         })
         .unwrap();
-    assert_eq!(coordinator.scan_diagnostics().unwrap().len(), 1);
+    assert_eq!(coordinator.scan_diagnostics(&mut writer).unwrap().len(), 1);
     assert_eq!(coordinator.server().current_stamp().version, version);
 
     let base = coordinator.server().current_stamp().version;
@@ -778,6 +783,7 @@ fn rewrite_under_a_new_schema(
 ) -> Result<AuthoredValue, distill_rpc::RpcFailure> {
     let temp = tempfile::tempdir().unwrap();
     let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
     let type_uuid = TypeUuid([71; 16]);
     let (bundle_uuid, asset_uuid) = (BundleUuid([73; 16]), AssetUuid([72; 16]));
     let (schema, data) = stored;
@@ -801,7 +807,7 @@ fn rewrite_under_a_new_schema(
     })
     .unwrap();
     std::fs::write(&bundle_path, bytes).unwrap();
-    coordinator.reconcile_full_scan().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
 
     let (schema, value) = written;
     let operation = AuthoringOp::Set(AuthoringEntry {
@@ -822,8 +828,8 @@ fn rewrite_under_a_new_schema(
     });
     let backend = Arc::clone(coordinator.authoring_service());
     let mut failure = None;
-    let committed = coordinator.coordinated_commit(InputVersion(1), || {
-        match backend.prepare_write(InputVersion(1), &[operation], force_lossy) {
+    let committed = coordinator.coordinated_commit(&mut writer, InputVersion(1), |store| {
+        match backend.prepare_write(store, InputVersion(1), &[operation], force_lossy) {
             Ok(commit) => commit.ok_or_else(|| "no commit".to_owned()),
             Err(error) => {
                 failure = Some(error);

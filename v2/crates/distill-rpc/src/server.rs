@@ -2,10 +2,11 @@
 //!
 //! A [`ServerHandle`] is the shared, `Send + Sync` identity of one served
 //! store: its configuration, snapshot policy, publication signal, backends,
-//! and two admission counters. It is the only state connections share, and
-//! none of it is per-connection: the counters and the policy are atomics,
-//! and every thread writes through its own writer of the store
-//! ([`SharedStore`]), whose write lock orders them.
+//! two admission counters, and the store's [`StoreOpener`]. It is the only
+//! state connections share, and none of it is per-connection: the counters
+//! and the policy are atomics, and the opener is immutable but for the
+//! operational configuration. Every owner writes through a writer of its
+//! own, opened from the opener; SQLite's write lock orders them.
 //!
 //! Every client connection ([`Root::connect`], [`Root::metadata`]) owns a
 //! private front end ([`Server`]): its own store reader, its own snapshots
@@ -14,9 +15,13 @@
 //! connection, so a connection lives on one thread and needs no locks; the
 //! Cap'n Proto transport gives each one a thread of its own. A connection
 //! learns of publications from the handle's watch signal and reads the
-//! change log itself, from its own cursor. Admin work (commits, installs)
-//! goes through a per-thread front end ([`Server::attach`]) that holds no
-//! connection state.
+//! change log itself, from its own cursor. A connection opens its writer
+//! on its first write and runs writes, imports and operations inline on
+//! its own thread, so a call waiting on the write lock delays only its
+//! own connection. Admin work (commits, installs) takes the caller's
+//! writer explicitly ([`ServerHandle::coordinated_commit`] and friends);
+//! [`Server::open`] wraps the handle with a writer of its own for callers
+//! that have none.
 //!
 //! Embedded servers (tests, tools) own a private store in a temporary
 //! directory. Daemon servers share the daemon's store: the daemon's
@@ -24,7 +29,7 @@
 //! input ([`crate::apply_commit`]), and then the handle is signalled.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
@@ -38,7 +43,7 @@ use unicode_normalization::UnicodeNormalization;
 use distill_store::served::{
     Change, ChangeEntry, ServedWrite, SERVED_PIPELINE,
 };
-use distill_store::{SharedStore, Store, StoreConfig, StoreError, StoreReader};
+use distill_store::{Store, StoreConfig, StoreError, StoreOpener, StoreReader, StoreWriter};
 
 use crate::apply::{
     apply_commit, apply_commit_served, configuration_status, publish_protocol_epoch, publish_restart_required,
@@ -152,46 +157,6 @@ pub enum CoordinatedCommitError {
 // ---------------------------------------------------------------------------
 // Handle
 
-/// A publication a transport runs on a blocking thread, so its event loop
-/// never waits on SQLite's write lock ([`WriteCall::run`]).
-pub struct WriteCall<T> {
-    handle: Arc<ServerHandle>,
-    step: Box<dyn FnOnce(&Server) -> T + Send>,
-}
-
-impl<T> WriteCall<T> {
-    /// Run the step on this thread's front end.
-    pub fn run(self) -> T {
-        let Self { handle, step } = self;
-        step(&Server::attach(&handle))
-    }
-}
-
-/// An input the daemon's coordinated step joins: rolled back unless
-/// finished.
-struct OpenInput<'a> {
-    handle: &'a ServerHandle,
-    open: bool,
-}
-
-impl OpenInput<'_> {
-    fn finish(mut self) -> Result<(), CoordinatedCommitError> {
-        self.open = false;
-        self.handle
-            .with_store(|store| store.finish_input(true))
-            .map(|_| ())
-            .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))
-    }
-}
-
-impl Drop for OpenInput<'_> {
-    fn drop(&mut self) {
-        if self.open {
-            let _ = self.handle.with_store(|store| store.finish_input(false));
-        }
-    }
-}
-
 enum PublishError {
     Stale {
         expected: InputVersion,
@@ -201,12 +166,10 @@ enum PublishError {
     Store(StoreError),
 }
 
-static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// The shared identity of one served store. Cheap front ends attach to it
-/// per thread ([`Server::attach`]).
+/// The shared identity of one served store. Every connection opens a front
+/// end of its own on it ([`Root::connect`]); writes go through a writer the
+/// caller owns and passes in.
 pub struct ServerHandle {
-    id: u64,
     instance: StoreInstanceId,
     config: StoreConfig,
     published: watch::Sender<u64>,
@@ -221,8 +184,8 @@ pub struct ServerHandle {
     /// Admitted hubs and metadata hubs ([`SnapshotPolicy::max_connections`]).
     open_connections: AtomicUsize,
     next_connection_id: AtomicU64,
-    /// Every thread writes through its own writer of this store.
-    store: Option<Arc<SharedStore>>,
+    /// Opens each owner's own reader and writer.
+    opener: Arc<StoreOpener>,
     embedded_dir: Option<PathBuf>,
 }
 
@@ -237,7 +200,6 @@ impl fmt::Debug for ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        self.store.take();
         if let Some(dir) = self.embedded_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -249,11 +211,10 @@ impl ServerHandle {
         instance: StoreInstanceId,
         config: StoreConfig,
         authoring_backend: Arc<dyn AuthoringBackend>,
-        store: Arc<SharedStore>,
+        opener: Arc<StoreOpener>,
         embedded_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            id: NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed),
             instance,
             config,
             published: watch::Sender::new(0),
@@ -264,26 +225,28 @@ impl ServerHandle {
             open_snapshots: AtomicUsize::new(0),
             open_connections: AtomicUsize::new(0),
             next_connection_id: AtomicU64::new(1),
-            store: Some(store),
+            opener,
             embedded_dir,
         })
     }
 
     /// Serve a daemon store. The target set must already be recorded
     /// ([`crate::publish_target_set`]).
-    pub fn open(authoring_backend: Arc<dyn AuthoringBackend>, store: Arc<SharedStore>) -> Arc<Self> {
-        let config = StoreConfig::clone(&store.config());
-        Self::new(store.instance_id(), config, authoring_backend, store, None)
+    pub fn open(
+        authoring_backend: Arc<dyn AuthoringBackend>,
+        opener: Arc<StoreOpener>,
+    ) -> Arc<Self> {
+        let config = StoreConfig::clone(&opener.config());
+        Self::new(opener.instance_id(), config, authoring_backend, opener, None)
+    }
+
+    /// Opens readers and writers on the served store.
+    pub fn opener(&self) -> &Arc<StoreOpener> {
+        &self.opener
     }
 
     pub fn instance(&self) -> StoreInstanceId {
         self.instance
-    }
-
-    /// Run `job` on this thread's writer.
-    fn with_store<T>(&self, job: impl FnOnce(&mut Store) -> T) -> T {
-        let store = self.store.as_ref().expect("the store lives as long as the handle");
-        job(&mut store.write())
     }
 
     pub(crate) fn embedded(&self) -> bool {
@@ -384,12 +347,13 @@ impl ServerHandle {
     /// becomes that version); the served projection is applied on top.
     fn publish(
         &self,
+        store: &mut Store,
         base: Option<InputVersion>,
         commit: Commit,
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<SnapshotStamp, PublishError> {
         let full = self.embedded();
-        let result = self.with_store(|store| {
+        let result = (|| {
             let mut rejection = None;
             let mut stale = None;
             let mut reject = |error: ApplyError| match error {
@@ -448,9 +412,9 @@ impl ServerHandle {
                     None => PublishError::Store(error),
                 })),
             }
-        });
+        })();
         // Inside an open input, readers are told once it commits.
-        if result.is_ok() && !self.with_store(|store| store.input_open()) {
+        if result.is_ok() && !store.input_open() {
             self.notify_published();
         }
         result
@@ -458,20 +422,19 @@ impl ServerHandle {
 
     /// Change served state in one transaction, optionally as a new (empty)
     /// input version.
-    fn write_served<T: Send + 'static>(
+    fn write_served<T>(
         &self,
+        store: &mut Store,
         new_version: bool,
-        job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<T, StoreError> + Send + 'static,
+        job: impl FnOnce(&mut dyn ServedWriteObj) -> Result<T, StoreError>,
     ) -> T {
-        let result = self.with_store(|store| {
-            if new_version {
-                store
-                    .input_transaction(|txn| job(txn))
-                    .map(|(value, _)| value)
-            } else {
-                store.served_transaction(|txn| job(txn))
-            }
-        });
+        let result = if new_version {
+            store
+                .input_transaction(|txn| job(txn))
+                .map(|(value, _)| value)
+        } else {
+            store.served_transaction(|txn| job(txn))
+        };
         let value = result.unwrap_or_else(|error| panic!("RPC store write failed: {error}"));
         self.notify_published();
         value
@@ -533,6 +496,7 @@ impl BuildBackend for UnavailableBuildBackend {
 impl AuthoringBackend for UnavailableAuthoringBackend {
     fn prepare_import(
         &self,
+        _store: &mut Store,
         _base: InputVersion,
         _request: &ImportRequest,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -543,6 +507,7 @@ impl AuthoringBackend for UnavailableAuthoringBackend {
 
     fn prepare_reimport(
         &self,
+        _store: &mut Store,
         _base: InputVersion,
         _bundle: BundleUuid,
     ) -> Result<PreparedImportCommit, RpcFailure> {
@@ -553,6 +518,7 @@ impl AuthoringBackend for UnavailableAuthoringBackend {
 
     fn prepare_operation(
         &self,
+        _store: &mut Store,
         _base: InputVersion,
         _operation: &LongRunningOp,
     ) -> Result<PreparedOperationCommit, RpcFailure> {
@@ -577,13 +543,8 @@ fn embedded_state_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 // Front end
 
-thread_local! {
-    /// Each thread's admin front end, by handle ([`Server::attach`]).
-    static FRONT_ENDS: RefCell<HashMap<u64, Weak<Inner>>> = RefCell::new(HashMap::new());
-}
-
-/// A front end of one served store: one connection's, or a thread's admin
-/// front end ([`Server::attach`]). Cheap to clone; not `Send`.
+/// A front end of one served store: one connection's, or an admin front end
+/// ([`Server::open`]). Cheap to clone; not `Send`.
 /// [`Server::root`] hands out the `Send` bootstrap for other threads.
 #[derive(Clone)]
 pub struct Server {
@@ -595,6 +556,8 @@ pub struct Server {
 pub(crate) struct Inner {
     /// Current-state reads: fences, the change log, CAS bytes, artifacts.
     pub(crate) reader: StoreReader,
+    /// This front end's writer, opened on its first write.
+    writer: RefCell<Option<StoreWriter>>,
     /// This front end's snapshots of one version share a read transaction.
     current_txn: RefCell<Weak<SnapshotTxn>>,
     /// This front end's open snapshots, oldest first.
@@ -687,30 +650,21 @@ impl Server {
         store
             .served_transaction(|txn| publish_target_set(txn, &target_map))
             .expect("embedded RPC store records its targets");
-        let handle = ServerHandle::new(
-            instance,
-            config,
-            authoring_backend,
-            Arc::new(SharedStore::new(store)),
-            Some(dir),
-        );
-        Ok(Self::attach(&handle))
+        let (opener, writer) = StoreOpener::new(store);
+        let handle = ServerHandle::new(instance, config, authoring_backend, opener, Some(dir));
+        let server = Self::open(&handle);
+        *server.inner.writer.borrow_mut() = Some(writer);
+        Ok(server)
     }
 
-    /// This thread's admin front end of `handle`: commits, installs, and
-    /// current-state reads. It holds no connection state; every connection
-    /// gets a front end of its own ([`Root::connect`]).
-    pub fn attach(handle: &Arc<ServerHandle>) -> Self {
-        FRONT_ENDS.with(|front_ends| {
-            let mut front_ends = front_ends.borrow_mut();
-            if let Some(inner) = front_ends.get(&handle.id).and_then(Weak::upgrade) {
-                return Self { inner };
-            }
-            front_ends.retain(|_, inner| inner.strong_count() > 0);
-            let inner = Rc::new(Inner::open(handle, None));
-            front_ends.insert(handle.id, Rc::downgrade(&inner));
-            Self { inner }
-        })
+    /// An admin front end of `handle` of the caller's own: commits,
+    /// installs and current-state reads on its own reader and writer. It
+    /// holds no connection state; every connection gets a front end of its
+    /// own ([`Root::connect`]).
+    pub fn open(handle: &Arc<ServerHandle>) -> Self {
+        Self {
+            inner: Rc::new(Inner::open(handle, None)),
+        }
     }
 
     /// A front end of its own for one admitted connection.
@@ -803,21 +757,18 @@ impl Server {
         Ok(requests)
     }
 
+}
+
+impl ServerHandle {
     /// Publish a runtime failure of the current pipeline epoch. Every
     /// snapshot that pinned the epoch sees it and every connection must
-    /// reconnect. `persist` records the daemon's own durable failure first.
+    /// reconnect. `persist` records the daemon's own durable failure first,
+    /// on the same writer.
     pub fn coordinated_runtime_pipeline_failure(
         &self,
+        store: &mut Store,
         failure: PipelineFailure,
-        persist: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
-        self.runtime_pipeline_failure_locked(failure, persist)
-    }
-
-    fn runtime_pipeline_failure_locked(
-        &self,
-        failure: PipelineFailure,
-        persist: impl FnOnce() -> Result<(), String>,
+        persist: impl FnOnce(&mut Store) -> Result<(), String>,
     ) -> Result<(), String> {
         failure
             .validate()
@@ -825,9 +776,9 @@ impl Server {
         if failure.origin != PipelineFailureOrigin::PublishedRuntime {
             return Err("runtime failure publication requires PublishedRuntime origin".to_owned());
         }
-        let (_, current) = self
-            .inner
-            .current_pipeline()
+        let (_, current) = store
+            .served_blob(SERVED_PIPELINE)
+            .and_then(read_served_pipeline)
             .map_err(|error| error.to_string())?;
         match &current {
             PipelineDiagnostic::Ready => {}
@@ -838,24 +789,29 @@ impl Server {
                 ))
             }
         }
-        persist()?;
-        self.inner
-            .handle
-            .write_served(false, move |txn| txn.runtime_failure(failure));
+        persist(store)?;
+        self.write_served(store, false, move |txn| txn.runtime_failure(failure));
         Ok(())
     }
 
+    /// The version `store` is at, as this server stamps it.
+    pub fn stamp_of(&self, store: &StoreReader) -> SnapshotStamp {
+        SnapshotStamp {
+            instance: self.instance,
+            version: store.input_version(),
+        }
+    }
+
     /// Advance the protocol epoch and fence every existing connection.
-    pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> SnapshotStamp {
-        self.inner
-            .handle
-            .write_served(true, move |txn| txn.protocol_epoch(protocol_epoch));
-        self.current_stamp()
+    pub fn replace_protocol_epoch(&self, store: &mut Store, protocol_epoch: u32) -> SnapshotStamp {
+        self.write_served(store, true, move |txn| txn.protocol_epoch(protocol_epoch));
+        self.stamp_of(store)
     }
 
     /// Validate and publish one artifact with its typed direct load edges.
     pub fn install_artifact(
         &self,
+        store: &mut Store,
         hash: ContentHash,
         payload: ArtifactPayload,
     ) -> Result<(), AdminError> {
@@ -898,14 +854,13 @@ impl Server {
             .iter()
             .map(|edge| (edge.asset, edge.expected_terminal))
             .collect::<Vec<_>>();
-        if self.inner.reader.cas_contains(&hash.0).unwrap_or(false) {
-            let existing = self
-                .inner
-                .reader
-                .artifact_load_edges(hash)
-                .map_err(|error| AdminError::InvalidArtifact {
-                    detail: format!("cannot read recorded load edges: {error}"),
-                })?;
+        if store.cas_contains(&hash.0).unwrap_or(false) {
+            let existing =
+                store
+                    .artifact_load_edges(hash)
+                    .map_err(|error| AdminError::InvalidArtifact {
+                        detail: format!("cannot read recorded load edges: {error}"),
+                    })?;
             if existing == edges && (!edges.is_empty() || !existing.is_empty()) {
                 return Ok(());
             }
@@ -914,11 +869,7 @@ impl Server {
             }
         }
         let bytes = distill_wire::artifact::assemble_artifact(&payload.structural, &blob_parts);
-        let stored = self
-            .inner
-            .handle
-            .with_store(|store| store.put_artifact(asset, &bytes, &edges));
-        match stored {
+        match store.put_artifact(asset, &bytes, &edges) {
             Ok(stored) if stored == hash => Ok(()),
             Ok(stored) => Err(AdminError::InvalidArtifact {
                 detail: format!("stored artifact hash {stored:?} differs from {hash:?}"),
@@ -933,7 +884,12 @@ impl Server {
     }
 
     /// Validate and publish one canonical DSWL body.
-    pub fn install_wire_tree(&self, hash: LayoutHash, bytes: Arc<[u8]>) -> Result<(), AdminError> {
+    pub fn install_wire_tree(
+        &self,
+        store: &mut Store,
+        hash: LayoutHash,
+        bytes: Arc<[u8]>,
+    ) -> Result<(), AdminError> {
         let root = distill_wire::dswl::decode_dswl(&bytes).map_err(|error| {
             AdminError::InvalidWireTree {
                 detail: format!("invalid canonical DSWL body: {error:?}"),
@@ -949,14 +905,11 @@ impl Server {
                 observed,
             });
         }
-        if self.inner.reader.wire_tree_read(hash).is_ok() {
+        if store.wire_tree_read(hash).is_ok() {
             return Ok(());
         }
-        let body = bytes.to_vec();
-        let stored = self
-            .inner
-            .handle
-            .with_store(|store| store.put_wire_tree(&body))
+        let stored = store
+            .put_wire_tree(&bytes)
             .map_err(|error| AdminError::InvalidWireTree {
                 detail: format!("the store rejected the wire tree: {error}"),
             })?;
@@ -972,6 +925,7 @@ impl Server {
     /// Publish a build's artifacts and wire trees; return its root hash.
     pub(crate) fn install_build_publication(
         &self,
+        store: &mut Store,
         asset: AssetUuid,
         publication: BuildPublication,
     ) -> Result<ContentHash, RpcFailure> {
@@ -1013,7 +967,7 @@ impl Server {
                     detail: "lazy-build publication contains a duplicate wire tree".to_owned(),
                 });
             }
-            self.install_wire_tree(tree.layout_hash, tree.bytes)
+            self.install_wire_tree(store, tree.layout_hash, tree.bytes)
                 .map_err(|error| RpcFailure::InvalidQuery {
                     detail: format!("lazy-build wire-tree publication rejected: {error:?}"),
                 })?;
@@ -1025,7 +979,7 @@ impl Server {
                     detail: "lazy-build publication contains a duplicate artifact".to_owned(),
                 });
             }
-            self.install_artifact(artifact.content_hash, artifact.payload)
+            self.install_artifact(store, artifact.content_hash, artifact.payload)
                 .map_err(|error| RpcFailure::InvalidQuery {
                     detail: format!("lazy-build artifact publication rejected: {error:?}"),
                 })?;
@@ -1033,95 +987,84 @@ impl Server {
         Ok(root_hash)
     }
 
-    /// Embedded: publish an input-version commit.
-    pub fn commit(&self, commit: Commit) -> Result<SnapshotStamp, AdminError> {
-        assert!(
-            self.inner.handle.embedded(),
-            "the daemon publishes through coordinated commits"
-        );
-        match self.inner.handle.publish(None, commit, None) {
-            Ok(stamp) => Ok(stamp),
-            Err(PublishError::Invalid(error)) => Err(error),
-            Err(PublishError::Stale { .. }) => unreachable!("an unconditioned commit is never stale"),
-            Err(PublishError::Store(error)) => panic!("embedded RPC store write failed: {error}"),
-        }
-    }
-
-    /// Publish one coordinator step against `base`. `publish` runs the
-    /// daemon's durable step (if any) and returns the RPC delta, which is
-    /// then applied as the version after `base`. No other publication
-    /// interleaves.
+    /// Publish one coordinator step against `base` on `store`. `publish`
+    /// runs the daemon's durable step (if any) on that same writer, inside
+    /// the input, and returns the RPC delta, which is then applied as the
+    /// version after `base`. No other publication interleaves.
     pub fn coordinated_commit(
         &self,
+        store: &mut Store,
         base: InputVersion,
-        publish: impl FnOnce() -> Result<Commit, String>,
+        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.coordinated_maybe_commit(base, || publish().map(Some))
+        self.coordinated_maybe_commit(store, base, |store| publish(store).map(Some))
             .map(|stamp| stamp.expect("a coordinated commit always publishes"))
-    }
-
-    /// `step` as a job a transport runs on its blocking pool, never on its
-    /// event loop.
-    pub(crate) fn write_call<T: Send + 'static>(
-        &self,
-        step: impl FnOnce(&Server) -> T + Send + 'static,
-    ) -> WriteCall<T> {
-        WriteCall {
-            handle: Arc::clone(&self.inner.handle),
-            step: Box::new(step),
-        }
     }
 
     /// A coordinated publication that may terminate in durable memo state
     /// only; `None` leaves the input version untouched.
     pub fn coordinated_maybe_commit(
         &self,
+        store: &mut Store,
         base: InputVersion,
-        publish: impl FnOnce() -> Result<Option<Commit>, String>,
+        publish: impl FnOnce(&mut Store) -> Result<Option<Commit>, String>,
     ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
-        self.coordinated_locked(base, publish, None)
+        self.coordinated_locked(store, base, publish, None)
     }
 
     fn coordinated_locked(
         &self,
+        store: &mut Store,
         base: InputVersion,
-        publish: impl FnOnce() -> Result<Option<Commit>, String>,
+        publish: impl FnOnce(&mut Store) -> Result<Option<Commit>, String>,
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
-        let handle = &self.inner.handle;
         // The step, its own writes and the served projection commit as one
-        // input, begun here: the base is checked inside it, and no reader
-        // sees the version before its rows.
-        let observed = handle
-            .with_store(|store| store.open_input())
+        // input on this writer, begun here: the base is checked inside it,
+        // and no reader sees the version before its rows.
+        let observed = store
+            .open_input()
             .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
-        let open = OpenInput { handle, open: true };
-        if observed != base {
-            return Err(CoordinatedCommitError::Stale {
-                expected: base,
-                observed,
-            });
-        }
-        let published = match publish().map_err(CoordinatedCommitError::Publication)? {
-            Some(commit) => Some(self.publish_locked(base, commit, targets)?),
-            None => None,
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if observed != base {
+                return Err(CoordinatedCommitError::Stale {
+                    expected: base,
+                    observed,
+                });
+            }
+            match publish(store).map_err(CoordinatedCommitError::Publication)? {
+                Some(commit) => self.publish_locked(store, base, commit, targets).map(Some),
+                None => Ok(None),
+            }
+        }));
+        let published = match step {
+            Ok(Ok(published)) => published,
+            Ok(Err(error)) => {
+                let _ = store.finish_input(false);
+                return Err(error);
+            }
+            Err(panic) => {
+                let _ = store.finish_input(false);
+                std::panic::resume_unwind(panic);
+            }
         };
-        open.finish()?;
-        handle.notify_published();
+        store
+            .finish_input(true)
+            .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
+        self.notify_published();
         Ok(published)
     }
 
-    /// Apply `commit` as the version after `base`, inside the caller's
-    /// input.
+    /// Apply `commit` as the version after `base`, inside the input open on
+    /// `store`.
     pub(crate) fn publish_locked(
         &self,
+        store: &mut Store,
         base: InputVersion,
         commit: Commit,
         targets: Option<BTreeMap<String, TargetDefinitionHash>>,
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
-        self.inner
-            .handle
-            .publish(Some(base), commit, targets)
+        self.publish(store, Some(base), commit, targets)
             .map_err(|error| match error {
                 PublishError::Stale { expected, observed } => {
                     CoordinatedCommitError::Stale { expected, observed }
@@ -1135,53 +1078,160 @@ impl Server {
     /// coordinator commit's projection.
     pub fn coordinated_replace_target_set(
         &self,
+        store: &mut Store,
         base: InputVersion,
         replacements: Vec<TargetDefinition>,
-        publish: impl FnOnce() -> Result<Commit, String>,
+        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
     ) -> Result<SnapshotStamp, CoordinatedCommitError> {
         let targets = target_map(replacements)
             .map_err(|error| CoordinatedCommitError::Publication(error.to_string()))?;
-        self.coordinated_locked(base, || publish().map(Some), Some(targets))
-        .map(|stamp| stamp.expect("a coordinated commit always publishes"))
+        self.coordinated_locked(store, base, |store| publish(store).map(Some), Some(targets))
+            .map(|stamp| stamp.expect("a coordinated commit always publishes"))
     }
 
     /// Discard cursor history strictly before `oldest_available`.
-    pub fn discard_history_before(&self, oldest_available: InputVersion) {
-        self.inner
-            .handle
-            .write_served(false, move |txn| txn.discard_before(oldest_available));
+    pub fn discard_history_before(&self, store: &mut Store, oldest_available: InputVersion) {
+        self.write_served(store, false, move |txn| txn.discard_before(oldest_available));
     }
 
     /// Replace a staged target definition and fence every bound Hub.
     pub fn replace_target(
         &self,
+        store: &mut Store,
         replacement: TargetDefinition,
     ) -> Result<SnapshotStamp, AdminError> {
         let name = replacement.name().to_owned();
         let hash = replacement.definition_hash();
-        let known = self.inner.reader.rpc_target(&name).map_err(|_| AdminError::UnknownTarget {
+        let known = store.rpc_target(&name).map_err(|_| AdminError::UnknownTarget {
             target: name.clone(),
         })?;
         match known {
             None => return Err(AdminError::UnknownTarget { target: name }),
-            Some(row) if row.definition_hash == hash.0 => return Ok(self.current_stamp()),
+            Some(row) if row.definition_hash == hash.0 => return Ok(self.stamp_of(store)),
             Some(_) => {}
         }
-        let changed = self
-            .inner
-            .handle
-            .write_served(true, move |txn| txn.target(&name, hash));
+        let changed = self.write_served(store, true, move |txn| txn.target(&name, hash));
         debug_assert_eq!(changed, Some(true));
-        Ok(self.current_stamp())
+        Ok(self.stamp_of(store))
     }
 
     /// Stage a valid restart-only edit. This does not advance the input
     /// version or mutate active configuration values.
+    pub fn restart_required(&self, store: &mut Store, keys: Vec<String>) -> SnapshotStamp {
+        self.write_served(store, false, move |txn| txn.restart(&keys));
+        self.stamp_of(store)
+    }
+}
+
+/// Admin calls on a front end's own writer: embedded servers and tests.
+impl Server {
+    /// Run `job` on this front end's writer, opening it on first use.
+    pub fn with_writer<T>(&self, job: impl FnOnce(&mut Store) -> T) -> T {
+        self.inner.with_writer(job)
+    }
+
+    pub fn coordinated_runtime_pipeline_failure(
+        &self,
+        failure: PipelineFailure,
+        persist: impl FnOnce(&mut Store) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.with_writer(|store| {
+            self.inner
+                .handle
+                .coordinated_runtime_pipeline_failure(store, failure, persist)
+        })
+    }
+
+    pub fn replace_protocol_epoch(&self, protocol_epoch: u32) -> SnapshotStamp {
+        self.with_writer(|store| self.inner.handle.replace_protocol_epoch(store, protocol_epoch))
+    }
+
+    pub fn install_artifact(
+        &self,
+        hash: ContentHash,
+        payload: ArtifactPayload,
+    ) -> Result<(), AdminError> {
+        self.with_writer(|store| self.inner.handle.install_artifact(store, hash, payload))
+    }
+
+    pub fn install_wire_tree(&self, hash: LayoutHash, bytes: Arc<[u8]>) -> Result<(), AdminError> {
+        self.with_writer(|store| self.inner.handle.install_wire_tree(store, hash, bytes))
+    }
+
+    pub(crate) fn install_build_publication(
+        &self,
+        asset: AssetUuid,
+        publication: BuildPublication,
+    ) -> Result<ContentHash, RpcFailure> {
+        self.with_writer(|store| {
+            self.inner
+                .handle
+                .install_build_publication(store, asset, publication)
+        })
+    }
+
+    /// Embedded: publish an input-version commit.
+    pub fn commit(&self, commit: Commit) -> Result<SnapshotStamp, AdminError> {
+        assert!(
+            self.inner.handle.embedded(),
+            "the daemon publishes through coordinated commits"
+        );
+        match self
+            .with_writer(|store| self.inner.handle.publish(store, None, commit, None))
+        {
+            Ok(stamp) => Ok(stamp),
+            Err(PublishError::Invalid(error)) => Err(error),
+            Err(PublishError::Stale { .. }) => unreachable!("an unconditioned commit is never stale"),
+            Err(PublishError::Store(error)) => panic!("embedded RPC store write failed: {error}"),
+        }
+    }
+
+    pub fn coordinated_commit(
+        &self,
+        base: InputVersion,
+        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
+    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
+        self.with_writer(|store| self.inner.handle.coordinated_commit(store, base, publish))
+    }
+
+    pub fn coordinated_maybe_commit(
+        &self,
+        base: InputVersion,
+        publish: impl FnOnce(&mut Store) -> Result<Option<Commit>, String>,
+    ) -> Result<Option<SnapshotStamp>, CoordinatedCommitError> {
+        self.with_writer(|store| {
+            self.inner
+                .handle
+                .coordinated_maybe_commit(store, base, publish)
+        })
+    }
+
+    pub fn coordinated_replace_target_set(
+        &self,
+        base: InputVersion,
+        replacements: Vec<TargetDefinition>,
+        publish: impl FnOnce(&mut Store) -> Result<Commit, String>,
+    ) -> Result<SnapshotStamp, CoordinatedCommitError> {
+        self.with_writer(|store| {
+            self.inner
+                .handle
+                .coordinated_replace_target_set(store, base, replacements, publish)
+        })
+    }
+
+    pub fn discard_history_before(&self, oldest_available: InputVersion) {
+        self.with_writer(|store| self.inner.handle.discard_history_before(store, oldest_available))
+    }
+
+    pub fn replace_target(
+        &self,
+        replacement: TargetDefinition,
+    ) -> Result<SnapshotStamp, AdminError> {
+        self.with_writer(|store| self.inner.handle.replace_target(store, replacement))
+    }
+
     pub fn restart_required(&self, keys: Vec<String>) -> SnapshotStamp {
-        self.inner
-            .handle
-            .write_served(false, move |txn| txn.restart(&keys));
-        self.current_stamp()
+        self.with_writer(|store| self.inner.handle.restart_required(store, keys))
     }
 }
 
@@ -1456,11 +1506,25 @@ impl Inner {
             .unwrap_or_else(|error| panic!("cannot read the served store: {error}"));
         Self {
             reader,
+            writer: RefCell::new(None),
             current_txn: RefCell::new(Weak::new()),
             snapshots: RefCell::new(VecDeque::new()),
             handle: Arc::clone(handle),
             _admission: admission,
         }
+    }
+
+    /// Run `job` on this front end's writer, opening it on first use. Not
+    /// reentrant: whatever `job` calls receives the writer explicitly.
+    pub(crate) fn with_writer<T>(&self, job: impl FnOnce(&mut Store) -> T) -> T {
+        let mut writer = self.writer.borrow_mut();
+        let writer = match &mut *writer {
+            Some(writer) => writer,
+            empty => empty.insert(self.handle.opener.open_writer().unwrap_or_else(|error| {
+                panic!("cannot open a writer on the served store: {error}")
+            })),
+        };
+        job(writer)
     }
 
     pub(crate) fn current_stamp(&self) -> SnapshotStamp {
@@ -1854,7 +1918,7 @@ pub(crate) fn publish_backend_commit(
     commit: Commit,
 ) -> Result<SnapshotStamp, RpcFailure> {
     server
-        .publish_locked(base, commit, None)
+        .with_writer(|store| server.inner.handle.publish_locked(store, base, commit, None))
         .map_err(|error| match error {
             CoordinatedCommitError::Stale { expected, observed } => {
                 RpcFailure::StaleInputVersion {
