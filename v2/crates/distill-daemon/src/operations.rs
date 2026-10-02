@@ -299,9 +299,9 @@ impl OperationRuntime {
         };
         let (filesystem_mismatch, scan_diagnostics) = if request == DoctorRequest::Verify {
             let observed = self.scanner.scan().map_err(|error| error.to_string())?;
-            let published = crate::scanner::ScanSnapshot::load(store)
+            let mismatch = !observed
+                .matches_published(store, true)
                 .map_err(|error| error.to_string())?;
-            let mismatch = !observed.same_observation(&published);
             let diagnostics = observed
                 .diagnostic_rows()
                 .map(ToString::to_string)
