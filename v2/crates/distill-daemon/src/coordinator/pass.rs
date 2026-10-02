@@ -606,7 +606,7 @@ impl DaemonCoordinator {
                 if PendingScanRejection::stored(store)?.is_none()
                     && self.scan_initialized.get().is_some() =>
             {
-                if scan.same_namespace_observation(&ScanSnapshot::load(store)?) {
+                if scan.matches_published(store, false)? {
                     // Warning-grade exclusions are scanner state, not authored
                     // input: refresh them without minting an input version.
                     Ok(ScanStep::Diagnostics {

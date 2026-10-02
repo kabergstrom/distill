@@ -39,7 +39,7 @@ use globset::Glob;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::compiled::Compiled;
 use crate::scanner::{RootedScanner, ScanError};
-use distill_store::files::{FileKind, ObservedFile};
+use distill_store::files::{FileKind, ObservedFile, PathSelection};
 
 pub use distill_pipeline_api::importer::{
     AuthoringImportContext, AuthoringImporter, AuthoringImporterError,
@@ -483,7 +483,7 @@ impl AuthoringService {
             }
         }
         if work.is_none() {
-            let bundles = store.all_bundles().map_err(invalid)?;
+            let bundles = store.generated_bundles().map_err(invalid)?;
             self.record_directory_orphans(store, &bundles, &active_origins, &capabilities)?;
         } else {
             self.record_directory_orphans_affected(
@@ -973,7 +973,20 @@ impl AuthoringService {
         let watched = {
             require_base(store, base)?;
             let mut watched = Vec::new();
-            for meta in store.all_bundles().map_err(invalid)? {
+            // Only a bundle with a `$record` entry row can hold an import
+            // record; a poisoned bundle has no rows, so its file is read as
+            // a full read would. Every other bundle would `continue` below.
+            let mut candidates = store
+                .bundles_with_reserved_entry("$record")
+                .map_err(invalid)?;
+            candidates.extend(store.poisoned_bundles().map_err(invalid)?);
+            candidates.sort();
+            candidates.dedup();
+            for bundle in candidates {
+                let meta = store
+                    .bundle(bundle)
+                    .map_err(invalid)?
+                    .ok_or_else(|| invalid(format!("bundle {bundle} has entry rows but no row")))?;
                 let bundle = self.cached_bundle(store, &meta)?;
                 let Some(record) = bundle.assets.get("$record") else {
                     continue;
@@ -1492,12 +1505,7 @@ impl AuthoringService {
         requested_root: &str,
     ) -> Result<ImportDestination, RpcFailure> {
         let compiled = self.compiled(store)?;
-        let matches = store
-            .all_bundles()
-            .map_err(invalid)?
-            .into_iter()
-            .filter(|meta| meta.path == path)
-            .collect::<Vec<_>>();
+        let matches = store.bundles_at_path(path).map_err(invalid)?;
         let meta = match matches.as_slice() {
             [] => None,
             [meta] => Some(meta.clone()),
@@ -1552,10 +1560,7 @@ impl AuthoringService {
             )));
         }
         let mut meta = None;
-        for candidate in store.all_bundles().map_err(invalid)? {
-            if candidate.path != path {
-                continue;
-            }
+        for candidate in store.bundles_at_path(&path).map_err(invalid)? {
             let candidate_root = store
                 .root_name(candidate.root)
                 .map_err(invalid)?
@@ -1951,11 +1956,15 @@ impl ImportRows<'_> {
         }
     }
 
-    fn observed_files(&self) -> Result<Vec<ObservedFile>, StoreError> {
+    /// The rows `selection` selects, in (root name, path) order.
+    fn observed_files_in(
+        &self,
+        selection: PathSelection<'_>,
+    ) -> Result<Vec<ObservedFile>, StoreError> {
         match self {
-            Self::Borrowed(reader) => reader.observed_files(),
-            Self::Owned(reader, None) => reader.observed_files(),
-            Self::Owned(reader, Some(overlay)) => overlay.files(reader),
+            Self::Borrowed(reader) => reader.observed_files_in(selection),
+            Self::Owned(reader, None) => reader.observed_files_in(selection),
+            Self::Owned(reader, Some(overlay)) => overlay.files_in(reader, selection),
         }
     }
 }
@@ -2015,12 +2024,23 @@ impl FileOverlay {
         Ok(rows)
     }
 
-    fn files(&self, reader: &StoreReader) -> Result<Vec<ObservedFile>, StoreError> {
+    /// The rows `selection` selects as the pass will publish them: the
+    /// committed rows it selects outside the overlay plus the overlay's own.
+    fn files_in(
+        &self,
+        reader: &StoreReader,
+        selection: PathSelection<'_>,
+    ) -> Result<Vec<ObservedFile>, StoreError> {
         let mut rows = match self.under {
             None => Vec::new(),
-            Some(_) => self.committed(reader.observed_files()?),
+            Some(_) => self.committed(reader.observed_files_in(selection)?),
         };
-        rows.extend(self.rows.iter().cloned());
+        rows.extend(
+            self.rows
+                .iter()
+                .filter(|row| selection.contains(&row.path))
+                .cloned(),
+        );
         rows.sort_by(|left, right| {
             (&left.root_name, &left.path).cmp(&(&right.root_name, &right.path))
         });
@@ -2147,9 +2167,17 @@ impl ImportBackend for RootedImportBackend<'_> {
             .map(|glob| Glob::new(glob).map(|glob| glob.compile_matcher()))
             .transpose()
             .map_err(|_| RawFileFailureClass::OtherStable)?;
+        // SQL narrows the rows to the prefix subtree, or else to the glob's
+        // literal prefix; both filters below still decide every row.
+        let literal = query.path_glob.as_deref().map(glob_literal_prefix);
+        let selection = match (&query.path_prefix, literal) {
+            (Some(prefix), _) => PathSelection::Subtree(prefix),
+            (None, Some(literal)) if !literal.is_empty() => PathSelection::Prefix(literal),
+            (None, _) => PathSelection::All,
+        };
         let rows = self
             .rows
-            .observed_files()
+            .observed_files_in(selection)
             .map_err(|_| RawFileFailureClass::ListingFailed)?;
         let mut results = Vec::new();
         for row in rows {
@@ -2183,6 +2211,16 @@ impl ImportBackend for RootedImportBackend<'_> {
             _ => None,
         }
     }
+}
+
+/// The longest literal prefix of a `globset` pattern: the text before its
+/// first metacharacter (`*`, `?`, `[`, `{`, or a `\` escape). Every path the
+/// pattern matches starts with it, so SQL may narrow a scan to that range.
+pub(crate) fn glob_literal_prefix(pattern: &str) -> &str {
+    let end = pattern
+        .find(['*', '?', '[', '{', '\\'])
+        .unwrap_or(pattern.len());
+    &pattern[..end]
 }
 
 fn scan_failure(error: ScanError) -> RawFileFailureClass {
@@ -3554,5 +3592,268 @@ mod tests {
             observed: Observed::Ok(None),
         };
         assert!(!read_set_intersects_work(&[unrelated_file], &[], &[], true,));
+    }
+}
+
+#[cfg(test)]
+mod enumerate_tests {
+    //! An import's file enumeration reads only the `files` rows its query
+    //! can select, from the committed rows or under a pass's overlay, and
+    //! answers what the whole-table filter it replaced answered.
+
+    use super::*;
+    use distill_core::id::ContentHash;
+    use distill_store::files::{FileObservation, FileState};
+    use distill_store::StoreConfig;
+
+    const PATHS: [&str; 13] = [
+        "dir",
+        "dir.txt",
+        "dir-old",
+        "dir/child",
+        "dir/child/leaf",
+        "dir0",
+        "dirt/x",
+        "é/ü.png",
+        "éa",
+        "a*b",
+        "a{b,c}/[x]",
+        "z",
+        "z/dir",
+    ];
+
+    fn kind(index: usize) -> FileKind {
+        [FileKind::File, FileKind::File, FileKind::Directory, FileKind::Symlink][index % 4]
+    }
+
+    /// `paths` in both roots (`alt` only every other one), with `version`
+    /// in their mtimes so two stores' rows differ.
+    fn write_files(store: &mut Store, paths: &[String], version: i64) {
+        store
+            .input_transaction(|txn| {
+                let observation = txn.version();
+                let roots = [txn.intern_root("main")?, txn.intern_root("alt")?];
+                for (index, path) in paths.iter().enumerate() {
+                    for root in &roots[..if index % 2 == 0 { 2 } else { 1 }] {
+                        txn.upsert_file(
+                            *root,
+                            path,
+                            &FileObservation::from(FileState {
+                                mtime: version,
+                                size: index as u64,
+                                kind: kind(index),
+                                content_hash: Some(ContentHash([index as u8; 32])),
+                            }),
+                            observation,
+                        )?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn store(paths: &[String], version: i64) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        write_files(&mut store, paths, version);
+        (dir, store)
+    }
+
+    fn paths(filler: usize) -> Vec<String> {
+        PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .chain((0..filler).map(|index| format!("bulk/b{index:05}")))
+            .collect()
+    }
+
+    /// The whole-table filter `enumerate` replaced, over every row.
+    fn enumerate_scan(
+        rows: Vec<ObservedFile>,
+        query: &FileQuery,
+    ) -> Result<Vec<RootedPath>, RawFileFailureClass> {
+        let matcher = query
+            .path_glob
+            .as_ref()
+            .map(|glob| Glob::new(glob).map(|glob| glob.compile_matcher()))
+            .transpose()
+            .map_err(|_| RawFileFailureClass::OtherStable)?;
+        let mut results = Vec::new();
+        for row in rows {
+            if !matches!(row.file.state.kind, FileKind::File | FileKind::Symlink) {
+                continue;
+            }
+            let prefix_matches = query.path_prefix.as_ref().is_none_or(|prefix| {
+                row.path == *prefix
+                    || row
+                        .path
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
+            if prefix_matches
+                && matcher
+                    .as_ref()
+                    .is_none_or(|matcher| matcher.is_match(&row.path))
+            {
+                results.push(
+                    RootedPath::new(&row.root_name, &row.path)
+                        .map_err(|_| RawFileFailureClass::OtherStable)?,
+                );
+            }
+        }
+        Ok(results)
+    }
+
+    /// The overlay's whole-table read `files_in` replaced.
+    fn overlay_files_scan(overlay: &FileOverlay, reader: &StoreReader) -> Vec<ObservedFile> {
+        let mut rows = match overlay.under {
+            None => Vec::new(),
+            Some(_) => overlay.committed(reader.observed_files().unwrap()),
+        };
+        rows.extend(overlay.rows.iter().cloned());
+        rows.sort_by(|left, right| {
+            (&left.root_name, &left.path).cmp(&(&right.root_name, &right.path))
+        });
+        rows
+    }
+
+    fn queries() -> Vec<FileQuery> {
+        let mut queries = vec![FileQuery {
+            path_prefix: None,
+            path_glob: None,
+        }];
+        for prefix in ["", "dir", "dir/", "di", "é", "z", "a{b,c}", "bulk"] {
+            queries.push(FileQuery {
+                path_prefix: Some(prefix.into()),
+                path_glob: None,
+            });
+            queries.push(FileQuery {
+                path_prefix: Some(prefix.into()),
+                path_glob: Some("**/*".into()),
+            });
+        }
+        for glob in [
+            "*", "**", "dir*", "dir/**", "**/dir", "{dir,z}*", "[d]ir*", "a\\*b", "a{b,c}/*",
+            "é/*", "bulk/b000?", "z/*", "[",
+        ] {
+            queries.push(FileQuery {
+                path_prefix: None,
+                path_glob: Some(glob.into()),
+            });
+        }
+        queries
+    }
+
+    fn scanner(dir: &tempfile::TempDir) -> RootedScanner {
+        let main = dir.path().join("main-root");
+        let alt = dir.path().join("alt-root");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&alt).unwrap();
+        RootedScanner::new([
+            crate::scanner::AssetRoot::new("main", main),
+            crate::scanner::AssetRoot::new("alt", alt),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn enumeration_answers_what_the_table_scan_answered() {
+        let (dir, store) = store(&paths(30), 1);
+        let scanner = scanner(&dir);
+        let reader = store.reader().unwrap();
+        let capabilities = BTreeMap::new();
+        let mut backend = RootedImportBackend::new(&scanner, &reader, &capabilities);
+        let mut nonempty = 0;
+        for query in queries() {
+            let indexed = backend.enumerate(&query);
+            let scanned = enumerate_scan(reader.observed_files().unwrap(), &query);
+            assert_eq!(indexed, scanned, "{query:?}");
+            nonempty += usize::from(indexed.is_ok_and(|paths| !paths.is_empty()));
+        }
+        assert!(nonempty > 15, "{nonempty}");
+    }
+
+    #[test]
+    fn enumeration_under_an_overlay_answers_what_the_table_scan_answered() {
+        // The committed rows, and a pass's newer observation of some of
+        // them: `dir`'s subtree lost `dir/child/leaf` and gained a file.
+        let (dir, committed) = store(&paths(30), 1);
+        let observed_paths = paths(30)
+            .into_iter()
+            .filter(|path| path != "dir/child/leaf")
+            .chain(["dir/new".to_owned()])
+            .collect::<Vec<_>>();
+        let (_observed_dir, observed) = store(&observed_paths, 2);
+        let scanner = scanner(&dir);
+        let capabilities = BTreeMap::new();
+        let under = [
+            ("main".to_owned(), "dir".to_owned()),
+            ("alt".to_owned(), "z".to_owned()),
+            ("main".to_owned(), String::new()),
+        ];
+        for under in [None, Some(&under[..2]), Some(&under[2..])] {
+            let overlay = FileOverlay::capture(&observed.reader().unwrap(), under).unwrap();
+            let reader = committed.reader().unwrap();
+            for query in queries() {
+                let literal = query.path_glob.as_deref().map(glob_literal_prefix);
+                let selection = match (&query.path_prefix, literal) {
+                    (Some(prefix), _) => PathSelection::Subtree(prefix),
+                    (None, Some(literal)) if !literal.is_empty() => PathSelection::Prefix(literal),
+                    (None, _) => PathSelection::All,
+                };
+                let whole = overlay_files_scan(&overlay, &reader);
+                assert_eq!(
+                    overlay.files_in(&reader, selection).unwrap(),
+                    whole
+                        .iter()
+                        .filter(|row| selection.contains(&row.path))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "{under:?} {selection:?}"
+                );
+                let mut backend = RootedImportBackend {
+                    scanner: &scanner,
+                    rows: ImportRows::Owned(committed.reader().unwrap(), Some(&overlay)),
+                    capabilities: &capabilities,
+                };
+                assert_eq!(
+                    backend.enumerate(&query),
+                    enumerate_scan(whole, &query),
+                    "{under:?} {query:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_enumeration_reads_little_of_a_large_namespace() {
+        let (dir, store) = store(&paths(20_000), 1);
+        let scanner = scanner(&dir);
+        let reader = store.reader().unwrap();
+        let capabilities = BTreeMap::new();
+        let mut backend = RootedImportBackend::new(&scanner, &reader, &capabilities);
+        for query in [
+            FileQuery {
+                path_prefix: Some("dir".into()),
+                path_glob: None,
+            },
+            FileQuery {
+                path_prefix: None,
+                path_glob: Some("bulk/b1234?".into()),
+            },
+        ] {
+            let before = reader.pages_fetched().unwrap();
+            let indexed = backend.enumerate(&query).unwrap();
+            let middle = reader.pages_fetched().unwrap();
+            let scanned = enumerate_scan(reader.observed_files().unwrap(), &query).unwrap();
+            let after = reader.pages_fetched().unwrap();
+            let (indexed_pages, scanned_pages) = (middle - before, after - middle);
+            assert_eq!(indexed, scanned);
+            assert!(!indexed.is_empty());
+            println!("{query:?}: {indexed_pages} pages (scan: {scanned_pages})");
+            assert!(indexed_pages <= 64, "{indexed_pages} pages");
+            assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+        }
     }
 }

@@ -56,7 +56,8 @@ fn every_section_13_table_exists() {
     // CAS segment ids), asset_tags (the `assets` search tags),
     // result_candidates / derived_outputs / derived_assertions /
     // cas_extents / cas_segments (the three roles of §13's `artifacts`
-    // row), cas_refs (what keeps each extent indexed), registrations (the
+    // row), cas_refs (what keeps each extent indexed), bundle_path_refs
+    // (the reference fields a rename rewrites), registrations (the
     // pipeline_state registration list), and
     // codegen_outputs (§20's daemon-owned expected-preimage authority).
     let expected: BTreeSet<String> = [
@@ -73,6 +74,7 @@ fn every_section_13_table_exists() {
         "dirty_files",
         "rename_events",
         "bundles",
+        "bundle_path_refs",
         "assets",
         "asset_tags",
         "asset_tag_index",

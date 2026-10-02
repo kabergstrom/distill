@@ -4885,6 +4885,7 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `dirty_files` | pending incremental work (root id, path, exists/deleted), enqueued atomically with the corresponding `files` mutation and later cleared atomically with the downstream work it triggers |
 | `rename_events` | ordered live-rename log from the watcher, consumed transactionally before the batch is acknowledged |
 | `bundles` | bundle uuid → **(root id, normalized path)**, format version, content hash — the physical key, matching `files`: UUID-based access must reach the owning file without a logical-index round trip that could turn ambiguous under a same-path file in a second root; path-query ambiguity is derived separately. Directory-import ownership derives at scan from generated bundles' `DirectoryOrigin` records (§8), whose `rule` is the authored stable `ImportRuleId`, never a vector index; deleting that id re-derives the orphan state, never reassigns ownership |
+| `bundle_path_refs` | bundle uuid → each logical path its entries' asset/weak reference fields name, written with the bundle's rows at publication. Rename-with-fixups (§4) reads only the bundles that reference the moving path, plus the poisoned ones, whose references are unknown |
 | `assets` | asset uuid → bundle uuid, local_id, type_uuid, logical hash, search tags |
 | `path_index` | path/primary resolution index |
 | `deps` | recorded content / resolution / query dependencies + selector indexes |

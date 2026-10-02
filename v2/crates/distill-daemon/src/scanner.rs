@@ -370,11 +370,9 @@ impl ScanSnapshot {
     /// bundle, directory or symlink alias a rename from there would move.
     pub(crate) fn observes_at_or_under(&self, root: &str, path: &str) -> bool {
         fn any_under<V>(map: &BTreeMap<(String, String), V>, root: &str, path: &str) -> bool {
-            // Every key with `path` as a string prefix, then only those at or
-            // below it: a sibling such as `path.txt` sorts among them.
-            map.range((root.to_owned(), path.to_owned())..)
-                .take_while(|(key, _)| key.0 == root && key.1.starts_with(path))
-                .any(|(key, _)| path_matches(root, path, &key.0, &key.1))
+            subtree_entries(map, &(root.to_owned(), path.to_owned()))
+                .next()
+                .is_some()
         }
         any_under(&self.files, root, path)
             || any_under(&self.bundles, root, path)
@@ -612,49 +610,19 @@ impl ScanSnapshot {
         let mut snapshot = Self::default();
         for row in files {
             let key = (row.root_name.clone(), row.path.clone());
-            if let Some(target) = &row.file.symlink_target {
-                snapshot
-                    .symlink_aliases
-                    .insert(key.clone(), decode_path(target));
+            let (file, alias) = scanned_file_row(row);
+            if let Some(target) = alias {
+                snapshot.symlink_aliases.insert(key.clone(), target);
             }
-            snapshot.files.insert(
-                key,
-                ScannedFile {
-                    root_name: row.root_name,
-                    normalized_path: row.path,
-                    kind: match row.file.state.kind {
-                        FileKind::File => ScannedFileKind::File,
-                        FileKind::Directory => ScannedFileKind::Directory,
-                        FileKind::Symlink => ScannedFileKind::Symlink,
-                    },
-                    modified_nanos: row.file.state.mtime,
-                    size: row.file.state.size,
-                    content_hash: row.file.state.content_hash,
-                    raw_relative_path: decode_raw_path(&row.file.raw_path),
-                },
-            );
+            snapshot.files.insert(key, file);
         }
         for row in directories {
-            snapshot.directory_observations.insert(
-                (row.root_name, row.path),
-                DirectoryObservation {
-                    canonical_path: decode_path(&row.canonical_path),
-                    physical_path: decode_path(&row.physical_path),
-                },
-            );
+            let (key, observation) = directory_observation_row(row);
+            snapshot.directory_observations.insert(key, observation);
         }
         for row in diagnostics {
-            let diagnostic = decode_diagnostic(&row.detail).ok_or_else(|| {
-                StoreError::InvalidConfiguration {
-                    error: format!(
-                        "malformed scan diagnostic at {}/{}",
-                        row.root_name, row.path
-                    ),
-                }
-            })?;
-            snapshot
-                .diagnostics
-                .insert((row.root_name, row.path), diagnostic);
+            let (key, diagnostic) = diagnostic_row(row)?;
+            snapshot.diagnostics.insert(key, diagnostic);
         }
         for row in bundles {
             let bundle = scanned_bundle(&row.root_name, &row.path, row.bytes);
@@ -668,6 +636,73 @@ impl ScanSnapshot {
             }
         })?;
         Ok(snapshot)
+    }
+
+    /// Whether this scan observes what the store's scan tables publish:
+    /// `self.same_observation(&ScanSnapshot::load(reader)?)`, or
+    /// [`Self::same_namespace_observation`] without `diagnostics`, failing
+    /// where `load` fails. The tables are streamed in key order and compared
+    /// row by row; a bundle file is compared by its stored hash, so no
+    /// bundle bytes are read or parsed.
+    pub(crate) fn matches_published(
+        &self,
+        reader: &StoreReader,
+        diagnostics: bool,
+    ) -> Result<bool, StoreError> {
+        if reader.has_directory_alias()? {
+            // `load` rejects the tables; let it say how.
+            return Self::load(reader).map(|_| false);
+        }
+        let mut published_diagnostics = BTreeMap::new();
+        for row in reader.scan_diagnostics()? {
+            let (key, diagnostic) = diagnostic_row(row)?;
+            published_diagnostics.insert(key, diagnostic);
+        }
+        let mut same = !diagnostics || published_diagnostics == self.diagnostics;
+
+        let (mut files, mut aliases) = (self.files.iter(), self.symlink_aliases.iter());
+        reader.for_each_observed_file(|row| {
+            if same {
+                let key = (row.root_name.clone(), row.path.clone());
+                let (file, alias) = scanned_file_row(row);
+                if let Some(target) = alias {
+                    same = aliases
+                        .next()
+                        .is_some_and(|(left, right)| *left == key && *right == target);
+                }
+                same &= files
+                    .next()
+                    .is_some_and(|(left, right)| *left == key && *right == file);
+            }
+            Ok(())
+        })?;
+        same &= files.next().is_none() && aliases.next().is_none();
+
+        let mut directories = self.directory_observations.iter();
+        reader.for_each_observed_directory(|row| {
+            if same {
+                let (key, observation) = directory_observation_row(row);
+                same = directories
+                    .next()
+                    .is_some_and(|(left, right)| *left == key && *right == observation);
+            }
+            Ok(())
+        })?;
+        same &= directories.next().is_none();
+
+        let mut bundles = self.bundles.values();
+        reader.for_each_bundle_file_hash(|root_name, path, hash| {
+            if same {
+                same = bundles.next().is_some_and(|bundle| {
+                    bundle.root_name == root_name
+                        && bundle.normalized_path == path
+                        && bundle.file_hash == BundleFileHash(hash)
+                });
+            }
+            Ok(())
+        })?;
+        same &= bundles.next().is_none();
+        Ok(same)
     }
 
     /// The `files` row recorded for one scanned path.
@@ -875,6 +910,46 @@ fn decode_diagnostic(bytes: &[u8]) -> Option<ScanDiagnostic> {
         }
         _ => None,
     }
+}
+
+/// One `files` row as the scan file it records, with its symlink target.
+fn scanned_file_row(row: ObservedFile) -> (ScannedFile, Option<PathBuf>) {
+    let alias = row.file.symlink_target.as_deref().map(decode_path);
+    let file = ScannedFile {
+        root_name: row.root_name,
+        normalized_path: row.path,
+        kind: match row.file.state.kind {
+            FileKind::File => ScannedFileKind::File,
+            FileKind::Directory => ScannedFileKind::Directory,
+            FileKind::Symlink => ScannedFileKind::Symlink,
+        },
+        modified_nanos: row.file.state.mtime,
+        size: row.file.state.size,
+        content_hash: row.file.state.content_hash,
+        raw_relative_path: decode_raw_path(&row.file.raw_path),
+    };
+    (file, alias)
+}
+
+fn directory_observation_row(row: ObservedDirectory) -> ((String, String), DirectoryObservation) {
+    (
+        (row.root_name, row.path),
+        DirectoryObservation {
+            canonical_path: decode_path(&row.canonical_path),
+            physical_path: decode_path(&row.physical_path),
+        },
+    )
+}
+
+fn diagnostic_row(row: ObservedDiagnostic) -> Result<((String, String), ScanDiagnostic), StoreError> {
+    let diagnostic =
+        decode_diagnostic(&row.detail).ok_or_else(|| StoreError::InvalidConfiguration {
+            error: format!(
+                "malformed scan diagnostic at {}/{}",
+                row.root_name, row.path
+            ),
+        })?;
+    Ok(((row.root_name, row.path), diagnostic))
 }
 
 pub(crate) fn scanned_bundle(root_name: &str, normalized_path: &str, bytes: Vec<u8>) -> ScannedBundle {
@@ -1957,24 +2032,39 @@ fn key_matches(prefix: &(String, String), candidate: &(String, String)) -> bool 
     path_matches(&prefix.0, &prefix.1, &candidate.0, &candidate.1)
 }
 
+/// The entries of `map` at or below `prefix` (every entry of its root when
+/// the path is empty), in key order: the exact key, then the keys in
+/// `[path/, path0)`. Siblings such as `path.txt` or `path-old/x` sort between
+/// `path` and `path/`, so a walk from `path` that stopped at the first
+/// non-matching key would never reach the subtree.
+fn subtree_entries<'a, V>(
+    map: &'a BTreeMap<(String, String), V>,
+    prefix: &(String, String),
+) -> Box<dyn Iterator<Item = (&'a (String, String), &'a V)> + 'a> {
+    let (root, path) = prefix;
+    if path.is_empty() {
+        let root = root.clone();
+        return Box::new(
+            map.range((root.clone(), String::new())..)
+                .take_while(move |(key, _)| key.0 == root),
+        );
+    }
+    let below = map.range((root.clone(), format!("{path}/"))..(root.clone(), format!("{path}0")));
+    Box::new(map.get_key_value(prefix).into_iter().chain(below))
+}
+
 fn matching_values<'a, V>(
     map: &'a BTreeMap<(String, String), V>,
     prefix: &(String, String),
 ) -> impl Iterator<Item = &'a V> {
-    let start = prefix.clone();
-    let prefix = prefix.clone();
-    map.range(start..)
-        .take_while(move |(key, _)| key_matches(&prefix, key))
-        .map(|(_, value)| value)
+    subtree_entries(map, prefix).map(|(_, value)| value)
 }
 
 fn matching_keys<V>(
     map: &BTreeMap<(String, String), V>,
     prefix: &(String, String),
 ) -> Vec<(String, String)> {
-    let start = prefix.clone();
-    map.range(start..)
-        .take_while(|(key, _)| key_matches(prefix, key))
+    subtree_entries(map, prefix)
         .map(|(key, _)| key.clone())
         .collect()
 }
@@ -2563,6 +2653,83 @@ mod tests {
         assert_eq!(decode_diagnostic(&[7]), None);
     }
 
+    fn scanned(path: &str, kind: ScannedFileKind, hash: u8) -> ((String, String), ScannedFile) {
+        (
+            ("main".to_owned(), path.to_owned()),
+            ScannedFile {
+                root_name: "main".to_owned(),
+                normalized_path: path.to_owned(),
+                kind,
+                modified_nanos: 1,
+                size: 1,
+                content_hash: (kind != ScannedFileKind::Directory).then_some(ContentHash([hash; 32])),
+                raw_relative_path: PlatformPathBytes::Unix(path.as_bytes().to_vec()),
+            },
+        )
+    }
+
+    fn snapshot(files: impl IntoIterator<Item = ((String, String), ScannedFile)>) -> ScanSnapshot {
+        let mut snapshot = ScanSnapshot {
+            files: files.into_iter().collect(),
+            ..ScanSnapshot::default()
+        };
+        rebuild_reverse_indexes(&mut snapshot).unwrap();
+        snapshot
+    }
+
+    /// `dir.txt` and `dir-old` sort between `dir` and `dir/child`; a subtree
+    /// walk that stops at the first key outside `dir` never reaches the child.
+    #[test]
+    fn subtree_walks_reach_children_past_sorting_siblings() {
+        let baseline = snapshot([
+            scanned("dir", ScannedFileKind::Directory, 0),
+            scanned("dir-old", ScannedFileKind::File, 1),
+            scanned("dir-old/x", ScannedFileKind::File, 2),
+            scanned("dir.txt", ScannedFileKind::File, 3),
+            scanned("dir/child", ScannedFileKind::File, 4),
+        ]);
+        let affected = ("main".to_owned(), "dir".to_owned());
+        assert_eq!(
+            matching_keys(&baseline.files, &affected),
+            [
+                ("main".to_owned(), "dir".to_owned()),
+                ("main".to_owned(), "dir/child".to_owned())
+            ]
+        );
+        assert!(baseline.observes_at_or_under("main", "dir/child"));
+        assert!(!baseline.observes_at_or_under("main", "di"));
+
+        // The child changed: the delta is not the same observation.
+        let changed = ScanDelta {
+            affected: vec![affected.clone()],
+            observed: snapshot([
+                scanned("dir", ScannedFileKind::Directory, 0),
+                scanned("dir/child", ScannedFileKind::File, 5),
+            ]),
+        };
+        assert!(!changed.is_same_namespace_observation(&baseline));
+        let unchanged = ScanDelta {
+            affected: vec![affected.clone()],
+            observed: snapshot([
+                scanned("dir", ScannedFileKind::Directory, 0),
+                scanned("dir/child", ScannedFileKind::File, 4),
+            ]),
+        };
+        assert!(unchanged.is_same_namespace_observation(&baseline));
+
+        // Removing the child replaces the subtree and leaves the siblings.
+        let mut applied = baseline.clone();
+        applied.apply_delta(ScanDelta {
+            affected: vec![affected],
+            observed: snapshot([scanned("dir", ScannedFileKind::Directory, 0)]),
+        });
+        assert_eq!(
+            applied.files.keys().map(|key| key.1.as_str()).collect::<Vec<_>>(),
+            ["dir", "dir-old", "dir-old/x", "dir.txt"]
+        );
+        assert_eq!(applied.logical_roots.get("dir/child"), None);
+    }
+
     #[test]
     fn raw_paths_round_trip_through_their_table_encoding() {
         for raw in [
@@ -2572,5 +2739,162 @@ mod tests {
         ] {
             assert_eq!(decode_raw_path(&encode_raw_path(&raw)), raw);
         }
+    }
+}
+
+#[cfg(test)]
+mod published_compare_tests {
+    //! A scan compared row by row with the published tables answers what
+    //! comparing it with the whole loaded snapshot answered, errors included.
+
+    use super::*;
+    use distill_store::{Store, StoreConfig};
+
+    struct World {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        scanner: RootedScanner,
+        store: Store,
+    }
+
+    fn new_world() -> World {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("dir/child")).unwrap();
+        fs::write(root.join("dir/child/leaf.txt"), b"leaf").unwrap();
+        fs::write(root.join("dir.txt"), b"sibling").unwrap();
+        fs::write(root.join("a.bundle"), b"not a bundle").unwrap();
+        fs::write(root.join("b.bundle"), b"also not a bundle").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("dir.txt"), root.join("alias.txt")).unwrap();
+            std::os::unix::fs::symlink(root.join("dir"), root.join("dir/child/loop")).unwrap();
+        }
+        let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
+        let store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        World {
+            _dir: dir,
+            root,
+            scanner,
+            store,
+        }
+    }
+
+    /// Publish `scan`'s rows as a complete publication writes them, with
+    /// `diagnostics` (or its own) as the diagnostic rows.
+    fn publish(store: &mut Store, scan: &ScanSnapshot, diagnostics: Option<Vec<ObservedDiagnostic>>) {
+        store
+            .input_transaction(|txn| {
+                let version = txn.version();
+                for (key, file) in scan.file_observations() {
+                    let root = txn.intern_root(&key.0)?;
+                    txn.upsert_file(root, &key.1, &file, version)?;
+                    if let Some(bundle) = scan.bundles.get(key) {
+                        txn.set_bundle_file(root, &key.1, &bundle.bytes)?;
+                    }
+                }
+                txn.replace_scan_structure(
+                    None,
+                    &scan.directory_rows(),
+                    &diagnostics.unwrap_or_else(|| scan.encoded_diagnostic_rows()),
+                )
+            })
+            .unwrap();
+    }
+
+    /// Both comparisons, which must agree; returns the agreed answer.
+    fn compare(scan: &ScanSnapshot, store: &Store, diagnostics: bool) -> Result<bool, String> {
+        let streamed = scan
+            .matches_published(store, diagnostics)
+            .map_err(|error| error.to_string());
+        let loaded = ScanSnapshot::load(store)
+            .map(|published| {
+                if diagnostics {
+                    scan.same_observation(&published)
+                } else {
+                    scan.same_namespace_observation(&published)
+                }
+            })
+            .map_err(|error| error.to_string());
+        assert_eq!(streamed, loaded, "diagnostics: {diagnostics}");
+        streamed
+    }
+
+    fn both(scan: &ScanSnapshot, store: &Store) -> [Result<bool, String>; 2] {
+        [compare(scan, store, false), compare(scan, store, true)]
+    }
+
+    #[test]
+    fn an_unchanged_tree_matches_and_every_change_does_not() {
+        type Change = fn(&Path);
+        let changes: [(&str, Change); 7] = [
+            ("content", |root| fs::write(root.join("dir.txt"), b"changed!").unwrap()),
+            ("added", |root| fs::write(root.join("dir/new.txt"), b"new").unwrap()),
+            ("removed", |root| fs::remove_file(root.join("dir/child/leaf.txt")).unwrap()),
+            ("bundle bytes", |root| {
+                fs::write(root.join("b.bundle"), b"ALSO NOT A BUNDLE").unwrap()
+            }),
+            ("bundle removed", |root| fs::remove_file(root.join("a.bundle")).unwrap()),
+            ("directory", |root| fs::create_dir(root.join("empty")).unwrap()),
+            ("symlink target", |root| {
+                fs::remove_file(root.join("alias.txt")).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(root.join("a.bundle"), root.join("alias.txt")).unwrap();
+            }),
+        ];
+        for (name, change) in changes {
+            let mut world = new_world();
+            let published = world.scanner.scan().unwrap();
+            publish(&mut world.store, &published, None);
+            assert_eq!(both(&published, &world.store), [Ok(true), Ok(true)]);
+            change(&world.root);
+            let scan = world.scanner.scan().unwrap();
+            assert_eq!(both(&scan, &world.store), [Ok(false), Ok(false)], "{name}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_count_only_when_asked_for() {
+        let mut world = new_world();
+        let scan = world.scanner.scan().unwrap();
+        #[cfg(unix)]
+        assert!(scan.diagnostic_rows().next().is_some());
+        publish(&mut world.store, &scan, Some(Vec::new()));
+        #[cfg(unix)]
+        assert_eq!(both(&scan, &world.store), [Ok(true), Ok(false)]);
+    }
+
+    #[test]
+    fn inconsistent_tables_fail_as_loading_them_fails() {
+        // A diagnostic row that does not decode.
+        let mut world = new_world();
+        let scan = world.scanner.scan().unwrap();
+        let malformed = ObservedDiagnostic {
+            root_name: "main".into(),
+            path: "dir".into(),
+            detail: vec![7],
+        };
+        publish(&mut world.store, &scan, Some(vec![malformed]));
+        let [namespace, all] = both(&scan, &world.store);
+        assert!(namespace.unwrap_err().contains("malformed scan diagnostic"));
+        assert!(all.is_err());
+
+        // Two traversed directories sharing a canonical path.
+        let mut world = new_world();
+        let scan = world.scanner.scan().unwrap();
+        publish(&mut world.store, &scan, None);
+        let mut directories = scan.directory_rows();
+        let mut alias = directories[0].clone();
+        alias.path = "elsewhere".into();
+        directories.push(alias);
+        world
+            .store
+            .input_transaction(|txn| {
+                txn.replace_scan_structure(None, &directories, &scan.encoded_diagnostic_rows())
+            })
+            .unwrap();
+        let [namespace, all] = both(&scan, &world.store);
+        assert!(namespace.unwrap_err().contains("inconsistent"));
+        assert!(all.is_err());
     }
 }

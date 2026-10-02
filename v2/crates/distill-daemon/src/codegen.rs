@@ -4,7 +4,7 @@
 //! pinned authored reads, DSTR observations, complete generated namespace,
 //! and its atomic publication.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
@@ -441,7 +441,64 @@ fn validate_unit_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The runtime assets `query` selects, as one indexed SQL query. It fails as
+/// a read of every entry would: on a tag selector's poisoned index, then on
+/// the first unreadable entry (a poisoned bundle's) in UUID order. Only the
+/// glob is matched here, after SQL narrowed the rows to its literal prefix.
 fn query_results(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUuid>, String> {
+    if query.terminal_type.is_some() {
+        return Err("target-dependent terminal_type is unavailable to Rust codegen".into());
+    }
+    if let Some(tag) = &query.tag {
+        store
+            .check_tag_selector(&tag.tag, tag.value.as_deref(), false)
+            .map_err(|error| error.to_string())?;
+    }
+    let glob = query
+        .path_glob
+        .as_ref()
+        .map(|pattern| {
+            globset::Glob::new(pattern)
+                .map(|glob| glob.compile_matcher())
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    store.check_entries().map_err(|error| error.to_string())?;
+    let mut path_prefixes = query.path_prefix.iter().cloned().collect::<Vec<_>>();
+    if let Some(literal) = query
+        .path_glob
+        .as_deref()
+        .map(crate::importer::glob_literal_prefix)
+        .filter(|literal| !literal.is_empty())
+    {
+        path_prefixes.push(literal.to_owned());
+    }
+    let filter = distill_store::bundles::AssetFilter {
+        asset: query.uuid,
+        bundle: query.bundle_uuid,
+        bundle_path: query.bundle_path.clone(),
+        local_id: query.local_id.clone(),
+        authored_type: query.authored_type,
+        tag: query
+            .tag
+            .as_ref()
+            .map(|tag| (tag.tag.clone(), tag.value.clone())),
+        path_prefixes,
+        authoring_only: Some(false),
+        ..Default::default()
+    };
+    Ok(store
+        .namespace_assets_matching(&filter)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|matched| glob.as_ref().is_none_or(|glob| glob.is_match(&matched.path)))
+        .map(|matched| matched.asset)
+        .collect())
+}
+
+/// The whole-table scan [`query_results`] replaced, kept to pin its results.
+#[cfg(test)]
+fn query_results_scan(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUuid>, String> {
     if query.terminal_type.is_some() {
         return Err("target-dependent terminal_type is unavailable to Rust codegen".into());
     }
@@ -451,7 +508,7 @@ fn query_results(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUui
         .map(|tag| {
             store
                 .assets_by_tag_value(&tag.tag, tag.value.as_deref())
-                .map(|assets| assets.into_iter().collect::<BTreeSet<_>>())
+                .map(|assets| assets.into_iter().collect::<std::collections::BTreeSet<_>>())
         })
         .transpose()
         .map_err(|error| error.to_string())?;
@@ -1024,5 +1081,326 @@ mod tests {
             outputs[first.relative_path()],
             content_hash(first.bytes())
         );
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    //! Codegen's indexed asset query answers what the whole-namespace scan
+    //! it replaced answered, errors included, and reads a small part of a
+    //! large namespace.
+
+    use super::*;
+    use distill_build::query::TagSelector;
+    use distill_core::id::{BundleUuid, LogicalHash, TypeUuid};
+    use distill_store::bundles::{AssetRecord, BundleMeta, NamespaceSkeleton};
+    use distill_store::StoreConfig;
+
+    const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
+    const MESH: TypeUuid = TypeUuid([0x71; 16]);
+    const TEXTURE: TypeUuid = TypeUuid([0x72; 16]);
+
+    const PATHS: [&str; 12] = [
+        "dir",
+        "dir.txt",
+        "dir-old",
+        "dir/child",
+        "dir/child/leaf",
+        "dir0",
+        "dirt/x",
+        "é/ü.bundle",
+        "éa",
+        "a*b",
+        "a{b,c}/[x]",
+        "z",
+    ];
+
+    fn uuid(kind: u8, index: u32) -> [u8; 16] {
+        let mut bytes = [kind; 16];
+        bytes[12..].copy_from_slice(&index.to_be_bytes());
+        bytes
+    }
+
+    #[derive(Clone, Copy)]
+    enum Damage {
+        None,
+        PoisonedBundle,
+        PendingTagIndex,
+    }
+
+    fn namespace(filler: u32, damage: Damage) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        store
+            .input_transaction(|txn| {
+                let root = txn.intern_root("main")?;
+                txn.put_schema(SCHEMA, "{}")?;
+                let paths = PATHS
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .chain((0..filler).map(|index| format!("bulk/b{index:05}")));
+                for (index, path) in paths.enumerate() {
+                    let index = index as u32;
+                    let bundle = BundleUuid(uuid(0x10, index));
+                    txn.upsert_bundle(&BundleMeta {
+                        bundle,
+                        root,
+                        path,
+                        format_version: 1,
+                        content_hash: ContentHash([index as u8; 32]),
+                        origin: None,
+                    })?;
+                    for (entry, authoring_only) in [(1u8, false), (2, true)] {
+                        let mut tags = BTreeMap::new();
+                        tags.insert(
+                            "kind".to_owned(),
+                            (index % 3 != 0).then(|| ["mesh", "rock"][index as usize % 2].to_owned()),
+                        );
+                        if index % 4 == u32::from(entry) {
+                            tags.insert("hero".into(), None);
+                        }
+                        txn.upsert_asset(&AssetRecord {
+                            asset: AssetUuid(uuid(0x20 + entry, index)),
+                            bundle,
+                            local_id: if entry == 1 { "main" } else { "settings" }.into(),
+                            type_uuid: if index % 2 == 0 { MESH } else { TEXTURE },
+                            logical_hash: SCHEMA,
+                            authoring_only,
+                            tags,
+                            served: None,
+                        })?;
+                    }
+                }
+                match damage {
+                    Damage::None => {}
+                    Damage::PendingTagIndex => {
+                        txn.set_tag_index_pending(AssetUuid(uuid(0x21, 11)), [7; 32])?;
+                    }
+                    Damage::PoisonedBundle => txn.poison_bundle(
+                        &NamespaceSkeleton {
+                            bundle: BundleUuid(uuid(0x10, 5)),
+                            root,
+                            path: "dir0".into(),
+                            format_version: 1,
+                            content_hash: ContentHash([0xee; 32]),
+                            entries: vec![distill_store::bundles::SkeletonEntry {
+                                asset: AssetUuid(uuid(0x21, 5)),
+                                local_id: "main".into(),
+                                type_uuid: MESH,
+                                authoring_only: false,
+                                tags: BTreeMap::from([("kind".to_owned(), None)]),
+                            }],
+                        },
+                        "malformed",
+                    )?,
+                }
+                Ok(())
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    fn none() -> AssetQuery {
+        AssetQuery {
+            uuid: None,
+            bundle_path: None,
+            local_id: None,
+            bundle_uuid: None,
+            authored_type: None,
+            terminal_type: None,
+            tag: None,
+            path_prefix: None,
+            path_glob: None,
+            authoring_only: None,
+        }
+    }
+
+    const GLOBS: [&str; 16] = [
+        "*",
+        "**",
+        "dir*",
+        "dir/*",
+        "dir/**",
+        "**/child",
+        "d?r*",
+        "{dir,z}*",
+        "[d]ir*",
+        "dir/\\*",
+        "a\\*b",
+        "a{b,c}/*",
+        "é/*",
+        "bulk/b000?",
+        "dir",
+        "[",
+    ];
+
+    fn queries() -> Vec<AssetQuery> {
+        let mut queries = vec![
+            AssetQuery {
+                terminal_type: Some(MESH),
+                ..none()
+            },
+            AssetQuery {
+                authoring_only: Some(true),
+                ..none()
+            },
+            AssetQuery {
+                authoring_only: Some(false),
+                ..none()
+            },
+        ];
+        for index in [0, 3, 5, 11] {
+            queries.push(AssetQuery {
+                uuid: Some(AssetUuid(uuid(0x21, index))),
+                ..none()
+            });
+            queries.push(AssetQuery {
+                uuid: Some(AssetUuid(uuid(0x22, index))),
+                ..none()
+            });
+            queries.push(AssetQuery {
+                bundle_uuid: Some(BundleUuid(uuid(0x10, index))),
+                local_id: Some("main".into()),
+                ..none()
+            });
+        }
+        for path in PATHS {
+            queries.push(AssetQuery {
+                bundle_path: Some(path.into()),
+                ..none()
+            });
+            queries.push(AssetQuery {
+                path_prefix: Some(path.into()),
+                ..none()
+            });
+        }
+        for prefix in ["", "d", "dir/", "é", "bulk/b0001"] {
+            queries.push(AssetQuery {
+                path_prefix: Some(prefix.into()),
+                ..none()
+            });
+        }
+        for glob in GLOBS {
+            queries.push(AssetQuery {
+                path_glob: Some(glob.into()),
+                ..none()
+            });
+            queries.push(AssetQuery {
+                path_glob: Some(glob.into()),
+                path_prefix: Some("dir".into()),
+                ..none()
+            });
+        }
+        for type_uuid in [MESH, TEXTURE] {
+            queries.push(AssetQuery {
+                authored_type: Some(type_uuid),
+                ..none()
+            });
+        }
+        for (tag, value) in [
+            ("kind", None),
+            ("kind", Some("mesh")),
+            ("hero", None),
+            ("hero", Some("x")),
+            ("absent", None),
+        ] {
+            let tag = Some(TagSelector {
+                tag: tag.into(),
+                value: value.map(str::to_owned),
+            });
+            queries.push(AssetQuery {
+                tag: tag.clone(),
+                ..none()
+            });
+            queries.push(AssetQuery {
+                tag,
+                path_glob: Some("dir/**".into()),
+                ..none()
+            });
+        }
+        queries
+    }
+
+    #[test]
+    fn asset_queries_answer_what_the_scan_answered() {
+        for damage in [Damage::None, Damage::PoisonedBundle, Damage::PendingTagIndex] {
+            let (_dir, store) = namespace(30, damage);
+            let reader = store.reader().unwrap();
+            let mut nonempty = 0;
+            for query in queries() {
+                let indexed = query_results(&reader, &query);
+                assert_eq!(indexed, query_results_scan(&reader, &query), "{query:?}");
+                nonempty += usize::from(indexed.is_ok_and(|assets| !assets.is_empty()));
+            }
+            if matches!(damage, Damage::None) {
+                assert!(nonempty > 30, "{nonempty}");
+            }
+        }
+    }
+
+    /// Every path a `globset` pattern matches starts with the pattern's
+    /// literal prefix, which is what lets SQL narrow to that range.
+    #[test]
+    fn a_glob_matches_only_paths_under_its_literal_prefix() {
+        let paths = PATHS
+            .iter()
+            .copied()
+            .chain(["", "/", "d", "dir/", "dirx/y", "z/z", "é", "a{b,c}", "x/dir"]);
+        let globs = GLOBS.iter().copied().chain([
+            "dir/",
+            "dir/{a,b}",
+            "**/dir",
+            "a/**/b",
+            "\\d*",
+            "dir/[!a]*",
+            "dir?",
+        ]);
+        let mut matched = 0;
+        for pattern in globs {
+            let Ok(glob) = globset::Glob::new(pattern) else {
+                continue;
+            };
+            let glob = glob.compile_matcher();
+            let literal = crate::importer::glob_literal_prefix(pattern);
+            for path in paths.clone() {
+                if glob.is_match(path) {
+                    matched += 1;
+                    assert!(path.starts_with(literal), "{pattern:?} matched {path:?}");
+                }
+            }
+        }
+        assert!(matched > 20, "{matched}");
+    }
+
+    #[test]
+    fn a_narrow_codegen_query_reads_little_of_a_large_namespace() {
+        let (_dir, store) = namespace(20_000, Damage::None);
+        let reader = store.reader().unwrap();
+        for query in [
+            AssetQuery {
+                bundle_path: Some("bulk/b12345".into()),
+                ..none()
+            },
+            AssetQuery {
+                path_glob: Some("bulk/b1234?".into()),
+                tag: Some(TagSelector {
+                    tag: "kind".into(),
+                    value: None,
+                }),
+                ..none()
+            },
+        ] {
+            let before = reader.pages_fetched().unwrap();
+            let indexed = query_results(&reader, &query).unwrap();
+            let middle = reader.pages_fetched().unwrap();
+            let scanned = query_results_scan(&reader, &query).unwrap();
+            let after = reader.pages_fetched().unwrap();
+            let (indexed_pages, scanned_pages) = (middle - before, after - middle);
+            assert_eq!(indexed, scanned);
+            assert!(!indexed.is_empty());
+            println!("{query:?}: {indexed_pages} pages (scan: {scanned_pages})");
+            assert!(indexed_pages <= 128, "{indexed_pages} pages");
+            assert!(scanned_pages >= 100 * indexed_pages, "{scanned_pages} pages");
+        }
     }
 }

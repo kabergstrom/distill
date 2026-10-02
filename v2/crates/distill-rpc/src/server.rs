@@ -731,17 +731,12 @@ impl Server {
         }
         let snapshot = txn.snapshot();
         let targets = snapshot.rpc_targets().map_err(store_failure)?;
-        let mut entries = Vec::new();
-        for meta in snapshot.served_entries().map_err(store_failure)? {
-            if meta.authoring_only {
-                continue;
-            }
-            let entry = snapshot
-                .served_entry(meta.asset)
-                .map_err(store_failure)?
-                .ok_or(RpcFailure::AssetNotFound { uuid: meta.asset })?;
-            entries.push(authoring_entry(entry).map_err(store_failure)?);
-        }
+        let entries = snapshot
+            .served_runtime_entries()
+            .map_err(store_failure)?
+            .into_iter()
+            .map(|entry| authoring_entry(entry.map_err(store_failure)?).map_err(store_failure))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut requests = Vec::new();
         for target in &targets {
             for entry in &entries {

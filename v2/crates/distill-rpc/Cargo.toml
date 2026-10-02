@@ -22,3 +22,6 @@ unicode-normalization.workspace = true
 
 [build-dependencies]
 capnpc = "0.26.0"
+
+[dev-dependencies]
+tempfile = "3"

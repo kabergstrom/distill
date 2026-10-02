@@ -24,6 +24,9 @@ pub mod opener;
 pub mod state;
 pub mod trace_reads;
 
+#[cfg(test)]
+mod query_plans;
+
 pub use current::Current;
 pub use config::{parse_byte_size, ByteSizeError, StoreConfig};
 pub use db::{InputTxn, Store, StoreReader, SCHEMA_VERSION};

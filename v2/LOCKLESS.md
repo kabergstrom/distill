@@ -935,6 +935,34 @@ should reach zero by the end of phase 6.
   - The node key (`DSNK` v2) includes each named type's build-only policy,
     so a policy change cannot serve a cached node.
   - The unused `publish_pipeline_candidate` is gone.
+- **Queries, not table loads** (schema 36). Readers that loaded a whole
+  table and filtered it in Rust ask SQLite instead, on the caller's
+  transaction, with the same results, order and errors. Each statement is
+  checked by `EXPLAIN QUERY PLAN` (`distill-store/src/query_plans.rs`), and
+  the narrow ones are pinned by the pages they fetch from a 20 000-entry
+  store (`StoreReader::pages_fetched`).
+  - RPC `query`/`queryAssets` and codegen queries: one `assets ⋈ bundles`
+    query per selector set (`AssetFilter`); a glob narrows to its literal
+    prefix by range and is matched on the returned rows only. Doctor build
+    verification reads the runtime entries in one query.
+  - Import destinations look bundles up by path (`bundles_by_path`);
+    enumeration and the pass overlay read the prefix subtree or the glob's
+    literal-prefix range of `files`; the watched-fixpoint check reads only
+    bundles with a `$record` row (`assets_reserved`) or a poison
+    (`bundles_poisoned`); directory orphans read only generated bundles.
+  - Rename-with-fixups reads only the moving bundle, the bundles whose
+    reference fields name its path (`bundle_path_refs`, written with each
+    bundle's rows at publication) and the poisoned ones.
+  - The full step's no-change check and doctor verify compare the scan with
+    the scan tables row by row; bundle files compare by
+    `bundle_files.hash`, so no bundle bytes are loaded.
+  - A complete publication diffs `files`, the per-bundle asset sets, the
+    asset deletions and the path index by ordered merges of streamed rows,
+    holding only the differences.
+  - Still whole: `published_scan` and the no-coordinator fallback of
+    `publish_incremental_paths` republish the complete namespace, so they
+    load it; the `all_asset_bundles` fallbacks feed tag refinement, which
+    takes the complete map; `ensure_import_index` rebuilds every row.
 
 ## 7. Test baseline
 
@@ -966,3 +994,5 @@ Compiled state by store version: 1162 passed, no failures. (One earlier
 full run failed the timing-sensitive `distill-loader --test
 rpc_io_backpressure fetch_throughput_is_not_one_per_two_frames` once
 under load; it passed on every rerun.)
+Queries, not table loads (schema 36), on top of build cells and the scanner
+sibling fix: 1170 passed, no failures.

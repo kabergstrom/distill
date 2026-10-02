@@ -243,32 +243,32 @@ mod tests {
                 ASSETS_AT_BUNDLE_PATH,
                 &[
                     "SEARCH b USING INDEX bundles_by_path (path=?)",
-                    "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=?)",
+                    "SEARCH a USING COVERING INDEX assets_by_bundle (bundle_uuid=?)",
                 ],
             ),
             (
                 LOCAL_ASSETS,
-                &["SEARCH assets USING INDEX assets_by_bundle (bundle_uuid=? AND local_id=?)"],
+                &["SEARCH assets USING COVERING INDEX assets_by_bundle (bundle_uuid=? AND local_id=?)"],
             ),
             (
                 LOCAL_ASSETS_AT_BUNDLE_PATH,
                 &[
                     "SEARCH b USING INDEX bundles_by_path (path=?)",
-                    "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=? AND local_id=?)",
+                    "SEARCH a USING COVERING INDEX assets_by_bundle (bundle_uuid=? AND local_id=?)",
                 ],
             ),
             (
                 ASSETS_IN_BUNDLE_PATH_RANGE,
                 &[
                     "SEARCH b USING INDEX bundles_by_path (path>? AND path<?)",
-                    "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=?)",
+                    "SEARCH a USING COVERING INDEX assets_by_bundle (bundle_uuid=?)",
                 ],
             ),
             (
                 ASSETS_FROM_BUNDLE_PATH,
                 &[
                     "SEARCH b USING INDEX bundles_by_path (path>?)",
-                    "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=?)",
+                    "SEARCH a USING COVERING INDEX assets_by_bundle (bundle_uuid=?)",
                 ],
             ),
             (
