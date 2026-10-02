@@ -2134,6 +2134,88 @@ fn published_bundle_assets(
     assets
 }
 
+/// The candidate scan's `files` rows to write, each with whether it is
+/// dirty, and the stored rows it no longer has: one ordered merge of the
+/// stored rows against the candidate's, holding only the differences.
+fn scan_file_changes(
+    store: &StoreReader,
+    scan: &ScanSnapshot,
+) -> Result<(BTreeMap<(String, String), bool>, Vec<(String, String)>), StoreError> {
+    let (mut writes, mut removed) = (BTreeMap::new(), Vec::new());
+    let mut current = scan.file_observations().peekable();
+    store.for_each_observed_file(|row| {
+        let key = (row.root_name, row.path);
+        while let Some((added, _)) = current.next_if(|(next, _)| **next < key) {
+            writes.insert(added.clone(), true);
+        }
+        match current.next_if(|(next, _)| **next == key) {
+            Some((_, file)) if file == row.file => {}
+            Some((_, file)) => {
+                let dirty = file.state != row.file.state;
+                writes.insert(key, dirty);
+            }
+            None => removed.push(key),
+        }
+        Ok(())
+    })?;
+    writes.extend(current.map(|(added, _)| (added.clone(), true)));
+    Ok((writes, removed))
+}
+
+/// Which bundles' stored asset rows differ from a candidate's. The rows
+/// arrive grouped by bundle; each group is compared and dropped, so only
+/// bundle identities are held.
+struct AssetGroupChanges {
+    stored: BTreeSet<BundleUuid>,
+    differ: BTreeSet<BundleUuid>,
+}
+
+impl AssetGroupChanges {
+    fn read(
+        store: &StoreReader,
+        current: &BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
+    ) -> Result<Self, StoreError> {
+        let mut changes = Self {
+            stored: BTreeSet::new(),
+            differ: BTreeSet::new(),
+        };
+        let mut close = |group: Option<(BundleUuid, BTreeSet<AssetUuid>)>| {
+            if let Some((bundle, assets)) = group {
+                if current.get(&bundle) != Some(&assets) {
+                    changes.differ.insert(bundle);
+                }
+                changes.stored.insert(bundle);
+            }
+        };
+        let mut group = None::<(BundleUuid, BTreeSet<AssetUuid>)>;
+        store.for_each_bundle_asset(|bundle, asset| {
+            match &mut group {
+                Some((open, assets)) if *open == bundle => {
+                    assets.insert(asset);
+                }
+                _ => close(group.replace((bundle, BTreeSet::from([asset])))),
+            }
+            Ok(())
+        })?;
+        close(group);
+        Ok(changes)
+    }
+
+    /// Whether `bundle`'s stored asset set differs from `current`'s: a
+    /// bundle with no stored rows differs exactly when the candidate has it.
+    fn changed(
+        &self,
+        bundle: &BundleUuid,
+        current: &BTreeMap<BundleUuid, BTreeSet<AssetUuid>>,
+    ) -> bool {
+        if self.stored.contains(bundle) {
+            self.differ.contains(bundle)
+        } else {
+            current.contains_key(bundle)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // The scan transaction receives each publication input explicitly.
 fn publish_scan(
     store: &mut Store,
@@ -2181,14 +2263,8 @@ fn publish_scan(
             ),
         });
     }
-    let old_files = store
-        .observed_files()?
-        .into_iter()
-        .map(|row| ((row.root_name, row.path), row.file))
-        .collect::<BTreeMap<_, _>>();
+    let (file_writes, removed_files) = scan_file_changes(store, &candidate.scan)?;
     let old_bundles = store.all_bundles()?;
-    let old_asset_bundles = store.all_asset_bundles()?;
-    let old_paths = store.all_path_entries()?;
     let mut old_bundle_summaries = BTreeMap::new();
     for bundle in &old_bundles {
         let root_name =
@@ -2211,13 +2287,9 @@ fn publish_scan(
     let current_bundle_summaries = candidate_bundle_summaries(&published, &candidate.bundle_poisons)?;
     // A bundle whose assets changed without its bytes (an asset started or
     // stopped colliding) republishes too.
-    let mut old_bundle_assets = BTreeMap::<BundleUuid, BTreeSet<AssetUuid>>::new();
-    for (asset, bundle) in &old_asset_bundles {
-        old_bundle_assets.entry(*bundle).or_default().insert(*asset);
-    }
     let current_bundle_assets = published_bundle_assets(&published, &candidate.bundle_poisons);
-    let assets_changed =
-        |bundle: &BundleUuid| old_bundle_assets.get(bundle) != current_bundle_assets.get(bundle);
+    let asset_changes = AssetGroupChanges::read(store, &current_bundle_assets)?;
+    let assets_changed = |bundle: &BundleUuid| asset_changes.changed(bundle, &current_bundle_assets);
     let changed_bundles = current_bundle_summaries
         .iter()
         .filter_map(|(bundle, current)| {
@@ -2257,8 +2329,7 @@ fn publish_scan(
         &published,
         &withheld,
         &newly_failed,
-        &old_asset_bundles,
-        &old_paths,
+        store,
         projection,
         derived_outputs.clone(),
         &rpc_publishable_bundles,
@@ -2276,28 +2347,21 @@ fn publish_scan(
                 .entry(key.0.clone())
                 .or_insert(transaction.intern_root(&key.0)?);
             newest_mtime = newest_mtime.max(file.state.mtime);
-            let old = old_files.get(key);
-            if old == Some(&file) {
+            let Some(&dirty) = file_writes.get(key) else {
                 continue;
-            }
+            };
             transaction.upsert_file(root, &key.1, &file, observation)?;
             if let Some(bundle) = candidate.scan.bundles.get(key) {
                 transaction.set_bundle_file(root, &key.1, &bundle.bytes)?;
             }
-            if old.is_none_or(|old| old.state != file.state) {
+            if dirty {
                 transaction.push_dirty(root, &key.1, true, observation)?;
             }
         }
-        for (root_name, path) in old_files.keys() {
-            if !candidate
-                .scan
-                .files
-                .contains_key(&(root_name.clone(), path.clone()))
-            {
-                let root = transaction.intern_root(root_name)?;
-                transaction.remove_file(root, path)?;
-                transaction.push_dirty(root, path, false, observation)?;
-            }
+        for (root_name, path) in &removed_files {
+            let root = transaction.intern_root(root_name)?;
+            transaction.remove_file(root, path)?;
+            transaction.push_dirty(root, path, false, observation)?;
         }
         transaction.replace_scan_structure(
             None,
@@ -3047,8 +3111,7 @@ fn rpc_commit(
     published: &[Arc<ScannedBundle>],
     withheld: &Withheld,
     newly_failed: &BTreeMap<AssetUuid, String>,
-    old_asset_bundles: &BTreeMap<AssetUuid, BundleUuid>,
-    old_paths: &[(String, distill_store::files::RootId, AssetUuid)],
+    old: &StoreReader,
     projection: &PipelineProjection,
     derived_outputs: BTreeMap<AssetUuid, DerivedOutputEntry>,
     changed_bundles: &BTreeSet<BundleUuid>,
@@ -3076,7 +3139,7 @@ fn rpc_commit(
             },
             delta: AssetDeltaState::Changed,
         });
-        if old_asset_bundles.contains_key(asset) {
+        if old.asset_exists(*asset)? {
             commit
                 .authoring
                 .push(AuthoringMutation::Remove { uuid: *asset });
@@ -3137,49 +3200,91 @@ fn rpc_commit(
                 .as_mut()
                 .expect("scan commit initializes tag poisons")
                 .insert(entry.asset, poison.bundle);
-            if old_asset_bundles.contains_key(&entry.asset) {
+            if old.asset_exists(entry.asset)? {
                 commit
                     .authoring
                     .push(AuthoringMutation::Remove { uuid: entry.asset });
             }
         }
     }
-    for asset in old_asset_bundles.keys() {
-        if !current_assets.contains(asset) {
+    old.for_each_asset_bundle(|asset, _| {
+        if !current_assets.contains(&asset) {
             commit.assets.push(AssetMutation::Set {
-                uuid: *asset,
+                uuid: asset,
                 resolution: StoredResolve::Deleted,
                 delta: AssetDeltaState::Deleted,
             });
             commit
                 .authoring
-                .push(AuthoringMutation::Remove { uuid: *asset });
+                .push(AuthoringMutation::Remove { uuid: asset });
         }
-    }
-    let mut old_path_candidates = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
-    for (path, _, asset) in old_paths {
-        old_path_candidates
-            .entry(path.clone())
-            .or_default()
-            .insert(*asset);
-    }
-    let path_names = old_path_candidates
-        .keys()
-        .chain(paths.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for path in path_names {
-        match (old_path_candidates.get(&path), paths.get(&path)) {
-            (old, current) if old == current => {}
-            (_, Some(candidates)) => commit.paths.push(PathMutation::Set {
-                path,
-                candidates: candidates.clone(),
-            }),
-            (Some(_), None) => commit.paths.push(PathMutation::Remove { path }),
-            (None, None) => unreachable!("path name came from one projection"),
-        }
-    }
+        Ok(())
+    })?;
+    path_mutations(old, &paths, &mut commit.paths)?;
     Ok(commit)
+}
+
+/// The path mutations taking the stored path index to `paths`. The index
+/// arrives grouped by path and merges, group by group, with `paths` in
+/// path order.
+fn path_mutations(
+    old: &StoreReader,
+    paths: &BTreeMap<String, BTreeSet<AssetUuid>>,
+    mutations: &mut Vec<PathMutation>,
+) -> Result<(), StoreError> {
+    let mut current_paths = paths.iter().peekable();
+    let mut group = None::<(String, BTreeSet<AssetUuid>)>;
+    old.for_each_path_entry(|path, _, asset| {
+        match &mut group {
+            Some((open, assets)) if *open == path => {
+                assets.insert(asset);
+            }
+            _ => {
+                if let Some(closed) = group.replace((path, BTreeSet::from([asset]))) {
+                    merge_path_group(&mut current_paths, Some(closed), mutations);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(closed) = group {
+        merge_path_group(&mut current_paths, Some(closed), mutations);
+    }
+    merge_path_group(&mut current_paths, None, mutations);
+    Ok(())
+}
+
+/// Merge one stored path-index group, or the end of the index (`None`),
+/// into `mutations`: each candidate path ordered before it is new, and the
+/// group's own path is kept, replaced or removed.
+fn merge_path_group(
+    current: &mut std::iter::Peekable<
+        std::collections::btree_map::Iter<'_, String, BTreeSet<AssetUuid>>,
+    >,
+    stored: Option<(String, BTreeSet<AssetUuid>)>,
+    mutations: &mut Vec<PathMutation>,
+) {
+    while let Some((path, candidates)) = current.next_if(|(next, _)| {
+        stored
+            .as_ref()
+            .is_none_or(|(stored, _)| next.as_str() < stored.as_str())
+    }) {
+        mutations.push(PathMutation::Set {
+            path: path.clone(),
+            candidates: candidates.clone(),
+        });
+    }
+    let Some((path, old)) = stored else {
+        return;
+    };
+    match current.next_if(|(next, _)| **next == path) {
+        Some((_, candidates)) if *candidates == old => {}
+        Some((_, candidates)) => mutations.push(PathMutation::Set {
+            path,
+            candidates: candidates.clone(),
+        }),
+        None => mutations.push(PathMutation::Remove { path }),
+    }
 }
 
 fn rpc_entry(
@@ -3534,5 +3639,205 @@ mod scheduler_tests {
         release_second_tx.send(()).unwrap();
         first.join().unwrap();
         second.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod publish_diff_tests {
+    //! A complete publication's streamed diffs against the stored rows give
+    //! what the whole-table maps they replaced gave.
+
+    use super::*;
+    use crate::scanner::{AssetRoot, RootedScanner};
+    use distill_core::id::LogicalHash;
+    use distill_store::files::RootId;
+
+    /// A deterministic generator: the cases vary, the runs do not.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+        (dir, store)
+    }
+
+    const NAMES: [&str; 8] = ["dir", "dir.txt", "dir-old", "dir0", "é", "a", "z", "b c"];
+
+    fn write_tree(root: &std::path::Path, random: &mut Lcg) {
+        for name in NAMES {
+            match random.next(4) {
+                0 => {}
+                1 => std::fs::write(root.join(name), [random.next(3) as u8]).unwrap(),
+                _ => {
+                    std::fs::create_dir_all(root.join(name)).unwrap();
+                    for child in ["child", "x.bin"] {
+                        if random.next(2) == 0 {
+                            std::fs::write(root.join(name).join(child), [random.next(3) as u8])
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_changes_match_the_stored_file_map() {
+        let mut random = Lcg(7);
+        for _ in 0..12 {
+            let (dir, mut store) = store();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            let scanner = RootedScanner::new([AssetRoot::new("main", &root)]).unwrap();
+            write_tree(&root, &mut random);
+            let published = scanner.scan().unwrap();
+            store
+                .input_transaction(|txn| {
+                    let version = txn.version();
+                    for (key, file) in published.file_observations() {
+                        let root = txn.intern_root(&key.0)?;
+                        txn.upsert_file(root, &key.1, &file, version)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            write_tree(&root, &mut random);
+            let candidate = scanner.scan().unwrap();
+
+            let old_files = store
+                .observed_files()
+                .unwrap()
+                .into_iter()
+                .map(|row| ((row.root_name, row.path), row.file))
+                .collect::<BTreeMap<_, _>>();
+            let mut writes = BTreeMap::new();
+            for (key, file) in candidate.file_observations() {
+                let old = old_files.get(key);
+                if old != Some(&file) {
+                    writes.insert(key.clone(), old.is_none_or(|old| old.state != file.state));
+                }
+            }
+            let removed = old_files
+                .keys()
+                .filter(|key| !candidate.files.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(scan_file_changes(&store, &candidate).unwrap(), (writes, removed));
+        }
+    }
+
+    /// Stored assets for random bundles, then random candidate groups.
+    #[test]
+    fn asset_and_path_changes_match_the_stored_maps() {
+        let mut random = Lcg(11);
+        for _ in 0..20 {
+            let (_dir, mut store) = store();
+            let bundle = |index: u64| BundleUuid([index as u8 + 1; 16]);
+            let asset = |index: u64| AssetUuid([index as u8 + 1; 16]);
+            let path = |index: u64| NAMES[index as usize % NAMES.len()].to_owned();
+            store
+                .input_transaction(|txn| {
+                    let roots = [txn.intern_root("main")?, txn.intern_root("alt")?];
+                    for index in 0..6 {
+                        if random.next(3) == 0 {
+                            continue;
+                        }
+                        txn.upsert_bundle(&BundleMeta {
+                            bundle: bundle(index),
+                            root: roots[0],
+                            path: path(index),
+                            format_version: 1,
+                            content_hash: ContentHash([0; 32]),
+                            origin: None,
+                        })?;
+                        for entry in 0..random.next(3) {
+                            txn.upsert_asset(&AssetRecord {
+                                asset: asset(index * 8 + entry),
+                                bundle: bundle(index),
+                                local_id: format!("e{entry}"),
+                                type_uuid: TypeUuid([1; 16]),
+                                logical_hash: LogicalHash([1; 32]),
+                                authoring_only: false,
+                                tags: BTreeMap::new(),
+                                served: None,
+                            })?;
+                        }
+                    }
+                    for index in 0..10 {
+                        if random.next(2) == 0 {
+                            let root = roots[random.next(2) as usize];
+                            txn.set_path_entry(&path(index), root, asset(random.next(40)))?;
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let mut current = BTreeMap::<BundleUuid, BTreeSet<AssetUuid>>::new();
+            let mut paths = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
+            for index in 0..6 {
+                if random.next(3) != 0 {
+                    current.insert(
+                        bundle(index),
+                        (0..random.next(3)).map(|entry| asset(index * 8 + entry)).collect(),
+                    );
+                }
+            }
+            for index in 0..10 {
+                if random.next(2) == 0 {
+                    paths
+                        .entry(path(index))
+                        .or_default()
+                        .extend((0..1 + random.next(2)).map(|_| asset(random.next(40))));
+                }
+            }
+
+            let mut old_bundle_assets = BTreeMap::<BundleUuid, BTreeSet<AssetUuid>>::new();
+            for (asset, bundle) in store.all_asset_bundles().unwrap() {
+                old_bundle_assets.entry(bundle).or_default().insert(asset);
+            }
+            let changes = AssetGroupChanges::read(&store, &current).unwrap();
+            for index in 0..8 {
+                assert_eq!(
+                    changes.changed(&bundle(index), &current),
+                    old_bundle_assets.get(&bundle(index)) != current.get(&bundle(index)),
+                    "{index}"
+                );
+            }
+
+            let old_paths: Vec<(String, RootId, AssetUuid)> = store.all_path_entries().unwrap();
+            let mut old_path_candidates = BTreeMap::<String, BTreeSet<AssetUuid>>::new();
+            for (path, _, asset) in &old_paths {
+                old_path_candidates.entry(path.clone()).or_default().insert(*asset);
+            }
+            let mut expected = Vec::new();
+            let names = old_path_candidates
+                .keys()
+                .chain(paths.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for path in names {
+                match (old_path_candidates.get(&path), paths.get(&path)) {
+                    (old, current) if old == current => {}
+                    (_, Some(candidates)) => expected.push(PathMutation::Set {
+                        path,
+                        candidates: candidates.clone(),
+                    }),
+                    (Some(_), None) => expected.push(PathMutation::Remove { path }),
+                    (None, None) => unreachable!(),
+                }
+            }
+            let mut merged = Vec::new();
+            path_mutations(&store, &paths, &mut merged).unwrap();
+            assert_eq!(merged, expected);
+        }
     }
 }
