@@ -871,3 +871,31 @@ fn a_subtree_read_of_a_large_root_touches_its_rows() {
     assert!(narrow <= 16 + 2 * rows as u64, "{narrow} pages for {rows} rows");
     assert!(whole >= 10 * narrow, "{narrow} pages against {whole}");
 }
+
+/// A complete scan's old bundle summaries are one streamed join of the
+/// bundle rows with their roots, never a root-name lookup per bundle.
+#[test]
+fn bundles_with_root_names_are_one_join() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, mut store) = store_with(200);
+    let plans = subtree_plans(&mut store, |store| {
+        let mut count = 0;
+        store
+            .for_each_bundle_with_root_name(|root_name, _| {
+                assert!(root_name == "main" || root_name == "alt");
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 200);
+    });
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert_eq!(
+        plans[0].1,
+        [
+            "SCAN bundles USING INDEX sqlite_autoindex_bundles_1",
+            "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)",
+        ],
+        "{plans:#?}"
+    );
+}

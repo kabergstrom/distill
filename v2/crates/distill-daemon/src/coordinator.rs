@@ -2168,26 +2168,20 @@ fn publish_scan(
         });
     }
     let (file_writes, removed_files) = scan_file_changes(store, &candidate.scan)?;
-    let old_bundles = store.all_bundles()?;
     let mut old_bundle_summaries = BTreeMap::new();
-    for bundle in &old_bundles {
-        let root_name =
-            store
-                .root_name(bundle.root)?
-                .ok_or_else(|| StoreError::InvalidConfiguration {
-                    error: format!("bundle {} has an unknown root id", bundle.bundle),
-                })?;
+    store.for_each_bundle_with_root_name(|root_name, bundle| {
         old_bundle_summaries.insert(
             bundle.bundle,
             BundleSummary {
                 root_name,
-                path: bundle.path.clone(),
+                path: bundle.path,
                 format_version: bundle.format_version,
                 content_hash: bundle.content_hash,
-                origin: bundle.origin.clone(),
+                origin: bundle.origin,
             },
         );
-    }
+        Ok(())
+    })?;
     let current_bundle_summaries = candidate_bundle_summaries(&published, &candidate.bundle_poisons)?;
     // A bundle whose assets changed without its bytes (an asset started or
     // stopped colliding) republishes too.

@@ -647,6 +647,23 @@ impl StoreReader {
         )
     }
 
+    /// Visit every bundle row with its root's name, by bundle UUID: one
+    /// streamed join, for a complete scan's publication.
+    pub fn for_each_bundle_with_root_name(
+        &self,
+        mut visit: impl FnMut(String, BundleMeta) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {BUNDLE_COLUMNS}, r.name FROM bundles JOIN roots r USING (root_id)
+             ORDER BY bundle_uuid"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            visit(row.get(9)?, bundle_meta_row(row)?)?;
+        }
+        Ok(())
+    }
+
     /// The bundle rows at logical `path` in any root, by bundle UUID.
     pub fn bundles_at_path(&self, path: &str) -> Result<Vec<BundleMeta>, StoreError> {
         self.query_rows(
