@@ -1096,3 +1096,51 @@ fn a_single_bundle_edit_reads_independent_of_namespace_size() {
     println!("single bundle edit: {small} pages beside 100 files, {large} beside 6000");
     assert!(large <= small + 16, "{small} pages beside 100 files, {large} beside 6000");
 }
+
+/// Pages a configuration source rejection and its heal read and write beside
+/// `filler` files, and the configuration error the rejection stored.
+fn configuration_error_pages(filler: usize) -> u64 {
+    let temp = tempfile::tempdir().unwrap();
+    let assets = temp.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    for index in 0..filler {
+        let directory = assets.join(format!("filler/d{}", index % 40));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(format!("f{index}.txt")), index.to_string()).unwrap();
+    }
+    let (bytes, _, _) = ordinary_bundle();
+    std::fs::write(assets.join("first.bundle"), bytes).unwrap();
+    let coordinator = coordinator(&temp);
+    let mut writer = coordinator.open_writer().unwrap();
+    coordinator.reconcile_full_scan(&mut writer).unwrap();
+    let ready = writer.configuration_state().unwrap();
+
+    let before = writer.pages_fetched().unwrap();
+    let base = writer.input_version();
+    let rejected = coordinator
+        .publish_configuration_rejection(
+            &mut writer,
+            DscpV1::MalformedConfiguration { file_hash: [5; 32] },
+            "malformed",
+        )
+        .unwrap();
+    assert_eq!(rejected.version.0, base.0 + 1);
+    assert!(matches!(
+        writer.configuration_state().unwrap(),
+        ConfigurationState::Failed { .. }
+    ));
+    let healed = coordinator.heal_configuration_rejection(&mut writer).unwrap();
+    assert_eq!(healed.version.0, base.0 + 2);
+    assert_eq!(format!("{:?}", writer.configuration_state().unwrap()), format!("{ready:?}"));
+    writer.pages_fetched().unwrap() - before
+}
+
+/// A configuration source error and its heal write the error row and the
+/// configuration status; they never republish the namespace.
+#[test]
+fn a_configuration_error_reads_independent_of_namespace_size() {
+    let small = configuration_error_pages(100);
+    let large = configuration_error_pages(6000);
+    println!("configuration error and heal: {small} pages beside 100 files, {large} beside 6000");
+    assert!(large <= small + 16, "{small} pages beside 100 files, {large} beside 6000");
+}

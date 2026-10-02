@@ -579,11 +579,38 @@ impl DaemonCoordinator {
         message: impl Into<String>,
     ) -> Result<SnapshotStamp, CoordinatorError> {
         let error = ConfigurationError::from_reason(&reason, message.into());
-        self.publish_cached_scan(store, pass::SourceError::Set(error))
+        self.publish_configuration_source_error(store, Some(error))
     }
 
     pub fn heal_configuration_rejection(&self, store: &mut Store) -> Result<SnapshotStamp, CoordinatorError> {
-        self.publish_cached_scan(store, pass::SourceError::Heal)
+        self.publish_configuration_source_error(store, None)
+    }
+
+    /// Store the configuration source's error (`None` heals it) and the
+    /// configuration status the stored errors then select, as one input
+    /// version. The namespace and the compiled state stay as they are.
+    fn publish_configuration_source_error(
+        &self,
+        store: &mut Store,
+        error: Option<ConfigurationError>,
+    ) -> Result<SnapshotStamp, CoordinatorError> {
+        self.loop_compiled(store)?;
+        let base = self.server.stamp_of(store).version;
+        self.server
+            .coordinated_commit(store, base, |store| {
+                let generation = configuration_generation(store).map_err(|error| error.to_string())?;
+                let (configuration, _) = store
+                    .input_transaction(|transaction| {
+                        transaction.set_configuration_source_error(error.as_ref())?;
+                        transaction.publish_configuration_status(generation)
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok(Commit {
+                    configuration: Some(configuration_status(configuration)),
+                    ..Commit::default()
+                })
+            })
+            .map_err(CoordinatorError::Coordinated)
     }
 
     /// Publish a validated configuration candidate as one input version: its
@@ -905,15 +932,7 @@ impl DaemonCoordinator {
                 Err(CompiledLookupError::NotLoaded { .. }) => Arc::new(self.boot.clone()),
                 Err(error) => return Err(error.to_string()),
             };
-            let generation = match store
-                .configuration_state()
-                .map_err(|error| error.to_string())?
-            {
-                ConfigurationState::Ready(epoch) => epoch.generation,
-                ConfigurationState::Failed { last_good, .. } => {
-                    last_good.map_or(0, |epoch| epoch.generation)
-                }
-            };
+            let generation = configuration_generation(store).map_err(|error| error.to_string())?;
             let ((configuration, version), _) = store
                 .input_transaction(|transaction| {
                     transaction.publish_pipeline_failure(&diagnostic)?;
@@ -985,21 +1004,6 @@ impl DaemonCoordinator {
         let compiled = self.loop_compiled(store)?;
         let base = self.server.stamp_of(store).version;
         let step = self.incremental_step(&compiled, store, batch)?;
-        self.pass(store, base, step, ImportScope::NONE)
-            .map(|outcome| outcome.stamp)
-    }
-
-    /// Republish the observed namespace as a pass, changing the stored
-    /// configuration source error as `source_error` says.
-    fn publish_cached_scan(
-        &self,
-        store: &mut Store,
-        source_error: pass::SourceError,
-    ) -> Result<SnapshotStamp, CoordinatorError> {
-        let compiled = self.loop_compiled(store)?;
-        let base = self.server.stamp_of(store).version;
-        let scan = self.published_scan(store)?;
-        let step = self.candidate_step(&compiled, scan, &[], false, source_error)?;
         self.pass(store, base, step, ImportScope::NONE)
             .map(|outcome| outcome.stamp)
     }
@@ -1121,6 +1125,16 @@ impl PendingScanRejection {
 
 /// The status `error`, the configuration error the stored errors select,
 /// publishes.
+/// The generation of the last ready configuration the store published (0
+/// before any): what a configuration status published without a new
+/// candidate keeps.
+fn configuration_generation(store: &StoreReader) -> Result<u64, StoreError> {
+    Ok(match store.configuration_state()? {
+        ConfigurationState::Ready(epoch) => epoch.generation,
+        ConfigurationState::Failed { last_good, .. } => last_good.map_or(0, |epoch| epoch.generation),
+    })
+}
+
 fn configuration_status(error: Option<ConfigurationError>) -> ConfigurationStatus {
     error.map_or(ConfigurationStatus::Ready, ConfigurationStatus::Failed)
 }
@@ -2198,12 +2212,7 @@ fn publish_scan(
         })
         .collect::<BTreeSet<_>>();
     let newly_failed = withheld.newly_failed(store)?;
-    let mut generation = match store.configuration_state()? {
-        ConfigurationState::Ready(epoch) => epoch.generation,
-        ConfigurationState::Failed { last_good, .. } => {
-            last_good.map_or(0, |epoch| epoch.generation)
-        }
-    };
+    let mut generation = configuration_generation(store)?;
     if advance_configuration {
         generation = generation
             .checked_add(1)
@@ -2609,12 +2618,7 @@ fn prepare_incremental_publication(
     let plan = incremental_plan(store, inputs).map_err(|error| StoreError::InvalidConfiguration {
         error: error.to_string(),
     })?;
-    let configuration_generation = match store.configuration_state()? {
-        ConfigurationState::Ready(epoch) => epoch.generation,
-        ConfigurationState::Failed { last_good, .. } => {
-            last_good.map_or(0, |epoch| epoch.generation)
-        }
-    };
+    let configuration_generation = configuration_generation(store)?;
     let mut durable_bundles = BTreeMap::new();
     for bundle in plan.bundles.keys() {
         let meta = store.bundle(*bundle)?;
@@ -3687,3 +3691,4 @@ mod publish_diff_tests {
         }
     }
 }
+

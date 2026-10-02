@@ -104,10 +104,6 @@ pub(super) struct FullStep {
     candidate: ScanCandidate,
     claims: Vec<SourceClaims>,
     tags: TagInputs,
-    /// The scan observed every root: the publication heals the pending scan
-    /// rejection.
-    heals: bool,
-    source_error: SourceError,
 }
 
 pub(super) struct RejectionStep {
@@ -115,14 +111,6 @@ pub(super) struct RejectionStep {
     /// The scan observed every root: its rejection replaces the pending
     /// one instead of joining it.
     replaces_pending: bool,
-}
-
-/// What a step does to the configuration source's stored error.
-#[derive(Clone)]
-pub(super) enum SourceError {
-    Keep,
-    Set(ConfigurationError),
-    Heal,
 }
 
 /// What a scan publication pins for its projection and tag index: the
@@ -884,28 +872,20 @@ impl DaemonCoordinator {
                         rows: scan.encoded_diagnostic_rows(),
                     })
                 } else {
-                    self.candidate_step(compiled, scan, &[], true, SourceError::Keep)
+                    self.candidate_step(compiled, scan)
                 }
             }
-            Ok(scan) => self.candidate_step(compiled, scan, &[], true, SourceError::Keep),
+            Ok(scan) => self.candidate_step(compiled, scan),
             Err(error) => self.rejection_step(compiled, &error, true),
         }
     }
 
-    /// The step publishing `scan` as the complete namespace. `heals` when
-    /// it observed every root.
-    pub(super) fn candidate_step(
-        &self,
-        compiled: &Arc<Compiled>,
-        scan: ScanSnapshot,
-        renames: &[LogicalRename],
-        heals: bool,
-        source_error: SourceError,
-    ) -> Result<ScanStep, CoordinatorError> {
+    /// The step publishing `scan`, which observed every root, as the
+    /// complete namespace: it heals the pending scan rejection.
+    fn candidate_step(&self, compiled: &Arc<Compiled>, scan: ScanSnapshot) -> Result<ScanStep, CoordinatorError> {
         let tags = self.tag_inputs(compiled);
         let authority = tags.authority();
-        let mut candidate = ScanCandidate::build(scan, authority.as_deref())?;
-        candidate.renames.extend_from_slice(renames);
+        let candidate = ScanCandidate::build(scan, authority.as_deref())?;
         let claims = bundle_claims(
             candidate.scan.bundle_rows(),
             compiled.projection(),
@@ -915,8 +895,6 @@ impl DaemonCoordinator {
             candidate,
             claims,
             tags,
-            heals,
-            source_error,
         })))
     }
 
@@ -1013,25 +991,9 @@ impl DaemonCoordinator {
             }
             ScanStep::Full(step) => {
                 let tags = &step.tags;
-                if step.heals || !matches!(step.source_error, SourceError::Keep) {
-                    store
-                        .input_transaction(|transaction| {
-                            if step.heals {
-                                transaction.set_scan_rejection(None)?;
-                            }
-                            match &step.source_error {
-                                SourceError::Keep => {}
-                                SourceError::Set(error) => {
-                                    transaction.set_configuration_source_error(Some(error))?
-                                }
-                                SourceError::Heal => {
-                                    transaction.set_configuration_source_error(None)?
-                                }
-                            }
-                            Ok(())
-                        })
-                        .map_err(|error| error.to_string())?;
-                }
+                store
+                    .input_transaction(|transaction| transaction.set_scan_rejection(None))
+                    .map_err(|error| error.to_string())?;
                 let authority = tags.authority().filter(|_| refine_tags);
                 let mut commit = publish_scan(
                     store,
@@ -1087,15 +1049,7 @@ impl DaemonCoordinator {
                 let claims_errors = store
                     .claims_namespace_errors()
                     .map_err(|error| error.to_string())?;
-                let generation = match store
-                    .configuration_state()
-                    .map_err(|error| error.to_string())?
-                {
-                    ConfigurationState::Ready(epoch) => epoch.generation,
-                    ConfigurationState::Failed { last_good, .. } => {
-                        last_good.map_or(0, |epoch| epoch.generation)
-                    }
-                };
+                let generation = configuration_generation(store).map_err(|error| error.to_string())?;
                 let (configuration, _) = store
                     .input_transaction(|transaction| {
                         transaction.set_namespace_errors(claims_errors)?;
