@@ -582,7 +582,10 @@ impl ScanBaseline for StoredBaseline<'_> {
 }
 
 impl ScanSnapshot {
-    /// The complete published observation, from the store's scan tables.
+    /// The complete published observation, from the store's scan tables:
+    /// the oracle the bounded readers are compared with. No publication
+    /// loads it.
+    #[cfg(test)]
     pub(crate) fn load(reader: &StoreReader) -> Result<Self, StoreError> {
         Self::from_rows(
             reader.observed_files()?,

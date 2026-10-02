@@ -290,12 +290,6 @@ impl DaemonCoordinator {
             .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
     }
 
-    /// The published observation, from the store's scan tables.
-    fn published_scan(&self, store: &mut Store) -> Result<ScanSnapshot, CoordinatorError> {
-        ScanSnapshot::load(store)
-            .map_err(|error| CoordinatorError::InvalidManifest(error.to_string()))
-    }
-
     pub fn authoring_service(&self) -> &Arc<AuthoringService> {
         &self.authoring
     }
@@ -642,17 +636,20 @@ impl DaemonCoordinator {
                 CoordinatorError::InvalidManifest(AuthoringServiceInitError::from(error).to_string())
             })?;
         let filesystem_changed = !self.scanner.has_same_roots(&scanner);
-        // Schema, target, or module-only candidates reuse the already
-        // observed asset snapshot. A physical complete scan is reserved for
-        // an actual configured-root replacement.
-        let candidate_scan_heals =
-            filesystem_changed || self.scan_initialized.get().is_none();
-        let scan = if candidate_scan_heals {
-            scanner.scan()?
+        // The compiled state the published rows were derived under. A
+        // candidate with the same roots republishes only what its
+        // difference from that state reaches; a root replacement, or a
+        // process that has neither observed the roots nor compiled the
+        // store's version, scans them physically and publishes completely.
+        let previous = self.compiled.at(store).ok();
+        let candidate_scan_heals = filesystem_changed
+            || self.scan_initialized.get().is_none()
+            || previous.is_none();
+        let candidate = if candidate_scan_heals {
+            Some(ScanCandidate::build(scanner.scan()?, Some(&schema_authority))?)
         } else {
-            self.published_scan(store)?
+            None
         };
-        let candidate = ScanCandidate::build(scan, Some(&schema_authority))?;
         let mut runtime = lock_pipeline(&self.pipeline);
         let prepared_epoch = {
             let CoordinatedPipelineRuntime { host, loader, .. } = &mut *runtime;
@@ -737,11 +734,11 @@ impl DaemonCoordinator {
                 PipelineProjection::default(),
             ),
         };
-        let installed_claims = match bundle_claims(
-            candidate.scan.bundle_rows(),
-            &projection,
-            Some(&schema_authority),
-        ) {
+        let installed_claims = match candidate
+            .as_ref()
+            .map(|candidate| bundle_claims(candidate.scan.bundle_rows(), &projection, Some(&schema_authority)))
+            .transpose()
+        {
             Ok(claims) => claims,
             Err(error) => {
                 if let Some(failure) = discard_prepared(&mut runtime, &mut prepared_epoch) {
@@ -779,17 +776,27 @@ impl DaemonCoordinator {
                         Ok(transaction.version())
                     })
                     .map_err(|error| error.to_string())?;
-                let mut commit = publish_scan(
-                    store,
-                    store.input_version(),
-                    candidate,
-                    true,
-                    Some(&pipeline),
-                    &projection,
-                    &retyped,
-                    tag_epoch,
-                    &installed_claims,
-                )
+                let mut commit = match (candidate, &installed_claims) {
+                    (Some(candidate), Some(claims)) => publish_scan(
+                        store,
+                        store.input_version(),
+                        candidate,
+                        true,
+                        Some(&pipeline),
+                        &projection,
+                        &retyped,
+                        tag_epoch,
+                        claims,
+                    ),
+                    _ => publish_reconfiguration(
+                        store,
+                        &pipeline,
+                        &projection,
+                        &retyped,
+                        &schema_authority,
+                        tag_epoch,
+                    ),
+                }
                 .map_err(|error| error.to_string())?;
                 let diagnostic = commit
                     .pipeline
@@ -2401,6 +2408,98 @@ fn publish_scan(
     Ok(commit)
 }
 
+/// Publish a configuration candidate whose roots are unchanged, inside its
+/// open input: its pipeline epoch (or the epoch's failure) and the claims of
+/// only the sources its difference from the published state reaches,
+/// through the incremental publication a watcher edit uses.
+///
+/// - `retyped` are the types whose pipeline interface (terminal and derived
+///   outputs) the projection changed: every bundle holding one is claimed
+///   again and republished, its rows unchanged but for that interface.
+/// - The types whose tag epoch the schema authority changed (see
+///   [`crate::build::type_tag_epochs`]) are claimed again only in poisoned
+///   bundles, whose skeleton the authority validates; their healthy assets
+///   keep their rows, and the tag refinement of this input redoes their tag
+///   rows.
+/// - Malformed sources and the sources of colliding claims are claimed again
+///   whenever either set is non-empty: their claims hold the old authority
+///   or projection but publish nothing to compare.
+///
+/// A pipeline-module-only change reaches no source: its migrated tag rows
+/// are the refinement's. Nothing here reads a bundle outside those sets.
+fn publish_reconfiguration(
+    store: &mut Store,
+    pipeline: &ConfigurationPipelinePublication,
+    projection: &PipelineProjection,
+    retyped: &BTreeSet<TypeUuid>,
+    authority: &ProjectSchemaAuthority,
+    tag_epoch: [u8; 32],
+) -> Result<Commit, StoreError> {
+    let reschemaed = store.tag_epoch_changes(&crate::build::type_tag_epochs(authority))?;
+    let mut keys = BTreeSet::new();
+    for type_uuid in retyped {
+        keys.extend(store.bundle_sources_of_type(*type_uuid, false)?);
+    }
+    for type_uuid in &reschemaed {
+        keys.extend(store.bundle_sources_of_type(*type_uuid, true)?);
+    }
+    if !retyped.is_empty() || !reschemaed.is_empty() {
+        keys.extend(store.unpublished_claim_sources()?);
+    }
+    let mut fresh = BTreeMap::new();
+    let mut claims = Vec::new();
+    let mut forced = BTreeSet::new();
+    for (root_name, path) in &keys {
+        let Some(bytes) = store.bundle_file(root_name, path)? else {
+            continue;
+        };
+        #[cfg(test)]
+        compiled_tests::source_reclaimed();
+        let source = Arc::new(crate::scanner::scanned_bundle(root_name, path, bytes));
+        claims.push(source_claims(&source, projection, Some(authority)).map_err(|error| {
+            StoreError::InvalidConfiguration {
+                error: error.to_string(),
+            }
+        })?);
+        match (&source.parsed, &source.namespace_skeleton) {
+            (Ok(bundle), _) => {
+                forced.insert(bundle.uuid);
+            }
+            (Err(_), Some(skeleton)) => {
+                forced.insert(skeleton.uuid);
+            }
+            (Err(_), None) => {}
+        }
+        fresh.insert((root_name.clone(), path.clone()), source);
+    }
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let (commit, _) = store.input_transaction(|transaction| {
+        match pipeline {
+            ConfigurationPipelinePublication::Epoch { epoch, tools } => {
+                transaction.publish_pipeline_epoch(epoch)?;
+                transaction.publish_tool_epoch(tools)?;
+            }
+            ConfigurationPipelinePublication::Failed(failure) => {
+                transaction.publish_pipeline_failure(failure)?;
+            }
+        }
+        transaction.replace_source_claims(Some(&keys), &claims)?;
+        publish_claimed(
+            transaction,
+            &PlanInputs {
+                authority: Some(authority),
+                fresh,
+            },
+            projection,
+            tag_epoch,
+            &forced,
+            true,
+            &mut BTreeMap::new(),
+        )
+    })?;
+    Ok(commit)
+}
+
 #[derive(Debug)]
 struct IncrementalFileMutation {
     root_name: String,
@@ -2500,117 +2599,150 @@ fn publish_incremental_scan(
         )?;
         transaction.set_clean_watermark(newest_mtime)?;
         transaction.replace_source_claims(Some(delta.affected_prefixes()), claims)?;
-        let IncrementalPublication {
-            plan,
-            mut commit,
-            changed_bundles,
-            configuration_generation,
-        } = prepare_incremental_publication(
-            &transaction.reader(),
+        let commit = publish_claimed(
+            transaction,
             inputs,
             projection,
+            tag_epoch,
+            &BTreeSet::new(),
+            false,
+            &mut root_ids,
         )?;
-        transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
-        let configuration = transaction.publish_configuration_status(configuration_generation)?;
-        commit.configuration = Some(configuration_status(configuration));
-        for bundle_uuid in &changed_bundles {
-            transaction.remove_bundle(*bundle_uuid)?;
-            let Some(source) = &plan.bundles[bundle_uuid] else {
-                continue;
-            };
-            if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
-                let root = *root_ids
-                    .entry(poison.root_name.clone())
-                    .or_insert(transaction.intern_root(&poison.root_name)?);
-                transaction.poison_bundle(
-                    &StoreNamespaceSkeleton {
-                        bundle: poison.bundle,
-                        root,
-                        path: poison.normalized_path.clone(),
-                        format_version: poison.format_version,
-                        content_hash: poison.content_hash,
-                        entries: poison.entries.clone(),
-                    },
-                    &poison.message,
-                )?;
-                continue;
-            }
-            let bundle = source
-                .parsed
-                .as_ref()
-                .expect("indexed current bundle parsed successfully");
-            let summary = bundle_summary(source)?;
-            let root = *root_ids
-                .entry(source.root_name.clone())
-                .or_insert(transaction.intern_root(&source.root_name)?);
-            transaction.upsert_bundle(&BundleMeta {
-                bundle: bundle.uuid,
-                root,
-                path: source.normalized_path.clone(),
-                format_version: bundle.format_version,
-                content_hash: ContentHash(source.file_hash.0),
-                origin: summary.origin,
-            })?;
-            transaction.set_bundle_path_refs(
-                bundle.uuid,
-                crate::operations::bundle_path_references(bundle)
-                    .iter()
-                    .map(String::as_str),
-            )?;
-            for (hash, schema) in &bundle.schemas {
-                let snapshot =
-                    distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
-                        StoreError::InvalidConfiguration {
-                            error: format!("cannot serialize verified schema {hash}: {error}"),
-                        }
-                    })?;
-                transaction.put_schema(*hash, &snapshot)?;
-            }
-            for (local_id, entry) in &bundle.assets {
-                transaction.upsert_asset(&AssetRecord {
-                    asset: entry.uuid,
-                    bundle: bundle.uuid,
-                    local_id: local_id.clone(),
-                    type_uuid: entry.type_uuid,
-                    logical_hash: entry.schema_hash,
-                    authoring_only: entry.authoring_only,
-                    tags: BTreeMap::new(),
-                    served: Some(served_authoring(entry, projection)?),
-                })?;
-                transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
-            }
-            if let Some(primary) = &bundle.primary {
-                transaction.set_path_entry(
-                    &source.normalized_path,
-                    root,
-                    bundle.assets[primary].uuid,
-                )?;
-            }
-        }
-        for (child, current) in &plan.derived_outputs {
-            match current {
-                Some(entry) => {
-                    transaction.set_derived_output(
-                        *child,
-                        entry.parent,
-                        &entry.output_key,
-                        entry.terminal_type,
-                    )?
-                }
-                None => {
-                    transaction.remove_derived_output(*child)?;
-                }
-            }
-        }
         for rename in renames {
             let root = *root_ids
                 .entry(rename.root_name.clone())
                 .or_insert(transaction.intern_root(&rename.root_name)?);
             transaction.push_rename(root, &rename.from_path, &rename.to_path)?;
         }
-        transaction.clear_pending_claims()?;
         Ok(commit)
     })?;
+    Ok(commit)
+}
+
+/// Publish the plan of the claims an input just replaced, inside that
+/// input: the namespace errors, the configuration status (its generation
+/// advanced when `advance_configuration`), the bundles whose rows change
+/// (and every bundle of `forced`, whose rows change without its summary or
+/// assets: a retype, a new skeleton), the derived outputs, and the pending
+/// claims cleared.
+#[allow(clippy::too_many_arguments)] // Each input is independently pinned by the caller.
+fn publish_claimed(
+    transaction: &mut distill_store::InputTxn<'_>,
+    inputs: &PlanInputs<'_>,
+    projection: &PipelineProjection,
+    tag_epoch: [u8; 32],
+    forced: &BTreeSet<BundleUuid>,
+    advance_configuration: bool,
+    root_ids: &mut BTreeMap<String, distill_store::files::RootId>,
+) -> Result<Commit, StoreError> {
+    let IncrementalPublication {
+        plan,
+        mut commit,
+        changed_bundles,
+        configuration_generation,
+    } = prepare_incremental_publication(&transaction.reader(), inputs, projection, forced)?;
+    transaction.set_namespace_errors(plan.namespace_errors.iter().cloned())?;
+    let generation = if advance_configuration {
+        configuration_generation
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidConfiguration {
+                error: "configuration generation exhausted".to_owned(),
+            })?
+    } else {
+        configuration_generation
+    };
+    let configuration = transaction.publish_configuration_status(generation)?;
+    commit.configuration = Some(configuration_status(configuration));
+    for bundle_uuid in &changed_bundles {
+        transaction.remove_bundle(*bundle_uuid)?;
+        let Some(source) = &plan.bundles[bundle_uuid] else {
+            continue;
+        };
+        if let Some(poison) = plan.bundle_poisons.get(bundle_uuid) {
+            let root = *root_ids
+                .entry(poison.root_name.clone())
+                .or_insert(transaction.intern_root(&poison.root_name)?);
+            transaction.poison_bundle(
+                &StoreNamespaceSkeleton {
+                    bundle: poison.bundle,
+                    root,
+                    path: poison.normalized_path.clone(),
+                    format_version: poison.format_version,
+                    content_hash: poison.content_hash,
+                    entries: poison.entries.clone(),
+                },
+                &poison.message,
+            )?;
+            continue;
+        }
+        let bundle = source
+            .parsed
+            .as_ref()
+            .expect("indexed current bundle parsed successfully");
+        let summary = bundle_summary(source)?;
+        let root = *root_ids
+            .entry(source.root_name.clone())
+            .or_insert(transaction.intern_root(&source.root_name)?);
+        transaction.upsert_bundle(&BundleMeta {
+            bundle: bundle.uuid,
+            root,
+            path: source.normalized_path.clone(),
+            format_version: bundle.format_version,
+            content_hash: ContentHash(source.file_hash.0),
+            origin: summary.origin,
+        })?;
+        transaction.set_bundle_path_refs(
+            bundle.uuid,
+            crate::operations::bundle_path_references(bundle)
+                .iter()
+                .map(String::as_str),
+        )?;
+        for (hash, schema) in &bundle.schemas {
+            let snapshot =
+                distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
+                    StoreError::InvalidConfiguration {
+                        error: format!("cannot serialize verified schema {hash}: {error}"),
+                    }
+                })?;
+            transaction.put_schema(*hash, &snapshot)?;
+        }
+        for (local_id, entry) in &bundle.assets {
+            transaction.upsert_asset(&AssetRecord {
+                asset: entry.uuid,
+                bundle: bundle.uuid,
+                local_id: local_id.clone(),
+                type_uuid: entry.type_uuid,
+                logical_hash: entry.schema_hash,
+                authoring_only: entry.authoring_only,
+                tags: BTreeMap::new(),
+                served: Some(served_authoring(entry, projection)?),
+            })?;
+            transaction.set_tag_index_pending(entry.uuid, tag_epoch)?;
+        }
+        if let Some(primary) = &bundle.primary {
+            transaction.set_path_entry(
+                &source.normalized_path,
+                root,
+                bundle.assets[primary].uuid,
+            )?;
+        }
+    }
+    for (child, current) in &plan.derived_outputs {
+        match current {
+            Some(entry) => {
+                transaction.set_derived_output(
+                    *child,
+                    entry.parent,
+                    &entry.output_key,
+                    entry.terminal_type,
+                )?
+            }
+            None => {
+                transaction.remove_derived_output(*child)?;
+            }
+        }
+    }
+    transaction.clear_pending_claims()?;
     Ok(commit)
 }
 
@@ -2627,6 +2759,7 @@ fn prepare_incremental_publication(
     store: &StoreReader,
     inputs: &PlanInputs<'_>,
     projection: &PipelineProjection,
+    forced: &BTreeSet<BundleUuid>,
 ) -> Result<IncrementalPublication, StoreError> {
     let plan = incremental_plan(store, inputs).map_err(|error| StoreError::InvalidConfiguration {
         error: error.to_string(),
@@ -2700,7 +2833,10 @@ fn prepare_incremental_publication(
                 .unwrap_or_default(),
             (None, None) => BTreeSet::new(),
         };
-        if old.summary == current_summary && old.assets == published_assets {
+        if old.summary == current_summary
+            && old.assets == published_assets
+            && !forced.contains(bundle_uuid)
+        {
             continue;
         }
         changed_bundles.insert(*bundle_uuid);
