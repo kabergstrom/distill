@@ -5442,10 +5442,12 @@ One writer, many snapshot readers:
   surfaced — and deterministic failures commit **failure records** with
   their basis and partial trace (the CAS rules above), so an unchanged
   basis answers from the record rather than rebuilding per client.
-  Concurrent requests may perform duplicate deterministic work; no build job
-  waits on another build job. Synchronous `ctx.read` executes descendants
-  inline on the same worker, with request-local cycle detection and the
-  mandatory depth bound from §9. The pool configures 8 MiB worker stacks, and
+  Requests for one node share one build: builds are scheduled as **build
+  cells** keyed by their static inputs (below), and a worker needing a
+  dependency some other cell builds waits on it or steals it by the rules
+  below. Synchronous `ctx.read` executes descendants on the same worker,
+  with request-local cycle detection and the mandatory depth bound from
+  §9. The pool configures 8 MiB worker stacks, and
   callbacks must avoid large native-stack allocations. Results converge
   through the serialized CAS commit path. The queue has
   two priorities, FIFO within each: interactive resolves ahead of batch work
@@ -5467,6 +5469,80 @@ One writer, many snapshot readers:
   threading).
 - **Watcher thread** — OS watcher events batch into coordinator messages
   (§14).
+
+### Build cells
+
+A build is a pure function of all of its input data. A snapshot is not
+one of those inputs: two requesters at different snapshots whose inputs
+agree want the same build, and the artifacts it produces are shared CAS
+state. The daemon therefore keys, schedules and shares builds by node, not
+by requester.
+
+**Keys and traces.** A node is one asset's import plus its processor chain
+for one target. Its key (`KeyKind::Node`, canonical `DSNK` bytes) holds
+only its *static* inputs: the asset uuid, its entry metadata and its
+bundle's content hash, the chain (each stage's processor identity and
+types, the terminal and extra types, the pipeline dylib hash), the target
+definition, the validated flag, and the migration-planner and artifact
+format versions. Everything a build discovers while it runs (reads of
+other assets' built artifacts, path resolutions, queries, tool and control
+calls, reference and role checks) is *dynamic*: it is recorded in the
+node's trace rather than its key, and a strong load dependency enters the
+trace as a `Read` of the content its dependency built to. A cached node
+answers a lookup only where its trace revalidates. The asset uuid stays in
+the key: artifacts embed their asset uuid (§12), so two assets with equal
+content are still two builds. `asset_resolutions` stays a projection of
+the input version (§13): it records *that* an asset is drifted, never a
+build's result, so a build's completion changes no input version.
+
+**Resolve.** A resolve of a drifted asset at snapshot `S` computes the
+node's key at `S` and looks it up: a cached result whose trace holds at
+`S` answers `Built` at once. A miss submits the key's cell, or joins the
+cell already in flight for it, and the requester awaits its ticket.
+
+**Cells.** The scheduler holds at most one cell per key, `Queued`,
+`Running` or `Done`. A requester's ticket is a `Send` future holding one
+interest in its cell; dropping it withdraws that interest, and a queued
+cell no ticket and no worker wants is removed without running. A running
+cell always finishes, and its result is published whoever still waits.
+A cell is queued at the highest work class among its waiters: an
+interactive requester joining a queued batch cell promotes it. A cell's
+worker builds at a snapshot it opens when the cell starts.
+
+**Answering each waiter.** A finished cell's outcome is answered at each
+waiter's own snapshot. `Built` carries the node's trace: a waiter at
+whose snapshot it revalidates gets `Built`; any other gets `Drifted`
+naming the first input that differs, and retries at a fresher snapshot.
+A failure is answered `Failed` only to waiters at the snapshot the worker
+built at (it is a fact about exactly those inputs); others get `Drifted`.
+Failed nodes are not cached as nodes, and a node with an uncacheable stage
+(§9) gets no cache entry: a later request rebuilds it, though concurrent
+requests still share its one cell.
+
+**Workers and dependencies.** A worker building a node that needs another
+node first looks it up in the cache at its own snapshot, then claims its
+cell: an absent or queued cell is run (stolen) inline by this worker; a
+cell running on another worker is waited on, unless waiting would close a
+cycle of waiting workers (this one included), in which case the node is
+built privately, outside any cell. A waited-for result is used
+only if its trace holds at the waiting worker's snapshot. Waiting never
+needs a free worker, so a chain of any depth completes with one worker,
+and the visiting set and the §9 depth bound keep every walk finite.
+
+**Publication.** A worker publishes each node in one write transaction:
+its stage cache rows, wire trees, artifacts with their load edges, and the
+node's cache row. Only then does it complete the node's cell, so a waiter
+woken by a result always finds its artifacts in the CAS. Workers hold no
+write transaction while a processor runs.
+
+**The RPC side.** A connection thread only reads: it looks the node up and
+submits or joins a cell, then awaits the ticket on its `LocalSet`; the
+build runs on the build workers, never on a connection thread. Inline
+builds (`doctor verify`, tag-index refinement) run on a writer inside an
+open input and are reachable only through an `OpenInput` proof; nothing
+that answers a resolve holds one. A reconciliation pass refines the tag
+index in its one apply input (§14, one pass, one input version), never in
+its rolled-back plan.
 
 ## 14. File Tracking & Consistency
 
@@ -6956,7 +7032,11 @@ accepted connection gets an OS thread of its own with a current-thread
 tokio runtime and a `LocalSet`, on which that connection's `RpcSystem`, its
 capabilities and its pending calls live. A request that stalls inside a
 backend, or a fetch streaming a large artifact, therefore delays only its own
-connection; other connections and new connects proceed.
+connection; other connections and new connects proceed. A resolve that
+needs a build never runs it there: it submits or joins the node's build
+cell (§13 Build cells) and awaits the ticket on the `LocalSet`, so the
+connection keeps serving its other calls meanwhile, and a cancelled call
+drops the ticket.
 
 **Nothing mutable is shared between connections.** A connection owns its
 front end outright: its own store reader, its own snapshots (each an open
@@ -6974,7 +7054,8 @@ publications and operation completions on its own thread, passing that
 writer explicitly to the daemon backend; the process loop and each build
 job own writers too, and nothing finds a writer through shared or
 thread-local state. SQLite's write lock orders the writers. The build
-backend memoizes builds, so the RPC layer keeps no build cache of its own. The RPC layer takes no lock of its
+backend's node cache and build cells share builds across connections, so
+the RPC layer keeps no build cache of its own. The RPC layer takes no lock of its
 own, so it has no lock order: the bounds are claimed by compare-and-swap,
 and the only lock a connection waits on is the store's.
 

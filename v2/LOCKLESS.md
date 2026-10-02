@@ -37,8 +37,11 @@ at f10f599, not from the older design documents.
    - A snapshot is a **metadata** snapshot. It does not pin file contents
      or build inputs. A cook or load that finds its data changed (and no CAS
      blob for it) fails as `Drifted`, and the client retries with a new
-     snapshot. Builds always run against current state; a mismatch with the
-     snapshot's recorded inputs is `Drifted`.
+     snapshot. A build is a pure function of its inputs, not of a
+     snapshot: it is keyed by its static inputs and shared by every
+     requester of that key, and each requester gets its answer at its own
+     snapshot, `Drifted` where the build's traced inputs differ there
+     (§3 Builds).
    - Clients normally hold one snapshot, but nothing enforces it; the lease
      cap bounds open connections.
 6. **Publication is a transaction.** It bumps `input_version`, writes the
@@ -162,9 +165,10 @@ a connection of its own, and SQLite's write lock orders the writers.
  notify ──▶ watcher ──WatcherEvent──▶ process loop ──(own writer)──▶ SQLite
  rpc listener ──▶ one thread per connection (LocalSet front end: snapshots, subscriptions)
     ├─ reads: own StoreReader, one read transaction per snapshot
-    ├─ importer runs, builds: blocking worker (the connection keeps serving)
+    ├─ importer runs: blocking worker (the connection keeps serving)
+    ├─ builds: submit or join a build cell, await its ticket on the LocalSet
     └─ writes, import publications, operations: inline ──(own writer)──▶ SQLite
- scheduler: lends each build job a writer it owns ──▶ worker ──▶ SQLite
+ scheduler: build cells (key → Queued | Running | Done); lends each job a writer ──▶ worker ──▶ SQLite
 ```
 
 - **Writers.** Each owner opens a writer of its own from the daemon's
@@ -199,10 +203,24 @@ a connection of its own, and SQLite's write lock orders the writers.
   a rolled-back write, runs its importers in parallel outside any write
   against an overlay of the planned file state, and applies them all in
   one coordinated input (`Stale`, and rerun whole, if the base moved).
-- **Builds** run on scheduler workers. A worker does memo lookup and trace
-  revalidation against its reader, builds dependency reads inline, and
-  commits the CAS index, `artifact_load_edges` and `resolutions` in one
-  transaction on its own writer.
+- **Builds** are build cells (DESIGN.md §13 Build cells). A resolve, on
+  its connection thread, computes the node's key (static inputs only) at
+  its snapshot and looks it up in the node cache: a cached node whose
+  trace holds there answers at once. Otherwise it submits the key's cell,
+  or joins the one in flight, and awaits the ticket (a `Send` future; a
+  dropped ticket withdraws its interest, and a queued cell nobody wants
+  never runs). The scheduler runs a cell at the highest class among its
+  waiters. Its worker builds at a snapshot of its own, looks up stage and
+  node results on a latest reader, and, for a dependency, steals a
+  queued cell, waits on a running one unless that closes a cycle of
+  waiting workers, or builds it privately; one worker suffices for any
+  chain. It publishes each node's stage rows, wire trees, artifacts with
+  `artifact_load_edges`, and node row in one transaction on its own
+  writer, then completes the cell. Each waiter revalidates the node's
+  trace at its own snapshot: `Built` where it holds, `Drifted` where not.
+  Inline builds (doctor verification, tag-index refinement) take an
+  `OpenInput` proof: they run only on a writer inside an open input, and
+  nothing on the resolve path has one.
 - **rpc front ends** are cheap, `!Send` values, one per client
   connection, each on that connection's own thread (`Rc<RefCell<…>>` state
   on its `LocalSet`). Each owns its reader, subscriptions, delta queue,
@@ -850,6 +868,18 @@ should reach zero by the end of phase 6.
   `NEXT_SHARED_ID` went with it. Doctor verification rebuilds inline on
   the writer whose input it completes in, as the old in-transaction path
   did.
+- **Build cells.** A build's identity is its static inputs, never the
+  requester's snapshot: `BuildRequest` lost its `basis`, and the drift a
+  build reported when the store had moved past the requester's basis is
+  gone. `BuildBackend::build` (blocking, returning a publication the server
+  installed) became `BuildBackend::start`, which answers at once or hands
+  back a `BuildTicket`; the finished build answers each waiter at its own
+  `BuildView`. The transport awaits the ticket on the connection's
+  `LocalSet` instead of `spawn_blocking`, and `run_scheduled` is test-only.
+  The wire protocol is unchanged. Node results are cached under
+  `KeyKind::Node` with their traces. Tag-index refinement keeps running
+  inline, now with an `OpenInput` proof, in a pass's apply input and never
+  in its rolled-back plan.
 
 ## 7. Test baseline
 
@@ -870,3 +900,6 @@ End of phase 8: 1151 passed, the same single failure.
 
 End of phase 9: 1144 passed (the supervisor's 8 tests removed, 1 bootstrap
 test added), the same single failure.
+
+Build cells, on top of the one-input pass: 1151 passed, no failures (the
+stdin-drain test now passes).
