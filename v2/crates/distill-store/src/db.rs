@@ -19,7 +19,7 @@ use crate::state::{InputVersion, MemoSeq, SnapshotStamp, StoreInstanceId};
 /// SQLite's `user_version`. There is deliberately no in-place migration
 /// story: daemon state is disposable (§2), so a mismatch is a typed error
 /// and the remedy is [`Store::recreate`].
-pub const SCHEMA_VERSION: u32 = 35;
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// §13's table inventory. Physical placement (`segment, offset, len`)
 /// lives solely in `cas_extents` — every other row references artifacts
@@ -51,11 +51,13 @@ CREATE INDEX files_by_path ON files(path);
 CREATE INDEX files_by_symlink_target ON files(symlink_target)
     WHERE symlink_target IS NOT NULL;
 -- The bytes of every observed `.bundle` file, as read by the scan that
--- recorded its `files` row.
+-- recorded its `files` row, and their blake3 hash (the bundle's file hash),
+-- so an observation compares without reading the bytes.
 CREATE TABLE bundle_files (
     root_id INTEGER NOT NULL,
     path    TEXT NOT NULL,
     bytes   BLOB NOT NULL,
+    hash    BLOB NOT NULL CHECK (length(hash) = 32),
     PRIMARY KEY (root_id, path)
 );
 -- Every traversed directory (the root itself at path ''), for alias checks.
@@ -171,6 +173,18 @@ CREATE TABLE bundles (
 );
 CREATE INDEX bundles_by_origin ON bundles(origin_rules_bundle)
     WHERE origin_rules_bundle IS NOT NULL;
+-- Bundles by logical path (exact, and string-prefix ranges), across roots.
+CREATE INDEX bundles_by_path ON bundles(path, root_id);
+CREATE INDEX bundles_poisoned ON bundles(bundle_uuid) WHERE poison IS NOT NULL;
+-- The logical path strings each bundle's AssetRef/WeakRef fields name
+-- (a bare string or an object's `path` field): what a rename rewrites.
+-- Derived at scan from the published bundle, with its `bundles` row.
+CREATE TABLE bundle_path_refs (
+    bundle_uuid BLOB NOT NULL,
+    target      TEXT NOT NULL,
+    PRIMARY KEY (bundle_uuid, target)
+) WITHOUT ROWID;
+CREATE INDEX bundle_path_refs_by_target ON bundle_path_refs(target);
 CREATE TABLE assets (
     asset_uuid   BLOB NOT NULL PRIMARY KEY,
     bundle_uuid  BLOB NOT NULL,
@@ -187,7 +201,13 @@ CREATE TABLE assets (
     authored_value BLOB,
     terminal_type  BLOB
 );
-CREATE INDEX assets_by_bundle ON assets(bundle_uuid);
+CREATE INDEX assets_by_bundle ON assets(bundle_uuid, asset_uuid);
+CREATE INDEX assets_by_type ON assets(type_uuid);
+CREATE INDEX assets_by_terminal_type ON assets(terminal_type) WHERE terminal_type IS NOT NULL;
+-- Skeleton rows (and only they) lack a logical hash.
+CREATE INDEX assets_unhashed ON assets(asset_uuid) WHERE logical_hash IS NULL;
+-- The reserved `$`-prefixed entries (`$record`, `$settings`) by local id.
+CREATE INDEX assets_reserved ON assets(local_id, bundle_uuid) WHERE local_id GLOB '$*';
 CREATE TABLE asset_tags (
     asset_uuid BLOB NOT NULL,
     tag        TEXT NOT NULL,
@@ -203,12 +223,14 @@ CREATE TABLE asset_tag_index (
     trace             BLOB NOT NULL,
     poison            TEXT
 );
+CREATE INDEX asset_tag_index_poisoned ON asset_tag_index(asset_uuid) WHERE poison IS NOT NULL;
 CREATE TABLE path_index (
     path       TEXT NOT NULL,
     root_id    INTEGER NOT NULL,
     asset_uuid BLOB NOT NULL,
     PRIMARY KEY (path, root_id)
 );
+CREATE INDEX path_index_by_asset ON path_index(asset_uuid);
 CREATE TABLE deps (
     src_uuid BLOB NOT NULL,
     kind     INTEGER NOT NULL,
@@ -974,6 +996,30 @@ impl StoreReader {
 
     pub fn instance_id(&self) -> StoreInstanceId {
         self.instance_id
+    }
+
+    /// How many database pages this connection has fetched since it opened
+    /// (page-cache hits plus misses): a deterministic measure of how much of
+    /// the database its reads touched, for tests that pin a query's cost.
+    pub fn pages_fetched(&self) -> Result<u64, StoreError> {
+        use rusqlite::ffi;
+        let mut total = 0;
+        for op in [ffi::SQLITE_DBSTATUS_CACHE_HIT, ffi::SQLITE_DBSTATUS_CACHE_MISS] {
+            let (mut current, mut highwater) = (0, 0);
+            // SAFETY: the handle is this reader's open connection, used on
+            // this thread; db_status only reads its counters.
+            let code = unsafe {
+                ffi::sqlite3_db_status(self.conn.handle(), op, &mut current, &mut highwater, 0)
+            };
+            if code != ffi::SQLITE_OK {
+                return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(code),
+                    Some("sqlite3_db_status".to_owned()),
+                )));
+            }
+            total += current as u64;
+        }
+        Ok(total)
     }
 
     /// The committed input version visible to this connection.

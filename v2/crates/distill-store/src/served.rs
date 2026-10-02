@@ -238,9 +238,17 @@ impl Drop for StoreSnapshot {
 
 const SERVED_ENTRY_COLUMNS: &str = "a.asset_uuid, a.bundle_uuid, a.local_id, b.path, a.type_uuid,
      a.terminal_type, a.logical_hash, a.authoring_only";
-const SERVED_ENTRY_FROM: &str = "FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-     WHERE a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL
-       AND a.logical_hash IS NOT NULL AND b.poison IS NULL";
+macro_rules! served_entry_where {
+    () => {
+        "a.authored_value IS NOT NULL AND a.terminal_type IS NOT NULL
+       AND a.logical_hash IS NOT NULL AND b.poison IS NULL"
+    };
+}
+const SERVED_ENTRY_WHERE: &str = served_entry_where!();
+const SERVED_ENTRY_FROM: &str = concat!(
+    "FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE ",
+    served_entry_where!()
+);
 
 fn served_entry_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServedEntryMeta> {
     Ok(ServedEntryMeta {
@@ -285,6 +293,61 @@ impl StoreReader {
             }
         }
         Ok(entries)
+    }
+
+    /// The served authoring entries `filter` selects, with bundle and logical
+    /// path, by asset UUID: one SQL query over the namespace indexes.
+    pub fn served_assets_matching(
+        &self,
+        filter: &crate::bundles::AssetFilter,
+    ) -> Result<Vec<crate::bundles::MatchedAsset>, StoreError> {
+        let mut params = Vec::new();
+        let conditions = filter.sql_conditions(&mut params);
+        self.query_rows(
+            &format!(
+                "SELECT a.asset_uuid, a.bundle_uuid, b.path {SERVED_ENTRY_FROM}{conditions}
+                 ORDER BY a.asset_uuid"
+            ),
+            rusqlite::params_from_iter(params),
+            crate::bundles::matched_asset_row,
+        )
+    }
+
+    /// Every served runtime (not authoring-only) entry with its schema and
+    /// value, by asset UUID, read in one query. Each entry fails on its own,
+    /// as [`StoreReader::served_entry`] would for it: an entry whose schema
+    /// snapshot is missing is an error in its place.
+    pub fn served_runtime_entries(&self) -> Result<Vec<Result<ServedEntry, StoreError>>, StoreError> {
+        let rows = self.query_rows(
+            &format!(
+                "SELECT {SERVED_ENTRY_COLUMNS}, s.schema_json, a.authored_value
+                 FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
+                 LEFT JOIN schemas s ON s.logical_hash = a.logical_hash
+                 WHERE {SERVED_ENTRY_WHERE} AND a.authoring_only = 0
+                 ORDER BY a.asset_uuid"
+            ),
+            [],
+            |row| {
+                Ok((
+                    served_entry_meta_row(row)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(mut meta, schema_json, authored_value)| {
+                meta.tags = self.asset_tag_map(meta.asset)?;
+                let schema_json = schema_json
+                    .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
+                Ok(ServedEntry {
+                    meta,
+                    schema_json,
+                    authored_value,
+                })
+            })
+            .collect())
     }
 
     /// One served authoring entry's metadata.

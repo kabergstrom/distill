@@ -1,0 +1,378 @@
+//! The plans and costs of the namespace's selective reads. Every statement
+//! those readers issue is captured from SQLite's trace and explained: none
+//! may scan a namespace table. And over a large namespace, a narrow read
+//! touches a small, fixed number of pages where the whole-table read it
+//! replaced touches them all.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use distill_core::id::{AssetUuid, BundleUuid, ContentHash, LogicalHash, TypeUuid};
+use rusqlite::Connection;
+
+use crate::bundles::{
+    AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, ServedAuthoring, SkeletonEntry,
+};
+use crate::db::{ReaderConn, StoreReader};
+use crate::files::{FileKind, FileObservation, FileState, PathSelection};
+use crate::{Store, StoreConfig};
+
+const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
+const RUNTIME_TYPE: TypeUuid = TypeUuid([0x71; 16]);
+const RECORD_TYPE: TypeUuid = TypeUuid([0x72; 16]);
+/// The bundle every hundredth bundle references.
+const REFERENCED: &str = "d00/b00000.bundle";
+
+fn bundle_uuid(index: u32) -> BundleUuid {
+    let mut bytes = [0x10; 16];
+    bytes[12..].copy_from_slice(&index.to_be_bytes());
+    BundleUuid(bytes)
+}
+
+fn asset_uuid(index: u32, entry: u8) -> AssetUuid {
+    let mut bytes = [0x20; 16];
+    bytes[0] = entry;
+    bytes[12..].copy_from_slice(&index.to_be_bytes());
+    AssetUuid(bytes)
+}
+
+fn bundle_path(index: u32) -> String {
+    format!("d{:02}/b{index:05}.bundle", index % 50)
+}
+
+/// A namespace of `count` bundles across two roots: each with a served
+/// runtime entry (tagged; one in a thousand rarely), a scanned file row and
+/// its bytes, and a path index entry; every seventh with a `$record` entry,
+/// every hundredth referencing [`REFERENCED`], and one in five hundred
+/// poisoned instead.
+fn populate(store: &mut Store, count: u32) {
+    store
+        .input_transaction(|txn| {
+            let version = txn.version();
+            let roots = [txn.intern_root("main")?, txn.intern_root("alt")?];
+            txn.put_schema(SCHEMA, "{}")?;
+            for index in 0..count {
+                let root = roots[(index % 2) as usize];
+                let path = bundle_path(index);
+                let bundle = bundle_uuid(index);
+                let bytes = format!("bundle {index}").into_bytes();
+                txn.upsert_file(
+                    root,
+                    &path,
+                    &FileObservation::from(FileState {
+                        mtime: i64::from(index),
+                        size: bytes.len() as u64,
+                        kind: FileKind::File,
+                        content_hash: Some(ContentHash(*blake3::hash(&bytes).as_bytes())),
+                    }),
+                    version,
+                )?;
+                txn.set_bundle_file(root, &path, &bytes)?;
+                let runtime = asset_uuid(index, 1);
+                if index % 500 == 199 {
+                    txn.poison_bundle(
+                        &NamespaceSkeleton {
+                            bundle,
+                            root,
+                            path,
+                            format_version: 1,
+                            content_hash: ContentHash(*blake3::hash(&bytes).as_bytes()),
+                            entries: vec![SkeletonEntry {
+                                asset: runtime,
+                                local_id: "main".into(),
+                                type_uuid: RUNTIME_TYPE,
+                                authoring_only: false,
+                                tags: BTreeMap::new(),
+                            }],
+                        },
+                        "malformed",
+                    )?;
+                    continue;
+                }
+                txn.upsert_bundle(&BundleMeta {
+                    bundle,
+                    root,
+                    path: path.clone(),
+                    format_version: 1,
+                    content_hash: ContentHash(*blake3::hash(&bytes).as_bytes()),
+                    origin: None,
+                })?;
+                let mut tags = BTreeMap::from([(
+                    "kind".to_owned(),
+                    Some(if index % 3 == 0 { "mesh" } else { "texture" }.to_owned()),
+                )]);
+                if index % 1000 == 7 {
+                    tags.insert("rare".into(), Some("yes".into()));
+                }
+                txn.upsert_asset(&AssetRecord {
+                    asset: runtime,
+                    bundle,
+                    local_id: "main".into(),
+                    type_uuid: RUNTIME_TYPE,
+                    logical_hash: SCHEMA,
+                    authoring_only: false,
+                    tags,
+                    served: Some(ServedAuthoring {
+                        authored_value: Vec::new(),
+                        terminal_type: RUNTIME_TYPE,
+                    }),
+                })?;
+                if index % 7 == 0 {
+                    txn.upsert_asset(&AssetRecord {
+                        asset: asset_uuid(index, 2),
+                        bundle,
+                        local_id: "$record".into(),
+                        type_uuid: RECORD_TYPE,
+                        logical_hash: SCHEMA,
+                        authoring_only: true,
+                        tags: BTreeMap::new(),
+                        served: None,
+                    })?;
+                }
+                if index % 100 == 1 {
+                    txn.set_bundle_path_refs(bundle, [REFERENCED])?;
+                }
+                txn.set_path_entry(&path, root, runtime)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn store_with(count: u32) -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(StoreConfig::new(dir.path().join(".distill"))).unwrap();
+    populate(&mut store, count);
+    (dir, store)
+}
+
+/// A filter selecting `path`'s runtime entries.
+fn at_path(path: &str) -> AssetFilter {
+    AssetFilter {
+        bundle_path: Some(path.into()),
+        ..AssetFilter::default()
+    }
+}
+
+fn rare() -> AssetFilter {
+    AssetFilter {
+        tag: Some(("rare".into(), Some("yes".into()))),
+        authoring_only: Some(false),
+        ..AssetFilter::default()
+    }
+}
+
+/// Run every selective read the converted call sites issue.
+fn selective_reads(reader: &StoreReader) {
+    let path = bundle_path(42);
+    reader.bundles_at_path(&path).unwrap();
+    reader.poisoned_bundles().unwrap();
+    reader.bundles_with_reserved_entry("$record").unwrap();
+    reader.bundles_referencing_path(REFERENCED).unwrap();
+    reader.asset_exists(asset_uuid(42, 1)).unwrap();
+    reader.check_entries().unwrap_err();
+    reader.check_tag_selector("rare", Some("yes"), false).unwrap();
+    reader.check_tag_selector("kind", None, true).unwrap();
+    reader.observed_files_in(PathSelection::Subtree("d07")).unwrap();
+    reader.observed_files_in(PathSelection::Prefix("d07/b000")).unwrap();
+    for filter in [
+        at_path(&path),
+        rare(),
+        AssetFilter {
+            asset: Some(asset_uuid(42, 1)),
+            ..AssetFilter::default()
+        },
+        AssetFilter {
+            bundle: Some(bundle_uuid(42)),
+            local_id: Some("main".into()),
+            ..AssetFilter::default()
+        },
+        AssetFilter {
+            path_prefixes: vec!["d07/b000".into()],
+            authoring_only: Some(false),
+            ..AssetFilter::default()
+        },
+        AssetFilter {
+            tag: Some(("rare".into(), None)),
+            path_prefixes: vec!["d07/".into()],
+            ..AssetFilter::default()
+        },
+    ] {
+        reader.served_assets_matching(&filter).unwrap();
+        reader.namespace_assets_matching(&filter).unwrap();
+    }
+}
+
+static TRACED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn trace(sql: &str) {
+    TRACED.lock().unwrap().push(sql.to_owned());
+}
+
+fn connection(reader: &mut StoreReader) -> &mut Connection {
+    match &mut reader.conn {
+        ReaderConn::Owned(conn) => conn,
+        ReaderConn::Lent(_) => unreachable!("a store's reader owns its connection"),
+    }
+}
+
+fn explain(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    statement
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The tables a selective read must never scan.
+const NAMESPACE_TABLES: [&str; 8] = [
+    "assets",
+    "bundles",
+    "files",
+    "asset_tags",
+    "asset_tag_index",
+    "bundle_path_refs",
+    "path_index",
+    "directories",
+];
+
+/// Partial indexes: walking one visits only the rows it was declared for.
+const PARTIAL_INDEXES: [&str; 5] = [
+    "bundles_poisoned",
+    "assets_unhashed",
+    "assets_reserved",
+    "asset_tag_index_poisoned",
+    "assets_by_terminal_type",
+];
+
+/// Whether one `EXPLAIN QUERY PLAN` step walks a whole namespace table or
+/// one of its full indexes. Queries alias their tables by one letter, and
+/// those count as namespace tables too.
+fn scans_namespace(step: &str) -> bool {
+    let Some(rest) = step.strip_prefix("SCAN ") else {
+        return false;
+    };
+    let mut words = rest.split_whitespace();
+    let table = words.next().unwrap_or_default();
+    let words = words.collect::<Vec<_>>();
+    let partial = words
+        .last()
+        .is_some_and(|index| PARTIAL_INDEXES.contains(index));
+    (NAMESPACE_TABLES.contains(&table) || table.len() == 1) && !partial
+}
+
+#[test]
+fn selective_namespace_reads_search_indexes() {
+    let (_dir, store) = store_with(200);
+    let mut reader = store.reader().unwrap();
+    connection(&mut reader).trace(Some(trace));
+    selective_reads(&reader);
+    connection(&mut reader).trace(None);
+    let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+    assert!(statements.len() >= 20, "{statements:?}");
+    let conn = connection(&mut reader);
+    for sql in statements {
+        let plan = explain(conn, &sql);
+        println!("{sql}\n  {}\n", plan.join("\n  "));
+        assert!(
+            !plan.iter().any(|step| scans_namespace(step)),
+            "{sql}\nscans a namespace table: {plan:?}"
+        );
+    }
+}
+
+/// Pages fetched by `read`, by this reader's page-cache counters.
+fn pages(reader: &StoreReader, read: impl FnOnce()) -> u64 {
+    let before = reader.pages_fetched().unwrap();
+    read();
+    reader.pages_fetched().unwrap() - before
+}
+
+#[test]
+fn narrow_reads_of_a_large_namespace_touch_few_pages() {
+    let (_dir, store) = store_with(20_000);
+    let reader = store.reader().unwrap();
+    let path = bundle_path(12_345);
+    let count = |rows: usize, expected: usize| {
+        assert_eq!(rows, expected);
+        rows as u64
+    };
+    let mut rows = 0;
+    // (read, rows it returns, pages it fetched, pages of the whole-table
+    // read it replaced)
+    let costs = [
+        (
+            "bundle at a path",
+            pages(&reader, || rows = count(reader.bundles_at_path(&path).unwrap().len(), 1)),
+            rows,
+            pages(&reader, || drop(reader.all_bundles().unwrap())),
+        ),
+        (
+            "file prefix",
+            pages(&reader, || {
+                let selected = reader.observed_files_in(PathSelection::Prefix("d07/b000"));
+                rows = count(selected.unwrap().len(), 2);
+            }),
+            rows,
+            pages(&reader, || drop(reader.observed_files().unwrap())),
+        ),
+        (
+            "file subtree",
+            pages(&reader, || {
+                let selected = reader.observed_files_in(PathSelection::Subtree("d07"));
+                rows = count(selected.unwrap().len(), 400);
+            }),
+            rows,
+            pages(&reader, || drop(reader.observed_files().unwrap())),
+        ),
+        (
+            "served entries at a path",
+            pages(&reader, || {
+                rows = count(reader.served_assets_matching(&at_path(&path)).unwrap().len(), 1);
+            }),
+            rows,
+            pages(&reader, || drop(reader.served_entries().unwrap())),
+        ),
+        (
+            "rarely tagged entries",
+            pages(&reader, || {
+                rows = count(reader.namespace_assets_matching(&rare()).unwrap().len(), 20);
+            }),
+            rows,
+            pages(&reader, || {
+                drop(reader.all_bundles().unwrap());
+                drop(reader.assets_by_tag_value("rare", Some("yes")).unwrap());
+            }),
+        ),
+        (
+            "unreadable entries",
+            pages(&reader, || {
+                reader.check_entries().unwrap_err();
+                // It visits each poisoned bundle's skeleton rows: one in 500.
+                rows = 40;
+            }),
+            rows,
+            pages(&reader, || {
+                for asset in reader.all_asset_ids().unwrap() {
+                    if reader.entry(asset).is_err() {
+                        break;
+                    }
+                }
+            }),
+        ),
+        (
+            "bundles referencing a path",
+            pages(&reader, || {
+                rows = count(reader.bundles_referencing_path(REFERENCED).unwrap().len(), 200);
+            }),
+            rows,
+            pages(&reader, || drop(reader.all_bundles().unwrap())),
+        ),
+    ];
+    for (read, narrow, rows, full) in costs {
+        println!("{read}: {rows} rows in {narrow} pages (whole-table read: {full} pages)");
+        assert!(narrow <= 16 + 8 * rows, "{read} fetched {narrow} pages for {rows} rows");
+        assert!(full >= 4 * narrow, "{read}: {narrow} pages against {full}");
+    }
+}

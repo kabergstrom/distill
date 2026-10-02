@@ -219,9 +219,9 @@ impl InputTxn<'_> {
         bytes: &[u8],
     ) -> Result<(), StoreError> {
         self.txn.execute(
-            "INSERT INTO bundle_files(root_id, path, bytes) VALUES (?1, ?2, ?3)
-             ON CONFLICT(root_id, path) DO UPDATE SET bytes = excluded.bytes",
-            rusqlite::params![root.0, path, bytes],
+            "INSERT INTO bundle_files(root_id, path, bytes, hash) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(root_id, path) DO UPDATE SET bytes = excluded.bytes, hash = excluded.hash",
+            rusqlite::params![root.0, path, bytes, blake3::hash(bytes).as_bytes().as_slice()],
         )?;
         Ok(())
     }
@@ -778,5 +778,139 @@ impl StoreReader {
             )?
             .query_row(rusqlite::params![root_name, path], |row| row.get(0))
             .optional()?)
+    }
+}
+
+/// Which logical paths a cross-root `files` query selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathSelection<'a> {
+    /// Every row.
+    All,
+    /// The path itself and every path below it (`path/…`).
+    Subtree(&'a str),
+    /// Every path that starts with the string.
+    Prefix(&'a str),
+}
+
+impl PathSelection<'_> {
+    /// Whether `path` is selected.
+    pub fn contains(&self, path: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Subtree(prefix) => {
+                path == *prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+            Self::Prefix(prefix) => path.starts_with(prefix),
+        }
+    }
+}
+
+/// The SQL range over `column` that selects exactly the paths starting with
+/// `?{param}`: valid UTF-8 never holds the bytes `F4 90`, so every string
+/// with the prefix sorts below the prefix followed by them.
+pub(crate) fn starts_with_sql(column: &str, param: usize) -> String {
+    format!("({column} >= ?{param} AND {column} < ?{param} || CAST(x'F490' AS TEXT))")
+}
+
+/// The SQL that selects `?{param}` itself and every path below it.
+pub(crate) fn subtree_sql(column: &str, param: usize) -> String {
+    format!(
+        "({column} = ?{param} OR ({column} >= ?{param} || '/' AND {column} < ?{param} || '0'))"
+    )
+}
+
+impl StoreReader {
+    /// The scanned rows of every root that `selection` selects, in (root
+    /// name, path) order. Answered from the `files_by_path` index.
+    pub fn observed_files_in(
+        &self,
+        selection: PathSelection<'_>,
+    ) -> Result<Vec<ObservedFile>, StoreError> {
+        match selection {
+            PathSelection::All => self.observed_files(),
+            PathSelection::Subtree(path) => self.query_rows(
+                &format!(
+                    "{OBSERVED_FILE} WHERE {} ORDER BY r.name, t.path",
+                    subtree_sql("t.path", 1)
+                ),
+                [path],
+                observed_file_row,
+            ),
+            PathSelection::Prefix(prefix) => self.query_rows(
+                &format!(
+                    "{OBSERVED_FILE} WHERE {} ORDER BY r.name, t.path",
+                    starts_with_sql("t.path", 1)
+                ),
+                [prefix],
+                observed_file_row,
+            ),
+        }
+    }
+
+    /// Visit every scanned file row in (root name, path) order without
+    /// collecting them.
+    pub fn for_each_observed_file(
+        &self,
+        mut visit: impl FnMut(ObservedFile) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut statement = self
+            .conn
+            .prepare_cached(&format!("{OBSERVED_FILE} ORDER BY r.name, t.path"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            visit(observed_file_row(row)?)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every traversed directory in (root name, path) order.
+    pub fn for_each_observed_directory(
+        &self,
+        mut visit: impl FnMut(ObservedDirectory) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT r.name, t.path, t.canonical_path, t.physical_path
+             FROM directories t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            visit(observed_directory_row(row)?)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every observed `.bundle` file's (root name, path, blake3 hash)
+    /// in (root name, path) order, without reading its bytes.
+    pub fn for_each_bundle_file_hash(
+        &self,
+        mut visit: impl FnMut(String, String, [u8; 32]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT r.name, t.path, t.hash
+             FROM bundle_files t JOIN roots r USING (root_id) ORDER BY r.name, t.path",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            visit(
+                row.get(0)?,
+                row.get(1)?,
+                crate::bundles::blob32(row.get(2)?),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether two traversed directories share a canonical path: the scan
+    /// tables then hold a directory alias.
+    pub fn has_directory_alias(&self) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM directories
+                           GROUP BY canonical_path HAVING count(*) > 1)",
+            [],
+            |row| row.get(0),
+        )?)
     }
 }
