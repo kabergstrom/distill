@@ -477,6 +477,10 @@ fn queries() -> Vec<AssetQuery> {
             "*",
             "textures/[ab].bundle",
             "\u{f6}/x.bundle",
+            "**/c.bundle",
+            "*/a.bundle",
+            "**/x.bundle",
+            "*.bundle",
         ]
         .into_iter()
         .map(|g| -> Setter { Box::new(move |q: &mut AssetQuery| q.path_glob = Some(g.to_owned())) })
@@ -856,9 +860,11 @@ fn take_statements() -> Vec<String> {
     STATEMENTS.with(|statements| std::mem::take(&mut *statements.borrow_mut()))
 }
 
-/// With 20 000 assets in the store, revalidating a five-question trace
-/// runs a dozen statements, each planned on an index; the eager capture
-/// ran tens of thousands.
+/// With 20 000 assets in the store, revalidating a seven-question trace
+/// runs under twenty statements, each planned on an index; the eager capture
+/// ran tens of thousands. Its queries name an exact path and local id, a
+/// glob whose final segment is literal beside a type every other asset
+/// shares, and a local id alone.
 #[test]
 fn revalidating_a_trace_reads_only_what_it_asks_about() {
     const BUNDLES: usize = 200;
@@ -901,6 +907,9 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
                 EXTRA_A,
             )?;
         }
+        // One bundle whose name and local id no other shares.
+        put_bundle(txn, bundle_uuid(BUNDLES), 1, "extra/solo.bundle", 0xee)?;
+        put_asset(txn, uuid(BUNDLES, 0), bundle_uuid(BUNDLES), "solo", TA, false, &[])?;
         Ok(())
     });
     let registry = registry();
@@ -925,6 +934,15 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
             local_id: Some("a5".to_owned()),
             ..AssetQuery::default()
         };
+        let by_name = AssetQuery {
+            path_glob: Some("**/solo.bundle".to_owned()),
+            authored_type: Some(TA),
+            ..AssetQuery::default()
+        };
+        let by_local_id = AssetQuery {
+            local_id: Some("solo".to_owned()),
+            ..AssetQuery::default()
+        };
         let trace = vec![
             TraceOp::Resolve {
                 path: path.clone(),
@@ -947,6 +965,14 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
                 observed: source.query(&query),
                 query: Box::new(query),
             },
+            TraceOp::Query {
+                observed: source.query(&by_name),
+                query: Box::new(by_name.clone()),
+            },
+            TraceOp::Query {
+                observed: source.query(&by_local_id),
+                query: Box::new(by_local_id.clone()),
+            },
         ];
         source.check().unwrap();
         assert_eq!(
@@ -956,6 +982,9 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
             }),
             vec![uuid(117, 5)]
         );
+        for query in [&by_name, &by_local_id] {
+            assert_eq!(source.query_results(query), vec![uuid(BUNDLES, 0)]);
+        }
         trace
     };
 
@@ -973,7 +1002,7 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
     source.check().unwrap();
     let statements = take_statements();
     assert!(
-        statements.len() <= 16,
+        statements.len() <= 20,
         "{} statements: {statements:#?}",
         statements.len()
     );
@@ -996,7 +1025,7 @@ fn revalidating_a_trace_reads_only_what_it_asks_about() {
         "{eager_statements}"
     );
     eprintln!(
-        "revalidating a 5-question trace over {} assets: store source {} statements in {lazy_time:?}, eager capture {eager_statements} statements in {eager_time:?}",
+        "revalidating a 7-question trace over {} assets: store source {} statements in {lazy_time:?}, eager capture {eager_statements} statements in {eager_time:?}",
         BUNDLES * PER_BUNDLE,
         statements.len(),
     );

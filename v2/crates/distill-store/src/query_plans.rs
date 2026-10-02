@@ -14,7 +14,7 @@ use crate::bundles::{
     AssetFilter, AssetRecord, BundleMeta, NamespaceSkeleton, ServedAuthoring, SkeletonEntry,
 };
 use crate::db::{ReaderConn, StoreReader};
-use crate::files::{FileKind, FileObservation, FileState, PathSelection};
+use crate::files::{path_name, FileKind, FileObservation, FileState, PathSelection};
 use crate::{Store, StoreConfig};
 
 const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
@@ -42,9 +42,9 @@ fn bundle_path(index: u32) -> String {
 
 /// A namespace of `count` bundles across two roots: each with a served
 /// runtime entry (tagged; one in a thousand rarely), a scanned file row and
-/// its bytes, and a path index entry; every seventh with a `$record` entry,
-/// every hundredth referencing [`REFERENCED`], and one in five hundred
-/// poisoned instead.
+/// its bytes, and a path index entry; one in a hundred referencing
+/// [`REFERENCED`], one in a thousand with an authoring-only `$record` entry
+/// and beside a `.png` file, and one in five hundred poisoned instead.
 fn populate(store: &mut Store, count: u32) {
     store
         .input_transaction(|txn| {
@@ -68,6 +68,20 @@ fn populate(store: &mut Store, count: u32) {
                     version,
                 )?;
                 txn.set_bundle_file(root, &path, &bytes)?;
+                if index % 1000 == 3 {
+                    let png = format!("d{:02}/t{index:05}.png", index % 50);
+                    txn.upsert_file(
+                        root,
+                        &png,
+                        &FileObservation::from(FileState {
+                            mtime: 0,
+                            size: 0,
+                            kind: FileKind::File,
+                            content_hash: Some(ContentHash([0; 32])),
+                        }),
+                        version,
+                    )?;
+                }
                 let runtime = asset_uuid(index, 1);
                 if index % 500 == 199 {
                     txn.poison_bundle(
@@ -117,7 +131,7 @@ fn populate(store: &mut Store, count: u32) {
                         terminal_type: RUNTIME_TYPE,
                     }),
                 })?;
-                if index % 7 == 0 {
+                if index % 1000 == 3 {
                     txn.upsert_asset(&AssetRecord {
                         asset: asset_uuid(index, 2),
                         bundle,
@@ -175,6 +189,12 @@ fn selective_reads(reader: &StoreReader) {
     reader.check_tag_selector("kind", None, true).unwrap();
     reader.observed_files_in(PathSelection::Subtree("d07")).unwrap();
     reader.observed_files_in(PathSelection::Prefix("d07/b000")).unwrap();
+    reader.observed_files_in(PathSelection::Name("b00042.bundle")).unwrap();
+    reader.observed_files_in(PathSelection::Extension("png")).unwrap();
+    for (filter, _) in filter_shapes() {
+        reader.served_assets_matching(&filter).unwrap();
+        reader.namespace_assets_matching(&filter).unwrap();
+    }
     for filter in [
         at_path(&path),
         rare(),
@@ -204,6 +224,8 @@ fn selective_reads(reader: &StoreReader) {
 }
 
 static TRACED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Held by each test that traces, so their statements do not mix.
+static TRACING: Mutex<()> = Mutex::new(());
 
 fn trace(sql: &str) {
     TRACED.lock().unwrap().push(sql.to_owned());
@@ -238,10 +260,11 @@ const NAMESPACE_TABLES: [&str; 8] = [
 ];
 
 /// Partial indexes: walking one visits only the rows it was declared for.
-const PARTIAL_INDEXES: [&str; 5] = [
+const PARTIAL_INDEXES: [&str; 6] = [
     "bundles_poisoned",
     "assets_unhashed",
-    "assets_reserved",
+    "assets_authoring",
+    "files_by_ext",
     "asset_tag_index_poisoned",
     "assets_by_terminal_type",
 ];
@@ -264,6 +287,7 @@ fn scans_namespace(step: &str) -> bool {
 
 #[test]
 fn selective_namespace_reads_search_indexes() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, store) = store_with(200);
     let mut reader = store.reader().unwrap();
     connection(&mut reader).trace(Some(trace));
@@ -279,6 +303,143 @@ fn selective_namespace_reads_search_indexes() {
             !plan.iter().any(|step| scans_namespace(step)),
             "{sql}\nscans a namespace table: {plan:?}"
         );
+    }
+}
+
+/// One filter per driving shape, each beside the broader selectors it must
+/// not be driven by, with the index that must drive it.
+fn filter_shapes() -> Vec<(AssetFilter, &'static str)> {
+    let name = |index: u32| path_name(&bundle_path(index)).to_owned();
+    let kind_mesh = Some(("kind".to_owned(), Some("mesh".to_owned())));
+    vec![
+        (
+            AssetFilter {
+                asset: Some(asset_uuid(42, 1)),
+                authored_type: Some(RUNTIME_TYPE),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
+        ),
+        (
+            AssetFilter {
+                bundle: Some(bundle_uuid(42)),
+                local_id: Some("main".into()),
+                tag: kind_mesh.clone(),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX assets_by_bundle (bundle_uuid=? AND local_id=?)",
+        ),
+        (
+            AssetFilter {
+                bundle_path: Some(bundle_path(42)),
+                local_id: Some("main".into()),
+                ..AssetFilter::default()
+            },
+            "SEARCH b USING INDEX bundles_by_path (path=?)",
+        ),
+        (
+            AssetFilter {
+                bundle_name: Some(name(42)),
+                authored_type: Some(RUNTIME_TYPE),
+                path_prefixes: vec!["d42/".into()],
+                tag: kind_mesh.clone(),
+                ..AssetFilter::default()
+            },
+            "SEARCH b USING INDEX bundles_by_name (name=?)",
+        ),
+        (
+            AssetFilter {
+                local_id: Some("$record".into()),
+                authored_type: Some(RECORD_TYPE),
+                authoring_only: Some(true),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX assets_by_local_id (local_id=?)",
+        ),
+        (
+            AssetFilter {
+                tag_index_poisoned: true,
+                path_prefixes: vec!["d07/".into()],
+                authoring_only: Some(false),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
+        ),
+        (
+            AssetFilter {
+                tag: kind_mesh,
+                authored_type: Some(RUNTIME_TYPE),
+                path_prefixes: vec!["d07/".into()],
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
+        ),
+        (
+            AssetFilter {
+                authored_type: Some(RUNTIME_TYPE),
+                terminal_type: Some(RUNTIME_TYPE),
+                path_prefixes: vec!["d07/".into()],
+                tag: Some(("kind".into(), None)),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX assets_by_type (type_uuid=?)",
+        ),
+        (
+            AssetFilter {
+                path_prefixes: vec!["d07/b000".into()],
+                terminal_type: Some(RUNTIME_TYPE),
+                tag: Some(("kind".into(), None)),
+                authoring_only: Some(false),
+                ..AssetFilter::default()
+            },
+            "SEARCH b USING INDEX bundles_by_path (path>? AND path<?)",
+        ),
+        (
+            AssetFilter {
+                terminal_type: Some(RUNTIME_TYPE),
+                tag: Some(("kind".into(), None)),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX assets_by_terminal_type (terminal_type=?)",
+        ),
+        (
+            AssetFilter {
+                tag: Some(("rare".into(), None)),
+                authoring_only: Some(false),
+                ..AssetFilter::default()
+            },
+            "SEARCH a USING INDEX sqlite_autoindex_assets_1 (asset_uuid=?)",
+        ),
+        (
+            AssetFilter {
+                authoring_only: Some(true),
+                ..AssetFilter::default()
+            },
+            "SCAN a USING INDEX assets_authoring",
+        ),
+    ]
+}
+
+/// Each filter's query is driven by the index of its most selective
+/// selector, whatever else it names: SQLite has no statistics to choose by.
+#[test]
+fn filters_are_driven_by_their_most_selective_index() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_dir, store) = store_with(200);
+    let mut reader = store.reader().unwrap();
+    for (filter, driver) in filter_shapes() {
+        connection(&mut reader).trace(Some(trace));
+        reader.namespace_assets_matching(&filter).unwrap();
+        reader.served_assets_matching(&filter).unwrap();
+        connection(&mut reader).trace(None);
+        let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        for sql in statements {
+            let plan = explain(connection(&mut reader), &sql);
+            // Whether the driving index also covers the read is beside the point.
+            let first = plan.first().map(|step| step.replace("COVERING INDEX", "INDEX"));
+            assert_eq!(first.as_deref(), Some(driver), "{filter:?}\n{sql}\n{plan:?}");
+        }
     }
 }
 
@@ -362,6 +523,61 @@ fn narrow_reads_of_a_large_namespace_touch_few_pages() {
             }),
         ),
         (
+            "entries at a bundle name, beside a broad type",
+            pages(&reader, || {
+                let filter = AssetFilter {
+                    bundle_name: Some(path_name(&path).to_owned()),
+                    authored_type: Some(RUNTIME_TYPE),
+                    ..AssetFilter::default()
+                };
+                rows = count(reader.served_assets_matching(&filter).unwrap().len(), 1);
+            }),
+            rows,
+            pages(&reader, || drop(reader.served_entries().unwrap())),
+        ),
+        (
+            "entries of a local id",
+            pages(&reader, || {
+                let filter = AssetFilter {
+                    local_id: Some("$record".into()),
+                    ..AssetFilter::default()
+                };
+                rows = count(reader.namespace_assets_matching(&filter).unwrap().len(), 20);
+            }),
+            rows,
+            pages(&reader, || drop(reader.all_asset_bundles().unwrap())),
+        ),
+        (
+            "authoring-only entries",
+            pages(&reader, || {
+                let filter = AssetFilter {
+                    authoring_only: Some(true),
+                    ..AssetFilter::default()
+                };
+                rows = count(reader.namespace_assets_matching(&filter).unwrap().len(), 20);
+            }),
+            rows,
+            pages(&reader, || drop(reader.all_asset_bundles().unwrap())),
+        ),
+        (
+            "file name",
+            pages(&reader, || {
+                let selected = reader.observed_files_in(PathSelection::Name(path_name(&path)));
+                rows = count(selected.unwrap().len(), 1);
+            }),
+            rows,
+            pages(&reader, || drop(reader.observed_files().unwrap())),
+        ),
+        (
+            "file extension",
+            pages(&reader, || {
+                let selected = reader.observed_files_in(PathSelection::Extension("png"));
+                rows = count(selected.unwrap().len(), 20);
+            }),
+            rows,
+            pages(&reader, || drop(reader.observed_files().unwrap())),
+        ),
+        (
             "bundles referencing a path",
             pages(&reader, || {
                 rows = count(reader.bundles_referencing_path(REFERENCED).unwrap().len(), 200);
@@ -397,3 +613,4 @@ fn the_bundle_asset_walk_sorts_one_bundle_at_a_time() {
         ]
     );
 }
+

@@ -45,9 +45,17 @@ CREATE TABLE files (
     -- target, in the daemon's platform path encoding.
     raw_path       BLOB NOT NULL,
     symlink_target BLOB,
+    -- The final path segment, and the text after its last `.` (NULL
+    -- without one): what a glob with no literal prefix (`**/name.ext`,
+    -- `*.ext`) is looked up by. Derived from `path` on write.
+    name TEXT GENERATED ALWAYS AS (substr(path, length(rtrim(path, replace(path, '/', ''))) + 1)) VIRTUAL,
+    ext  TEXT GENERATED ALWAYS AS (CASE WHEN instr(name, '.') > 0
+        THEN substr(name, length(rtrim(name, replace(name, '.', ''))) + 1) END) VIRTUAL,
     PRIMARY KEY (root_id, path)
 );
 CREATE INDEX files_by_path ON files(path);
+CREATE INDEX files_by_name ON files(name);
+CREATE INDEX files_by_ext ON files(ext) WHERE ext IS NOT NULL;
 CREATE INDEX files_by_symlink_target ON files(symlink_target)
     WHERE symlink_target IS NOT NULL;
 -- The bytes of every observed `.bundle` file, as read by the scan that
@@ -176,13 +184,18 @@ CREATE TABLE bundles (
     origin_rules_bundle BLOB,
     origin_rule         BLOB,
     origin_group_root   TEXT,
-    origin_group_path   TEXT
+    origin_group_path   TEXT,
+    -- The final segment of `path`: what a glob whose last segment is
+    -- literal (`**/name.bundle`) is looked up by. Derived on write. (No
+    -- extension column: every bundle path ends in `.bundle`.)
+    name TEXT GENERATED ALWAYS AS (substr(path, length(rtrim(path, replace(path, '/', ''))) + 1)) VIRTUAL
 );
 CREATE INDEX bundles_by_origin ON bundles(origin_rules_bundle)
     WHERE origin_rules_bundle IS NOT NULL;
 -- Bundles by logical path (exact, and string-prefix ranges), across roots:
 -- what build traces resolve bundle paths and path prefixes by (§9).
 CREATE INDEX bundles_by_path ON bundles(path, root_id);
+CREATE INDEX bundles_by_name ON bundles(name);
 CREATE INDEX bundles_poisoned ON bundles(bundle_uuid) WHERE poison IS NOT NULL;
 -- The logical path strings each bundle's AssetRef/WeakRef fields name
 -- (a bare string or an object's `path` field): what a rename rewrites.
@@ -219,8 +232,11 @@ CREATE INDEX assets_by_type ON assets(type_uuid);
 CREATE INDEX assets_by_terminal_type ON assets(terminal_type) WHERE terminal_type IS NOT NULL;
 -- Skeleton rows (and only they) lack a logical hash.
 CREATE INDEX assets_unhashed ON assets(asset_uuid) WHERE logical_hash IS NULL;
--- The reserved `$`-prefixed entries (`$record`, `$settings`) by local id.
-CREATE INDEX assets_reserved ON assets(local_id, bundle_uuid) WHERE local_id GLOB '$*';
+-- Assets by local id alone: a reserved entry (`$record`, `$settings`)
+-- across bundles, or a query naming only a local id.
+CREATE INDEX assets_by_local_id ON assets(local_id);
+-- The authoring-only rows (control entries and tooling-only values).
+CREATE INDEX assets_authoring ON assets(asset_uuid) WHERE authoring_only = 1;
 CREATE TABLE asset_tags (
     asset_uuid BLOB NOT NULL,
     tag        TEXT NOT NULL,

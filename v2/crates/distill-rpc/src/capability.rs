@@ -17,6 +17,7 @@ use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 use distill_store::bundles::AssetFilter;
+use distill_store::files::GlobKeys;
 use distill_store::served::{ResolutionRow, ServedEntryMeta, SERVED_RESTART_KEYS};
 use distill_store::{Store, StoreError, StoreReader};
 
@@ -349,17 +350,11 @@ fn validate_asset_query(query: &AssetQuery, allow_authoring: bool) -> Result<(),
 }
 
 /// The SQL half of an asset query: every selector but the glob, which
-/// contributes only its literal prefix (the text before its first `*` or
-/// `?`, which every match starts with) and is matched on the rows.
+/// contributes only its keys (its literal prefix, and the final segment its
+/// literal tail names; its only metacharacters are `*` and `?`) and is
+/// matched on the rows.
 fn asset_filter(query: &AssetQuery, role: AuthoringEntryRole) -> AssetFilter {
-    let mut path_prefixes = query.path_prefix.iter().cloned().collect::<Vec<_>>();
-    if let Some(glob) = &query.path_glob {
-        let literal = &glob[..glob.find(['*', '?']).unwrap_or(glob.len())];
-        if !literal.is_empty() {
-            path_prefixes.push(literal.to_owned());
-        }
-    }
-    AssetFilter {
+    let filter = AssetFilter {
         asset: query.uuid,
         bundle: query.bundle_uuid,
         bundle_path: query.bundle_path.clone(),
@@ -370,9 +365,13 @@ fn asset_filter(query: &AssetQuery, role: AuthoringEntryRole) -> AssetFilter {
             .tag
             .as_ref()
             .map(|tag| (tag.tag.clone(), tag.value.clone())),
-        path_prefixes,
+        path_prefixes: query.path_prefix.iter().cloned().collect(),
         authoring_only: Some(role == AuthoringEntryRole::AuthoringOnly),
-        tag_index_poisoned: false,
+        ..AssetFilter::default()
+    };
+    match &query.path_glob {
+        Some(pattern) => filter.with_glob_keys(GlobKeys::of(pattern, &['*', '?'])),
+        None => filter,
     }
 }
 
@@ -2387,7 +2386,7 @@ mod query_tests {
         }
         for glob in [
             "*", "dir*", "dir/*", "*child*", "d?r*", "é/*", "a*b", "a?b/*", "bulk/b000?", "?",
-            "dir", "*.txt",
+            "dir", "*.txt", "*/child", "*/leaf", "*/ü.bundle", "*/c", "*.bundle", "*b/c", "a?b/c",
         ] {
             queries.push(AssetQuery {
                 path_glob: Some(glob.into()),
@@ -2402,6 +2401,24 @@ mod query_tests {
         for type_uuid in [MESH, TEXTURE, GPU_MESH] {
             queries.push(AssetQuery {
                 authored_type: Some(type_uuid),
+                ..none.clone()
+            });
+            // A narrow selector beside a broad one.
+            for glob in ["*/child", "*/ü.bundle", "*.txt"] {
+                queries.push(AssetQuery {
+                    path_glob: Some(glob.into()),
+                    authored_type: Some(type_uuid),
+                    ..none.clone()
+                });
+            }
+            queries.push(AssetQuery {
+                local_id: Some("settings".into()),
+                authored_type: Some(type_uuid),
+                ..none.clone()
+            });
+            queries.push(AssetQuery {
+                authoring_only: Some(true),
+                terminal_type: Some(type_uuid),
                 ..none.clone()
             });
             queries.push(AssetQuery {
@@ -2437,6 +2454,12 @@ mod query_tests {
                 ..none.clone()
             });
         }
+        for local_id in ["main", "settings", "absent"] {
+            queries.push(AssetQuery {
+                local_id: Some(local_id.into()),
+                ..none.clone()
+            });
+        }
         for authoring_only in [false, true] {
             queries.push(AssetQuery {
                 authoring_only: Some(authoring_only),
@@ -2444,6 +2467,36 @@ mod query_tests {
             });
         }
         queries
+    }
+
+    /// Every path an RPC glob matches starts with its literal prefix and has
+    /// the final segment and extension its literal tail names.
+    #[test]
+    fn an_rpc_glob_matches_only_paths_with_its_keys() {
+        let paths = PATHS.iter().copied().chain([
+            "", "x/child", "a/b/c", "q.txt", "x.y/z", "bulk/b12345", "dir/child/x",
+        ]);
+        let mut matched = 0;
+        for query in selectors() {
+            let Some(pattern) = query.path_glob.as_deref() else {
+                continue;
+            };
+            let keys = GlobKeys::of(pattern, &['*', '?']);
+            for path in paths.clone() {
+                if path_glob_matches(pattern, path) {
+                    matched += 1;
+                    let name = path.rsplit_once('/').map_or(path, |(_, name)| name);
+                    assert!(path.starts_with(keys.prefix), "{pattern:?} matched {path:?}");
+                    assert!(keys.name.is_none_or(|key| key == name), "{pattern:?} matched {path:?}");
+                    assert!(
+                        keys.extension
+                            .is_none_or(|key| name.rsplit_once('.').map(|(_, e)| e) == Some(key)),
+                        "{pattern:?} matched {path:?}"
+                    );
+                }
+            }
+        }
+        assert!(matched > 20, "{matched}");
     }
 
     #[test]
@@ -2582,6 +2635,18 @@ mod query_tests {
                 local_id: None,
                 bundle_uuid: None,
                 authored_type: None,
+                terminal_type: None,
+                path_prefix: None,
+                authoring_only: None,
+            },
+            AssetQuery {
+                bundle_path: None,
+                path_glob: Some("*/b12345".into()),
+                tag: None,
+                uuid: None,
+                local_id: None,
+                bundle_uuid: None,
+                authored_type: Some(TEXTURE),
                 terminal_type: None,
                 path_prefix: None,
                 authoring_only: None,

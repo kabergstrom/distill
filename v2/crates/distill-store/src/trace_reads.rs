@@ -29,12 +29,20 @@ pub(crate) const ASSETS_WITH_TAG_VALUE: &str =
 pub(crate) const ASSETS_AT_BUNDLE_PATH: &str = "SELECT a.asset_uuid FROM bundles b
      JOIN assets a ON a.bundle_uuid = b.bundle_uuid
      WHERE b.path = ?1";
+/// Assets of one local id across bundles (`assets_by_local_id`).
+pub(crate) const ASSETS_WITH_LOCAL_ID: &str = "SELECT asset_uuid FROM assets WHERE local_id = ?1";
+/// Assets of the bundles whose paths' final segment is `?1` (`bundles_by_name`).
+pub(crate) const ASSETS_AT_BUNDLE_NAME: &str = "SELECT a.asset_uuid FROM bundles b
+     CROSS JOIN assets a ON a.bundle_uuid = b.bundle_uuid
+     WHERE b.name = ?1";
 /// The asset of one local id in one bundle (`assets_by_bundle`).
 pub(crate) const LOCAL_ASSETS: &str =
     "SELECT asset_uuid FROM assets WHERE bundle_uuid = ?1 AND local_id = ?2";
-/// The assets of one local id in the bundles at one path.
+/// The assets of one local id in the bundles at one path. `CROSS JOIN` keeps the
+/// path the driver: the planner would take the local id's index, which
+/// spans every bundle.
 pub(crate) const LOCAL_ASSETS_AT_BUNDLE_PATH: &str = "SELECT a.asset_uuid FROM bundles b
-     JOIN assets a ON a.bundle_uuid = b.bundle_uuid
+     CROSS JOIN assets a ON a.bundle_uuid = b.bundle_uuid
      WHERE b.path = ?1 AND a.local_id = ?2";
 /// Assets of the bundles whose paths lie in `[?1, ?2)`.
 pub(crate) const ASSETS_IN_BUNDLE_PATH_RANGE: &str = "SELECT a.asset_uuid FROM bundles b
@@ -77,6 +85,17 @@ impl StoreReader {
     /// Every asset row of a bundle at exactly `path`, in asset order.
     pub fn asset_ids_at_bundle_path(&self, path: &str) -> Result<Vec<AssetUuid>, StoreError> {
         self.asset_ids(ASSETS_AT_BUNDLE_PATH, rusqlite::params![path])
+    }
+
+    /// Every asset row of local id `local_id`, in any bundle, in asset order.
+    pub fn asset_ids_with_local_id(&self, local_id: &str) -> Result<Vec<AssetUuid>, StoreError> {
+        self.asset_ids(ASSETS_WITH_LOCAL_ID, rusqlite::params![local_id])
+    }
+
+    /// Every asset row of a bundle whose path's final segment is `name`, in
+    /// asset order.
+    pub fn asset_ids_at_bundle_name(&self, name: &str) -> Result<Vec<AssetUuid>, StoreError> {
+        self.asset_ids(ASSETS_AT_BUNDLE_NAME, rusqlite::params![name])
     }
 
     /// The asset row of `local_id` in `bundle`, if any.
@@ -243,6 +262,17 @@ mod tests {
                 ASSETS_AT_BUNDLE_PATH,
                 &[
                     "SEARCH b USING INDEX bundles_by_path (path=?)",
+                    "SEARCH a USING COVERING INDEX assets_by_bundle (bundle_uuid=?)",
+                ],
+            ),
+            (
+                ASSETS_WITH_LOCAL_ID,
+                &["SEARCH assets USING INDEX assets_by_local_id (local_id=?)"],
+            ),
+            (
+                ASSETS_AT_BUNDLE_NAME,
+                &[
+                    "SEARCH b USING INDEX bundles_by_name (name=?)",
                     "SEARCH a USING COVERING INDEX assets_by_bundle (bundle_uuid=?)",
                 ],
             ),

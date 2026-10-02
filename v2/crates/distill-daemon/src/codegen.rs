@@ -444,7 +444,8 @@ fn validate_unit_path(path: &str) -> Result<(), String> {
 /// The runtime assets `query` selects, as one indexed SQL query. It fails as
 /// a read of every entry would: on a tag selector's poisoned index, then on
 /// the first unreadable entry (a poisoned bundle's) in UUID order. Only the
-/// glob is matched here, after SQL narrowed the rows to its literal prefix.
+/// glob is matched here, after SQL narrowed the rows by its literal prefix
+/// and final segment.
 fn query_results(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUuid>, String> {
     if query.terminal_type.is_some() {
         return Err("target-dependent terminal_type is unavailable to Rust codegen".into());
@@ -464,15 +465,6 @@ fn query_results(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUui
         })
         .transpose()?;
     store.check_entries().map_err(|error| error.to_string())?;
-    let mut path_prefixes = query.path_prefix.iter().cloned().collect::<Vec<_>>();
-    if let Some(literal) = query
-        .path_glob
-        .as_deref()
-        .map(crate::importer::glob_literal_prefix)
-        .filter(|literal| !literal.is_empty())
-    {
-        path_prefixes.push(literal.to_owned());
-    }
     let filter = distill_store::bundles::AssetFilter {
         asset: query.uuid,
         bundle: query.bundle_uuid,
@@ -483,9 +475,17 @@ fn query_results(store: &StoreReader, query: &AssetQuery) -> Result<Vec<AssetUui
             .tag
             .as_ref()
             .map(|tag| (tag.tag.clone(), tag.value.clone())),
-        path_prefixes,
+        path_prefixes: query.path_prefix.iter().cloned().collect(),
         authoring_only: Some(false),
         ..Default::default()
+    };
+    // SQL narrows the rows by the glob's literal prefix and final segment.
+    let filter = match &query.path_glob {
+        Some(pattern) => filter.with_glob_keys(distill_store::files::GlobKeys::of(
+            pattern,
+            distill_store::files::GLOBSET_META,
+        )),
+        None => filter,
     };
     Ok(store
         .namespace_assets_matching(&filter)
@@ -1094,6 +1094,7 @@ mod query_tests {
     use distill_build::query::TagSelector;
     use distill_core::id::{BundleUuid, LogicalHash, TypeUuid};
     use distill_store::bundles::{AssetRecord, BundleMeta, NamespaceSkeleton};
+    use distill_store::files::{path_extension, path_name, GlobKeys, GLOBSET_META};
     use distill_store::StoreConfig;
 
     const SCHEMA: LogicalHash = LogicalHash([0x5c; 32]);
@@ -1215,9 +1216,15 @@ mod query_tests {
         }
     }
 
-    const GLOBS: [&str; 16] = [
+    const GLOBS: [&str; 22] = [
         "*",
         "**",
+        "**/leaf",
+        "*/child",
+        "**/ü.bundle",
+        "*.bundle",
+        "*.txt",
+        "d*/c*",
         "dir*",
         "dir/*",
         "dir/**",
@@ -1264,6 +1271,12 @@ mod query_tests {
                 ..none()
             });
         }
+        for local_id in ["main", "settings", "absent"] {
+            queries.push(AssetQuery {
+                local_id: Some(local_id.into()),
+                ..none()
+            });
+        }
         for path in PATHS {
             queries.push(AssetQuery {
                 bundle_path: Some(path.into()),
@@ -1293,6 +1306,24 @@ mod query_tests {
         }
         for type_uuid in [MESH, TEXTURE] {
             queries.push(AssetQuery {
+                authored_type: Some(type_uuid),
+                ..none()
+            });
+            // A narrow selector beside a broad one.
+            for glob in ["**/child", "*/leaf", "*.txt", "**/ü.bundle"] {
+                queries.push(AssetQuery {
+                    path_glob: Some(glob.into()),
+                    authored_type: Some(type_uuid),
+                    ..none()
+                });
+            }
+            queries.push(AssetQuery {
+                local_id: Some("main".into()),
+                authored_type: Some(type_uuid),
+                ..none()
+            });
+            queries.push(AssetQuery {
+                authoring_only: Some(true),
                 authored_type: Some(type_uuid),
                 ..none()
             });
@@ -1339,13 +1370,17 @@ mod query_tests {
     }
 
     /// Every path a `globset` pattern matches starts with the pattern's
-    /// literal prefix, which is what lets SQL narrow to that range.
+    /// literal prefix and has the final segment and extension its literal
+    /// tail names, which is what lets SQL narrow to those rows.
     #[test]
-    fn a_glob_matches_only_paths_under_its_literal_prefix() {
+    fn a_glob_matches_only_paths_with_its_keys() {
         let paths = PATHS
             .iter()
             .copied()
-            .chain(["", "/", "d", "dir/", "dirx/y", "z/z", "é", "a{b,c}", "x/dir"]);
+            .chain([
+                "", "/", "d", "dir/", "dirx/y", "z/z", "é", "a{b,c}", "x/dir", "q.txt",
+                "x/y.z", "a/q/b.c.d", "[x].y", "w/x.y", "a.b/c", "dir/child/x",
+            ]);
         let globs = GLOBS.iter().copied().chain([
             "dir/",
             "dir/{a,b}",
@@ -1354,6 +1389,12 @@ mod query_tests {
             "\\d*",
             "dir/[!a]*",
             "dir?",
+            "*\\.txt",
+            "**/x\\/y.z",
+            "a*/b.c.d",
+            "**/[x].y",
+            "*/c?ild",
+            "**/child/*",
         ]);
         let mut matched = 0;
         for pattern in globs {
@@ -1361,11 +1402,20 @@ mod query_tests {
                 continue;
             };
             let glob = glob.compile_matcher();
-            let literal = crate::importer::glob_literal_prefix(pattern);
+            let keys = GlobKeys::of(pattern, GLOBSET_META);
             for path in paths.clone() {
                 if glob.is_match(path) {
                     matched += 1;
-                    assert!(path.starts_with(literal), "{pattern:?} matched {path:?}");
+                    assert!(path.starts_with(keys.prefix), "{pattern:?} matched {path:?}");
+                    assert!(
+                        keys.name.is_none_or(|name| path_name(path) == name),
+                        "{pattern:?} matched {path:?}"
+                    );
+                    assert!(
+                        keys.extension
+                            .is_none_or(|extension| path_extension(path) == Some(extension)),
+                        "{pattern:?} matched {path:?}"
+                    );
                 }
             }
         }
@@ -1387,6 +1437,11 @@ mod query_tests {
                     tag: "kind".into(),
                     value: None,
                 }),
+                ..none()
+            },
+            AssetQuery {
+                path_glob: Some("**/b12345".into()),
+                authored_type: Some(TEXTURE),
                 ..none()
             },
         ] {

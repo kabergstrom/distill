@@ -319,7 +319,11 @@ impl<'a> StoreTraceSource<'a> {
     }
 
     /// A superset of the assets `query` can select, from the index of its
-    /// most selective selector; `None` when it names no indexed selector.
+    /// most selective selector: an identity or exact name (a bundle path, a
+    /// glob's literal final segment, a local id) before a tag value, a type,
+    /// a path prefix and a bare tag. `None` when it names no indexed
+    /// selector: a bare `*` or `**` glob, or `authoring_only` alone, selects
+    /// every runtime asset (intake refuses `authoring_only = true`).
     fn candidates(&self, query: &AssetQuery) -> Result<Option<Vec<AssetUuid>>, BuildError> {
         let store = self.store;
         let found = if let Some(uuid) = query.uuid {
@@ -334,6 +338,10 @@ impl<'a> StoreTraceSource<'a> {
                 .map(|assets| assets.into_iter().collect())
         } else if let Some(path) = &query.bundle_path {
             store.asset_ids_at_bundle_path(path)
+        } else if let Some(name) = glob_name(query) {
+            store.asset_ids_at_bundle_name(name)
+        } else if let Some(local_id) = &query.local_id {
+            store.asset_ids_with_local_id(local_id)
         } else if let Some(tag) = query.tag.as_ref().filter(|tag| tag.value.is_some()) {
             store.asset_ids_with_tag(&tag.tag, tag.value.as_deref())
         } else if let Some(authored) = query.authored_type {
@@ -436,6 +444,14 @@ impl<'a> StoreTraceSource<'a> {
             .insert(query.clone(), least);
         Ok(least)
     }
+}
+
+/// The final segment every path a query's (valid) glob matches ends in,
+/// when its last segment is literal.
+fn glob_name(query: &AssetQuery) -> Option<&str> {
+    let pattern = query.path_glob.as_deref()?;
+    globset::Glob::new(pattern).ok()?;
+    distill_store::files::GlobKeys::of(pattern, distill_store::files::GLOBSET_META).name
 }
 
 /// The literal prefix every path a query selects starts with: its path

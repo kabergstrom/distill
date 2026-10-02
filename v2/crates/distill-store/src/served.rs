@@ -305,8 +305,9 @@ impl StoreReader {
         let conditions = filter.sql_conditions(&mut params);
         self.query_rows(
             &format!(
-                "SELECT a.asset_uuid, a.bundle_uuid, b.path {SERVED_ENTRY_FROM}{conditions}
-                 ORDER BY a.asset_uuid"
+                "SELECT a.asset_uuid, a.bundle_uuid, b.path FROM {} WHERE {SERVED_ENTRY_WHERE}{conditions}
+                 ORDER BY a.asset_uuid",
+                filter.sql_from()
             ),
             rusqlite::params_from_iter(params),
             crate::bundles::matched_asset_row,

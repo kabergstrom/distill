@@ -799,6 +799,11 @@ pub enum PathSelection<'a> {
     Subtree(&'a str),
     /// Every path that starts with the string.
     Prefix(&'a str),
+    /// Every path whose final segment is the string (`files_by_name`).
+    Name(&'a str),
+    /// Every path whose final segment's text after its last `.` is the
+    /// string (`files_by_ext`).
+    Extension(&'a str),
 }
 
 impl PathSelection<'_> {
@@ -813,6 +818,64 @@ impl PathSelection<'_> {
                         .is_some_and(|suffix| suffix.starts_with('/'))
             }
             Self::Prefix(prefix) => path.starts_with(prefix),
+            Self::Name(name) => path_name(path) == *name,
+            Self::Extension(extension) => path_extension(path) == Some(*extension),
+        }
+    }
+}
+
+/// A logical path's final segment: the `name` column of `files` and
+/// `bundles`.
+pub fn path_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// The text after the last `.` of a logical path's final segment, if it
+/// has one: the `ext` column of `files`.
+pub fn path_extension(path: &str) -> Option<&str> {
+    path_name(path).rsplit_once('.').map(|(_, extension)| extension)
+}
+
+/// `globset`'s metacharacters, its `\` escape among them.
+pub const GLOBSET_META: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
+
+/// What a path glob's literal text says about every path it matches, in
+/// a dialect whose metacharacters are `meta` and whose wildcards may match
+/// `/` (as `globset`'s and the RPC's do): the keys an index can find its
+/// candidates by. A bare `*` or `**` has none: it selects every path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GlobKeys<'a> {
+    /// The text before the first metacharacter: every match starts with it.
+    pub prefix: &'a str,
+    /// The final segment, when the glob's is literal (`**/name.ext`):
+    /// every match's final segment.
+    pub name: Option<&'a str>,
+    /// The extension of a literal tail holding a `.` (`*.ext`): every
+    /// match's extension, since the tail ends every match's final segment.
+    /// A wildcard may match `/`, so a literal stem after one (`**/name.*`)
+    /// says nothing about the final segment.
+    pub extension: Option<&'a str>,
+}
+
+impl<'a> GlobKeys<'a> {
+    pub fn of(pattern: &'a str, meta: &[char]) -> Self {
+        let first = pattern.find(meta).unwrap_or(pattern.len());
+        // The literal text after the last metacharacter ends every match.
+        let tail = match pattern.char_indices().rev().find(|(_, c)| meta.contains(c)) {
+            Some((last, c)) => &pattern[last + c.len_utf8()..],
+            None => pattern,
+        };
+        let literal_segment = tail.rsplit_once('/').map(|(_, name)| name);
+        let name = if first == pattern.len() {
+            Some(path_name(pattern))
+        } else {
+            literal_segment
+        };
+        let segment_tail = literal_segment.unwrap_or(tail);
+        Self {
+            prefix: &pattern[..first],
+            name: name.filter(|name| !name.is_empty()),
+            extension: segment_tail.rsplit_once('.').map(|(_, extension)| extension),
         }
     }
 }
@@ -833,7 +896,8 @@ pub(crate) fn subtree_sql(column: &str, param: usize) -> String {
 
 impl StoreReader {
     /// The scanned rows of every root that `selection` selects, in (root
-    /// name, path) order. Answered from the `files_by_path` index.
+    /// name, path) order. Answered from the `files_by_path` index,
+    /// or `files_by_name` or `files_by_ext` for a name or an extension.
     pub fn observed_files_in(
         &self,
         selection: PathSelection<'_>,
@@ -854,6 +918,16 @@ impl StoreReader {
                     starts_with_sql("t.path", 1)
                 ),
                 [prefix],
+                observed_file_row,
+            ),
+            PathSelection::Name(name) => self.query_rows(
+                &format!("{OBSERVED_FILE} WHERE t.name = ?1 ORDER BY r.name, t.path"),
+                [name],
+                observed_file_row,
+            ),
+            PathSelection::Extension(extension) => self.query_rows(
+                &format!("{OBSERVED_FILE} WHERE t.ext = ?1 ORDER BY r.name, t.path"),
+                [extension],
                 observed_file_row,
             ),
         }

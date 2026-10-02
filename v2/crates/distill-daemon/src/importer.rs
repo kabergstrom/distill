@@ -39,7 +39,7 @@ use globset::Glob;
 use crate::authoring::{invalid, require_base, AuthoringService};
 use crate::compiled::Compiled;
 use crate::scanner::{RootedScanner, ScanError};
-use distill_store::files::{FileKind, ObservedFile, PathSelection};
+use distill_store::files::{FileKind, GlobKeys, ObservedFile, PathSelection, GLOBSET_META};
 
 pub use distill_pipeline_api::importer::{
     AuthoringImportContext, AuthoringImporter, AuthoringImporterError,
@@ -2379,17 +2379,9 @@ impl ImportBackend for RootedImportBackend<'_> {
             .map(|glob| Glob::new(glob).map(|glob| glob.compile_matcher()))
             .transpose()
             .map_err(|_| RawFileFailureClass::OtherStable)?;
-        // SQL narrows the rows to the prefix subtree, or else to the glob's
-        // literal prefix; both filters below still decide every row.
-        let literal = query.path_glob.as_deref().map(glob_literal_prefix);
-        let selection = match (&query.path_prefix, literal) {
-            (Some(prefix), _) => PathSelection::Subtree(prefix),
-            (None, Some(literal)) if !literal.is_empty() => PathSelection::Prefix(literal),
-            (None, _) => PathSelection::All,
-        };
         let rows = self
             .rows
-            .observed_files_in(selection)
+            .observed_files_in(file_selection(query))
             .map_err(|_| RawFileFailureClass::ListingFailed)?;
         let mut results = Vec::new();
         for row in rows {
@@ -2425,14 +2417,24 @@ impl ImportBackend for RootedImportBackend<'_> {
     }
 }
 
-/// The longest literal prefix of a `globset` pattern: the text before its
-/// first metacharacter (`*`, `?`, `[`, `{`, or a `\` escape). Every path the
-/// pattern matches starts with it, so SQL may narrow a scan to that range.
-pub(crate) fn glob_literal_prefix(pattern: &str) -> &str {
-    let end = pattern
-        .find(['*', '?', '[', '{', '\\'])
-        .unwrap_or(pattern.len());
-    &pattern[..end]
+/// The rows SQL narrows a (valid) query's enumeration to, by its most
+/// selective key: the final segment its glob names, the prefix subtree or
+/// the glob's literal prefix, then the extension its glob's literal tail
+/// names. The query's filters still decide every row. A bare `*` or `**`
+/// selects every row.
+fn file_selection(query: &FileQuery) -> PathSelection<'_> {
+    let keys = query
+        .path_glob
+        .as_deref()
+        .map(|pattern| GlobKeys::of(pattern, GLOBSET_META))
+        .unwrap_or_default();
+    match (keys.name, &query.path_prefix, keys.extension) {
+        (Some(name), _, _) => PathSelection::Name(name),
+        (None, Some(prefix), _) => PathSelection::Subtree(prefix),
+        (None, None, _) if !keys.prefix.is_empty() => PathSelection::Prefix(keys.prefix),
+        (None, None, Some(extension)) => PathSelection::Extension(extension),
+        (None, None, None) => PathSelection::All,
+    }
 }
 
 fn scan_failure(error: ScanError) -> RawFileFailureClass {
@@ -3957,10 +3959,18 @@ mod enumerate_tests {
         }
         for glob in [
             "*", "**", "dir*", "dir/**", "**/dir", "{dir,z}*", "[d]ir*", "a\\*b", "a{b,c}/*",
-            "é/*", "bulk/b000?", "z/*", "[",
+            "é/*", "bulk/b000?", "z/*", "[", "**/leaf", "*/child", "**/ü.png", "*.png", "*.txt",
+            "**/[x]", "d*/c*", "**/dir",
         ] {
             queries.push(FileQuery {
                 path_prefix: None,
+                path_glob: Some(glob.into()),
+            });
+        }
+        // A final segment or extension beside a prefix subtree.
+        for (prefix, glob) in [("dir", "*/leaf"), ("dir", "*.txt"), ("é", "*.png"), ("z", "**/dir")] {
+            queries.push(FileQuery {
+                path_prefix: Some(prefix.into()),
                 path_glob: Some(glob.into()),
             });
         }
@@ -4018,12 +4028,7 @@ mod enumerate_tests {
             let overlay = FileOverlay::capture(&observed.reader().unwrap(), under).unwrap();
             let reader = committed.reader().unwrap();
             for query in queries() {
-                let literal = query.path_glob.as_deref().map(glob_literal_prefix);
-                let selection = match (&query.path_prefix, literal) {
-                    (Some(prefix), _) => PathSelection::Subtree(prefix),
-                    (None, Some(literal)) if !literal.is_empty() => PathSelection::Prefix(literal),
-                    (None, _) => PathSelection::All,
-                };
+                let selection = file_selection(&query);
                 let whole = overlay_files_scan(&overlay, &reader);
                 assert_eq!(
                     overlay.files_in(&reader, selection).unwrap(),
@@ -4063,6 +4068,14 @@ mod enumerate_tests {
             FileQuery {
                 path_prefix: None,
                 path_glob: Some("bulk/b1234?".into()),
+            },
+            FileQuery {
+                path_prefix: None,
+                path_glob: Some("**/b12344".into()),
+            },
+            FileQuery {
+                path_prefix: None,
+                path_glob: Some("*.png".into()),
             },
         ] {
             let before = reader.pages_fetched().unwrap();

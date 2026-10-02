@@ -686,8 +686,8 @@ impl StoreReader {
             });
         }
         self.bundle_ids(
-            "SELECT DISTINCT bundle_uuid FROM assets
-             WHERE local_id GLOB '$*' AND local_id = ?1 ORDER BY bundle_uuid",
+            "SELECT DISTINCT bundle_uuid FROM assets INDEXED BY assets_by_local_id
+             WHERE local_id = ?1 ORDER BY bundle_uuid",
             [local_id],
         )
     }
@@ -797,7 +797,7 @@ impl StoreReader {
 
     /// The asset rows of non-poisoned bundles that `filter` selects, with
     /// their bundle and its logical path, by asset UUID. Every selector is
-    /// a SQL condition the planner answers from an index.
+    /// a SQL condition; the most selective drives the query from its index.
     pub fn namespace_assets_matching(
         &self,
         filter: &AssetFilter,
@@ -806,9 +806,9 @@ impl StoreReader {
         let conditions = filter.sql_conditions(&mut params);
         self.query_rows(
             &format!(
-                "SELECT a.asset_uuid, a.bundle_uuid, b.path
-                 FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-                 WHERE b.poison IS NULL{conditions} ORDER BY a.asset_uuid"
+                "SELECT a.asset_uuid, a.bundle_uuid, b.path FROM {}
+                 WHERE b.poison IS NULL{conditions} ORDER BY a.asset_uuid",
+                filter.sql_from()
             ),
             rusqlite::params_from_iter(params),
             matched_asset_row,
@@ -1305,6 +1305,8 @@ pub struct AssetFilter {
     pub bundle: Option<BundleUuid>,
     /// The owning bundle's logical path, exactly.
     pub bundle_path: Option<String>,
+    /// The final segment of the owning bundle's logical path, exactly.
+    pub bundle_name: Option<String>,
     pub local_id: Option<String>,
     pub authored_type: Option<TypeUuid>,
     pub terminal_type: Option<TypeUuid>,
@@ -1314,13 +1316,120 @@ pub struct AssetFilter {
     /// Strings the owning bundle's logical path starts with; every one must
     /// hold.
     pub path_prefixes: Vec<String>,
+    /// Only authoring-only rows (`Some(true)`) or only runtime rows. Alone,
+    /// `Some(false)` selects every runtime row: it narrows nothing.
     pub authoring_only: Option<bool>,
     /// Only assets whose tag index is poisoned (pending or failed).
     pub tag_index_poisoned: bool,
 }
 
+/// The selector a filter's query is driven from, and so the index it
+/// names. SQLite keeps no statistics here and cannot tell a basename from
+/// a type by selectivity, so the filter decides, in the order build traces
+/// pick their candidates in: an identity or exact name first (asset, bundle,
+/// bundle path, bundle name, local id), then the poisoned tag-index rows
+/// (normally none), a tag value, an authored type, a path prefix, a terminal
+/// type and a bare tag, then the authoring-only rows. Every other selector is checked on the rows the
+/// driver finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    Asset,
+    Bundle,
+    BundlePath,
+    BundleName,
+    LocalId,
+    TagPoisoned,
+    Tag,
+    AuthoredType,
+    TerminalType,
+    PathPrefix,
+    AuthoringOnly,
+    Everything,
+}
+
 impl AssetFilter {
-    /// `AND`-prefixed conditions over `assets a JOIN bundles b`, pushing
+    /// With the keys of a path glob (see [`crate::files::GlobKeys`]): its
+    /// literal prefix and the final segment its literal tail names.
+    pub fn with_glob_keys(mut self, keys: crate::files::GlobKeys<'_>) -> Self {
+        if !keys.prefix.is_empty() {
+            self.path_prefixes.push(keys.prefix.to_owned());
+        }
+        if self.bundle_name.is_none() {
+            self.bundle_name = keys.name.map(str::to_owned);
+        }
+        self
+    }
+
+    fn driver(&self) -> Driver {
+        let tag_value = self.tag.as_ref().is_some_and(|(_, value)| value.is_some());
+        if self.asset.is_some() {
+            Driver::Asset
+        } else if self.bundle.is_some() {
+            Driver::Bundle
+        } else if self.bundle_path.is_some() {
+            Driver::BundlePath
+        } else if self.bundle_name.is_some() {
+            Driver::BundleName
+        } else if self.local_id.is_some() {
+            Driver::LocalId
+        } else if self.tag_index_poisoned {
+            Driver::TagPoisoned
+        } else if tag_value {
+            Driver::Tag
+        } else if self.authored_type.is_some() {
+            Driver::AuthoredType
+        } else if self.path_prefixes.iter().any(|prefix| !prefix.is_empty()) {
+            Driver::PathPrefix
+        } else if self.terminal_type.is_some() {
+            Driver::TerminalType
+        } else if self.tag.is_some() {
+            Driver::Tag
+        } else if self.authoring_only == Some(true) {
+            Driver::AuthoringOnly
+        } else {
+            Driver::Everything
+        }
+    }
+
+    /// The `assets a`, `bundles b` join this filter's driver walks, outer
+    /// table first, each table on the index it must use.
+    pub(crate) fn sql_from(&self) -> &'static str {
+        const BY_ASSET: &str = "assets a INDEXED BY sqlite_autoindex_assets_1
+             CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid";
+        match self.driver() {
+            Driver::Asset | Driver::TagPoisoned | Driver::Tag | Driver::Everything => BY_ASSET,
+            Driver::Bundle => {
+                "assets a INDEXED BY assets_by_bundle
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
+            Driver::LocalId => {
+                "assets a INDEXED BY assets_by_local_id
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
+            Driver::AuthoredType => {
+                "assets a INDEXED BY assets_by_type
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
+            Driver::TerminalType => {
+                "assets a INDEXED BY assets_by_terminal_type
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
+            Driver::AuthoringOnly => {
+                "assets a INDEXED BY assets_authoring
+                 CROSS JOIN bundles b ON b.bundle_uuid = a.bundle_uuid"
+            }
+            Driver::BundlePath | Driver::PathPrefix => {
+                "bundles b INDEXED BY bundles_by_path
+                 CROSS JOIN assets a INDEXED BY assets_by_bundle ON a.bundle_uuid = b.bundle_uuid"
+            }
+            Driver::BundleName => {
+                "bundles b INDEXED BY bundles_by_name
+                 CROSS JOIN assets a INDEXED BY assets_by_bundle ON a.bundle_uuid = b.bundle_uuid"
+            }
+        }
+    }
+
+    /// `AND`-prefixed conditions over [`Self::sql_from`]'s join, pushing
     /// their parameters (numbered from `params.len() + 1`).
     pub(crate) fn sql_conditions(&self, params: &mut Vec<rusqlite::types::Value>) -> String {
         use rusqlite::types::Value;
@@ -1329,6 +1438,7 @@ impl AssetFilter {
             params.push(value);
             params.len()
         }
+        let driver = self.driver();
         let mut conditions = Vec::new();
         if let Some(asset) = self.asset {
             let n = bind(params, Value::Blob(asset.0.to_vec()));
@@ -1341,6 +1451,10 @@ impl AssetFilter {
         if let Some(path) = &self.bundle_path {
             let n = bind(params, Value::Text(path.clone()));
             conditions.push(format!("b.path = ?{n}"));
+        }
+        if let Some(name) = &self.bundle_name {
+            let n = bind(params, Value::Text(name.clone()));
+            conditions.push(format!("b.name = ?{n}"));
         }
         if let Some(local_id) = &self.local_id {
             let n = bind(params, Value::Text(local_id.clone()));
@@ -1365,35 +1479,34 @@ impl AssetFilter {
                 Some(value) => format!(" AND t.value = ?{}", bind(params, Value::Text(value.clone()))),
                 None => String::new(),
             };
-            // Without statistics the planner takes a tag's `IN` list for
-            // the narrowest selector. Next to an identity or path selector
-            // the tag is only checked, per row, on its primary key; alone
-            // (or beside a type) it drives the query from `asset_tags_by_tag`.
-            let narrowed = self.asset.is_some()
-                || self.bundle.is_some()
-                || self.bundle_path.is_some()
-                || self.path_prefixes.iter().any(|prefix| !prefix.is_empty());
-            conditions.push(if narrowed {
-                format!(
-                    "EXISTS (SELECT 1 FROM asset_tags t
-                             WHERE t.asset_uuid = a.asset_uuid AND t.tag = ?{n}{value})"
-                )
-            } else {
+            // Driving, the tag's rows are the candidates; otherwise each
+            // candidate's tag is checked on its primary key.
+            conditions.push(if driver == Driver::Tag {
                 format!(
                     "a.asset_uuid IN (SELECT t.asset_uuid FROM asset_tags t
                                       WHERE t.tag = ?{n}{value})"
                 )
+            } else {
+                format!(
+                    "EXISTS (SELECT 1 FROM asset_tags t
+                             WHERE t.asset_uuid = a.asset_uuid AND t.tag = ?{n}{value})"
+                )
             });
         }
+        // A literal, so the partial `assets_authoring` index applies.
         if let Some(authoring_only) = self.authoring_only {
-            let n = bind(params, Value::Integer(i64::from(authoring_only)));
-            conditions.push(format!("a.authoring_only = ?{n}"));
+            conditions.push(format!("a.authoring_only = {}", i64::from(authoring_only)));
         }
         if self.tag_index_poisoned {
-            conditions.push(
-                "a.asset_uuid IN (SELECT asset_uuid FROM asset_tag_index WHERE poison IS NOT NULL)"
-                    .to_owned(),
-            );
+            conditions.push(if driver == Driver::TagPoisoned {
+                "a.asset_uuid IN (SELECT i.asset_uuid FROM asset_tag_index i
+                                  WHERE i.poison IS NOT NULL)"
+                    .to_owned()
+            } else {
+                "EXISTS (SELECT 1 FROM asset_tag_index i
+                         WHERE i.asset_uuid = a.asset_uuid AND i.poison IS NOT NULL)"
+                    .to_owned()
+            });
         }
         conditions
             .iter()
