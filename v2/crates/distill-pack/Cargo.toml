@@ -19,5 +19,6 @@ distill-schema = { path = "../distill-schema" }
 distill-wire = { path = "../distill-wire" }
 
 [dev-dependencies]
+distill-store = { path = "../distill-store" }
 tempfile = "3"
 tokio = { version = "1", features = ["net", "rt", "time"] }

@@ -9,6 +9,7 @@ pub mod bootstrap;
 mod build;
 pub mod callbacks;
 pub mod codegen;
+pub mod compiled;
 pub mod config;
 pub mod coordinator;
 pub mod epoch;

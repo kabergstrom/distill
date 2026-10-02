@@ -53,6 +53,7 @@ impl BuildBackend for TypePolicyBackend {
 
     fn runtime_type_policy(
         &self,
+        _snapshot: &distill_store::StoreReader,
         _request: &RuntimeTypePolicyRequest,
     ) -> Result<RuntimeTypePolicy, RpcFailure> {
         Ok(RuntimeTypePolicy {

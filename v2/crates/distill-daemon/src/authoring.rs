@@ -23,64 +23,34 @@ use distill_rpc::{
 };
 use distill_store::{Current, Store, StoreOpener, StoreReader};
 
+use crate::atomic::{atomic_write_expecting, remove_expecting};
+use crate::compiled::{Compiled, CompiledRegistry};
 use crate::coordinator::publish_incremental_paths;
 use crate::importer::{RegisteredImporter, RegisteredImporters};
-use crate::atomic::{atomic_write_expecting, remove_expecting};
-use crate::pipeline_map::PipelineProjection;
-use crate::scanner::{AssetRoot, RootedScanner, ScanError};
+use crate::scanner::ScanError;
 
 pub struct AuthoringService {
     /// Opens the reader an import run reads through when it runs outside
     /// any write.
     pub(crate) opener: Arc<StoreOpener>,
-    pub(crate) scanner: RootedScanner,
-    /// The asset roots and what hangs off them, replaced together when the
-    /// configuration changes.
-    filesystem: Current<AuthoringFilesystem>,
-    importers: Current<Importers>,
-    pipeline_projection: Current<PipelineProjection>,
-    /// Set once this process has built the store's import index (see
-    /// `importer`). A reconciliation pass whose input rolls back restores
-    /// it: the rows it describes rolled back too.
-    pub(crate) import_index_built: std::sync::atomic::AtomicBool,
+    /// The daemon's own importers. The pipeline's are compiled state.
+    builtin_importers: Current<RegisteredImporters>,
+    /// The compiled configuration state of each live store version: every
+    /// operation reads the roots, importers, schema and pipeline of the
+    /// version its own transaction sees (`crate::compiled`).
+    compiled: Arc<CompiledRegistry>,
     tag_index_coordinator: OnceLock<Weak<crate::coordinator::DaemonCoordinator>>,
 }
 
-struct AuthoringFilesystem {
-    roots: Vec<AssetRoot>,
-}
-
-/// Registered importers: the daemon's own, and the loaded pipeline's.
-#[derive(Default, Clone)]
-pub(crate) struct Importers {
-    pub(crate) builtin: RegisteredImporters,
-    pub(crate) pipeline: RegisteredImporters,
-}
-
-pub(crate) struct AuthoringFilesystemCandidate {
-    scanner: RootedScanner,
-    filesystem: AuthoringFilesystem,
-}
-
-impl AuthoringFilesystemCandidate {
-    pub(crate) fn scanner(&self) -> &RootedScanner {
-        &self.scanner
-    }
-}
-
 impl AuthoringService {
-    pub fn new(
+    pub(crate) fn new(
         opener: Arc<StoreOpener>,
-        roots: Vec<AssetRoot>,
-        scanner: RootedScanner,
+        compiled: Arc<CompiledRegistry>,
     ) -> Self {
         Self {
             opener,
-            scanner,
-            filesystem: Current::new(AuthoringFilesystem { roots }),
-            importers: Current::new(Importers::default()),
-            pipeline_projection: Current::new(PipelineProjection::default()),
-            import_index_built: std::sync::atomic::AtomicBool::new(false),
+            builtin_importers: Current::new(RegisteredImporters::new()),
+            compiled,
             tag_index_coordinator: OnceLock::new(),
         }
     }
@@ -104,36 +74,18 @@ impl AuthoringService {
         self.tag_index_coordinator.get().and_then(Weak::upgrade)
     }
 
-    pub(crate) fn pipeline_projection(&self) -> PipelineProjection {
-        PipelineProjection::clone(&self.pipeline_projection.load())
+    /// The compiled state of the version `store`'s transaction sees.
+    pub(crate) fn compiled(&self, store: &StoreReader) -> Result<Arc<Compiled>, RpcFailure> {
+        self.compiled.at(store).map_err(RpcFailure::from)
     }
 
-    pub(crate) fn install_pipeline_projection(&self, projection: PipelineProjection) {
-        self.pipeline_projection.store(Arc::new(projection));
+    pub(crate) fn compiled_registry(&self) -> Arc<CompiledRegistry> {
+        Arc::clone(&self.compiled)
     }
 
-    pub(crate) fn prepare_filesystem_candidate(
-        &self,
-        roots: Vec<AssetRoot>,
-    ) -> Result<AuthoringFilesystemCandidate, AuthoringServiceInitError> {
-        let scanner = self.scanner.candidate_with_roots(roots.clone())?;
-        Ok(AuthoringFilesystemCandidate {
-            scanner,
-            filesystem: AuthoringFilesystem { roots },
-        })
-    }
-
-    pub(crate) fn install_filesystem_candidate(&self, candidate: AuthoringFilesystemCandidate) {
-        self.scanner.replace_from(&candidate.scanner);
-        self.filesystem.store(Arc::new(candidate.filesystem));
-    }
-
-    pub(crate) fn roots_snapshot(&self) -> Vec<AssetRoot> {
-        self.filesystem.load().roots.clone()
-    }
-
-    pub(crate) fn importers(&self) -> Arc<Importers> {
-        self.importers.load()
+    /// The daemon's own importers.
+    pub(crate) fn builtin_importers(&self) -> Arc<RegisteredImporters> {
+        self.builtin_importers.load()
     }
 
     pub fn register_importer(
@@ -141,14 +93,16 @@ impl AuthoringService {
         importer: Arc<dyn crate::importer::AuthoringImporter>,
     ) -> Result<(), RpcFailure> {
         let registered = RegisteredImporter::validate(importer)?;
-        let mut duplicate = false;
-        self.importers.update(|current| {
-            duplicate = current.builtin.contains_key(&registered.id)
-                || current.pipeline.contains_key(&registered.id);
-            let mut next = Importers::clone(current);
+        let pipeline_has = self
+            .compiled
+            .latest()
+            .is_some_and(|compiled| compiled.pipeline_importers().contains_key(&registered.id));
+        let mut duplicate = pipeline_has;
+        self.builtin_importers.update(|current| {
+            duplicate |= current.contains_key(&registered.id);
+            let mut next = RegisteredImporters::clone(current);
             if !duplicate {
-                next.builtin
-                    .insert(registered.id.clone(), registered.clone());
+                next.insert(registered.id.clone(), registered.clone());
             }
             next
         });
@@ -161,15 +115,8 @@ impl AuthoringService {
         Ok(())
     }
 
-    pub(crate) fn replace_pipeline_importers(
-        &self,
-        importers: Vec<Arc<dyn crate::importer::AuthoringImporter>>,
-    ) -> Result<(), RpcFailure> {
-        let next = self.prepare_pipeline_importers(importers)?;
-        self.install_pipeline_importers(next);
-        Ok(())
-    }
-
+    /// Validate a pipeline epoch's importers as its compiled state holds
+    /// them: a built-in id is the built-in's.
     pub(crate) fn prepare_pipeline_importers(
         &self,
         importers: Vec<Arc<dyn crate::importer::AuthoringImporter>>,
@@ -181,27 +128,13 @@ impl AuthoringService {
                 return Err(invalid("pipeline epoch contains a duplicate importer id"));
             }
         }
-        let builtins = &self.importers.load().builtin;
+        let builtins = self.builtin_importers.load();
         if let Some(id) = next.keys().find(|id| builtins.contains_key(*id)) {
             return Err(invalid(format!(
                 "pipeline importer {id:?} conflicts with a built-in importer"
             )));
         }
         Ok(next)
-    }
-
-    /// Install the pipeline's importers. A built-in registered since they
-    /// were prepared keeps its id: the pipeline's importer of that id is
-    /// left out.
-    pub(crate) fn install_pipeline_importers(&self, next: RegisteredImporters) {
-        self.importers.update(|current| {
-            let mut pipeline = next.clone();
-            pipeline.retain(|id, _| !current.builtin.contains_key(id));
-            Importers {
-                builtin: current.builtin.clone(),
-                pipeline,
-            }
-        });
     }
 
     fn prepare_direct_write(
@@ -240,12 +173,12 @@ impl AuthoringService {
         }
         .map_err(invalid)?;
 
+        let compiled = self.compiled(store)?;
         publish_incremental_paths(
-            &self.scanner,
             std::slice::from_ref(&target),
             store,
             base,
-            &self.pipeline_projection(),
+            &compiled,
             self.tag_index_coordinator().as_deref(),
         )
         .map_err(invalid)
@@ -286,6 +219,8 @@ impl AuthoringService {
             ));
         }
         let bundle_id = *bundle_ids.first().expect("one bundle ID");
+        let compiled = self.compiled(store)?;
+        let scanner = compiled.scanner();
 
         let (target, preimage, mut bundle) = if let Some(meta) =
             store.bundle(bundle_id).map_err(invalid)?
@@ -294,12 +229,10 @@ impl AuthoringService {
                 .root_name(meta.root)
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("bundle root identity is missing"))?;
-            let target = self
-                .scanner
+            let target = scanner
                 .physical_path(&root, &meta.path)
                 .map_err(invalid)?;
-            let bytes = self
-                .scanner
+            let bytes = scanner
                 .read_identity_checked(&target)
                 .map_err(invalid)?;
             let observed = ContentHash(*blake3::hash(&bytes).as_bytes());
@@ -344,14 +277,12 @@ impl AuthoringService {
                 return Err(invalid("new bundle entries must name one destination path"));
             }
             let path = *paths.first().expect("one destination path");
-            let roots = self.roots_snapshot();
-            let [root] = roots.as_slice() else {
+            let [root] = compiled.roots() else {
                 return Err(invalid(
                     "direct bundle creation requires exactly one configured asset root; import supplies an explicit root",
                 ));
             };
-            let target = self
-                .scanner
+            let target = scanner
                 .physical_path(&root.name, path)
                 .map_err(invalid)?;
             if fs::symlink_metadata(&target).is_ok() {
@@ -387,7 +318,7 @@ impl AuthoringService {
             let AuthoringOp::Set(entry) = operation else {
                 continue;
             };
-            self.apply_set(store, &mut bundle, entry, force_lossy)?;
+            self.apply_set(store, &compiled, &mut bundle, entry, force_lossy)?;
         }
         infer_primary(&mut bundle)?;
         let used_schemas = distill_bundle::referenced_schema_hashes(&bundle);
@@ -407,6 +338,7 @@ impl AuthoringService {
     fn apply_set(
         &self,
         store: &StoreReader,
+        compiled: &Compiled,
         bundle: &mut Bundle,
         entry: &AuthoringEntry,
         force_lossy: bool,
@@ -447,7 +379,7 @@ impl AuthoringService {
             .map_err(|error| invalid(format!("invalid authored value: {error:?}")))?;
         if !force_lossy {
             if let Some(existing) = bundle.assets.get(&entry.local_id) {
-                self.check_lossless(bundle, existing, &schema, entry.schema_hash)?;
+                self.check_lossless(compiled, bundle, existing, &schema, entry.schema_hash)?;
             }
         }
         bundle.schemas.insert(entry.schema_hash, schema);
@@ -470,6 +402,7 @@ impl AuthoringService {
     /// planner refuses needs a registered migration function.
     fn check_lossless(
         &self,
+        compiled: &Compiled,
         bundle: &Bundle,
         existing: &AssetEntry,
         written: &distill_schema::ngp_schema::LogicalSchema,
@@ -488,7 +421,7 @@ impl AuthoringService {
             fields,
             detail,
         };
-        let renames = self.current_renames(existing.type_uuid, written_hash);
+        let renames = current_renames(compiled, existing.type_uuid, written_hash);
         match plan_automatic_renamed(&stored.root, &written.root, &renames) {
             Ok(ops) => {
                 let fields = lossy_drops(&ops, &stored.root, &existing.data);
@@ -507,7 +440,7 @@ impl AuthoringService {
                     from: existing.schema_hash,
                     to: written_hash,
                 };
-                if self.migration_function_registered(&key) {
+                if migration_function_registered(compiled, &key) {
                     return Ok(());
                 }
                 Err(lossy(
@@ -518,31 +451,28 @@ impl AuthoringService {
         }
     }
 
-    /// The renamed fields of the type's current schema, when the write
-    /// is under it.
-    fn current_renames(
-        &self,
-        type_uuid: distill_core::id::TypeUuid,
-        written_hash: LogicalHash,
-    ) -> distill_schema::ngp_schema::Renames {
-        self.tag_index_coordinator()
-            .and_then(|coordinator| coordinator.schema_authority())
-            .and_then(|authority| {
-                let project = authority.project_type(type_uuid)?;
-                (project.logical_hash == written_hash).then(|| project.renamed_from.clone())
-            })
-            .unwrap_or_default()
-    }
+}
 
-    fn migration_function_registered(&self, key: &MigrationKey) -> bool {
-        let Some(coordinator) = self.tag_index_coordinator() else {
-            return false;
-        };
-        let snapshot = coordinator.pipeline_snapshot();
-        snapshot
-            .epoch()
-            .is_ok_and(|epoch| epoch.migration_function_keys().contains(&key.id()))
-    }
+/// The renamed fields of the type's schema at `compiled`, when the write is
+/// under it.
+fn current_renames(
+    compiled: &Compiled,
+    type_uuid: distill_core::id::TypeUuid,
+    written_hash: LogicalHash,
+) -> distill_schema::ngp_schema::Renames {
+    compiled
+        .schema_authority()
+        .and_then(|authority| {
+            let project = authority.project_type(type_uuid)?;
+            (project.logical_hash == written_hash).then(|| project.renamed_from.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn migration_function_registered(compiled: &Compiled, key: &MigrationKey) -> bool {
+    compiled
+        .pipeline_epoch()
+        .is_ok_and(|epoch| epoch.migration_function_keys().contains(&key.id()))
 }
 
 impl AuthoringBackend for AuthoringService {

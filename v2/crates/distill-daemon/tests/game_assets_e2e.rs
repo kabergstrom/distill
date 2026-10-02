@@ -150,7 +150,13 @@ fn imports_cooks_hot_reloads_packs_mounts_and_adopts_basic_game_assets() {
 
     let [texture, mesh, shader] = import_assets(&process, &config, &assets);
 
-    let target = process.coordinator().build_target("dev").unwrap();
+    let coordinator = process.coordinator();
+    let reader = coordinator.opener().open_reader().unwrap();
+    let target = coordinator
+        .compiled_at(&reader)
+        .unwrap()
+        .build_target("dev")
+        .unwrap();
     let target_hash = target_definition_hash(&target);
     let request = ConnectRequest::new("dev", TargetDefinitionHash(target_hash));
 
