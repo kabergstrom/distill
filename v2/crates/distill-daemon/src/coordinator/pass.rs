@@ -565,8 +565,13 @@ impl DaemonCoordinator {
                 }
             }
         };
+        // A rename from a path never observed (the temporary file of an
+        // atomic write, the daemon's own included) moves no identity: the
+        // echo of an import's bundle write publishes nothing.
         if delta.is_same_namespace_observation(&baseline)
-            && renames.is_empty()
+            && renames.iter().all(|rename| {
+                delta.rename_moves_nothing(&baseline, &rename.root_name, &rename.from_path)
+            })
             && locked(&self.scan).healthy
         {
             // Diagnostics are replaced with their affected subtree even when

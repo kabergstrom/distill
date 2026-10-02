@@ -366,6 +366,22 @@ impl ScanSnapshot {
         self.diagnostics.values()
     }
 
+    /// Whether anything is observed at or below `path` in `root`: a file,
+    /// bundle, directory or symlink alias a rename from there would move.
+    pub(crate) fn observes_at_or_under(&self, root: &str, path: &str) -> bool {
+        fn any_under<V>(map: &BTreeMap<(String, String), V>, root: &str, path: &str) -> bool {
+            // Every key with `path` as a string prefix, then only those at or
+            // below it: a sibling such as `path.txt` sorts among them.
+            map.range((root.to_owned(), path.to_owned())..)
+                .take_while(|(key, _)| key.0 == root && key.1.starts_with(path))
+                .any(|(key, _)| path_matches(root, path, &key.0, &key.1))
+        }
+        any_under(&self.files, root, path)
+            || any_under(&self.bundles, root, path)
+            || any_under(&self.directory_observations, root, path)
+            || any_under(&self.symlink_aliases, root, path)
+    }
+
 
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for affected in &delta.affected {
@@ -443,6 +459,17 @@ impl ScanDelta {
                 matching_values(&baseline.diagnostics, affected)
                     .eq(matching_values(&self.observed.diagnostics, affected))
             })
+    }
+
+    /// Whether a rename from `root`/`from` moves nothing: this delta covers
+    /// the path and `baseline` observed nothing at or below it. The daemon's
+    /// own atomic writes rename an unobserved temporary file onto their
+    /// target; such a rename carries no identity.
+    pub(crate) fn rename_moves_nothing(&self, baseline: &ScanSnapshot, root: &str, from: &str) -> bool {
+        self.affected
+            .iter()
+            .any(|(prefix_root, prefix)| path_matches(prefix_root, prefix, root, from))
+            && !baseline.observes_at_or_under(root, from)
     }
 
     pub(crate) fn is_same_namespace_observation(&self, baseline: &ScanSnapshot) -> bool {

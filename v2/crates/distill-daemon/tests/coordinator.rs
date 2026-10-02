@@ -909,3 +909,35 @@ fn a_write_the_planner_refuses_needs_a_migration_function() {
         Err(distill_rpc::RpcFailure::LossyWrite { .. })
     ));
 }
+
+#[test]
+fn the_echo_of_an_atomic_write_through_an_unobserved_temporary_file_publishes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bytes, _, _) = ordinary_bundle();
+    let coordinator = coordinator(&temp);
+    let path = temp.path().join("assets/ordinary.bundle");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut writer = coordinator.open_writer().unwrap();
+    let startup = coordinator.reconcile_full_scan(&mut writer).unwrap();
+
+    // An atomic write: a temporary file renamed onto its target.
+    let (edited, _, _) = ordinary_bundle_with(73, 72, 9);
+    let temporary = temp.path().join("assets/.ordinary.bundle.distill-1.tmp");
+    std::fs::write(&temporary, edited).unwrap();
+    std::fs::rename(&temporary, &path).unwrap();
+    let batch = WatcherBatch {
+        paths: vec![temporary.clone(), path.clone()],
+        renames: vec![distill_daemon::watcher::WatcherRename {
+            from: temporary,
+            to: path,
+        }],
+    };
+    let published = coordinator.reconcile_incremental(&mut writer, &batch).unwrap();
+    assert_eq!(published.version.0, startup.version.0 + 1);
+
+    // The same events again, as the watcher delivers the echo of a write the
+    // daemon already observed: the namespace is unchanged and the rename
+    // moved nothing, so no version is published.
+    let echo = coordinator.reconcile_incremental(&mut writer, &batch).unwrap();
+    assert_eq!(echo.version, published.version);
+}
