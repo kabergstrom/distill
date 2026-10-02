@@ -769,28 +769,33 @@ impl StoreReader {
         )
     }
 
-    /// The observed `.bundle` files at or below `prefix` in `root_name`.
-    pub fn bundle_files_under(
+    /// The (path, blake3 hash) of each observed `.bundle` file at or below
+    /// `prefix` in `root_name`, in path order, without reading its bytes.
+    pub fn bundle_file_hashes_under(
         &self,
         root_name: &str,
         prefix: &str,
-    ) -> Result<Vec<ObservedBundleFile>, StoreError> {
+    ) -> Result<Vec<(String, [u8; 32])>, StoreError> {
         self.query_rows(
             &format!(
-                "SELECT r.name, t.path, t.bytes
-                 FROM bundle_files t JOIN roots r USING (root_id)
+                "SELECT t.path, t.hash FROM bundle_files t JOIN roots r USING (root_id)
                  WHERE {} ORDER BY t.path",
                 under_sql(prefix)
             ),
             rusqlite::params![root_name, prefix],
-            |row| {
-                Ok(ObservedBundleFile {
-                    root_name: row.get(0)?,
-                    path: row.get(1)?,
-                    bytes: row.get(2)?,
-                })
-            },
+            |row| Ok((row.get(0)?, crate::bundles::blob32(row.get(1)?))),
         )
+    }
+
+    /// Whether a file or traversed directory is observed at or below
+    /// `prefix` in `root_name`.
+    pub fn observes_under(&self, root_name: &str, prefix: &str) -> Result<bool, StoreError> {
+        let under = under_sql(prefix);
+        Ok(self.conn.prepare_cached(&format!(
+            "SELECT EXISTS(SELECT 1 FROM files t JOIN roots r USING (root_id) WHERE {under})
+                 OR EXISTS(SELECT 1 FROM directories t JOIN roots r USING (root_id) WHERE {under})"
+        ))?
+        .query_row(rusqlite::params![root_name, prefix], |row| row.get(0))?)
     }
 
     /// One observed `.bundle` file's bytes.

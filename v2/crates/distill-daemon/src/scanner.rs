@@ -366,20 +366,6 @@ impl ScanSnapshot {
         self.diagnostics.values()
     }
 
-    /// Whether anything is observed at or below `path` in `root`: a file,
-    /// bundle, directory or symlink alias a rename from there would move.
-    pub(crate) fn observes_at_or_under(&self, root: &str, path: &str) -> bool {
-        fn any_under<V>(map: &BTreeMap<(String, String), V>, root: &str, path: &str) -> bool {
-            subtree_entries(map, &(root.to_owned(), path.to_owned()))
-                .next()
-                .is_some()
-        }
-        any_under(&self.files, root, path)
-            || any_under(&self.bundles, root, path)
-            || any_under(&self.directory_observations, root, path)
-            || any_under(&self.symlink_aliases, root, path)
-    }
-
 
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for affected in &delta.affected {
@@ -451,39 +437,65 @@ impl ScanDelta {
         self.observed.bundles.iter()
     }
 
-    pub fn is_same_observation(&self, baseline: &ScanSnapshot) -> bool {
-        self.is_same_namespace_observation(baseline)
-            && self.affected.iter().all(|affected| {
-                matching_values(&baseline.diagnostics, affected)
-                    .eq(matching_values(&self.observed.diagnostics, affected))
-            })
-    }
-
     /// Whether a rename from `root`/`from` moves nothing: this delta covers
-    /// the path and `baseline` observed nothing at or below it. The daemon's
+    /// the path and the store publishes nothing at or below it. The daemon's
     /// own atomic writes rename an unobserved temporary file onto their
     /// target; such a rename carries no identity.
-    pub(crate) fn rename_moves_nothing(&self, baseline: &ScanSnapshot, root: &str, from: &str) -> bool {
-        self.affected
+    pub(crate) fn rename_moves_nothing(
+        &self,
+        published: &StoreReader,
+        root: &str,
+        from: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .affected
             .iter()
             .any(|(prefix_root, prefix)| path_matches(prefix_root, prefix, root, from))
-            && !baseline.observes_at_or_under(root, from)
+            && !published.observes_under(root, from)?)
     }
 
-    pub(crate) fn is_same_namespace_observation(&self, baseline: &ScanSnapshot) -> bool {
-        self.affected.iter().all(|affected| {
-            matching_values(&baseline.files, affected)
-                .eq(matching_values(&self.observed.files, affected))
-                && matching_bundle_observations(&baseline.bundles, affected).eq(
-                    matching_bundle_observations(&self.observed.bundles, affected),
-                )
-                && matching_values(&baseline.directory_observations, affected).eq(matching_values(
-                    &self.observed.directory_observations,
-                    affected,
-                ))
-                && matching_values(&baseline.symlink_aliases, affected)
-                    .eq(matching_values(&self.observed.symlink_aliases, affected))
-        })
+    /// Whether the store publishes, under every affected prefix, the
+    /// namespace this delta observed there: its files and symlink targets,
+    /// its bundle files' hashes (never their bytes) and its directories.
+    /// Diagnostics are scanner state and do not count.
+    pub(crate) fn matches_published(&self, published: &StoreReader) -> Result<bool, StoreError> {
+        for affected in &self.affected {
+            let (root, prefix) = affected;
+            let mut aliases = Vec::new();
+            let files = published
+                .observed_files_under(root, prefix)?
+                .into_iter()
+                .map(|row| {
+                    let key = (row.root_name.clone(), row.path.clone());
+                    let (file, alias) = scanned_file_row(row);
+                    aliases.extend(alias.map(|target| (key, target)));
+                    file
+                })
+                .collect::<Vec<_>>();
+            let bundles = published.bundle_file_hashes_under(root, prefix)?;
+            let directories = published
+                .observed_directories_under(root, prefix)?
+                .into_iter()
+                .map(directory_observation_row)
+                .collect::<Vec<_>>();
+            let same = files.iter().eq(matching_values(&self.observed.files, affected))
+                && aliases
+                    .iter()
+                    .map(|(key, target)| (key, target))
+                    .eq(subtree_entries(&self.observed.symlink_aliases, affected))
+                && bundles
+                    .iter()
+                    .map(|(path, hash)| (root.as_str(), path.as_str(), BundleFileHash(*hash)))
+                    .eq(matching_bundle_observations(&self.observed.bundles, affected))
+                && directories
+                    .iter()
+                    .map(|(key, observation)| (key, observation))
+                    .eq(subtree_entries(&self.observed.directory_observations, affected));
+            if !same {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -578,22 +590,6 @@ impl ScanSnapshot {
             reader.scan_diagnostics()?,
             reader.bundle_files()?,
         )
-    }
-
-    /// The published observation at or below each of `prefixes`.
-    pub(crate) fn load_under(
-        reader: &StoreReader,
-        prefixes: &[(String, String)],
-    ) -> Result<Self, StoreError> {
-        let (mut files, mut directories, mut diagnostics, mut bundles) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (root, prefix) in prefixes {
-            files.extend(reader.observed_files_under(root, prefix)?);
-            directories.extend(reader.observed_directories_under(root, prefix)?);
-            diagnostics.extend(reader.scan_diagnostics_under(root, prefix)?);
-            bundles.extend(reader.bundle_files_under(root, prefix)?);
-        }
-        Self::from_rows(files, directories, diagnostics, bundles)
     }
 
     /// Only the diagnostic rows of the published observation.
@@ -2696,8 +2692,23 @@ mod tests {
                 ("main".to_owned(), "dir/child".to_owned())
             ]
         );
-        assert!(baseline.observes_at_or_under("main", "dir/child"));
-        assert!(!baseline.observes_at_or_under("main", "di"));
+        // The store publishing `baseline` answers for it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            distill_store::Store::open(distill_store::StoreConfig::new(dir.path().join(".distill")))
+                .unwrap();
+        store
+            .input_transaction(|txn| {
+                let version = txn.version();
+                let root = txn.intern_root("main")?;
+                for (key, file) in baseline.file_observations() {
+                    txn.upsert_file(root, &key.1, &file, version)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.observes_under("main", "dir/child").unwrap());
+        assert!(!store.observes_under("main", "di").unwrap());
 
         // The child changed: the delta is not the same observation.
         let changed = ScanDelta {
@@ -2707,7 +2718,7 @@ mod tests {
                 scanned("dir/child", ScannedFileKind::File, 5),
             ]),
         };
-        assert!(!changed.is_same_namespace_observation(&baseline));
+        assert!(!changed.matches_published(&store).unwrap());
         let unchanged = ScanDelta {
             affected: vec![affected.clone()],
             observed: snapshot([
@@ -2715,7 +2726,9 @@ mod tests {
                 scanned("dir/child", ScannedFileKind::File, 4),
             ]),
         };
-        assert!(unchanged.is_same_namespace_observation(&baseline));
+        assert!(unchanged.matches_published(&store).unwrap());
+        assert!(!unchanged.rename_moves_nothing(&store, "main", "dir/child").unwrap());
+        assert!(unchanged.rename_moves_nothing(&store, "main", "dir/tmp").unwrap());
 
         // Removing the child replaces the subtree and leaves the siblings.
         let mut applied = baseline.clone();

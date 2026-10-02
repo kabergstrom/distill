@@ -91,7 +91,6 @@ pub(super) enum ScanStep {
 }
 
 pub(super) struct IncrementalStep {
-    baseline: ScanSnapshot,
     delta: ScanDelta,
     claims: Vec<SourceClaims>,
     renames: Vec<LogicalRename>,
@@ -824,29 +823,24 @@ impl DaemonCoordinator {
                 }
             }
         }
-        let (delta, baseline) = {
+        let delta = {
             let stored = StoredBaseline::new(store);
             let delta = scanner.scan_incremental_delta(&stored, &scan_paths);
             stored.finish()?;
             match delta {
                 Ok(None) => return Ok(ScanStep::Unchanged),
-                // The published rows the delta replaces.
-                Ok(Some(delta)) => {
-                    let baseline = ScanSnapshot::load_under(store, delta.affected_prefixes())?;
-                    (delta, baseline)
-                }
+                Ok(Some(delta)) => delta,
                 Err(error) => return self.rejection_step(compiled, &error, heals),
             }
         };
         // A rename from a path never observed (the temporary file of an
         // atomic write, the daemon's own included) moves no identity: the
         // echo of an import's bundle write publishes nothing.
-        if delta.is_same_namespace_observation(&baseline)
-            && renames.iter().all(|rename| {
-                delta.rename_moves_nothing(&baseline, &rename.root_name, &rename.from_path)
-            })
-            && healthy
-        {
+        let mut echo = healthy && delta.matches_published(store)?;
+        for rename in &renames {
+            echo = echo && delta.rename_moves_nothing(store, &rename.root_name, &rename.from_path)?;
+        }
+        if echo {
             // Diagnostics are replaced with their affected subtree even when
             // the authored namespace itself did not change.
             return Ok(ScanStep::Diagnostics {
@@ -863,7 +857,6 @@ impl DaemonCoordinator {
             tags.authority().as_deref(),
         )?;
         Ok(ScanStep::Incremental(Box::new(IncrementalStep {
-            baseline,
             delta,
             claims,
             renames,
@@ -992,7 +985,6 @@ impl DaemonCoordinator {
                 let mut commit = publish_incremental_scan(
                     store,
                     store.input_version(),
-                    &step.baseline,
                     &step.delta,
                     &step.claims,
                     &inputs,

@@ -1741,15 +1741,6 @@ struct IncrementalScanPlan {
     paths: BTreeMap<String, BTreeSet<AssetUuid>>,
 }
 
-fn scan_key_matches(prefix: &ScanKey, key: &ScanKey) -> bool {
-    prefix.0 == key.0
-        && (prefix.1.is_empty()
-            || prefix.1 == key.1
-            || key
-                .1
-                .strip_prefix(&prefix.1)
-                .is_some_and(|suffix| suffix.starts_with('/')))
-}
 #[derive(Clone)]
 struct ScanCandidate {
     scan: ScanSnapshot,
@@ -2436,7 +2427,6 @@ fn append_path_mutations(
 fn publish_incremental_scan(
     store: &mut Store,
     base: InputVersion,
-    baseline: &ScanSnapshot,
     delta: &ScanDelta,
     claims: &[SourceClaims],
     inputs: &PlanInputs<'_>,
@@ -2444,7 +2434,6 @@ fn publish_incremental_scan(
     projection: &PipelineProjection,
     tag_epoch: [u8; 32],
 ) -> Result<Commit, StoreError> {
-    let file_mutations = incremental_file_mutations(baseline, delta);
     if store.input_version() != base {
         return Err(StoreError::InvalidConfiguration {
             error: format!(
@@ -2457,6 +2446,7 @@ fn publish_incremental_scan(
         // Rows are labelled with the version the input publishes: inside a
         // pass, an earlier step has already advanced it past `base`.
         let observation = transaction.version();
+        let file_mutations = incremental_file_mutations(&transaction.reader(), delta)?;
         let watermark = transaction.reader().clean_watermark()?.unwrap_or(0);
         let mut root_ids = BTreeMap::new();
         let mut newest_mtime = watermark;
@@ -2804,26 +2794,25 @@ fn prepare_incremental_publication(
     })
 }
 
+/// The `files` rows `delta` writes or removes: its observation against the
+/// published rows under its affected prefixes, read from `published`.
 fn incremental_file_mutations(
-    baseline: &ScanSnapshot,
+    published: &StoreReader,
     delta: &ScanDelta,
-) -> Vec<IncrementalFileMutation> {
-    let old = baseline
-        .file_observations()
-        .filter(|(key, _)| {
-            delta
-                .affected_prefixes()
-                .iter()
-                .any(|prefix| scan_key_matches(prefix, key))
-        })
-        .map(|(key, file)| (key.clone(), file))
-        .collect::<BTreeMap<_, _>>();
+) -> Result<Vec<IncrementalFileMutation>, StoreError> {
+    let mut old = BTreeMap::new();
+    for (root, prefix) in delta.affected_prefixes() {
+        for row in published.observed_files_under(root, prefix)? {
+            old.insert((row.root_name, row.path), row.file);
+        }
+    }
     let observed = delta.observed();
     let current = observed
         .file_observations()
         .map(|(key, file)| (key.clone(), file))
         .collect::<BTreeMap<_, _>>();
-    old.keys()
+    Ok(old
+        .keys()
         .chain(current.keys())
         .cloned()
         .collect::<BTreeSet<_>>()
@@ -2839,7 +2828,7 @@ fn incremental_file_mutations(
                 path: key.1,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn bundle_summary(source: &ScannedBundle) -> Result<BundleSummary, StoreError> {
@@ -2884,17 +2873,14 @@ pub(crate) fn publish_incremental_paths(
 ) -> Result<Commit, String> {
     let scanner = compiled.scanner();
     let projection = compiled.projection();
-    let (delta, baseline) = {
+    let delta = {
         let store: &StoreReader = store;
         let stored = StoredBaseline::new(store);
         let delta = scanner.scan_incremental_delta(&stored, paths);
         stored.finish().map_err(|error| error.to_string())?;
-        let delta = delta
+        delta
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "authored path is outside every configured root".to_owned())?;
-        let baseline = ScanSnapshot::load_under(store, delta.affected_prefixes())
-            .map_err(|error| error.to_string())?;
-        (delta, baseline)
+            .ok_or_else(|| "authored path is outside every configured root".to_owned())?
     };
     let authority = coordinator.and_then(|_| compiled.schema_authority());
     let tag_epoch = authority
@@ -2917,7 +2903,6 @@ pub(crate) fn publish_incremental_paths(
         let mut commit = publish_incremental_scan(
             store,
             base,
-            &baseline,
             &delta,
             &claims,
             &inputs,
@@ -2944,7 +2929,6 @@ pub(crate) fn publish_incremental_paths(
         return Ok(commit);
     }
 
-    drop(baseline);
     let mut scan = ScanSnapshot::load(store).map_err(|error| error.to_string())?;
     scan.apply_delta(delta);
     let claims = bundle_claims(scan.bundle_rows(), projection, authority.as_deref())

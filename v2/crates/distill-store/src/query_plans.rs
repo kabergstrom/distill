@@ -765,13 +765,30 @@ fn subtree_reads_search_one_key_range() {
             store.observed_files_under("main", prefix).unwrap();
             store.observed_directories_under("main", prefix).unwrap();
             store.scan_diagnostics_under("main", prefix).unwrap();
-            store.bundle_files_under("main", prefix).unwrap();
+            store.bundle_file_hashes_under("main", prefix).unwrap();
         });
         let plans = reads.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
         assert_eq!(
             plans,
             ["files", "directories", "scan_diagnostics", "bundle_files"].map(read),
             "{prefix:?}: {reads:#?}"
+        );
+        let exists = subtree_plans(&mut store, |store| {
+            store.observes_under("main", prefix).unwrap();
+        });
+        assert_eq!(exists.len(), 1);
+        assert_eq!(
+            exists[0].1,
+            [
+                "SCAN CONSTANT ROW".to_owned(),
+                "SCALAR SUBQUERY 1".to_owned(),
+                roots.to_owned(),
+                search("files", true),
+                "SCALAR SUBQUERY 2".to_owned(),
+                roots.to_owned(),
+                search("directories", true),
+            ],
+            "{prefix:?}: {exists:#?}"
         );
         let under = [("main".to_owned(), prefix.to_owned())];
         let writes = subtree_plans(&mut store, |store| {
@@ -828,13 +845,13 @@ fn a_subtree_read_of_a_large_root_touches_its_rows() {
         rows = reader.observed_files_under("main", "d08").unwrap().len();
         rows += reader.observed_directories_under("main", "d08").unwrap().len();
         rows += reader.scan_diagnostics_under("main", "d08").unwrap().len();
-        rows += reader.bundle_files_under("main", "d08").unwrap().len();
+        rows += reader.bundle_file_hashes_under("main", "d08").unwrap().len();
     });
     let whole = pages(&reader, || {
         drop(reader.observed_files_under("main", "").unwrap());
         drop(reader.observed_directories_under("main", "").unwrap());
         drop(reader.scan_diagnostics_under("main", "").unwrap());
-        drop(reader.bundle_files_under("main", "").unwrap());
+        drop(reader.bundle_file_hashes_under("main", "").unwrap());
     });
     println!("subtree: {rows} rows in {narrow} pages (whole root: {whole} pages)");
     assert_eq!(rows, 4 * 400);
