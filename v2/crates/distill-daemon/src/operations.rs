@@ -4,6 +4,7 @@
 //! until the RPC progress stream reaches its terminal event, so cancellation
 //! cannot strand the durable store ahead of the RPC coordinator.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -133,8 +134,22 @@ impl AuthoringService {
             return Err(invalid("rename destination already exists"));
         }
 
+        // The bundles a rewrite can change: the moving one, those whose
+        // published bytes reference its path, and the poisoned ones, whose
+        // references are unknown because their bytes did not index.
+        let mut candidates = store
+            .bundles_referencing_path(&moving.path)
+            .map_err(invalid)?;
+        candidates.extend(store.poisoned_bundles().map_err(invalid)?);
+        candidates.push(moving.bundle);
+        candidates.sort();
+        candidates.dedup();
         let mut files = Vec::new();
-        for meta in store.all_bundles().map_err(invalid)? {
+        for bundle in candidates {
+            let meta = store
+                .bundle(bundle)
+                .map_err(invalid)?
+                .ok_or_else(|| invalid(format!("bundle {bundle} has references but no row")))?;
             let root = store
                 .root_name(meta.root)
                 .map_err(invalid)?
@@ -412,6 +427,87 @@ impl OperationFile {
 
 }
 
+/// Every logical path `bundle`'s reference fields name: the strings
+/// [`rewrite_bundle_path_references`] would rewrite if they were its `from`.
+/// Publication stores them as `bundle_path_refs` so a rename reads only the
+/// bundles it can change.
+pub(crate) fn bundle_path_references(bundle: &Bundle) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for entry in bundle.assets.values() {
+        // A parsed bundle holds every entry's schema snapshot.
+        if let Some(schema) = bundle.schemas.get(&entry.schema_hash) {
+            collect_references(&schema.root, &entry.data, &mut paths);
+        }
+    }
+    paths
+}
+
+/// [`rewrite_value`]'s traversal, collecting each reference it would test.
+fn collect_references(schema: &SchemaNode, value: &AuthoredValue, paths: &mut BTreeSet<String>) {
+    match schema {
+        SchemaNode::AssetRef(_) | SchemaNode::WeakRef(_) => match value {
+            AuthoredValue::Str(path) => {
+                paths.insert(path.clone());
+            }
+            AuthoredValue::Object(fields) => {
+                if let Some(AuthoredValue::Str(path)) = fields.get("path") {
+                    paths.insert(path.clone());
+                }
+            }
+            _ => {}
+        },
+        SchemaNode::Struct { fields, .. } => {
+            let AuthoredValue::Object(values) = value else {
+                return;
+            };
+            for (name, _, field) in fields {
+                if let Some(value) = values.get(name) {
+                    collect_references(field, value, paths);
+                }
+            }
+        }
+        SchemaNode::Enum { variants, .. } => {
+            let AuthoredValue::Object(values) = value else {
+                return;
+            };
+            let Some((name, payload)) = values.iter().next() else {
+                return;
+            };
+            if let Some((_, _, variant)) =
+                variants.iter().find(|(candidate, _, _)| candidate == name)
+            {
+                collect_references(variant, payload, paths);
+            }
+        }
+        SchemaNode::Vec(inner) | SchemaNode::Set(inner) | SchemaNode::Array { elem: inner, .. } => {
+            if let AuthoredValue::Array(values) = value {
+                for value in values {
+                    collect_references(inner, value, paths);
+                }
+            }
+        }
+        SchemaNode::Option(inner) => {
+            if !matches!(value, AuthoredValue::Null) {
+                collect_references(inner, value, paths);
+            }
+        }
+        SchemaNode::Map { key, value: item } => {
+            if let AuthoredValue::Object(values) = value {
+                if matches!(key.as_ref(), SchemaNode::String) {
+                    for value in values.values() {
+                        collect_references(item, value, paths);
+                    }
+                }
+            }
+        }
+        SchemaNode::Primitive(_)
+        | SchemaNode::String
+        | SchemaNode::Blob
+        | SchemaNode::Unit
+        | SchemaNode::BackRef(_) => {}
+    }
+}
+
 fn rewrite_bundle_path_references(
     bundle: &mut Bundle,
     from: &str,
@@ -533,5 +629,158 @@ fn operation_summary(operation: &PlannedOperation) -> String {
             failures.len()
         ),
         PlannedOperation::Doctor { request, .. } => format!("doctor {request:?}"),
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    //! The references publication stores for a bundle are exactly the
+    //! paths a rename rewrite would change in it.
+
+    use std::collections::BTreeMap;
+
+    use distill_bundle::AssetEntry;
+    use distill_core::id::{AssetUuid, BundleUuid, LogicalHash, TypeUuid};
+    use distill_schema::ngp_schema::{LogicalSchema, PrimitiveKind};
+
+    use super::*;
+
+    fn object(fields: &[(&str, AuthoredValue)]) -> AuthoredValue {
+        AuthoredValue::Object(
+            fields
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn text(value: &str) -> AuthoredValue {
+        AuthoredValue::Str(value.to_owned())
+    }
+
+    /// A bundle whose one entry holds references under every container the
+    /// traversal descends, beside strings it must not count: plain string
+    /// fields, non-string-keyed maps, inactive enum variants, and fields the
+    /// schema does not name.
+    fn bundle() -> Bundle {
+        let target = TypeUuid([3; 16]);
+        let reference = SchemaNode::AssetRef(target);
+        let schema = LogicalSchema {
+            root: SchemaNode::Struct {
+                rev: 0,
+                fields: vec![
+                    ("direct".into(), 0, reference.clone()),
+                    ("weak".into(), 0, SchemaNode::WeakRef(target)),
+                    ("label".into(), 0, SchemaNode::String),
+                    ("list".into(), 0, SchemaNode::Vec(Box::new(reference.clone()))),
+                    ("set".into(), 0, SchemaNode::Set(Box::new(reference.clone()))),
+                    (
+                        "fixed".into(),
+                        0,
+                        SchemaNode::Array {
+                            len: 1,
+                            elem: Box::new(reference.clone()),
+                        },
+                    ),
+                    ("maybe".into(), 0, SchemaNode::Option(Box::new(reference.clone()))),
+                    ("absent".into(), 0, SchemaNode::Option(Box::new(reference.clone()))),
+                    (
+                        "by_name".into(),
+                        0,
+                        SchemaNode::Map {
+                            key: Box::new(SchemaNode::String),
+                            value: Box::new(reference.clone()),
+                        },
+                    ),
+                    (
+                        "by_number".into(),
+                        0,
+                        SchemaNode::Map {
+                            key: Box::new(SchemaNode::Primitive(PrimitiveKind::U8)),
+                            value: Box::new(reference.clone()),
+                        },
+                    ),
+                    (
+                        "choice".into(),
+                        0,
+                        SchemaNode::Enum {
+                            rev: 0,
+                            variants: vec![
+                                ("Linked".into(), 0, reference.clone()),
+                                ("Named".into(), 0, SchemaNode::String),
+                            ],
+                        },
+                    ),
+                    (
+                        "other_choice".into(),
+                        0,
+                        SchemaNode::Enum {
+                            rev: 0,
+                            variants: vec![("Linked".into(), 0, reference.clone())],
+                        },
+                    ),
+                ],
+            },
+        };
+        let data = object(&[
+            ("direct", text("a.bundle")),
+            ("weak", object(&[("path", text("b.bundle")), ("local_id", text("x"))])),
+            ("label", text("label.bundle")),
+            ("list", AuthoredValue::Array(vec![text("c.bundle"), text("a.bundle")])),
+            ("set", AuthoredValue::Array(vec![object(&[("path", text("d.bundle"))])])),
+            ("fixed", AuthoredValue::Array(vec![text("e.bundle")])),
+            ("maybe", text("f.bundle")),
+            ("absent", AuthoredValue::Null),
+            ("by_name", object(&[("k", text("g.bundle"))])),
+            (
+                "by_number",
+                AuthoredValue::Array(vec![AuthoredValue::Array(vec![
+                    AuthoredValue::UInt(1),
+                    text("number.bundle"),
+                ])]),
+            ),
+            ("choice", object(&[("Linked", text("h.bundle"))])),
+            ("other_choice", object(&[("Unknown", text("unknown.bundle"))])),
+            ("unnamed", text("unnamed.bundle")),
+        ]);
+        let hash = LogicalHash([1; 32]);
+        Bundle {
+            format_version: 1,
+            uuid: BundleUuid([2; 16]),
+            primary: None,
+            schemas: BTreeMap::from([(hash, schema)]),
+            assets: BTreeMap::from([(
+                "main".to_owned(),
+                AssetEntry {
+                    uuid: AssetUuid([4; 16]),
+                    type_uuid: TypeUuid([5; 16]),
+                    schema_hash: hash,
+                    authoring_only: false,
+                    data,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn stored_references_are_the_paths_a_rename_rewrites() {
+        let bundle = bundle();
+        let references = bundle_path_references(&bundle);
+        assert_eq!(
+            references,
+            ["a", "b", "c", "d", "e", "f", "g", "h"]
+                .map(|name| format!("{name}.bundle"))
+                .into()
+        );
+        let candidates = references.iter().cloned().chain(
+            ["label", "number", "unknown", "unnamed", "x", "absent"]
+                .map(|name| format!("{name}.bundle")),
+        );
+        for from in candidates {
+            let mut rewritten = bundle.clone();
+            let changed =
+                rewrite_bundle_path_references(&mut rewritten, &from, "moved.bundle").unwrap();
+            assert_eq!(changed, references.contains(&from), "{from}");
+        }
     }
 }

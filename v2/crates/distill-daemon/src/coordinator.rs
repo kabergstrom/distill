@@ -2361,6 +2361,12 @@ fn publish_scan(
                 content_hash: ContentHash(source.file_hash.0),
                 origin: summary.origin.clone(),
             })?;
+            transaction.set_bundle_path_refs(
+                bundle.uuid,
+                crate::operations::bundle_path_references(bundle)
+                    .iter()
+                    .map(String::as_str),
+            )?;
             for (hash, schema) in &bundle.schemas {
                 let snapshot =
                     distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
@@ -2579,6 +2585,12 @@ fn publish_incremental_scan(
                 content_hash: ContentHash(source.file_hash.0),
                 origin: summary.origin,
             })?;
+            transaction.set_bundle_path_refs(
+                bundle.uuid,
+                crate::operations::bundle_path_references(bundle)
+                    .iter()
+                    .map(String::as_str),
+            )?;
             for (hash, schema) in &bundle.schemas {
                 let snapshot =
                     distill_schema::ngp_schema::snapshot_to_json(schema).map_err(|error| {
