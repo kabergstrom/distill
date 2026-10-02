@@ -4113,12 +4113,12 @@ mod tests {
     use distill_build::pipeline::{GraphicsApi, TargetArch, TargetOs, TargetSelector};
     use distill_json::AuthoredValue;
     use distill_rpc::{
-        ArtifactPayload, AuthoringEntry, AuthoringEntryRole, AuthoringValue,
+        ArtifactPayload, BuildEntry,
         BuildArtifactPublication, BuildPublication, BuildWireTree, TargetDefinition,
         TargetDefinitionHash,
     };
     use distill_schema::ngp_schema::{
-        node_hash, snapshot_to_json, Field, FieldAttrs, FieldIdentifier, FieldLayout,
+        node_hash, Field, FieldAttrs, FieldIdentifier, FieldLayout,
         LayoutIdentity, LogicalSchema, PrimitiveKind, PrimitiveType, Schema, SchemaLayouts,
         SchemaNode, SchemaTypeId, TypeAttrs, TypeDef, TypeLayout, TypePath,
     };
@@ -4787,21 +4787,10 @@ mod tests {
             requested_asset: ASSET,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid: ASSET,
-                bundle: BUNDLE,
-                local_id: "entry".to_owned(),
-                normalized_path: "widen.bundle".to_owned(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: old_hash,
-                logical_schema: Arc::from(snapshot_to_json(&old_schema).unwrap().into_bytes()),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };
@@ -4967,25 +4956,10 @@ mod tests {
             requested_asset: ASSET,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid: ASSET,
-                bundle: BUNDLE,
-                local_id: "entry".to_owned(),
-                normalized_path: "byte.bundle".to_owned(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: project.logical_hash,
-                logical_schema: Arc::from(
-                    snapshot_to_json(&project.logical_schema)
-                        .unwrap()
-                        .into_bytes(),
-                ),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };
@@ -5206,25 +5180,10 @@ mod tests {
             requested_asset: ASSET,
             output_key: String::new(),
             requested_terminal_type: TERMINAL,
-            entry: AuthoringEntry {
+            entry: BuildEntry {
                 uuid: ASSET,
-                bundle: BUNDLE,
-                local_id: "entry".to_owned(),
-                normalized_path: "byte.bundle".to_owned(),
                 type_uuid: TYPE,
                 terminal_type: TERMINAL,
-                schema_hash: project.logical_hash,
-                logical_schema: Arc::from(
-                    snapshot_to_json(&project.logical_schema)
-                        .unwrap()
-                        .into_bytes(),
-                ),
-                role: AuthoringEntryRole::Runtime,
-                tags: BTreeMap::new(),
-                value: AuthoringValue {
-                    canonical_value: Arc::from(&b"{\"value\":7}"[..]),
-                    blobs: Vec::new(),
-                },
             },
             drifted_input: DriftedInput::Asset(ASSET),
         };

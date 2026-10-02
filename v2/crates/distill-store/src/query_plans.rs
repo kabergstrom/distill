@@ -834,3 +834,29 @@ fn rare_row_reads_walk_their_partial_index() {
         assert_eq!(explain(connection(&mut reader), &statements[0]), expected);
     }
 }
+
+/// Doctor verification names every served runtime entry by one statement
+/// of three columns, whatever the namespace size: no per-entry tag, schema
+/// or value read.
+#[test]
+fn runtime_entry_types_are_one_statement() {
+    let _tracing = TRACING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut answered = Vec::new();
+    for count in [50, 500] {
+        let (_dir, store) = store_with(count);
+        let mut reader = store.reader().unwrap();
+        connection(&mut reader).trace(Some(trace));
+        answered.push(reader.served_runtime_entry_types().unwrap().len());
+        connection(&mut reader).trace(None);
+        let statements = std::mem::take(&mut *TRACED.lock().unwrap());
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        assert_eq!(
+            explain(connection(&mut reader), &statements[0]),
+            [
+                "SCAN a USING INDEX sqlite_autoindex_assets_1",
+                "SEARCH b USING INDEX sqlite_autoindex_bundles_1 (bundle_uuid=?)",
+            ]
+        );
+    }
+    assert!(answered[1] > 9 * answered[0] && answered[0] > 0, "{answered:?}");
+}

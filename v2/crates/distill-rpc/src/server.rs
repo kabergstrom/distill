@@ -732,11 +732,15 @@ impl Server {
         let snapshot = txn.snapshot();
         let targets = snapshot.rpc_targets().map_err(store_failure)?;
         let entries = snapshot
-            .served_runtime_entries()
+            .served_runtime_entry_types()
             .map_err(store_failure)?
             .into_iter()
-            .map(|entry| authoring_entry(entry.map_err(store_failure)?).map_err(store_failure))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(uuid, type_uuid, terminal_type)| BuildEntry {
+                uuid,
+                type_uuid,
+                terminal_type,
+            })
+            .collect::<Vec<_>>();
         let mut requests = Vec::new();
         for target in &targets {
             for entry in &entries {

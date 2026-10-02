@@ -249,6 +249,13 @@ const SERVED_ENTRY_FROM: &str = concat!(
     "FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE ",
     served_entry_where!()
 );
+/// Every served runtime entry's UUID, authored type and terminal type.
+pub(crate) const SERVED_RUNTIME_ENTRY_TYPES: &str = concat!(
+    "SELECT a.asset_uuid, a.type_uuid, a.terminal_type
+     FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid WHERE ",
+    served_entry_where!(),
+    " AND a.authoring_only = 0 ORDER BY a.asset_uuid"
+);
 
 fn served_entry_meta_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServedEntryMeta> {
     Ok(ServedEntryMeta {
@@ -307,41 +314,19 @@ impl StoreReader {
         self.assets_matching(filter, SERVED_ENTRY_WHERE, glob)
     }
 
-    /// Every served runtime (not authoring-only) entry with its schema and
-    /// value, by asset UUID, read in one query. Each entry fails on its own,
-    /// as [`StoreReader::served_entry`] would for it: an entry whose schema
-    /// snapshot is missing is an error in its place.
-    pub fn served_runtime_entries(&self) -> Result<Vec<Result<ServedEntry, StoreError>>, StoreError> {
-        let rows = self.query_rows(
-            &format!(
-                "SELECT {SERVED_ENTRY_COLUMNS}, s.schema_json, a.authored_value
-                 FROM assets a JOIN bundles b ON b.bundle_uuid = a.bundle_uuid
-                 LEFT JOIN schemas s ON s.logical_hash = a.logical_hash
-                 WHERE {SERVED_ENTRY_WHERE} AND a.authoring_only = 0
-                 ORDER BY a.asset_uuid"
-            ),
-            [],
-            |row| {
-                Ok((
-                    served_entry_meta_row(row)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Vec<u8>>(9)?,
-                ))
-            },
-        )?;
-        Ok(rows
-            .into_iter()
-            .map(|(mut meta, schema_json, authored_value)| {
-                meta.tags = self.asset_tag_map(meta.asset)?;
-                let schema_json = schema_json
-                    .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
-                Ok(ServedEntry {
-                    meta,
-                    schema_json,
-                    authored_value,
-                })
-            })
-            .collect())
+    /// Every served runtime (not authoring-only) entry's UUID, authored type
+    /// and terminal type, by asset UUID, in one statement: what a
+    /// verification build request names of its entry.
+    pub fn served_runtime_entry_types(
+        &self,
+    ) -> Result<Vec<(AssetUuid, TypeUuid, TypeUuid)>, StoreError> {
+        self.query_rows(SERVED_RUNTIME_ENTRY_TYPES, [], |row| {
+            Ok((
+                AssetUuid(blob16(row.get(0)?)),
+                TypeUuid(blob16(row.get(1)?)),
+                TypeUuid(blob16(row.get(2)?)),
+            ))
+        })
     }
 
     /// One served authoring entry's metadata.

@@ -1893,12 +1893,12 @@ impl Snapshot {
         // its static inputs: a cached result whose traced inputs hold at
         // this snapshot answers at once, and requesters of one key share
         // one build.
-        if let (Some(VersionResolve::Drifted(input)), Some(_)) = (&resolution, &meta) {
-            let entry = snapshot
-                .served_entry(authoring_uuid)?
-                .map(authoring_entry)
-                .transpose()?
-                .expect("a served entry's metadata implies the entry");
+        if let (Some(VersionResolve::Drifted(input)), Some(meta)) = (&resolution, &meta) {
+            let entry = BuildEntry {
+                uuid: meta.asset,
+                type_uuid: meta.type_uuid,
+                terminal_type: meta.terminal_type,
+            };
             let Some(row) = self.server.inner.reader.rpc_target(&target)? else {
                 return done(RpcResult::ReconnectRequired {
                     reason: ReconnectReason::TargetDefinitionChanged,
@@ -2636,54 +2636,6 @@ mod query_tests {
                 bundles: vec![bundle]
             })
         );
-    }
-
-    /// The runtime entries build verification reads in one query are the
-    /// per-entry reads it replaced, each failing where that read failed.
-    #[test]
-    fn runtime_entries_are_the_per_entry_reads() {
-        let (_dir, mut store) = namespace(30);
-        // An entry whose schema snapshot is missing fails in its place.
-        let unknown = LogicalHash([0x99; 32]);
-        store
-            .input_transaction(|txn| {
-                txn.upsert_asset(&AssetRecord {
-                    asset: AssetUuid(uuid(0x21, 4)),
-                    bundle: BundleUuid(uuid(0x10, 4)),
-                    local_id: "main".into(),
-                    type_uuid: MESH,
-                    logical_hash: unknown,
-                    authoring_only: false,
-                    tags: BTreeMap::from([("kind".to_owned(), None)]),
-                    served: Some(ServedAuthoring {
-                        authored_value: vec![1, 2, 3],
-                        terminal_type: GPU_MESH,
-                    }),
-                })
-            })
-            .unwrap();
-        let reader = store.reader().unwrap();
-        let per_entry = reader
-            .served_entries()
-            .unwrap()
-            .into_iter()
-            .filter(|meta| !meta.authoring_only)
-            .map(|meta| {
-                reader
-                    .served_entry(meta.asset)
-                    .map(|entry| entry.expect("a served entry reads"))
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Vec<_>>();
-        let batched = reader
-            .served_runtime_entries()
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.map_err(|error| error.to_string()))
-            .collect::<Vec<_>>();
-        assert_eq!(batched, per_entry);
-        assert!(batched.iter().filter(|entry| entry.is_err()).count() == 1);
-        assert!(batched.len() > 30);
     }
 
     /// Pages fetched by `read`.

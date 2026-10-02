@@ -1028,6 +1028,14 @@ should reach zero by the end of phase 6.
 - **Loader step counters.** `RpcIo::last_step()` reports a step's turns,
   task polls and most polls in one turn; the backpressure tests assert
   those counts, not wall time.
+- **Build requests carry what a build takes.** `BuildRequest::entry` is a
+  `BuildEntry` (uuid, authored type, terminal type) instead of a whole
+  `AuthoringEntry`: the build reads the rest at its view. Runtime resolve
+  builds it from the metadata it already read, and doctor verify names
+  every runtime entry by one three-column statement
+  (`served_runtime_entry_types`) instead of reading each entry's tags,
+  schema and value. An entry whose schema snapshot is missing now fails
+  its own verification build instead of the whole request set.
 
 ## 7. Test baseline
 

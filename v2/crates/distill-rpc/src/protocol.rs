@@ -806,8 +806,18 @@ pub struct BuildRequest {
     /// Empty for the primary, otherwise the statically declared extra key.
     pub output_key: String,
     pub requested_terminal_type: TypeUuid,
-    pub entry: AuthoringEntry,
+    pub entry: BuildEntry,
     pub drifted_input: DriftedInput,
+}
+
+/// The authored entry a build request builds, as the served snapshot
+/// records it: all a build takes from the request (it reads the rest
+/// itself, at its view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildEntry {
+    pub uuid: AssetUuid,
+    pub type_uuid: TypeUuid,
+    pub terminal_type: TypeUuid,
 }
 
 /// Snapshot- and target-bound schema policy lookup used by offline pack
