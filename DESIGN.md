@@ -4896,6 +4896,20 @@ All daemon state is disposable (§2) and lives under `.distill/` (gitignored).
 | `schema_lineage` | disposable projection of the source-controlled `SchemaLineageManifest`: per type, the append-only accepted epoch vector `(digest, forward_parent)`, current cursor, explicit `Active \| Retired` authority state, and verified `DSSL` (§5, §6, §11). Startup rebuilds it only from that manifest; non-bootstrap `EntryLineageV1::Manifest` stamps and migration-endpoint stamps are checked against it but never unioned into authority. Forward ancestry follows parent links from current. Explicit rollback moves the cursor only after complete reverse-edge validation; ordinary acceptance appends and advances; retire/reactivate preserve history and require exact stale-base candidate checks including the metadata/control SnapshotStamp used for retirement's negative proof. Every input publication enforces that Retired types have no live entries/endpoints; violation publishes typed RetiredTypeReferenced authority poison. A missing/duplicate manifest leaves this table unavailable and hard-stops schema-dependent work; only §6's unbound exact-basis local repair surface remains mutable until one valid authority publishes |
 | `codegen_outputs` | daemon-owned Rust codegen namespace → the exact `ContentHash` of each previously published file. This memo-side table is the expected-preimage authority for §20 publication and recovery; replacing the complete map never advances the input version |
 
+**Evaluating a query.** An `AssetQuery` (a build trace's, codegen's, the
+RPC's) or a `FileQuery` enumeration is answered by SQL driven from the index
+of its most selective selector, the others checked on the rows it finds.
+SQLite keeps no statistics here, so the daemon ranks them: an identity or
+exact name (uuid, bundle, bundle path, a glob's literal final segment, local
+id), then a tag value, an authored type, a path prefix (or a glob's literal
+prefix), a terminal type, a bare tag, and the authoring-only rows. A glob
+whose last segment is literal (`**/name.ext`) is found by the final-segment
+`name` column of `bundles` and `files`; one whose literal tail holds a `.`
+(`*.ext`) by `files.ext`. A wildcard may match `/`, so a literal stem after
+one (`**/name.*`) narrows nothing. A bare `*` or `**`, or `authoring_only =
+false` alone, selects every runtime entry (or every file): the only
+queries that read the whole namespace.
+
 Each published input-version header stores either no global poison or the exact
 canonical `VersionPoisonV1` code/detail plus recomputed DSVP identity (§7).
 If validation discovers more than one global defect, this is §7's first
@@ -5578,7 +5592,10 @@ builds (`doctor verify`, tag-index refinement) run on a writer inside an
 open input and are reachable only through an `OpenInput` proof; nothing
 that answers a resolve holds one. A reconciliation pass refines the tag
 index in its one apply input (§14, one pass, one input version), never in
-its rolled-back plan.
+its rolled-back plan. A complete refinement (a full rescan or a configuration
+publication) that fails poisons every asset's tags, reading the
+asset-to-bundle map inside that input: a whole-namespace bulk operation,
+like the publication it belongs to.
 
 ## 14. File Tracking & Consistency
 
@@ -5626,12 +5643,23 @@ Modeled on v1's `FileTracker`, whose behavior is carried over:
   single input remain: configuration/schema/pipeline candidate
   publications (each its own version, before the pass, because they install
   the epoch and importers the pass uses), codegen (files only, no version),
-  chained imports whose source is another import's output (they join the
-  next pass's version), and the disk writes of import outputs (written
-  before the input commits, as before). The pass observes those outputs in
-  its own input, so the watcher's echo of them publishes nothing: an echo
-  whose namespace observation is unchanged and whose renames start from a
-  path never observed (an atomic write's temporary file) is no change.
+  and the disk writes of import outputs (written before the input commits,
+  as before). The pass observes those outputs in its own input, so the
+  watcher's echo of them publishes nothing: an echo whose namespace
+  observation is unchanged and whose renames start from a path never
+  observed (an atomic write's temporary file) is no change.
+- **Chained imports run in the same pass.** An import whose sources include
+  another import's output runs after it, against its output: once a level
+  of imports has run, the pass compares each output with the `files` row it
+  will replace, discovers (in the rolled-back plan input, over the overlay
+  plus those outputs) the imports that read a changed output, and runs them
+  as the next level, upstream first; an import found again at a later level
+  runs only there. The apply checks each level against the outputs before
+  it, so a chain lands in the pass's one input version. A pass runs at most
+  8 levels; the rest of a deeper chain runs in the next pass, which the
+  pass reports as more work. An import that reads its own output through a
+  chain (a cycle) is cut: the pass reports it as an import failure naming
+  the chain and it reruns in the next pass.
 - **Incremental-workload invariant.** After a successful startup scan, ordinary
   filesystem activity never invokes the complete-root scanner. Complete scans
   are restricted to process startup, an accepted configured-root replacement,

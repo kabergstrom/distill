@@ -890,8 +890,9 @@ should reach zero by the end of phase 6.
   transaction (`distill-store` `trace_reads`), kept in the build's
   `TraceAnswers`; tools are read per id at the build's tool version. New
   indexes `bundles_by_path`, `assets_by_type`, the partial
-  `asset_tag_index_poisoned`, and `assets_by_bundle` now on
-  `(bundle_uuid, local_id)` (SCHEMA_VERSION 36). A store failure fails
+  `asset_tag_index_poisoned`, and `assets_by_bundle` keyed by bundle and
+  local id (SCHEMA_VERSION 36 on that branch; the merged schema is 37,
+  below). A store failure fails
   only the questions that reach it, where the capture failed every build.
 - **Compiled state by store version.** SQLite is the only source of truth
   for what the daemon compiled; memory holds derivations of it, each keyed
@@ -942,13 +943,14 @@ should reach zero by the end of phase 6.
   the narrow ones are pinned by the pages they fetch from a 20 000-entry
   store (`StoreReader::pages_fetched`).
   - RPC `query`/`queryAssets` and codegen queries: one `assets ⋈ bundles`
-    query per selector set (`AssetFilter`); a glob narrows to its literal
-    prefix by range and is matched on the returned rows only. Doctor build
+    query per selector set (`AssetFilter`); a glob narrows by its keys
+    (below) and is matched on the returned rows only. Doctor build
     verification reads the runtime entries in one query.
   - Import destinations look bundles up by path (`bundles_by_path`);
     enumeration and the pass overlay read the prefix subtree or the glob's
-    literal-prefix range of `files`; the watched-fixpoint check reads only
-    bundles with a `$record` row (`assets_reserved`) or a poison
+    literal-prefix range of `files` (or its keys, below); the
+    watched-fixpoint check reads only bundles with a `$record` row
+    (`assets_by_local_id`) or a poison
     (`bundles_poisoned`); directory orphans read only generated bundles.
   - Rename-with-fixups reads only the moving bundle, the bundles whose
     reference fields name its path (`bundle_path_refs`, written with each
@@ -961,8 +963,53 @@ should reach zero by the end of phase 6.
     holding only the differences.
   - Still whole: `published_scan` and the no-coordinator fallback of
     `publish_incremental_paths` republish the complete namespace, so they
-    load it; the `all_asset_bundles` fallbacks feed tag refinement, which
-    takes the complete map; `ensure_import_index` rebuilds every row.
+    load it; `ensure_import_index` rebuilds every row. A failed complete
+    tag refinement (a full rescan or configuration publication) reads
+    `all_asset_bundles` inside its open input to poison every asset: a
+    bulk operation of a bulk publication, read only on that failure.
+- **Merged schema 37.** The build-cells, db-truth and db-queries branches each
+  defined a schema 36; the merge is one SCHEMA_VERSION 37 with the union of
+  their tables and one copy of each index. `assets_by_bundle` is
+  `(bundle_uuid, local_id, asset_uuid)`: it answers a trace's (bundle, local
+  id) lookup and covers the (bundle, asset) walk of a complete publication,
+  which sorts one bundle's rows at a time (local ids are unique within a
+  bundle). `bundles_by_path` is `(path, root_id)`. `bundle_files` stores
+  `hash` before `bytes`, so the hash-only walk never reads the bytes'
+  overflow pages (a test counts the bytes the reading thread reads).
+- **Query drivers.** Schema 37 also adds `assets_by_local_id` (replacing the
+  partial `assets_reserved`), the partial `assets_authoring`, and a
+  generated final-segment `name` column on `bundles` and `files` and an
+  `ext` column on `files`, each indexed. `GlobKeys` reads a glob's literal
+  prefix, the final segment its literal tail names (`**/name.ext`) and the
+  extension (`*.ext`), in `globset`'s or the RPC's dialect. `AssetFilter`
+  ranks its selectors (identity or exact name, poisoned tag rows, tag value,
+  authored type, path prefix, terminal type, bare tag, authoring-only) and
+  names the driver's index with `INDEXED BY` and the join order with `CROSS
+  JOIN`; build traces pick their candidates in the same order and file
+  enumeration takes a name, then a subtree or prefix, then an extension.
+  A bare `*` or `**`, or `authoring_only = false` alone, is a whole read.
+  The shapes callers issue: build traces (closed queries: uuid, bundle and
+  local id, bundle path and local id, type, tag, prefix and glob), codegen
+  (any selector set, always runtime-only), RPC (any selector set, always with
+  a role) and pure metadata (uuid, bundle, type, prefix, role), pack roots
+  (any selector set, through the RPC), directory-import listings
+  (`*.ext` globs over `files`) and the reserved-entry lookup (`$record` by
+  local id). None needs a composite index beyond `assets_by_bundle`: each
+  has one selective driver, and the rest filter its rows.
+- **Chained imports in one pass.** A pass runs imports in levels: after a
+  level runs, the rolled-back plan input finds the imports that read a
+  changed output (over the overlay plus those outputs) and runs them next,
+  upstream first, at most 8 levels per pass; a cycle is cut and reported.
+  The apply checks each level against the outputs before it.
+- **The scheduler thread is joined on drop.** It owns the opener and the
+  idle writers, which hold the state directory's lock; dropping the pool
+  now waits for it (except on a pool worker running a job, which the
+  scheduler waits for, and on the scheduler thread, which drops queued
+  jobs as it stops), so a coordinator reopened at once finds the lock
+  free.
+- **Loader step counters.** `RpcIo::last_step()` reports a step's turns,
+  task polls and most polls in one turn; the backpressure tests assert
+  those counts, not wall time.
 
 ## 7. Test baseline
 
@@ -996,3 +1043,6 @@ rpc_io_backpressure fetch_throughput_is_not_one_per_two_frames` once
 under load; it passed on every rerun.)
 Queries, not table loads (schema 36), on top of build cells and the scanner
 sibling fix: 1170 passed, no failures.
+Merge of db-truth and db-queries (schema 37), with the tag-refinement
+fallback read only on failure, chained imports in one pass, counted loader
+steps, the scheduler join and the query drivers: 1196 passed, no failures.
